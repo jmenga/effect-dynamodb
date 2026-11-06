@@ -705,3 +705,66 @@ describe("definition attribute names are typed from the model", () => {
     })
   })
 })
+
+describe("timeSeries.appendInput against a sharded index (EDD-9113)", () => {
+  class Series extends Schema.Class<Series>("FieldNamesSeries")({
+    id: Schema.String,
+    at: Schema.Number,
+    tenant: Schema.String,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+  }) {}
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const indexes = {
+    byTenant: {
+      name: "gsi",
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+      pk: { field: "gpk", composite: ["tenant"] },
+      sk: { field: "gsk", composite: ["region", "group"] },
+      shards: { count: 4, by: ["group"] },
+    },
+  } as const
+
+  it("the whole key compiles", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          region: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
+  })
+
+  it("`by` without the composite before it does not, and make throws", () => {
+    expect(() =>
+      Entity.make({
+        model: Series,
+        entityType: "Series",
+        primaryKey,
+        indexes,
+        timeSeries: {
+          orderBy: "at",
+          // @ts-expect-error carries `group` but not `region`
+          appendInput: Schema.Struct({
+            id: Schema.String,
+            at: Schema.Number,
+            tenant: Schema.String,
+            group: Schema.String,
+          }),
+        },
+      }),
+    ).toThrow("[EDD-9113]")
+  })
+})

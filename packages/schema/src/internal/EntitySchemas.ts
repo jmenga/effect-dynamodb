@@ -26,6 +26,7 @@ import {
   getSchemaFields,
   isSchemaLike,
   numericTypeWithStringEncoding,
+  rowCanLack,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
 import { parseZonedIso } from "./ZonedIso.js"
@@ -2115,13 +2116,16 @@ export const buildDerivedSchemas = (
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
   // --- Update Schema: optional model fields minus key composites & immutable ---
-  // Each field is wrapped in `Schema.optional` so the key may be omitted
-  // entirely (the structural composer treats absent keys as absent for GSI
-  // composition under v3's two-way classification). The field's value type
-  // matches the model declaration exactly — there is no `null` widening,
-  // because EDD-9025 prevents composites from declaring `null` and the
-  // standard update payload follows the same shape. If the model declares a
-  // non-composite attribute as `Schema.NullOr(X)`, `set({ attr: null })`
+  // The key may always be omitted (the structural composer treats absent keys
+  // as absent for GSI composition under v3's two-way classification). Whether
+  // its value may be `undefined` follows the row: `undefined` clears the field,
+  // so a field a row can lack takes `Schema.optional` and one it can't takes
+  // `Schema.optionalKey`, as do ref ids. A library-generated value (a colliding
+  // `updatedAt`) stays `Schema.optional`: `undefined` there means generate it.
+  // The field's value type matches the model declaration exactly — there is
+  // no `null` widening, because EDD-9025 prevents composites from declaring
+  // `null` and the standard update payload follows the same shape. If the model
+  // declares a non-composite attribute as `Schema.NullOr(X)`, `set({ attr: null })`
   // still typechecks; the v1.6 `NullishOr` wrap that allowed null on
   // arbitrary fields (regardless of model declaration) is removed.
   const buildUpdateFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
@@ -2131,12 +2135,15 @@ export const buildDerivedSchemas = (
       if (immutableFields.has(key)) continue
       if (refFieldSet.has(key)) continue
       if (strippedFromUpdate.has(key)) continue
-      acc[key] = Schema.optional(field as Schema.Top)
+      const clearable = optionalOnCollide.has(key) || rowCanLack(field as Schema.Top)
+      acc[key] = clearable
+        ? Schema.optional(field as Schema.Top)
+        : Schema.optionalKey(field as Schema.Top)
     }
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optional(ref.identifierSchema as Schema.Top)
+      acc[ref.idFieldName] = Schema.optionalKey(ref.identifierSchema as Schema.Top)
     }
     return acc
   }

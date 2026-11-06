@@ -79,6 +79,7 @@ import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
+import * as Clears from "./helpers/ClearScenarios.js"
 
 // ---------------------------------------------------------------------------
 // Skip if DynamoDB Local is not available
@@ -3334,7 +3335,7 @@ describeConnected("timeSeries .append().remove() integration tests (closes #49)"
           deviceId: "d-val-1",
           timestamp: DateTime.makeUnsafe("2026-04-22T15:00:00.000Z"),
         })
-          .remove(["accountId"]) // accountId is NOT in appendInput
+          .remove(["accountId"] as never) // accountId is NOT in appendInput
           .asEffect()
           .pipe(Effect.flip)
 
@@ -5351,10 +5352,9 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
         const beforeSk = beforeStored.gsi1sk
 
         // Touch sk with a hole pattern under preserve, no removedSet.
-        // city: undefined, site: 'datacenter-2' → hole at sk[1].
+        // city omitted, site: 'datacenter-2' → hole at sk[1].
         yield* dbHier.entities.HierAssets.update({ assetId: "rack-11" }).set({
           country: "us",
-          city: undefined,
           site: "datacenter-2",
         })
 
@@ -5362,6 +5362,35 @@ describeConnected("indexPolicy v1.7.1 integration tests (closes #41)", () => {
         // v1.7.1: preserve + can't-compose + no cascade → noop. The stored
         // gsi1sk is left at its previous value (no SET, no REMOVE).
         expect(item.gsi1sk).toBe(beforeSk)
+      }).pipe(provideHier),
+  )
+
+  it.effect(
+    "scenario 11a — `city: undefined` is `.remove(['city'])`: the same hole cascades, attribute and key both gone",
+    () =>
+      Effect.gen(function* () {
+        const dbHier = yield* DynamoClient.make({
+          entities: { HierAssets },
+          tables: { HierTable },
+        })
+
+        yield* dbHier.entities.HierAssets.put({
+          assetId: "rack-11a",
+          region: "americas",
+          country: "us",
+          city: "sf",
+          site: "datacenter-1",
+        })
+
+        yield* dbHier.entities.HierAssets.update({ assetId: "rack-11a" }).set({
+          country: "us",
+          city: undefined,
+          site: "datacenter-2",
+        })
+
+        const item = yield* HierAssets.get({ assetId: "rack-11a" }).pipe(Entity.asItem)
+        expect(item.city).toBeUndefined()
+        expect(item.gsi1sk).toBeUndefined()
       }).pipe(provideHier),
   )
 
@@ -23873,4 +23902,13 @@ describeConnected("write limits diagnosed from DynamoDB's rejection (#144)", () 
     },
     60_000,
   )
+})
+
+// A cleared composite (#177): `.set({ composite: undefined })` and `.remove`, through every
+// canonical shape, on every update path, against the real index.
+describeConnected("a cleared composite, by canonical GSI-composite shape", () => {
+  const harness = Clears.connectedHarness(ENDPOINT)
+  for (const scenario of [...Clears.shapeScenarios, ...Clears.primaryCompositeShapeScenarios]) {
+    it.effect(scenario.name, () => scenario.run(harness), { timeout: 20_000 })
+  }
 })

@@ -61,8 +61,8 @@ const AppSchema = DynamoSchema.make({ name: "app", version: 1 })
 class Product extends Schema.Class<Product>("Product")({
   productId: Schema.String,
   tenantId: Schema.String,
-  name: Schema.String,
-  description: Schema.String,
+  name: Schema.optional(Schema.String),
+  description: Schema.optional(Schema.String),
   category: Schema.String,
   price: Schema.Number,
 }) {}

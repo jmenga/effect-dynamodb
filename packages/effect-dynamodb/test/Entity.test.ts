@@ -81,6 +81,7 @@ const UserWithImmutableModel = DynamoModel.configure(UserWithImmutable, {
 class SimpleItem extends Schema.Class<SimpleItem>("SimpleItem")({
   itemId: Schema.String,
   name: Schema.String,
+  nickname: Schema.optional(Schema.String),
 }) {}
 
 // ---------------------------------------------------------------------------
@@ -3665,12 +3666,15 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(Entity.remove(["name"]), Entity.asModel)
+        yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
+          Entity.remove(["nickname"]),
+          Entity.asModel,
+        )
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toContain("REMOVE")
-        // name should be referenced via expression attribute name
-        expect(Object.values(input.ExpressionAttributeNames)).toContain("name")
+        // nickname should be referenced via expression attribute name
+        expect(Object.values(input.ExpressionAttributeNames)).toContain("nickname")
       }).pipe(Effect.provide(TestLayer)),
     )
 
@@ -3738,7 +3742,8 @@ describe("Entity", () => {
 
         yield* SimpleEntity.update({ itemId: "i-1" }).pipe(
           Entity.set({ name: "Updated" }),
-          Entity.remove(["obsoleteField"]),
+          // An attribute the model doesn't declare: allowed, past the types.
+          Entity.remove(["obsoleteField"] as never),
           Entity.add({ viewCount: 1 }),
           Entity.asModel,
         )
@@ -3767,7 +3772,7 @@ describe("Entity", () => {
         )
 
         yield* VersionedEntity.update({ itemId: "i-1" }).pipe(
-          Entity.remove(["name"]),
+          Entity.remove(["nickname"]),
           Entity.expectedVersion(2),
           Entity.asModel,
         )
@@ -3782,7 +3787,7 @@ describe("Entity", () => {
       Effect.gen(function* () {
         mockUpdateItem.mockResolvedValueOnce(standardUpdateResult)
 
-        yield* Entity.remove(SimpleEntity.update({ itemId: "i-1" }), ["name"]).asEffect()
+        yield* Entity.remove(SimpleEntity.update({ itemId: "i-1" }), ["nickname"]).asEffect()
 
         const input = mockUpdateItem.mock.calls[0]![0]
         expect(input.UpdateExpression).toContain("REMOVE")
@@ -4013,8 +4018,8 @@ describe("Entity", () => {
     class TenantUser extends Schema.Class<TenantUser>("TenantUser")({
       userId: Schema.String,
       name: Schema.String,
-      tenantId: Schema.String,
-      region: Schema.String,
+      tenantId: Schema.optional(Schema.String),
+      region: Schema.optional(Schema.String),
       email: Schema.String,
     }) {}
 
@@ -4326,7 +4331,7 @@ describe("Entity", () => {
           class MultiGsiUser extends Schema.Class<MultiGsiUser>("MultiGsiUser")({
             userId: Schema.String,
             name: Schema.String,
-            tenantId: Schema.String,
+            tenantId: Schema.optional(Schema.String),
             region: Schema.String,
             department: Schema.String,
           }) {}

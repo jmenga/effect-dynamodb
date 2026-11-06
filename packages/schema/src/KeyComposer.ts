@@ -120,8 +120,9 @@ export type KeyValue = string | Uint8Array
  * - `"preserve"` — noop (leave the stored key for this half untouched). The
  *   stored value may go stale until either (a) the next write that touches
  *   this half supplies enough composites to recompose, or (b) a composite of
- *   this half is named in `Entity.remove([...])` — the cascade override
- *   then REMOVEs this half's key.
+ *   this half is named in `Entity.remove([...])` (`.set({ f: undefined })`
+ *   reaches this composer as the same thing) — the cascade override then
+ *   REMOVEs this half's key.
  *
  * Halves not declared in `indexPolicy` default to `"preserve"`. See
  * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision rules

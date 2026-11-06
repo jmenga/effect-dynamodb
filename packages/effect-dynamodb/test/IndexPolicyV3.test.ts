@@ -40,6 +40,7 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import * as Clears from "./helpers/ClearScenarios.js"
 import { applyUpdate, mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
@@ -2744,6 +2745,7 @@ describe("Entity writes — shape 9d: `by` after a composite the update can't su
         tenant: Schema.String,
         at: Schema.DateTimeUtc,
         group: Schema.String,
+        region: Schema.optional(Schema.String),
       }),
     },
   })
@@ -2907,7 +2909,7 @@ describe("Entity writes — shape 9d: `by` after a composite the update can't su
   )
 
   describe("the append path", () => {
-    it.effect("an appendInput carrying `by` without the gap refuses", () =>
+    it.effect("an append carrying `by` without the gap refuses", () =>
       on((db, table) =>
         Effect.gen(function* () {
           yield* db.entities.Series.put(seed).asEffect()
@@ -2951,5 +2953,61 @@ describe("Entity writes — shape 9d: `by` after a composite the update can't su
         Effect.provide(Layer.merge(table.layer, WholeTable.layer({ name: "agree" }))),
       ) as Effect.Effect<void, unknown>
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A cleared composite (#177): `.set({ composite: undefined })` and `.remove`, through
+// every canonical shape, on every update path. The composer's half of this is in the
+// schema package's `KeyComposer.test.ts`, DynamoDB's in `connected.test.ts`.
+// ---------------------------------------------------------------------------
+
+describe("a cleared composite, by canonical GSI-composite shape", () => {
+  for (const scenario of [...Clears.shapeScenarios, ...Clears.primaryCompositeShapeScenarios]) {
+    it.effect(scenario.name, () => scenario.run(Clears.recordingHarness))
+  }
+
+  /** The requests a clear sends, with what differs per run (the row's incarnation) taken out. */
+  const requestsOf = (
+    shape: (typeof Clears.SHAPES)[number],
+    policy: string,
+    path: (typeof Clears.SHAPE_PATHS)[number],
+    form: (typeof Clears.FORMS)[number],
+  ) => {
+    const world = Clears.shapedWorld(shape.index, policy, path.options)
+    const table = makeRecordingTable({ indexes: { gsi: { pk: "gpk", sk: "gsk" } } })
+    return Effect.gen(function* () {
+      const db = yield* Clears.clientOf(world)
+      yield* db.entities.Rows.put(Clears.shapedSeed).asEffect()
+      table.take()
+      yield* path.write(db, world, form.clear(shape.clear, shape.also))
+      return JSON.stringify(table.take()).replace(
+        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g,
+        "<uuid>",
+      )
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, world.MainTable.layer({ name: "t" }))),
+    ) as Effect.Effect<string, unknown>
+  }
+
+  describe("both forms send the same requests", () => {
+    const [undefinedForm, removeForm] = Clears.FORMS as readonly [
+      (typeof Clears.FORMS)[number],
+      (typeof Clears.FORMS)[number],
+    ]
+    for (const shape of Clears.SHAPES) {
+      for (const policy of ["sparse", "preserve"]) {
+        for (const path of Clears.SHAPE_PATHS) {
+          it.effect(`${shape.name}, ${policy}, ${path.name}`, () =>
+            Effect.gen(function* () {
+              const a = yield* requestsOf(shape, policy, path, undefinedForm)
+              const b = yield* requestsOf(shape, policy, path, removeForm)
+              expect(a).not.toBe("[]")
+              expect(a).toBe(b)
+            }),
+          )
+        }
+      }
+    }
   })
 })

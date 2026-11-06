@@ -13,7 +13,7 @@
  * Not part of the public API.
  */
 
-import { type Schema, SchemaAST } from "effect"
+import { Exit, Schema, SchemaAST } from "effect"
 
 /**
  * Read `.fields` from a `Schema.Struct` or `Schema.Class`.
@@ -228,3 +228,81 @@ export const numericTypeWithStringEncoding = (schema: Schema.Top): boolean => {
     (SchemaAST.isNumber(typeAst) || SchemaAST.isBigInt(typeAst)) && SchemaAST.isString(encodedAst)
   )
 }
+
+/**
+ * Whether a stored row can be without this field: a row that lacks it still
+ * decodes. Optional fields can (`Schema.optional`, `Schema.optionalKey`, the
+ * `OptionFromOptional` family) and so can a decoding default, whose value a
+ * read fills in. A required field cannot, nor can a `NullOr` or `UndefinedOr`
+ * field, whose key is required even though its value may be empty.
+ *
+ * The stored side's optionality rules most fields out without running
+ * anything; what is left is decoded for real, because a transformation may
+ * still refuse the missing key. A default that cannot run synchronously is
+ * taken at its word.
+ */
+export const rowCanLack = (field: Schema.Top): boolean => {
+  if (!SchemaAST.isOptional(SchemaAST.toEncoded(field.ast))) return false
+  const probe = Schema.Struct({ field }) as unknown as Schema.Codec<unknown, unknown>
+  return !Exit.hasFails(Schema.decodeUnknownExit(probe)({}))
+}
+
+/** The verdict on a path, as far as a schema can tell. */
+type PathVerdict = "required" | "open" | "absent"
+
+const pathVerdict = (ast: SchemaAST.AST, segments: ReadonlyArray<string | number>): PathVerdict => {
+  const head = segments[0]
+  if (head === undefined) return "open"
+  const rest = segments.slice(1)
+  const below = (member: SchemaAST.AST, optional: boolean): PathVerdict =>
+    rest.length > 0 ? pathVerdict(member, rest) : optional ? "open" : "required"
+  if (SchemaAST.isSuspend(ast)) return pathVerdict(ast.thunk(), segments)
+  if (SchemaAST.isUnion(ast)) {
+    const verdicts = ast.types
+      .map((member) => pathVerdict(member, segments))
+      .filter((verdict) => verdict !== "absent")
+    if (verdicts.length === 0) return "absent"
+    return verdicts.every((verdict) => verdict === "required") ? "required" : "open"
+  }
+  if (SchemaAST.isObjects(ast)) {
+    if (typeof head !== "string") return "absent"
+    const property = ast.propertySignatures.find((signature) => signature.name === head)
+    if (property !== undefined) return below(property.type, SchemaAST.isOptional(property.type))
+    const index = ast.indexSignatures[0]
+    return index === undefined ? "absent" : rest.length > 0 ? pathVerdict(index.type, rest) : "open"
+  }
+  if (SchemaAST.isArrays(ast)) {
+    if (typeof head !== "number") return "absent"
+    const element = ast.elements[head]
+    if (element !== undefined && ast.rest.length === 0) {
+      return below(element, SchemaAST.isOptional(element))
+    }
+    // A list closes up when an element is removed, so which element is gone
+    // says nothing about the row; only what's below an element can be judged.
+    const repeated = element ?? ast.rest[0]
+    return repeated === undefined
+      ? "absent"
+      : rest.length > 0
+        ? pathVerdict(repeated, rest)
+        : "open"
+  }
+  return "absent"
+}
+
+/**
+ * Whether removing `segments`, a path inside this field, leaves a value the
+ * field's schema refuses: the last segment is a property (or a fixed tuple
+ * element) the stored side requires.
+ *
+ * It walks the stored side of the schema, so a `Schema.Class` and a `ref`
+ * field are seen through and a decoding default counts as optional. A union
+ * is judged by the members that declare the property: a value holding it is
+ * one of those. `false` means the schema can't say the row breaks: a record's
+ * keys, a list's elements, and anything opaque (a `Schema.declare`, a set, a
+ * `.check()` such as a minimum length, which is a verdict on the value and
+ * not its shape).
+ */
+export const pathIsRequired = (
+  field: Schema.Top,
+  segments: ReadonlyArray<string | number>,
+): boolean => pathVerdict(SchemaAST.toEncoded(field.ast), segments) === "required"

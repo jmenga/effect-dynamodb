@@ -717,6 +717,23 @@ export type ExtractPackedFields<Model> =
     : never
 
 /**
+ * The domain field names a `ConfiguredModel` marks immutable or stores as a
+ * sparse map, which `.remove()` does not take (`never` when none): an update
+ * can't change an immutable field, and a sparse map is cleared with
+ * `.clearMap()`.
+ */
+export type ExtractUnremovableFields<Model> =
+  Model extends ConfiguredModel<any, infer A>
+    ? {
+        [K in keyof A & string]: A[K] extends
+          | { readonly immutable: true }
+          | { readonly storedAs: SparseMapConfig }
+          ? K
+          : never
+      }[keyof A & string]
+    : never
+
+/**
  * A model wrapped with DynamoDB-specific attribute overrides.
  *
  * Carries the original model plus per-field configuration:

@@ -123,6 +123,22 @@ describe("Integration: Entity definition → hover tooltip", () => {
     expect(params.UpdateExpression).toContain("SET")
   })
 
+  it("shows a field set to `undefined` as what's sent: a REMOVE", () => {
+    const source =
+      fullSource +
+      `
+    Users.update({ userId: "u-alice" }).pipe(
+      Users.set({ role: "member", displayName: undefined }),
+    )`
+    const sf = parseSource(source)
+    const entities = resolveEntities(ts, sf)
+    const op = detectOperation(ts, sf, source.lastIndexOf(".update(") + 1, entities)
+    const params = buildParamsOrThrow(op!)
+    expect(params.UpdateExpression).toContain("REMOVE #displayName")
+    expect(params.UpdateExpression).not.toContain("#displayName = :displayName")
+    expect(params.UpdateExpression).toContain("#role = :role")
+  })
+
   it("should produce tooltip for scan", () => {
     const source = `${fullSource}\nUsers.scan()`
     const sf = parseSource(source)

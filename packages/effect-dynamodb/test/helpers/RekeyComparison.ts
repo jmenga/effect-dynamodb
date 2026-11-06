@@ -320,7 +320,7 @@ export const writePathScenarios: ReadonlyArray<{
         }),
     },
     {
-      name: "a composite cleared: `preserve` keeps the key",
+      name: "a composite cleared: the same write as removing it",
       run: (db) =>
         Effect.gen(function* () {
           yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
@@ -1028,25 +1028,28 @@ export const labelScenarios: ReadonlyArray<{
   })
   return [
     {
+      // `.set({ score: undefined })` under `preserve` left this row before 1.40.
       name: `${half}: a number cleared before a string whose label begins with its own`,
-      run: (h: Harness) =>
-        h.on(
-          worldOf(Labelled, primaryKey, { byIt: composite(["score", "score_label"]) }),
-          (db, table) =>
-            Effect.gen(function* () {
-              yield* db.entities.Rows.put({ ...key, code: "c", score: 3, score_label: "abc" })
-              const [before] = yield* table.rows()
-              yield* db.entities.Rows.update(key).set({ score: undefined }).asEffect()
-              yield* nothingToDo(db, table)
-              const [after] = yield* table.rows()
-              expect(after![field]).toEqual(before![field])
-              const found = yield* db.entities.Rows.byIt({
-                score: 3,
-                score_label: "abc",
-              }).collect()
-              expect(found).toHaveLength(1)
-            }),
-        ),
+      run: (h: Harness) => {
+        const world = worldOf(Labelled, primaryKey, { byIt: composite(["score", "score_label"]) })
+        return h.on(world, (db, table) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ ...key, code: "c", score: 3, score_label: "abc" })
+            const [before] = yield* table.rows()
+            const { score: _cleared, ...kept } = before!
+            yield* table.seed(kept)
+            yield* nothingToDo(db, table)
+            const [after] = yield* table.rows()
+            expect(after![field]).toEqual(before![field])
+            expect(after!.score).toBeUndefined()
+            const found = yield* db.entities.Rows.byIt({
+              score: 3,
+              score_label: "abc",
+            }).collect()
+            expect(found).toHaveLength(1)
+          }),
+        )
+      },
     },
     ...bothWays(
       `${half}: a number at its other text, cleared after a string whose label begins the same`,

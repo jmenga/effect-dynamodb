@@ -1997,10 +1997,11 @@ export type TypedClient<
       infer TS,
       infer GenId,
       infer VI,
-      infer P
+      infer P,
+      infer Un
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               PathModel<Schema.Schema.Type<M>, P>,
@@ -2023,10 +2024,11 @@ export type TypedClient<
             infer TS,
             infer GenId,
             infer VI,
-            infer P
+            infer P,
+            infer Un
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
+            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 PathModel<Schema.Schema.Type<M>, P>,
