@@ -5489,7 +5489,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
 | `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
 
-Next free code: **`EDD-9125`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseReadonlyMaps`), through `Entity.make` and `Aggregate.make`, pure and operational | A model's stored side holds a `Schema.ReadonlyMap`, at any depth. It's stored as a DynamoDB map, which reads back as a plain object, so the row doesn't decode. Refused at load, naming the path and pointing to `Schema.Record`. A map whose stored side is something else (a transform from a record, `Schema.toCodecJson`) isn't refused. |
+
+Next free code: **`EDD-9126`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 
