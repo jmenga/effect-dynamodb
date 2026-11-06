@@ -39,7 +39,7 @@ Nothing to do. The default composes the key text 1.36 composed, for strings and 
 1.37.0 changed key text: it escaped sort keys, gave numbers their numeric text, and put the `orderBy`'s key text in time-series event keys. 1.38.0 kept it. **From 1.39.0 the default reverses that.** So these rows, as 1.37.0 or 1.38.0 wrote them, aren't where the default looks:
 
 - a row with a character up to `%` in a sort key;
-- a row with a number whose text 1.37.0 changed in a key: negative, fractional, 1e16 and up (a `bigint`: negative, 1e38 and up), `Infinity`, or a `DateEpochMs` or `DateEpochSeconds` date before 1970;
+- a row with a number whose text those releases changed in a key: negative, fractional, 1e16 and up (a `bigint`: negative, 1e38 and up), `Infinity`, or a `DateEpochMs` or `DateEpochSeconds` date before 1970;
 - a time-series event of a `NumberFromString` or `BigIntFromString` `orderBy`.
 
 Choose one, and run `rekey` before serving traffic:
