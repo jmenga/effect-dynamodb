@@ -528,12 +528,14 @@ export const composePrimaryKeyOrFail = (
  * `createdAt`. `Entity._planPut` needs them to derive uniqueness sentinels and
  * the retain snapshot from the same values that were written (#113), and to
  * keep a replaced item's `createdAt` (#133); re-deriving `now` there would risk
- * a skew between an item's `createdAt` and its snapshot's TTL.
+ * a skew between an item's `createdAt` and its snapshot's TTL. `options.createdAt`
+ * is the `createdAt` of a row being rewritten, which no input supplies.
  */
 export const validateAndBuildPutItem = (
   entity: Entity,
   input: Record<string, unknown>,
   operation: string,
+  options?: { readonly createdAt?: DateTime.Utc | undefined },
 ): Effect.Effect<
   {
     readonly item: Record<string, unknown>
@@ -541,6 +543,10 @@ export const validateAndBuildPutItem = (
     readonly now: DateTime.Utc
     /** Whether the input supplied `createdAt` (a replacing put keeps the stored one otherwise). */
     readonly createdAtSupplied: boolean
+    /** The item's keys, were these system fields what a guarded put carries over from the stored item. */
+    readonly composeKeys: (
+      carried: Record<string, unknown>,
+    ) => Effect.Effect<Record<string, unknown>, ValidationError>
   },
   ValidationError
 > =>
@@ -573,20 +579,46 @@ export const validateAndBuildPutItem = (
     item.__edd_e__ = entity.entityType
     if (unsentineled.length > 0) item[UNSENTINELED_DEFAULTS] = new Set(unsentineled)
 
+    // System fields (collision-aware), before the keys, as `Entity.put` does:
+    // an index may be composed from one. When a timestamp field collides with
+    // a model-declared field, the user may have supplied their own value
+    // (already encoded to wire by `Schema.encode`); else generate a wire
+    // primitive directly.
+    const sf = entity.systemFields
+    const createdAtSupplied = sf.createdAt !== null && item[sf.createdAt] !== undefined
+    if (sf.createdAt) {
+      if (options?.createdAt !== undefined) {
+        item[sf.createdAt] = generateTimestampPrimitive(options.createdAt, sf.createdAtEncoding)
+      } else if (item[sf.createdAt] === undefined) {
+        item[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
+      }
+    }
+    if (sf.updatedAt) {
+      if (item[sf.updatedAt] === undefined) {
+        item[sf.updatedAt] = generateTimestampPrimitive(now, sf.updatedAtEncoding)
+      }
+    }
+    if (sf.version) item[sf.version] = 1
+
     // Same normalisation `Entity.put` applies. Without it a `BigIntFromString`
     // composite composed `txn_420` here and `txn_000…0420` there, so the two
     // APIs wrote two different rows for the same logical item and neither
     // accessor could read the transact-written one (#111).
-    const keys = yield* composeKeysOrFail(entity.entityType, operation, () =>
-      KeyComposer.composeAllKeys(
-        entity._schema,
-        entity.entityType,
-        1,
-        entity.indexes,
-        entity._keyForm(encoded as Record<string, unknown>),
-      ),
-    )
-    Object.assign(item, keys)
+    const composed = { ...(encoded as Record<string, unknown>) }
+    for (const field of [sf.createdAt, sf.updatedAt, sf.version]) {
+      if (field) composed[field] = item[field]
+    }
+    const composeKeys = (carried: Record<string, unknown>) =>
+      composeKeysOrFail(entity.entityType, operation, () =>
+        KeyComposer.composeAllKeys(
+          entity._schema,
+          entity.entityType,
+          1,
+          entity.indexes,
+          entity._keyForm({ ...composed, ...carried }),
+        ),
+      )
+    Object.assign(item, yield* composeKeys({}))
     // A unique field's sentinel key is composed from its value later, on the
     // guarded path, after this item is marshalled. One with no key text
     // (`NaN`, `[EDD-9096]`) is refused here, as `Entity.put` refuses it, not
@@ -602,23 +634,6 @@ export const validateAndBuildPutItem = (
       }
     })
 
-    // System fields (collision-aware). When a timestamp field collides with a
-    // model-declared field, the user may have supplied their own value
-    // (already encoded to wire by `Schema.encode`); else generate a wire
-    // primitive directly.
-    const sf = entity.systemFields
-    const createdAtSupplied = sf.createdAt !== null && item[sf.createdAt] !== undefined
-    if (sf.createdAt) {
-      if (item[sf.createdAt] === undefined) {
-        item[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
-      }
-    }
-    if (sf.updatedAt) {
-      if (item[sf.updatedAt] === undefined) {
-        item[sf.updatedAt] = generateTimestampPrimitive(now, sf.updatedAtEncoding)
-      }
-    }
-    if (sf.version) item[sf.version] = 1
     if (entity._incarnationToken) item[INCARNATION_TOKEN] = yield* freshIncarnationToken
 
     // Rename domain fields to their stored attribute names, in the same
@@ -650,5 +665,5 @@ export const validateAndBuildPutItem = (
       () => toAttributeMap(item),
       { fieldOf: entity._fieldOfAttribute },
     )
-    return { item, marshalled, now, createdAtSupplied }
+    return { item, marshalled, now, createdAtSupplied, composeKeys }
   })

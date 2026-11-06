@@ -91,10 +91,11 @@ export const mockOutput = <T extends { readonly $metadata: unknown }>(
 /**
  * Apply an UpdateItem request to an in-memory item, for mocks that keep a
  * store. Understands the shapes the library emits for whole attributes —
- * `SET #a = :v`, `SET #v = #v + :n`, `REMOVE #a` — which is every write of the
- * read-then-write update branch. Anything else (path expressions, ADD,
- * list_append, …) only bumps the `version` attribute, so a retain update can
- * still recognise its own write by version.
+ * `SET #a = :v`, `SET #v = #v + :n`, `SET #a = if_not_exists(#a, :v)`,
+ * `SET #v = if_not_exists(#v, :z) + :n`, `REMOVE #a` — which is every write of
+ * the read-then-write update branch and of an upsert or append. Anything else
+ * (nested paths, ADD, list_append, …) only bumps the `version` attribute, so a
+ * retain update can still recognise its own write by version.
  */
 export const applyUpdate = (
   item: Record<string, AttributeValue> | undefined,

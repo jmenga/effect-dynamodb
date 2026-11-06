@@ -4296,13 +4296,36 @@ const buildDynamoItems = (
           : composeKey(config.schema, item.entityType, [...item.skComposites])
       }
 
+      // System timestamps. Written last, so a generated value wins over the same-named field
+      // propagated onto edge items via `context`; known first, so a list key over one holds what
+      // the row holds.
+      const stamped: Record<string, unknown> = {}
+      if (stamp) {
+        const { existingCreated, fields, now } = stamp
+        const sk = attrs.sk as string
+        if (fields.createdAt !== null) {
+          const prior = existingCreated.get(sk)
+          stamped[fields.createdAt] =
+            prior ?? generateTimestampPrimitive(now, fields.createdEncoding)
+        }
+        if (fields.updatedAt !== null) {
+          stamped[fields.updatedAt] =
+            stamp.existingUpdated?.get(sk) ??
+            generateTimestampPrimitive(now, fields.updatedEncoding)
+        }
+      }
+
       // List collection GSI keys (root items only)
       if (isRootItem && config.list) {
+        const listKeyValues = keyRecord({
+          ...(item.keyAttributes ?? item.attributes),
+          ...stamped,
+        })
         const listPkComposites = KeyComposer.extractKeyComposites(
           config.schema,
           {},
           config.list.pk.composite,
-          keyRecord(item.keyAttributes ?? item.attributes),
+          listKeyValues,
         )
         if (config.list.cardinality) {
           const shard = hashToShard(pkValue, config.list.cardinality)
@@ -4321,7 +4344,7 @@ const buildDynamoItems = (
           config.schema,
           {},
           config.list.sk.composite,
-          keyRecord(item.keyAttributes ?? item.attributes),
+          listKeyValues,
         )
         attrs[config.list.sk.field] = composeCollectionKey(
           config.schema,
@@ -4330,23 +4353,7 @@ const buildDynamoItems = (
         )
       }
 
-      // System timestamps — last, so a generated value wins over the same-named
-      // field propagated onto edge items via `context`.
-      if (stamp) {
-        const { existingCreated, fields, now } = stamp
-        const sk = attrs.sk as string
-        if (fields.createdAt !== null) {
-          const prior = existingCreated.get(sk)
-          attrs[fields.createdAt] = prior ?? generateTimestampPrimitive(now, fields.createdEncoding)
-        }
-        if (fields.updatedAt !== null) {
-          attrs[fields.updatedAt] =
-            stamp.existingUpdated?.get(sk) ??
-            generateTimestampPrimitive(now, fields.updatedEncoding)
-        }
-      }
-
-      return toAttributeMap(attrs)
+      return toAttributeMap({ ...attrs, ...stamped })
     }),
   }))
 

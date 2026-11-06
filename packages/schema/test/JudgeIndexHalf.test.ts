@@ -22,7 +22,8 @@ const judging: KeyComposer.IndexKeyJudging = {
     { pk: schemaEscaped(schema), sk: schemaEscaped(schema) },
   ],
   primaryComposites: new Set(["tenant", "id"]),
-  stamped: new Set(["updatedAt"]),
+  stamped: new Set(["createdAt", "updatedAt", "version"]),
+  lagTolerated: "updatedAt",
 }
 
 const index = (
@@ -157,20 +158,6 @@ describe.each(POLICIES)("the rule table, %s", (policy) => {
     })
   })
 
-  it("a composite the library stamps: never judged", () => {
-    const values = { tenant: "t", id: "1", updatedAt: "2026" }
-    const stamped = index(["tenant"], ["updatedAt"], policy)
-    for (const stored of [undefined, key("updatedat_old")]) {
-      expect(KeyComposer.judgeIndexHalf(judging, stamped, "sk", stored, values)).toEqual({
-        kind: "fine",
-      })
-    }
-    // Nor does it make a whole index of the other half.
-    expect(KeyComposer.judgeIndexHalf(judging, stamped, "pk", undefined, values)).toEqual({
-      kind: "fine",
-    })
-  })
-
   it("values composing no key: nothing, as a put would refuse", () => {
     const number = index(["tenant"], ["n"], policy)
     expect(
@@ -205,6 +192,180 @@ describe.each(POLICIES)("the rule table, %s", (policy) => {
       KeyComposer.judgeIndexHalf(judging, empty, "sk", undefined, { tenant: "t", id: "1" }),
     ).toEqual({ kind: "fine" })
     expect(KeyComposer.judgeIndexHalf(judging, empty, "sk", key(), whole)).toEqual({ kind: "fine" })
+  })
+})
+
+describe.each(POLICIES)("a composite the library stamps (shapes 16 to 18), %s", (policy) => {
+  const values = { tenant: "t", id: "1", status: "open", createdAt: "c9", updatedAt: "u9" }
+  const judged = (
+    pk: ReadonlyArray<string>,
+    sk: ReadonlyArray<string>,
+    stored: string | undefined,
+    record: Record<string, unknown> = values,
+    half: "pk" | "sk" = "sk",
+  ) => KeyComposer.judgeIndexHalf(judging, index(pk, sk, policy), half, stored, record)
+  const FINE = { kind: "fine" }
+
+  it("no key on a row a put would index: missing, whichever stamp", () => {
+    expect(judged(["tenant"], ["updatedAt"], undefined)).toEqual({
+      kind: "set",
+      drift: "missing",
+      value: key("updatedat_u9"),
+    })
+    expect(judged(["tenant"], ["createdAt"], undefined)).toEqual({
+      kind: "set",
+      drift: "missing",
+      value: key("createdat_c9"),
+    })
+    expect(judged(["tenant"], ["status", "updatedAt"], undefined)).toEqual({
+      kind: "set",
+      drift: "missing",
+      value: key("status_open", "updatedat_u9"),
+    })
+    expect(judged(["createdAt"], ["id"], undefined, values, "pk")).toEqual({
+      kind: "set",
+      drift: "missing",
+      value: "$j#v1#row#createdat_c9",
+    })
+  })
+
+  it("the other half of a whole index is missing with it", () => {
+    expect(judged(["tenant"], ["updatedAt"], undefined, values, "pk")).toEqual({
+      kind: "set",
+      drift: "missing",
+      value: PK,
+    })
+  })
+
+  it("no key and another composite absent: a put wouldn't index it", () => {
+    const noStatus = { tenant: "t", id: "1", createdAt: "c9", updatedAt: "u9" }
+    expect(judged(["tenant"], ["status", "updatedAt"], undefined, noStatus)).toEqual(FINE)
+    expect(judged(["tenant"], ["status", "createdAt"], undefined, noStatus)).toEqual(FINE)
+  })
+
+  it("no stamped value on the row: nothing to compose", () => {
+    const unstamped = { tenant: "t", id: "1", status: "open" }
+    expect(judged(["tenant"], ["updatedAt"], undefined, unstamped)).toEqual(FINE)
+    expect(judged(["tenant"], ["createdAt"], undefined, unstamped)).toEqual(FINE)
+  })
+
+  it("a key holding `updatedAt` that lags: nothing, so a run after any write rewrites nothing", () => {
+    expect(judged(["tenant"], ["updatedAt"], key("updatedat_u1"))).toEqual(FINE)
+    expect(judged(["tenant"], ["status", "updatedAt"], key("status_open", "updatedat_u1"))).toEqual(
+      FINE,
+    )
+    // A composite after it has to match too.
+    expect(judged(["tenant"], ["updatedAt", "id"], key("updatedat_u1", "id_1"))).toEqual(FINE)
+    expect(judged(["updatedAt"], ["id"], "$j#v1#row#updatedat_u1", values, "pk")).toEqual(FINE)
+    // And it's no different when equal.
+    expect(judged(["tenant"], ["status", "updatedAt"], key("status_open", "updatedat_u9"))).toEqual(
+      FINE,
+    )
+  })
+
+  it("a key differing in anything else is rewritten, once, from the row's `updatedAt`", () => {
+    const whole = key("status_open", "updatedat_u9")
+    expect(judged(["tenant"], ["status", "updatedAt"], key("status_shut", "updatedat_u1"))).toEqual(
+      {
+        kind: "set",
+        drift: "lagging",
+        value: whole,
+      },
+    )
+    // What that wrote is the row's own, so the next run has nothing, whatever `updatedAt` does next.
+    expect(
+      judged(["tenant"], ["status", "updatedAt"], whole, { ...values, updatedAt: "u10" }),
+    ).toEqual(FINE)
+    // After it too.
+    expect(judged(["tenant"], ["updatedAt", "id"], key("updatedat_u1", "id_2"))).toEqual({
+      kind: "set",
+      drift: "lagging",
+      value: key("updatedat_u9", "id_1"),
+    })
+  })
+
+  it("one lagging segment means one: no empty text, no extra segment", () => {
+    for (const stored of [
+      key("status_open", "updatedat_"),
+      key("status_open", "updatedat_u1", "extra"),
+      key("status_open", "updatedat_u1#extra"),
+    ]) {
+      expect(judged(["tenant"], ["status", "updatedAt"], stored)).toEqual({
+        kind: "set",
+        drift: "lagging",
+        value: key("status_open", "updatedat_u9"),
+      })
+    }
+  })
+
+  it("a key cut short is truncated, and not a lag", () => {
+    expect(judged(["tenant"], ["status", "updatedAt"], key("status_open"))).toEqual({
+      kind: "set",
+      drift: "truncated",
+      value: key("status_open", "updatedat_u9"),
+    })
+    expect(judged(["tenant"], ["status", "createdAt"], key("status_open"))).toEqual({
+      kind: "set",
+      drift: "truncated",
+      value: key("status_open", "createdat_c9"),
+    })
+  })
+
+  it("`createdAt` never moves, so a key that differs in it is rewritten", () => {
+    expect(judged(["tenant"], ["createdAt"], key("createdat_c1"))).toEqual({
+      kind: "set",
+      drift: "lagging",
+      value: key("createdat_c9"),
+    })
+    expect(judged(["tenant"], ["createdAt"], key("createdat_c9"))).toEqual(FINE)
+  })
+
+  it("a retain `version` is judged whole: every write of that path composes it", () => {
+    const versioned = { ...values, version: 3 }
+    const text = "version_0000000000000003"
+    expect(judged(["tenant"], ["version"], key("version_0000000000000002"), versioned)).toEqual({
+      kind: "set",
+      drift: "lagging",
+      value: key(text),
+    })
+    expect(judged(["tenant"], ["version"], key(text), versioned)).toEqual(FINE)
+    expect(judged(["tenant"], ["version"], undefined, versioned)).toEqual({
+      kind: "set",
+      drift: "missing",
+      value: key(text),
+    })
+  })
+
+  it("no writer leaves a stamp out, so only the other composites can be ambiguous", () => {
+    const placed = { ...values, region: "r" }
+    const verdict = judged(["tenant"], ["status", "region", "updatedAt"], undefined, placed)
+    expect(verdict).toEqual(
+      policy === "sparse"
+        ? { kind: "ambiguous" }
+        : {
+            kind: "set",
+            drift: "missing",
+            value: key("status_open", "region_r", "updatedat_u9"),
+          },
+    )
+    expect(judged(["tenant"], ["status", "createdAt"], undefined)).toEqual({
+      kind: "set",
+      drift: "missing",
+      value: key("status_open", "createdat_c9"),
+    })
+  })
+
+  it("without a `timestamps.updated`, an `updatedAt` composite is any other", () => {
+    const plain = { ...judging, stamped: new Set<string>(), lagTolerated: null }
+    expect(
+      KeyComposer.judgeIndexHalf(
+        plain,
+        index(["tenant"], ["updatedAt"], policy),
+        "sk",
+        key("updatedat_u1"),
+        values,
+      ),
+    ).toEqual({ kind: "set", drift: "lagging", value: key("updatedat_u9") })
   })
 })
 

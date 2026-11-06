@@ -786,6 +786,10 @@ export interface Entity<
     readonly create: boolean
     readonly operation: string
     readonly key: globalThis.Record<string, unknown>
+    /** The item's keys, were these system fields what the plan carries over. */
+    readonly composeKeys: (
+      carried: globalThis.Record<string, unknown>,
+    ) => Effect.Effect<globalThis.Record<string, unknown>, ValidationError>
   }) => Effect.Effect<PutPlan, ValidationError | DynamoClientError, DynamoClient>
 
   /**
@@ -2064,7 +2068,8 @@ export const make = <
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey>
+  readonly indexes?: TGsiIndexes &
+    EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey, TVersioned>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
@@ -3584,6 +3589,58 @@ const makeImpl = <
   }
 
   /**
+   * What a write stamps on an item it builds whole, in wire form: a timestamp the caller didn't
+   * supply, and the first version. Keys are composed after this, so an index can be composed from
+   * any of them (`DESIGN.md` §7, "Composites the library stamps").
+   */
+  const stampsOf = (
+    encoded: globalThis.Record<string, unknown>,
+    times: { readonly createdAt: DateTime.Utc; readonly updatedAt: DateTime.Utc },
+  ): globalThis.Record<string, unknown> => ({
+    ...(systemFields.createdAt && encoded[systemFields.createdAt] === undefined
+      ? {
+          [systemFields.createdAt]: generateTimestamp(
+            systemFields.createdAtEncoding,
+            times.createdAt,
+          ),
+        }
+      : {}),
+    ...(systemFields.updatedAt && encoded[systemFields.updatedAt] === undefined
+      ? {
+          [systemFields.updatedAt]: generateTimestamp(
+            systemFields.updatedAtEncoding,
+            times.updatedAt,
+          ),
+        }
+      : {}),
+    ...(systemFields.version ? { [systemFields.version]: 1 } : {}),
+  })
+
+  /**
+   * What an update stamps, by model name: the `updatedAt` it writes, and the next version where the
+   * write read the item to know it. See `KeyComposer.composeGsiKeysForUpdatePolicyAware`.
+   */
+  const writeStamps = (
+    updatedAt: unknown,
+    version: number | undefined,
+  ): globalThis.Record<string, unknown> => ({
+    ...(systemFields.updatedAt && updatedAt !== undefined
+      ? { [systemFields.updatedAt]: updatedAt }
+      : {}),
+    ...(systemFields.version && version !== undefined ? { [systemFields.version]: version } : {}),
+  })
+
+  /** The system fields of `item`, by model name: what a guarded put may have carried over from the stored item. */
+  const carriedSystemFields = (
+    item: globalThis.Record<string, unknown>,
+  ): globalThis.Record<string, unknown> => ({
+    ...(systemFields.createdAt
+      ? { [systemFields.createdAt]: item[resolveDbName(systemFields.createdAt)] }
+      : {}),
+    ...(systemFields.version ? { [systemFields.version]: item[systemFields.version] } : {}),
+  })
+
+  /**
    * Every index's keys for `record`. A Z-order sort key can fail to place a
    * value (`[EDD-9092]`, #171), and a composite can have no key text (`NaN`,
    * `[EDD-9096]`), which surface as a `ValidationError` for `operation`. So
@@ -3766,6 +3823,19 @@ const makeImpl = <
   const upsertClears = (field: string, value: unknown): boolean =>
     (isEmptySet(value) || (value === undefined && fieldAbsentReading(field) !== undefined)) &&
     !immutableFields.has(field)
+
+  /**
+   * Whether an index key depends on a value an upsert doesn't overwrite: `createdAt` and immutable
+   * fields keep what's stored (`if_not_exists`), and a single `UpdateItem` can't say what that is. So
+   * the key would hold the input's value next to the stored one. The upsert reads the item first.
+   */
+  const upsertKeyDependsOnStored = (): boolean => {
+    const composites = indexCompositeFields()
+    return (
+      (systemFields.createdAt !== null && composites.has(systemFields.createdAt)) ||
+      [...immutableFields].some((field) => composites.has(field) && !isPrimaryComposite(field))
+    )
+  }
 
   /** Attach the model class prototype to a decoded plain object (when model is Schema.Class). */
   const attachPrototype = (decoded: any) =>
@@ -5374,6 +5444,10 @@ const makeImpl = <
     readonly operation: string
     /** The key errors name. */
     readonly key: globalThis.Record<string, unknown>
+    /** The item's keys, were these system fields what the plan carries over (see `carriedSystemFields`). */
+    readonly composeKeys: (
+      carried: globalThis.Record<string, unknown>,
+    ) => Effect.Effect<globalThis.Record<string, unknown>, ValidationError>
   }): Effect.Effect<PutPlan, ValidationError | DynamoClientError, DynamoClient> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -5410,6 +5484,12 @@ const makeImpl = <
       } else if (systemFields.version && isRetainEnabled()) {
         item[systemFields.version] =
           (yield* highestRetainedVersion(args.tableName, owner.pk, owner.sk)) + 1
+      }
+      // What the put continues is what an index over it holds. A put that carries nothing, or an
+      // entity with no such index, keeps the keys it was built with.
+      const carried = carriedSystemFields(item)
+      if (Object.keys(carried).some((field) => indexCompositeFields().has(field))) {
+        Object.assign(item, yield* args.composeKeys(carried))
       }
       const marshalled = toAttributeMap(item)
 
@@ -6120,12 +6200,25 @@ const makeImpl = <
             operation,
           )
 
+          // Clock-backed time source resolved once for this write op and
+          // threaded into every timestamp/TTL computation below — deterministic
+          // under `TestClock`, wall-clock in production.
+          const now = yield* DateTime.now
+
+          // System fields, before the keys: an index may be composed from one.
+          // When a timestamp field collides with a model-declared field, the
+          // user may have supplied their own value (optional on collision in
+          // `inputSchema`). Respect their value if present (already encoded to
+          // wire); otherwise generate a wire primitive directly.
+          const stamps = stampsOf(encodedInput as globalThis.Record<string, unknown>, {
+            createdAt: opts.createdAt ?? now,
+            updatedAt: now,
+          })
+          const keyValues = { ...(encodedInput as object), ...stamps }
+
           // Compose all keys from the encoded input (ID fields still present
           // and key composites are wire-format strings/numbers).
-          const keys = yield* composeAllKeys(
-            encodedInput as globalThis.Record<string, unknown>,
-            operation,
-          )
+          const keys = yield* composeAllKeys(keyValues, operation)
 
           // A put that sends something before its write refuses a value DynamoDB can't
           // store first. Any other put finds out when it marshals, at no extra cost.
@@ -6149,32 +6242,7 @@ const makeImpl = <
             : (encodedInput as globalThis.Record<string, unknown>)
 
           // Build the DynamoDB item — already in wire-format after encode
-          const item: globalThis.Record<string, unknown> = { ...encoded }
-
-          // Clock-backed time source resolved once for this write op and
-          // threaded into every timestamp/TTL computation below — deterministic
-          // under `TestClock`, wall-clock in production.
-          const now = yield* DateTime.now
-
-          // Add system fields. When a timestamp field collides with a
-          // model-declared field, the user may have supplied their own value
-          // (optional on collision in `inputSchema`). Respect their value if
-          // present (already encoded to wire); otherwise generate a wire
-          // primitive directly.
-          if (systemFields.createdAt) {
-            if (item[systemFields.createdAt] === undefined) {
-              item[systemFields.createdAt] = generateTimestamp(
-                systemFields.createdAtEncoding,
-                opts.createdAt ?? now,
-              )
-            }
-          }
-          if (systemFields.updatedAt) {
-            if (item[systemFields.updatedAt] === undefined) {
-              item[systemFields.updatedAt] = generateTimestamp(systemFields.updatedAtEncoding, now)
-            }
-          }
-          if (systemFields.version) item[systemFields.version] = 1
+          const item: globalThis.Record<string, unknown> = { ...encoded, ...stamps }
           if (stampsIncarnation) item[INCARNATION_TOKEN] = yield* freshIncarnation
 
           // Add entity type discriminator
@@ -6190,7 +6258,7 @@ const makeImpl = <
           // absent contributes nothing. See `DESIGN.md §14`.
           if (hasVectorIndexes) {
             const vectorWrite = yield* computeVectorAttributes(
-              encoded as globalThis.Record<string, unknown>,
+              { ...encoded, ...stamps },
               opts.withVectors,
               "all",
             )
@@ -6265,6 +6333,7 @@ const makeImpl = <
               create: opts.putKind === "create",
               operation,
               key: encoded as globalThis.Record<string, unknown>,
+              composeKeys: (carried) => composeAllKeys({ ...keyValues, ...carried }, operation),
             })
             return yield* decodeAs(plan.item, plan.marshalled, mode)
           }
@@ -6910,7 +6979,10 @@ const makeImpl = <
             allIndexes,
             keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
             keyForm(newItem),
-            retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet },
+            {
+              ...(retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet }),
+              stamped: keyForm(writeStamps(newItem[systemFields.updatedAt ?? ""], newVersion)),
+            },
           ),
         )
         for (const [field, value] of Object.entries(gsiUpdate.sets)) {
@@ -7130,8 +7202,14 @@ const makeImpl = <
           )
           for (const [indexName, indexDef] of Object.entries(allIndexes)) {
             if (indexName === "primary") continue
-            if (written.has(indexDef.pk.field)) add(indexDef.pk.composite)
-            if (written.has(indexDef.sk.field)) add(indexDef.sk.composite)
+            // Not what this write stamps: its own value is what it writes, and a concurrent
+            // write that moved it changed nothing this key was composed from.
+            const asRead = (composites: ReadonlyArray<string>) =>
+              composites.filter(
+                (attr) => attr !== systemFields.updatedAt && attr !== systemFields.version,
+              )
+            if (written.has(indexDef.pk.field)) add(asRead(indexDef.pk.composite))
+            if (written.has(indexDef.sk.field)) add(asRead(indexDef.sk.composite))
           }
           for (const rotation of sentinelRotations) {
             add(resolveUniqueFields(config.unique![rotation.constraintName]!), true)
@@ -7678,16 +7756,17 @@ const makeImpl = <
       // Add updatedAt timestamp. User-supplied value wins (already in wire
       // form via encode); else fall back to a freshly generated wire
       // primitive.
+      const suppliedUpdatedAt =
+        systemFields.updatedAt === null ? undefined : encodedUpdatesMap[systemFields.updatedAt]
+      const stampedUpdatedAt =
+        suppliedUpdatedAt !== undefined
+          ? suppliedUpdatedAt
+          : generateTimestamp(systemFields.updatedAtEncoding, now)
       if (systemFields.updatedAt) {
-        const userSupplied = encodedUpdatesMap[systemFields.updatedAt]
         const nameKey = `#u${counter}`
         const valKey = `:u${counter}`
-        names[nameKey] = systemFields.updatedAt
-        values[valKey] = toAttributeValue(
-          userSupplied !== undefined
-            ? userSupplied
-            : generateTimestamp(systemFields.updatedAtEncoding, now),
-        )
+        names[nameKey] = resolveDbName(systemFields.updatedAt)
+        values[valKey] = toAttributeValue(stampedUpdatedAt)
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -7786,7 +7865,15 @@ const makeImpl = <
           allIndexes,
           keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
           keyForm(encodedKey as globalThis.Record<string, unknown>),
-          removedSet === undefined ? {} : { removedSet },
+          {
+            ...(removedSet === undefined ? {} : { removedSet }),
+            stamped: keyForm(
+              writeStamps(
+                stampedUpdatedAt,
+                retainSnapshot === undefined ? undefined : retainSnapshot.version + 1,
+              ),
+            ),
+          },
         ),
       )
       // The key and vector attributes this update writes — a retain
@@ -9379,10 +9466,24 @@ const makeImpl = <
     new EntityPutImpl(
       (mode: DecodeMode, opts: EntityPutOpts) =>
         Effect.gen(function* () {
+          // A primary key over `createdAt` the input doesn't supply names no item that exists yet.
+          if (
+            systemFields.createdAt !== null &&
+            isPrimaryComposite(systemFields.createdAt) &&
+            (input as globalThis.Record<string, unknown>)[systemFields.createdAt] === undefined
+          ) {
+            return yield* put(input)._builder(mode, {
+              condition: opts.condition,
+              withVectors: opts.withVectors,
+              putKind: "create",
+              operation: "upsert",
+            }) as Effect.Effect<unknown, unknown>
+          }
           if (
             (config.unique != null && Object.keys(config.unique).length > 0) ||
             isRetainEnabled() ||
-            omitsIndexedDefault(input)
+            omitsIndexedDefault(input) ||
+            upsertKeyDependsOnStored()
           ) {
             return yield* guardedUpsert(input, mode, opts)
           }
@@ -9425,11 +9526,21 @@ const makeImpl = <
             : encodedInput
 
           const item = encoded as globalThis.Record<string, unknown>
+          // `createdAt`, which keeps what's stored, took the guarded path if a key depends on it.
+          const suppliedUpdatedAt =
+            systemFields.updatedAt === null ? undefined : item[systemFields.updatedAt]
+          const upsertedUpdatedAt =
+            suppliedUpdatedAt !== undefined
+              ? suppliedUpdatedAt
+              : generateTimestamp(systemFields.updatedAtEncoding, now)
 
           // Every index's keys, composed before anything is marshalled: a
           // composite with no key text (`NaN`, `[EDD-9096]`) or Z-order level
           // (`[EDD-9092]`) fails the upsert with a `ValidationError`.
-          const allKeys = yield* composeAllKeys(item, "upsert")
+          const allKeys = yield* composeAllKeys(
+            { ...item, ...writeStamps(upsertedUpdatedAt, undefined) },
+            "upsert",
+          )
           yield* refuseUncomposed(encodedInput, "upsert")
           const primaryKey = composePrimaryKey(item)
           const marshalledKey = toAttributeMap(primaryKey)
@@ -9551,7 +9662,11 @@ const makeImpl = <
           // source fields must overwrite the vector derived from them, or the
           // item would stay searchable under its previous description forever.
           if (hasVectorIndexes) {
-            const vectorWrite = yield* computeVectorAttributes(item, opts.withVectors, "all")
+            const vectorWrite = yield* computeVectorAttributes(
+              { ...item, ...writeStamps(upsertedUpdatedAt, undefined) },
+              opts.withVectors,
+              "all",
+            )
             for (const [field, value] of Object.entries(vectorWrite.sets)) {
               const nameKey = `#u${counter}`
               const valKey = `:u${counter}`
@@ -9587,7 +9702,7 @@ const makeImpl = <
             const userSupplied = item[systemFields.createdAt]
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
-            names[nameKey] = systemFields.createdAt
+            names[nameKey] = resolveDbName(systemFields.createdAt)
             values[valKey] = toAttributeValue(
               userSupplied !== undefined
                 ? userSupplied
@@ -9599,15 +9714,10 @@ const makeImpl = <
 
           // Add updatedAt — user-supplied wins, else always set to current time.
           if (systemFields.updatedAt) {
-            const userSupplied = item[systemFields.updatedAt]
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
-            names[nameKey] = systemFields.updatedAt
-            values[valKey] = toAttributeValue(
-              userSupplied !== undefined
-                ? userSupplied
-                : generateTimestamp(systemFields.updatedAtEncoding, now),
-            )
+            names[nameKey] = resolveDbName(systemFields.updatedAt)
+            values[valKey] = toAttributeValue(upsertedUpdatedAt)
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
           }
@@ -10063,22 +10173,35 @@ const makeImpl = <
             !config.indexes.primary.sk.composite.includes(attr),
         ),
       )
-      const gsiUpdate = yield* composeKeysOrFail(entityType, "append", () =>
-        KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
-          entityType,
-          entityVersion,
-          allIndexes,
-          keyForm(appendNamed),
-          keyForm(encoded),
-          removedSet !== undefined ? { removedSet } : undefined,
-        ),
-      )
+      //
+      // `createdAt` isn't in the input: an append that creates the row stamps it, and any other
+      // keeps what's stored (`if_not_exists` below), which an UpdateItem can't tell apart. So an
+      // index over it reads the row first, below, and the key values are composed for what it finds.
+      const stampedCreatedAt = generateTimestamp(systemFields.createdAtEncoding, now)
+      const createdAtKeyed =
+        systemFields.createdAt !== null && indexCompositeFields().has(systemFields.createdAt)
+      const composeAppendKeys = (createdAt: unknown) =>
+        composeKeysOrFail(entityType, "append", () =>
+          KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            entityType,
+            entityVersion,
+            allIndexes,
+            keyForm(appendNamed),
+            keyForm(
+              createdAtKeyed ? { ...encoded, [systemFields.createdAt!]: createdAt } : encoded,
+            ),
+            removedSet !== undefined ? { removedSet } : undefined,
+          ),
+        )
+      const gsiUpdate = yield* composeAppendKeys(stampedCreatedAt)
+      const gsiValueNames: globalThis.Record<string, string> = {}
       for (const [field, value] of Object.entries(gsiUpdate.sets)) {
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
         names[nameKey] = field
         values[valKey] = toAttributeValue(value)
+        gsiValueNames[field] = valKey
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -10118,8 +10241,8 @@ const makeImpl = <
       if (systemFields.createdAt) {
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
-        names[nameKey] = systemFields.createdAt
-        values[valKey] = toAttributeValue(generateTimestamp(systemFields.createdAtEncoding, now))
+        names[nameKey] = resolveDbName(systemFields.createdAt)
+        values[valKey] = toAttributeValue(stampedCreatedAt)
         setClauses.push(`${nameKey} = if_not_exists(${nameKey}, ${valKey})`)
         counter++
       }
@@ -10295,8 +10418,9 @@ const makeImpl = <
       })
 
       if (
+        createdAtKeyed ||
         compositeKeyFormKind(schemas.inputSchema as unknown as Schema.Top, orderByField) ===
-        "type-numeric"
+          "type-numeric"
       ) {
         // A string-encoded numeric orderBy (`NumberFromString`,
         // `BigIntFromString`) is stored as `S`, and DynamoDB compares `S` as
@@ -10306,7 +10430,9 @@ const makeImpl = <
         // and guards the write on the stored value it read (`=`, exact on
         // text). A concurrent append moves the stored value and cancels the
         // write; the append then reads again and decides again, up to
-        // `APPEND_GUARD_ATTEMPTS` attempts in all.
+        // `APPEND_GUARD_ATTEMPTS` attempts in all. An index over `createdAt`
+        // needs the same read, and the same guard: an append that found no item
+        // must not write a key for a `createdAt` another writer just created.
         const attempted = appendKeyForm[orderByField] as number | bigint
         const storedKeyForm = (stored: AttributeValue) =>
           Effect.try({
@@ -10333,6 +10459,15 @@ const makeImpl = <
             return yield* skipFollowUp
               ? staleAppend(Option.none())
               : staleAppend(Option.some(yield* decodeCurrent(current)))
+          }
+          if (createdAtKeyed) {
+            const stored = current?.[resolveDbName(systemFields.createdAt!)]
+            const keys = yield* composeAppendKeys(
+              stored === undefined ? stampedCreatedAt : fromAttributeMap({ v: stored }).v,
+            )
+            for (const [field, value] of Object.entries(keys.sets)) {
+              values[gsiValueNames[field]!] = toAttributeValue(value)
+            }
           }
           const outcome = yield* send(
             current === undefined
@@ -11868,6 +12003,7 @@ const makeImpl = <
               (field): field is string => typeof field === "string",
             ),
           ),
+          lagTolerated: systemFields.updatedAt,
         }
       }
       return judging
@@ -11941,9 +12077,6 @@ const makeImpl = <
         const attribute = row[field]
         const stored = attribute === undefined ? undefined : (attribute.S ?? attribute.B)
         if (attribute !== undefined && stored === undefined) continue
-        if (stored === undefined && composite.some((attr) => judging.stamped.has(attr))) {
-          keptAbsent.push(field)
-        }
         const verdict = KeyComposer.judgeIndexHalf(judging, index, half, stored, rowKeyForm)
         if (verdict.kind === "fine") continue
         if (verdict.kind === "ambiguous") {

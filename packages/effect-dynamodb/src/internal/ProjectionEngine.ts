@@ -54,7 +54,6 @@ import {
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
-  generateTimestampPrimitive,
   KEY_TEXT,
   marshalOrFail,
   OUTBOX_ROW_PK as ROW_PK,
@@ -705,15 +704,9 @@ export const makeEngine = (config: EngineConfig) => {
           readModel as any,
           target.value,
           `${config.label}.write`,
+          { createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined },
         )
-        const item = { ...built.item }
-        if (createdAtField !== null && DateTime.isDateTime(createdAt)) {
-          item[dbName(createdAtField)] = generateTimestampPrimitive(
-            DateTime.toUtc(createdAt),
-            readModel.systemFields.createdAtEncoding as any,
-          )
-        }
-        rowItem = toAttributeMap(item)
+        rowItem = toAttributeMap(built.item)
       }
 
       if (rowItem === undefined) {

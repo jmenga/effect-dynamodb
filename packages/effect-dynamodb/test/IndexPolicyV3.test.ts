@@ -43,6 +43,8 @@ import * as Transaction from "../src/Transaction.js"
 import * as Clears from "./helpers/ClearScenarios.js"
 import { applyUpdate, mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { harnessOn, RECORDING_INDEXES } from "./helpers/RekeyRepair.js"
+import * as StampedComposites from "./helpers/StampedComposites.js"
 
 // ---------------------------------------------------------------------------
 // Mock client capture helpers
@@ -3010,4 +3012,23 @@ describe("a cleared composite, by canonical GSI-composite shape", () => {
       }
     }
   })
+})
+
+// ---------------------------------------------------------------------------
+// Canonical shapes 16 to 18: values the library stamps. The same scenarios run on DynamoDB Local in
+// `connected.test.ts`. They need the clock to move.
+// ---------------------------------------------------------------------------
+
+describe("index keys over values the library stamps", () => {
+  const harness = harnessOn(() => {
+    const table = makeRecordingTable({ indexes: RECORDING_INDEXES })
+    return { tableName: "t", client: table.layer, acquire: Effect.void, release: Effect.void }
+  })
+  for (const [name, scenarios] of StampedComposites.ALL_SCENARIOS) {
+    describe(name, () => {
+      for (const scenario of scenarios) {
+        it.live(scenario.name, () => scenario.run(harness))
+      }
+    })
+  }
 })

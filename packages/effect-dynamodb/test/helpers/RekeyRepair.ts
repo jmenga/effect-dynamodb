@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { DateTime, Effect, Layer, Option, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { expect } from "vitest"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
@@ -272,7 +272,7 @@ export interface RepairScenario {
   readonly run: (h: Harness) => Effect.Effect<void, unknown>
 }
 
-const bothSettings = (
+export const bothSettings = (
   name: string,
   run: (h: Harness, escapeKeys: boolean) => Effect.Effect<void, unknown>,
 ): ReadonlyArray<RepairScenario> =>
@@ -1287,11 +1287,13 @@ class Stamped extends Schema.Class<Stamped>("Stamped")({
   id: Schema.String,
   owner: Schema.String,
   status: Schema.optional(Schema.String),
+  region: Schema.optional(Schema.String),
+  note: Schema.optional(Schema.String),
   createdAt: Schema.DateTimeUtc,
   updatedAt: Schema.DateTimeUtc,
-  version: Schema.Number,
 }) {}
 
+/** The definition `fixtures/stamped-rows-1.38.0.json`'s rows were written under. */
 const stampedWorld = (escapeKeys: boolean) => {
   const schema = DynamoSchema.make({ name: "stamped", version: 1, escapeKeys })
   const Stampeds = Entity.make({
@@ -1302,17 +1304,28 @@ const stampedWorld = (escapeKeys: boolean) => {
       sk: { field: "sk", composite: [] },
     },
     timestamps: true,
-    versioned: true,
     indexes: {
       byCreated: { name: "gsi1", pk: half(1, ["owner"]), sk: sortHalf(1, ["createdAt"]) },
       byUpdated: { name: "gsi2", pk: half(2, ["owner"]), sk: sortHalf(2, ["updatedAt"]) },
-      byVersion: { name: "gsi3", pk: half(3, ["owner"]), sk: sortHalf(3, ["version"]) },
-      byUpdatedSparse: {
+      byStatus: { name: "gsi3", pk: half(3, ["owner"]), sk: sortHalf(3, ["status", "updatedAt"]) },
+      byStatusSparse: {
         name: "gsi4",
         pk: half(4, ["owner"]),
-        sk: sortHalf(4, ["updatedAt"]),
+        sk: sortHalf(4, ["status", "updatedAt"]),
         indexPolicy: { sk: "sparse" },
       },
+      byStatusCreated: {
+        name: "gsi5",
+        pk: half(5, ["owner"]),
+        sk: sortHalf(5, ["status", "createdAt"]),
+      },
+      byPlace: {
+        name: "gsi6",
+        pk: half(6, ["owner"]),
+        sk: sortHalf(6, ["status", "region", "updatedAt"]),
+        indexPolicy: { sk: "sparse" },
+      },
+      byCreatedPk: { name: "gsi7", pk: half(7, ["createdAt"]), sk: sortHalf(7, ["id"]) },
     },
   } as never) as any
   const MainTable = Table.make({ schema, entities: { Stampeds } })
@@ -1320,40 +1333,466 @@ const stampedWorld = (escapeKeys: boolean) => {
   return { schema, Stampeds, MainTable, client } as any
 }
 
+const stampedFixture: {
+  readonly rows: Readonly<Record<string, { readonly writes: string; readonly item: StoredRow }>>
+} = JSON.parse(
+  readFileSync(new URL("../fixtures/stamped-rows-1.38.0.json", import.meta.url), "utf8"),
+)
+
+const stampedRow = (id: string): StoredRow => stampedFixture.rows[id]!.item
+
+const seedStamped = (table: RepairTable, ids = Object.keys(stampedFixture.rows)) =>
+  Effect.forEach(ids, (id) => table.seed(stampedRow(id)), { discard: true })
+
+/**
+ * What the fixture's rows hold, half by half (a whole index's two halves are two keys).
+ *
+ * `bare` (no status): gsi1, gsi2, gsi7 whole = 6 missing. `open`: gsi1 to gsi5 and gsi7 whole, and
+ * gsi6's partition key = 13 missing, gsi6's sort key ambiguous. `noted`: the same, less gsi7's sort
+ * key its update composed (shape 2) = 12 missing, gsi6's sort key ambiguous. `shut`: gsi1, gsi2 whole
+ * and gsi7's partition key = 5 missing, gsi3 to gsi6's partition keys = 4 missing and their sort keys
+ * = 4 truncated. `given`, `givenNoted` (only lagging), `givenRemoved` (out on purpose): nothing.
+ * `givenShut`: gsi3 to gsi6 = 4 truncated. `givenRegion`: gsi6's sort key, dropped by 1.38's hole
+ * rule, ambiguous.
+ */
+const STAMPED_DAMAGE = { ...ZERO, missing: 40, truncated: 8, ambiguous: 3 }
+
+const stampedRowOf = (rows: ReadonlyArray<StoredRow>, id: string): StoredRow =>
+  rows.find((row) => row.id?.S === id)!
+
+/** The ids an index of the fixture's owner holds, in no particular order. */
+const idsIn = (db: any, accessor: string) =>
+  db.entities.Stampeds[accessor]({ owner: "o" })
+    .collect()
+    .pipe(
+      Effect.map((items: ReadonlyArray<{ readonly id: string }>) =>
+        items.map((item) => item.id).sort(),
+      ),
+    )
+
+const STAMP_OF = (row: StoredRow, attribute: string) =>
+  `${attribute.toLowerCase()}_${row[attribute].S.toLowerCase()}`
+
 export const stampedScenarios: ReadonlyArray<RepairScenario> = [
-  ...bothSettings("a composite the library stamps is never judged", (h, on) => {
+  ...bothSettings(
+    "without the option it counts what 1.38.0 left out, and writes nothing",
+    (h, on) => {
+      const w = stampedWorld(on)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          yield* seedStamped(table)
+          const before = yield* table.rows()
+          const db = yield* w.client
+          table.clear()
+          const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+          expect(report.indexKeys).toEqual(STAMPED_DAMAGE)
+          expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+          expect(yield* table.rows()).toEqual(before)
+          const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+            repairIndexKeys: true,
+            dryRun: true,
+          })
+          expect(dry.indexKeys).toEqual({ ...STAMPED_DAMAGE, repaired: 48 })
+          expect(yield* table.rows()).toEqual(before)
+        }),
+      )
+    },
+  ),
+  ...bothSettings("repairing brings 1.38.0's rows into their indexes, and stays done", (h, on) => {
+    const w = stampedWorld(on)
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        yield* seedStamped(table)
+        const db = yield* w.client
+        expect(yield* idsIn(db, "byCreated")).toEqual([
+          "given",
+          "givenNoted",
+          "givenRegion",
+          "givenRemoved",
+          "givenShut",
+        ])
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          repairIndexKeys: true,
+        })
+        expect(report.indexKeys).toEqual({ ...STAMPED_DAMAGE, repaired: 48 })
+        const all = Object.keys(stampedFixture.rows).sort()
+        const withStatus = all.filter((id) => id !== "bare" && id !== "givenRemoved")
+        expect(yield* idsIn(db, "byCreated")).toEqual(all)
+        expect(yield* idsIn(db, "byUpdated")).toEqual(all)
+        expect(yield* idsIn(db, "byStatus")).toEqual(withStatus)
+        expect(yield* idsIn(db, "byStatusSparse")).toEqual(withStatus)
+        expect(yield* idsIn(db, "byStatusCreated")).toEqual(withStatus)
+        // The three a put of 1.38.0 can't be told from a hole's drop stay out, and are reported.
+        expect(yield* idsIn(db, "byPlace")).toEqual(
+          withStatus.filter((id) => !["open", "noted", "givenRegion"].includes(id)),
+        )
+        const rows = yield* table.rows()
+        // Each key holds the row's own values, for a row that never held a key.
+        const open = stampedRowOf(rows, "open")
+        expect(open.gsi1sk.S).toBe(`$stamped#v1#stamped#${STAMP_OF(open, "createdAt")}`)
+        expect(open.gsi2sk.S).toBe(`$stamped#v1#stamped#${STAMP_OF(open, "updatedAt")}`)
+        expect(open.gsi3sk.S).toBe(`$stamped#v1#stamped#status_open#${STAMP_OF(open, "updatedAt")}`)
+        expect(open.gsi7pk.S).toBe(`$stamped#v1#stamped#${STAMP_OF(open, "createdAt")}`)
+        // And for one 1.38.0 truncated, under the status it holds.
+        const shut = stampedRowOf(rows, "givenShut")
+        expect(shut.gsi3sk.S).toBe(`$stamped#v1#stamped#status_shut#${STAMP_OF(shut, "updatedAt")}`)
+        expect(shut.gsi5sk.S).toBe(`$stamped#v1#stamped#status_shut#${STAMP_OF(shut, "createdAt")}`)
+        expect(shut.gsi6sk.S).toBe(
+          `$stamped#v1#stamped#status_shut#region_r#${STAMP_OF(shut, "updatedAt")}`,
+        )
+        // A key that only lags is as 1.38.0 left it.
+        const noted = stampedRowOf(rows, "givenNoted")
+        expect(noted.gsi2sk).toEqual(stampedRow("givenNoted").gsi2sk)
+        expect(noted.gsi3sk).toEqual(stampedRow("givenNoted").gsi3sk)
+        // Nothing else moved: not the row's values, and no key for a row out on purpose.
+        const removed = stampedRowOf(rows, "givenRemoved")
+        expect(removed).toEqual(stampedRow("givenRemoved"))
+        expect(stampedRowOf(rows, "given")).toEqual(stampedRow("given"))
+        for (const id of all) {
+          const { updatedAt, createdAt, status, version } = stampedRowOf(rows, id)
+          const held = stampedRow(id)
+          expect({ updatedAt, createdAt, status, version }).toEqual({
+            updatedAt: held.updatedAt,
+            createdAt: held.createdAt,
+            status: held.status,
+            version: held.version,
+          })
+        }
+        // A second run: the same bytes, nothing to write, what can't be told apart still reported.
+        table.clear()
+        const again: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          repairIndexKeys: true,
+        })
+        expect(again.indexKeys).toEqual({ ...ZERO, ambiguous: 3 })
+        expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+        expect(yield* table.rows()).toEqual(rows)
+      }),
+    )
+  }),
+  ...bothSettings(
+    "a key lagging behind `updatedAt` is expected: no count, no write, every run",
+    (h, on) => {
+      const w = stampedWorld(on)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          // A row this build wrote, then an update that can't compose `[status, updatedAt]`.
+          yield* db.entities.Stampeds.put({
+            id: "a",
+            owner: "o",
+            status: "open",
+            region: "r",
+          }).asEffect()
+          const put = stampedRowOf(yield* table.rows(), "a")
+          yield* Effect.sleep("3 millis")
+          yield* db.entities.Stampeds.update({ id: "a" }).set({ note: "n" }).asEffect()
+          const updated = stampedRowOf(yield* table.rows(), "a")
+          expect(updated.updatedAt.S).not.toBe(put.updatedAt.S)
+          expect(updated.gsi3sk).toEqual(put.gsi3sk)
+          expect(updated.gsi4sk).toEqual(put.gsi4sk)
+          expect(updated.gsi6sk).toEqual(put.gsi6sk)
+          // `[updatedAt]` moved with it.
+          expect(updated.gsi2sk.S).toContain(STAMP_OF(updated, "updatedAt"))
+          for (let run = 0; run < 3; run++) {
+            table.clear()
+            const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+              repairIndexKeys: true,
+            })
+            expect(report.indexKeys).toEqual(ZERO)
+            expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+            yield* Effect.sleep("3 millis")
+            yield* db.entities.Stampeds.update({ id: "a" })
+              .set({ note: `n${run}` })
+              .asEffect()
+          }
+        }),
+      )
+    },
+  ),
+  ...bothSettings("a key under another status is rewritten once, then stays", (h, on) => {
     const w = stampedWorld(on)
     return h.on(w, (table) =>
       Effect.gen(function* () {
         const db = yield* w.client
-        // A put not supplying them: their values on the row, no index keys.
-        yield* db.entities.Stampeds.put({ id: "a", owner: "o" }).asEffect()
-        // Supplied, then updated: `updatedAt` and `version` move, and their keys stay.
-        const at = DateTime.makeUnsafe("2026-01-01T00:00:00.000Z")
-        yield* db.entities.Stampeds.put({
-          id: "b",
-          owner: "o",
-          createdAt: at,
-          updatedAt: at,
-        }).asEffect()
-        yield* db.entities.Stampeds.update({ id: "b" }).set({ status: "x" }).asEffect()
-        const before = yield* table.rows()
-        const unsupplied = before.find((row) => row.id?.S === "a")!
-        expect(unsupplied.updatedAt).toBeDefined()
-        expect(unsupplied.version).toBeDefined()
-        expect(unsupplied.gsi1sk).toBeUndefined()
-        expect(unsupplied.gsi2sk).toBeUndefined()
-        expect(unsupplied.gsi3sk).toBeUndefined()
+        const held = stampedRow("given")
+        yield* table.seed({
+          ...held,
+          status: { S: "shut" },
+          gsi3sk: { S: "$stamped#v1#stamped#status_open#updatedat_2020" },
+        })
+        const first: Table.RekeyReport = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+        // gsi3's sort key, and the status every other half holding it had moved past.
+        expect(first.indexKeys.lagging).toBe(4)
+        expect(first.indexKeys.repaired).toBe(4)
+        const repaired = stampedRowOf(yield* table.rows(), "given")
+        expect(repaired.gsi3sk.S).toBe(
+          `$stamped#v1#stamped#status_shut#${STAMP_OF(repaired, "updatedAt")}`,
+        )
         table.clear()
-        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        const second: Table.RekeyReport = yield* db.tables.MainTable.rekey({
           repairIndexKeys: true,
         })
-        expect(report.indexKeys).toEqual(ZERO)
+        expect(second.indexKeys).toEqual(ZERO)
         expect(table.requests().map((request) => request.command)).toEqual(["scan"])
-        expect(yield* table.rows()).toEqual(before)
+        // Later writes that can't compose it move `updatedAt` only, and it stays fine.
+        yield* Effect.sleep("3 millis")
+        yield* db.entities.Stampeds.update({ id: "given" }).set({ note: "n" }).asEffect()
+        table.clear()
+        const third: Table.RekeyReport = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+        expect(third.indexKeys).toEqual(ZERO)
+        expect(table.requests().map((request) => request.command)).toEqual(["scan"])
       }),
     )
   }),
+  ...bothSettings(
+    "this build's `[status, createdAt]` truncation is restored, and stays",
+    (h, on) => {
+      const w = stampedWorld(on)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          yield* db.entities.Stampeds.put({ id: "a", owner: "o", status: "open" }).asEffect()
+          yield* db.entities.Stampeds.update({ id: "a" }).set({ status: "shut" }).asEffect()
+          const truncated = stampedRowOf(yield* table.rows(), "a")
+          expect(truncated.gsi5sk.S).toBe("$stamped#v1#stamped#status_shut")
+          const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+            repairIndexKeys: true,
+          })
+          expect(report.indexKeys).toEqual({ ...ZERO, truncated: 1, repaired: 1 })
+          const restored = stampedRowOf(yield* table.rows(), "a")
+          expect(restored.gsi5sk.S).toBe(
+            `$stamped#v1#stamped#status_shut#${STAMP_OF(restored, "createdAt")}`,
+          )
+          table.clear()
+          const again: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+            repairIndexKeys: true,
+          })
+          expect(again.indexKeys).toEqual(ZERO)
+          expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+        }),
+      )
+    },
+  ),
+  ...bothSettings("a writer moving `updatedAt` mid-repair: the key holds what it left", (h, on) => {
+    const w = stampedWorld(on)
+    return h.on(w, (table) =>
+      Effect.gen(function* () {
+        yield* seedStamped(table, ["bare"])
+        const db = yield* w.client
+        const moved = { ...stampedRow("bare"), updatedAt: { S: "2030-01-01T00:00:00.000Z" } }
+        let writes = 0
+        table.beforeUpdate(() => {
+          writes++
+          return writes === 1 ? table.seed(moved) : Effect.void
+        })
+        const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          repairIndexKeys: true,
+        })
+        expect(writes).toBe(2)
+        expect(report.indexKeys.skipped).toBe(0)
+        const row = stampedRowOf(yield* table.rows(), "bare")
+        expect(row.updatedAt).toEqual(moved.updatedAt)
+        expect(row.gsi2sk.S).toBe("$stamped#v1#stamped#updatedat_2030-01-01t00:00:00.000z")
+        table.clear()
+        const again: Table.RekeyReport = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+        expect(again.indexKeys).toEqual(ZERO)
+        expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+      }),
+    )
+  }),
+  ...[false, true].flatMap((repairIndexKeys) =>
+    bothSettings(
+      `a stamped row that moves lands with its keys, ${repairIndexKeys ? "with" : "without"} the option`,
+      (h, on) => {
+        const now = stampedWorld(on)
+        const was = stampedWorld(!on)
+        return h.on(now, (table) =>
+          Effect.gen(function* () {
+            const put = "2026-01-01T00:00:00.000Z"
+            const later = "2026-01-02T00:00:00.000Z"
+            const values = { id: "a b", owner: "o", status: "open", createdAt: put, updatedAt: put }
+            // Lagging `updatedAt`, as any update leaves it.
+            yield* table.seed(
+              toAttributeMap({
+                ...values,
+                updatedAt: later,
+                __edd_e__: "Stamped",
+                ...KeyComposer.composeAllKeys(
+                  was.schema,
+                  "Stamped",
+                  1,
+                  was.Stampeds.indexes,
+                  values,
+                ),
+              }),
+            )
+            // No index keys at all, as a 1.38.0 put left it.
+            const bare = { id: "c d", owner: "o", createdAt: put, updatedAt: put }
+            const { pk, sk } = KeyComposer.composeAllKeys(
+              was.schema,
+              "Stamped",
+              1,
+              was.Stampeds.indexes,
+              bare,
+            ) as Record<string, string>
+            yield* table.seed(toAttributeMap({ ...bare, __edd_e__: "Stamped", pk, sk }))
+            const db = yield* now.client
+            const options = repairIndexKeys ? { repairIndexKeys: true } : {}
+            const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+              ...options,
+              dryRun: true,
+            })
+            const real: Table.RekeyReport = yield* db.tables.MainTable.rekey(options)
+            expect(real.moved.item).toBe(2)
+            expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
+            const rows = yield* table.rows()
+            const lagged = stampedRowOf(rows, "a b")
+            expect(lagged.gsi2sk.S).toContain("updatedat_")
+            expect(lagged.gsi1sk.S).toContain(`createdat_${put.toLowerCase()}`)
+            const brought = stampedRowOf(rows, "c d")
+            expect(brought.gsi1sk.S).toContain(`createdat_${put.toLowerCase()}`)
+            expect(brought.gsi2sk.S).toContain(`updatedat_${put.toLowerCase()}`)
+            // There's nothing left, for either row, on any later run.
+            table.clear()
+            const again: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+              repairIndexKeys: true,
+            })
+            expect(again.indexKeys).toEqual(ZERO)
+            expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+          }),
+        )
+      },
+    ),
+  ),
+  ...bothSettings("a stamped Z-order dimension: repaired when missing, otherwise left", (h, on) => {
+    class Listing extends Schema.Class<Listing>("Listing")({
+      id: Schema.String,
+      owner: Schema.String,
+      price: Schema.optional(Schema.Number),
+      note: Schema.optional(Schema.String),
+      updatedAt: Schema.DateTimeUtc,
+    }) {}
+    const schema = DynamoSchema.make({ name: "stamped", version: 1, escapeKeys: on })
+    const Listings = Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+      timestamps: true,
+      indexes: {
+        byPrice: {
+          name: "gsi1",
+          pk: half(1, ["owner"]),
+          sk: {
+            field: "gsi1sk",
+            zorder: [
+              { field: "price", min: 0, max: 1000 },
+              { field: "updatedAt", from: "2024-01-01", unit: "seconds", bits: 32 },
+            ],
+          },
+        },
+      },
+    } as never) as any
+    const MainTable = Table.make({ schema, entities: { Listings } })
+    const client = DynamoClient.make({ entities: { Listings }, tables: { MainTable } })
+    return h.on({ MainTable }, (table) =>
+      Effect.gen(function* () {
+        const db: any = yield* client
+        yield* db.entities.Listings.put({ id: "priced", owner: "o", price: 10 }).asEffect()
+        yield* db.entities.Listings.put({ id: "bare", owner: "o", price: 10 }).asEffect()
+        const rowsBefore = yield* table.rows()
+        const priced = rowsBefore.find((row) => row.id?.S === "priced")!
+        const whole = rowsBefore.find((row) => row.id?.S === "bare")!
+        expect(priced.gsi1sk.B).toBeDefined()
+        // A row 1.38.0 stored: no address, its price known. A row with no price: none due.
+        const { gsi1pk: _pk, gsi1sk: _sk, ...stripped } = whole
+        yield* table.seed(stripped)
+        yield* db.entities.Listings.put({ id: "priceless", owner: "o" }).asEffect()
+        const repair: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          repairIndexKeys: true,
+        })
+        expect(repair.indexKeys).toEqual({ ...ZERO, missing: 2, repaired: 2 })
+        const rows = yield* table.rows()
+        const bare = rows.find((row) => row.id?.S === "bare")!
+        expect([...bare.gsi1sk.B]).toEqual([...whole.gsi1sk.B])
+        expect(rows.find((row) => row.id?.S === "priceless")!.gsi1sk).toBeUndefined()
+        // An update naming no dimension moves `updatedAt`, and the address is left: expected.
+        yield* Effect.sleep("1100 millis")
+        yield* db.entities.Listings.update({ id: "priced" }).set({ note: "n" }).asEffect()
+        const noted = (yield* table.rows()).find((row) => row.id?.S === "priced")!
+        expect([...noted.gsi1sk.B]).toEqual([...priced.gsi1sk.B])
+        expect(noted.updatedAt).not.toEqual(priced.updatedAt)
+        table.clear()
+        const again: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          repairIndexKeys: true,
+        })
+        expect(again.indexKeys).toEqual(ZERO)
+        expect(table.requests().map((request) => request.command)).toEqual(["scan"])
+      }),
+    )
+  }),
+  ...bothSettings(
+    "a retain `version` key is judged whole, since every write there composes it",
+    (h, on) => {
+      class Revision extends Schema.Class<Revision>("Revision")({
+        id: Schema.String,
+        owner: Schema.String,
+        note: Schema.optional(Schema.String),
+        version: Schema.Number,
+      }) {}
+      const schema = DynamoSchema.make({ name: "stamped", version: 1, escapeKeys: on })
+      const Revisions = Entity.make({
+        model: Revision,
+        entityType: "Revision",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: [] },
+        },
+        versioned: { retain: true },
+        indexes: {
+          byVersion: { name: "gsi1", pk: half(1, ["owner"]), sk: sortHalf(1, ["version"]) },
+        },
+      } as never) as any
+      const MainTable = Table.make({ schema, entities: { Revisions } })
+      const client = DynamoClient.make({ entities: { Revisions }, tables: { MainTable } })
+      return h.on({ MainTable }, (table) =>
+        Effect.gen(function* () {
+          const db: any = yield* client
+          yield* db.entities.Revisions.put({ id: "a", owner: "o" }).asEffect()
+          yield* db.entities.Revisions.update({ id: "a" }).set({ note: "n" }).asEffect()
+          const live = (rows: ReadonlyArray<StoredRow>) =>
+            rows.find((row) => row.id?.S === "a" && !row.sk.S.includes("#v#"))!
+          const updated = live(yield* table.rows())
+          expect(updated.gsi1sk.S).toBe("$stamped#v1#revision#version_0000000000000002")
+          table.clear()
+          const clean: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+            repairIndexKeys: true,
+          })
+          expect(clean.indexKeys).toEqual(ZERO)
+          // What 1.38.0's put stored: the version, no keys.
+          const { gsi1pk: _pk, gsi1sk: _sk, ...stripped } = updated
+          yield* table.seed(stripped)
+          const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+            repairIndexKeys: true,
+          })
+          expect(report.indexKeys).toEqual({ ...ZERO, missing: 2, repaired: 2 })
+          expect(live(yield* table.rows()).gsi1sk).toEqual(updated.gsi1sk)
+          // A key behind the version.
+          yield* table.seed({
+            ...updated,
+            gsi1sk: { S: "$stamped#v1#revision#version_0000000000000001" },
+          })
+          const behind: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+            repairIndexKeys: true,
+          })
+          expect(behind.indexKeys).toEqual({ ...ZERO, lagging: 1, repaired: 1 })
+          expect(live(yield* table.rows()).gsi1sk).toEqual(updated.gsi1sk)
+        }),
+      )
+    },
+  ),
 ]
 
 // ---------------------------------------------------------------------------

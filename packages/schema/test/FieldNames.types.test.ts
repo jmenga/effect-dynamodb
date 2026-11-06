@@ -693,6 +693,142 @@ describe("definition attribute names are typed from the model", () => {
       ).toThrow("[EDD-9102]")
     })
 
+    describe("a key over a value the library changes on every write (EDD-9121)", () => {
+      class Revision extends Schema.Class<Revision>("Revision")({
+        id: Schema.String,
+        owner: Schema.String,
+        price: Schema.Number,
+        version: Schema.Number,
+        rev: Schema.Number,
+      }) {}
+      const byId = {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      } as const
+
+      it("`retain` knows the value, and without `versioned` it's any field", () => {
+        Entity.make({
+          model: Revision,
+          entityType: "Revision",
+          primaryKey: byId,
+          versioned: { retain: true },
+          indexes: {
+            byVersion: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["owner"] },
+              sk: { field: "gsi1sk", composite: ["version"] },
+            },
+          },
+        })
+        Entity.make({
+          model: Revision,
+          entityType: "Revision",
+          primaryKey: byId,
+          indexes: {
+            byVersion: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["owner"] },
+              sk: { field: "gsi1sk", composite: ["version"] },
+            },
+          },
+        })
+        // `versioned` keeps it elsewhere, so `version` is the model's.
+        Entity.make({
+          model: Revision,
+          entityType: "Revision",
+          primaryKey: byId,
+          versioned: { field: "rev" },
+          indexes: {
+            byVersion: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["owner"] },
+              sk: { field: "gsi1sk", composite: ["version"] },
+            },
+          },
+        })
+      })
+
+      it("a half over it without `retain` is the error, on that half", () => {
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: true,
+            indexes: {
+              byVersion: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["owner"] },
+                // @ts-expect-error `versioned` adds one to it on every write, without reading it
+                sk: { field: "gsi1sk", composite: ["version"] },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: { field: "rev" },
+            indexes: {
+              byRev: {
+                name: "gsi1",
+                // @ts-expect-error `versioned` keeps its version here
+                pk: { field: "gsi1pk", composite: ["rev"] },
+                sk: { field: "gsi1sk", composite: ["owner"] },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+      })
+
+      it("a Z-order entry over it, dimension or prefix", () => {
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: true,
+            indexes: {
+              search: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["owner"] },
+                sk: {
+                  field: "gsi1sk",
+                  zorder: [
+                    { field: "price", min: 0, max: 9 },
+                    // @ts-expect-error `versioned` adds one to it on every write, without reading it
+                    { field: "version", min: 0, max: 9 },
+                  ],
+                },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: true,
+            indexes: {
+              search: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["owner"] },
+                sk: {
+                  field: "gsi1sk",
+                  // @ts-expect-error `versioned` adds one to it on every write, without reading it
+                  prefix: ["version"],
+                  zorder: [{ field: "price", min: 0, max: 9 }],
+                },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+      })
+    })
+
     it("refuses shards on the primary key", () => {
       expect(() =>
         Entity.make({
