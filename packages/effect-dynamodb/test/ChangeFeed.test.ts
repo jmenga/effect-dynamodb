@@ -315,6 +315,13 @@ const recording = (store: CheckpointStoreService, fail?: (n: number) => boolean)
 /** Let the fake's promises settle (they run outside the test clock). */
 const flush = Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 10)))
 
+/**
+ * Waits in real time until `condition` holds. For work that takes a chain of
+ * timers to finish: on a loaded machine that chain overruns any fixed sleep.
+ */
+const waitUntil = (condition: () => boolean) =>
+  Effect.sleep("1 millis").pipe(Effect.repeat({ until: () => condition() }))
+
 /** Advance the test clock, then let the fake's promises settle. */
 const adjust = (duration: Duration.Input) =>
   TestClock.adjust(duration).pipe(Effect.andThen(flush), Effect.andThen(flush))
@@ -1117,8 +1124,7 @@ describe("changeFeed", () => {
           ...fast,
           lease: { duration: "1 second", renewEvery: "10 millis" },
         }).pipe(Effect.provide(layerOf(fake, flaky)), Effect.exit, Effect.forkChild)
-        yield* Effect.sleep("60 millis")
-        expect(renewals).toBeGreaterThan(2)
+        yield* waitUntil(() => renewals > 2)
         expect(fiber.pollUnsafe()).toBeUndefined()
         yield* Fiber.interrupt(fiber)
       }),
@@ -1336,7 +1342,7 @@ describe("runChangeFeed", () => {
             })
           }),
       }).pipe(Effect.provide(layerOf(fake, store)), Effect.forkChild)
-      yield* Effect.sleep("40 millis")
+      yield* waitUntil(() => seen.length >= 2)
       yield* Fiber.interrupt(fiber)
       // The record that fails to decode is reported: the checkpoint stops before it.
       expect(seen[0]).toEqual({ positions: [1, 2, 3], failed: 1, owners: ["ann", "cy"] })
