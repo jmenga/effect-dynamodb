@@ -57,7 +57,8 @@ const describeConnected = dynamoAvailable ? describe : describe.skip
 // Model
 // ---------------------------------------------------------------------------
 
-const AppSchema = DynamoSchema.make({ name: "abort-it", version: 1 })
+// `escapeKeys`, so the rekey tests below have rows in another key form to move.
+const AppSchema = DynamoSchema.make({ name: "abort-it", version: 1, escapeKeys: true })
 const tableName = `abort-it-${Date.now()}`
 const zTableName = `abort-it-z-${Date.now()}`
 
