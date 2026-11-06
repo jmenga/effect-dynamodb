@@ -26,6 +26,7 @@ import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
   RekeyConflict,
   RekeyCounts,
+  RekeyIndexKeys,
   RekeyMemberReport,
   RekeyOptions,
   RekeyReport,
@@ -49,6 +50,8 @@ type Item = Record<string, AttributeValue>
 export interface RekeyRowContext {
   readonly tableName: string
   readonly dryRun: boolean
+  /** Write the index keys that differ ({@link RekeyOptions.repairIndexKeys}), or only count them. */
+  readonly repairIndexKeys: boolean
   /**
    * Whether this run has read every page of the table: it started at the beginning and is past the
    * end. A run bounded by `maxPages`, or started from `resume`, hasn't, so what it didn't find says
@@ -83,6 +86,7 @@ export interface RekeyTally {
   readonly moved?: Partial<Record<RekeyRowKind, number>> | undefined
   readonly indexKeysRewritten?: number | undefined
   readonly sentinelsMoved?: number | undefined
+  readonly indexKeys?: Partial<RekeyIndexKeys> | undefined
   readonly conflicts?: ReadonlyArray<RekeyConflict> | undefined
   readonly skipped?: Partial<Record<RekeySkipReason, number>> | undefined
 }
@@ -168,11 +172,32 @@ const zeroCounts = (): MutableCounts => ({
   stream: 0,
 })
 
+type MutableIndexKeys = { -readonly [K in keyof RekeyIndexKeys]: number }
+
+const INDEX_KEY_COUNTS: ReadonlyArray<keyof RekeyIndexKeys> = [
+  "missing",
+  "truncated",
+  "lagging",
+  "ambiguous",
+  "repaired",
+  "skipped",
+]
+
+const zeroIndexKeys = (): MutableIndexKeys => ({
+  missing: 0,
+  truncated: 0,
+  lagging: 0,
+  ambiguous: 0,
+  repaired: 0,
+  skipped: 0,
+})
+
 interface MutableMember {
   unchanged: number
   moved: MutableCounts
   indexKeysRewritten: number
   sentinelsMoved: number
+  indexKeys: MutableIndexKeys
   conflicts: number
 }
 
@@ -183,6 +208,7 @@ class Totals {
   moved = zeroCounts()
   indexKeysRewritten = 0
   sentinelsMoved = 0
+  indexKeys = zeroIndexKeys()
   conflicts: Array<RekeyConflict> = []
   private readonly conflicted = new Set<string>()
   skipped: { -readonly [R in RekeySkipReason]: number } = {
@@ -204,6 +230,7 @@ class Totals {
               moved: zeroCounts(),
               indexKeysRewritten: 0,
               sentinelsMoved: 0,
+              indexKeys: zeroIndexKeys(),
               conflicts: 0,
             }
             this.byMember.set(member, fresh)
@@ -223,6 +250,11 @@ class Totals {
     const sentinels = tally.sentinelsMoved ?? 0
     this.sentinelsMoved += sentinels
     if (into !== undefined) into.sentinelsMoved += sentinels
+    for (const count of INDEX_KEY_COUNTS) {
+      const n = tally.indexKeys?.[count] ?? 0
+      this.indexKeys[count] += n
+      if (into !== undefined) into.indexKeys[count] += n
+    }
     for (const conflict of tally.conflicts ?? []) {
       // A row that can't move is met again by what wants its key, and by the scan.
       const row = `${conflict.member}\u0000${conflict.kind}\u0000${JSON.stringify(conflict.key)}`
@@ -248,6 +280,7 @@ class Totals {
         moved: { ...m.moved },
         indexKeysRewritten: m.indexKeysRewritten,
         sentinelsMoved: m.sentinelsMoved,
+        indexKeys: { ...m.indexKeys },
         conflicts: m.conflicts,
       }
     }
@@ -258,6 +291,7 @@ class Totals {
       moved: { ...this.moved } as RekeyCounts,
       indexKeysRewritten: this.indexKeysRewritten,
       sentinelsMoved: this.sentinelsMoved,
+      indexKeys: { ...this.indexKeys },
       conflicts: [...this.conflicts],
       skipped: { ...this.skipped },
       byMember,
@@ -375,6 +409,7 @@ export const run = (args: {
       const ctx: RekeyRowContext = {
         tableName,
         dryRun,
+        repairIndexKeys: options.repairIndexKeys === true,
         sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
         claim: (unit) => {
           if (claimed.has(unit)) return false
@@ -478,6 +513,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
   const moved: Partial<Record<RekeyRowKind, number>> = {}
   const skipped: Partial<Record<RekeySkipReason, number>> = {}
   const conflicts: Array<RekeyConflict> = []
+  const indexKeys: Partial<MutableIndexKeys> = {}
   let unchanged = 0
   let indexKeysRewritten = 0
   let sentinelsMoved = 0
@@ -485,6 +521,10 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     unchanged += tally.unchanged ?? 0
     indexKeysRewritten += tally.indexKeysRewritten ?? 0
     sentinelsMoved += tally.sentinelsMoved ?? 0
+    for (const count of INDEX_KEY_COUNTS) {
+      const n = tally.indexKeys?.[count]
+      if (n !== undefined) indexKeys[count] = (indexKeys[count] ?? 0) + n
+    }
     for (const kind of ROW_KINDS) {
       const n = tally.moved?.[kind]
       if (n !== undefined) moved[kind] = (moved[kind] ?? 0) + n
@@ -500,6 +540,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     ...(Object.keys(moved).length > 0 && { moved }),
     ...(indexKeysRewritten > 0 && { indexKeysRewritten }),
     ...(sentinelsMoved > 0 && { sentinelsMoved }),
+    ...(Object.keys(indexKeys).length > 0 && { indexKeys }),
     ...(conflicts.length > 0 && { conflicts }),
     ...(Object.keys(skipped).length > 0 && { skipped }),
   }

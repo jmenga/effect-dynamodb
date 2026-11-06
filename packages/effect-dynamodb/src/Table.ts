@@ -956,6 +956,30 @@ export interface RekeyConflict {
   readonly message: string
 }
 
+/**
+ * The index keys of live items that aren't what a `put` of their stored values writes (#185). Keys,
+ * not rows: a row can count more than once. The first four are counted on every run, for no extra
+ * read, and the last two only with {@link RekeyOptions.repairIndexKeys}.
+ *
+ * - `missing` — every composite is on the row, and no key
+ * - `truncated` — every composite is on the row, and the key stops at a leading run of them
+ * - `lagging` — the key holds other values: a composite changed under `preserve`, or a `sparse` half
+ *   holds a key its values no longer compose
+ * - `ambiguous` — a `sparse` half with no key and two or more composites outside the primary key on
+ *   the row. A writer naming only a later composite takes a row out of the index on purpose, and
+ *   that leaves the same bytes, so these are never written
+ * - `repaired` — keys written, or with `dryRun`, keys that would be
+ * - `skipped` — keys a writer changed the row under, twice: the writer won
+ */
+export interface RekeyIndexKeys {
+  readonly missing: number
+  readonly truncated: number
+  readonly lagging: number
+  readonly ambiguous: number
+  readonly repaired: number
+  readonly skipped: number
+}
+
 /** One member's share of a {@link RekeyReport}. */
 export interface RekeyMemberReport {
   readonly unchanged: number
@@ -963,6 +987,7 @@ export interface RekeyMemberReport {
   readonly indexKeysRewritten: number
   readonly sentinelsMoved: number
   readonly conflicts: number
+  readonly indexKeys: RekeyIndexKeys
 }
 
 /**
@@ -987,6 +1012,8 @@ export interface RekeyReport {
   readonly indexKeysRewritten: number
   /** Unique-constraint sentinels moved to their current keys. */
   readonly sentinelsMoved: number
+  /** Index keys that aren't what a `put` of their row's values writes: {@link RekeyIndexKeys}. */
+  readonly indexKeys: RekeyIndexKeys
   /** Rows left where they are — see {@link RekeyConflict}. */
   readonly conflicts: ReadonlyArray<RekeyConflict>
   /** Rows no member owns, by reason. */
@@ -1010,6 +1037,14 @@ export interface RekeyOptions {
    * row's destination is judged too, so what would stop the row stops it here as well.
    */
   readonly dryRun?: boolean | undefined
+  /**
+   * Also write the index keys {@link RekeyReport.indexKeys} finds differing, except `ambiguous`
+   * ones. Default `false`: the run counts them and writes nothing new. Each row is one conditional
+   * `UpdateItem`, guarded on every key it writes and every composite it composes them from as read,
+   * so a writer changing any of them wins; on a failed condition the row is read once and judged
+   * again, then counted in `skipped`. A table with nothing to repair costs the scan alone.
+   */
+  readonly repairIndexKeys?: boolean | undefined
   /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */
   readonly segments?: number | undefined
   /** Rows of one scan page handled at once, per segment. Default 4. */
