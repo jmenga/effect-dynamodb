@@ -7,6 +7,8 @@ import * as KeyComposer from "../src/KeyComposer.js"
 
 describe("KeyComposer", () => {
   const schema = DynamoSchema.make({ name: "myapp", version: 1 })
+  const schemaOn = DynamoSchema.make({ name: "myapp", version: 1, escapeKeys: true })
+  const schemaOff = DynamoSchema.make({ name: "myapp", version: 1, escapeKeys: false })
 
   describe("extractComposites", () => {
     it("extracts values in order", () => {
@@ -1324,6 +1326,394 @@ describe("KeyComposer", () => {
     // `classifyHalf` (which already handled empty composites correctly as
     // `{ kind: 'set', length: 0 }`) is finally reached.
 
+    describe("shape 10 — a half mixing a primary key composite with a mutable one", () => {
+      // The writer addresses the item by `channel` and `deviceId`. A half that
+      // needs `zone` as well isn't this writer's to truncate or drop because one
+      // of its composites happens to be in the key record.
+      const keyRecord = { channel: "c", deviceId: "d" }
+      const compose = (
+        gsi: Partial<KeyComposer.IndexDefinition>,
+        payload: Record<string, unknown>,
+        options?: { readonly removedSet?: ReadonlySet<string>; readonly record?: object },
+      ) =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Device",
+          1,
+          {
+            gsi: {
+              index: "gsi1",
+              pk: { field: "gsi1pk", composite: ["channel"] },
+              sk: { field: "gsi1sk", composite: ["zone", "deviceId"] },
+              ...gsi,
+            },
+          },
+          payload,
+          { ...keyRecord, ...options?.record },
+          options?.removedSet === undefined ? {} : { removedSet: options.removedSet },
+        )
+      const sk = (composite: ReadonlyArray<string>) => ({
+        sk: { field: "gsi1sk", composite },
+      })
+      const policies = ["sparse", "preserve"] as const
+
+      for (const policy of policies) {
+        const indexPolicy = { sk: policy, pk: policy }
+
+        it(`an unrelated update leaves a leading mutable composite's half alone (${policy})`, () => {
+          const { sets, removes } = compose({ indexPolicy }, { status: "on" })
+          expect(sets).toEqual({ gsi1pk: expect.any(String) })
+          expect(removes).toEqual([])
+        })
+
+        it(`an unrelated update doesn't truncate a trailing mutable one's half (${policy})`, () => {
+          const { sets, removes } = compose(
+            { indexPolicy, ...sk(["deviceId", "zone"]) },
+            { status: "on" },
+          )
+          expect(sets).toEqual({ gsi1pk: expect.any(String) })
+          expect(removes).toEqual([])
+        })
+
+        it(`an unrelated update leaves a mixed partition key half alone (${policy})`, () => {
+          const { sets, removes } = compose(
+            {
+              indexPolicy,
+              pk: { field: "gsi1pk", composite: ["channel", "zone"] },
+              ...sk(["deviceId"]),
+            },
+            { status: "on" },
+          )
+          expect(sets).toEqual({ gsi1sk: expect.any(String) })
+          expect(removes).toEqual([])
+        })
+
+        it(`both halves mixed: an unrelated update writes nothing (${policy})`, () => {
+          expect(
+            compose(
+              {
+                indexPolicy,
+                pk: { field: "gsi1pk", composite: ["zone", "channel"] },
+                ...sk(["deviceId", "site"]),
+              },
+              { status: "on" },
+            ),
+          ).toEqual({ sets: {}, removes: [] })
+        })
+
+        it(`naming the mutable composite composes the half (${policy})`, () => {
+          const { sets, removes } = compose({ indexPolicy }, { zone: "z" })
+          expect(sets.gsi1sk).toBe(
+            KeyComposer.composeSk(
+              schema,
+              "Device",
+              1,
+              {
+                pk: { field: "p", composite: [] },
+                sk: { field: "s", composite: ["zone", "deviceId"] },
+              },
+              { zone: "z", deviceId: "d" },
+            ),
+          )
+          expect(removes).toEqual([])
+        })
+
+        it(`a key record with every composite recomposes it: the retain path (${policy})`, () => {
+          const { sets, removes } = compose(
+            { indexPolicy },
+            { status: "on" },
+            { record: { zone: "z" } },
+          )
+          expect(sets.gsi1sk).toContain("zone_z#deviceid_d")
+          expect(removes).toEqual([])
+        })
+
+        it(`a key record lacking the mutable composite leaves it: the retain path (${policy})`, () => {
+          for (const record of [{ status: "on" }, { zone: undefined }, { zone: null }]) {
+            const { sets, removes } = compose({ indexPolicy }, { status: "on" }, { record })
+            expect(sets).toEqual({ gsi1pk: expect.any(String) })
+            expect(removes).toEqual([])
+          }
+        })
+
+        it(`a Z-order half with a primary key prefix stays untouched (${policy})`, () => {
+          const zorder = {
+            field: "gsi1sk",
+            composite: ["channel", "x"],
+            zorderHalf: { prefix: ["channel"], dimensions: [], layout: undefined },
+          } as unknown as KeyComposer.IndexDefinition["sk"]
+          expect(compose({ indexPolicy, sk: zorder }, { status: "on" }).removes).toEqual([])
+          expect(compose({ indexPolicy, sk: zorder }, { status: "on" }).sets.gsi1sk).toBeUndefined()
+        })
+      }
+
+      it("an explicit clear still decides the half: 'sparse' drops, 'preserve' keeps", () => {
+        expect(compose({ indexPolicy: { sk: "sparse" } }, { zone: undefined }).removes).toEqual([
+          "gsi1sk",
+        ])
+        expect(compose({ indexPolicy: { sk: "preserve" } }, { zone: undefined }).removes).toEqual(
+          [],
+        )
+        expect(compose({ indexPolicy: { sk: "preserve" } }, { zone: null }).sets.gsi1sk).toBe(
+          undefined,
+        )
+      })
+
+      it("`.remove()` still cascades: a hole drops, a trailing composite truncates", () => {
+        const removedSet = new Set(["zone"])
+        for (const policy of policies) {
+          const indexPolicy = { sk: policy }
+          expect(compose({ indexPolicy }, {}, { removedSet }).removes).toEqual(["gsi1sk"])
+          const trailing = compose({ indexPolicy, ...sk(["deviceId", "zone"]) }, {}, { removedSet })
+          expect(trailing.removes).toEqual([])
+          expect(trailing.sets.gsi1sk?.toString().endsWith("#deviceid_d")).toBe(true)
+        }
+      })
+
+      it("a half wholly in the key record is unchanged: shape 2 still composes (#43)", () => {
+        const { sets } = compose({ ...sk(["deviceId"]) }, { status: "on" })
+        expect(Object.keys(sets).sort()).toEqual(["gsi1pk", "gsi1sk"])
+      })
+
+      it("an empty half is unchanged: shape 6 still composes (#46)", () => {
+        const { sets } = compose(
+          { pk: { field: "gsi1pk", composite: ["zone"] }, ...sk([]) },
+          { status: "on" },
+        )
+        expect(Object.keys(sets)).toEqual(["gsi1sk"])
+      })
+
+      it("a half no composite of which is known is unchanged: shape 1 still skips (#41)", () => {
+        expect(
+          compose(
+            { pk: { field: "gsi1pk", composite: ["tenant"] }, ...sk(["state", "at"]) },
+            { status: "on" },
+          ),
+        ).toEqual({ sets: {}, removes: [] })
+      })
+
+      it("a sharded mixed half stays untouched, and fails no write", () => {
+        const { sets, removes } = compose(
+          {
+            pk: { field: "gsi1pk", composite: ["channel", "zone"] },
+            ...sk(["deviceId"]),
+            shards: {
+              count: 8,
+              by: undefined,
+              previous: undefined,
+              source: ["channel", "deviceId"],
+            },
+          },
+          { status: "on" },
+        )
+        expect(sets).toEqual({ gsi1sk: expect.any(String) })
+        expect(removes).toEqual([])
+      })
+
+      it("a sharded empty partition key half with part of `by` known stays untouched", () => {
+        const { sets, removes } = compose(
+          {
+            pk: { field: "gsi1pk", composite: [] },
+            ...sk(["deviceId", "zone"]),
+            shards: {
+              count: 8,
+              by: ["deviceId", "zone"],
+              previous: undefined,
+              source: ["deviceId", "zone"],
+            },
+          },
+          { status: "on" },
+        )
+        expect(sets).toEqual({})
+        expect(removes).toEqual([])
+      })
+    })
+
+    describe("tryComposeStructuralKeys — a row's key under the structural rule", () => {
+      const def: KeyComposer.IndexDefinition = {
+        index: "gsi1",
+        pk: { field: "gsi1pk", composite: ["region", "tenant"] },
+        sk: { field: "gsi1sk", composite: ["country", "city", "site"] },
+      }
+      const composed = (record: Record<string, unknown>) =>
+        KeyComposer.tryComposeStructuralKeys(schema, "Asset", 1, def, record)
+
+      it("every composite present: the key `composeIndexKeys` composes", () => {
+        const record = { region: "r", tenant: "t", country: "us", city: "sf", site: "s" }
+        const keys = KeyComposer.composeIndexKeys(schema, "Asset", 1, def, record)
+        expect(composed(record)).toEqual({ pk: keys.gsi1pk, sk: keys.gsi1sk })
+      })
+
+      it("trailing composites absent: truncated, as an update stores it", () => {
+        const keys = composed({ region: "r", tenant: "t", country: "us", city: "sf" })
+        expect(keys?.sk.endsWith("#country_us#city_sf")).toBe(true)
+        expect(composed({ region: "r", country: "us" })?.pk.endsWith("#region_r")).toBe(true)
+      })
+
+      it("a hole, or no leading value: no key", () => {
+        expect(composed({ region: "r", tenant: "t", country: "us", site: "s" })).toBeUndefined()
+        expect(composed({ region: "r", tenant: "t", city: "sf" })).toBeUndefined()
+        expect(composed({ tenant: "t", country: "us" })).toBeUndefined()
+      })
+
+      it("a Z-order half has no text form: no key", () => {
+        expect(
+          KeyComposer.tryComposeStructuralKeys(
+            schema,
+            "Asset",
+            1,
+            {
+              ...def,
+              sk: {
+                field: "gsi1sk",
+                composite: ["x"],
+                zorderHalf: { prefix: [], dimensions: [], layout: undefined },
+              } as unknown as KeyComposer.IndexDefinition["sk"],
+            },
+            { region: "r", tenant: "t", x: 1 },
+          ),
+        ).toBeUndefined()
+      })
+    })
+
+    // A new degenerate shape (#183): DynamoDB refuses an update that writes a table key
+    // attribute, whatever it writes, so a half stored in one is never in the result.
+    describe("a half stored in a table key attribute", () => {
+      const indexes: Record<string, KeyComposer.IndexDefinition> = {
+        primary: {
+          pk: { field: "pk", composite: ["tenant"] },
+          sk: { field: "sk", composite: ["id"] },
+        },
+        local: {
+          index: "lsi",
+          pk: { field: "pk", composite: ["tenant"] },
+          sk: { field: "lsk", composite: ["id"] },
+        },
+        inverted: {
+          index: "gsi1",
+          pk: { field: "sk", composite: ["id"] },
+          sk: { field: "pk", composite: ["tenant"] },
+        },
+        byNote: {
+          index: "gsi2",
+          pk: { field: "gsi2pk", composite: ["note"] },
+          sk: { field: "sk", composite: ["id"] },
+        },
+      }
+      const key = { tenant: "t", id: "1" }
+
+      it("isn't set: a write names what's left", () => {
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          indexes,
+          { note: "n" },
+          { ...key, note: "n" },
+        )
+        expect(Object.keys(result.sets).sort()).toEqual(["gsi2pk", "lsk"])
+        expect(result.removes).toEqual([])
+      })
+
+      it("a kept half beside one says nothing, which isn't a drop (shape 12)", () => {
+        const shared = { primary: indexes.primary!, byNote: indexes.byNote! }
+        const kept = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          shared,
+          { note: undefined },
+          key,
+        )
+        expect(kept).toEqual({ sets: {}, removes: [] })
+        const local = {
+          primary: indexes.primary!,
+          byNote: {
+            index: "lsi",
+            pk: { field: "pk", composite: ["tenant"] },
+            sk: { field: "lsk", composite: ["note"] },
+          },
+        }
+        expect(
+          KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Row",
+            1,
+            local,
+            { note: undefined },
+            key,
+          ),
+        ).toEqual({ sets: {}, removes: [] })
+        const sparse = {
+          primary: indexes.primary!,
+          byNote: { ...indexes.byNote!, indexPolicy: { pk: "sparse" as const } },
+        }
+        expect(
+          KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Row",
+            1,
+            sparse,
+            { note: undefined },
+            key,
+          ),
+        ).toEqual({ sets: {}, removes: ["gsi2pk"] })
+      })
+
+      it("isn't removed: dropping the entry takes the other half", () => {
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          indexes,
+          {},
+          key,
+          { removedSet: new Set(["note"]) },
+        )
+        expect(result.removes).toEqual(["gsi2pk"])
+        expect(Object.keys(result.sets).sort()).toEqual(["lsk"])
+      })
+
+      // An update can't ask for this any more (a `.remove()` of a primary key composite is
+      // refused), but a row an earlier release left without one still reads this way. Moving
+      // it from its 1.36 key recomposes from the row, and the move has to keep its key.
+      it("isn't removed for a row that lost a composite of its own", () => {
+        const row = { region: "r", id: "1", note: "n" }
+        const pk = { field: "pk", composite: ["tenant", "region"] }
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          {
+            primary: { pk, sk: { field: "sk", composite: ["id"] } },
+            local: {
+              index: "lsi",
+              pk,
+              sk: { field: "lsk", composite: ["note"] },
+              indexPolicy: { pk: "sparse", sk: "sparse" },
+            },
+          },
+          row,
+          row,
+        )
+        expect(result.removes).toEqual([])
+        expect(Object.keys(result.sets)).toEqual(["lsk"])
+      })
+
+      it("every other shape is untouched when the map holds no primary index", () => {
+        const { primary: _primary, ...secondary } = indexes
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Row",
+          1,
+          secondary,
+          { note: "n" },
+          { ...key, note: "n" },
+        )
+        expect(Object.keys(result.sets).sort()).toEqual(["gsi2pk", "lsk", "pk", "sk"])
+      })
+    })
+
     describe("empty-composite halves are always evaluated (issue #46)", () => {
       const emptySkIndexes = (
         indexPolicy?: KeyComposer.IndexPolicy,
@@ -1343,17 +1733,38 @@ describe("KeyComposer", () => {
       it("update touching the PK half → empty SK half ALSO emits SET (constant prefix)", () => {
         // The exact #46 reproducer scenario. Pre-v1.7.3: gsi3pk SET,
         // gsi3sk silently skipped. Post-v1.7.3: both halves SET.
-        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
+        const escaped = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schemaOn,
           "Vehicle",
           1,
           emptySkIndexes(),
           { deviceBinding: "cloud#dev-1" },
           { id: "veh-1" },
         )
-        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(escaped.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud%23dev-1")
+        expect(escaped.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schemaOn,
+          "Vehicle",
+          1,
+          emptySkIndexes(),
+          { deviceBinding: "cloud#dev-1" },
+          { id: "veh-1" },
+        )
+        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud%23dev-1")
         expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
         expect(result.removes).toEqual([])
+        const off = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schemaOff,
+          "Vehicle",
+          1,
+          emptySkIndexes(),
+          { deviceBinding: "cloud#dev-1" },
+          { id: "veh-1" },
+        )
+        expect(off.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(off.sets.gsi3sk).toBe("$myapp#v1#vehicle")
+        expect(off.removes).toEqual([])
       })
 
       it("update with empty payload (untouched PK) still evaluates empty SK half (constant prefix)", () => {
@@ -1432,14 +1843,14 @@ describe("KeyComposer", () => {
         // { kind: 'set', length: 0 } regardless of policy. The skip-
         // predicate now reaches that branch even under sparse.
         const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
-          schema,
+          schemaOn,
           "Vehicle",
           1,
           emptySkIndexes({ pk: "sparse", sk: "sparse" }),
           { deviceBinding: "cloud#dev-1" },
           { id: "veh-1" },
         )
-        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud#dev-1")
+        expect(result.sets.gsi3pk).toBe("$myapp#v1#vehicle#devicebinding_cloud%23dev-1")
         expect(result.sets.gsi3sk).toBe("$myapp#v1#vehicle")
         expect(result.removes).toEqual([])
       })
@@ -2449,11 +2860,11 @@ describe("KeyComposer", () => {
         pk: { field: "gsi1pk", composite: ["deviceId"] },
         sk: { field: "gsi1sk", composite: ["seq", "part"] },
       }
-      const operand = KeyComposer.composeSortKeyBeginsWith(schema, "Reading", 1, numericSk, {
+      const operand = KeyComposer.composeSortKeyBeginsWith(schemaOn, "Reading", 1, numericSk, {
         seq: 42,
       })
       expect(operand).toBe("$myapp#v1#reading#seq_0000000000000042#")
-      const fraction = KeyComposer.composeSk(schema, "Reading", 1, numericSk, {
+      const fraction = KeyComposer.composeSk(schemaOn, "Reading", 1, numericSk, {
         seq: 42.5,
         part: "a",
       })
@@ -2508,8 +2919,51 @@ describe("KeyComposer", () => {
         ...collection,
       }) as KeyComposer.IndexDefinition
 
-    it("partial prefix — begins_with on the prefix and the delimiter", () => {
+    it("partial prefix on a secondary index, escaped — the prefix and everything below it", () => {
       const index = onIndex(["status", "taskId"])
+      const prefix = KeyComposer.composeSortKeyPrefix(schemaOn, "Task", 1, index, {
+        status: "done",
+      })
+      expect(
+        KeyComposer.composeSortKeyCondition(schemaOn, "Task", 1, index, { status: "done" }),
+      ).toEqual({ between: [prefix, `${prefix}#\uFFFF`] })
+    })
+
+    it("partial prefix on a secondary index, off — begins_with, as 1.36 sent it", () => {
+      const index = onIndex(["status", "taskId"])
+      expect(
+        KeyComposer.composeSortKeyCondition(schemaOff, "Task", 1, index, { status: "done" }),
+      ).toEqual({ beginsWith: "$myapp#v1#task#status_done#" })
+    })
+
+    it("partial prefix on a secondary index selects the truncated row and no sibling", () => {
+      const index = onIndex(["city", "site"])
+      const composed = KeyComposer.composeSortKeyCondition(schemaOn, "Task", 1, index, {
+        city: "sf",
+      }) as { between: readonly [string, string] }
+      const [low, high] = composed.between
+      const selects = (key: string) => low <= key && key <= high
+      const at = (city: string, site?: string) =>
+        KeyComposer.composeSkPrefixUpTo(
+          schemaOn,
+          "Task",
+          1,
+          index,
+          site === undefined ? { city } : { city, site },
+          site === undefined ? 1 : 2,
+        )
+      expect(selects(at("sf"))).toBe(true)
+      expect(selects(at("sf", "a"))).toBe(true)
+      expect(selects(at("sf", "\u{10FFFF}"))).toBe(true)
+      for (const sibling of ["sfx", "sf x", "sf!", "sf#a", "sf$", "sf%", "sf\u0000"]) {
+        expect(selects(at(sibling)), sibling).toBe(false)
+        expect(selects(at(sibling, "a")), sibling).toBe(false)
+      }
+      expect(selects(at("se"))).toBe(false)
+    })
+
+    it("partial prefix on the primary index — begins_with on the prefix and the delimiter", () => {
+      const { index: _gsi, ...index } = onIndex(["status", "taskId"])
       expect(
         KeyComposer.composeSortKeyCondition(schema, "Task", 1, index, { status: "done" }),
       ).toEqual({
@@ -2517,6 +2971,13 @@ describe("KeyComposer", () => {
           status: "done",
         }),
       })
+    })
+
+    it("subtreePrefix recognises a subtree condition and nothing else", () => {
+      expect(KeyComposer.subtreePrefix(KeyComposer.subtreeCondition("a#b"))).toBe("a#b")
+      expect(KeyComposer.subtreePrefix({ between: ["a", "b"] })).toBeUndefined()
+      expect(KeyComposer.subtreePrefix({ beginsWith: "a#" })).toBeUndefined()
+      expect(KeyComposer.subtreePrefix({ eq: "a" })).toBeUndefined()
     })
 
     it("complete key — eq on exactly the key composeSk writes", () => {
@@ -2537,14 +2998,14 @@ describe("KeyComposer", () => {
     for (const [shape, collection] of shapes) {
       it(`${shape}: a pinned number matches neither its fractions nor longer digits`, () => {
         const index = onIndex(["tag", "seq"], collection)
-        const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+        const condition = KeyComposer.composeSortKeyCondition(schemaOn, "Reading", 1, index, {
           tag: "a",
           seq: 3,
         })
         expect("eq" in condition).toBe(true)
         const eq = (condition as { readonly eq: string }).eq
         const stored = (seq: number) =>
-          KeyComposer.composeSk(schema, "Reading", 1, index, { tag: "a", seq })
+          KeyComposer.composeSk(schemaOn, "Reading", 1, index, { tag: "a", seq })
         expect(stored(3)).toBe(eq)
         for (const sibling of [3.14, 3.5, 30, -3, -3.14]) {
           expect(stored(sibling) === eq, String(sibling)).toBe(false)
@@ -2559,8 +3020,8 @@ describe("KeyComposer", () => {
       // `:0381` (1e38) is a prefix of `:03815` (1.5e38) and `:03812` (1.2e38).
       const index = onIndex(["level"])
       const stored = (level: bigint) =>
-        KeyComposer.composeSk(schema, "Reading", 1, index, { level })
-      const condition = KeyComposer.composeSortKeyCondition(schema, "Reading", 1, index, {
+        KeyComposer.composeSk(schemaOn, "Reading", 1, index, { level })
+      const condition = KeyComposer.composeSortKeyCondition(schemaOn, "Reading", 1, index, {
         level: 10n ** 38n,
       })
       expect(condition).toEqual({ eq: stored(10n ** 38n) })

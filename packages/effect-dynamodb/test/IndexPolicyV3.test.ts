@@ -33,12 +33,15 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { CompositeNullableError } from "@effect-dynamodb/schema/Errors.js"
+import { shardOf } from "@effect-dynamodb/schema/internal/Shards.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import { applyUpdate, mockDynamoClient, mockOutput } from "./helpers/MockDynamoClient.js"
+import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 // ---------------------------------------------------------------------------
 // Mock client capture helpers
@@ -1939,4 +1942,1014 @@ describe("Entity append — Z-order halves (#171)", () => {
       }).pipe(Effect.provide(layer), Effect.scoped)
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// Sharded indexes (#183): the canonical shapes through the standard, retain and
+// append paths, with the new degenerate fixtures 9a–9c.
+// ---------------------------------------------------------------------------
+
+describe("Entity update — sharded indexes, canonical shapes (#183)", () => {
+  const ShardedSchema = DynamoSchema.make({ name: "fleet", version: 1 })
+
+  class Fleet extends Schema.Class<Fleet>("Fleet")({
+    channel: Schema.String,
+    deviceId: Schema.String,
+    accountId: Schema.optional(Schema.String),
+    alertState: Schema.optional(Schema.String),
+    timestamp: Schema.optional(Schema.Number),
+    region: Schema.optional(Schema.String),
+    country: Schema.optional(Schema.String),
+    city: Schema.optional(Schema.String),
+    deviceBinding: Schema.optional(Schema.String),
+    zone: Schema.optional(Schema.String),
+    hubId: Schema.optional(Schema.String),
+    tenantId: Schema.optional(Schema.String),
+    groupId: Schema.optional(Schema.String),
+    status: Schema.optional(Schema.String),
+  }) {}
+
+  const primaryKey = {
+    pk: { field: "pk", composite: ["channel"] },
+    sk: { field: "sk", composite: ["deviceId"] },
+  } as const
+
+  const shapes = {
+    // Shape 1: multi-writer. The account is one writer's, the alert another's.
+    multiWriter: {
+      name: "gsi1",
+      pk: { field: "gsi1pk", composite: ["accountId"] },
+      sk: { field: "gsi1sk", composite: ["alertState", "timestamp"] },
+      shards: 8,
+    },
+    // Shape 2: PK-composites-only. Every value arrives through the key (#43).
+    keyOnly: {
+      name: "gsi2",
+      pk: { field: "gsi2pk", composite: ["channel"] },
+      sk: { field: "gsi2sk", composite: ["deviceId"] },
+      shards: 8,
+    },
+    // Shape 3: hierarchical.
+    hierarchy: {
+      name: "gsi3",
+      pk: { field: "gsi3pk", composite: ["region"] },
+      sk: { field: "gsi3sk", composite: ["country", "city"] },
+      shards: 8,
+    },
+    // Shape 4: hole. An optional leading composite, a present trailing one.
+    hole: {
+      name: "gsi4",
+      pk: { field: "gsi4pk", composite: ["zone", "hubId"] },
+      sk: { field: "gsi4sk", composite: ["status"] },
+      shards: 8,
+    },
+    // Shape 6: an empty sort key half: a constant prefix (#46).
+    binding: {
+      name: "gsi5",
+      pk: { field: "gsi5pk", composite: ["deviceBinding"] },
+      sk: { field: "gsi5sk", composite: [] },
+      shards: 8,
+    },
+  } as const
+
+  const degenerate = {
+    // Shape 5: all composites mutable, with `by`.
+    byGroup: {
+      name: "gsi6",
+      pk: { field: "gsi6pk", composite: ["tenantId"] },
+      sk: { field: "gsi6sk", composite: ["groupId", "status"] },
+      shards: { count: 8, by: ["groupId"] },
+    },
+    // 9a: an empty partition key half with `by`: no longer a constant.
+    emptyPkBy: {
+      name: "gsi7",
+      pk: { field: "gsi7pk", composite: [] },
+      sk: { field: "gsi7sk", composite: ["groupId"] },
+      shards: { count: 8, by: ["groupId"] },
+    },
+    // 9b: a `by` attribute that is also in the primary key.
+    keyedBy: {
+      name: "gsi8",
+      pk: { field: "gsi8pk", composite: ["zone"] },
+      sk: { field: "gsi8sk", composite: ["deviceId"] },
+      shards: { count: 8, by: ["deviceId"] },
+    },
+    // 9c: an empty partition key half with the default source: varies per item.
+    emptyPk: {
+      name: "gsi9",
+      pk: { field: "gsi9pk", composite: [] },
+      sk: { field: "gsi9sk", composite: ["status"] },
+      shards: 8,
+    },
+  } as const
+
+  const Fleets = Entity.make({
+    model: Fleet,
+    entityType: "Fleet",
+    primaryKey,
+    indexes: { ...shapes, ...degenerate },
+  })
+  const Retained = Entity.make({
+    model: Fleet,
+    entityType: "Retained",
+    primaryKey,
+    indexes: { ...shapes, ...degenerate },
+    versioned: { retain: true },
+  })
+  const ShardedTable = Table.make({ schema: ShardedSchema, entities: { Fleets, Retained } })
+  const ShardedLayer = ShardedTable.layer({ name: "fleet-table" })
+
+  const stored = (entityType: string, extra: Record<string, AttributeValue> = {}) => ({
+    pk: { S: "pk" },
+    sk: { S: "sk" },
+    channel: { S: "channel-a" },
+    deviceId: { S: "device-1" },
+    version: { N: "1" },
+    __edd_e__: { S: entityType },
+    ...extra,
+  })
+
+  const client = DynamoClient.make({ entities: { Fleets, Retained }, tables: { ShardedTable } })
+
+  const updateOf = (
+    entity: "Fleets" | "Retained",
+    f: (update: any) => { readonly asEffect: () => Effect.Effect<unknown, unknown> },
+    extra: Record<string, AttributeValue> = {},
+  ) => {
+    const capture: Capture = {}
+    const row = stored(entity === "Fleets" ? "Fleet" : "Retained", extra)
+    const layer = Layer.mergeAll(Layer.succeed(DynamoClient, makeZMock(capture, row)), ShardedLayer)
+    return Effect.gen(function* () {
+      const db: any = yield* client
+      yield* f(
+        db.entities[entity].update({ channel: "channel-a", deviceId: "device-1" }),
+      ).asEffect()
+      const written =
+        entity === "Fleets"
+          ? capture.updateItem
+          : (capture.transactWriteItems?.TransactItems?.[0]?.Update as UpdateItemCommandInput)
+      expect(written).toBeDefined()
+      return wireOf(written!)
+    }).pipe(Effect.provide(layer), Effect.scoped)
+  }
+
+  const standard = (f: Parameters<typeof updateOf>[1]) => updateOf("Fleets", f)
+  const retained = (f: Parameters<typeof updateOf>[1], extra?: Record<string, AttributeValue>) =>
+    updateOf("Retained", f, extra)
+
+  /** The sharded text of a partition key: its marker, then its values. */
+  const shardedText = (entityType: string, shard: number, rest = "") =>
+    `$fleet#v1#${entityType}#!8.${shard}${rest}`
+  const keySource = shardOf(["channel-a", "device-1"], 8)
+  const groupShard = (group: string) => shardOf([group], 8)
+
+  describe("shape 1 — multi-writer", () => {
+    it.effect("a writer's SK half alone: the sharded PK half is skipped", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.set({ alertState: "ok", timestamp: 5 }))
+        untouched(wire, "gsi1pk")
+        expect(wire.sets.gsi1sk?.S).toBe(
+          `$fleet#v1#fleet#alertstate_ok#timestamp_${KeyComposer.serializeValue(5)}`,
+        )
+      }),
+    )
+
+    it.effect("the other writer's PK half: SET sharded, SK untouched", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.set({ accountId: "acct" }))
+        expect(wire.sets.gsi1pk?.S).toBe(shardedText("fleet", keySource, "#accountid_acct"))
+        untouched(wire, "gsi1sk")
+      }),
+    )
+  })
+
+  describe("shape 2 — PK-composites-only (#43)", () => {
+    it.effect("every write SETs the sharded key, from the key alone", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.set({ status: "on" }))
+        expect(wire.sets.gsi2pk?.S).toBe(shardedText("fleet", keySource, "#channel_channel-a"))
+        expect(wire.sets.gsi2sk?.S).toBe("$fleet#v1#fleet#deviceid_device-1")
+      }),
+    )
+  })
+
+  describe("shape 3 — hierarchical", () => {
+    it.effect("a truncated PK half keeps the marker; the SK truncates", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.set({ region: "r", country: "c" }).remove(["city"]))
+        expect(wire.sets.gsi3pk?.S).toBe(shardedText("fleet", keySource, "#region_r"))
+        expect(wire.sets.gsi3sk?.S).toBe("$fleet#v1#fleet#country_c")
+        expect(wire.removes.has("gsi3pk")).toBe(false)
+      }),
+    )
+  })
+
+  describe("shape 4 — hole", () => {
+    it.effect("'preserve' leaves the half; `.remove()` cascades", () =>
+      Effect.gen(function* () {
+        const left = yield* standard((u) => u.set({ hubId: "h" }))
+        untouched(left, "gsi4pk")
+        const cascaded = yield* standard((u) => u.set({ hubId: "h" }).remove(["zone"]))
+        expect(cascaded.removes.has("gsi4pk")).toBe(true)
+      }),
+    )
+  })
+
+  describe("shape 5 — all composites mutable", () => {
+    it.effect("the payload carries them: the entry moves to its new shard", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.set({ tenantId: "t", groupId: "g", status: "on" }))
+        expect(wire.sets.gsi6pk?.S).toBe(shardedText("fleet", groupShard("g"), "#tenantid_t"))
+        expect(wire.sets.gsi6sk?.S).toBe("$fleet#v1#fleet#groupid_g#status_on")
+      }),
+    )
+  })
+
+  describe("shape 6 — empty sort key half (#46)", () => {
+    it.effect("the constant prefix always SETs; the sharded PK when bound", () =>
+      Effect.gen(function* () {
+        const unbound = yield* standard((u) => u.set({ status: "on" }))
+        expect(unbound.sets.gsi5sk?.S).toBe("$fleet#v1#fleet")
+        untouched(unbound, "gsi5pk")
+        const bound = yield* standard((u) => u.set({ deviceBinding: "b" }))
+        expect(bound.sets.gsi5pk?.S).toBe(shardedText("fleet", keySource, "#devicebinding_b"))
+        expect(bound.sets.gsi5sk?.S).toBe("$fleet#v1#fleet")
+      }),
+    )
+  })
+
+  describe("the update gate with `by` (finding 2)", () => {
+    it.effect("a `by`-only update fails with nothing written", () => {
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeZMock(capture, stored("Fleet"))),
+        ShardedLayer,
+      )
+      return Effect.gen(function* () {
+        const db: any = yield* client
+        const error: any = yield* db.entities.Fleets.update({
+          channel: "channel-a",
+          deviceId: "device-1",
+        })
+          .set({ groupId: "g" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause)).toContain("[EDD-9100]")
+        expect(capture.updateItem).toBeUndefined()
+      }).pipe(Effect.provide(layer), Effect.scoped) as Effect.Effect<void, unknown>
+    })
+
+    it.effect("moving the tenant without `by` fails rather than go unsharded", () => {
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(DynamoClient, makeZMock(capture, stored("Fleet"))),
+        ShardedLayer,
+      )
+      return Effect.gen(function* () {
+        const db: any = yield* client
+        const error: any = yield* db.entities.Fleets.update({
+          channel: "channel-a",
+          deviceId: "device-1",
+        })
+          .set({ tenantId: "t" })
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(String(error.cause)).toContain("[EDD-9100]")
+        expect(capture.updateItem).toBeUndefined()
+      }).pipe(Effect.provide(layer), Effect.scoped) as Effect.Effect<void, unknown>
+    })
+
+    it.effect("`.remove(['groupId'])` drops the sharded half and writes no unsharded key", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.remove(["groupId"]))
+        expect(wire.removes.has("gsi6pk")).toBe(true)
+        expect(wire.sets).not.toHaveProperty("gsi6pk")
+      }),
+    )
+
+    it.effect("an unrelated update leaves it alone", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.set({ zone: "z" }))
+        untouched(wire, "gsi6pk")
+      }),
+    )
+
+    it.effect("the retain path reads the item, so a `by`-only update composes", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained((u) => u.set({ groupId: "g" }), {
+          tenantId: { S: "t" },
+          status: { S: "on" },
+        })
+        expect(wire.sets.gsi6pk?.S).toBe(shardedText("retained", groupShard("g"), "#tenantid_t"))
+      }),
+    )
+
+    it.effect("the retain path's whole item doesn't count as touching `by`", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained((u) => u.set({ zone: "z" }), {
+          tenantId: { S: "t" },
+          status: { S: "on" },
+        })
+        expect(wire.removes.has("gsi6pk")).toBe(false)
+      }),
+    )
+  })
+
+  describe("new degenerate fixtures", () => {
+    it.effect("9a — empty PK half with `by`: skipped until `by` is written", () =>
+      Effect.gen(function* () {
+        const unrelated = yield* standard((u) => u.set({ zone: "z" }))
+        untouched(unrelated, "gsi7pk")
+        const moved = yield* standard((u) => u.set({ tenantId: "t", groupId: "g" }))
+        expect(moved.sets.gsi7pk?.S).toBe(shardedText("fleet", groupShard("g")))
+        expect(moved.sets.gsi7sk?.S).toBe("$fleet#v1#fleet#groupid_g")
+        const removed = yield* standard((u) => u.remove(["groupId"]))
+        expect(removed.removes.has("gsi7pk")).toBe(true)
+      }),
+    )
+
+    it.effect("9b — `by` in the primary key: composes from the key record", () =>
+      Effect.gen(function* () {
+        const untouchedHalf = yield* standard((u) => u.set({ status: "on" }))
+        untouched(untouchedHalf, "gsi8pk")
+        const moved = yield* standard((u) => u.set({ zone: "z" }))
+        expect(moved.sets.gsi8pk?.S).toBe(shardedText("fleet", shardOf(["device-1"], 8), "#zone_z"))
+      }),
+    )
+
+    it.effect("9c — empty PK half with the default source: varies per item", () =>
+      Effect.gen(function* () {
+        const wire = yield* standard((u) => u.set({ status: "on" }))
+        expect(wire.sets.gsi9pk?.S).toBe(shardedText("fleet", keySource))
+        expect(wire.sets.gsi9sk?.S).toBe("$fleet#v1#fleet#status_on")
+      }),
+    )
+  })
+
+  describe("the Z-order shapes", () => {
+    class Listing extends Schema.Class<Listing>("Listing")({
+      listingId: Schema.String,
+      region: Schema.optional(Schema.String),
+      agencyId: Schema.optional(Schema.String),
+      price: Schema.optional(Schema.Number),
+      bedrooms: Schema.optional(Schema.Number),
+    }) {}
+    const zorder = [
+      { field: "price", min: 0, max: 1000, step: 1 },
+      { field: "bedrooms", min: 0, max: 15, step: 1 },
+    ] as const
+    const Listings = Entity.make({
+      model: Listing,
+      entityType: "Listing",
+      primaryKey: {
+        pk: { field: "pk", composite: ["listingId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        // Shape 7: a sharded PK half beside a Z-order SK.
+        byFacets: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["region"] },
+          sk: { field: "gsi1sk", zorder },
+          shards: 4,
+        },
+        // Shape 8: a composite prefix before the bytes.
+        byAgency: {
+          name: "gsi2",
+          pk: { field: "gsi2pk", composite: ["region"] },
+          sk: { field: "gsi2sk", prefix: ["agencyId"], zorder },
+          shards: 4,
+        },
+      },
+    })
+    const ZShardedTable = Table.make({ schema: ShardedSchema, entities: { Listings } })
+
+    const write = (payload: Record<string, unknown>) => {
+      const capture: Capture = {}
+      const layer = Layer.mergeAll(
+        Layer.succeed(
+          DynamoClient,
+          makeZMock(capture, {
+            pk: { S: "pk" },
+            sk: { S: "sk" },
+            listingId: { S: "l-1" },
+            __edd_e__: { S: "Listing" },
+          }),
+        ),
+        ZShardedTable.layer({ name: "z-table" }),
+      )
+      return Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: { Listings },
+          tables: { ZShardedTable },
+        })
+        yield* db.entities.Listings.update({ listingId: "l-1" }).set(payload).asEffect()
+        return wireOf(capture.updateItem!)
+      }).pipe(Effect.provide(layer), Effect.scoped) as Effect.Effect<
+        ReturnType<typeof wireOf>,
+        unknown
+      >
+    }
+
+    it.effect("shape 7: the sharded PK beside the bytes, each half on its own", () =>
+      Effect.gen(function* () {
+        const full = yield* write({ region: "r", price: 5, bedrooms: 2 })
+        expect(full.sets.gsi1pk?.S).toMatch(/^\$fleet#v1#listing#!4\.\d#region_r$/)
+        expect(full.sets.gsi1sk?.B).toBeInstanceOf(Uint8Array)
+        const dimensions = yield* write({ price: 5, bedrooms: 2 })
+        untouched(dimensions, "gsi1pk")
+        expect(dimensions.sets.gsi1sk?.B).toBeInstanceOf(Uint8Array)
+      }),
+    )
+
+    it.effect("shape 8: a prefix change isn't a shard change without `by`", () =>
+      Effect.gen(function* () {
+        const wire = yield* write({ agencyId: "a", price: 5, bedrooms: 2 })
+        untouched(wire, "gsi2pk")
+        expect(wire.sets.gsi2sk?.B).toBeInstanceOf(Uint8Array)
+      }),
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Canonical shape 10 (#183): a half mixing a primary key composite with a mutable
+// one. One composite in the key record is no claim on the half: an update that
+// names no composite of it must leave the stored key byte for byte, on every path.
+// ---------------------------------------------------------------------------
+
+class MixedDevice extends Schema.Class<MixedDevice>("MixedDevice")({
+  channel: Schema.String,
+  deviceId: Schema.String,
+  at: Schema.DateTimeUtc,
+  zone: Schema.optional(Schema.String),
+  status: Schema.optional(Schema.String),
+}) {}
+
+const mixedIndexes = {
+  leadingSparse: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["channel"] },
+    sk: { field: "gsi1sk", composite: ["zone", "deviceId"] },
+    indexPolicy: { sk: "sparse" },
+  },
+  leadingPreserve: {
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: ["channel"] },
+    sk: { field: "gsi2sk", composite: ["zone", "deviceId"] },
+  },
+  trailing: {
+    name: "gsi3",
+    pk: { field: "gsi3pk", composite: ["channel"] },
+    sk: { field: "gsi3sk", composite: ["deviceId", "zone"] },
+  },
+  mixedPk: {
+    name: "gsi4",
+    pk: { field: "gsi4pk", composite: ["channel", "zone"] },
+    sk: { field: "gsi4sk", composite: ["deviceId"] },
+  },
+  sharded: {
+    name: "gsi5",
+    pk: { field: "gsi5pk", composite: ["channel", "zone"] },
+    sk: { field: "gsi5sk", composite: ["deviceId"] },
+    shards: 8,
+  },
+} as const
+
+const mixedPrimary = {
+  pk: { field: "pk", composite: ["channel"] },
+  sk: { field: "sk", composite: ["deviceId"] },
+} as const
+
+const MixedSchema = DynamoSchema.make({ name: "mixed", version: 1 })
+const MixedDevices = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedDevice",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+})
+const MixedRetained = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedRetained",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+  versioned: { retain: true },
+})
+const MixedSeries = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedSeries",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      channel: Schema.String,
+      deviceId: Schema.String,
+      at: Schema.DateTimeUtc,
+      status: Schema.optional(Schema.String),
+    }),
+  },
+})
+const MixedSeriesWithZone = Entity.make({
+  model: MixedDevice,
+  entityType: "MixedSeries",
+  primaryKey: mixedPrimary,
+  indexes: mixedIndexes,
+  timeSeries: {
+    orderBy: "at",
+    appendInput: Schema.Struct({
+      channel: Schema.String,
+      deviceId: Schema.String,
+      at: Schema.DateTimeUtc,
+      zone: Schema.optional(Schema.String),
+    }),
+  },
+})
+const MixedTable = Table.make({
+  schema: MixedSchema,
+  entities: { MixedDevices, MixedRetained, MixedSeries },
+})
+const MixedZoneTable = Table.make({
+  schema: MixedSchema,
+  entities: { MixedSeriesWithZone },
+})
+
+/** Every half the unrelated writes below must not touch. */
+const MIXED_HALVES = ["gsi1sk", "gsi2sk", "gsi3sk", "gsi4pk", "gsi5pk"] as const
+
+const mixedStored = (entityType: string, zone?: string): Record<string, AttributeValue> => ({
+  pk: { S: `$mixed#v1#${entityType.toLowerCase()}#channel_c-1` },
+  sk: { S: `$mixed#v1#${entityType.toLowerCase()}#deviceid_d-1` },
+  channel: { S: "c-1" },
+  deviceId: { S: "d-1" },
+  at: { S: "2026-04-30T10:00:00.000Z" },
+  version: { N: "1" },
+  __edd_e__: { S: entityType },
+  ...(zone === undefined ? {} : { zone: { S: zone } }),
+})
+
+const mixedLayer = (capture: Capture, stored: Record<string, AttributeValue>) =>
+  Layer.mergeAll(
+    Layer.succeed(
+      DynamoClient,
+      mockDynamoClient({
+        ...makeMockClient(capture),
+        getItem: () => Effect.succeed(mockOutput<GetItemCommandOutput>({ Item: stored })),
+        updateItem: (input) => {
+          capture.updateItem = input
+          return Effect.succeed(mockOutput<UpdateItemCommandOutput>({ Attributes: stored }))
+        },
+      }),
+    ),
+    MixedTable.layer({ name: "mixed-table" }),
+    MixedZoneTable.layer({ name: "mixed-table" }),
+  )
+
+const mixedClient = DynamoClient.make({
+  entities: { MixedDevices, MixedRetained, MixedSeries },
+  tables: { MixedTable },
+})
+
+const standardMixed = (
+  f: (devices: Effect.Success<typeof mixedClient>["entities"]["MixedDevices"]) => ZWrite,
+) => {
+  const capture: Capture = {}
+  return Effect.gen(function* () {
+    const db = yield* mixedClient
+    yield* f(db.entities.MixedDevices).asEffect()
+    return wireOf(capture.updateItem!)
+  }).pipe(Effect.provide(mixedLayer(capture, mixedStored("MixedDevice"))), Effect.scoped)
+}
+
+const expectUntouched = (wire: ReturnType<typeof wireOf>) => {
+  for (const half of MIXED_HALVES) {
+    expect(wire.sets, half).not.toHaveProperty(half)
+    expect(wire.removes.has(half), half).toBe(false)
+  }
+}
+
+describe("Entity writes — shape 10: a half mixing a primary key composite with a mutable one", () => {
+  describe("the standard path", () => {
+    it.effect("an unrelated update leaves every mixed half alone, under both policies", () =>
+      Effect.gen(function* () {
+        const wire = yield* standardMixed((devices) =>
+          devices.update({ channel: "c-1", deviceId: "d-1" }).set({ status: "on" }),
+        )
+        expectUntouched(wire)
+        // The halves wholly in the primary key still compose (#43).
+        expect(wire.sets.gsi1pk?.S).toBe("$mixed#v1#mixeddevice#channel_c-1")
+        expect(wire.sets.gsi4sk?.S).toBe("$mixed#v1#mixeddevice#deviceid_d-1")
+      }),
+    )
+
+    it.effect("naming the mutable composite composes each half", () =>
+      Effect.gen(function* () {
+        const wire = yield* standardMixed((devices) =>
+          devices.update({ channel: "c-1", deviceId: "d-1" }).set({ zone: "z" }),
+        )
+        expect(wire.sets.gsi1sk?.S).toBe("$mixed#v1#mixeddevice#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi2sk?.S).toBe("$mixed#v1#mixeddevice#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixeddevice#deviceid_d-1#zone_z")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixeddevice#channel_c-1#zone_z")
+        expect(wire.sets.gsi5pk?.S).toBe(
+          `$mixed#v1#mixeddevice#!8.${shardOf(["c-1", "d-1"], 8)}#channel_c-1#zone_z`,
+        )
+        expect(wire.removes.size).toBe(0)
+      }),
+    )
+
+    it.effect("`.remove()` cascades: a leading hole drops, a trailing one truncates", () =>
+      Effect.gen(function* () {
+        const wire = yield* standardMixed((devices) =>
+          devices.update({ channel: "c-1", deviceId: "d-1" }).remove(["zone"]),
+        )
+        expect(wire.removes.has("gsi1sk")).toBe(true)
+        expect(wire.removes.has("gsi2sk")).toBe(true)
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixeddevice#deviceid_d-1")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixeddevice#channel_c-1")
+      }),
+    )
+  })
+
+  describe("the retain path", () => {
+    const retained = (zone?: string, keys: Record<string, AttributeValue> = {}) => {
+      const capture: Capture = {}
+      const stored = { ...mixedStored("MixedRetained", zone), ...keys }
+      return Effect.gen(function* () {
+        const db = yield* mixedClient
+        yield* db.entities.MixedRetained.update({ channel: "c-1", deviceId: "d-1" }).set({
+          status: "on",
+        })
+        const tx = capture.transactWriteItems as {
+          TransactItems: Array<{ Update?: Parameters<typeof wireOf>[0] }>
+        }
+        return wireOf(tx.TransactItems.find((item) => item.Update !== undefined)!.Update!)
+      }).pipe(Effect.provide(mixedLayer(capture, stored)), Effect.scoped)
+    }
+
+    it.effect("an item lacking the mutable composite gets no such half", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained()
+        for (const half of MIXED_HALVES) expect(wire.sets, half).not.toHaveProperty(half)
+      }),
+    )
+
+    it.effect("an item lacking it with a kept key leaves the key: a skip isn't a drop", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained(undefined, {
+          gsi1pk: { S: "$mixed#v1#mixedretained#channel_c-1" },
+          gsi1sk: { S: "$mixed#v1#mixedretained#zone_z#deviceid_d-1" },
+          gsi4pk: { S: "$mixed#v1#mixedretained#channel_c-1#zone_z" },
+        })
+        for (const half of MIXED_HALVES) {
+          expect(wire.removes.has(half), half).toBe(false)
+          expect(wire.sets, half).not.toHaveProperty(half)
+        }
+      }),
+    )
+
+    it.effect("an item holding it recomposes the key it already has: idempotent", () =>
+      Effect.gen(function* () {
+        const wire = yield* retained("z")
+        expect(wire.sets.gsi1sk?.S).toBe("$mixed#v1#mixedretained#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixedretained#deviceid_d-1#zone_z")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixedretained#channel_c-1#zone_z")
+        expect(wire.removes.size).toBe(0)
+      }),
+    )
+  })
+
+  describe("the append path", () => {
+    const at = DateTime.makeUnsafe("2026-04-30T11:00:00.000Z")
+
+    it.effect("appendInput repeating the primary key claims no mixed half", () => {
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* mixedClient
+        yield* db.entities.MixedSeries.append({
+          channel: "c-1",
+          deviceId: "d-1",
+          at,
+          status: "on",
+        }).skipFollowUp()
+        const tx = capture.transactWriteItems as {
+          TransactItems: Array<{ Update?: Parameters<typeof wireOf>[0] }>
+        }
+        const wire = wireOf(tx.TransactItems[0]!.Update!)
+        expectUntouched(wire)
+        // Wholly primary halves still compose (#43).
+        expect(wire.sets.gsi1pk?.S).toBe("$mixed#v1#mixedseries#channel_c-1")
+        expect(wire.sets.gsi4sk?.S).toBe("$mixed#v1#mixedseries#deviceid_d-1")
+      }).pipe(Effect.provide(mixedLayer(capture, mixedStored("MixedSeries"))), Effect.scoped)
+    })
+
+    it.effect("an appendInput carrying the mutable composite composes them", () => {
+      const capture: Capture = {}
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: { MixedSeriesWithZone },
+          tables: { MixedZoneTable },
+        })
+        yield* db.entities.MixedSeriesWithZone.append({
+          channel: "c-1",
+          deviceId: "d-1",
+          at,
+          zone: "z",
+        }).skipFollowUp()
+        const tx = capture.transactWriteItems as {
+          TransactItems: Array<{ Update?: Parameters<typeof wireOf>[0] }>
+        }
+        const wire = wireOf(tx.TransactItems[0]!.Update!)
+        expect(wire.sets.gsi1sk?.S).toBe("$mixed#v1#mixedseries#zone_z#deviceid_d-1")
+        expect(wire.sets.gsi3sk?.S).toBe("$mixed#v1#mixedseries#deviceid_d-1#zone_z")
+        expect(wire.sets.gsi4pk?.S).toBe("$mixed#v1#mixedseries#channel_c-1#zone_z")
+      }).pipe(Effect.provide(mixedLayer(capture, mixedStored("MixedSeries"))), Effect.scoped)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Canonical shape 9d (#183): `by` after a sort key composite the update can't
+// supply. The shard follows `by`, and `preserve` keeps the sort key: a row there
+// would be out of reach of every pin. Run against a table that stores what's
+// written, so the assertions are about which pins find the row.
+// ---------------------------------------------------------------------------
+
+describe("Entity writes — shape 9d: `by` after a composite the update can't supply", () => {
+  const AgreeSchema = DynamoSchema.make({ name: "agree", version: 1 })
+  const at = DateTime.makeUnsafe("2026-04-30T11:00:00.000Z")
+
+  class Row extends Schema.Class<Row>("Row")({
+    id: Schema.String,
+    tenant: Schema.String,
+    at: Schema.DateTimeUtc,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+    rank: Schema.optional(Schema.Number),
+  }) {}
+
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const byTenant = {
+    name: "gsi",
+    pk: { field: "gpk", composite: ["tenant"] },
+    sk: { field: "gsk", composite: ["region", "group"] },
+    shards: { count: 8, by: ["group"] },
+  } as const
+
+  const Rows = Entity.make({
+    model: Row,
+    entityType: "Row",
+    primaryKey,
+    indexes: { byTenant },
+  })
+  const Sparse = Entity.make({
+    model: Row,
+    entityType: "Sparse",
+    primaryKey,
+    indexes: { byTenant: { ...byTenant, indexPolicy: { sk: "sparse" } } },
+  })
+  const Retained = Entity.make({
+    model: Row,
+    entityType: "Retained",
+    primaryKey,
+    indexes: { byTenant },
+    versioned: { retain: true },
+  })
+  const Ranked = Entity.make({
+    model: Row,
+    entityType: "Ranked",
+    primaryKey,
+    indexes: {
+      byTenant: {
+        name: "gsi",
+        pk: { field: "gpk", composite: ["tenant"] },
+        sk: { field: "gsk", composite: ["region", "rank"] },
+        shards: { count: 8, by: ["rank"] },
+      },
+    },
+  })
+  const Series = Entity.make({
+    model: Row,
+    entityType: "Series",
+    primaryKey,
+    indexes: { byTenant },
+    timeSeries: {
+      orderBy: "at",
+      appendInput: Schema.Struct({
+        id: Schema.String,
+        tenant: Schema.String,
+        at: Schema.DateTimeUtc,
+        group: Schema.String,
+      }),
+    },
+  })
+  const WholeSeries = Entity.make({
+    model: Row,
+    entityType: "Series",
+    primaryKey,
+    indexes: { byTenant },
+    timeSeries: {
+      orderBy: "at",
+      appendInput: Schema.Struct({
+        id: Schema.String,
+        tenant: Schema.String,
+        at: Schema.DateTimeUtc,
+        region: Schema.String,
+        group: Schema.String,
+      }),
+    },
+  })
+  const AgreeTable = Table.make({
+    schema: AgreeSchema,
+    entities: { Rows, Sparse, Retained, Ranked, Series },
+  })
+  const WholeTable = Table.make({ schema: AgreeSchema, entities: { WholeSeries } })
+
+  const on = <A, E>(
+    body: (db: any, table: ReturnType<typeof makeRecordingTable>) => Effect.Effect<A, E, any>,
+  ) => {
+    const table = makeRecordingTable({ indexes: { gsi: { pk: "gpk", sk: "gsk" } } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Rows, Sparse, Retained, Ranked, Series },
+        tables: { AgreeTable },
+      })
+      return yield* body(db, table)
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, AgreeTable.layer({ name: "agree" }))),
+    ) as Effect.Effect<A, E>
+  }
+
+  const pinned = (entity: any, region: string, group: string) =>
+    entity.byTenant({ tenant: "t", region, group }).collect()
+  const refusal = (write: Effect.Effect<unknown, any, any>) =>
+    Effect.map(Effect.flip(write), (error: any) => {
+      expect(error._tag).toBe("ValidationError")
+      expect(String(error.cause)).toContain("[EDD-9100]")
+      expect(String(error.cause)).toContain('"region"')
+    })
+  const seed = { id: "1", tenant: "t", at, region: "r", group: "a" }
+
+  describe("the standard path", () => {
+    it.effect("refuses, and the row stays where its pin finds it", () =>
+      on((db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          const before = structuredClone([...table.items.values()])
+          yield* refusal(
+            db.entities.Rows.update({ id: "1" }).set({ tenant: "t", group: "b" }).asEffect(),
+          )
+          expect([...table.items.values()]).toEqual(before)
+          expect(yield* pinned(db.entities.Rows, "r", "a")).toHaveLength(1)
+          expect(yield* pinned(db.entities.Rows, "r", "b")).toHaveLength(0)
+        }),
+      ),
+    )
+
+    it.effect("a complete update moves shard and sort key together", () =>
+      on((db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          yield* db.entities.Rows.update({ id: "1" })
+            .set({ tenant: "t", region: "r", group: "b" })
+            .asEffect()
+          expect(yield* pinned(db.entities.Rows, "r", "b")).toHaveLength(1)
+          expect(yield* pinned(db.entities.Rows, "r", "a")).toHaveLength(0)
+        }),
+      ),
+    )
+
+    it.effect("under `sparse` the entry leaves the index, and a complete update rejoins", () =>
+      on((db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Sparse.put(seed).asEffect()
+          yield* db.entities.Sparse.update({ id: "1" }).set({ tenant: "t", group: "b" }).asEffect()
+          expect(yield* db.entities.Sparse.byTenant({ tenant: "t" }).collect()).toHaveLength(0)
+          yield* db.entities.Sparse.update({ id: "1" })
+            .set({ tenant: "t", region: "r", group: "b" })
+            .asEffect()
+          expect(yield* pinned(db.entities.Sparse, "r", "b")).toHaveLength(1)
+        }),
+      ),
+    )
+
+    it.effect("`.remove()` of the gap takes the entry out of the index", () =>
+      on((db) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          yield* db.entities.Rows.update({ id: "1" })
+            .set({ tenant: "t", group: "b" })
+            .remove(["region"])
+            .asEffect()
+          expect(yield* db.entities.Rows.byTenant({ tenant: "t" }).collect()).toHaveLength(0)
+        }),
+      ),
+    )
+
+    it.effect("a transaction refuses the same update", () =>
+      on((db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(seed).asEffect()
+          const before = structuredClone([...table.items.values()])
+          yield* refusal(
+            Transaction.transactWrite([
+              Rows.update({ id: "1" }).pipe(Entity.set({ tenant: "t", group: "b" })),
+            ]),
+          )
+          expect([...table.items.values()]).toEqual(before)
+        }),
+      ),
+    )
+  })
+
+  it.effect("the retain path holds the whole item, so a `by`-only update composes both", () =>
+    on((db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Retained.put(seed).asEffect()
+        yield* db.entities.Retained.update({ id: "1" }).set({ group: "b" }).asEffect()
+        expect(yield* pinned(db.entities.Retained, "r", "b")).toHaveLength(1)
+        expect(yield* pinned(db.entities.Retained, "r", "a")).toHaveLength(0)
+      }),
+    ),
+  )
+
+  it.effect("the retain path refuses an item with the gap: nothing can compose it", () =>
+    on((db, table) =>
+      Effect.gen(function* () {
+        yield* db.entities.Retained.put({ id: "1", tenant: "t", at, group: "a" }).asEffect()
+        const before = structuredClone([...table.items.values()])
+        yield* refusal(db.entities.Retained.update({ id: "1" }).set({ group: "b" }).asEffect())
+        expect([...table.items.values()]).toEqual(before)
+      }),
+    ),
+  )
+
+  it.effect("the computed path reads the item, so `.add()` on `by` composes both", () =>
+    on((db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Ranked.put({ id: "1", tenant: "t", at, region: "r", rank: 1 }).asEffect()
+        yield* db.entities.Ranked.update({ id: "1" }).add({ rank: 1 }).asEffect()
+        const found = yield* db.entities.Ranked.byTenant({
+          tenant: "t",
+          region: "r",
+          rank: 2,
+        }).collect()
+        expect(found).toHaveLength(1)
+        expect(
+          yield* db.entities.Ranked.byTenant({ tenant: "t", region: "r", rank: 1 }).collect(),
+        ).toHaveLength(0)
+      }),
+    ),
+  )
+
+  describe("the append path", () => {
+    it.effect("an appendInput carrying `by` without the gap refuses", () =>
+      on((db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Series.put(seed).asEffect()
+          const before = structuredClone([...table.items.values()])
+          yield* refusal(
+            db.entities.Series.append({
+              id: "1",
+              tenant: "t",
+              at: DateTime.addDuration(at, Duration.seconds(1)),
+              group: "b",
+            })
+              .skipFollowUp()
+              .asEffect(),
+          )
+          expect([...table.items.values()]).toEqual(before)
+          expect(yield* pinned(db.entities.Series, "r", "a")).toHaveLength(1)
+        }),
+      ),
+    )
+
+    it.effect("an appendInput carrying the whole sort key moves both", () => {
+      const table = makeRecordingTable({ indexes: { gsi: { pk: "gpk", sk: "gsk" } } })
+      return Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: { WholeSeries },
+          tables: { WholeTable },
+        })
+        yield* db.entities.WholeSeries.put(seed).asEffect()
+        yield* db.entities.WholeSeries.append({
+          id: "1",
+          tenant: "t",
+          at: DateTime.addDuration(at, Duration.seconds(1)),
+          region: "r",
+          group: "b",
+        })
+          .skipFollowUp()
+          .asEffect()
+        expect(yield* pinned(db.entities.WholeSeries, "r", "b")).toHaveLength(1)
+        expect(yield* pinned(db.entities.WholeSeries, "r", "a")).toHaveLength(0)
+      }).pipe(
+        Effect.provide(Layer.merge(table.layer, WholeTable.layer({ name: "agree" }))),
+      ) as Effect.Effect<void, unknown>
+    })
+  })
 })

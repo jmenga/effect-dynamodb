@@ -71,6 +71,7 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
   const mockTransactWrite = vi.fn()
   const TestLayer = Layer.merge(
     mockDynamoClientLayer({
+      getItem: () => Effect.succeed({ $metadata: {} }),
       transactWriteItems: (input) =>
         Effect.tryPromise({
           try: () => mockTransactWrite(input),
@@ -123,31 +124,57 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
     stops: Schema.Array(Stop),
   }) {}
 
-  // #171: every sort key composite escapes U+0000–U+0025 — the collection
-  // sort key's and a many edge's. The partition key does not.
-  const RouteAggregate = Aggregate.make(Route, {
-    table: MainTable,
-    schema: AppSchema,
-    pk: { field: "pk", composite: ["id"] },
-    collection: { index: "lsi1", name: "routes", sk: { field: "lsi1sk", composite: ["area"] } },
-    root: { entityType: "RouteItem" },
-    edges: {
-      stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
-    },
-  })
+  /**
+   * `escapeKeys: true` escapes U+0000–U+0025 in every key composite: the partition key's, the
+   * collection sort key's and a many edge's. Off, they are written as they are.
+   */
+  const routesUnder = (escapeKeys: boolean) => {
+    const schema = DynamoSchema.make({ name: "aggkeys", version: 1, escapeKeys })
+    const table = Table.make({ schema, entities: {} })
+    return {
+      table,
+      aggregate: Aggregate.make(Route, {
+        table,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { index: "lsi1", name: "routes", sk: { field: "lsi1sk", composite: ["area"] } },
+        root: { entityType: "RouteItem" },
+        edges: {
+          stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
+        },
+      }),
+    }
+  }
 
-  it.effect("sort key composites escape characters up to '%'; the partition key does not", () =>
+  const createdRouteKeys = (escapeKeys: boolean) =>
     Effect.gen(function* () {
       mockTransactWrite.mockResolvedValue({})
-      yield* RouteAggregate.create({
-        id: "r 1#x",
-        area: "North East",
-        stops: [
-          { label: "a#b", note: "n" },
-          { label: "new york", note: "n" },
-          { label: "50%", note: "n" },
-        ],
-      } as never)
+      const { aggregate, table } = routesUnder(escapeKeys)
+      yield* aggregate
+        .create({
+          id: "r 1#x",
+          area: "North East",
+          stops: [
+            { label: "a#b", note: "n" },
+            { label: "new york", note: "n" },
+            { label: "50%", note: "n" },
+          ],
+        } as never)
+        .pipe(
+          Effect.provide(
+            Layer.merge(
+              mockDynamoClientLayer({
+                getItem: () => Effect.succeed({ $metadata: {} }),
+                transactWriteItems: (input) =>
+                  Effect.tryPromise({
+                    try: () => mockTransactWrite(input),
+                    catch: (e) => new DynamoError({ operation: "TransactWriteItems", cause: e }),
+                  }),
+              }),
+              table.layer({ name: "aggkeys-table" }),
+            ),
+          ),
+        )
       const items = mockTransactWrite.mock.calls.flatMap(
         ([input]) =>
           (
@@ -156,12 +183,23 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
             }
           ).TransactItems,
       )
-      const keys = items.map((item) => ({
-        pk: item.Put!.Item.pk!.S,
-        sk: item.Put!.Item.sk!.S,
-        lsi1sk: item.Put!.Item.lsi1sk?.S,
-      }))
-      expect(new Set(keys.map((key) => key.pk))).toEqual(new Set(["$aggkeys#v1#routes#r 1#x"]))
+      return items.flatMap((item) =>
+        item.Put === undefined
+          ? []
+          : [
+              {
+                pk: item.Put.Item.pk!.S,
+                sk: item.Put.Item.sk!.S,
+                lsi1sk: item.Put.Item.lsi1sk?.S,
+              },
+            ],
+      )
+    })
+
+  it.effect("with escapeKeys, key composites escape characters up to '%', partition and sort", () =>
+    Effect.gen(function* () {
+      const keys = yield* createdRouteKeys(true)
+      expect(new Set(keys.map((key) => key.pk))).toEqual(new Set(["$aggkeys#v1#routes#r%201%23x"]))
       expect(keys.map((key) => key.sk).sort()).toEqual([
         "$aggkeys#v1#routeitem",
         "$aggkeys#v1#routestop#50%25",
@@ -172,7 +210,23 @@ describe("Aggregate key encoding (shared composite key-form rule)", () => {
       expect(keys.find((key) => key.sk === "$aggkeys#v1#routeitem")?.lsi1sk).toBe(
         "$aggkeys#v1#routes#north%20east",
       )
-    }).pipe(Effect.provide(TestLayer)),
+    }),
+  )
+
+  it.effect("without escapeKeys, key composites are written as they are", () =>
+    Effect.gen(function* () {
+      const keys = yield* createdRouteKeys(false)
+      expect(new Set(keys.map((key) => key.pk))).toEqual(new Set(["$aggkeys#v1#routes#r 1#x"]))
+      expect(keys.map((key) => key.sk).sort()).toEqual([
+        "$aggkeys#v1#routeitem",
+        "$aggkeys#v1#routestop#50%",
+        "$aggkeys#v1#routestop#a#b",
+        "$aggkeys#v1#routestop#new york",
+      ])
+      expect(keys.find((key) => key.sk === "$aggkeys#v1#routeitem")?.lsi1sk).toBe(
+        "$aggkeys#v1#routes#north east",
+      )
+    }),
   )
 
   it.effect("DateEpochMs composes the EPOCH — changed from the previous ISO form", () =>

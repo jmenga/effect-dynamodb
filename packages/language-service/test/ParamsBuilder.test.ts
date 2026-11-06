@@ -315,4 +315,68 @@ describe("ParamsBuilder", () => {
       expect(params.ExpressionAttributeValues![":et0"]).toBe("User")
     })
   })
+
+  describe("a sharded index (#183)", () => {
+    const entity: ResolvedEntity = {
+      variableName: "Devices",
+      entityType: "Device",
+      schema: { name: "fleet", version: 1, casing: "lowercase" },
+      indexes: {
+        primary: {
+          pk: { field: "pk", composite: ["channel"] },
+          sk: { field: "sk", composite: ["deviceId"] },
+        },
+        byTenant: {
+          index: "gsi5",
+          pk: { field: "gsi5pk", composite: ["tenantId"] },
+          sk: { field: "gsi5sk", composite: ["groupId"] },
+          shards: { count: 20, by: ["groupId"], previous: 4 },
+        },
+      },
+      timestamps: false,
+      versioned: false,
+      softDelete: false,
+      unique: undefined,
+    }
+
+    it("a put's key holds the marker, with a placeholder for the shard", () => {
+      const params = buildParamsOrThrow({
+        entity,
+        type: "put",
+        arguments: { channel: "c", deviceId: "d", tenantId: "t", groupId: "g" },
+      })
+      expect(params.Item!.gsi5pk).toBe("$fleet#v1#device#!20.{shard}#tenantid_t")
+      expect(params.Item!.gsi5sk).toBe("$fleet#v1#device#groupid_g")
+    })
+
+    it("a count that isn't a literal is shown as such", () => {
+      const unknown: ResolvedEntity = {
+        ...entity,
+        indexes: {
+          ...entity.indexes,
+          byTenant: {
+            ...entity.indexes.byTenant!,
+            shards: { count: undefined, by: [], previous: undefined },
+          },
+        },
+      }
+      const params = buildParamsOrThrow({
+        entity: unknown,
+        type: "put",
+        arguments: { channel: "c", deviceId: "d", tenantId: "t", groupId: "g" },
+      })
+      expect(params.Item!.gsi5pk).toBe("$fleet#v1#device#!{count}.{shard}#tenantid_t")
+    })
+
+    it("an accessor's hover says how it reads", () => {
+      const params = buildParamsOrThrow({
+        entity,
+        type: "entity-query-accessor",
+        indexName: "byTenant",
+        arguments: { tenantId: "t" },
+      })
+      expect(params.info).toContain("Shards: 20 by groupId")
+      expect(params.info).toContain("previous layout of 4")
+    })
+  })
 })

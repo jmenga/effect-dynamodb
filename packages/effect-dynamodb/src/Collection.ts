@@ -15,7 +15,6 @@ import {
   makeCompositeKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
-import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, type Schema } from "effect"
@@ -232,6 +231,13 @@ export const make = <
       return index === undefined ? [] : [{ key, schema: entity._schema, index }]
     }),
   )
+  KeyComposer.assertCollectionShardsAgreement(
+    name,
+    entityEntries.flatMap(([key, entity]) => {
+      const index = entity.indexes[sharedIndexName]
+      return index === undefined ? [] : [{ key, index }]
+    }),
+  )
 
   // Compute the SK prefix for clustered collections.
   // For sub-collections (collection: ["parent", "child"]), the prefix includes
@@ -303,42 +309,27 @@ export const make = <
   // path uses — see `internal/CompositeCodec.ts`. Members are checked for
   // agreement at `Collections.make()` time, so the first member's form speaks
   // for all.
-  const collectionPk = (pkComposites: Record<string, unknown>) => {
+  const collectionPartitions = (pkComposites: Record<string, unknown>) => {
     const firstEntity = entityEntries[0]![1]
-    return KeyComposer.composePk(
+    // Members share the partitions, whatever each hashes: never pruned (#183).
+    return KeyComposer.composeReadPartitions(
       sharedSchema!,
       firstEntity.entityType,
       firstEntity.indexes[sharedIndexName!]!,
       collectionKeyForm(firstEntity, pkComposites),
+      { prune: false },
     )
   }
-  /**
-   * The partition key 1.36 composed for the same composites (#171): rows 1.36
-   * wrote under a number composite whose text changed are read there too. A
-   * collection's sort key prefix holds names only, so it is unchanged.
-   */
-  const collectionPk136 = (
-    entity: (typeof entityEntries)[number][1],
-    pkComposites: Record<string, unknown>,
-  ): string | undefined =>
-    KeyText136.enabled(sharedSchema!)
-      ? KeyText136.composePk(
-          sharedSchema!,
-          entity.entityType,
-          entity.indexes[sharedIndexName!]!,
-          collectionKeyForm(entity, pkComposites),
-        )
-      : undefined
-
   // Main query: returns grouped results
   const queryAll = (pkComposites: Record<string, unknown>) => {
     // Each item is tagged with its member by `collectionDecoder`; the collect
     // terminal groups them.
+    const read = collectionPartitions(pkComposites)
     let q = Query.make<CollectionResult<TEntities>>({
       tableName: "",
       indexName: sharedDynamoIndexName,
       pkField: sharedPkField!,
-      pkValue: collectionPk(pkComposites),
+      pkValue: read.partitions[0]!,
       skField: sharedSkField,
       entityTypes,
       resolveTableName: entityEntries[0]![1]._tableTag.useSync((tc: TableConfig) => tc.name),
@@ -357,12 +348,14 @@ export const make = <
       keyConditionDiagnosis: { operation: "query", label: `collection "${name}"` },
     })
 
+    q = Query.fanOut(q, read)
+
     // Clustered collections add begins_with SK condition on collection prefix
     if (collectionType === "clustered" && collectionSkPrefix) {
       q = q.pipe(Query.where({ beginsWith: collectionSkPrefix }))
     }
 
-    return Query.alsoReadPartition136(q, collectionPk136(entityEntries[0]![1], pkComposites))
+    return q
   }
 
   // Entity selector functions
@@ -372,12 +365,14 @@ export const make = <
   for (const [key, entity] of entityEntries) {
     selectors[key] = (pkComposites: Record<string, unknown>) => {
       const indexDef = entity.indexes[sharedIndexName!]!
-      const pkValue = KeyComposer.composePk(
+      const read = KeyComposer.composeReadPartitions(
         sharedSchema!,
         entity.entityType,
         indexDef,
         collectionKeyForm(entity, pkComposites),
+        { prune: false },
       )
+      const pkValue = read.partitions[0]!
 
       let q = Query.make({
         tableName: "",
@@ -396,7 +391,7 @@ export const make = <
           entity.indexes.primary?.sk.field,
         ],
         keyConditionDiagnosis: { operation: "query", label: `collection "${name}" (${key})` },
-      })
+      }).pipe((made) => Query.fanOut(made, read))
 
       // Clustered entity selectors add begins_with on the entity SK prefix.
       // For sub-collections, the prefix uses the FULL hierarchy from root to
@@ -415,7 +410,7 @@ export const make = <
         q = q.pipe(Query.where({ beginsWith: entitySkPrefix }))
       }
 
-      return Query.alsoReadPartition136(q, collectionPk136(entity, pkComposites))
+      return q
     }
   }
 

@@ -115,6 +115,176 @@ describe("definition attribute names are typed from the model (runtime package)"
     ).toThrow(/EDD-9087/)
   })
 
+  describe("Entity.make: a sharded partition key in an attribute another key uses", () => {
+    const primaryKey = {
+      pk: { field: "pk", composite: ["task"] },
+      sk: { field: "sk", composite: [] },
+    } as const
+
+    it("the table's partition key or sort key", () => {
+      expect(() =>
+        Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey,
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              // @ts-expect-error the marker would overwrite the table's partition key
+              pk: { field: "pk", composite: ["project"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+              shards: 8,
+            },
+          },
+        }),
+      ).toThrow(/EDD-9106/)
+      expect(() =>
+        Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey,
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              // @ts-expect-error the marker would overwrite the table's sort key
+              pk: { field: "sk", composite: ["project"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+              shards: { count: 8 },
+            },
+          },
+        }),
+      ).toThrow(/EDD-9106/)
+    })
+
+    it("another index's partition key or sort key", () => {
+      expect(() =>
+        Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey,
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              // @ts-expect-error an unsharded partition key is stored there
+              pk: { field: "gpk", composite: ["project"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+              shards: 8,
+            },
+            byEmployee: {
+              name: "gsi2",
+              pk: { field: "gpk", composite: ["employee"] },
+              sk: { field: "gsi2sk", composite: ["status"] },
+            },
+          },
+        }),
+      ).toThrow(/EDD-9106/)
+      expect(() =>
+        Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey,
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              // @ts-expect-error a sort key is stored there
+              pk: { field: "gsk", composite: ["project"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+              shards: 8,
+            },
+            byEmployee: {
+              name: "gsi2",
+              pk: { field: "gsi2pk", composite: ["employee"] },
+              sk: { field: "gsk", composite: ["status"] },
+            },
+          },
+        }),
+      ).toThrow(/EDD-9106/)
+    })
+
+    it("a field the type doesn't name is `Entity.make`'s to check", () => {
+      const named: string = "pk"
+      expect(() =>
+        Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey,
+          indexes: {
+            byProject: {
+              name: "gsi1",
+              pk: { field: named, composite: ["project"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+              shards: 8,
+            },
+          },
+        }),
+      ).toThrow(/EDD-9106/)
+      const other: string = "gsi2sk"
+      const made = Entity.make({
+        model: Task,
+        entityType: "Task",
+        primaryKey,
+        indexes: {
+          byProject: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["project"] },
+            sk: { field: "gsi1sk", composite: ["status"] },
+            shards: 8,
+          },
+          byEmployee: {
+            name: "gsi2",
+            pk: { field: "gsi2pk", composite: ["employee"] },
+            sk: { field: other, composite: ["status"] },
+          },
+        },
+      })
+      expect(made.indexes.byProject.shards?.count).toBe(8)
+    })
+
+    it("what compiles: own attributes, an unsharded overlap, and another sharded index's", () => {
+      const made = Entity.make({
+        model: Task,
+        entityType: "Task",
+        primaryKey,
+        indexes: {
+          byProject: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["project"] },
+            sk: { field: "gsi1sk", composite: ["status"] },
+            shards: 8,
+          },
+          local: {
+            name: "lsi1",
+            pk: { field: "pk", composite: ["task"] },
+            sk: { field: "lsi1sk", composite: ["status"] },
+          },
+        },
+      })
+      expect(made.indexes.byProject.shards?.count).toBe(8)
+      // Only `Entity.make` can tell these two are sharded differently.
+      expect(() =>
+        Entity.make({
+          model: Task,
+          entityType: "Task",
+          primaryKey,
+          indexes: {
+            one: {
+              name: "gsi1",
+              pk: { field: "gpk", composite: ["project"] },
+              sk: { field: "gsi1sk", composite: ["status"] },
+              shards: 8,
+            },
+            other: {
+              name: "gsi2",
+              pk: { field: "gpk", composite: ["project"] },
+              sk: { field: "gsi2sk", composite: ["status"] },
+              shards: 16,
+            },
+          },
+        }),
+      ).toThrow(/EDD-9106/)
+    })
+  })
+
   it("Collections.member: SK composites of the member's model", () => {
     Collections.member(Tasks, ["project", "task"])
     // @ts-expect-error not a field of Task

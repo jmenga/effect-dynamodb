@@ -66,6 +66,9 @@ jobs:
       - name: Test
         run: pnpm test
 
+      - name: Test with escapeKeys on
+        run: pnpm -r --if-present test:escape-on
+
       - name: Wait for DynamoDB Local
         run: |
           for i in {1..30}; do
@@ -86,6 +89,14 @@ jobs:
           AWS_ACCESS_KEY_ID: dummy
           AWS_SECRET_ACCESS_KEY: dummy
         run: pnpm -r --if-present test:connected
+
+      - name: Integration tests (connected, escapeKeys on)
+        env:
+          DYNAMODB_ENDPOINT: http://localhost:8000
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: dummy
+          AWS_SECRET_ACCESS_KEY: dummy
+        run: pnpm -r --if-present test:connected:escape-on
 
       # Enforce Option A (see CLAUDE.md > Release Workflow): any PR declaring a
       # release must run `pnpm changeset version` as part of that same PR, so

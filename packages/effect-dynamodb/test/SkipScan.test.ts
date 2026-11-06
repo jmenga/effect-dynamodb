@@ -254,7 +254,7 @@ describe("skip-scan (#171)", () => {
     // `on%23hold`, so no value holds the delimiter and every tuple parses
     // from the key. Up to 1.36's key text this took the filter plan.
     const statuses = ["active", "on#hold", "on hold", "on", "on!", "50%", "sold"]
-    const fixture = makeListings({ statuses, status: Schema.String })
+    const fixture = makeListings({ statuses, status: Schema.String, escapeKeys: true })
     const items = grid(statuses)
     return over(fixture, items, (byStore, partition) =>
       Effect.gen(function* () {
@@ -714,7 +714,7 @@ describe("a ref-derived composite bound (#171)", () => {
     refs: { part: { entity: Parts } },
   })
 
-  const schema = DynamoSchema.make({ name: "lines", version: 1 })
+  const schema = DynamoSchema.make({ name: "lines", version: 1, escapeKeys: true })
   const LinesTable = Table.make({ schema, entities: { OrderLines, Parts } })
 
   const stages = ["packed", "picked", "shipped"] as const

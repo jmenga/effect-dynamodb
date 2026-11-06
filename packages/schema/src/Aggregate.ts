@@ -30,6 +30,7 @@ import type {
 } from "./internal/AggregateTypes.js"
 import type { TimestampsConfig } from "./internal/EntityConfig.js"
 import type { ModelFieldName } from "./internal/EntityTypes.js"
+import { refuseAggregateKeyInTableKey } from "./internal/SharedKeyAttribute.js"
 
 export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
 export {
@@ -263,6 +264,21 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
   schema: TSchema,
   config: AggregateConfig<TSchema>,
 ): AggregateDefinition<TSchema> => {
+  refuseAggregateKeyInTableKey(
+    config.root.entityType,
+    [config.pk.field, "sk"],
+    [
+      ...(config.collection.index === undefined
+        ? []
+        : [["its collection sort key", config.collection.sk.field] as const]),
+      ...(config.list === undefined
+        ? []
+        : [
+            ["its list partition key", config.list.pk.field] as const,
+            ["its list sort key", config.list.sk.field] as const,
+          ]),
+    ],
+  )
   const derivedSchemas = deriveAggregateSchemas(schema, config.edges, config.pk.composite)
 
   return {

@@ -13,7 +13,6 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { Effect, Layer, Schema } from "effect"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -145,7 +144,7 @@ const whereOf =
 
 describe("numeric key order (#171 E8)", () => {
   it("index order is numeric order", () => {
-    const fixture = makeListings({ sk: ["price", "listingId"] })
+    const fixture = makeListings({ sk: ["price", "listingId"], escapeKeys: true })
     const items = listingsOf(["active"], 1)
     expect(ids(fixture.ordered(items))).toEqual(
       ids([...items].sort(numericOrder(["price", "listingId"]))),
@@ -155,7 +154,7 @@ describe("numeric key order (#171 E8)", () => {
   it.effect(".where() ranges over negative, fractional and large prices", () =>
     Effect.gen(function* () {
       for (const casing of ["lowercase", "uppercase", "preserve"] as const) {
-        const fixture = makeListings({ sk: ["price", "listingId"], casing })
+        const fixture = makeListings({ sk: ["price", "listingId"], casing, escapeKeys: true })
         const items = listingsOf(["active"], 2)
         const next = random(casing.length * 7919)
         for (let round = 0; round < 40; round++) {
@@ -185,8 +184,8 @@ describe("numeric key order (#171 E8)", () => {
   it.effect(".within() key plan and skip-scan over negative and fractional prices", () =>
     Effect.gen(function* () {
       const statuses = ["active", "pending", "sold"]
-      const keyPlan = makeListings({ sk: ["price", "listingId"] })
-      const skipScan = makeListings({ statuses })
+      const keyPlan = makeListings({ sk: ["price", "listingId"], escapeKeys: true })
+      const skipScan = makeListings({ statuses, escapeKeys: true })
       const next = random(4242)
       for (let round = 0; round < 40; round++) {
         const bound =
@@ -229,7 +228,11 @@ describe("numeric key order (#171 E8)", () => {
       // tuple: its text (`-`, `.`, `:` included) is parsed from the probed
       // key, and the next probe starts just past it.
       const statuses = ["active", "pending", "sold"]
-      const fixture = makeListings({ statuses, sk: ["price", "status", "listingId"] })
+      const fixture = makeListings({
+        statuses,
+        escapeKeys: true,
+        sk: ["price", "status", "listingId"],
+      })
       const items = listingsOf(statuses, 9)
       for (const status of statuses) {
         for (const reverse of [false, true]) {
@@ -268,7 +271,7 @@ class Reading extends Schema.Class<Reading>("Reading")({
   value: Schema.Number,
 }) {}
 
-const AppSchema = DynamoSchema.make({ name: "numeric-keys", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "numeric-keys", version: 1, escapeKeys: true })
 const Readings = Entity.make({
   model: Reading,
   entityType: "Reading",
@@ -361,7 +364,6 @@ describe("numeric primary-key composites round-trip (#171 E8)", () => {
     it.effect(`put, get, update and delete address offset ${offset}, level ${level}n`, () =>
       Effect.gen(function* () {
         const captured: Captured = { writes: [], keys: [] }
-        const reading136 = { sensorId: "s-1", offset, level }
         const result = yield* Effect.gen(function* () {
           const db = yield* DynamoClient.make({
             entities: { Readings },
@@ -381,22 +383,10 @@ describe("numeric primary-key composites round-trip (#171 E8)", () => {
         expect(result.offset).toBe(offset)
         expect(result.level).toBe(level)
         // Every read and write of the item (the unique constraint adds reads
-        // of the current item and transactions) addresses the key put wrote,
-        // but for the put's one read of the key 1.36 composed — whose text
-        // differs — in case 1.36 wrote the item there.
+        // of the current item and transactions) addresses the key put wrote.
         const addressed = captured.keys.filter((k) => k.key.pk?.S?.includes("#sensorid_"))
         expect(new Set(addressed.map((k) => k.op))).toEqual(new Set(["get", "update", "delete"]))
-        const old = KeyText136.composeIndexKeys(
-          AppSchema,
-          "Reading",
-          1,
-          Readings.indexes.primary,
-          reading136,
-        )
-        expect(old).not.toEqual({ pk, sk })
-        const [first, fallback, ...rest] = addressed
-        expect(fallback).toEqual({ op: "get", key: { pk: { S: old.pk }, sk: { S: old.sk } } })
-        for (const { op, key } of [first!, ...rest]) {
+        for (const { op, key } of addressed) {
           expect(key.pk!.S, op).toBe(pk)
           expect(key.sk!.S, op).toBe(sk)
         }
@@ -497,7 +487,7 @@ const Meters = Entity.make({
   timeSeries: { orderBy: "at", appendInput: Meter },
 })
 const NanTable = Table.make({
-  schema: DynamoSchema.make({ name: "nan-keys", version: 1 }),
+  schema: DynamoSchema.make({ name: "nan-keys", version: 1, escapeKeys: true }),
   entities: { Gauges, Badges, Slots, Meters },
 })
 /**

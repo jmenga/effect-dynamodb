@@ -23,39 +23,50 @@ export interface DynamoSchema {
   readonly version: number
   readonly casing: Casing
   /**
-   * `false` turns off the 1.36 key fallback (#171): operations no longer read
-   * or move rows still stored under the key text 1.36 composed. Absent means
-   * on. See {@link make}.
+   * `true` composes key text that sorts as its values: numbers in numeric order, and strings
+   * escaped. Absent (the default throughout 1.x) composes the key text 1.36 composed. See
+   * {@link make}.
    */
-  readonly legacyKeys?: false | undefined
+  readonly escapeKeys?: boolean | undefined
+  /**
+   * @internal Numbers in numeric order and strings as they are: the partition keys 1.37.0
+   * and 1.38.0 composed. Nothing sets it but `rekey`, which composes that text to find rows there.
+   */
+  readonly numericKeyText?: true | undefined
 }
 
 /**
  * Create a DynamoSchema instance.
  *
- * `legacyKeys: false` turns off the 1.36 key fallback. 1.37 composes some key
- * text differently from 1.36 — numbers that are negative, fractional, or 1e16
- * and over (bigints: negative or 1e38 and over), sort key values holding a
- * character U+0000–U+0025 (a space, `!`, `"`, `#`, `$`, `%`, a control
- * character), and the event keys of a `NumberFromString` / `BigIntFromString`
- * time-series `orderBy` — so a row 1.36 wrote with such a value sits under a
- * key 1.37 does not compose. While the fallback is on (the default throughout
- * 1.37.x) single-item reads also read that 1.36 key, queries that pin a key
- * prefix read it too, and writes move the row to its current key. Once every
- * row has moved (`db.tables.<Table>.rekey()`), turn it off: requests are then
- * exactly those of a build without the fallback. The setting and the fallback
- * go in the next major release.
+ * `escapeKeys` chooses the key text, in every key, partition and sort: table keys, index keys,
+ * collections, aggregates, event streams, unique sentinels and vector partitions. It's all or
+ * nothing, and a table's rows are written under one setting.
+ *
+ * - **Off, the default throughout 1.x, is the key text 1.36 composed**, for strings and numbers.
+ *   Nothing is needed to upgrade from 1.36 or earlier. Its limitations: a `.where()` or
+ *   `.within()` range on a sort key composite before the last can return wrong rows when a value
+ *   holds a character below `#` (`new york` sorts below `new#...`), a `#` in a value can imitate
+ *   a segment, a skip-scan over free-form strings can hide rows, and a number sorts in numeric
+ *   order only when it is a non-negative integer below 1e16 (bigint: 1e38).
+ * - **`escapeKeys: true`** escapes each character U+0000-U+0025 of a composite value as `%` and
+ *   two hex digits (`KeyComposer.escapeKeyText`) and encodes numbers in numeric order, so a key
+ *   sorts as its values and no value can imitate a delimiter. On is the planned default of the
+ *   next major.
+ *
+ * Changing the setting changes the key of every row whose text differs: such rows aren't found
+ * by any read until `db.tables.<Table>.rekey()` has moved them to the text the setting composes.
+ * Run it before serving traffic.
  */
 export const make = (config: {
   readonly name: string
   readonly version: number
   readonly casing?: Casing | undefined
-  readonly legacyKeys?: boolean | undefined
+  readonly escapeKeys?: boolean | undefined
 }): DynamoSchema => ({
   name: config.name,
   version: config.version,
   casing: config.casing ?? "lowercase",
-  ...(config.legacyKeys === false && { legacyKeys: false as const }),
+  ...(config.escapeKeys === true && { escapeKeys: true as const }),
 })
 
 /**

@@ -11,6 +11,7 @@ import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypt
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
+import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, Schema } from "effect"
@@ -106,10 +107,11 @@ export const isProjectionTombstone = (
 ): boolean => item?.__edd_e__?.S === `${entityType}#tombstone`
 
 /**
- * Marks a projection's row tombstone or outbox item written under the key
- * text 1.37 composes (#171). They hold no values to tell whose key they are
- * at, and `foo bar`'s current key is `foo%20bar`'s 1.36 key: one without the
- * mark is 1.36's, the row its key reads back as.
+ * Marks a projection's row tombstone or outbox item with the key text it's
+ * under (#171, #183). They hold no values to tell whose key they are at, and
+ * `foo bar`'s escaped key is `foo%20bar`'s unescaped one, so `rekey` reads the
+ * key back by the mark (`KeyText136.formOfMark`): none is the text 1.36
+ * composed, which `escapeKeys` off composes too.
  */
 export const KEY_TEXT = "__edd_kt__"
 
@@ -431,8 +433,9 @@ export const resolveTableNames = (infos: ReadonlyArray<{ readonly entity: Entity
  * `ValidationError` for `operation`: a Z-order value (`[EDD-9092]`,
  * `ZOrderValueError`: `NaN`, an unparseable date, a value outside a `literals`
  * list — #171), or a composite with no key text (`[EDD-9096]`,
- * `KeyValueError`: `NaN`, a bigint past 1,000 digits). Every write path that
- * composes an item's keys goes through this, so the failure is typed instead
+ * `KeyValueError`: `NaN`, a bigint past 1,000 digits), or a sharded index's
+ * missing shard source (`[EDD-9100]`, `ShardSourceError`, #183). Every write path
+ * that composes an item's keys goes through this, so the failure is typed instead
  * of a defect. Any other throw stays a defect.
  */
 export const composeKeysOrFail = <A>(
@@ -442,7 +445,7 @@ export const composeKeysOrFail = <A>(
 ): Effect.Effect<A, ValidationError> =>
   Effect.try({ try: compose, catch: (error) => error }).pipe(
     Effect.catch((error) =>
-      isZOrderValueError(error) || isKeyValueError(error)
+      isZOrderValueError(error) || isKeyValueError(error) || isShardSourceError(error)
         ? Effect.fail(new ValidationError({ entityType, operation, cause: error }))
         : Effect.die(error),
     ),
@@ -563,7 +566,9 @@ export const validateAndBuildPutItem = (
       for (const def of Object.values(entity.unique ?? {})) {
         for (const field of resolveUniqueFields(def as UniqueConstraintDef)) {
           const value = (encoded as Record<string, unknown>)[field]
-          if (value !== undefined && value !== null) KeyComposer.serializeValue(value)
+          if (value !== undefined && value !== null) {
+            KeyComposer.compositeText(entity._schema, value)
+          }
         }
       }
     })

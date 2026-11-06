@@ -62,6 +62,7 @@ const RECORD_TAKING = [
   "composeSortKeyPrefix",
   "composeSortKeyBeginsWith",
   "composeSortKeyCondition",
+  "tryComposeStructuralKeys",
   "composeGsiKeysForUpdatePolicyAware",
   "composeVectorPartition",
   "tryComposeVectorPartition",
@@ -69,23 +70,8 @@ const RECORD_TAKING = [
   "tryExtractComposites",
 ] as const
 
-/**
- * The `KeyText136` functions taking a record. `changedPrimaryKey` takes the
- * record and then the current key, which `composePrimaryKey` normalises.
- */
-const RECORD_TAKING_136 = [
-  "composePk",
-  "composeSk",
-  "composeIndexKeys",
-  "tryComposeIndexKeys",
-  "composeAllKeys",
-  "composeSortKeyPrefix",
-  "composeSortKeyBeginsWith",
-  "tryComposeVectorPartition",
-  "extractComposites",
-  "tryExtractComposites",
-  "changedPrimaryKey",
-] as const
+/** The `KeyText136` function taking a record: `rekey` composing a key at another text. */
+const RECORD_TAKING_136 = ["composeAt"] as const
 
 const CALLS = [
   ...RECORD_TAKING.map((fn) => ({ module: "KeyComposer", fn })),

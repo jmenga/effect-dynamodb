@@ -3187,31 +3187,41 @@ describe("Entity", () => {
       expect(q._state.skConditions).toHaveLength(0)
     })
 
-    it("query with PK + partial SK params applies beginsWith condition", () => {
-      const UserEntity = withConfig(
-        Entity.make({
-          model: User,
-          entityType: "User",
-          primaryKey: {
-            pk: { field: "pk", composite: ["userId"] },
-            sk: { field: "sk", composite: [] },
+    const partialPinOf = (escapeKeys: boolean) => {
+      const UserEntity = Entity.make({
+        model: User,
+        entityType: "User",
+        primaryKey: {
+          pk: { field: "pk", composite: ["userId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byRole: {
+            name: "gsi2",
+            pk: { field: "gsi2pk", composite: ["role"] },
+            sk: { field: "gsi2sk", composite: ["userId", "email"] },
           },
-          indexes: {
-            byRole: {
-              name: "gsi2",
-              pk: { field: "gsi2pk", composite: ["role"] },
-              sk: { field: "gsi2sk", composite: ["userId", "email"] },
-            },
-          },
-        }),
+        },
+      })
+      UserEntity._configure(
+        DynamoSchema.make({ name: "myapp", version: 1, escapeKeys }),
+        MainTable.Tag,
       )
-
       const q = UserEntity.query.byRole({ role: "admin", userId: "u-1" })
       expect(q._state.skConditions).toHaveLength(1)
-      expect(q._state.skConditions[0]!.condition).toHaveProperty("beginsWith")
-      expect((q._state.skConditions[0]!.condition as { beginsWith: string }).beginsWith).toContain(
-        "u-1",
-      )
+      return q._state.skConditions[0]!.condition
+    }
+
+    it("with escapeKeys, query with PK + partial SK params selects the prefix and what is below it", () => {
+      const { between } = partialPinOf(true) as { between: readonly [string, string] }
+      expect(between[0]).toContain("u-1")
+      expect(between[1]).toBe(`${between[0]}#\uFFFF`)
+    })
+
+    it("without escapeKeys, query with PK + partial SK params is begins_with the prefix", () => {
+      const { beginsWith } = partialPinOf(false) as { beginsWith: string }
+      expect(beginsWith).toContain("u-1")
+      expect(beginsWith.endsWith("#")).toBe(true)
     })
 
     it("query with PK + full SK composites matches the complete key with eq", () => {

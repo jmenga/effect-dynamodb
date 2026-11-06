@@ -117,6 +117,29 @@ describe("EntityResolver", () => {
       expect(entities[1]!.softDelete).toBe(true)
     })
 
+    it("should resolve DynamoSchema with escapeKeys on, and leave it off by default", () => {
+      const resolve = (options: string) => {
+        const source = `
+          const AppSchema = DynamoSchema.make({ name: "MyApp", version: 1${options} })
+
+          const Users = Entity.make({
+            model: User,
+            entityType: "User",
+            primaryKey: {
+              pk: { field: "pk", composite: ["userId"] },
+              sk: { field: "sk", composite: [] },
+            },
+          })
+
+          const MainTable = Table.make({ schema: AppSchema, entities: { Users } })
+        `
+        return resolveEntities(ts, parseSource(source))[0]!.schema
+      }
+      expect(resolve(", escapeKeys: true").escapeKeys).toBe(true)
+      expect(resolve(", escapeKeys: false").escapeKeys).toBeUndefined()
+      expect(resolve("").escapeKeys).toBeUndefined()
+    })
+
     it("should resolve DynamoSchema with custom casing", () => {
       const source = `
         const AppSchema = DynamoSchema.make({ name: "MyApp", version: 1, casing: "preserve" })
@@ -534,6 +557,44 @@ describe("EntityResolver", () => {
       expect(collections).toHaveLength(1)
       expect(collections[0]!.collectionName).toBe("tasksByProject")
       expect(Object.keys(collections[0]!.members)).toEqual(["Tasks"])
+    })
+  })
+
+  describe("shards (#183)", () => {
+    const resolve = (shards: string) => {
+      const source = `
+        const Devices = Entity.make({
+          model: Device,
+          entityType: "Device",
+          primaryKey: { pk: { field: "pk", composite: ["channel"] }, sk: { field: "sk", composite: ["deviceId"] } },
+          indexes: {
+            byTenant: {
+              name: "gsi5",
+              pk: { field: "gsi5pk", composite: ["tenantId"] },
+              sk: { field: "gsi5sk", composite: ["groupId"] },
+              shards: ${shards},
+            },
+          },
+        })
+        const MainTable = Table.make({ schema: DynamoSchema.make({ name: "fleet", version: 1 }), entities: { Devices } })
+      `
+      return resolveEntities(ts, parseSource(source))[0]!.indexes.byTenant!.shards
+    }
+
+    it("parses the shorthand", () => {
+      expect(resolve("20")).toEqual({ count: 20, by: [], previous: undefined })
+    })
+
+    it("parses the object form", () => {
+      expect(resolve('{ count: 20, by: ["groupId"], previous: 4 }')).toEqual({
+        count: 20,
+        by: ["groupId"],
+        previous: 4,
+      })
+    })
+
+    it("a count that isn't a literal stays unknown", () => {
+      expect(resolve("SHARDS")).toEqual({ count: undefined, by: [], previous: undefined })
     })
   })
 })

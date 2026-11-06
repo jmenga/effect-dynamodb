@@ -67,7 +67,7 @@ const allMembers = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
 }).collect()
 
-// Narrow by partial SK composite (begins_with prefix match)
+// Narrow by partial SK composite (prefix match on a segment boundary)
 const acmeAdmins = yield* db.entities.Memberships.primary({
   orgId: "org-acme",
 })
@@ -82,6 +82,38 @@ This is the natural access pattern for shared-PK single-table designs — for ex
 GSI access patterns are defined directly on the entity via the `indexes` property. Each index specifies the physical GSI, PK composites, and SK composites — see the `task-entity` block above for the canonical shape.
 
 Several entities can overload one physical GSI (`gsi1` serving `byProject` on one entity and `byTenant` on another), but one physical index has one key schema. Every member of a table that declares it, including the auto-generated `_cascade_<field>` indexes and an aggregate's collection and list indexes, must name the same `pk.field` / `sk.field` and agree on GSI versus LSI. Entities on one table must also declare the same primary-key fields. `Table.make` and `Table.definition` throw `[EDD-9069]`, naming both declarers, when they differ; earlier releases silently kept the first declaration, so the other member's items never reached the index.
+
+### Sharing a key attribute
+
+**Give every index key its own attribute.** That's the library's principle: a dedicated `gsi1pk` and `gsi1sk` for each GSI, which several entities can overload.
+
+One entity can use a physical index once, even over the same fields (`EDD-9108`), since an item has one key in an index. Two key halves of one entity may share an attribute only with the same fields, in the same order and casing, and a sharded partition key only with one sharded the same way (`EDD-9106`). A row can't show which half owns the attribute, so the one written last would overwrite the other, and an update would corrupt even a row that only used one.
+
+```typescript
+// Refused: one attribute, two different definitions
+byRegion: { name: "gsi1", pk: { field: "gpk", composite: ["region"] }, sk: { field: "gsk1", composite: ["id"] } },
+byGroup: { name: "gsi2", pk: { field: "gpk", composite: ["group"] }, sk: { field: "gsk2", composite: ["extra"] } },
+```
+
+Give each its own attribute, which means a new index, and re-put existing rows. The check runs per entity, so several entities can still overload one index.
+
+A local index's partition key and a sort key shared with the table meet that rule. So does an inverted index, which is **supported but not encouraged**:
+
+```typescript
+primaryKey: {
+  pk: { field: "pk", composite: ["userId"] },
+  sk: { field: "sk", composite: ["groupId"] },
+},
+indexes: {
+  byGroup: {
+    name: "inverted",
+    pk: { field: "sk", composite: ["groupId"] },
+    sk: { field: "pk", composite: ["userId"] },
+  },
+},
+```
+
+One rule composes every key's values, so both roles of an attribute build identical text, with `escapeKeys` on or off, and an inverted index stays in step with `get` for any value. An update never writes a table key attribute: a key changes only by moving the row.
 
 ### Z-order Sort Keys
 
@@ -116,6 +148,22 @@ const Listings = Entity.make({
 ```
 
 `zorder` belongs on a secondary index's sort key half: not on the primary key, not on a partition key half, and never together with `composite` (`[EDD-9086]`). The physical attribute is declared `B` in the table definition; the partition key half stays an ordinary string key. The [Z-order Indexes guide](/effect-dynamodb/guides/zorder/) covers the dimensions, the key layout, the read strategies, and when Z-order pays; [indexPolicy](/effect-dynamodb/guides/index-policy/#z-order-sort-keys) covers how writes keep the address current.
+
+
+### Write Sharding
+
+A partition takes about 1,000 write units a second. An index key that takes more than that can be spread over several physical partitions with `shards`:
+
+```typescript
+byTenant: {
+  name: "gsi1",
+  pk: { field: "gsi1pk", composite: ["tenantId"] },
+  sk: { field: "gsi1sk", composite: ["deviceId"] },
+  shards: 8, // or { count: 8, by: ["groupId"], previous: 1 }
+},
+```
+
+Writes hash the item to pick a shard, and the accessor reads every shard and merges them into index order, so no caller names a shard. Every query pays for it, with at least one request per shard. The [Write Sharding guide](/effect-dynamodb/guides/sharding/) covers choosing the count, pruning, cursors, and adopting sharding on a populated index.
 
 ### Logical Names as API Surface
 
@@ -165,72 +213,62 @@ Both `pk.composite` and `sk.composite` can be empty arrays. The entity type pref
 
 | Type | Key Value |
 |------|-----------|
-| `string` | As-is; in a sort key, characters up to `%` escaped ([Sort key text](#sort-key-text)) |
-| `number`, `bigint` | Numeric key text (below) |
+| `string` | As it is, or with `escapeKeys: true` its characters up to `%` escaped ([Key text](#key-text)) |
+| `number`, `bigint` | Zero-padded, or with `escapeKeys: true` numeric key text ([below](#numeric-composites)) |
 | `DateTime.Utc` | ISO 8601 |
 | `boolean` | `"true"` / `"false"` |
 | Branded string | Underlying value |
 
 ### Numeric composites
 
-DynamoDB orders sort keys as text, byte by byte, so numbers are written as text that sorts in numeric order. Ranges with `.where()` and `.within()` over a numeric composite return rows in numeric order, negatives and fractions included.
+DynamoDB orders sort keys as text, byte by byte, so a number's order in a key is the order of its text. Which text depends on `escapeKeys`:
 
-| Value | Key text |
-|-------|----------|
-| `42` | `0000000000000042` (16 digits; a `bigint` is padded to 38) |
-| `3.14` | `0000000000000003.14` |
-| `1e21` | `:0211` (exponent and digits, for 1e16 and up; 1e38 and up for a `bigint`) |
-| `-3.14` | `-9999999999999996.85:` (each digit complemented, so larger magnitudes sort first) |
-| `Infinity` / `-Infinity` | `;` / `-)` |
+- **Off (the default):** `String(n)` zero-padded to 16 characters (a `bigint` to 38), as up to 1.36. **Non-negative integers below 1e16 sort in numeric order, and nothing else does:** `-3` sorts above `-5`, `10.5` below `3.14`, and `lt: 3` leaves out `2.5`.
+- **`escapeKeys: true`:** text that sorts in numeric order, negatives and fractions included, for ranges with `.where()` and `.within()` alike.
 
-The text holds no letters and no `#`, so casing never changes it. A composite holding one numeric value matches only that value: a query accessor given every sort key composite sends `sk = …`, so `seq: 3` never returns `3.14` or `3.5` (see [Queries](/effect-dynamodb/guides/queries/#how-much-of-the-sort-key-an-accessor-pins)).
+| Value | Off | `escapeKeys: true` |
+|-------|-----|--------------------|
+| `42` | `0000000000000042` | `0000000000000042` |
+| `3.14` | `0000000000003.14` | `0000000000000003.14` |
+| `1e21` | `000000000001e+21` | `:0211` (exponent and digits, for 1e16 and up; 1e38 and up for a `bigint`) |
+| `-3.14` | `00000000000-3.14` | `-9999999999999996.85:` (each digit complemented, so larger magnitudes sort first) |
+| `Infinity` / `-Infinity` | `00000000infinity` / `0000000-infinity` | `;` / `-)` |
 
-`NaN` has no order and can't be a key composite. An entity operation given one — `put`, `create`, `upsert`, `update`, `get`, `delete`, `restore`, `purge`, `append`, or a batch or transaction — fails with a `ValidationError` (`EDD-9096`) before anything is sent, and a query accessor, `.where()` or `.within()` given one throws it. Up to 1.36 a `get` by a `NaN` key failed with `ItemNotFound` and a `delete` did nothing. A bigint of more than 1,000 digits is refused the same way. Aggregates and event stores don't convert it: there it is a defect.
+Under `escapeKeys: true` the text holds no letters and no `#`, so casing never changes it. Under either setting a composite holding one numeric value matches only that value: a query accessor given every sort key composite sends `sk = …`, so `seq: 3` never returns `3.14` or `3.5` (see [Queries](/effect-dynamodb/guides/queries/#how-much-of-the-sort-key-an-accessor-pins)).
 
-:::caution[Stored keys changed in 1.37.0]
-Up to 1.36, a number was zero-padded as text (`String(n).padStart(16, "0")`), which sorted `-3` above `-5` and `10.5` below `3.14`. Non-negative integers below 1e16 (below 1e38 for a `bigint`) keep the same key text. Every other value composes different text: negatives, fractions, 1e16 and up, `Infinity`, and a `DateEpochMs` or `DateEpochSeconds` date before 1970. A row written by 1.36 with one in a key keeps its old key until it moves. Single-item operations still find it, and move it the first time they write it, and queries that pin its key read it (see [Migrating rows written by 1.36](#migrating-rows-written-by-136)); a range bound misses or misorders it until it moves.
+`NaN` has no order. With `escapeKeys: true` it can't be a key composite: an entity operation given one — `put`, `create`, `upsert`, `update`, `get`, `delete`, `restore`, `purge`, `append`, or a batch or transaction — fails with a `ValidationError` (`EDD-9096`) before anything is sent, and a query accessor, `.where()` or `.within()` given one throws it. A bigint of more than 1,000 digits is refused the same way. Aggregates and event stores don't convert it: there it is a defect. With it off, `NaN` composes the text it did up to 1.36, so a `get` by a `NaN` key fails with `ItemNotFound` and a `delete` does nothing. A `NaN` in a [shard source](/effect-dynamodb/guides/sharding/) is refused under either setting, and a `Schema.Number` attribute holding `NaN` can't be marshalled.
+
+:::caution[Stored keys changed in 1.37.0, and back in 1.39.0]
+1.37.0 and 1.38.0 gave negatives, fractions, 1e16 and up, `Infinity`, and a `DateEpochMs` or `DateEpochSeconds` date before 1970 numeric text. The 1.39.0 default composes the 1.36 text again: `escapeKeys: true` gets you the numeric text. A row under the text the setting doesn't compose isn't found until `rekey` moves it: see [Upgrading](/effect-dynamodb/guides/upgrading/).
 :::
 
-### Sort key text
+### Key text
 
-In a sort key, a string's text escapes every character up to `%` — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%` and two hex digits, after casing:
+`DynamoSchema.make({ name, version, escapeKeys: true })` escapes every key, partition and sort: it's all or nothing. **It's off by default for all of 1.x**, and on by default is planned for the next major release. Off, a string is written as it is, as up to 1.36, and numbers keep [their 1.36 text](#numeric-composites).
 
-| Value | Sort key text (`"lowercase"` casing) |
+With `escapeKeys: true` a string's text escapes every character up to `%` — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%` and two hex digits, after casing, in table keys, index keys, collections, aggregates, event streams, unique constraints and vector partitions:
+
+| Value | Key text (`"lowercase"` casing), `escapeKeys: true` |
 |-------|--------------------------------------|
 | `new york` | `new%20york` |
 | `a#b` | `a%23b` |
 | `50%` | `50%25` |
 | `"Line\nTwo"` | `line%0atwo` |
 
-Every remaining character sorts above the `#` that follows a composite, so keys sort as their values do and a value may hold `#`: a bound on any composite is one key condition that returns exactly the values it means, and `a` neither equals nor prefixes `a#b` (see [Queries](/effect-dynamodb/guides/queries/#sort-key-conditions)). Every sort key composed from composite values is escaped: table and index sort keys, time-series event keys, version snapshot and tombstone keys, aggregate sort keys and Z-order prefix segments. Partition keys and unique-constraint values aren't, and the stored attribute keeps its value.
+Every remaining character sorts above the `#` that follows a composite, so with `escapeKeys: true` keys sort as their values do and a value may hold `#`: a bound on any composite is one key condition that returns exactly the values it means, and `a` neither equals nor prefixes `a#b` (see [Queries](/effect-dynamodb/guides/queries/#sort-key-conditions)).
 
-:::caution[Stored keys changed in 1.37.0]
-Up to 1.36 a sort key held a string's text as it was: a space, `!`, `"` or control character sorted below the `#` after a composite, so `new york` sorted before `new` and bounds returned the wrong rows, and `#` split a value in two. A string without a character up to `%` keeps the same key text. A row written by 1.36 with such a string in a sort key composite, or as a time-series `orderBy`, keeps its old sort key until it moves (below); partition keys are unaffected.
-:::
+A string without a character up to `%`, and a non-negative integer below 1e16, compose the same text under either setting. To turn it on over a table with rows in it, set the flag and run `rekey` before serving traffic: see [Upgrading](/effect-dynamodb/guides/upgrading/#turning-escapekeys-on-over-existing-data). There's no fallback: an operation looks only under the text its setting composes.
 
-### Migrating rows written by 1.36
+### Limitations with `escapeKeys` off
 
-Through 1.37.x, single-item operations keep working over rows 1.36 wrote under key text that has since changed. `get`, `getVersion`, `deleted.get`, `Batch.get` and `Transaction.transactGet` read the 1.36 key when the current key misses. `put`, `create`, `upsert`, `update`, `patch`, `append`, `delete`, `deleteIfExists`, soft delete, `restore`, `purge` and `Batch.write` act on the item wherever it is; the first write moves it to its current key, recomposing its index keys under their index policy and moving its unique-constraint sentinels and, on a `retain` entity, the snapshot of the version it is at (older snapshots and tombstones stay where they are and are read there), and a unique value held under its 1.36 sentinel stays taken. Concurrent first writes of an unmoved item all succeed. An operation whose keys did not change sends exactly the requests it always did.
+These are the default behaviour in 1.x, and the same as up to 1.36. The library has no machinery and no refusal for them. If your key values or numbers can reach them, turn `escapeKeys` on.
 
-Moving costs requests while the fallback is on. A conditioned `put`, `upsert`, `update`, `patch` and `append` are sent first, as if the item were at its current key; only when that finds no item do they move it (one read of the 1.36 key and one transaction) and send again, so creating a new item this way costs one failed conditional write more. An unconditioned `put` of an item whose key text changed is always one transaction of two items, a Put at the current key and a Delete at the 1.36 key: twice the write capacity of a plain put for each, and a concurrent transaction on either key can cancel it, which the put retries up to three times. A value holding `%` and no character below it, whose 1.36 key can be another value's current key (below), is put as a conditioned put is. `Batch.write` deletes a put's 1.36 key in a later request, once the put is written. On a `retain` entity a move also reads the snapshot of the item's version and moves it in the same transaction: one more strongly consistent read and two more transaction items.
-
-1.36 didn't escape sort key text, so the 1.36 key of a string holding `%` and two hex digits can be another value's current key: `foo%20bar`'s 1.36 row sits where `foo bar` is stored now, and `x%23y`'s where `x#y` is. Operations tell the two apart by the row's values. A `get`, a batch or transaction read, or an accessor query of `foo bar` doesn't return `foo%20bar`'s row. `update`, `patch` and `delete` of `foo bar` treat it as no item, and `purge` deletes only the item's own rows. A write that needs the key — a `put`, `create` or `upsert` of `foo bar`, or the move of `foo bar`'s own 1.36 row — first moves `foo%20bar`'s row to its own current key. The other way round, a write of `foo%20bar` leaves `foo bar`'s row at its 1.36 key alone: a `put` of it is sent as a conditioned put is, and `create` and `restore` read that key first. A retained `foo%20bar` created afresh continues its own versions, not `foo bar`'s, and each lists only its own: 1.36 kept `foo%20bar`'s version history under the prefix `foo bar`'s history is under now, so a write of `foo bar` whose version snapshot lands on one of `foo%20bar`'s moves that snapshot to `foo%20bar`'s current key first. `Transaction.transactWrite` can't move the row, so it fails `ItemNotMoved` naming the item that holds the key; write that item once through the entity first.
-
-A transaction can't move an item: an update, patch, conditioned put or delete, guarded put or condition check in `Transaction.transactWrite` of an item still under its 1.36 key fails with `ItemNotMoved` (`EDD-9097`) and writes nothing. Write the item once through the entity, then run the transaction again.
-
-A query that pins a key prefix reads the 1.36 key for the same pins too: an index or primary accessor (its pins, and an `eq` or `beginsWith` in `.where()` that extends them), `Entity.query.*`, a collection, `.history()`, `versions()`, `deleted.list()` and `count()`. It reads the 1.36 key first and the current key second (the other way round under `.reverse()`), so `limit`, pages and `count()` span both and a cursor resumes in the right one. Rows still under their 1.36 key come first, in their 1.36 order: the two keys are read one after the other, not merged. `versions()` lists a version whose snapshot is under both keys once, from the current key; to know which, it first looks under the 1.36 key (one keys-only read of one row) and, when a snapshot is there, reads the current key's versions (keys only).
-
-Aggregates are read under both keys, and `update` moves every row it finds under a 1.36 key in the same transaction as its write, and recomposes a root's list keys that hold 1.36 text, so an `update` that changes nothing moves the aggregate; `create` fails `ConditionalCheckFailed` when the aggregate exists under its 1.36 key, and `list` lists it. An event store stream whose stream id's key text changed (a number passed as a stream id) is read and appended under its 1.36 key until `rekey` moves it: it is never split across the two keys, and a new stream starts under its current key. An append to it carries one more check, that `rekey` hasn't moved it meanwhile; an append that loses that race fails with `VersionConflict`, and finds the stream at its current key when it is retried. A projection reads a read-model row, or its tombstone, under its 1.36 key and folds onto it, and its next write moves it; `drain(key)` and `drainPending` deliver a row's outbox effects under both keys in one order. An effect of `foo bar`'s row never replaces `foo%20bar`'s pending one at the same key: it moves that one to `foo%20bar`'s current key first, and each `drain(key)` delivers only its own row's effects.
-
-Until a row moves, some reads are not transparent:
-
-- A range bound in `.where()` (`gt`, `gte`, `lt`, `lte`, `between`) and `.within()` read the current key only, so they miss rows still under their 1.36 key.
-- Rows under their 1.36 keys come before the others (after them under `.reverse()`), in 1.36's order: a negative number sorts above a smaller one.
-- Time-series events of a `NumberFromString` or `BigIntFromString` `orderBy` that 1.36 wrote come before the current ones, in 1.36's order, and `.history().where()` bounds hold on their numbers; to do that, a bounded `.history()` reads all of the item's events. Events of a `Schema.Number` `orderBy` that is negative, fractional or 1e16 and up, or of a string `orderBy` holding a character up to `%`, are read in text order and bounds compare text.
-- A collection query can return another value's 1.36 row stored at a key it pins (`foo%20bar`'s under pins on `foo bar`), and an `append` overwrites another value's 1.36 event stored under the same key text. (`deleted.list()` lists every tombstone in the partition, as it always has.)
-- A `many` edge's elements over unmoved rows assemble in key text order.
-
-To move every remaining row, run `db.tables.<Table>.rekey()` once the deploy has finished: it scans the table and moves each row the way its own operations would — items with their index keys and unique sentinels, version snapshots, tombstones, time-series events, aggregates, event streams, and projections' row tombstones and outbox items — reports conflicts instead of overwriting anything, and moves nothing on a rerun. Once a rerun moves nothing and reports no conflicts, turn the fallback off with `DynamoSchema.make({ name, version, legacyKeys: false })`; the fallback and the setting are removed in the next major release. [Upgrading from 1.36](/effect-dynamodb/guides/upgrading/) walks through it: the dry run, resuming a bounded run, what each kind of row costs, and resolving conflicts.
+- **Key order isn't value order when a value holds a character below `#`** (a control character, space, `!` or `"`). `new york` sorts below `new#…`, so on `sk: ["city", "siteId"]`, `lte(t.city, "new york")` leaves out `new`, and `gt(t.city, "new")` leaves out `new york`. Under a pin on the last composite, `gt` can miss a longer value continuing below `#` (`a b` for `a`).
+- **Numbers sort as zero-padded text**, so a range over a negative, fractional or very large number returns the wrong rows and in the wrong order: `-10, -3, -5, 0, 7, 10, 2.5`. `.history()` over a `NumberFromString` or `BigIntFromString` `orderBy` reads in text order: `10` before `9`.
+- **A `#` in a value can imitate a segment.** `a#b` + `c` and `a` + `b#c` compose one key, and a pin on `new` also returns `new#2`.
+- **A pin on a sort key composite that isn't the last** — on an accessor, `.where(eq)` or an `eq` in `.within()` — is `begins_with(…#city_new#)`. A row an update [truncated at that composite](/effect-dynamodb/guides/index-policy/) isn't returned.
+- **Skip-scan over free-form strings can hide rows.** A `.within()` that skips a composite probes for each distinct value, and a value holding a character below `#` can sort out of the probe's way: `on#zone` hides behind `on`. A probe that lands on a key it can't parse stops, and the rest of the range is read once with every bound checked per row.
+- **A cursor or row from `escapeKeys: true` isn't found,** nor is one 1.37.0 or 1.38.0 wrote with text that differs: see [Upgrading](/effect-dynamodb/guides/upgrading/#from-1370-or-1380).
 
 ### Casing Resolution
 
@@ -600,6 +638,7 @@ Each composite value in a key is prefixed with its attribute name (e.g., `employ
 
 - [indexPolicy — Per-Half GSI Membership Rules](/effect-dynamodb/guides/index-policy/) -- Per-half sparse/preserve declaration, per-half evaluation gate, structural composition with the unified per-half can't-compose rule, set/remove asymmetry, per-half cascade, EDD-9025 invariant
 - [Z-order Indexes](/effect-dynamodb/guides/zorder/) -- Bound several attributes in one query with an interleaved binary sort key
+- [Write Sharding](/effect-dynamodb/guides/sharding/) -- Spread one logical partition over several physical ones
 - [Queries](/effect-dynamodb/guides/queries/) -- Query by index, filter by sort key composites, paginate results
 - [Data Integrity](/effect-dynamodb/guides/data-integrity/) -- Unique constraints and optimistic concurrency
 - [Lifecycle](/effect-dynamodb/guides/lifecycle/) -- Soft delete and version retention

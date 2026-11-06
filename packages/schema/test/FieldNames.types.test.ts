@@ -585,4 +585,123 @@ describe("definition attribute names are typed from the model", () => {
       )
     })
   })
+  describe("shards.by (#183)", () => {
+    const shardedOn = {
+      name: "gsi7",
+      pk: { field: "gsi7pk", composite: ["region"] },
+      sk: { field: "gsi7sk", composite: ["agencyId", "status"] },
+    } as const
+    /** `shardedOn` in its own attributes: two key halves can't share one (`EDD-9106`). */
+    const attributes = (n: number) =>
+      ({
+        name: `gsi${n}`,
+        pk: { field: `gsi${n}pk`, composite: shardedOn.pk.composite },
+        sk: { field: `gsi${n}sk`, composite: shardedOn.sk.composite },
+      }) as const
+
+    it("names sort key composites of its own index", () => {
+      const made = Entity.make({
+        model: Listing,
+        entityType: "Listing",
+        primaryKey: byListingId,
+        indexes: {
+          byRegion: { ...shardedOn, shards: { count: 8, by: ["agencyId"] } },
+          byRegionAll: { ...attributes(8), shards: { count: 8, by: ["agencyId", "status"] } },
+          shorthand: { ...attributes(9), shards: 8 },
+          full: { ...attributes(10), shards: { count: 8, previous: 1 } },
+        },
+      })
+      expect(made.indexes.byRegion.shards?.source).toEqual(["agencyId"])
+    })
+
+    it("refuses a name that is not a model field", () => {
+      expect(() =>
+        Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byRegion: {
+              ...shardedOn,
+              shards: {
+                count: 8,
+                // @ts-expect-error not a model field
+                by: ["agency"],
+              },
+            },
+          },
+        }),
+      ).toThrow("[EDD-9102]")
+    })
+
+    it("refuses a model field that is not a sort key composite of this index", () => {
+      expect(() =>
+        Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byRegion: {
+              ...shardedOn,
+              shards: {
+                count: 8,
+                // @ts-expect-error `title` is a model field, not a composite of this index
+                by: ["title"],
+              },
+            },
+          },
+        }),
+      ).toThrow("[EDD-9102]")
+      expect(() =>
+        Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byRegion: {
+              ...shardedOn,
+              shards: {
+                count: 8,
+                // @ts-expect-error a partition key composite can't be the source
+                by: ["region"],
+              },
+            },
+          },
+        }),
+      ).toThrow("[EDD-9102]")
+    })
+
+    it("refuses any `by` on a Z-order sort key", () => {
+      expect(() =>
+        Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          primaryKey: byListingId,
+          indexes: {
+            byFacets: {
+              name: "gsi7",
+              pk: { field: "gsi7pk", composite: ["region"] },
+              sk: { field: "gsi7sk", zorder: [{ field: "bedrooms", min: 0, max: 15, step: 1 }] },
+              shards: {
+                count: 8,
+                // @ts-expect-error a Z-order half's fields can't be pinned by an accessor
+                by: ["bedrooms"],
+              },
+            },
+          },
+        }),
+      ).toThrow("[EDD-9102]")
+    })
+
+    it("refuses shards on the primary key", () => {
+      expect(() =>
+        Entity.make({
+          model: Listing,
+          entityType: "Listing",
+          // @ts-expect-error shards is an option of a secondary index
+          primaryKey: { ...byListingId, shards: 8 },
+        }),
+      ).toThrow("[EDD-9099]")
+    })
+  })
 })

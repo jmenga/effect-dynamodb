@@ -24,6 +24,7 @@ import { beforeEach } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import { applyUpdate, mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
 // ---------------------------------------------------------------------------
@@ -186,6 +187,19 @@ const Ports = variants("Port", Port, {
   },
 })
 
+// A primary-key composite stored under another name: `.remove()` and `pathRemove()` take any
+// string, and write to the attribute either name spells.
+const RenamedPorts = Entity.make({
+  model: DynamoModel.configure(Port, { channel: { field: "ch" } }),
+  entityType: "RenamedPort",
+  primaryKey: {
+    pk: { field: "pk", composite: ["channel"] },
+    sk: { field: "sk", composite: ["deviceId"] },
+  },
+  timestamps: true,
+  versioned: true,
+} as any)
+
 // 3. Hierarchical: region → country → city → site.
 class Site extends Schema.Class<Site>("GpoSite")({
   id: Schema.String,
@@ -305,6 +319,7 @@ const entities = {
   DevicesRetained: Devices.retained,
   PortsPlain: Ports.plain,
   PortsRetained: Ports.retained,
+  RenamedPorts,
   SitesPlain: Sites.plain,
   SitesRetained: Sites.retained,
   SlotsPlain: Slots.plain,
@@ -1023,6 +1038,111 @@ describe("#133 .set() of a field an update cannot change", () => {
       expect([updated.label, updated.version]).toEqual(["m", 2])
     }).pipe(Effect.provide(TestLayer), closed),
   )
+})
+
+describe(".remove() of a primary-key composite", () => {
+  const seed = { channel: "c1", deviceId: "x1", label: "l" }
+
+  /** The update fails with `.set()`'s error, naming `field`, and nothing is written. */
+  const expectRefused = (
+    result: { readonly exit: unknown; readonly writes: ReadonlyArray<unknown> },
+    field: string,
+  ) => {
+    expect(failureOf(result.exit)?._tag).toBe("ValidationError")
+    expect(String(failureOf(result.exit)?.cause)).toContain(`"${field}" is a primary-key composite`)
+    expect(result.writes).toEqual([])
+  }
+
+  for (const variant of ["Plain", "Retained"] as const) {
+    const unbound = variant === "Plain" ? Ports.plain : Ports.retained
+
+    describe(variant, () => {
+      for (const field of ["channel", "deviceId"]) {
+        it.effect(`the bound builder refuses "${field}"`, () =>
+          Effect.gen(function* () {
+            const result = yield* runUpdate(`Ports${variant}`, seed, (u) => u.remove([field]))
+            expectRefused(result, field)
+          }).pipe(Effect.provide(TestLayer), closed),
+        )
+
+        it.effect(`the unbound combinator refuses "${field}"`, () =>
+          Effect.gen(function* () {
+            const result = yield* runUpdate(`Ports${variant}`, seed, () =>
+              (unbound as any).update(seed).pipe(Entity.remove([field])),
+            )
+            expectRefused(result, field)
+          }).pipe(Effect.provide(TestLayer), closed),
+        )
+
+        it.effect(`a transaction refuses "${field}"`, () =>
+          Effect.gen(function* () {
+            const result = yield* runUpdate(`Ports${variant}`, seed, () => ({
+              asEffect: () =>
+                Transaction.transactWrite([
+                  (unbound as any).update(seed).pipe(Entity.remove([field])),
+                ]),
+            }))
+            expectRefused(result, field)
+          }).pipe(Effect.provide(TestLayer), closed),
+        )
+      }
+
+      it.effect("beside a write that's allowed, nothing is written", () =>
+        Effect.gen(function* () {
+          const result = yield* runUpdate(`Ports${variant}`, seed, (u) =>
+            u.set({ label: "m" }).remove(["label", "channel"]),
+          )
+          expectRefused(result, "channel")
+        }).pipe(Effect.provide(TestLayer), closed),
+      )
+
+      it.effect("another field is still removed", () =>
+        Effect.gen(function* () {
+          const result = yield* runUpdate(`Ports${variant}`, seed, (u) => u.remove(["label"]))
+          expect(failureOf(result.exit)).toBeUndefined()
+          expect(result.writes.length).toBeGreaterThan(0)
+        }).pipe(Effect.provide(TestLayer), closed),
+      )
+    })
+  }
+
+  describe("a composite stored under another name", () => {
+    const storedChannel = (result: { readonly store: ReadonlyArray<[string, Item]> }) =>
+      result.store.map(([, item]) => item.ch)
+
+    for (const [name, build, field] of [
+      [".remove() by its stored name", (u: Builder) => u.remove(["ch"]), "ch"],
+      [".remove() by its model name", (u: Builder) => u.remove(["channel"]), "channel"],
+      ["pathRemove() by its stored name", (u: Builder) => u.pathRemove(["ch"]), "ch"],
+      ["pathRemove() by its model name", (u: Builder) => u.pathRemove(["channel"]), "channel"],
+      [
+        "pathSet() by its stored name",
+        (u: Builder) => u.pathSet({ segments: ["ch"], value: "c2" }),
+        "ch",
+      ],
+      [
+        "the unbound combinator by its stored name",
+        () => (RenamedPorts as any).update(seed).pipe(Entity.remove(["ch"])),
+        "ch",
+      ],
+    ] as const) {
+      it.effect(`${name} is refused`, () =>
+        Effect.gen(function* () {
+          const result = yield* runUpdate("RenamedPorts", seed, build)
+          expectRefused(result, field)
+          expect(storedChannel(result)).toEqual([{ S: "c1" }])
+        }).pipe(Effect.provide(TestLayer), closed),
+      )
+    }
+
+    it.effect("another field is still removed", () =>
+      Effect.gen(function* () {
+        const result = yield* runUpdate("RenamedPorts", seed, (u) => u.remove(["label"]))
+        expect(failureOf(result.exit)).toBeUndefined()
+        expect(storedChannel(result)).toEqual([{ S: "c1" }])
+      }).pipe(Effect.provide(TestLayer), closed),
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------

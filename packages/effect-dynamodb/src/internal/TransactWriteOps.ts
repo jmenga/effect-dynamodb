@@ -20,7 +20,7 @@ import type {
   UniqueConstraintViolation,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
-import { ItemNotMoved, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Option } from "effect"
 import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
@@ -46,7 +46,7 @@ import {
   resolveTableNames,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
-import { Planning, type TransactPlan } from "./TransactPlan.js"
+import type { TransactPlan } from "./TransactPlan.js"
 import {
   type KeyAttributes,
   keyAttributesOf,
@@ -251,12 +251,9 @@ export interface ItemProvenance {
    * `"main"`: the op's own item. `"guarded"`: one of the items of a guarded put
    * or of a planned update or delete — see {@link GuardedWrite}, which reads
    * their cancellation reasons. `"stream"`: one of the items of a nested
-   * stream append — see {@link NestedStreamAppend}. `"notMoved"`: the check
-   * that the op's item is not still under its 1.36 key (#171), whose failure
-   * is `error`.
+   * stream append — see {@link NestedStreamAppend}.
    */
-  readonly kind: "main" | "guarded" | "stream" | "notMoved"
-  readonly error?: ItemNotMoved | undefined
+  readonly kind: "main" | "guarded" | "stream"
   /**
    * The entity the op targeted (a nested stream append: its event marker), so
    * consumers can name it in an error.
@@ -426,7 +423,7 @@ export const buildTransactWriteItems = (
     | undefined,
 ): Effect.Effect<
   BuiltTransactWriteItems,
-  ValidationError | DynamoClientError | ItemNotMoved,
+  ValidationError | DynamoClientError,
   TableConfig | DynamoClient
 > =>
   Effect.gen(function* () {
@@ -588,55 +585,6 @@ export const buildTransactWriteItems = (
 
     // The nested stream appends, built by their own streams, are pushed in
     // caller op order between the entity ops' items.
-    /**
-     * The item an op adds for its item's 1.36 key (#171): `item` — what the op
-     * does there — or, without one, the check that the item moved, whose
-     * failure is `ItemNotMoved`.
-     */
-    const movedOr136 = (
-      op: { readonly opIndex: number; readonly entity: Entity },
-      table: string,
-      old: Record<string, string>,
-      item: TransactWriteItem | undefined,
-      opName: string,
-      key: Record<string, unknown>,
-    ): [TransactWriteItem, ItemProvenance, boolean] =>
-      item !== undefined
-        ? [item, { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType }, true]
-        : [
-            absentAt(table, old, keyFields),
-            {
-              opIndex: op.opIndex,
-              kind: "notMoved",
-              entityType: op.entity.entityType,
-              error: new ItemNotMoved({ entityType: op.entity.entityType, key, operation: opName }),
-            },
-            true,
-          ]
-
-    /**
-     * The item's 1.36 key, when its text changed (#171) — unless another
-     * value's current row is there, which the op leaves alone. Another value's
-     * 1.36 row at the item's current key cannot move inside a transaction:
-     * `ItemNotMoved`, naming that value.
-     */
-    const old136 = (
-      op: { readonly entity: Entity },
-      key: Record<string, unknown>,
-      opName: string,
-    ) =>
-      Effect.gen(function* () {
-        const alias = yield* op.entity._alias136(key, true)
-        if (alias.held !== undefined) {
-          return yield* new ItemNotMoved({
-            entityType: op.entity.entityType,
-            key: alias.held,
-            operation: opName,
-          })
-        }
-        return alias.old ? undefined : op.entity._primaryKey136(key)
-      })
-
     const pushStreamOp = (opIndex: number) =>
       Effect.gen(function* () {
         const op = streamOps.get(opIndex)!
@@ -691,21 +639,17 @@ export const buildTransactWriteItems = (
       if (op.type === "put") {
         const built = yield* validateAndBuildPutItem(op.entity, op.input!, `${operation}.put`)
         if (op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")) {
-          // Planned, not run: an item still under its 1.36 key is not moved
-          // here — the plan checks that it moved instead (#171).
-          const plan = yield* op.entity
-            ._planPut({
-              tableName,
-              ttlAttrName: resolveTtlAttributeName(yield* op.entity._tableTag),
-              now: built.now,
-              item: built.item,
-              createdAtSupplied: built.createdAtSupplied,
-              userCondition: op.condition,
-              create: op.putKind === "create",
-              operation,
-              key: op.input!,
-            })
-            .pipe(Effect.provideService(Planning, true))
+          const plan = yield* op.entity._planPut({
+            tableName,
+            ttlAttrName: resolveTtlAttributeName(yield* op.entity._tableTag),
+            now: built.now,
+            item: built.item,
+            createdAtSupplied: built.createdAtSupplied,
+            userCondition: op.condition,
+            create: op.putKind === "create",
+            operation,
+            key: op.input!,
+          })
           guarded.push({ opIndex: op.opIndex, start: items.length, plan })
           for (const [i, item] of plan.items.entries()) {
             push(
@@ -736,27 +680,6 @@ export const buildTransactWriteItems = (
           },
           { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
         )
-        // An item still under its 1.36 key (#171): a create requires that key
-        // empty too; a put replaces the item, so it is deleted there — unless
-        // the put is conditioned, which judges the item at its current key: it
-        // must have moved. Not another value's row at either key.
-        const old = yield* old136(op, op.input!, `${operation}.put`)
-        if (old !== undefined) {
-          push(
-            ...movedOr136(
-              op,
-              tableName,
-              old,
-              op.putKind === "create"
-                ? absentAt(tableName, old, keyFields)
-                : op.condition === undefined
-                  ? { Delete: { TableName: tableName, Key: toAttributeMap(old) } }
-                  : undefined,
-              `${operation}.put`,
-              op.input!,
-            ),
-          )
-        }
       } else if (op.type === "delete") {
         push(
           {
@@ -770,24 +693,6 @@ export const buildTransactWriteItems = (
           },
           { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
         )
-        // The item is removed wherever it is (#171) — unless the delete is
-        // conditioned, which judges the item at its current key: it must
-        // have moved. Not another value's row at either key.
-        const old = yield* old136(op, op.key!, `${operation}.delete`)
-        if (old !== undefined) {
-          push(
-            ...movedOr136(
-              op,
-              tableName,
-              old,
-              op.condition === undefined
-                ? { Delete: { TableName: tableName, Key: toAttributeMap(old) } }
-                : undefined,
-              `${operation}.delete`,
-              op.key!,
-            ),
-          )
-        }
       } else {
         push(
           {
@@ -802,11 +707,6 @@ export const buildTransactWriteItems = (
           },
           { opIndex: op.opIndex, kind: "main", entityType: op.entity.entityType },
         )
-        // A check judges the item at its current key: it must have moved (#171).
-        const old = yield* old136(op, op.key!, `${operation}.check`)
-        if (old !== undefined) {
-          push(...movedOr136(op, tableName, old, undefined, `${operation}.check`, op.key!))
-        }
       }
     }
 
@@ -820,20 +720,6 @@ export const buildTransactWriteItems = (
     const targets = () => naming.map((name) => name())
     return { items, provenance, targets, guarded, streams, conditioned, keys }
   })
-
-/** A ConditionCheck that nothing is stored at `key` (a primary key record). */
-const absentAt = (
-  tableName: string,
-  key: Record<string, string>,
-  keyFields: ReadonlyArray<string>,
-): TransactWriteItem => ({
-  ConditionCheck: {
-    TableName: tableName,
-    Key: toAttributeMap(key),
-    ConditionExpression: "attribute_not_exists(#pk)",
-    ExpressionAttributeNames: { "#pk": keyFields[0]! },
-  },
-})
 
 // ---------------------------------------------------------------------------
 // judgeCancellation
@@ -898,7 +784,7 @@ export const judgeCancellation = (
   | {
       readonly _tag: "fail"
       readonly opIndex: number
-      readonly error: UniqueConstraintViolation | ValidationError | ItemNotMoved
+      readonly error: UniqueConstraintViolation | ValidationError
     }
   | { readonly _tag: "conditions"; readonly opIndices: ReadonlyArray<number> }
   | {
@@ -930,7 +816,6 @@ export const judgeCancellation = (
     if (inGuarded.has(i) || inStream.has(i)) continue
     if (reasons[offset + i]?.Code !== "ConditionalCheckFailed") continue
     const from = built.provenance[i]
-    if (from?.error !== undefined) return { _tag: "fail", opIndex: from.opIndex, error: from.error }
     if (from !== undefined) conditions.add(from.opIndex)
   }
   if (conditions.size > 0) {

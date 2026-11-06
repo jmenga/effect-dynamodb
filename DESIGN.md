@@ -233,7 +233,7 @@ const AppSchema = DynamoSchema.make({
 | `name` | `string` | *required* | Application name, used as key prefix |
 | `version` | `number` | *required* | Schema version number |
 | `casing` | `"lowercase" \| "uppercase" \| "preserve"` | `"lowercase"` | Casing for the whole composed key, composite values included |
-| `legacyKeys` | `boolean` | `true` | `false` turns off the 1.36 key fallback (§7 "Rows written by 1.36"): operations stop reading and moving rows stored under the key text 1.36 composed (`rekey` moves rows whatever it is set to). 1.37.x only; removed with the fallback in the next major |
+| `escapeKeys` | `boolean` | `false` | `true` escapes strings and gives numbers numeric key text, in every key, partition and sort (§7 "Key text"): all or nothing. Off stores exactly the 1.36 text, for strings and numbers, with accepted limitations. Off by default for all of 1.x; on by default is planned for the next major. Over existing rows, `rekey` moves them |
 
 ### Casing Rules
 
@@ -718,16 +718,16 @@ Given `DynamoSchema({ name: "myapp", version: 1, casing: "lowercase" })` and `en
 | Type | Serialization |
 |------|---------------|
 | `string` | As-is; in a sort key, code points U+0000–U+0025 escaped (sort key text, below) |
-| `number` | Numeric key text (below): a non-negative integer is zero-padded to 16 digits |
-| `bigint` | Numeric key text (below): a non-negative bigint is zero-padded to 38 digits |
+| `number` | A non-negative integer is zero-padded to 16 digits. Anything else: `String(n)` padded (off), numeric key text (`escapeKeys: true`, below) |
+| `bigint` | A non-negative bigint is zero-padded to 38 digits. Anything else: `String(n)` padded (off), numeric key text (`escapeKeys: true`, below) |
 | `DateTime.Utc` | ISO 8601 string |
 | `boolean` | `"true"` / `"false"` |
 | Branded string | Underlying string value |
 
 #### Numeric key text
 
-DynamoDB orders sort keys by their UTF-8 bytes, so `KeyComposer.serializeValue`
-writes a number or bigint as text that sorts in numeric order
+DynamoDB orders sort keys by their UTF-8 bytes, so with `escapeKeys: true`
+`KeyComposer.serializeValue` writes a number or bigint as text that sorts in numeric order
 (`packages/schema/src/internal/NumericKey.ts`). `x` is the magnitude, `W` the pad
 width (16 for a number, 38 for a bigint):
 
@@ -746,8 +746,8 @@ orders the forms (`-` < digits < `:` < `;`; under `-`, `)` < `*` < digits), and 
 negative's `:` terminator sorts its shorter text last, so `-3.14 < -3.1 < -3`. Every
 byte is above the `#` delimiter and none is a letter, so casing never changes it and
 a composite that continues with `#<next>` keeps the order. `NaN` has no order and a
-bigint of more than 1,000 digits overflows the exponent: both throw `[EDD-9096]`
-(`KeyValueError`). Where that surfaces:
+bigint of more than 1,000 digits overflows the exponent: with `escapeKeys: true` both throw
+`[EDD-9096]` (`KeyValueError`). Where that surfaces:
 
 | Path | Result |
 |---|---|
@@ -757,32 +757,43 @@ bigint of more than 1,000 digits overflows the exponent: both throw `[EDD-9096]`
 | `Aggregate`, `EventStore` | Not converted: a defect |
 | A `NaN` in a number attribute that is not a key composite | Refused by the marshaller (a defect), as in 1.36 |
 
-Up to 1.36 `NaN` composed the text `0000000000000NaN` (then cased): a `get` by a `NaN` key failed with
-`ItemNotFound` and a `delete` did nothing, where they now fail with the
-`ValidationError`; a write died in the marshaller, as it still would without the
-check.
+Up to 1.36, and with `escapeKeys` off, a number's text is `String(n).padStart(16, "0")`
+(38 for a bigint), which sorts `-3` above `-5`, `10.5` below `3.14`, `1e-7` above `3` and
+`1e21` below `1e16`. Non-negative integers below `10^W` have the same bytes under both;
+every other number (negative, fractional, `≥ 1e16`, `±Infinity`), every negative or
+`≥ 1e38` bigint, and `DateEpochMs` and `DateEpochSeconds` composites before 1970 differ.
 
-**This changed stored keys in 1.37.0.** Up to 1.36 the text was
-`String(n).padStart(16, "0")` (38 for a bigint), which sorted `-3` above `-5`, `10.5`
-below `3.14`, `1e-7` above `3` and `1e21` below `1e16`. Non-negative integers below
-`10^W` keep their exact bytes; every other number (negative, fractional,
-`≥ 1e16`, `±Infinity`) and every negative or `≥ 1e38` bigint now composes different
-text — including `DateEpochMs` and `DateEpochSeconds` composites before 1970. Items
-written by 1.36 with such a composite keep their old keys until they move. While the
-1.36 key fallback is on ("Rows written by 1.36" below) single-item operations find and
-move them, queries that pin a key prefix read them, aggregates are read and moved, and
-an `EventStore` stream is read and appended where it lives; a range bound still misses
-or misorders them. `rekey` ("Rows written by 1.36", "`rekey`") moves every remaining
-row, row kind by row kind.
+**Off composes exactly what 1.36 composed**, so a row 1.36 stored stays where a read looks:
+`NaN` is `0000000000000NaN` (then cased), a very long bigint its digits, and neither is
+refused. A `NaN` shard source is `EDD-9096` under either setting: there was no sharding in
+1.36, so no text to keep. A `NaN` in a number attribute dies in the marshaller either way.
 
-#### Sort key text
+**History.** 1.37.0 composed numeric text unconditionally, and 1.38.0 kept it. Since 1.39.0
+it belongs to `escapeKeys: true`.
 
-A composite value's text in a **sort key** escapes every code point
-U+0000–U+0025 — control characters, space, `!`, `"`, `#`, `$` and `%` — as `%`
-and two hex digits (`KeyComposer.sortKeyText`, `serializeSortKeyValue`):
-`new york` is `new%20york`, `a#b` is `a%23b`, `50%` is `50%25`. The value is cased
-first, then escaped; the hex digits follow the casing (`%0A`, or `%0a` under
-`"lowercase"`). Partition key text is not escaped.
+#### Key text
+
+One setting decides the text of every key: `escapeKeys` on `DynamoSchema.make`. **It's off by
+default for all of 1.x, you opt in with `escapeKeys: true`, and on by default is planned for the
+next major release.** It's all or nothing, for strings and numbers, partition keys and sort keys.
+
+| | Off (default) | `escapeKeys: true` |
+|---|---|---|
+| A string in a key | As it is: the text 1.36 composed | Escaped, in every key |
+| A number or bigint in a key | Zero-padded: the text 1.36 composed | Numeric key text |
+| A time-series event's `orderBy` segment | The attribute's encoded value | Its key form, escaped |
+| A partial pin on a secondary index's sort key | `begins_with(<prefix>#)` | `BETWEEN <prefix> AND <prefix>#U+FFFF` |
+
+**One text, one request.** Every operation composes the one text its setting chooses and looks
+nowhere else: no second read, no second query, no move on first write, no row check on another
+value's text, whatever the value holds. `test/KeyRequests.test.ts` pins it by request capture: a
+value whose text differs under the other setting sends the same requests as one whose text doesn't,
+under both settings. `rekey` is the only thing that moves a row from one text to another.
+
+With `escapeKeys: true` a composite's text escapes every code point U+0000–U+0025 — control
+characters, space, `!`, `"`, `#`, `$` and `%` — as `%` and two hex digits (`KeyComposer.keyText`,
+`keyValueText`): `new york` is `new%20york`, `a#b` is `a%23b`, `50%` is `50%25`. The value is cased
+first, then escaped; the hex digits follow the casing (`%0A`, or `%0a` under `"lowercase"`).
 
 DynamoDB orders sort keys by UTF-8 bytes, and a composite that is not the last
 is followed by `#`. Escaped, a composite's text holds no character below `%`, so
@@ -791,334 +802,118 @@ sorts before every greater value's. An escape starts with `%`, below every
 unescaped character, and escapes keep the order of the code points they replace,
 so key order is the cased values' order. The map is per character, so a value is
 a prefix of another exactly when its key text is (`begins_with` is unchanged).
-Every bound is therefore one exact key range (§ "Accessor sort key conditions"),
-and a value may hold `#`. Numbers, bigints, dates and booleans never hold an
-escaped character, and a string without one keeps its 1.36 bytes.
+With `escapeKeys: true`, then, every bound is one exact key range (§ "Accessor sort key
+conditions"), and a value may hold `#`. Numbers, bigints, dates and booleans never hold an
+escaped character, and a string without one has the same bytes under both settings.
 
-| Key | Escaped |
+| Key | Escaped, with `escapeKeys: true` |
 |---|---|
-| Table and index sort keys (clustered collection members included), and every condition and prefix composed from their composites | yes |
+| Table and index partition keys and sort keys (clustered and isolated collection members included), and every condition and prefix composed from their composites | yes |
 | Time-series event sort key: the `orderBy` segment | yes |
 | Version snapshot and tombstone sort keys: the item segment, taken from the escaped live key | yes |
-| Aggregate: collection and list sort key composites, many-edge composites, discriminator values (not the discriminator names) | yes |
+| Aggregate: partition, collection and list key composites, many-edge composites, discriminator values (not the discriminator names) | yes |
+| EventStore stream partition keys, under the stream's own casing | yes |
+| Unique-constraint sentinels: the values in the sentinel's partition key | yes |
+| Vector index partitions | yes |
 | Z-order `sk.prefix` segments, before their length prefix or hash | yes |
-| Partition keys (table, index, aggregate, EventStore stream), unique-constraint sentinels (the value is in the sentinel's pk), EventStore event and command sort keys | no |
+| The structural parts of a key: the schema prefix, entity type, collection name, attribute labels, shard marker | no |
+| EventStore event sort keys (their parts are structural and a version) and command sort keys (an id only ever read by its exact key, never by a range) | no |
 
-The language service's params mirror it (`ParamsBuilder`, pinned by
-`KeyParity.test.ts`).
+The language service's params mirror it (`ParamsBuilder`, pinned by `KeyParity.test.ts` under both
+settings).
 
-**This changed stored keys in 1.37.0** for a sort key composite or time-series
-`orderBy` value holding such a character. Up to 1.36 such a value sorted apart
-from its order and `#` split it into two segments, so bounds returned wrong rows.
-Rows written by 1.36 keep their old sort keys until they move — a write, or
-`rekey` — as for numeric key text above (partition keys are unaffected).
+Since both roles of an attribute build one text, an inverted index needs no case of its
+own: `pk: { field: "sk", composite: ["groupId"] }, sk: { field: "pk", composite: ["userId"] }`
+composes the same bytes the table's halves do, under either setting (canonical shape 14). That
+fixes what 1.37.0 and 1.38.0 did to one ("Rows under other key text").
 
-#### Rows written by 1.36 (#171)
+**What off gives up.** Off is the text `test/EscapeKeys.test.ts` compares with
+`fixtures/rows-1.36.0.json`, which the published 1.36.0 stored. It has accepted limitations, the
+same as up to 1.36, with no machinery and no refusal for any of them:
 
-Numeric key text, sort key escaping and the event keys of a string-encoded
-numeric `orderBy` change the key text of some rows 1.36 wrote. Through 1.37.x
-operations keep working over those rows — single-item operations read and move
-them, queries that pin a key prefix read them — and an item moves to its current
-key the first time it is written. The fallback is on by default;
-`DynamoSchema.make({ legacyKeys: false })` turns it off once every row has moved
-(`rekey`, below), and it is removed in the next major release.
+- Key order isn't value order when a value holds a character below `#`. A range on a sort key
+  composite that isn't the last can return the wrong rows: `new york` sorts below `new#...`, so
+  `lte: "new york"` leaves out `new`. `gt` under a pin on the last composite can miss a longer value
+  continuing below `#` (`a b` or `a!` for `a`).
+- Numbers sort as zero-padded text, and `.history()` over a `NumberFromString` or `BigIntFromString`
+  `orderBy` reads in text order.
+- A `#` in a value can imitate a segment: `a#b` + `c` and `a` + `b#c` compose one key, and a pin on
+  `new` also returns `new#2`.
+- A pin on a composite that isn't the last, on a secondary index, is `begins_with(<prefix>#)`, so a
+  row truncated at that composite isn't returned (§ "A pin on a truncated row's own level"). An
+  `.where(eq)` or an `eq` in `.within()` means the same.
+- Skip-scan over free-form strings can hide rows, since its partition walk reads key order, and a
+  probe that lands on a key it can't parse stops: the rest of the range is one filtered read.
+- Z-order prefix segments hold the raw string.
 
-`KeyText136` (`@effect-dynamodb/schema/internal/KeyText136.ts`, internal)
-composes exactly the bytes 1.36 wrote for every key kind — 1.36's
-`serializeValue` (`String(n).padStart(16, "0")`, a bigint to 38, no escaping)
-through the unchanged structural composers, and the time-series event sort key
-from the encoded `orderBy`. Golden vectors generated once from the published
-1.36.0 packages pin it (`packages/schema/test/fixtures/key-text-1.36.0.json`). A
-key's text *changed* when its 1.36 text differs from its current text, computed
-from the values; only then does an operation take a fallback path. A key whose
-text did not change sends exactly the requests it sends with the fallback off
-(request capture, `LegacyKeys.test.ts`), and with it off no request names a 1.36
-key.
+The shard hash reads a value's `serializeValue` text, so a row's shard doesn't change with the flag.
 
-| Operation | An item whose primary key text changed |
-|---|---|
-| `get`, `getVersion`, `deleted.get`, `restore`'s tombstone read | Reads the current key; on a miss, the 1.36 key (`ConsistentRead` as asked). A snapshot or tombstone is read under the 1.36 partition and item segment. A row another value's 1.36 write left at either key is a miss ("Aliasing" below). Nothing moves |
-| `Batch.get` | One more `BatchGetItem` for the misses, under their 1.36 keys; another value's row is a miss |
-| `Transaction.transactGet` | One more `TransactGetItems` for the misses. The two reads are separate snapshots, not one; another value's row is a miss |
-| `put` (no unique constraint, unversioned, unconditioned) | One `TransactWriteItems`: Put at the current key, Delete at the 1.36 key — on every such put while the fallback is on, moved or not, since nothing tells the put whether the 1.36 row is gone. A transactional write costs twice a plain one's write capacity, for each of the two items, and a concurrent transaction over either key cancels it (`TransactionConflict`), which a plain `PutItem` would not meet: such a cancellation is sent again, up to 3 attempts in all (`GUARDED_PUT_ATTEMPTS`). A value whose 1.36 key can be another value's current key is put as a conditioned put is ("Aliasing") |
-| `create` | Put at the current key (`attribute_not_exists`) and a ConditionCheck that the 1.36 key is empty: either holding the item fails `ConditionalCheckFailed`. A 1.36 key that can be another value's current key is read first, and that value's row there is left out ("Aliasing") |
-| A conditioned `put`, `upsert`, `update`, `patch`, `append` (current item; but see below) | Sent first, as for an item at its current key, with `attribute_exists(pk)` added to the condition (`ReturnValuesOnConditionCheckFailure: ALL_OLD`): an item already there costs nothing more. A condition failure with no stored item means the item is not at its current key: it is moved (below) — or found absent — and the write sent again with the op's own condition, so a new item costs the failed write and one read of the 1.36 key |
-| A guarded put (unique, versioned), an `append` of a string-encoded numeric `orderBy` (its compare-and-set reads the stored value), soft `delete`, `restore` | Read first; a read that misses moves the item, then the op runs as for an item always at its current key |
-| `delete`, `deleteIfExists` | `DeleteItem` at the current key (`ALL_OLD`); when nothing was there, `DeleteItem` at the 1.36 key with the same condition. A condition is judged on the item that exists |
-| `purge` | Queries both partitions and deletes the rows of both that belong to the item — judged by their values, not by key prefix — with the sentinels each form names |
-| `Batch.write` | A put deletes the 1.36 key once every request of the batch is written, in a later `BatchWriteItem` (not beside the put: a batch is not atomic, and the Delete could land without its Put) — unless another put of the batch writes that key. A delete adds a Delete of the 1.36 key. A versioned put is create-only, so it adds a ConditionCheck that the 1.36 key is empty to its transaction group — which a chunk boundary can split from the put |
-| `Transaction.transactWrite` | An unconditioned put or delete adds a Delete of the 1.36 key; a create adds a ConditionCheck that it is empty. An update, patch, conditioned put or delete, guarded put and `Transaction.check` cannot move an item inside the transaction: each adds a ConditionCheck that the 1.36 key is empty, and an item still there fails the whole transaction with `ItemNotMoved` (`EDD-9097`) before or as it is sent, writing nothing |
+A cursor names a key. One from the other setting's text finds no rows, or DynamoDB refuses it
+(`DynamoValidationError`, its start key isn't in the partition), and on a `.within()` or sharded
+query it fails with `EDD-9094` (the fingerprint covers the partition). One from a query 1.37.0 or
+1.38.0 ran over two key texts (field `p`) fails with `EDD-9094` on any query.
 
-**The move.** A consistent `GetItem` of the 1.36 key, then one
-`TransactWriteItems`: a Put of the stored item at its current key
-(`attribute_not_exists(pk)`), every attribute copied, the primary key, every GSI
-key and every vector partition recomposed from the stored item; a Delete of the
-1.36 item guarded on the item read (`deleteGuard`: its version and incarnation
-token when versioned, else every attribute — stronger than an `updatedAt` check
-and needing no extra write); and the item's unique sentinels re-pointed — a
-sentinel whose text changed is Put under its current key (`attribute_not_exists`)
-and released under the 1.36 key, one whose text did not gets its back-pointer
-updated, each conditioned on the 1.36 item still owning it. GSI keys go through
-`composeGsiKeysForUpdatePolicyAware` with the stored item as both payload and
-key record, so the index policy decides each half exactly as for an update: a
-half the item holds composites for is recomposed, a half whose composites are
-all absent keeps its stored attribute, a hole is kept under `'preserve'` and
-removed under `'sparse'` (the six canonical shapes, unit, entity-level and
-connected). A Put that finds the item already at its current key means a
-concurrent move won: the op goes on. A Delete or sentinel guard that fails is a
-concurrent change: the move reads again, up to 3 attempts in all, then fails
-`ConcurrentModification`. A move that finds nothing at the 1.36 key may have
-lost to a concurrent first write that moved the item: the op reads (or writes)
-the current key once more before it reports `ItemNotFound`, so concurrent first
-writes of an unmoved item all succeed. Retained history stays where it is: snapshots and
-tombstones under the 1.36 partition are read there, `highestRetainedVersion`
-looks under both, and a put continues the version sequence. The exception is
-the snapshot of the version the item is at, which moves with the item in the
-move's transaction (`snapshotMove136`: a consistent read of it, a Put at its
-current key where nothing is or over the same snapshot — `snapshotPut`'s
-guard — and a Delete of it as read). 1.36 snapshotted that version when it
-wrote it, and the write that follows the move snapshots it again under the
-current key (a retain write snapshots the version it replaces), so left
-behind it would be stored under both keys. A current key holding a different
-snapshot of that version keeps it where it is, and the item moves without it.
-`restore` of a tombstone under its 1.36 key moves the snapshot of the version
-it restores the same way, in its own transaction, before it restores, and puts
-the snapshot it writes under the item's current partition key.
+#### Rows under other key text (#171, #183)
 
-**Unique values.** A value is held by its sentinel under either key text: a put,
-create, update or restore that reserves a value adds a ConditionCheck that its
-1.36 sentinel key is empty, and a release frees both forms of a value the item
-holds. A sentinel whose text changed (a number) moves with its item.
+A table can hold rows under any of these. `KeyText136.forms` (`@effect-dynamodb/schema/internal/KeyText136.ts`,
+internal) gives each as a pair of schemas whose composers give its partition and sort key text:
 
-**Aliasing.** 1.36 did not escape sort key text, so its text of a string
-holding `%` and two hex digits spells another value's escaped text: the 1.36
-key of `foo%20bar` is the current key of `foo bar`, and of `x%23y` that of
-`x#y`. Until it moves, such a row sits at another item's current key. Only a
-string sort key composite whose current text holds an escape is exposed —
-numbers, partition keys, unique sentinels and event store keys never alias — and
-every operation over such a key tells the two apart by the row's values
-(`rowOwner`): a row whose values compose the key it was read at is that key's
-item; one whose values compose another key is another value's.
+| Written by | Partition key | Sort key | Numbers | Event `orderBy` |
+|---|---|---|---|---|
+| Up to 1.36, and `escapeKeys` off | Raw | Raw | Zero-padded | Encoded value |
+| 1.37.0 and 1.38.0 | Raw | Escaped | Numeric | Key form |
+| `escapeKeys: true` | Escaped | Escaped | Numeric | Key form |
 
-- Reads — `get`, `getVersion`, `deleted.get`, `restore`'s tombstone read,
-  `Batch.get`, `transactGet` — treat another value's row, at either key, as a
-  miss. A `get` with a projection reads the key composites too, to judge the
-  row, and returns only the projection.
-- Writes at an exposed key carry a guard that a stored row is the item's own
-  (`aliasGuard`): the stored composite `contains` the value's first character
-  below `%` (casing never changes it, and no aliasing row holds one), or, for
-  a value whose only escaped character is `%`, equals it when no casing variant
-  can be stored. When no condition tells them apart (`%` and letters under a
-  casing) the op reads the key first. A write whose guard fails on another
-  value's row moves that row to its own current key — as a write of that item
-  would, up to four rows along a chain — and writes again; a chain longer than
-  that fails `ConcurrentModification`. `update`, `patch` and `delete` treat
-  such a row as no item at the current key, and a `delete` at the 1.36 key
-  leaves another value's row there alone.
-- At the item's 1.36 key another value's current row can sit when that key's
-  text can be escaped text — a value holding `%` and no character below it
-  (`spells136`): `foo%20bar`'s 1.36 key is `foo bar`'s current key. An
-  unconditioned `put` of such a value is sent as a conditioned one is (below),
-  so it moves only a row there whose values are the item's and never deletes
-  the key unread. A `create` (a guarded put's too, and a put planned for a
-  transaction) and `restore`, which require the item not live there, read the
-  key first (strongly consistent) and leave another value's row out of the
-  check (`foreignAt136`).
-- A version a retained item created afresh continues from counts every
-  snapshot under its own history prefix — another value's 1.36 snapshots too,
-  so its own land past them — and, under its 1.36 prefix, only the item's
-  own: `a%20b`'s 1.36 prefix is `a b`'s current one.
-- A transaction can't move one: `Transaction.transactWrite` reads each exposed
-  key first and fails `ItemNotMoved` naming the item whose row holds it, before
-  anything is sent; a planned transactional update or delete fails the same way.
-  `Batch.write` reads each exposed key first, moves another value's row out of
-  a put's way, and sends no Delete of a key another value's row holds.
-- Queries keep each row by its values (below). `purge` deletes the rows whose
-  values are the item's: under a 1.36 partition `a b`'s rows are a key prefix of
-  `a b#c`'s, and stay `a b#c`'s.
+1.37.0 and 1.38.0 write the same text: the published packages' rows are compared in
+`releaseRowScenarios`. They also leave a fourth form, on an index stored in the table's own key
+attributes (an inverted index): each attribute holds the text of the half that wrote it last, so
+`pk` is escaped and `sk` raw (`KeyText136.invertedForm137`).
 
-A row that sits at another value's current key moves before that value's row
-is written there: the entity's `put` does it, and `rekey` makes room the same
-way before it moves a row to a key such a row holds.
+Only `rekey` looks for any of these. **There is no fallback and nothing is promised until `rekey`
+finishes.** With a value whose key text changed:
 
-**Queries.** A query that pins a key prefix also reads the key 1.36 composed
-for the same pins, when its text differs: an entity accessor (the partition key,
-the pinned sort key composites, and an `eq` / `beginsWith` bound that extends
-the pins), the primary accessor, `Entity.query.*`, a collection, `.history()`,
-`versions()`, `deleted.list()`, `count()` and `purge`'s partition read. The two
-keys are two passes of one plan (`RangePlanner.keyPassesPlanner`, installed by
-`Query.alsoRead136`): rows 1.36 wrote are the older ones, so a forward read
-takes the 1.36 key first and `.reverse()` takes it last, each key in the
-query's direction — a fixed order, not a merge. `limit`, `maxPages`, pages and
-`count()` run across both; a cursor names its pass (`p` in the v2 cursor: `1`
-the 1.36 key, `0` the current key), a plain `{ k }` cursor is placed by its key,
-and one from a pass the query no longer reads is refused (`EDD-9094`). Each
-pass keeps a row by its values (`KeyPass.rows`), composing the index key they
-compose now: the current pass keeps a row stored at that key, or at any key but
-the one 1.36 composed for its values (`composed136`: an index policy left its
-key behind its values, so it belongs where it is, as with the fallback off), and
-the 1.36 pass a row stored elsewhere whose current key is in the current pass's
-partition and condition, unless both ranges hold it in one partition and the
-current pass kept it. So each row is read once, by the pass it belongs to: a current row
-the 1.36 condition also selects (`a#b`'s 1.36 text is the current text of `a`
-then `b`) is the current pass's; an unmoved `a#b` row is not returned under pins
-on `a`, as it was in 1.36; and another value's 1.36 row at a current key
-(Aliasing) is returned by the 1.36 pass of that value's own query, not by the
-current pass of the key it sits at. A row whose values compose no key falls
-back to the key text: under one partition the 1.36 pass drops rows the current
-condition selects. A query whose key text
-did not change plans no pass and sends exactly what it sent without the
-fallback. `asParams()` and `explain()` show the current key's request;
-`explain()` lists both key conditions.
+- No read finds its rows. `get` is `ItemNotFound`; queries, `.history()`, `versions()`, batch and
+  transaction reads, aggregates, streams and projections read as if the rows weren't there.
+- A write of the same key lands beside them. `rekey` then reports `bothKeys` and leaves both. An
+  `update` finds no item, and a stream append starts at version 1 under the new key.
+- A value can land on another value's old row. `foo bar` under `escapeKeys: true` composes the text
+  `foo%20bar` was stored under, so a read of `foo bar` returns that row, a `put` overwrites it and a
+  `delete` deletes it. Nothing checks whose row it is: such a check is a read on every operation.
+- A unique value isn't seen as taken while its sentinel is under other text, so a duplicate can land.
+  `rekey` reports the conflict and overwrites nothing.
 
-**History.** `.history(key)` reads the 1.36 event prefix (the 1.36 partition and
-current sort key, then `#e#`) and the current one. An append moves the current
-item first (above), so its events from then on are under the current prefix
-while the earlier ones stay where they are. Under a string-encoded numeric
-`orderBy` (`NumberFromString`, `BigIntFromString`) an item whose key text did
-not change keeps one prefix for both forms: 1.36 wrote `#e#2`, 1.37 writes
-`#e#0000000000000010`, and in text order `10` sorted between them. `.history()`
-reads that prefix in two passes split by the row's `orderBy`: the 1.36 pass
-keeps the events whose sort key is not the one their `orderBy` composes now, the
-current pass the others — 1.36's events first, in their 1.36 order, then the
-current ones (the other way round under `.reverse()`). A `.where()` bound on
-`orderBy` is a key condition in the current pass and a check of each row's
-number in the 1.36 pass, which reads the whole prefix — every operator returns
-exactly the events it selects, at the cost of reading all of the item's events
-once more until they move. `versions()` reads the 1.36 partition's snapshots,
-and `deleted.list()` its tombstones. A version whose snapshot is under both keys
-(a copy restored from a backup, or one a write made before its item moved with
-it) is listed once, from the current key: a `Limit 1` keys-only read of the
-1.36 prefix comes first, and when it finds a snapshot, a keys-only read of the
-current prefix's versions, which the 1.36 pass leaves out. Under an exposed key (Aliasing)
-`getVersion`, `deleted.get` and `versions()` judge each snapshot or tombstone
-by its values. `deleted.list()` lists every item's tombstones in the partition,
-under both partition keys, as it always has: partition keys never alias, so
-nothing it lists is another partition's.
+So there's a rule: keep the setting, or set it and run `rekey` before serving traffic. A fresh table
+has no rows under other text, and there two values never share a key: `test/AliasKeys.test.ts` and
+`connected.alias-keys.test.ts` pin that, and that every operation is correct on `foo bar` and
+`foo%20bar` after `rekey`, from real rows of every form.
 
-**Aggregates.** Every read of an aggregate's partition — `get`, `update`,
-`delete`, the assembly behind `list` — queries the 1.36 partition too when its
-text differs (its rows first). `update` finds each row it decomposed under its
-1.36 key (the 1.36 partition, discriminator values and `many`-edge composites in
-1.36 text) and moves it in its own group's transaction: the group is rewritten
-at the current keys and the 1.36 row deleted beside the Put, keeping its
-`created` timestamp. A removed edge is deleted under the key it is stored at. A
-root at its current key whose list or collection index key holds 1.36 text (a
-list sort key composite whose text changed, outside the primary key) has its
-group rewritten too, which recomposes those keys — also by an `update` that
-changes nothing.
-`create` adds a ConditionCheck that the 1.36 root is absent to its first
-transaction (`ConditionalCheckFailed`). `list` reads the 1.36 list keys as a
-second pass (ahead of the current key's, behind it under `reverse`; a cursor is
-placed by its key; a sharded list fans out over both keys' shards); a root the
-current composer keys under the 1.36 condition too is left out of that pass.
+**What upgrading means.** From 1.36 or earlier: nothing, the default composes the same text. From
+1.37.0 or 1.38.0: the default reverses their change, so a row with an escapable character in a sort
+key, a number whose text they changed, or a time-series event of a string-encoded numeric `orderBy`
+needs `rekey`, under the default or with the flag set.
 
-**Event streams.** A stream lives under its 1.36 partition when its first event
-is there (one consistent `GetItem` of `(pk136, event 1)`, only for a stream id
-whose text changed). Such a stream is read and appended there — its events,
-snapshot, seal, command sentinels, stream-scoped indexes, the version-contiguity
-check and `headProof` — until `rekey` moves it whole; a stream is never split
-across the two keys, and a new stream starts under its current key. A derived
-stream index filters on both partition keys. An append located at the 1.36 key
-carries a location check (`AppendParts.locationCheck`): its first event is not
-marked moved (`__edd_moved__`, set by `rekey`'s flip). For a head of 1 it is
-folded into the contiguity check on that event; otherwise it is one more
-`ConditionCheck` on `(pk136, event 1)`, `attribute_exists(pk) AND
-attribute_not_exists(__edd_moved__)`, in the contiguity range of the
-transaction. An append that loses the race to a flip fails `VersionConflict`
-and, retried, locates the current key: `locateStream` reads the marker with the
-first event and takes a marked stream as moved.
+`KeyText136` composes exactly the bytes 1.36 wrote for every key kind (`serializeValue136`
+through the same structural composers, and the time-series event sort key from the encoded
+`orderBy`). Golden vectors generated once from the published 1.36.0 packages pin it
+(`packages/schema/test/fixtures/key-text-1.36.0.json`), and with `escapeKeys` off the real composers
+match every one. `fixtures/rows-1.36.0.json`, `rows-1.37.0.json` and `rows-1.38.0.json` hold what the
+published packages stored through every key path, and `legacy-rows-1.36.0.json` their projections
+and retained history. None of these is ever regenerated from this repo.
 
-**Projections.** `projection` and `multiProjection` read a read-model row raw
-(`ProjectionEngine.readRow`, strongly consistent): at its current key, then —
-on a miss, for a key whose text changed — at its 1.36 key, each judged by
-`_ownsRow136` (Aliasing). A row, or a tombstone, found at its 1.36 key is
-folded onto (its state, checkpoints and revision carry over; a tombstone still
-recognises redeliveries) and carries that key (`at136`), so the next write
-moves it: the write through the entity (no removal, no outbox) is the entity's
-conditioned `put`, which moves the item first; a tombstone's `PutItem` and an
-outbox transaction become one transaction — the row's Put at the current key
-`attribute_not_exists`, a Delete of the 1.36 row conditioned on it being as
-read (`asReadGuard`, the revision first), and the outbox Puts. A write over a
-tombstone whose key text changed always takes that transaction, effects or
-none, so the tombstone never moves as an entity row. A cancellation is a lost
-race: the row is read again. A write that expects nothing at the current key
-and fails there clears another value's 1.36 row from it (`_clearAlias136`)
-before the retry, so a key no such row can hold sends what it did. A tombstone
-and an outbox item hold no values to judge by: 1.37 writes them marked
-(`__edd_kt__`) when their row's key text changed (under an unchanged key they
-are written as 1.36 wrote them); an unmarked one under a changed key is 1.36's,
-and is the row its key reads back as (`KeyText136.readIndexKeys`: the
-composites' text between the key's fixed parts, turned back into values by
-kind and kept only when they compose that key, and only when exactly one
-reading does — `_currentKeyOf136`). `rowOwner` judges a tombstone so;
-`displace` and the 1.36 move (`_displaceValueless136`) move an unmarked one,
-marked, to its own row's current key. An outbox Put at a row key that reads
-back as another value's 1.36 key is `attribute_not_exists` (`ALL_OLD`): a
-cancellation on that value's pending item moves it (unless a drainer holds it)
-and the write is retried as a lost race, so `a b`'s effect never replaces
-`a%20b`'s. `drain(key)` reads the head under both keys — the lowest
-`#outbox#<revision>#<n>` suffix of the two first items — so a row's effects
-are delivered in one order: at a current key that reads back as another
-value's 1.36 key it takes the marked items only, and at the 1.36 key of a
-value that `spells136` the unmarked ones only (a filtered read, which can't
-carry `Limit 1`). `drainPending` groups a row's items found through the sparse
-index the same way: an unmarked item by its row key read back, a marked one by
-its own.
-
-**Retained history at a shared segment.** `a%20b`'s 1.36 history segment is
-`a b`'s current one (`historyKeyOptions`: the segment is the live sort key's
-text). `versions()` keeps only the item's own snapshots under its current
-segment (`isItemsRow`, by their values) when the item's key can alias
-(`aliasGuard`), so another value's 1.36 snapshots neither list nor hide the
-item's own 1.36 ones. A snapshot Put replaces a row as "the same snapshot"
-(`sameSnapshotAs`) only when its escaped sort key values match too, so `a b`
-never overwrites `a%20b`'s snapshot of the same version. A write refused by
-such a snapshot (`historyConflict`) moves it to its own current key
-(`displaceSnapshot136`: Put there over nothing or the same snapshot, Delete as
-read) and runs again (`clearingSnapshotAlias`, the guarded put's loop), up to
-`DISPLACE_DEPTH` times; inside a transaction's plan the refusal stands.
-
-**Not transparent.** Until a row moves (a write, or `rekey`):
-
-- A range bound (`gt`, `gte`, `lt`, `lte`, `between`) and `.within()` read the
-  current key only: unmoved rows in the range are missed. `.history()` of a
-  string-encoded numeric `orderBy` under an unchanged item key is the exception
-  (above).
-- Across the two passes rows come in the fixed order above, not merged by sort
-  key; within the 1.36 pass, in 1.36's text order (a negative number above a
-  smaller one).
-- Time-series events of a `Schema.Number` `orderBy` that is negative,
-  fractional or 1e16 and up, or of a string `orderBy` holding a character up to
-  `%`, compose different text under the same prefix when the item's key did not
-  change: `.history()` reads both forms in one pass, in text order, and its
-  bounds compare text.
-- Aliasing is judged by values on single-item operations, entity and primary
-  accessors, `Entity.query.*`, `.history()`, `versions()` and `purge`, but not
-  by a collection query: it can return another value's 1.36 row read at a key
-  it pins. A time-series `append` puts its event
-  without a guard: another value's 1.36 event stored under the same sort key
-  text (that value spelling this one's escaped text, at the same `orderBy`) is
-  overwritten.
-- `Batch.write` and `Transaction.transactWrite` read an exposed key before they
-  send: a row a 1.36 writer still running puts there between the read and the
-  write is not seen.
-- A many-edge's elements over unmoved rows assemble in key text order.
-- `versions()` does not list snapshots an unsegmented, pre-#133 history wrote
-  under the 1.36 partition.
-- `EventStream.measureAppend` and `measureSnapshot` measure the current key.
-
-**Capacity.** Fallback reads and moves run on the operation's own client, so
-they are charged to its consumed-capacity report (§16).
+**Rows holding no values.** A projection's row tombstone or outbox item says which text its key is
+by `__edd_kt__` (`KeyText136.formOfMark`, `markOf`): none is off's, `1` that of 1.37.0 and 1.38.0, `2`
+that of `escapeKeys: true` when it differs from off's. `rekey` reads the key back by the mark.
 
 #### `rekey`
 
-`db.tables.<Table>.rekey(options?)` (`TableOperations.rekey`) moves every row
-1.36 wrote whose key text changed to its current key, so the fallback can be
-turned off. Run it once every instance runs 1.37 (a 1.36 instance writes 1.36
-keys again, and misses moved rows); dry run first. It returns a `RekeyReport`
-(`Table.ts`) and fails with `ValidationError` (`EDD-9098`) for a bad option or
-resume token, or with the `DynamoClientError` of a request that failed.
+`db.tables.<Table>.rekey(options?)` (`TableOperations.rekey`) is the only migration of key text. It
+moves every row under text the setting doesn't compose to the text it does, in either direction: off
+moves rows from 1.37.0, 1.38.0 and `escapeKeys: true` back to 1.36's text, and on moves rows from
+1.36, 1.37.0, 1.38.0 and off to escaped text. Every row is moved or counted, never silently left. Run
+it once every instance runs this release under the setting (another instance writes its own text
+again); dry run first. It returns a `RekeyReport` (`Table.ts`) and fails with `ValidationError`
+(`EDD-9098`) for a bad option or resume token, or with the `DynamoClientError` of a request that
+failed.
 
 **Driver** (`internal/Rekey.ts`). A `Scan` of the table — `segments` fibers
 (`Segment` / `TotalSegments` when more than one), `pageSize` as `Limit`, a
@@ -1133,19 +928,26 @@ is `notLibrary`; one no member claims is `unregistered`. A read model's entity
 also claims its projection row tombstones (`<type>#tombstone`) and outbox
 items (`<type>#outbox`); an outbox on another table is claimed on that table,
 for a read model whose projection registered it (`_projectionOutbox`, set when
-the projection is defined). A row of a
-member stored under neither its current key nor its 1.36 key is
-`unrecognizedKey`. A unit that moves together (an aggregate, a stream, a moved
-row's target) is claimed once per run (`claim`), so it is moved and counted
-once whichever of its rows the scan reaches first, and a row reached after it
-moved — by this run, or by an application write between the scan and the
-move — is `unchanged`: `moved` counts what the run moved.
+the projection is defined). A row of a member stored under no text its values
+composed is `unrecognizedKey`. A unit that moves together (an aggregate, a
+stream, a moved row's target) is claimed once per run (`claim`, `once`), so it is
+moved and counted once whichever of its rows the scan reaches first, and a row
+reached after it moved — by this run, or by an application write between the
+scan and the move — is `unchanged`: `moved` counts what the run moved. After the
+scan each member's `finish` runs (`RekeyMember.finish`): an aggregate judges the rows
+it found below a root it never saw there.
 
-**Idempotence.** A row moves only when it is stored under the key 1.36
-composed for its values (`KeyText136`, forced on whatever `legacyKeys` says)
-and that key differs from the one they compose now. The scan is eventually
-consistent: each move acts on a consistent read and is conditioned on what it
-read. A rerun finds every moved row current and moves nothing.
+**Idempotence.** A row moves only when it is stored under a key its values
+composed under another form and that key differs from the one they compose now. The scan is
+eventually consistent: each move acts on a consistent read and is conditioned on what it read. A rerun
+finds every moved row current and moves nothing.
+
+**The chain, in either direction.** Keys spell each other's: under `escapeKeys: true` `foo bar`
+belongs where `foo%20bar` was stored. So a row in the way that is another value's old row moves
+first (`clearTarget`, up to `DISPLACE_DEPTH` deep), whichever the scan reached first: `foo%20bar`'s
+old row to `foo%2520bar`, then `foo bar`'s to `foo%20bar`. With the flag off it's the reverse. Nothing
+is overwritten or merged. A row whose holder can't move stops retrying and reports `taken`
+(`cantMoveHolder`), and `RekeyReport.conflicts` lists a row once per run.
 
 **Resume token.** `rk1.` + base64url JSON `{ t: tableName, s: positions }`, one
 position per segment: `0` not started, `1` done, or the segment's
@@ -1157,64 +959,111 @@ an interrupted run resumes redoing at most the pages in flight. The token's
 segment count wins; a different `segments`, another table's token or a
 malformed one is `EDD-9098`.
 
+**Sharded indexes (#183).** `staleIndexKeys` has a sharded branch for the PK half. When
+the stored key differs from what the values compose now and the PK composites
+and source are present, the item is rewritten in place (`indexKeysRewritten`):
+an `UpdateItem` on the index key attribute alone, guarded on the old key text
+and the composites feeding it, including `by`. A write to an attribute feeding
+no key doesn't make it retry. A stored key under another layout whose values
+can't compose a current one is the conflict `uncomposable`; a row already in the
+current layout that can't compose is left alone with no conflict. This is step
+2 of adopting a sharded layout: deploy with `previous`, `rekey`, and remove
+`previous` once a run reports no conflicts.
+
+**Index keys, on every index: compare with what each form composed, don't parse.** Nothing
+reads a value out of a stored key. An unsharded partition key, any sort key and a vector
+partition are rewritten only when the stored key is exactly the text a form composed from
+the row's values, and that isn't the current text. Each half is judged by itself and by
+its bytes. Halves in one attribute compose the same bytes (`EDD-9106`), so no half can
+look like another's text under a form, and a half in a table key attribute is never rewritten: the
+table key's move carries it, and no update may set it ("Never set a table key attribute", §7,
+canonical shapes 13 and 14). A sort key missing a
+trailing composite is judged by the composites before the gap, which is what a truncated row
+stores. Anything else is left with no conflict: a key an index
+policy kept, one lagging its values, one cleared of them. A key the row doesn't have
+isn't written, since under `sparse` its absence can be deliberate. A Z-order index's partition half
+is a text half like any other, and its sort half is rewritten only when a prefix segment's text
+differs: the address keeps its bytes. A run that moves an item reads the moved row and does
+the same (`rekeyAfterMove`). The move itself recomposes index keys as an update would.
+
+**The accepted limit.** An index key that isn't any form's text stays, as when a row cleared a
+composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
+broader query finds it where its old text sorts, and under a partition key half `get` still reads it.
+Writing the composites puts it back. Telling such text apart from current text would take parsing it,
+and a value can spell anything.
+
+**A dry run agrees with the real run.** It judges the row the move would write (`movedRowOf`), and
+follows a chain: what holds a row's current key is judged by its own handler (`Rekey.displace`,
+counting nothing and claiming nothing, since the scan counts it when it reaches it), and what would
+stop it is reported, for it and for the row it holds up. Rootless aggregate rows are
+judged after the scan, so a dry run agrees with the real run whichever order the scan met them; a run
+stopped early by `maxPages` can count one whose root a later page brings in.
+
+**A row under both keys.** `clearTarget` reports `bothKeys` only if the row is still
+at its old key when it finds it at the new one. A page's rows run concurrently, and a
+write can move one, so between the two reads another fiber may have moved it.
+
 **Per row kind.** Every write is conditioned on what the move read: a Put
 lands only where nothing is (a stream's snapshot: over an older one; a stream
 row: over one whose TTL has passed), a Delete or in-place rewrite only while
 the row is as read. A write that lands in between wins, and the move reads
-again or reports the row (`contended`). A row in the way that is another
-value's 1.36 row (Aliasing) is moved first, never overwritten.
+again or reports the row (`contended`).
 
 | Row | Move |
 |---|---|
-| Item under its 1.36 key | A consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then the ops' move (`moveFrom136Detailed`, forced): consistent read, one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the 1.36 item under `deleteGuard`, sentinels moved or re-pointed, the snapshot of the version it is at moved with it (counted in `moved.snapshot`). A row at the target that is another value's 1.36 row (Aliasing) is displaced first (`displace`, `DISPLACE_DEPTH`). The same item already at the target is `bothKeys` only if it is still at its 1.36 key when read again: a move since (another row's in this run, or a write) put it there. A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys`. After the move, a half it couldn't recompose (a sort key truncated under 1.36 before a gap a later composite fills, which `preserve` keeps) is rewritten as for an item at its current key, in the same run (`rekeyAfterMove`, reading the item only when the predicted move, `movedRowOf`, leaves one); a dry run counts it from that prediction |
-| Item at its current key | GSI halves and vector partitions whose stored text is exactly their 1.36 text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites the row holds as read (`indexKeysRewritten`). A sort key missing a trailing composite is judged by the composites before the gap, which is what a row truncated under 1.36 stores, and rewritten to their current text. A Z-order half, one the index policy left behind its values, one kept for a value since cleared, and a table key attribute are not touched. Unique sentinels whose text changed (a numeric unique value) are put at the current key and the 1.36 sentinel released (`sentinelsMoved`) |
-| Version snapshot, soft-delete tombstone, time-series event | Consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the 1.36 row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the 1.36 row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
-| Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's 1.36 or current live key under its 1.36 key is put at its current key and the 1.36 one released; one at its current key naming the 1.36 live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: both partitions read consistently whatever `legacyKeys` says; each built row placed — under its current key, its 1.36 key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its 1.36 key moves (Put at the current key `attribute_not_exists`, Delete of the 1.36 row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold 1.36 text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the two partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the 1.36 partition has gone from it the attempt starts over; a row placed under both is checked under its 1.36 key the same way |
-| Projection row tombstone, outbox item | `rekeyProjectionRow`. A marked one (`__edd_kt__`) is current. An unmarked one names its row's key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — read back as 1.36 text (`_currentKeyOf136`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless136`): Put, marked, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the 1.36 row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's 1.36 row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
+| Item under other text | `moveItem`: a consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the old item under `deleteGuard`, unique sentinels moved or re-pointed (`sentinelRekeys`). Another value's old row at the target moves first (`clearTarget`). The same item already at the target is `bothKeys` only if it is still at its old key when read again. A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys`. After the move, a half it couldn't recompose (a truncated sort key before a gap a later composite fills, which `preserve` keeps) is rewritten as for an item at its current key, in the same run (`rekeyAfterMove`, reading the item only when the predicted move, `movedRowOf`, leaves one); a dry run counts it from that prediction |
+| Item at its current key | GSI halves and vector partitions whose stored text is exactly another form's text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites the row holds as read (`indexKeysRewritten`). A sharded index's partition key is the exception: it is composed and compared whatever it holds, which is what moves rows into the layout, and one whose values can't compose it is left, the conflict `uncomposable` unless it is already in the current layout. A Z-order sort half keeps its address, one the index policy left behind its values, one kept for a value since cleared, and a table key attribute are not touched. Unique sentinels whose text changed are put at the current key and the old one released (`rekeySentinels`, `sentinelsMoved`) |
+| Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
+| Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
+| Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there |
+| Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
 **Stream move.** A stream row's keys come from its `streamId` text: every way
 to split it at `#` into the stream's composites (a string composite may hold
 `#`; up to 256 splits), each part read as its text, number or bigint; the
-readings whose current or 1.36 key is the row's partition key say where it
+readings whose key under any form is the row's partition key say where it
 belongs, and readings that disagree are a `failed` conflict. `moveStream` reads
 both partitions consistently; a row whose TTL attribute has passed is absent,
-whether or not DynamoDB has deleted it yet. Rows under the current key that the
-1.36 partition doesn't have, or has differently (a snapshot aside), are another
-stream's: `taken` / `bothKeys`. COPY puts every row the current key lacks
-(`attribute_not_exists`, or over a row whose TTL has passed), and a snapshot
-over an older one (`asOfVersion <`) — never the other way (`__edd_moved__`
-stripped; a GSI stream index attribute holding the 1.36 partition rewritten). A
+whether or not DynamoDB has deleted it yet. Rows of another stream id in a partition are their own,
+and nothing is merged (`readOwn`). Rows under the current key that the
+old partition doesn't have, or has differently (a snapshot aside), are `taken` / `bothKeys`. COPY puts
+every row the current key lacks (`attribute_not_exists`, or over a row whose TTL has passed), and a
+snapshot over an older one (`asOfVersion <`) — never the other way (`__edd_moved__`
+stripped; a GSI stream index attribute holding the old partition rewritten). A
 copy that loses to a write copies again. FLIP is one transaction: Update of
 event 1 `SET __edd_moved__` (`attribute_not_exists`, and the seal state when the
 head is event 1), a ConditionCheck that event N+1 is absent, one that the
 head's seal state is as copied (N > 1), and one that the snapshot's
 `asOfVersion` and `timestamp` are as copied (or that it is absent). A cancelled
 flip copies again, up to `STREAM_MOVE_ATTEMPTS` (8) attempts in all, then `contended`. DELETE
-(also the whole move, for rows left under the 1.36 key once event 1 there is
+(also the whole move, for rows left under the old key once event 1 there is
 moved or gone — a run that stopped after the flip, a write beside it) reads
 both partitions again: a row the current key lacks is copied (a command
 sentinel), a snapshot newer than the current one copied over it, and a row the
 current key holds differently is `bothKeys` and nothing is deleted. Then each
-1.36 row is deleted while it is as read (`asReadGuard`): events from the head
-down, the other rows, event 1 last — until it goes, the stream is located at
-the 1.36 key and an append (events, or a command sentinel alone) or snapshot
-write there fails its location check (`VersionConflict`; `writeSnapshot`
-re-locates and writes again). A delete that loses to a write reads again.
-Readers that located the stream before the flip may read a prefix of it while
-the rows are deleted.
+old row is deleted while it is as read (`asReadGuard`): events from the head
+down, the other rows, event 1 last. A delete that loses to a write reads again.
 
 **Conflicts** (`RekeyConflict`: member, kind, stored key, target, message):
 `bothKeys` (the row is also under its current key; for a snapshot, a
 different snapshot of the version), `taken` (another row
-holds the target), `contended` (concurrent writes on every attempt — a
-`ConcurrentModification` from the item move, or the attempts exhausted),
-`failed` (a `ValidationError` from the move, e.g. values that no longer decode,
-or an aggregate that doesn't assemble). An aggregate whose root is under both
+holds the target), `contended` (concurrent writes on every attempt, or the attempts exhausted),
+`failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, or an
+aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
+compose a current one). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or
 rows are gone since the scan read them (moved or deleted by a write) is
 nothing. A `DynamoClientError` fails the run.
+
+**What it can't move.** Each is counted on every run and left. `skipped.unrecognizedKey`: a table key
+that is no form's text for its row's values; a sentinel with no row behind it, or whose row's values
+compose no such sentinel; an aggregate's rows below no root in their partition, including what a 1.37.0
+or 1.38.0 run cut short left (root at the current key, edges at the old partition); an aggregate root
+under no text; a projection tombstone or outbox item whose key reads as more than one set of values; a
+row holding `NaN` in a key under `escapeKeys: true`. `conflicts`, `failed`: a row whose Z-order value no
+longer places a key; a stream id whose rows read as two different ids.
 
 **Capacity.** The run is one `Table.rekey` operation measured whatever the
 `ConsumedCapacity` setting (`Capacity.measured`): every request asks for its
@@ -1312,6 +1161,28 @@ gsiNsk (B) = seg(prefix_1) ‖ … ‖ seg(prefix_k) ‖ toBytes(interleave(q(di
 | any in `removedSet` | REMOVE | REMOVE (cascade override) |
 
 A hierarchical prefix therefore does not truncate on the write side: `set({ agencyId }).remove(["officeId"])` on `prefix: [agencyId, officeId]` REMOVEs the half under both policies (the hierarchy is a query feature). `put` writes the half only when every field is present (sparse, as for string halves); `append` recomposes it only when `appendInput` (or the primary key) carries every field. A change within one quantization level writes identical bytes; a change of at least one level, or of a prefix composite, moves the entry (2 GSI writes on the shared GSI partition).
+
+### Write Sharding (#183)
+
+A secondary index's `shards` option stores one logical partition in N physical ones. A partition takes about 1,000 WCU/s, and a GSI that falls behind throttles writes to the table. Full design, reasoning and scoping: `docs/designs/gsi-write-sharding.md`. Guide: [Write Sharding](/effect-dynamodb/guides/sharding/).
+
+```typescript
+byTenant: {
+  name: "gsi5",
+  pk: { field: "gsi5pk", composite: ["tenantId"] },
+  sk: { field: "gsi5sk", composite: ["groupId", "deviceId"] },
+  shards: 20, // or { count: 20, by: ["groupId"], previous: 1 }
+},
+```
+
+- **`count`**: an integer from 2 to 256. **`by`**: string-half sort key composites of this index, hashed in place of the primary key composites; checked by type and by `Entity.make`. **`previous`**: migration only, the old layout's count, `1` for the unsharded key; a positive integer, not `count`. Definition errors: `EDD-9099`, `EDD-9101`, `EDD-9102`.
+- **Key text.** `!<count>.<shard>` right after the entity type or collection name, the shard zero-padded to the width of `count - 1`: `$fleet-db#v1#devicestate#!20.07#tenantid_t-123`, or `$fleet-db#v1#devicestate#!20.07` on an empty half. Under `escapeKeys: false` a value can hold `#`, so no final segment could be safe: the unsharded key for tenant `t-123#07` would equal shard 07 of tenant `t-123`. So the marker comes before all values, with the flag on or off. An unsharded key's fourth segment always holds `<label>_`, which a marker can't spell, and the count keeps two sharded layouts apart. So reading both needs no filter and no dedupe. Compact keys (#182) will carry the same marker in the same place; nothing is built for them yet.
+- **Shard function** (`schema/src/internal/Shards.ts`). `FNV-1a-32(F(text(v1)) ‖ 0xFF ‖ F(text(v2)) ‖ …) mod count`, with `text` = `KeyComposer.serializeValue` over key-form values and `F(s) = s.toLowerCase().toUpperCase()` in UTF-8. Golden vectors pin it; changing it is a breaking change. The fold is fixed, whatever `casing` says, because `"GROUP-A"` and `"group-a"` are one key under `lowercase` and must reach one shard. `L∘U` would fail on `ß` / `ẞ`, which lowercase to one key but fold apart. `0xFF` never occurs in UTF-8, so `("ab", "c")` and `("a", "bc")` differ. `TextEncoder` and `Math.imul` keep it runtime-agnostic.
+- **Composing is structural.** `composePk` and the truncating composer always add the marker and throw `ShardSourceError` (`EDD-9100`) when a source value is absent, which the error boundaries turn into a `ValidationError`; an index never bound to an entity throws, as an unbound Z-order half does. So `put`, `create`, `upsert`, `restore`, `Batch`, `Transaction`, `update`, `patch`, retain, `append` and `rekey`'s moves need no per-site change. A key for a sharded index can't be composed unsharded. Soft-deleted items, version snapshots and time-series events strip GSI keys; unique sentinels hold none; EventStore projection rows are entity writes; aggregates compose their own attributes and read no `entity.indexes`.
+- **Reads** use `composeReadPartitions`, the only function that returns more than one key: the current shards by number (one when the accessor pins every attribute of the shard source, whether that source is `by` or the primary key), then the `previous` layout's, never pruned. The pins are a leading sort key prefix, so a default source prunes only when the sort key holds the whole primary key. Query behaviour: §10 "Fan-out Queries".
+- **Key attributes.** Two key halves of one entity, sharded or not, share an attribute only with the same fields, in the same order and casing, and a sharded partition key only with one sharded the same way. A row can't show which owns the attribute, so the one written last overwrites the other, and an update corrupts even a row that only used one: a sharded index over the table's `pk` would leave the item unreachable by `get`. `EDD-9106` compares definitions: the effective casing, the shard count and source, a Z-order half's full declaration, and the text each half composes with a stand-in per exact attribute (`KeyComposer` itself), which is how a collection's label counts as well as the fields. `Entity.make` refuses what no schema can reconcile, and `Table.make` decides a casing left to the schema, before binding any member; an entity on two tables is judged by each. With one rule for every key, halves with the same definition build the same text in either role, so an inverted index is no special case (canonical shape 14 in §7). One entity can't use one physical index twice, even over the same fields (`EDD-9108`); different entities sharing one stay fine. The types refuse a sharded `pk.field` equal to the table's `pk` or `sk`, any index's `sk`, or an unsharded index's `pk`; two sharded indexes that differ, and non-literal `field`s, are runtime only, as is every pair with nothing sharded, since literals can't prove two halves the same and a type-level check that disagrees with the runtime would be worse than none.
+- **Collections.** Every member must declare the same `count` and `previous` (`EDD-9103`), since the partitions read are shared. `by` may differ. A collection query always reads every shard.
+- **Refused** (`EDD-9104`): `.within()`, skip-scan and `.zorder()` on a sharded accessor, and a `GeoIndex` over a sharded index. A Z-order sort key without `by` is allowed: the merge compares bytes.
 
 ### Special Key Patterns
 
@@ -1444,13 +1315,16 @@ indexes: {
 // Skip evaluation only when multi-writer protection actually applies:
 // composites exist (otherwise the half value is a constant prefix and
 // nothing to multi-writer-clobber); no explicit removal of one of the
-// half's composites; AND every composite is absent from both
-// `updatePayload` and `keyRecord` (so this writer is genuinely not
-// claiming ownership of this half on this call).
+// half's composites; no composite is in `updatePayload`; AND at least one
+// composite is unknown to `keyRecord` (#183). A half wholly known from the
+// key record recomposes to what it already is. One composite in the key
+// record is no claim on the half: the others can change, and this writer
+// didn't name them.
 const shouldSkip =
   halfComposites.length > 0 &&
   !halfHasRemoved &&
-  halfComposites.every((c) => !(c in updatePayload) && !(c in keyRecord))
+  halfComposites.every((c) => !(c in updatePayload)) &&
+  halfComposites.some((c) => !hasValue(keyRecord[c]))
 if (shouldSkip) continue  // leave this half's key attribute alone
 ```
 
@@ -1461,21 +1335,23 @@ if (shouldSkip) continue  // leave this half's key attribute alone
 | Half shape | Skip-predicate evaluates to | Outcome |
 |---|---|---|
 | Empty composite list (`composite: []`) | `length > 0` is false → not skipped | Evaluate (constant entity prefix) — **closes #46** |
-| PK-composites-only (composite ∈ keyRecord) | `every(NOT in keyRecord)` is false → not skipped | Evaluate (idempotent SET) — preserves v1.7.2 #43 fix |
-| Multi-writer not touching this half | `every()` true, length > 0, !hasRemoved → **skipped** | Skip — preserves v1.7.1 #41 fix |
+| PK-composites-only (composite ∈ keyRecord) | `some(NOT in keyRecord)` is false → not skipped | Evaluate (idempotent SET) — preserves v1.7.2 #43 fix |
+| Mixed: a primary key composite and a mutable one, neither in the payload (shape 10) | `some(NOT in keyRecord)` is true → **skipped** | Skip — the stored key stays byte for byte (#183) |
+| Multi-writer not touching this half | `every()` and `some()` true, length > 0, !hasRemoved → **skipped** | Skip — preserves v1.7.1 #41 fix |
 | Caller asserts authority via payload | `every(NOT in payload)` is false → not skipped | Evaluate |
 | Caller invalidates via `Entity.remove([...])` | `!halfHasRemoved` is false → not skipped | Evaluate (cascade override may apply under preserve) |
 
-**Why two input sources are checked, not one** (preserved from v1.7.2). Composites that are *also* entity primary-key composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]`) arrive through `keyRecord`, never through `updatePayload` — the writer addresses the row by key, doesn't restate those values in `.set({...})`, and `.append()` deliberately separates structural fields from the SET clause. The skip-predicate's `every(NOT in keyRecord)` clause keeps these halves un-skipped on every write, and the structural rule composes them from the always-present PK values. The behavior is idempotent — re-SETting the same composed value from immutable PK composites produces the same key — so there is no multi-writer regression (see issue #43).
+**Why two input sources are checked, not one** (preserved from v1.7.2). Composites that are *also* entity primary-key composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on an entity with `primaryKey: [channel, deviceId]`) arrive through `keyRecord`, never through `updatePayload` — the writer addresses the row by key, doesn't restate those values in `.set({...})`, and `.append()` deliberately separates structural fields from the SET clause. The skip-predicate's `some(NOT in keyRecord)` clause keeps these halves un-skipped on every write, and the structural rule composes them from the always-present PK values. The behavior is idempotent — re-SETting the same composed value from immutable PK composites produces the same key — so there is no multi-writer regression (see issue #43). That argument covers a half **every** composite of which is in `keyRecord`, and only those: from v1.7.2 through 1.38 the clause was `every(NOT in payload AND NOT in keyRecord)`, so one primary key composite was enough to wake a half whose other composites were mutable. An unrelated update then composed from what it had: a leading hole REMOVEd the key under `'sparse'` (the item left the index) and a trailing absence truncated it under `'preserve'` (`[channel, zone]` lost `zone`, moving the item to another partition). Shape 10 pins the fix.
 
 **Why empty composite lists are always evaluated** (NEW in v1.7.3). For a half with `composite: []`, the value is a *constant* (the bare entity / collection prefix). There is nothing for another writer to clobber, no per-call decision to make. The pre-v1.7.3 touched-predicate's `.some(...)` clauses all returned `false` for an empty array, classifying the half as untouched and skipping it — leaving items with one half SET and the other missing, invisible to the GSI (#46). The skip-predicate's leading `length > 0` guard short-circuits before `every()` is ever asked, and `classifyHalf` (which already correctly handled empty composites as `{ kind: 'set', length: 0 }`) is finally reached.
 
-**Why `'sparse'` still works.** `'sparse'`'s contract is *with the half's owner*. If the writer doesn't touch any of the half's composites — neither in payload, nor through the key-addressed structural inputs — they aren't claiming ownership of this half on this call, and the skip-predicate skips the half exactly as before. The writer-scope concept #38 was reaching for falls out of payload-plus-keyRecord contents naturally.
+**Why `'sparse'` still works.** `'sparse'`'s contract is *with the half's owner*. If the writer names none of the half's composites in the payload, and the key doesn't supply all of them, they aren't claiming ownership of this half on this call, and the skip-predicate skips the half. The writer-scope concept #38 was reaching for falls out of payload-plus-keyRecord contents naturally.
 
 **Design history.** The gate has been progressively reframed:
 - **v1.7.0** introduced the touched-predicate (`updatePayload`-only) to fix the v1.6 GSI-wide cascade. Closed the original GSI-blast bug but introduced the multi-writer leak.
 - **v1.7.1** added the `removedSet` arm to the touched-predicate (multi-writer leak fix — #41).
 - **v1.7.2** added the `keyRecord` arm to the touched-predicate (PK-composites-only fix — #43).
+- **1.39** (#183) narrowed the `keyRecord` arm to halves wholly known from the key record, closing shape 10. The skip-predicate's `every(absent in both)` clause had evaluated any half with one composite in the key record, which is what the #43 idempotence rationale never covered. No stored key text changes; a row an earlier release already damaged stays as it is until a write names the half's composites.
 - **v1.7.3** reframed the predicate from "list cases for which to evaluate" to "list the single condition for which it is safe to skip." Closes the empty-composite-half regression (#46) and any future degenerate-case gap of the same shape — the skip predicate's negation is the cumulative `||`-chain of all prior tactical fixes plus the structural `length === 0` short-circuit.
 
 End-to-end consequences for the canonical multi-writer scenarios:
@@ -1501,7 +1377,7 @@ When the structural rule **can compose** (leading prefix is non-empty and there'
 
 | Outcome for this half's key attribute | Conditions |
 |---|---|
-| **noop** (leave key alone) | No composite of this half is in the payload AND none in `Entity.remove([...])` (per-half evaluation gate) |
+| **noop** (leave key alone) | No composite of this half is in the payload, none in `Entity.remove([...])`, AND the key record doesn't hold every composite (per-half evaluation gate) |
 | **SET full** | Half touched + all composites have values supplied in payload (or available from primary key) |
 | **SET truncated** to leading prefix | Half touched + some leading composites have values, trailing absent, no hole |
 | **REMOVE** this half's key | Half touched + can't compose (empty leading prefix OR hole pattern), AND policy is `'sparse'` OR a composite is in `Entity.remove([...])` (cascade override) |
@@ -1549,7 +1425,7 @@ Naming any one composite of a half is enough — `Entity.remove` doesn't require
 
 For each half (PK then SK), independently:
 
-1. **Evaluation gate (skip-predicate, v1.7.3).** If the half's composite list is non-empty AND no composite is in `removedSet` AND every composite is absent from both `payload` AND `keyRecord` → `noop` (skip — leave the stored key untouched, multi-writer protection applies). Otherwise the half is **evaluated**, continue. (Halves with empty composite lists short-circuit on the leading `length > 0` guard and are always evaluated — the value is a constant prefix; closes #46. Halves whose composites are entity-PK composites fail the `every(NOT in keyRecord)` clause and are always evaluated — the structural rule composes idempotently from the immutable PK values; closes #43.)
+1. **Evaluation gate (skip-predicate, v1.7.3).** If the half's composite list is non-empty AND no composite is in `removedSet` AND no composite is in `payload` AND at least one composite is absent from `keyRecord` → `noop` (skip — leave the stored key untouched, multi-writer protection applies). Otherwise the half is **evaluated**, continue. (Halves with empty composite lists short-circuit on the leading `length > 0` guard and are always evaluated — the value is a constant prefix; closes #46. Halves whose composites are all entity-PK composites fail the `some(NOT in keyRecord)` clause and are always evaluated — the structural rule composes idempotently from the immutable PK values; closes #43. A half mixing a PK composite with a mutable one passes the clause and is skipped; shape 10.)
 2. **Structural rule.** Walk the half's composite list left-to-right. Find the longest leading prefix of present values in `M`.
 3. **Classify the outcome:**
    - **Compose succeeded** (leading prefix is non-empty AND no hole — i.e. all absent composites are at trailing positions): SET this half's key from the leading prefix. Done.
@@ -1562,9 +1438,9 @@ The two halves' outcomes are emitted independently — each affects only its own
 
 **`put()` semantics (unchanged).** `put()` does not consult `indexPolicy`. It writes a complete item from scratch — any missing composite means "this item is not in that GSI." The existing `tryComposeIndexKeys` path (omit GSI keys when any composite is absent) is preserved as-is. `indexPolicy` exists specifically to resolve the update/append ambiguity, not the put case.
 
-**`.append()` semantics (time-series) — same composer.** v1.7.x unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with the encoded append input passed as both `updatePayload` and `keyRecord` (v1.7.2 — see #43; the v1.7.1 path filtered PK composites out of the payload, which combined with the gate-only-checks-payload bug to skip GSI evaluation for any half whose composites are entirely entity-PK composites). Composites outside `appendInput` are simply absent under the structural rule, and the per-half evaluation gate applies — halves whose composites are entirely outside `appendInput` AND outside the entity primary key are untouched and follow the noop branch.
+**`.append()` semantics (time-series) — same composer.** v1.7.x unifies append with update. `.append(input)` calls the same composer as `.update(...).set(...)`, with the encoded append input passed as both `updatePayload` and `keyRecord` (v1.7.2 — see #43; the v1.7.1 path filtered PK composites out of the payload, which combined with the gate-only-checks-payload bug to skip GSI evaluation for any half whose composites are entirely entity-PK composites). Composites outside `appendInput` are simply absent under the structural rule, and the per-half evaluation gate applies — a half with a composite that neither `appendInput` nor the entity primary key supplies is untouched and follows the noop branch, even when another of its composites is a primary key composite (shape 10), since `appendInput` always repeats the primary key.
 
-For sparse GSIs whose composites are entirely outside `appendInput` *and* outside the entity primary key, the half is untouched → noop. Sparse only fires when the writer touches the half but can't compose it. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design.
+For sparse GSIs with a composite outside both `appendInput` and the entity primary key, the half is untouched → noop. Sparse only fires when the writer touches the half but can't compose it. This matches the consumer-side multi-writer recommendation: sparse GSIs should be single-writer-per-half by design.
 
 For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { pk: [channel], sk: [deviceId] }` on a Telemetry entity with `primaryKey: [channel, deviceId]`), the half is always touched (PK composites are always in `keyRecord`), the structural rule always composes from the immutable PK values, and the resulting SET is idempotent — every write re-emits the same composed key. This is the correct behavior; v1.7.0 / v1.7.1 silently skipped these GSIs, leaving items invisible to channel-scoped queries.
 
@@ -1620,6 +1496,33 @@ entity.update(key).remove(['alertState']).asEffect()
 
 **v1.7.0 / v1.7.1 / v1.7.2 → v1.7.3 empty-composite-half regression callout (closes #46).** The v1.7.2 per-half gate, even after the `keyRecord` broadening, still classified halves with **empty composite lists** as untouched. For an empty composite array, every `.some(...)` clause in the touched-predicate trivially returned `false`, so `Entity.update()` would skip composing the half entirely — leaving items with one half SET and the other missing, invisible to the GSI. The shape is common in single-table designs: a sparse "lookup" GSI like `byDeviceBinding: { pk: [deviceBinding], sk: { composite: [] } }` writes the SK as a constant entity prefix on every visible item, but the v1.7.0–v1.7.2 gate skipped the SK because no composite of an empty list can be "in" anything. v1.7.3 reframes the gate as a skip-predicate keyed on the gate's actual purpose (multi-writer protection); the leading `length > 0` guard short-circuits empty-composite halves to *always evaluated*, and `classifyHalf` (which already handled empty composites correctly as `{ kind: 'set', length: 0 }`) is finally reached. Affected items repair on the next `Entity.update()` — the next write composes the missing half from the constant prefix and the item rejoins the GSI. No data migration needed.
 
+#### Sharded partition key halves (#183)
+
+`by` attributes are sort key composites, and the skip-predicate looks only at a half's own composites, so an update setting only `groupId` would leave the stored shard stale and pruned queries would miss the item. **`by` attributes are therefore dependencies of the PK half, but only when the writer touches them.** `keyRecord` membership doesn't count: the retain path's `keyRecord` holds the whole item, and a default source is immutable, so neither is evidence of a change.
+
+Over the `by` attributes only: **T** one has a value in the payload; **N** one is `null` / `undefined` in the payload; **R** one is in `removedSet`; **A** a source attribute is absent from the merged record; **PT** a PK composite has a value in the payload.
+
+**Gate.** The PK half is skipped iff the existing skip-predicate holds and not (T or N or R). An empty PK half with `by` is no longer a constant, so it is skipped when `by` is absent from payload and `keyRecord` and not T / N / R. An empty PK half without `by` is never skipped, as before.
+
+**Outcome**, where P = `classifyHalf(pk composites, merged, policy.pk, hasRemoved)`:
+
+| Case | Condition | Outcome |
+|---|---|---|
+| 1 | R | REMOVE, both policies |
+| 2 | P = drop, T, PK composites merely omitted | Fail `EDD-9100`, both policies: a `by`-only update can't compute the new shard, and evicting the item isn't what the writer asked for |
+| 3 | P = drop, otherwise | REMOVE: `sparse` can't-compose, or a removed or explicitly nulled PK composite. No unsharded key is written |
+| 4 | P = noop, T | Fail `EDD-9100`: the stored shard would go stale |
+| 5 | P = noop, otherwise | noop |
+| 6a | P = set, not A, T, and the SK half would keep its text (a hole, under `preserve`) | Fail `EDD-9100`: the shard would follow the new value while the sort key stays at the old one, and no pin could reach the row |
+| 6 | P = set, not A, otherwise | SET sharded, truncated included |
+| 7 | P = set, A, N and `sparse` | REMOVE |
+| 8 | P = set, A, PT or T | Fail `EDD-9100`: moves the tenant without `by`, or changes one `by` attribute without another |
+| 9 | P = set, A, otherwise | noop: an unrelated `.set({ status })` must never evict or fail |
+
+Composer option `onMissingShardSource: "keep"` turns the failing cases into a noop for the two callers that compose from partial knowledge and don't write the result as-is: the pre-check at the retain branch point (the retain and computed branches then read the full item and compose again) and the move path, which recomposes a stored row. So a `by`-only update fails on the standard path and succeeds on the retain path, which has the composites. The SK half's own outcome is unaffected; case 6a only asks what its rule would do, and under `keep` it is a noop on both halves.
+
+A `put` missing a `by` value writes no index entry at all (`tryComposeIndexKeys`, sparse as ever), never an unsharded key.
+
 #### Canonical GSI-composite test-fixture shapes
 
 Test coverage for the policy-aware composer must span the canonical GSI-composite shapes. Missing one shape (as the v1.7.1 fixture matrix did with PK-composites-only, and as the v1.7.2 matrix did with empty-composite halves) leads to consumer-facing regressions. Future work in this area must verify each shape:
@@ -1641,6 +1544,41 @@ Degenerate fixtures for shapes 7 and 8 (audited against the existing shapes, not
 - **8a (#43 analogue)** — every prefix composite and dimension is also a primary-key composite: recomposed from `keyRecord` on every write, including an update that touches none of them.
 - **8b (#41 analogue)** — prefix owned by one writer, dimensions by another: writer A's prefix-only update must not SET (`'preserve'` noop); writer B's full-dimension update SETs only if the prefix is also present (from `keyRecord` or payload), else policy.
 - **8c (shape 3 analogue)** — hierarchical `prefix: [agencyId, officeId]`; `set({ agencyId }).remove(["officeId"])` → REMOVE under `'sparse'` and under `'preserve'` (cascade override), never a truncated SET.
+
+Shapes 1 to 8 hold on a sharded index as well (#183). The gate's new dependency adds:
+
+9. **Sharded half with `by`** — `pk: [tenantId], sk: [groupId, deviceId], shards: { count, by: [groupId] }`. A `by` attribute touched in the payload wakes the PK half; with the PK composites too it moves the entry, without them it fails `EDD-9100`.
+
+- **9a (shape 6 analogue)** — an empty PK half with `by`: the half's value is no longer constant, and it is skipped unless `by` is touched or known.
+- **9b (#43 analogue)** — a `by` attribute that is also a primary-key composite: it arrives through `keyRecord` on every write, which is not a touched dependency.
+- **9c (shape 6 analogue)** — a default source with an empty PK half: the value differs per item though the half has no composites, and is always evaluated.
+- **9d (shape 4 analogue)** — a `by` attribute after another composite: `sk: [region, group], shards: { count, by: [group] }`. An update naming `tenant` and `group` but not `region` would move the shard and keep the sort key at the old value, so no pin reaches the row: it fails `EDD-9100` under `preserve`, drops under `sparse`, cascades on `.remove(["region"])`, and composes from the whole item on the retain and computed paths. A real gap there, or in an `append`, fails too.
+
+10. **A half mixing a primary key composite with a mutable one** (#183) — `sk: [zone, deviceId]`, `sk: [deviceId, zone]` or `pk: [channel, zone]` on `primaryKey: [channel, deviceId]`. An update naming neither composite leaves the stored key byte for byte under both policies, on the standard, retain and append paths; naming the mutable composite composes the half; `.remove(["zone"])` cascades as ever. The composites in the key record alone never wake it, whichever position they hold. **This is the regression scenario from v1.7.2 through 1.38**, reachable on an unsharded index: the half woke through `keyRecord`, so an unrelated update removed the key under `'sparse'` or truncated it under `'preserve'`.
+
+The retain path holds the whole item in `keyRecord`, so a mixed half whose composites are all present recomposes to the key it already has. When every half of an index is skipped there, the entry stays as stored, as on the standard path.
+
+11. **A half stored in a table key attribute** (#183) — a local index's `pk`, an inverted index, or `sk: { field: "sk", composite: ["id"] }` shared with the table. DynamoDB refuses an update that writes a table key attribute, so the composer never returns one, in `sets` or `removes`: such a half holds what the table key does, out of composites an update can't change, and dropping the index entry takes the other half. Snapshots, tombstones and events keep the attribute too.
+
+12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. `.set({ note: undefined })` under `preserve` composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
+
+13. **Two accessors storing their halves in one attribute** (#183) — `byRegion: { pk: [region], sk: [id] }` and `byGroup: { pk: [group], sk: [extra] }` on one physical index, or `byName: { pk: [name], sk: [id] }` with a sparse `byOther: { pk: [other], sk: [name] }` in one attribute. **Refused: `EDD-9106` at `Entity.make`, or at `Table.make` for a casing left to the schema.** A row can't show which accessor owns the attribute, so no composer can be right: an ordinary update replaces one half and leaves a mismatched pair, including on a row that only ever populated one accessor, and a table key move composes from the whole row with the later accessor winning. Fixing the writes would mean patching every path, which is how this kept regressing. The check runs per entity, so overloading one index across entity types is unaffected. To keep such access patterns, give each half its own attribute, which means a new index, and re-put existing rows.
+
+14. **An index half with the same definition as the table half in its attribute** (#183) — above all an inverted index, `pk: { field: "sk", composite: ["groupId"] }, sk: { field: "pk", composite: ["userId"] }`, and also a local index's partition key and a sort key shared with the table. **Supported, not encouraged:** the library's principle is that index keys go in dedicated GSI attributes. It needs no case of its own: one rule composes every key, so both roles build identical text with `escapeKeys` on or off, and `EDD-9106` holds the rest by comparing definitions. No update writes it ("Never set a table key attribute", below). **The regression scenario from 1.37.0 and 1.38.0**, in which a sort key's escaping overwrote `pk`, so `get` failed for a value with a space, and a `put` of a value with one in `sk` failed. Cover values with a space, `%`, `#`, mixed case and non-ASCII, numbers and dates, each write path, under both flag settings, rows 1.36, 1.37.0 and 1.38.0 wrote through `rekey`, and that no other definition's bytes change.
+
+15. **Both halves of one index over one composite, holding only what a key escapes** (#183) — `pk: [tag], sk: [tag]` with `tag` of `#`, `%`, `%23`, `%25`, a space or `# #`. Each value has its own key under both flag settings, and a value spelled like another's escape isn't it. Cover on the composer, the entity and DynamoDB Local (`test/helpers/EscapeKeyScenarios.ts`, `schema/test/EscapeKeys.test.ts`).
+
+#### Never set a table key attribute
+
+**No write the library sends sets any attribute of the table's primary key to anything but the key it composed, on any write path, whatever the index structure.** DynamoDB refuses an update naming one (`Cannot update attribute sk. This attribute is part of the key`), and an index half can only be in one by having the same definition, so there's never anything to write. A `Put` would be worse: it accepts whatever key its item holds, so it could store the row at a key no read composes.
+
+- The update composer's `sets` and `removes` never hold one (`composeGsiKeysForUpdatePolicyAware`), so every update path has it.
+- Each builder that writes key attributes itself excludes them: the retain path, `upsert`, `append`, `rekey`'s in-place rewrite (`staleIndexKeys`, which guards this before judging a half, as a retry after another writer can compose new text for one), the vector backfill, and aggregate `rekey` (`indexFields`).
+- A key changes only by moving the row: a `Put` under the new key and a `Delete` of the old one, in a transaction.
+- `[EDD-9109]` refuses at `Entity.make` a model attribute, a system timestamp or a version field stored in a table key attribute, by rename (`payload: { field: "pk" }`) or by name. `[EDD-9112]` refuses at `Aggregate.make` a list key or a collection sort key stored in one.
+- At run time, `.remove`, `.set`, `.add`, `.subtract`, `.append`, `.deleteFromSet` and the path operations naming a table key attribute by its stored name fail with a `ValidationError` and write nothing, as `.remove` of a primary key composite does (D63).
+
+`test/NoTableKeyWrites.test.ts` records every `UpdateItem`, transactional `Update` and `Put` across inverted, shared `sk`, sharded shared `sk`, local and dedicated definitions, under both flag settings, through every lifecycle, `rekey` and its retry, moves over 1.36 rows, aggregates, streams and the scenarios of the other suites, and fails if an update names `pk` or `sk` or a `Put`'s key isn't the one its values compose. `test/TableKeyAttributes.test.ts` covers each definition position: refused, accepted, and the run-time check.
 
 ### Sparse Map Storage (`storedAs: DynamoModel.SparseMap()`)
 
@@ -1951,7 +1889,8 @@ indexes: {
 yield* db.entities.Assets.update(key).set({ country: 'us', city: 'sf' }).remove(['site'])
 // gsi1pk unchanged (region untouched — pk half is not in the payload).
 // gsi1sk truncated to "$app#v1#asset#country_us#city_sf"
-// begins_with(gsi1sk, "$app#v1#asset#country_us#city_sf") still finds this asset.
+// With `escapeKeys: true`, a pin on `city` (`gsi1sk BETWEEN K AND K#U+FFFF`, K the key above)
+// still finds this asset. Off, the pin is `begins_with(K#)` and doesn't.
 
 // Asset leaves the datacenter — *evict* (drop the whole half).
 // Without surviving composites in `set`, the library can't compose anything;
@@ -2344,7 +2283,9 @@ sibling:
 
 | Pinned | Condition |
 |---|---|
-| some composites | `begins_with(sk, <prefix>#)` — the delimiter ends the last value, so `done` never matches `done_archived` |
+| some composites, primary key | `begins_with(sk, <prefix>#)` — the delimiter ends the last value, so `done` never matches `done_archived` |
+| some composites, secondary index, `escapeKeys: true` | `sk BETWEEN <prefix> AND <prefix>#U+FFFF` — the row truncated at the last pinned composite and everything under it, and still no longer sibling (#183) |
+| some composites, secondary index, off | `begins_with(sk, <prefix>#)` |
 | every composite | `sk = <key>` — the stored key ends at the last value, so there is no delimiter to stop on; `seq: 3` never matches `3.14` / `3.5`, `ship` never `shipped` |
 
 Up to 1.36 a complete key was still `begins_with(<key>)` and matched those
@@ -2358,14 +2299,40 @@ unaffected. An index whose sort key has no composites (an empty-composite half)
 pins nothing: its accessor sends the partition key alone, and on the primary key
 the history rows that extend the live key are dropped as rows (`liveRows`).
 
+**A pin on a truncated row's own level (#183), with `escapeKeys: true`.** An update can truncate a secondary
+index sort key at its last present composite (§7, shape 3), so `city_sf` is a row of
+its own as well as the parent of `city_sf#block_1`. A condition on `begins_with(city_sf#)`
+missed that row, and `begins_with(city_sf)` would catch the sibling `city_sfx`. So a
+partial pin on a secondary index sends `BETWEEN <prefix> AND <prefix>#U+FFFF`: after a
+complete value the next byte is the end of the key, `#`, or a longer sibling's next
+character, and composite text escapes everything up to `%` (§7 "Key text"), so a
+sibling's next byte is above `#` and outside the range. `.where(eq)` on a composite that
+isn't the last, and an `eq` in `.within()`, mean the same.
+
+- **Off, the condition is 1.36's `begins_with(<prefix>#)`** (`KeyComposer.pinCondition`), and such
+  a row isn't returned. Without escaping, a sibling's next byte can be below `#`, so the range would
+  return `new york` for a pin on `new`, and only a row check could drop it.
+- **Why on the read side.** Stored key text doesn't change, so rows already truncated are
+  found the moment the reader upgrades. A trailing `#` on truncated keys would need a
+  migration of every such row and would no longer be "the key as far as it goes".
+- **The primary key stays `begins_with(<prefix>#)`.** Its rows are never truncated: a
+  primary key can't lose a composite. So do `Aggregate.list` (aggregates don't truncate),
+  and clustered collection prefixes, event, version and tombstone prefixes, whose segments
+  are names rather than values.
+- **Request size.** The high operand is four bytes past the prefix where `begins_with` was
+  one, so a prefix within three bytes of DynamoDB's 1,024-byte sort key limit is now refused
+  by DynamoDB. There's no client check, as for any other limit DynamoDB enforces.
+- **`.within()` on a sharded index** stays refused (`EDD-9104`), and the pin's condition is
+  the one each partition reads.
+
 **`beginsWith` on a numeric composite is `eq`.** Numeric key text has no textual
 prefix by value (`3` is not a prefix of `35`), so `.where(beginsWith)` with a
 `number` or `bigint` operand compiles to `eq` (`composeRangeUnder`, and history
 `.where()`). That is also what 1.36 amounted to for a non-negative integer, whose
 padded text has the full width.
 
-**A bound is one exact key range.** A composite's key text is escaped (§7
-"Sort key text"), so it sorts as the cased value, and the `#` that follows a
+**A bound is one exact key range, with `escapeKeys: true`.** A composite's key text is escaped (§7
+"Key text"), so it sorts as the cased value, and the `#` that follows a
 non-last composite sorts below every character the text holds: a value's subtree
 (`v#…`) sorts after `v` and before every greater value (`v%20x`, `v0`). So every
 `.where()` / `.within()` bound composes one condition over the composed operand
@@ -2374,7 +2341,7 @@ the values hold:
 
 | Bound | Unclamped | Clamped under pinned composites, prefix `P` |
 |---|---|---|
-| `eq v` | `begins_with(K(v)#)`; `sk = K(v)` on the last composite | the same |
+| `eq v` | `sk = K(v)` on the last composite; on any other, `begins_with(K(v)#)` on the primary key and `BETWEEN K(v) AND K(v)#U+FFFF` on a secondary index | the same |
 | `beginsWith v` | `begins_with(K(v))`; `eq` for a numeric operand | the same |
 | `lt v` | `< K(v)` | `BETWEEN P AND K(v)`; `BETWEEN P AND keyJustBelow(K(v))` on the last composite |
 | `lte v` | `<= K(v)#U+FFFF`; `<= K(v)` on the last | `BETWEEN P AND` the same end |
@@ -2382,13 +2349,13 @@ the values hold:
 | `gte v` | `>= K(v)` | `BETWEEN K(v) AND P + U+FFFF` |
 | `between a b` | `BETWEEN K(a) AND K(b)#U+FFFF`; `… K(b)` on the last | the same |
 
-These are 1.36's conditions over the escaped text: a value without a character
-U+0000–U+0025 composes byte-identical requests. Up to 1.36 the text was not
-escaped, so ` `, `!`, `"` and control characters sorted below the delimiter
+These are the conditions under either setting: a value without a character
+U+0000–U+0025 composes byte-identical requests. With the flag off the text is not
+escaped, so ` `, `!`, `"` and control characters sort below the delimiter
 (`new york#…` < `new!#…` < `new#…` though `new` < `new york` < `new!`) and both a
-bound and a stored value could sort apart (`lte: "new york"` left out `new`,
-`gt: "new"` left out `new york`), and a value holding `#` split into two
-segments. Now `a#b` is one value (`a%23b`), and `a` neither equals nor prefixes
+bound and a stored value can sort apart (`lte: "new york"` leaves out `new`,
+`gt: "new"` leaves out `new york`), and a value holding `#` splits into two
+segments. With it on, `a#b` is one value (`a%23b`), and `a` neither equals nor prefixes
 it.
 
 The strict `lt` on a clamped last composite was refused up to 1.36 (`EDD-9046`,
@@ -2427,7 +2394,9 @@ serialized and escaped — the same text `.history().where()`, row checks and
 `BigIntFromString`) that is the number's key text, so events sort numerically.
 Up to 1.36 `append` composed it from the encoded string, which sorted `"10"`
 before `"9"`, while `.where()` bounds were numeric: history read out of order
-and bounds missed events. Those event keys changed in 1.37.0.
+and bounds missed events. Those event keys changed in 1.37.0. **With `escapeKeys` off, the default
+since 1.39.0, the segment is the encoded value again** (`KeyComposer.eventOrderByValue`), bounds
+compose the same, and such a history reads in text order.
 
 **`append` on a string-encoded numeric `orderBy`.** The stored `orderBy` is `S`,
 which DynamoDB compares as text, so the CAS `attribute_not_exists(pk) OR
@@ -2455,7 +2424,7 @@ numerically and ISO-8601 text chronologically.
 **Cancellations every `append` tells apart (#171).** A transaction DynamoDB
 cancels for a `TransactionConflict` alone (another transaction in flight on the
 item; no condition failed, nothing written) is no verdict: on every path
-(`orderBy` of any type, an item still under its 1.36 key) it is sent again, at
+(`orderBy` of any type) it is sent again, at
 most 8 attempts (`APPEND_GUARD_ATTEMPTS`), then the append fails with the
 transaction's error. Up to 1.36 it was read as a stale append or a user
 condition's rejection, and the event dropped. A user condition that rejects an
@@ -2506,9 +2475,44 @@ On a Z-order accessor, `.within()` bounds dimensions (a `RangeBound` in the fiel
 
 `concurrency` defaults to 4 for reads with a `limit` and 1 for drains (natural 1 MB pages against one partition). Plans are cached (LRU, 64). Results arrive in address order (prefix order, then Z-order), never sorted by any one dimension. An empty box plans `empty` and sends nothing.
 
+### Fan-out Queries (#183)
+
+A query on a sharded index reads its partitions (§7 "Write Sharding") and merges them, on every terminal. `Query.fanOut` (internal) installs them, and the terminals branch on them before any other plan. A pruned query takes the same path with one partition, so a cursor can't change format because of a query's pins.
+
+**Merge** (`internal/ShardMerge.ts`, pure: `Query.ts` sends the requests). A row is emitted only when every unfinished partition has a buffered row to compare it with, which is what makes the order correct and bounds memory at one page per partition. `compareUtf8` for `S`, bytes for `B`, numeric for `N` with no float conversion. Equal sort keys on different partitions break by partition index, descending under `.reverse()`, so reverse reverses forward up to DynamoDB's unspecified order among equal sort keys within one partition; the table key can't be reached, since a tie is between heads of different partitions.
+
+| Terminal | Behaviour |
+|---|---|
+| `.collect()` / `.paginate()` | Streams the merge: each pull reads every unfinished partition whose buffer is empty, then emits what is proven in order |
+| `.limit(n).fetch()` | `n` merged items and a cursor, over as many rounds as it takes; rows read beyond the page are dropped and read again |
+| `.fetch()` without `limit` | One round of reads: what it proves in order, and a cursor |
+| `.count()` | Each partition counted (`Select: COUNT`, or the rows read where a row check judges them), summed, capped at `limit` |
+
+There is no `.stream()` terminal.
+
+**Rounds and refills.** A round reads every partition that has nothing buffered and more to read, all at once, and takes about as long as the slowest of them. The first round is every partition. The merge then emits until it reaches the budget or the first partition with more to read runs dry, and stops: nothing further is proven in order until that partition is read. So later rounds usually read one partition, one after another, and a `.limit(n).fetch()` takes one round trip per round, not one overall. Rows spread evenly over `N` partitions with each `Limit` near `n / N` run dry often. A measured 20-shard page of 100 took 26 requests over about 7 round trips, where the same page unsharded took 1 (`docs/designs/gsi-write-sharding.md` §12).
+
+**Request sizing.** One estimator per partition, kept in the terminal's loop and never in a cursor. `active` = partitions not finished, `remaining` = items still owed. `none`: no `Limit`. `fixed`: `pageSize(n)` as given (`min(n, remaining)` when nothing filters). `natural`: 1.36's sizing with `remaining`. `budget`: `min(remaining, max(⌈remaining / active × 1.25⌉, last × 2))`. `adaptive`: `nextLimit(estimator, ⌈remaining / active⌉, filtered)`.
+
+**`.maxPages(n)`** is `n` rounds: at most one request per unfinished partition per round. It does not force natural sizing here, since fan-out has no 1.36 sizing to preserve. Rows that can't be proven in order when the rounds run out are dropped; `fetch`'s cursor reads them again, and `collect` stops short.
+
+**`Query.where`.** A replaced condition isn't the pins a pruned query chose its shard for, so the unbound `Query.where` restores every partition, `previous`'s included, and reports `pruned: false`. An accessor's own pin, `Entity.query`'s and a bound `.where()`, which stay under the pins, use the internal `Query.whereUnderPins`. No other combinator changes the sort key condition after pruning.
+
+**`.concurrency(n)`** (`Query.concurrency`, `Function.dual`, and `BoundQuery`): requests in flight, default every partition. A value that isn't a positive integer throws `EDD-9105`. No effect on any other query.
+
+**Projections.** `cursorProjectionFields` always borrows the keys the merge and cursor need, across every partition's key fields, and `examinePage` strips them.
+
+**Failure.** Any partition's failure fails the terminal. `fetch` and `collect` return no partial result and interrupt requests in flight; a `paginate` stream fails at that point, having delivered only what was already proven in order.
+
+**Capacity.** Every request runs on `Capacity.client` inside the terminal's one operation.
+
+**`previous` and other key text.** A shard can hold a sort key under other text: an update naming the partition key and no sort key composite moves the partition key and keeps the sort key, with no read. A query reads the layouts' partitions under the one text the setting composes, so such a row isn't found until `rekey` rewrites it (`indexKeysRewritten`). `KeyText136.composePk` stays unsharded, so no partition key in a shard is under another form.
+
 ### Inspection: `explain()` and `onRequest()` (#171)
 
 `explain()` returns a `QueryExplain` — `index`, `plan` (`PlanMode`: `key`, `skip-scan`, `filter`, `naive`, `jump`, `precise`, `empty`), `reason`, `keyConditions` (`{ lower, upper, exact }`), `filter`, `rowChecks`, `sizing`, `zorder?` (`bits`, per-dimension `box`, `fill`, `exactRanges`), `maxSkips?` — with no I/O; a `startFrom` cursor is not read. `onRequest(observer)` runs each observer, in order, in the terminal's fiber after every request with a `QueryRequestEvent` (`kind: "read" | "probe" | "count"`, `request`, `lower`, `upper`, `limit`, `scannedCount`, `count`, `accepted`, `discarded`); a failure is a defect, and DynamoDB calls an observer makes run under `Capacity.detached`, outside the query's report. `asParams` with a planner reports the first request the terminal would send.
+
+On a fan-out, `explain()` keeps plan `key`, lists one key condition per partition and adds `fanOut: { partitions, pruned, concurrency }`; `asParams` reports the first partition's request. `onRequest` reports one event per request. A row's acceptance is known only when it is emitted, so an event fires when its page drains or at the end of the terminal, and events may arrive out of `request` order. `accepted` counts that page's rows that became items, and a page read and never used reports `discarded: true`.
 
 ### Cursors (#171)
 
@@ -2520,6 +2524,8 @@ Two formats (`internal/Cursor.ts`):
 A page hands its cursor out as an `Option<string>`: `Query.Page.cursor` (every `fetch()` / `Query.execute`), a collection's `fetch()` and an aggregate `ListResult.cursor` are `Some(text)` while there is more and `None` once the range is exhausted. The inputs take the text: `startFrom(cursor: string)` and `list({ cursor })`, so `None` never stands for "start again". Internally the loops keep `string | null` and wrap it at the terminal.
 
 `startFrom` never throws: the cursor is decoded when a terminal runs. A malformed cursor of either format, a fingerprint mismatch, a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan fails the terminal with a `ValidationError` (`EDD-9094`, `operation: "query.startFrom"`).
+
+A sharded query's v2 cursor adds `z`, one position per partition (`0` not started, `1` done, or the key to resume after, without the index partition key, which is recomposed), and `c`, an FNV checksum over them. Its fingerprint covers the index, entity types, partition texts, source, `previous`, conditions and direction, not `concurrency`, `pageSize` or `limit`. A fully consumed page with a `LastEvaluatedKey` positions at that key; a fully consumed page without one is done; a partly consumed page positions at its last consumed row; an untouched page keeps the previous position. `EDD-9094` also covers a wrong position count or shape, an unexpected attribute in a position, a position outside the query's key condition, a checksum mismatch, a plain or planned cursor on a sharded query and a sharded cursor on any other query. The checksum is an integrity check, not authentication; the security-relevant property is that the cursor doesn't carry its partitions, so it can't leave them.
 
 ### Entity Operations (via typed client)
 
@@ -2799,14 +2805,12 @@ safe way to remove such an item; `purge` removes it on any entity.
 **Version history is never overwritten.** Every `v#N` snapshot `Put`
 (`snapshotPut`) is conditioned on `attribute_not_exists(pk)` OR the existing
 row holding the same version, incarnation token and (with timestamps)
-`updatedAt` — and, at a key another value's 1.36 history can share, the same
-escaped sort key values (#171, "Retained history at a shared segment").
+`updatedAt`.
 Rewriting the same state is legitimate: a retain `put` writes
 `v#0000001` and the first update snapshots that same version-1 state again, and
 a restore rewrites the delete-time snapshot. Any other row is a different
 history, so the update, soft or hard delete, restore or replacing `put` fails with a
-`ValidationError` (`historyConflict`) and the write is not made (another value's 1.36
-snapshot is moved out of the way first, #171). A new item's snapshot
+`ValidationError` (`historyConflict`) and the write is not made. A new item's snapshot
 (`v#0000001`, or the version after the history retained at its key) carries a
 fresh incarnation token, so in effect it requires the row to be missing; one
 already there means the read missed retained history, and the put is planned
@@ -5073,8 +5077,7 @@ const Emulated = VectorSearchEmulation.layer(DdbLocal)
 | `ConcurrentModification` | An unversioned read-then-write write found an attribute it read changed before its write landed (or lost a guarded put's race on every attempt), or a unique sentinel it was releasing changed hands; nothing written (`attributes`, `current`) |
 | `TransactionOverflow` | DynamoDB rejected a write's own transaction (item, sentinels, snapshot) for exceeding 100 items; nothing written (`cause`: DynamoDB's error) |
 | `UpdateAppliedButUnreadable` | A retain update was applied at `version` but its result could not be read back provably; do not retry (`version`, `reason`) |
-| `ItemNotDeleted` | `restore` found a live item under the key alongside the tombstone (or under its 1.36 key, #171) |
-| `ItemNotMoved` | `EDD-9097`: a `Transaction.transactWrite` (or an `EventStore` append's `additionalItems`) op whose item is still under its 1.36 key, or whose current key holds another value's 1.36 row ("Aliasing"), which the transaction can't move (`entityType`, `key`, `operation`: the item to write first); nothing is written. Write that item once through the entity, or run `rekey`, then retry (§7 "Rows written by 1.36") |
+| `ItemNotDeleted` | `restore` found a live item under the key alongside the tombstone |
 | `RefNotFound` | Referenced entity does not exist during hydration |
 | `AggregateAssemblyError` | Collection query returned unexpected/incomplete data |
 | `AggregateDecompositionError` | Decomposition produced items that fail schema validation |
@@ -5124,9 +5127,9 @@ pre-#147 unions.
 | `restore` | `ItemNotFound`, `ItemNotDeleted`, `ValidationError`, `UniqueConstraintViolation`, `TransactionOverflow`, `ConcurrentModification` |
 | `append` | `ValidationError`, `StaleAppend`, `ConcurrentModification`, plus `ConditionalCheckFailed` with `.condition()` |
 | `purge` | `ValidationError` |
-| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound`, `ItemNotMoved` |
+| `Transaction.transactWrite` | `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ConditionalCheckFailed`, `ItemNotFound`, `TransactionOverflow`, `RefNotFound` |
 | Aggregate `create` | `AggregateWriteError` plus `ConditionalCheckFailed` |
-| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification`, `ItemNotMoved` |
+| `EventStore` `append` / `commandHandler` (plus the decider's errors, and a function-form `additionalItems` effect's `E2`) | `AppendError`: `VersionConflict`, `StreamSealed`, `DuplicateCommand`, `AdditionalItemConditionFailed`, `AppendTooLarge`, `ValidationError`, `TransactionCancelled`, `UniqueConstraintViolation`, `OptimisticLockError`, `ConcurrentModification` |
 | `EventStore` `read` / `readFrom` / `currentVersion` / `readLatest` / `readIndex` | `ValidationError` |
 | `EventStore` projection `apply` / `catchUp` / `rebuild` (`applyBatch` / `processBatch` carry them per instance, never failing) | `evolve`'s `E`, the read model's `get` / `put` errors (not `ItemNotFound` / `ConditionalCheckFailed`), `ValidationError`, `ConcurrentModification` |
 | `EventStream.parseStreamId` | `ValidationError` |
@@ -5173,7 +5176,8 @@ old format.
 
 Composites of every other shape — plain numbers, bigints, strings, `Schema.Date`,
 `DateTimeUtc`, literals — are byte-identical and need no migration. (1.37.0 later
-changed the text of negative, fractional and large numbers: see "Numeric key text".)
+changed the text of negative, fractional and large numbers, and 1.39.0 made that
+`escapeKeys: true`'s: see "Numeric key text".)
 ### Diagnostic Code Registry (`EDD-xxxx`)
 
 Configuration and usage mistakes carry a stable `EDD-xxxx` code in the message, so an
@@ -5202,7 +5206,7 @@ for unrelated errors and the collision was caught only at review.
 | 9080–9085 | EventStore `query.index`, projections, change feed, head proof |
 | 9086–9095 | Z-order indexes, range planning, skip-scan, cursors |
 | 9096 | Numeric key text |
-| 9097 | Transactions over rows still under their 1.36 keys (`ItemNotMoved`) |
+| 9097 | Retired: transactions over rows under 1.36 keys |
 | 9098 | `rekey` options and resume tokens |
 
 | Code | Raised in | Condition |
@@ -5253,7 +5257,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing |
 | `EDD-9051` | `Aggregate.ts` | `list({ cursor })` on a **sharded** aggregate (`list.cardinality`) — a fan-out over N partitions has no resumable position, so the cursor is rejected rather than silently ignored |
 | `EDD-9052` | `Batch.ts`, `Transaction.ts` | A read path (`Batch.get`, `Transaction.transactGet`, `Transaction.check`) was handed something that is not a get descriptor — pass `Entity.get(key)` or the bound `db.entities.X.get(key)` |
-| `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's `begins_with`, so the condition would discard the pin and return rows outside it rather than narrowing within it |
+| `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's sort key condition, so the condition would discard the pin and return rows outside it rather than narrowing within it |
 | `EDD-9054` | `Query.ts` | A client-side predicate (`.filterBy()`) and a projection (`.select()`) are both active — the predicate is an opaque closure, so its attribute reads cannot be borrowed into the `ProjectionExpression` the way key attributes are, and it would be handed items missing the fields it tests |
 | `EDD-9055` | `KeyComposer.ts` (via `DynamoClient.ts`, `Collection.ts`) | A collection's members compose its keys with different casings (index `casing` vs schema `casing`) — they share one physical index, so their keys would never meet |
 | `EDD-9056` | `Aggregate.ts` | A nested sub-aggregate binding declares a discriminator attribute it already inherits from an enclosing binding — the inner value would overwrite the outer one on the inner rows, so the parent's bindings could no longer be told apart. Use a distinct attribute name (e.g. `{ squadNo: 1 }` inside `{ clubNo: 1 }`) |
@@ -5294,13 +5298,25 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9091` | `Table.ts` (`Table.make`, `Table.definition`) | One physical attribute is declared with two types across table members: a Z-order (`B`) half and a string (`S`) key half, or a key attribute and a vector filter attribute |
 | `EDD-9092` | `internal/ZOrderCurve.ts`: through the write paths as a `ValidationError` (put, update, upsert, restore, append, transactional and batch writes); thrown at `.within()` (`DynamoClient.ts`) for a query bound | A value a Z-order dimension can't place: `NaN`, an unparseable date, a value outside a `literals` list |
 | `EDD-9093` | `DynamoClient.ts` (accessor, accessor `.within()`), `internal/BoundQuery.ts`, `Entity.ts` (legacy `query` namespace) | Misuse reachable from untyped code. On a Z-order accessor: a dimension or prefix composite passed as an accessor composite, or `.where()` (a binary address has no text order to compare). In `.within()`: an unknown or partition key field, a composite the accessor already pinned, a composite the item doesn't store (its bound can't be checked on the row; a ref-derived `${ref}Id` is read from the stored ref), a bound that is not one of `{ eq }`, `{ between: [low, high] }`, `{ gt \| gte }` and / or `{ lt \| lte }`, a range bound on a Z-order prefix composite, `in` on a dimension that is not `literals`, a bound of the wrong key-form type, `.within()` together with `.where()` or a second `.within()`, or `.within()` on a query with no sort key composites to bound |
-| `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
+| `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`) | A cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). On a sharded index (#183): also a wrong position count or shape, an unexpected attribute in a position, a checksum mismatch, a plain or planned cursor on a sharded query and a sharded cursor on any other query (`docs/designs/gsi-write-sharding.md` §6.6). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
 | `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
-| `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`): a `ValidationError` before anything is sent from entity writes and key-taking operations (put, create, upsert, update, get, delete, restore, purge, append, unique values), `Batch` and `Transaction`; thrown by query accessors, `.where()` and `.within()`; a defect in `Aggregate` and `EventStore` ("Numeric key text") | A key composite or bound with no numeric key text: `NaN` (no order), or a bigint of more than 1,000 digits (past the 3-digit exponent) |
-| `EDD-9097` | `Errors.ts` (schema): `ItemNotMoved`, from `internal/TransactWriteOps.ts` (a `Transaction.transactWrite` or `EventStore` `additionalItems` put / delete / check) and `Entity.ts` (`planned`: a transactional update, patch or planned delete) | An op inside a transaction whose item is still under its 1.36 key, or whose current key holds another value's 1.36 row (#171, "Aliasing"): a transaction can't move either. Write the item named once through the entity (or run `rekey`), then run the transaction again. Nothing is written |
+| `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`), with `escapeKeys: true`, and for a shard source under either setting: a `ValidationError` before anything is sent from entity writes and key-taking operations (put, create, upsert, update, get, delete, restore, purge, append, unique values), `Batch` and `Transaction`; thrown by query accessors, `.where()` and `.within()`; a defect in `Aggregate` and `EventStore` ("Numeric key text"). Off composes the 1.36 text and doesn't refuse | A key composite or bound with no numeric key text: `NaN` (no order), or a bigint of more than 1,000 digits (past the 3-digit exponent) |
+| `EDD-9097` | — | **Retired** in #183 (`ItemNotMoved`, a transaction over an item still under its 1.36 key): nothing reads or moves a row under other text but `rekey`. Do not reuse |
 | `EDD-9098` | `internal/Rekey.ts` (`ValidationError`, `entityType: "Table"`, `operation: "rekey"`) | A `rekey` option that is not a positive integer (`segments`, `concurrency`, `pageSize`, `maxPages`), a malformed resume token, a token of another table, or a `segments` other than the token's. Nothing is read |
 
-Next free code: **`EDD-9099`** (or `9009`, `9017`–`9019`, `9028`–`9029` within their bands).
+| `EDD-9099` | `KeyComposer.ts` (schema, `normalizeGsiConfig`), through `Entity.make` | Malformed `shards` (#183): `count` not an integer from 2 to 256, `previous` not a positive integer or equal to `count`, an unknown key, or `shards` on the primary key |
+| `EDD-9100` | `KeyComposer.ts` (schema, `ShardSourceError` from `composePk`, the truncating composer and the update gate): a `ValidationError` on every write path; nothing is sent | A shard source value is missing when a sharded partition key half is composed. There is no unsharded fallback (§7 "Sharded partition key halves") |
+| `EDD-9101` | `Entity.ts` (schema, `bindShards`) | Nothing to spread: every primary key composite is also a PK composite of the sharded index, with or without `by` |
+| `EDD-9102` | `Entity.ts` (schema, `bindShards`), and the type-level guard | `by` is empty, duplicated, not a sort key composite of this index, or on a Z-order half |
+| `EDD-9103` | `KeyComposer.ts` (schema, `assertCollectionShardsAgreement`), through `DynamoClient.make` and `Collections.make` | Collection members disagree on `count` or `previous`; undeclared differs from declared |
+| `EDD-9104` | `Query.ts` (`refuseShardedPlan`, thrown at the call), `effect-dynamodb-geo`'s `GeoIndex.make` | Unsupported on a sharded index: `.within()`, skip-scan, `.zorder()`, `GeoIndex` |
+| `EDD-9105` | `Query.ts` (`Query.concurrency`, thrown at the call) | `concurrency` not a positive integer |
+| `EDD-9106` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` and `Table.make`, and the type-level guard for a sharded half where literals show it | Two key halves of one entity stored in one attribute, sharded or not, without the same fields, in the same order and casing, or a sharded partition key with one sharded differently |
+| `EDD-9108` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | One entity uses one physical index twice, even over the same fields |
+| `EDD-9109` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | A model attribute, a system timestamp or a version field is stored in a table key attribute, by rename or by name |
+| `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
+
+Next free code: **`EDD-9113`** (`9110` and `9111` are reserved for #189; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

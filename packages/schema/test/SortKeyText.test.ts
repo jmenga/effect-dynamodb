@@ -1,5 +1,5 @@
 /**
- * Sort key text (#171): `KeyComposer.sortKeyText` escapes every code point
+ * Sort key text (#171): `KeyComposer.escapeKeyText` escapes every code point
  * U+0000–U+0025 of a composite value's cased text as `%` and two hex digits,
  * so that the key's UTF-8 byte order is the cased values' order — a value
  * followed by the delimiter `#` sorts before every extension of it — and a
@@ -101,7 +101,7 @@ describe("sort key text (#171)", () => {
     { a: word },
     ({ a }) => {
       for (const casing of casings) {
-        const text = KeyComposer.sortKeyText(a, casing)
+        const text = KeyComposer.escapeKeyText(a, casing)
         for (const char of text) {
           expect(char.codePointAt(0)! >= 0x25, JSON.stringify({ a, text, casing })).toBe(true)
         }
@@ -120,7 +120,7 @@ describe("sort key text (#171)", () => {
   )
 
   for (const casing of casings) {
-    const schema = DynamoSchema.make({ name: "Shop-App", version: 1, casing })
+    const schema = DynamoSchema.make({ name: "Shop-App", version: 1, casing, escapeKeys: true })
     const key = (index: KeyComposer.IndexDefinition, name: string, tag: string) =>
       KeyComposer.composeSk(schema, "Item", 1, index, { name, tag })
 
@@ -152,7 +152,7 @@ describe("sort key text (#171)", () => {
           const prefix = cased(y, casing).startsWith(cased(x, casing))
           const context = JSON.stringify({ x, y })
           expect(
-            KeyComposer.sortKeyText(y, casing).startsWith(KeyComposer.sortKeyText(x, casing)),
+            KeyComposer.escapeKeyText(y, casing).startsWith(KeyComposer.escapeKeyText(x, casing)),
             context,
           ).toBe(prefix)
           // A `beginsWith` on the last composite is a prefix of the stored key.
@@ -166,7 +166,7 @@ describe("sort key text (#171)", () => {
       `(d) a value without an escaped character keeps its 1.36 bytes (${casing})`,
       { a: plain, b: plain },
       ({ a, b }) => {
-        expect(KeyComposer.sortKeyText(a, casing)).toBe(cased(a, casing))
+        expect(KeyComposer.escapeKeyText(a, casing)).toBe(cased(a, casing))
         // 1.36's `composeSk`: the serialized values, cased by the composer.
         const legacy = DynamoSchema.composeKey(schema, "Item", [a, b], { names: ["name", "tag"] })
         expect(key(nameFirst, a, b)).toBe(legacy)
@@ -184,9 +184,10 @@ describe("sort key text (#171)", () => {
       ms: Int(-8.64e15, 8.64e15),
     },
     ({ n, big, flag, ms }) => {
+      const schema = DynamoSchema.make({ name: "app", version: 1, escapeKeys: true })
       for (const value of [n, big, flag, new Date(ms), DateTime.makeUnsafe(ms)]) {
         for (const casing of casings) {
-          expect(KeyComposer.serializeSortKeyValue(value, casing)).toBe(
+          expect(KeyComposer.keyValueText(schema, value, casing)).toBe(
             cased(KeyComposer.serializeValue(value), casing),
           )
         }
@@ -195,26 +196,26 @@ describe("sort key text (#171)", () => {
   )
 
   it("escapes every code point up to '%' and nothing above", () => {
-    expect(KeyComposer.sortKeyText("new york", "preserve")).toBe("new%20york")
-    expect(KeyComposer.sortKeyText("a#b", "preserve")).toBe("a%23b")
-    expect(KeyComposer.sortKeyText("50%", "preserve")).toBe("50%25")
-    expect(KeyComposer.sortKeyText("$&'", "preserve")).toBe("%24&'")
-    expect(KeyComposer.sortKeyText("Line\nTwo", "lowercase")).toBe("line%0atwo")
-    expect(KeyComposer.sortKeyText("Line\nTwo", "uppercase")).toBe("LINE%0ATWO")
-    expect(KeyComposer.sortKeyText("\u0000\u001f", "preserve")).toBe("%00%1F")
+    expect(KeyComposer.escapeKeyText("new york", "preserve")).toBe("new%20york")
+    expect(KeyComposer.escapeKeyText("a#b", "preserve")).toBe("a%23b")
+    expect(KeyComposer.escapeKeyText("50%", "preserve")).toBe("50%25")
+    expect(KeyComposer.escapeKeyText("$&'", "preserve")).toBe("%24&'")
+    expect(KeyComposer.escapeKeyText("Line\nTwo", "lowercase")).toBe("line%0atwo")
+    expect(KeyComposer.escapeKeyText("Line\nTwo", "uppercase")).toBe("LINE%0ATWO")
+    expect(KeyComposer.escapeKeyText("\u0000\u001f", "preserve")).toBe("%00%1F")
     // Cased first: an escape is never re-read by the casing's context rules.
-    expect(KeyComposer.sortKeyText("\nΣ", "lowercase")).toBe("%0aσ")
+    expect(KeyComposer.escapeKeyText("\nΣ", "lowercase")).toBe("%0aσ")
   })
 
-  it("applies to every sort key composition, and no partition key", () => {
-    const schema = DynamoSchema.make({ name: "app", version: 1 })
+  it("applies to every key composition, partition and sort", () => {
+    const schema = DynamoSchema.make({ name: "app", version: 1, escapeKeys: true })
     const index: KeyComposer.IndexDefinition = {
       pk: { field: "pk", composite: ["city"] },
       sk: { field: "sk", composite: ["city", "zone"] },
     }
     const record = { city: "New York", zone: "a#b" }
     expect(KeyComposer.composePk(schema, "Place", index, record)).toBe(
-      "$app#v1#place#city_new york",
+      "$app#v1#place#city_new%20york",
     )
     expect(KeyComposer.composeSk(schema, "Place", 1, index, record)).toBe(
       "$app#v1#place#city_new%20york#zone_a%23b",
@@ -225,13 +226,13 @@ describe("sort key text (#171)", () => {
     expect(KeyComposer.composeSkPrefixUpTo(schema, "Place", 1, index, record, 1)).toBe(
       "$app#v1#place#city_new%20york",
     )
-    expect(KeyComposer.composeEventSk("$app#v1#place", "2026 Q1", "lowercase")).toBe(
+    expect(KeyComposer.composeEventSk(schema, "$app#v1#place", "2026 Q1", "lowercase")).toBe(
       "$app#v1#place#e#2026%20q1",
     )
   })
 
-  it("index keys and policy-aware GSI updates escape the sort key half only (shapes 2 and 6)", () => {
-    const schema = DynamoSchema.make({ name: "app", version: 1 })
+  it("index keys and policy-aware GSI updates escape both halves (shapes 2 and 6)", () => {
+    const schema = DynamoSchema.make({ name: "app", version: 1, escapeKeys: true })
     const indexes: Record<string, KeyComposer.IndexDefinition> = {
       // shape 2: composites entirely the entity primary key's
       byChannel: {
@@ -248,7 +249,7 @@ describe("sort key text (#171)", () => {
     }
     const record = { channel: "North East", deviceId: "a#b 1", binding: "x y" }
     expect(KeyComposer.composeIndexKeys(schema, "Device", 1, indexes.byChannel!, record)).toEqual({
-      gsi1pk: "$app#v1#device#channel_north east",
+      gsi1pk: "$app#v1#device#channel_north%20east",
       gsi1sk: "$app#v1#device#deviceid_a%23b%201",
     })
     const { sets, removes } = KeyComposer.composeGsiKeysForUpdatePolicyAware(
@@ -261,10 +262,42 @@ describe("sort key text (#171)", () => {
     )
     expect(removes).toEqual([])
     expect(sets).toEqual({
-      gsi1pk: "$app#v1#device#channel_north east",
+      gsi1pk: "$app#v1#device#channel_north%20east",
       gsi1sk: "$app#v1#device#deviceid_a%23b%201",
-      gsi2pk: "$app#v1#device#binding_x y",
+      gsi2pk: "$app#v1#device#binding_x%20y",
       gsi2sk: "$app#v1#device",
     })
+  })
+})
+
+describe("the names before every key escaped (deprecated since 1.39.0)", () => {
+  const schema = DynamoSchema.make({ name: "app", version: 1, escapeKeys: true })
+
+  it("sortKeyText is escapeKeyText", () => {
+    expect(KeyComposer.sortKeyText("A b%", "lowercase")).toBe("a%20b%25")
+    expect(KeyComposer.sortKeyText("A b%", "preserve")).toBe(
+      KeyComposer.escapeKeyText("A b%", "preserve"),
+    )
+  })
+
+  it("serializeSortKeyValue escapes a value's serialized text", () => {
+    expect(KeyComposer.serializeSortKeyValue("A b", "lowercase")).toBe("a%20b")
+    expect(KeyComposer.serializeSortKeyValue(5, "lowercase")).toBe(
+      KeyComposer.keyValueText(schema, 5, "lowercase"),
+    )
+  })
+
+  it("composeEventSk still takes the current sort key first", () => {
+    expect(KeyComposer.composeEventSk("$x", "value", "preserve")).toBe("$x#e#value")
+    expect(KeyComposer.composeEventSk("$x", "A b")).toBe("$x#e#a%20b")
+    expect(KeyComposer.composeEventSk("$x", 42)).toBe(
+      KeyComposer.composeEventSk(schema, "$x", 42, "lowercase"),
+    )
+  })
+
+  it("with the schema first, composeEventSk honours escapeKeys", () => {
+    const off = DynamoSchema.make({ name: "app", version: 1, escapeKeys: false })
+    expect(KeyComposer.composeEventSk(off, "$x", "a b")).toBe("$x#e#a b")
+    expect(KeyComposer.composeEventSk(schema, "$x", "a b")).toBe("$x#e#a%20b")
   })
 })

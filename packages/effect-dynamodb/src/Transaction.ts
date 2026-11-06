@@ -9,13 +9,11 @@
  * transactGet returns a typed tuple inferred per-position.
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import {
   type ConcurrentModification,
   type ConditionalCheckFailed,
   DynamoError,
   type ItemNotFound,
-  type ItemNotMoved,
   isAwsTransactionCancelled,
   type OptimisticLockError,
   type RefNotFound,
@@ -138,10 +136,6 @@ type TransactGetResult<T extends ReadonlyArray<AnyGet>> = {
  * ])
  * // user: User | undefined, post: Post | undefined
  * ```
- *
- * An item still under its 1.36 key (#171) — 1.37 composes some key text
- * differently — is read there by a second `TransactGetItems` for the misses
- * whose key text changed. The two reads are separate snapshots, not one.
  */
 export const transactGet = <const T extends ReadonlyArray<AnyGet>>(
   items: T,
@@ -245,52 +239,7 @@ const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
       }),
     )
 
-    const responses = [...(result.Responses ?? [])]
-    // Another value's 1.36 row at an item's key is no item (#171).
-    const owned = (position: number, at: Record<string, AttributeValue> | undefined) => {
-      const item = responses[position]?.Item
-      const info = infos[position]!
-      if (
-        item !== undefined &&
-        at !== undefined &&
-        !info.entity._ownsRow136(info.key!, fromAttributeMap(at) as Record<string, unknown>, item)
-      ) {
-        responses[position] = {}
-      }
-    }
-    for (const [position, item] of transactItems.entries()) owned(position, item.Get?.Key)
-    // Items still under their 1.36 keys (#171): a second TransactGetItems, for
-    // the misses whose key text changed. The two reads are two snapshots, not
-    // one: an item written between them can be read in either state.
-    const misses = infos.flatMap((info, position) => {
-      if (responses[position]?.Item !== undefined) return []
-      const old = info.entity._primaryKey136(info.key!)
-      return old === undefined
-        ? []
-        : [{ position, Get: { TableName: tableNames.get(info.entity)!, Key: toAttributeMap(old) } }]
-    })
-    if (misses.length > 0) {
-      const again = yield* client
-        .transactGetItems({ TransactItems: misses.map(({ Get }) => ({ Get })) })
-        .pipe(
-          Effect.mapError((error) =>
-            isAwsTransactionCancelled(error.cause)
-              ? new TransactionCancelled({
-                  operation: "TransactGetItems",
-                  reasons: (error.cause.CancellationReasons ?? []).map((r) => ({
-                    code: r?.Code,
-                    message: r?.Message,
-                  })),
-                  cause: error.cause,
-                })
-              : error,
-          ),
-        )
-      for (const [j, response] of (again.Responses ?? []).entries()) {
-        responses[misses[j]!.position] = response
-        owned(misses[j]!.position, misses[j]!.Get.Key)
-      }
-    }
+    const responses = result.Responses ?? []
     const decoded: Array<unknown> = []
 
     for (let i = 0; i < infos.length; i++) {
@@ -336,18 +285,6 @@ const transactGetCore = <const T extends ReadonlyArray<AnyGet>>(
  * `ConcurrentModification`. A caller's own condition failing is
  * `TransactionCancelled`; a taken unique value is `UniqueConstraintViolation`.
  *
- * **Items still under their 1.36 keys** (#171). 1.37 composes some key text
- * differently from 1.36, and moving an item to its current key is a write of
- * its own, which cannot ride in this transaction. So an op on such a key adds
- * one item: an unconditioned `put` or `delete` deletes the 1.36 key; a
- * `create` checks it is empty (failing as the create's condition); an
- * `update`, `patch`, conditioned `put` / `delete`, guarded put or
- * `Transaction.check` checks the item is not there — and fails with
- * `ItemNotMoved` (EDD-9097) when it is. Write the item once through the entity
- * or run `rekey`, then run the transaction again. Only an op whose key text
- * changed adds an item, and none does with `DynamoSchema.make`'s
- * `legacyKeys: false`.
- *
  * DynamoDB's rules are not pre-checked (#144): a transaction breaking one is
  * sent, rejected whole, and reported naming the culprit — over 100 items
  * (counted after expansion) as `DynamoError`; two ops touching one item, an
@@ -391,8 +328,7 @@ export const transactWrite = (
   | ConditionalCheckFailed
   | ItemNotFound
   | TransactionOverflow
-  | RefNotFound
-  | ItemNotMoved,
+  | RefNotFound,
   DynamoClient | TableConfig
 > => Capacity.operation("Transaction.transactWrite", undefined, transactWriteCore(operations))
 
@@ -409,8 +345,7 @@ const transactWriteCore = (
   | ConditionalCheckFailed
   | ItemNotFound
   | TransactionOverflow
-  | RefNotFound
-  | ItemNotMoved,
+  | RefNotFound,
   DynamoClient | TableConfig
 > =>
   Effect.gen(function* () {
@@ -461,11 +396,7 @@ const transactWriteCore = (
             error: DynamoClientError | ValidationError,
           ): Effect.Effect<
             OptimisticLockError | ConcurrentModification,
-            | DynamoClientError
-            | ValidationError
-            | UniqueConstraintViolation
-            | TransactionCancelled
-            | ItemNotMoved
+            DynamoClientError | ValidationError | UniqueConstraintViolation | TransactionCancelled
           > => {
             if (!isAwsTransactionCancelled(error.cause)) return Effect.fail(error)
             const rawReasons = error.cause.CancellationReasons ?? []

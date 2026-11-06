@@ -1221,7 +1221,7 @@ describe("EventStore appendOp (#166)", () => {
       const withRecordProof = () =>
         Gen.append(B, [deposit(1)], 3, {
           additionalItems: [
-            Accounts.put({ accountId: "a-1#2", balance: 1, streamVersion: 4 }).pipe(
+            Accounts.put({ accountId: "a-1-2", balance: 1, streamVersion: 4 }).pipe(
               Accounts.condition({ streamVersion: 3 }),
             ),
             Gen.appendOp(A, [deposit(3)], 4),

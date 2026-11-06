@@ -1,6 +1,6 @@
 {
   "name": "effect-dynamodb",
-  "version": "1.38.0",
+  "version": "1.39.0",
   "description": "Effect TS ORM for DynamoDB — schema-driven entity modeling, single-table design, composite keys, transactions, and Stream-based pagination",
   "type": "module",
   "license": "MIT",
@@ -56,8 +56,10 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
+    "test:escape-on": "vitest run --config vitest.escape-on.ts",
     "test:watch": "vitest",
     "test:connected": "vitest run --config vitest.connected.ts",
+    "test:connected:escape-on": "vitest run --config vitest.connected.escape-on.ts",
     "check": "tsc --noEmit && tsc --noEmit -p tsconfig.examples.json && tsc --noEmit -p tsconfig.test.json",
     "lint": "biome check .",
     "lint:fix": "biome check --write ."

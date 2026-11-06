@@ -252,7 +252,9 @@ const Assets = Entity.make({
   },
 })
 
-const HierTable = Table.make({ schema: AppSchema, entities: { Assets } })
+// A pin finds a row truncated at its own level only with `escapeKeys: true`.
+const HierSchema = DynamoSchema.make({ name: "indexpolicy-demo", version: 1, escapeKeys: true })
+const HierTable = Table.make({ schema: HierSchema, entities: { Assets } })
 
 const scenario3 = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
@@ -282,7 +284,12 @@ const scenario3 = Effect.gen(function* () {
     .set({ country: "us", city: "sf" })
     .remove(["site"])
   // gsi1sk = "$indexpolicy-demo#v1#asset#country_us#city_sf"
-  // Asset still queryable at city level via begins_with.
+  // A query pinning the city finds it: the row that stops there, and anything under it.
+  const atCity = yield* db.entities.Assets.byLocation({
+    region: "americas",
+    country: "us",
+    city: "sf",
+  }).collect()
   // #endregion
 
   const atRegion = yield* db.entities.Assets.byLocation({
@@ -292,6 +299,11 @@ const scenario3 = Effect.gen(function* () {
     atRegion.some((a) => a.assetId === "rack-42"),
     true,
     "scenario 3 — rack-42 still in GSI after demote",
+  )
+  assertEq(
+    atCity.some((a) => a.assetId === "rack-42"),
+    true,
+    "scenario 3 — rack-42 found by a pin on its own level",
   )
   yield* Console.log("  rack-42 demoted from datacenter → still queryable at city level")
 })

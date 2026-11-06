@@ -18,6 +18,7 @@ import {
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
 import { encodeBigInt, encodeNumber } from "./internal/NumericKey.js"
+import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
 import {
   concatBytes,
   interleave,
@@ -144,6 +145,38 @@ export interface IndexPolicy {
   readonly sk?: IndexPolicyKey
 }
 
+/**
+ * Write sharding as declared on a secondary index (#183): one logical partition
+ * spread over `count` physical ones.
+ */
+export interface ShardsConfig<F extends string = string> {
+  /** How many physical partitions. An integer from 2 to 256. */
+  readonly count: number
+  /**
+   * The attributes to hash instead of the item's primary key: sort key
+   * composites of this index. A query pinning all of them reads one shard. A
+   * value that dominates a logical partition brings its hot key back.
+   */
+  readonly by?: ReadonlyArray<F>
+  /**
+   * Migration only: also read the old layout, `1` for the unsharded key or the
+   * old `count`. Deploy with it, run `rekey`, then remove it.
+   */
+  readonly previous?: number
+}
+
+/** A normalised {@link ShardsConfig}. Built only by {@link normalizeGsiConfig}. */
+export interface IndexShards {
+  readonly count: number
+  readonly by: ReadonlyArray<string> | undefined
+  readonly previous: number | undefined
+  /**
+   * The attributes hashed: `by`, or the primary key composites. `undefined`
+   * until `Entity.make` binds it; such an index can't compose a key.
+   */
+  readonly source: ReadonlyArray<string> | undefined
+}
+
 /** Index definition for primary or secondary index (internal format) */
 export interface IndexDefinition {
   readonly index?: string | undefined // Physical GSI name (omit for primary)
@@ -159,6 +192,8 @@ export interface IndexDefinition {
    * missing.
    */
   readonly indexPolicy?: IndexPolicy
+  /** Write sharding (#183). Secondary indexes only. */
+  readonly shards?: IndexShards
 }
 
 /** GSI definition as specified on Entity.make() indexes config.
@@ -192,6 +227,13 @@ export interface GsiConfig<TFields = globalThis.Record<string, unknown>> {
    * applied on `put()`. See `DESIGN.md §7 Policy-Aware GSI Composition`.
    */
   readonly indexPolicy?: IndexPolicy
+  /**
+   * Spread each logical partition over several physical ones, for a key too hot
+   * for one partition's write limit. `20` is short for `{ count: 20 }`. Writes
+   * hash the shard source; a query reads every shard and merges them, so callers
+   * don't change.
+   */
+  readonly shards?: number | ShardsConfig<keyof TFields & string>
 }
 
 /** The casing an index's keys are composed with: its own, else the schema's. */
@@ -221,6 +263,94 @@ export const assertCollectionCasingAgreement = (
         `physical index, so their keys would never meet — give the collection's index the same ` +
         `\`casing\` on every member.`,
     )
+  }
+}
+
+/**
+ * Fail when a collection's members would read different partitions (#183). They
+ * share one physical index and one logical key, so they must agree on how many
+ * partitions it is spread over and on the layout being migrated from. `by` may
+ * differ: each member hashes its own source, into the same partitions.
+ */
+export const assertCollectionShardsAgreement = (
+  collectionName: string,
+  members: ReadonlyArray<{
+    readonly key: string
+    readonly index: IndexDefinition
+  }>,
+): void => {
+  const layout = (member: { readonly index: IndexDefinition }) =>
+    `${member.index.shards?.count ?? "unsharded"}/${member.index.shards?.previous ?? "none"}`
+  if (new Set(members.map(layout)).size > 1) {
+    const shown = members.map((member) => {
+      const { count, previous } = member.index.shards ?? {}
+      return `${member.key}: ${count === undefined ? "unsharded" : `count ${count}`}${
+        previous === undefined ? "" : `, previous ${previous}`
+      }`
+    })
+    throw new Error(
+      `[EDD-9103] Collection "${collectionName}" members spread its index differently ` +
+        `(${shown.join("; ")}). They share one logical partition, so a query has to read one ` +
+        `set of partitions: give the collection's index the same \`shards\` count and \`previous\` ` +
+        `on every member.`,
+    )
+  }
+}
+
+const shardsMalformed = (index: string, why: string): Error =>
+  new Error(`[EDD-9099] Index "${index}" declares malformed shards: ${why}`)
+
+/** Normalise and check a declared `shards` (the rest is `Entity.make`'s, which has the model). */
+const normalizeShards = (index: string, declared: unknown): IndexShards => {
+  const config: { readonly count?: unknown; readonly by?: unknown; readonly previous?: unknown } =
+    typeof declared === "number" ? { count: declared } : (declared as object)
+  if (typeof config !== "object" || config === null || Array.isArray(config)) {
+    throw shardsMalformed(index, "pass a count, or { count, by?, previous? }.")
+  }
+  const unknownKeys = Object.keys(config).filter(
+    (key) => key !== "count" && key !== "by" && key !== "previous",
+  )
+  if (unknownKeys.length > 0) {
+    throw shardsMalformed(
+      index,
+      `unknown option ${unknownKeys.map((key) => `"${key}"`).join(", ")}: it takes count, by and previous.`,
+    )
+  }
+  const { count, by, previous } = config
+  if (
+    typeof count !== "number" ||
+    !Number.isInteger(count) ||
+    count < 2 ||
+    count > MAX_SHARD_COUNT
+  ) {
+    throw shardsMalformed(
+      index,
+      `count ${JSON.stringify(count)} must be an integer from 2 to ${MAX_SHARD_COUNT}.`,
+    )
+  }
+  if (previous !== undefined) {
+    if (typeof previous !== "number" || !Number.isInteger(previous) || previous < 1) {
+      throw shardsMalformed(
+        index,
+        `previous ${JSON.stringify(previous)} must be a positive integer: 1 for the unsharded key, or the old count.`,
+      )
+    }
+    if (previous === count) {
+      throw shardsMalformed(
+        index,
+        `previous ${previous} equals count: it names the layout being migrated from, which has to differ.`,
+      )
+    }
+    if (previous > MAX_SHARD_COUNT) {
+      throw shardsMalformed(index, `previous ${previous} is above ${MAX_SHARD_COUNT}.`)
+    }
+  }
+  return {
+    count,
+    by:
+      by === undefined ? undefined : ([...(by as ReadonlyArray<string>)] as ReadonlyArray<string>),
+    previous,
+    source: undefined,
   }
 }
 
@@ -262,6 +392,7 @@ export const normalizeGsiConfig = (config: GsiConfig): IndexDefinition => {
       : { field: sk.field, composite: [...sk.composite!] },
     ...(config.casing !== undefined && { casing: config.casing }),
     ...(config.indexPolicy !== undefined && { indexPolicy: config.indexPolicy }),
+    ...(config.shards !== undefined && { shards: normalizeShards(config.name, config.shards) }),
   }
 }
 
@@ -386,8 +517,28 @@ export const tryExtractComposites = (
   return values
 }
 
+/** A value's composite text, its numbers by `number` and `bigint`. */
+const serializeWith = (
+  value: unknown,
+  number: (n: number) => string,
+  bigint: (n: bigint) => string,
+): string => {
+  if (typeof value === "string") return value
+  if (typeof value === "number") return number(value)
+  if (typeof value === "bigint") return bigint(value)
+  if (typeof value === "boolean") return value ? "true" : "false"
+  // DateTime types → ISO string (Zoned normalized to UTC for sort order)
+  if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
+    return DateTime.formatIso(value)
+  }
+  // Native Date
+  if (value instanceof Date) return value.toISOString()
+  return String(value)
+}
+
 /**
- * Serialize a value for use in a composite key.
+ * Serialize a value for a composite key under `escapeKeys: true`. {@link compositeText} is the
+ * text under a schema's setting.
  *
  * Numeric values are encoded so their key text sorts in numeric order
  * (`internal/NumericKey.ts` has the format):
@@ -404,30 +555,38 @@ export const tryExtractComposites = (
  * - DateTime.Utc → ISO string
  * - Date → ISO string
  */
-export const serializeValue = (value: unknown): string => {
-  if (typeof value === "string") return value
-  if (typeof value === "number") return encodeNumber(value)
-  if (typeof value === "bigint") return encodeBigInt(value)
-  if (typeof value === "boolean") return value ? "true" : "false"
-  // DateTime types → ISO string (Zoned normalized to UTC for sort order)
-  if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
-    return DateTime.formatIso(value)
-  }
-  // Native Date
-  if (value instanceof Date) return value.toISOString()
-  return String(value)
-}
+export const serializeValue = (value: unknown): string =>
+  serializeWith(value, encodeNumber, encodeBigInt)
 
-/** The highest code point a sort key composite's text escapes: `%`. */
+/**
+ * A composite value's text with `escapeKeys` off, the text 1.36 composed: a number zero-padded to
+ * 16 characters and a bigint to 38 (`String(n)` padded, so `-3` is `00000000000000-3` and `2.5` is
+ * `00000000000002.5`). Never throws: `NaN` is `0000000000000NaN`.
+ */
+export const serializeValue136 = (value: unknown): string =>
+  serializeWith(
+    value,
+    (n) => String(n).padStart(16, "0"),
+    (n) => String(n).padStart(38, "0"),
+  )
+
+/** A composite value's serialized text under the schema's setting, before casing and escaping. */
+export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string =>
+  schema.escapeKeys === true || schema.numericKeyText === true
+    ? serializeValue(value)
+    : serializeValue136(value)
+
+/** The highest code point a key composite's text escapes: `%`. */
 const ESCAPED_MAX = 0x25
 
 /**
- * A composite value's serialized text as a sort key holds it (#171): cased,
+ * A composite value's serialized text as a key holds it (#171, #183): cased,
  * then each code point U+0000–U+0025 — control characters, space, `!`, `"`,
  * `#`, `$` and `%` — escaped as `%` and two hex digits (space → `%20`, `#` →
  * `%23`, `%` → `%25`), the hex digits in upper case, or lower case under
  * `"lowercase"` casing. Any other text is unchanged, so a value without such a
- * character keeps its 1.36 key text.
+ * character keeps its 1.36 key text. The same rule holds in a partition key and
+ * a sort key, so the two build identical text from identical values.
  *
  * Every escaped value sorts as its cased value and starts with its cased
  * prefixes' text: an unescaped character sorts above `%`, and an escape starts
@@ -439,7 +598,7 @@ const ESCAPED_MAX = 0x25
  * Casing comes first so the hex digits are the only text it can't reach: the
  * composer cases the key again, which leaves cased text as it is.
  */
-export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string => {
+export const escapeKeyText = (text: string, casing: DynamoSchema.Casing): string => {
   const cased = applyCasing(text, casing)
   let escaped = ""
   let from = 0
@@ -453,17 +612,57 @@ export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string =
   return from === 0 ? cased : `${escaped}${cased.slice(from)}`
 }
 
-/** A composite value's text in a sort key: {@link serializeValue}, then {@link sortKeyText}. */
-export const serializeSortKeyValue = (value: unknown, casing: DynamoSchema.Casing): string =>
-  sortKeyText(serializeValue(value), casing)
+/** The text {@link escapeKeyText} escaped back, cased: for `rekey`, reading a value out of a key. */
+export const unescapeKeyText = (text: string): string =>
+  text.replace(/%([0-9a-fA-F]{2})/g, (_, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  )
 
-/** {@link extractComposites} for a sort key half: each value's {@link sortKeyText}. */
-const extractSortKeyComposites = (
+/**
+ * @deprecated since 1.39.0: escaping is `escapeKeys: true`'s, in every key. Use {@link keyText},
+ * which follows the setting, or {@link escapeKeyText}, the same function under its new name.
+ */
+export const sortKeyText = (text: string, casing: DynamoSchema.Casing): string =>
+  escapeKeyText(text, casing)
+
+/**
+ * @deprecated since 1.39.0: escaping is `escapeKeys: true`'s, in every key. Use
+ * {@link keyValueText}, which follows the setting.
+ */
+export const serializeSortKeyValue = (value: unknown, casing: DynamoSchema.Casing): string =>
+  escapeKeyText(serializeValue(value), casing)
+
+/**
+ * A composite's serialized text in a key: cased, and with `escapeKeys: true`
+ * {@link escapeKeyText}. Every key composite passes through here, in every key.
+ */
+export const keyText = (
+  schema: DynamoSchema.DynamoSchema,
+  text: string,
+  casing: DynamoSchema.Casing,
+): string => (schema.escapeKeys === true ? escapeKeyText(text, casing) : applyCasing(text, casing))
+
+/** A composite value's text in a key: {@link compositeText}, then {@link keyText}. */
+export const keyValueText = (
+  schema: DynamoSchema.DynamoSchema,
+  value: unknown,
+  casing: DynamoSchema.Casing,
+): string => keyText(schema, compositeText(schema, value), casing)
+
+/** {@link extractComposites} under the schema's setting, each value's {@link keyValueText}. */
+export const extractKeyComposites = (
+  schema: DynamoSchema.DynamoSchema,
+  index: { readonly casing?: DynamoSchema.Casing | undefined },
   composite: ReadonlyArray<string>,
   record: Record<string, unknown>,
-  casing: DynamoSchema.Casing,
 ): ReadonlyArray<string> =>
-  extractComposites(composite, record).map((text) => sortKeyText(text, casing))
+  composite.map((attr) => {
+    const value = record[attr]
+    if (value === undefined || value === null) {
+      throw new Error(`Missing composite attribute "${attr}" in record`)
+    }
+    return keyValueText(schema, value, index.casing ?? schema.casing)
+  })
 
 /**
  * Compose a partition key for an entity index.
@@ -477,18 +676,274 @@ export const composePk = (
   index: IndexDefinition,
   record: Record<string, unknown>,
 ): string => {
-  const composites = extractComposites(index.pk.composite, record)
-  const names = [...index.pk.composite]
+  const composites = extractKeyComposites(schema, index, index.pk.composite, record)
+  return composePkText(
+    schema,
+    entityType,
+    index,
+    composites,
+    index.pk.composite,
+    composedShardMarker(entityType, index, record),
+  )
+}
+
+/**
+ * The text of a partition key: the entity type or collection name, the marker
+ * of a sharded index (design §2), then the composites.
+ */
+const composePkText = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  composites: ReadonlyArray<string>,
+  names: ReadonlyArray<string>,
+  marker: string | undefined,
+): string => {
   const collection = index.collection
+  // Collection index — PK uses collection name; regular index — entity type.
+  const label =
+    collection === undefined
+      ? entityType
+      : Array.isArray(collection)
+        ? collection[0]!
+        : (collection as string)
+  const spelled = marker === undefined ? label : `${label}${KEY_DELIMITER}${marker}`
+  const options = { casing: index.casing, names: [...names] }
+  return collection === undefined
+    ? composeKey(schema, spelled, composites, options)
+    : composeCollectionKey(schema, spelled, composites, options)
+}
 
-  if (collection !== undefined) {
-    // Collection index — PK uses collection name
-    const collectionName = Array.isArray(collection) ? collection[0]! : collection
-    return composeCollectionKey(schema, collectionName, composites, { casing: index.casing, names })
+/**
+ * The marker of the shard `record` hashes to; `undefined` on an unsharded index.
+ * Throws `[EDD-9100]` when the source is missing: a sharded index never composes
+ * an unsharded partition key, so a write can't go wrong by forgetting it.
+ */
+const composedShardMarker = (
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): string | undefined => {
+  const shards = index.shards
+  if (shards === undefined) return undefined
+  const source = boundShardSource(index, shards)
+  const absent = source.filter((attr) => record[attr] === undefined || record[attr] === null)
+  if (absent.length > 0) {
+    throw new ShardSourceError({
+      message:
+        `[EDD-9100] Entity "${entityType}": index "${index.index}" is sharded, and its partition ` +
+        `key can't be composed without the shard source: ${absent.map((attr) => `"${attr}"`).join(", ")} ` +
+        `missing. A sharded index never composes an unsharded key, so nothing was written. ` +
+        `Include ${absent.length === 1 ? "it" : "them"} in the write.`,
+    })
   }
+  return shardMarker(
+    shards.count,
+    shardOf(
+      source.map((attr) => serializeValue(record[attr])),
+      shards.count,
+    ),
+  )
+}
 
-  // Regular entity index — PK uses entity type
-  return composeKey(schema, entityType, composites, { casing: index.casing, names })
+/**
+ * `index` as its unsharded layout: what a `previous: 1` migration reads, and the
+ * only layout rows under another setting's key text can be in. Reads only.
+ */
+export const unshardedView = (index: IndexDefinition): IndexDefinition => {
+  if (index.shards === undefined) return index
+  const { shards: _shards, ...view } = index
+  return view
+}
+
+/**
+ * The partition key a stored row's values compose now, for `rekey` (#183): by the
+ * structural rule an update composes with, truncated included. `undefined` when
+ * they can't compose one: a hole, no leading composite, or the source missing.
+ */
+export const composeStoredPk = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): string | undefined => {
+  const outcome = classifyHalf(index.pk.composite, record, "sparse", false)
+  if (outcome.kind !== "set") return undefined
+  const shards = index.shards
+  if (
+    shards !== undefined &&
+    !boundShardSource(index, shards).every((attr) => hasValue(record[attr]))
+  ) {
+    return undefined
+  }
+  return outcome.length === index.pk.composite.length
+    ? composePk(schema, entityType, index, record)
+    : composePkPrefixUpTo(schema, entityType, index, record, outcome.length)
+}
+
+/**
+ * The index key a row's values compose now, truncating a half whose trailing
+ * composites are absent as the structural rule does (`DESIGN.md §7`). `undefined`
+ * when a half can't compose (a hole, or no leading value) or the sort key is a
+ * binary Z-order address.
+ */
+export const tryComposeStructuralKeys = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): { readonly pk: string; readonly sk: string } | undefined => {
+  if (isZOrderHalf(index.sk)) return undefined
+  const pk = classifyHalf(index.pk.composite, record, "sparse", false)
+  const sk = classifyHalf(index.sk.composite, record, "sparse", false)
+  if (pk.kind !== "set" || sk.kind !== "set") return undefined
+  return {
+    pk:
+      pk.length === index.pk.composite.length
+        ? composePk(schema, entityType, index, record)
+        : composePkPrefixUpTo(schema, entityType, index, record, pk.length),
+    sk:
+      sk.length === index.sk.composite.length
+        ? composeSk(schema, entityType, entityVersion, index, record)
+        : composeSkPrefixUpTo(schema, entityType, entityVersion, index, record, sk.length),
+  }
+}
+
+/**
+ * Does stored partition key text lie in `index`'s current layout (#183): shard
+ * marker with this count, whatever shard? A row whose values can't compose its key
+ * can only be left alone when this holds.
+ */
+export const isCurrentShardLayout = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  stored: string,
+): boolean =>
+  index.shards !== undefined &&
+  stored.startsWith(composePkText(schema, entityType, index, [], [], `!${index.shards.count}.`))
+
+const boundShardSource = (index: IndexDefinition, shards: IndexShards): ReadonlyArray<string> => {
+  if (shards.source === undefined) {
+    throw new Error(
+      `KeyComposer: sharded index "${index.index}" was never bound to an entity — Entity.make ` +
+        `binds a sharded index's source to the primary key composites or \`by\`.`,
+    )
+  }
+  return shards.source
+}
+
+/**
+ * Do the pins in `record` name every attribute of the shard source? A pin is a
+ * partition key composite or part of the sort key's leading run of present values:
+ * what a key condition can select. A value elsewhere in `record` selects nothing,
+ * and reading one shard for it would lose the rows of the others.
+ */
+const pinsShardSource = (
+  index: IndexDefinition,
+  source: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+): boolean => {
+  const pins = new Set(index.pk.composite)
+  if (!isZOrderHalf(index.sk)) {
+    for (const attr of index.sk.composite) {
+      if (!hasValue(record[attr])) break
+      pins.add(attr)
+    }
+  }
+  return source.every((attr) => pins.has(attr) && hasValue(record[attr]))
+}
+
+/**
+ * What a query of an index reads (#183): the partition key text of each physical
+ * partition, and on a sharded index, what the fan-out needs to know.
+ */
+export interface ReadPartitions {
+  /** The one partition of an unsharded index; else the current shards, then `previous`'s. */
+  readonly partitions: ReadonlyArray<string>
+  readonly fanOut: ReadFanOut | undefined
+}
+
+/** The layout a sharded query reads: what its cursor's fingerprint covers. */
+export interface ReadFanOut {
+  readonly count: number
+  readonly source: ReadonlyArray<string>
+  readonly previous: number | undefined
+  /** Every attribute of the shard source was pinned, so one current shard is read. */
+  readonly pruned: boolean
+  /**
+   * When pruned, what the query would read without those pins: a condition that
+   * replaces them (`Query.where`) has to read it, since a row it selects can be in
+   * any shard.
+   */
+  readonly everyPartition: ReadonlyArray<string> | undefined
+}
+
+/**
+ * The partitions a query of `index` reads for the pinned composites in `record`,
+ * in merge order: the current layout's by shard number (one, when every attribute
+ * of the shard source is pinned, whether that source is `by` or the primary key),
+ * then the `previous` layout's, which are never pruned: the old source isn't
+ * recorded. Every read path uses this; {@link composePk} composes the one key a
+ * write stores.
+ */
+export const composeReadPartitions = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+  /** `false`: read every shard, whatever is pinned (a collection's members may differ). */
+  options?: { readonly prune?: boolean },
+): ReadPartitions => {
+  const shards = index.shards
+  if (shards === undefined) {
+    return { partitions: [composePk(schema, entityType, index, record)], fanOut: undefined }
+  }
+  const source = boundShardSource(index, shards)
+  const composites = extractKeyComposites(schema, index, index.pk.composite, record)
+  const partition = (count: number, shard: number) =>
+    composePkText(
+      schema,
+      entityType,
+      index,
+      composites,
+      index.pk.composite,
+      shardMarker(count, shard),
+    )
+  const layout = (count: number) => Array.from({ length: count }, (_, i) => partition(count, i))
+  const pruned = options?.prune !== false && pinsShardSource(index, source, record)
+  const current = pruned
+    ? [
+        partition(
+          shards.count,
+          shardOf(
+            source.map((attr) => serializeValue(record[attr])),
+            shards.count,
+          ),
+        ),
+      ]
+    : layout(shards.count)
+  const unsharded =
+    shards.previous === 1
+      ? composePkText(schema, entityType, index, composites, index.pk.composite, undefined)
+      : undefined
+  const previous =
+    unsharded !== undefined
+      ? [unsharded]
+      : shards.previous === undefined
+        ? []
+        : layout(shards.previous)
+  return {
+    partitions: [...current, ...previous],
+    fanOut: {
+      count: shards.count,
+      source,
+      previous: shards.previous,
+      pruned,
+      everyPartition: pruned ? [...layout(shards.count), ...previous] : undefined,
+    },
+  }
 }
 
 /**
@@ -506,11 +961,7 @@ export const composeSk = (
   record: Record<string, unknown>,
 ): string => {
   assertStringHalf(index, "composeSk")
-  const composites = extractSortKeyComposites(
-    index.sk.composite,
-    record,
-    effectiveCasing(schema, index),
-  )
+  const composites = extractKeyComposites(schema, index, index.sk.composite, record)
   const names = [...index.sk.composite]
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
@@ -583,7 +1034,7 @@ export const composeZOrderSk = (
     if (value === undefined || value === null) {
       throw new Error(`Missing composite attribute "${part.field}" in record`)
     }
-    return prefixSegment(serializeSortKeyValue(value, casing), part.hash)
+    return prefixSegment(keyValueText(schema, value, casing), part.hash)
   })
   const levels = layout.dimensions.map((dim) => {
     const value = record[dim.field]
@@ -726,21 +1177,14 @@ const composePkPrefixUpTo = (
   stopBefore: number,
 ): string => {
   const slice = index.pk.composite.slice(0, stopBefore)
-  const composites = extractComposites(slice, record)
-  const collection = index.collection
-
-  if (collection !== undefined) {
-    const collectionName = Array.isArray(collection) ? collection[0]! : collection
-    return composeCollectionKey(schema, collectionName, composites, {
-      casing: index.casing,
-      names: [...slice],
-    })
-  }
-
-  return composeKey(schema, entityType, composites, {
-    casing: index.casing,
-    names: [...slice],
-  })
+  return composePkText(
+    schema,
+    entityType,
+    index,
+    extractKeyComposites(schema, index, slice, record),
+    slice,
+    composedShardMarker(entityType, index, record),
+  )
 }
 
 /**
@@ -766,7 +1210,7 @@ export const composeSkPrefixUpTo = (
 ): string => {
   assertStringHalf(index, "composeSkPrefixUpTo")
   const slice = index.sk.composite.slice(0, stopBefore)
-  const composites = extractSortKeyComposites(slice, record, effectiveCasing(schema, index))
+  const composites = extractKeyComposites(schema, index, slice, record)
   const collection = index.collection
   const collectionType = index.type ?? "isolated"
 
@@ -907,6 +1351,100 @@ const classifyZOrderHalf = (
   return "noop"
 }
 
+const hasValue = (value: unknown): boolean => value !== undefined && value !== null
+
+/**
+ * The per-half gate's question for a half with composites: does this writer name
+ * none of them, while the half can't be recomposed from what it knows? Then the
+ * half belongs to some other writer, and its stored key stays as it is.
+ */
+const writerLeavesHalf = (
+  composites: ReadonlyArray<string>,
+  updatePayload: Record<string, unknown>,
+  keyRecord: Record<string, unknown>,
+): boolean =>
+  composites.every((attr) => !(attr in updatePayload)) &&
+  composites.some((attr) => !hasValue(keyRecord[attr]))
+
+/**
+ * The PK half's outcome on a sharded index, from what {@link classifyHalf} says
+ * of its composites and what the update did to the shard source (design §5). On
+ * an unsharded index, that outcome as it is.
+ *
+ * A write that would leave the shard stale or need an unsharded key throws
+ * `[EDD-9100]`; a `by` attribute explicitly gone drops the entry, which writes no
+ * unsharded key; and an update that doesn't touch the source leaves the stored
+ * key alone.
+ */
+const shardedPkOutcome = (
+  entityType: string,
+  index: IndexDefinition,
+  outcome: HalfOutcome,
+  update: {
+    readonly merged: Record<string, unknown>
+    readonly updatePayload: Record<string, unknown>
+    readonly policy: IndexPolicyKey
+    readonly pkHasRemoved: boolean
+    readonly byTouched: boolean
+    readonly byCleared: boolean
+    readonly byRemoved: boolean
+    readonly onMissing: "fail" | "keep"
+    /** The sort key half keeps its stored text: a hole, under `preserve`. */
+    readonly skKept: boolean
+  },
+): HalfOutcome => {
+  const shards = index.shards
+  if (shards === undefined) return outcome
+  const { merged, updatePayload, policy } = update
+  const pkComposites = index.pk.composite
+  const refuse = (): HalfOutcome => {
+    if (update.onMissing === "keep") return { kind: "noop" }
+    const absent = boundShardSource(index, shards).filter((attr) => !hasValue(merged[attr]))
+    const missing = absent.length > 0 ? absent : pkComposites.filter((a) => !hasValue(merged[a]))
+    throw new ShardSourceError({
+      message:
+        `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
+        `sharded by, and its partition key can't be composed without ` +
+        `${missing.map((attr) => `"${attr}"`).join(", ")}. The stored shard would go stale, so ` +
+        `nothing was written. Include ${missing.length === 1 ? "it" : "them"} in the update.`,
+    })
+  }
+  if (update.byRemoved) return { kind: "drop" }
+  if (outcome.kind === "drop") {
+    const pkExplicitlyGone =
+      update.pkHasRemoved ||
+      pkComposites.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+    return update.byTouched && !pkExplicitlyGone ? refuse() : outcome
+  }
+  if (outcome.kind === "noop") return update.byTouched ? refuse() : outcome
+  if (boundShardSource(index, shards).every((attr) => hasValue(merged[attr]))) {
+    // The shard follows `by`, and the sort key would stay at the old value: no pin
+    // could reach the row, since each searches the shard its own value hashes to and
+    // only the old value's text is stored. The update may name the value the row
+    // already holds, but nothing was read to tell.
+    if (update.byTouched && update.skKept) {
+      if (update.onMissing === "keep") return { kind: "noop" }
+      const missing = index.sk.composite.filter((attr) => !hasValue(merged[attr]))
+      throw new ShardSourceError({
+        message:
+          `[EDD-9100] Entity "${entityType}": this update changes what index "${index.index}" is ` +
+          `sharded by, and its sort key can't be composed without ` +
+          `${missing.map((attr) => `"${attr}"`).join(", ")}. The stored sort key would stay at ` +
+          `the old value in the new value's shard, where no query could find it, so nothing was ` +
+          `written. Include ${missing.length === 1 ? "it" : "them"} in the update, or .remove() ` +
+          `${missing.length === 1 ? "it" : "them"} to take the item out of the index.`,
+      })
+    }
+    return outcome
+  }
+  if (update.byCleared && policy === "sparse") return { kind: "drop" }
+  // The source is incomplete: an update changing the partition or part of `by`
+  // can't compute the shard; any other leaves the stored key alone.
+  return update.byTouched || pkComposites.some((attr) => hasValue(updatePayload[attr]))
+    ? refuse()
+    : { kind: "noop" }
+}
+
 /**
  * Resolve the per-half policy for an index. Defaults each half to `"preserve"`
  * when omitted (or when `indexPolicy` is omitted entirely).
@@ -929,10 +1467,11 @@ const resolveIndexPolicy = (
  * protection: prevent writer A from clobbering keys for halves it doesn't
  * own when writer B does own them. The skip-predicate states that purpose
  * directly: skip iff multi-writer protection actually applies (the half has
- * composites, no composite was explicitly removed, and every composite is
- * absent from BOTH `updatePayload` AND `keyRecord` — so this writer is
- * genuinely not claiming ownership of this half on this call). If the half
- * cannot be safely skipped, it is evaluated by the structural rule.
+ * composites, no composite was explicitly removed, none is in `updatePayload`,
+ * and at least one is unknown to `keyRecord` — so this writer is genuinely not
+ * claiming ownership of this half on this call, and can't recompose it to the
+ * value it already holds). If the half cannot be safely skipped, it is evaluated
+ * by the structural rule.
  *
  * Pre-v1.7.3 the predicate was inverted ("list cases for which to evaluate"
  * as a chain of `||` clauses) and had to enumerate every shape: payload
@@ -942,7 +1481,9 @@ const resolveIndexPolicy = (
  * PK-composites-only case (#43), v1.7.2 then missed the empty-composite-half
  * case (#46) because every `.some(...)` clause trivially returned `false`
  * for an empty composite array. The skip-predicate closes the entire class
- * of degenerate-case bugs structurally.
+ * of degenerate-case bugs structurally. Through v1.37 its `keyRecord` arm asked
+ * whether *every* composite was absent, so one entity-PK composite woke a half
+ * that mixes it with a mutable composite (#183: `DESIGN.md §7`, shape 10).
  *
  * **Two-way payload classification.**
  * - **present** (`attr: <value>` in payload, or inherited from `keyRecord`)
@@ -987,6 +1528,13 @@ export const composeGsiKeysForUpdatePolicyAware = (
   keyRecord: Record<string, unknown>,
   options?: {
     readonly removedSet?: ReadonlySet<string>
+    /**
+     * What a sharded half does when the update can't compute its new shard:
+     * `"fail"` (the default) throws `[EDD-9100]`; `"keep"` leaves the stored key,
+     * for a caller composing from partial knowledge whose result is not the
+     * write (see `docs/designs/gsi-write-sharding.md` §5).
+     */
+    readonly onMissingShardSource?: "fail" | "keep"
   },
 ): GsiUpdateResult => {
   const sets: Record<string, KeyValue> = {}
@@ -1011,28 +1559,40 @@ export const composeGsiKeysForUpdatePolicyAware = (
     //     skipping would just leave a missing key forever — closes #46),
     //   - AND no composite of this half was explicitly removed (cascade
     //     intent must always evaluate),
-    //   - AND every composite is absent from BOTH `updatePayload` AND
-    //     `keyRecord` (so this writer is genuinely not claiming ownership
-    //     of this half on this call — preserves the v1.7.1 multi-writer
-    //     fix #41 and the v1.7.2 PK-composites-only fix #43, since
-    //     entity-PK composites are always present in `keyRecord`).
+    //   - AND no composite is in `updatePayload` (this writer names none of
+    //     them, so it claims no ownership of this half — #41),
+    //   - AND some composite is unknown to `keyRecord` (so the half can't be
+    //     recomposed to the value it already has). Every composite known
+    //     means a SET the writer can't get wrong: entity-PK composites are
+    //     immutable, which keeps #43's PK-composites-only half composing on
+    //     every write. One known composite proves nothing: a half mixing an
+    //     entity-PK composite with a mutable one is not this writer's to
+    //     truncate or drop on an unrelated write (see `DESIGN.md §7`, shape 10).
     //
-    // The negation `!shouldSkip` is observably equivalent to the previous
-    // touched-predicate `||`-chain extended with `composites.length === 0`:
-    // every fix the touched-predicate accumulated falls out of one of the
-    // skip-predicate's three structural conditions. See `DESIGN.md §7`.
+    // See `DESIGN.md §7`.
     const pkHasRemoved =
       removedSet !== undefined && pkComposites.some((attr) => removedSet.has(attr))
     const skHasRemoved =
       removedSet !== undefined && skComposites.some((attr) => removedSet.has(attr))
+    // A `by` attribute (#183) is a dependency of the PK half, when the writer
+    // touches it: the shard follows its value. Its presence in `keyRecord` is no
+    // evidence of a change. The retain path's holds the whole item.
+    const by = index.shards?.by ?? []
+    const byTouched = by.some((attr) => hasValue(updatePayload[attr]))
+    const byCleared = by.some((attr) => attr in updatePayload && !hasValue(updatePayload[attr]))
+    const byRemoved = removedSet !== undefined && by.some((attr) => removedSet.has(attr))
+    // An empty PK half is a constant prefix, unless `by` makes its marker vary.
     const skipPk =
-      pkComposites.length > 0 &&
-      !pkHasRemoved &&
-      pkComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
+      (pkComposites.length > 0
+        ? !pkHasRemoved && writerLeavesHalf(pkComposites, updatePayload, keyRecord)
+        : by.length > 0 && by.some((attr) => !hasValue(keyRecord[attr]))) &&
+      !byTouched &&
+      !byCleared &&
+      !byRemoved
     const skipSk =
       skComposites.length > 0 &&
       !skHasRemoved &&
-      skComposites.every((attr) => !(attr in updatePayload) && !(attr in keyRecord))
+      writerLeavesHalf(skComposites, updatePayload, keyRecord)
 
     if (skipPk && skipSk) continue
 
@@ -1057,9 +1617,29 @@ export const composeGsiKeysForUpdatePolicyAware = (
     }
 
     const policy = resolveIndexPolicy(index.indexPolicy)
+    // A Z-order half is never a `by` source, so only a text half can disagree.
+    const skKept =
+      !skipSk &&
+      !isZOrderHalf(index.sk) &&
+      classifyHalf(skComposites, merged, policy.sk, skHasRemoved).kind === "noop"
 
     if (!skipPk) {
-      const pkOutcome = classifyHalf(pkComposites, merged, policy.pk, pkHasRemoved)
+      const pkOutcome = shardedPkOutcome(
+        entityType,
+        index,
+        classifyHalf(pkComposites, merged, policy.pk, pkHasRemoved),
+        {
+          merged,
+          updatePayload,
+          policy: policy.pk,
+          pkHasRemoved,
+          byTouched,
+          byCleared,
+          byRemoved,
+          onMissing: options?.onMissingShardSource ?? "fail",
+          skKept,
+        },
+      )
       if (pkOutcome.kind === "drop") {
         removes.push(index.pk.field)
       } else if (pkOutcome.kind === "set") {
@@ -1098,7 +1678,20 @@ export const composeGsiKeysForUpdatePolicyAware = (
     }
   }
 
-  return { sets, removes }
+  // No part of the primary key is ever set or removed by an update, whatever the index
+  // structure (`DESIGN.md §7`). A half stored in a table key attribute (a local index's
+  // partition key, an inverted index, a sort key shared with the table) composes the
+  // table's text from what an update can't change, so there is nothing to write; dropping
+  // the entry takes only the other half. A half reads as dropped here only for a row an
+  // earlier release's `.remove()` left without a composite, which a move from other key text
+  // recomposes from: it keeps its key.
+  const primary = indexes.primary
+  if (primary === undefined) return { sets, removes }
+  const tableKey = new Set([primary.pk.field, primary.sk.field])
+  return {
+    sets: Object.fromEntries(Object.entries(sets).filter(([field]) => !tableKey.has(field))),
+    removes: removes.filter((field) => !tableKey.has(field)),
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,12 +1721,8 @@ export const tryComposeVectorPartition = (
   },
   record: Record<string, unknown>,
 ): string | undefined => {
-  const composites = tryExtractComposites(index.partition, record)
-  if (composites === undefined) return undefined
-  return composeKey(schema, entityType, composites, {
-    casing: index.casing,
-    names: [...index.partition],
-  })
+  if (tryExtractComposites(index.partition, record) === undefined) return undefined
+  return composeVectorPartition(schema, entityType, index, record)
 }
 
 /**
@@ -1150,7 +1739,7 @@ export const composeVectorPartition = (
   },
   record: Record<string, unknown>,
 ): string => {
-  const composites = extractComposites(index.partition, record)
+  const composites = extractKeyComposites(schema, index, index.partition, record)
   return composeKey(schema, entityType, composites, {
     casing: index.casing,
     names: [...index.partition],
@@ -1223,6 +1812,47 @@ export const composeSortKeyBeginsWith = (
 }
 
 /**
+ * Above every key below a complete sort key prefix: the delimiter is followed by
+ * a composite's label, and no label reaches U+FFFF.
+ */
+export const SORT_KEY_MAX = "\uFFFF"
+
+/**
+ * The condition selecting a complete sort key prefix on a secondary index, with
+ * `escapeKeys: true`: the key itself, where the structural rule truncates a row whose
+ * trailing composites are absent (`DESIGN.md §7`), and every key below it. A longer sibling
+ * value stays out: its text extends the prefix with a character above the delimiter (escaping
+ * puts everything up to `%` out of reach of a value).
+ *
+ * With `escapeKeys` off that range would hold `new york` for `new`, so a pin sends 1.36's
+ * `begins_with` on the prefix and the delimiter, and a row truncated at the prefix isn't among
+ * what it reads, as in 1.36.
+ */
+export const pinCondition = (
+  schema: DynamoSchema.DynamoSchema,
+  prefix: string,
+): { readonly beginsWith: string } | { readonly between: readonly [string, string] } =>
+  schema.escapeKeys === true
+    ? subtreeCondition(prefix)
+    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
+
+/** The range {@link pinCondition} sends with `escapeKeys: true`. */
+export const subtreeCondition = (
+  prefix: string,
+): { readonly between: readonly [string, string] } => ({
+  between: [prefix, `${prefix}${KEY_DELIMITER}${SORT_KEY_MAX}`],
+})
+
+/** The prefix a {@link subtreeCondition} selects; `undefined` for any other condition. */
+export const subtreePrefix = (condition: object): string | undefined => {
+  if (!("between" in condition)) return undefined
+  const [lower, upper] = condition.between as readonly [unknown, unknown]
+  return typeof lower === "string" && upper === `${lower}${KEY_DELIMITER}${SORT_KEY_MAX}`
+    ? lower
+    : undefined
+}
+
+/**
  * The sort key condition a query accessor sends for the leading SK composites
  * present in `record` (the caller has checked at least one is):
  *
@@ -1232,8 +1862,12 @@ export const composeSortKeyBeginsWith = (
  *   matching `"ab"`, and `seq: 3` matching 3.14 and 3.5, whose key text
  *   extends 3's. On the primary index `=` also leaves out the item's history
  *   rows, whose keys extend the current one.
- * - **Partial prefix** — `{ beginsWith }` on {@link composeSortKeyBeginsWith}:
- *   the prefix and the delimiter, so it stops on a segment boundary.
+ * - **Partial prefix, secondary index** — {@link pinCondition}: with `escapeKeys: true` a row
+ *   truncated at this prefix belongs to these pins, and `begins_with` on the
+ *   prefix and delimiter can't reach it (the key ends where the operand goes on).
+ * - **Partial prefix, primary index** — `{ beginsWith }` on
+ *   {@link composeSortKeyBeginsWith}: the prefix and the delimiter, so it stops on
+ *   a segment boundary. Primary keys are never truncated.
  */
 export const composeSortKeyCondition = (
   schema: DynamoSchema.DynamoSchema,
@@ -1241,12 +1875,16 @@ export const composeSortKeyCondition = (
   entityVersion: number,
   index: IndexDefinition,
   record: Record<string, unknown>,
-): { readonly eq: string } | { readonly beginsWith: string } => {
+):
+  | { readonly eq: string }
+  | { readonly beginsWith: string }
+  | { readonly between: readonly [string, string] } => {
   assertStringHalf(index, "composeSortKeyCondition")
   const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
-  return availableSkCount(index, record) === index.sk.composite.length
-    ? { eq: prefix }
-    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
+  if (availableSkCount(index, record) === index.sk.composite.length) return { eq: prefix }
+  return index.index === undefined
+    ? { beginsWith: `${prefix}${KEY_DELIMITER}` }
+    : pinCondition(schema, prefix)
 }
 
 /**
@@ -1275,7 +1913,7 @@ export const composeSortKeyPrefix = (
   for (const attr of index.sk.composite) {
     const value = record[attr]
     if (value === undefined || value === null) break
-    available.push(serializeSortKeyValue(value, casing))
+    available.push(keyValueText(schema, value, casing))
     names.push(attr)
   }
 
@@ -1305,7 +1943,7 @@ export const composeSortKeyPrefix = (
 // Event item SK format: `<currentSk>#e#<orderBy value's sort key text>`.
 // Casing is applied to both the `#e#` infix and the value for consistency with
 // the rest of the SK — matches how every other composite segment is cased —
-// and the value is escaped as every sort key composite is (`sortKeyText`).
+// and the value is escaped as every key composite is (`keyText`).
 // ---------------------------------------------------------------------------
 
 const EVENT_SK_INFIX = "e"
@@ -1315,13 +1953,39 @@ const EVENT_SK_INFIX = "e"
  *
  * Given `currentSk = "$app#v1#telemetry_1"` and `orderByValue = 42`, returns
  * `"$app#v1#telemetry_1#e#0000000000000042"` (with default lowercase casing).
+ * `orderByValue` is what {@link eventOrderByValue} picks for the schema's setting.
  */
-export const composeEventSk = (
-  currentSk: string,
-  orderByValue: unknown,
-  casing: DynamoSchema.Casing = "lowercase",
-): string =>
-  `${currentSk}#${applyCasing(EVENT_SK_INFIX, casing)}#${serializeSortKeyValue(orderByValue, casing)}`
+export const composeEventSk: {
+  (
+    schema: DynamoSchema.DynamoSchema,
+    currentSk: string,
+    orderByValue: unknown,
+    casing?: DynamoSchema.Casing,
+  ): string
+  /**
+   * @deprecated since 1.39.0: pass the schema first, so `escapeKeys` is followed. Without it, the
+   * value is escaped and `casing` defaults to `"lowercase"`, as in 1.37.0 and 1.38.0.
+   */
+  (currentSk: string, orderByValue: unknown, casing?: DynamoSchema.Casing): string
+} = (first: DynamoSchema.DynamoSchema | string, ...rest: ReadonlyArray<unknown>): string => {
+  if (typeof first === "string") {
+    const casing = (rest[1] ?? "lowercase") as DynamoSchema.Casing
+    return `${first}#${applyCasing(EVENT_SK_INFIX, casing)}#${escapeKeyText(serializeValue(rest[0]), casing)}`
+  }
+  const casing = (rest[2] ?? first.casing) as DynamoSchema.Casing
+  return `${rest[0] as string}#${applyCasing(EVENT_SK_INFIX, casing)}#${keyValueText(first, rest[1], casing)}`
+}
+
+/**
+ * The value of the `orderBy` attribute an event's sort key holds: its key form with numeric key
+ * text, its encoded value (a `NumberFromString` `"10"` as the string `10`) with `escapeKeys` off,
+ * as 1.36 composed it.
+ */
+export const eventOrderByValue = (
+  schema: DynamoSchema.DynamoSchema,
+  encoded: unknown,
+  keyForm: unknown,
+): unknown => (schema.escapeKeys === true || schema.numericKeyText === true ? keyForm : encoded)
 
 /**
  * Compose the prefix used to scope `.history()` queries to event items only.

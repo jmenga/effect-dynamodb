@@ -122,9 +122,6 @@ describe("cursor v2 (#171)", () => {
       { v: 2, f: "0a1b2c3d", s: "precise", t: { B: Cursor.toBase64(bytes) }, a: { B: "AAF/gP7/" } },
       { v: 2, f: "0a1b2c3d", s: "filter", t: { S: "t#" }, d: 1 },
       { v: 2, f: "0a1b2c3d", s: "key" },
-      // A key pass (#171): the 1.36 key's, then the current key's.
-      { v: 2, f: "0a1b2c3d", s: "key", p: 1, k: { pk: { S: "p" }, sk: { S: "s" } } },
-      { v: 2, f: "0a1b2c3d", s: "key", p: 0 },
       { v: 2, k: { pk: { S: "日本" } } },
     ]
     for (const envelope of envelopes) {
@@ -145,8 +142,9 @@ describe("cursor v2 (#171)", () => {
       { v: 2, x: 1 },
       { v: 2, t: { S: 1 } },
       { v: 2, k: {} },
-      { v: 2, s: "key", p: 2 },
-      { v: 2, s: "key", p: "1" },
+      // 1.37.0's cursor for a query that read two key texts: restart the listing.
+      { v: 2, s: "key", p: 0 },
+      { v: 2, f: "0a1b2c3d", s: "key", p: 1, k: { pk: { S: "p" }, sk: { S: "s" } } },
     ]) {
       expect(Cursor.decode(Cursor.encodeV2(malformed as any))).toBeUndefined()
     }

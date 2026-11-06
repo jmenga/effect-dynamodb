@@ -8,7 +8,7 @@
  * control characters sort below `#`: `new york#…` sorted before `new#…`, so
  * `lte: "new york"` left out `new` and `gt: "new"` left out `new york`; a
  * value holding `#` itself split into two segments. Sort key text is now
- * escaped (`KeyComposer.sortKeyText`), so key order is value order and every
+ * escaped (`KeyComposer.keyText`), so key order is value order and every
  * bound is one exact key condition. `.where()` and `.within()` (every plan)
  * must return exactly the rows whose cased value satisfies the bound.
  *
@@ -225,7 +225,7 @@ const definitionsOf = (entity: unknown) =>
   (entity as { readonly indexes: Record<string, KeyComposer.IndexDefinition> }).indexes
 
 const makePlaces = (casing: Casing) => {
-  const schema = DynamoSchema.make({ name: "places", version: 1, casing })
+  const schema = DynamoSchema.make({ name: "places", version: 1, casing, escapeKeys: true })
   const gsis = Object.fromEntries(
     Object.entries(indexes).map(([name, def], n) => [
       name,
@@ -261,7 +261,7 @@ const makePlaces = (casing: Casing) => {
 }
 
 const makeReadings = (casing: Casing) => {
-  const schema = DynamoSchema.make({ name: "places", version: 1, casing })
+  const schema = DynamoSchema.make({ name: "places", version: 1, casing, escapeKeys: true })
   const Readings = Entity.make({
     model: Reading,
     entityType: "Reading",
@@ -285,7 +285,7 @@ const makeReadings = (casing: Casing) => {
           ...reading,
           at,
           pk,
-          sk: KeyComposer.composeEventSk(sk, at, casing),
+          sk: KeyComposer.composeEventSk(schema, sk, at, casing),
           __edd_e__: "Reading",
         }),
       ),
@@ -603,8 +603,9 @@ describe("sort key bounds on values holding escaped characters (#171)", () => {
             })
           }
         }),
-      // Every shape, operator and plan per run: seconds per casing.
-      { timeout: 60_000, arbitrary: { runs: 150 } },
+      // Every shape, operator and plan per run: 15 seconds per casing here, and up to a minute on
+      // a CI runner, so the limit only has to catch a hang.
+      { timeout: 180_000, arbitrary: { runs: 150 } },
     )
   }
 
@@ -841,8 +842,9 @@ describe("composeRangeUnder sends 1.36's condition over the escaped key text", (
     },
     ({ a, b, plainA, plainB, n, m }) => {
       for (const casing of casings) {
+        const schema = DynamoSchema.make({ name: "app", version: 1, casing, escapeKeys: true })
         const escaped = (value: unknown) =>
-          `${DynamoSchema.applyCasing("city", casing)}_${KeyComposer.serializeSortKeyValue(value, casing)}`
+          `${DynamoSchema.applyCasing("city", casing)}_${KeyComposer.keyValueText(schema, value, casing)}`
         // 1.36's segment: the value as it was, cased.
         const unescaped = (value: unknown) =>
           `${DynamoSchema.applyCasing("city", casing)}_${DynamoSchema.applyCasing(KeyComposer.serializeValue(value), casing)}`
@@ -854,9 +856,13 @@ describe("composeRangeUnder sends 1.36's condition over the escaped key text", (
           for (const bound of conditions(x, y)) {
             for (const isLast of [false, true]) {
               for (const clamped of [false, true]) {
-                const composed = composeRangeUnder({ casing, isLast }, prefixText, "city", bound, {
-                  clampToPrefix: clamped,
-                })
+                const composed = composeRangeUnder(
+                  { schema, casing, isLast, secondary: false },
+                  prefixText,
+                  "city",
+                  bound,
+                  { clampToPrefix: clamped },
+                )
                 // 1.36 refused a strict `lt` on a clamped last composite
                 // (EDD-9046): BETWEEN's inclusive high end is now the greatest
                 // key text below the value. A number's `beginsWith` is `eq`.

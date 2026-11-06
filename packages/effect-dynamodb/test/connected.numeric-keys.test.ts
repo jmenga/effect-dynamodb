@@ -44,7 +44,7 @@ const describeConnected = dynamoAvailable ? describe : describe.skip
 // Model
 // ---------------------------------------------------------------------------
 
-const AppSchema = DynamoSchema.make({ name: "numeric-conn", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "numeric-conn", version: 1, escapeKeys: true })
 const tableName = `numeric-conn-${Date.now()}`
 
 class Reading extends Schema.Class<Reading>("Reading")({

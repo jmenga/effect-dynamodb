@@ -141,7 +141,6 @@ import type {
   IndexZOrderDimensions,
   IndexZOrderPrefix,
 } from "@effect-dynamodb/schema/internal/EntityTypes.js"
-import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as ZOrderCurve from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -220,22 +219,26 @@ import { mergeVectorIndexes, definition as tableDefinition, toVectorIndexSpec } 
  * code point representable in a 3-byte UTF-8 sequence, which sorts above every
  * character DynamoDB key composition emits for the following segment.
  */
-const SK_MAX_SENTINEL = "￿"
+const SK_MAX_SENTINEL = KeyComposer.SORT_KEY_MAX
 
 /**
  * A composite value's key text as key composition writes it: serialized,
- * cased and escaped (`KeyComposer.serializeSortKeyValue`), so it sorts as the
+ * cased and escaped (`KeyComposer.keyValueText`), so it sorts as the
  * cased value does.
  */
-const valueText = (casing: DynamoSchema.Casing, keyForm: unknown): string =>
-  KeyComposer.serializeSortKeyValue(keyForm, casing)
+const valueText = (
+  schema: DynamoSchema.DynamoSchema,
+  casing: DynamoSchema.Casing,
+  keyForm: unknown,
+): string => KeyComposer.keyValueText(schema, keyForm, casing)
 
 /** A sort key composite's segment as key composition writes it: `<name>_<value>`, cased. */
 export const compositeSegment = (
+  schema: DynamoSchema.DynamoSchema,
   casing: DynamoSchema.Casing,
   field: string,
   keyForm: unknown,
-): string => `${DynamoSchema.applyCasing(field, casing)}_${valueText(casing, keyForm)}`
+): string => `${DynamoSchema.applyCasing(field, casing)}_${valueText(schema, casing, keyForm)}`
 
 /** `bound` with each operand mapped — into its key form, say. */
 const mapBound = (
@@ -257,12 +260,13 @@ const mapBound = (
  * key condition reads in.
  */
 const boundHolds = (
+  schema: DynamoSchema.DynamoSchema,
   casing: DynamoSchema.Casing,
   bound: RawSortKeyCondition,
   keyForm: unknown,
 ): boolean => {
-  const text = valueText(casing, keyForm)
-  const against = (operand: unknown) => compareUtf8(text, valueText(casing, operand))
+  const text = valueText(schema, casing, keyForm)
+  const against = (operand: unknown) => compareUtf8(text, valueText(schema, casing, operand))
   if ("eq" in bound) return against(bound.eq) === 0
   if ("lt" in bound) return against(bound.lt) < 0
   if ("lte" in bound) return against(bound.lte) <= 0
@@ -273,7 +277,7 @@ const boundHolds = (
   const operand = bound.beginsWith
   return typeof operand === "number" || typeof operand === "bigint"
     ? against(operand) === 0
-    : text.startsWith(valueText(casing, operand))
+    : text.startsWith(valueText(schema, casing, operand))
 }
 
 /**
@@ -290,7 +294,7 @@ const boundHolds = (
  * the `<name>_` prefix, the casing and the escaping.
  *
  * The condition is exact: a composite's key text is escaped
- * (`KeyComposer.sortKeyText`), so it sorts as its value, and the delimiter
+ * (`KeyComposer.keyText`), so it sorts as its value, and the delimiter
  * that follows it sorts below every character it holds — a value's subtree
  * (`v#…`) sorts after `v` itself and before every greater value (`v%20x`,
  * `v0`), whatever characters the values hold (#171).
@@ -304,7 +308,13 @@ const boundHolds = (
  * Shared by `.where()` and `.within()` (#171), so the two can't drift.
  */
 export const composeRangeUnder = (
-  index: { readonly casing: DynamoSchema.Casing; readonly isLast: boolean },
+  index: {
+    readonly schema: DynamoSchema.DynamoSchema
+    readonly casing: DynamoSchema.Casing
+    readonly isLast: boolean
+    /** A secondary index: a row may be truncated at a value (`pinCondition`). */
+    readonly secondary: boolean
+  },
   prefixText: string,
   field: string,
   bound: RawSortKeyCondition,
@@ -315,7 +325,7 @@ export const composeRangeUnder = (
   const compose = (value: unknown): string =>
     value === undefined || value === null
       ? prefixText.slice(0, -1)
-      : `${prefixText}${compositeSegment(index.casing, field, value)}`
+      : `${prefixText}${compositeSegment(index.schema, index.casing, field, value)}`
 
   /**
    * `begins_with` operand matching exactly the keys whose composite equals
@@ -356,7 +366,10 @@ export const composeRangeUnder = (
     return { beginsWith: compose(operand) }
   }
   if ("eq" in bound) {
-    return index.isLast ? { eq: compose(bound.eq) } : { beginsWith: subtreeBeginsWith(bound.eq) }
+    if (index.isLast) return { eq: compose(bound.eq) }
+    return index.secondary
+      ? KeyComposer.pinCondition(index.schema, compose(bound.eq))
+      : { beginsWith: subtreeBeginsWith(bound.eq) }
   }
   if ("between" in bound) {
     return { between: [compose(bound.between[0]), upper(bound.between[1])] }
@@ -396,7 +409,12 @@ export const composeRangeUnder = (
  * ends could be reversed, which DynamoDB refuses.
  */
 export const composeIntervalUnder = (
-  index: { readonly casing: DynamoSchema.Casing; readonly isLast: boolean },
+  index: {
+    readonly schema: DynamoSchema.DynamoSchema
+    readonly casing: DynamoSchema.Casing
+    readonly isLast: boolean
+    readonly secondary: boolean
+  },
   prefixText: string,
   field: string,
   lower: RawSortKeyCondition | undefined,
@@ -411,7 +429,8 @@ export const composeIntervalUnder = (
     if (one === undefined) throw new Error("[internal] A .within() range bound has no end.")
     return under(one)
   }
-  const operand = (bound: RawSortKeyCondition) => valueText(index.casing, Object.values(bound)[0])
+  const operand = (bound: RawSortKeyCondition) =>
+    valueText(index.schema, index.casing, Object.values(bound)[0])
   const order = compareUtf8(operand(lower), operand(upper))
   if (order > 0 || (order === 0 && ("gt" in lower || "lt" in upper))) return undefined
   return { between: [under(lower).between[0], under(upper).between[1]] }
@@ -657,7 +676,8 @@ const planCompositeWithin = <A>(args: {
 
   // -- composition --
   const casing = KeyComposer.effectiveCasing(entityLike._schema, indexDef)
-  const segment = (i: number, keyForm: unknown) => compositeSegment(casing, sk[i]!, keyForm)
+  const segment = (i: number, keyForm: unknown) =>
+    compositeSegment(entityLike._schema, casing, sk[i]!, keyForm)
   const label = (i: number) => `${DynamoSchema.applyCasing(sk[i]!, casing)}_`
 
   /**
@@ -666,7 +686,12 @@ const planCompositeWithin = <A>(args: {
    */
   const composeBound = (prefixText: string, i: number): Query.SortKeyCondition | undefined => {
     const bound = bounds.get(i)!
-    const index = { casing, isLast: i === n - 1 }
+    const index = {
+      schema: entityLike._schema,
+      casing,
+      isLast: i === n - 1,
+      secondary: indexDef.index !== undefined,
+    }
     return bound._tag === "eq"
       ? composeRangeUnder(index, prefixText, sk[i]!, { eq: bound.value }, { clampToPrefix: true })
       : composeIntervalUnder(index, prefixText, sk[i]!, bound.lower, bound.upper)
@@ -675,10 +700,12 @@ const planCompositeWithin = <A>(args: {
   /** Does bound `i` hold for a composite value (key form), compared as key text? */
   const holds = (i: number, keyForm: unknown): boolean => {
     const bound = bounds.get(i)!
-    if (bound._tag === "eq") return boundHolds(casing, { eq: bound.value }, keyForm)
+    if (bound._tag === "eq") {
+      return boundHolds(entityLike._schema, casing, { eq: bound.value }, keyForm)
+    }
     return (
-      (bound.lower === undefined || boundHolds(casing, bound.lower, keyForm)) &&
-      (bound.upper === undefined || boundHolds(casing, bound.upper, keyForm))
+      (bound.lower === undefined || boundHolds(entityLike._schema, casing, bound.lower, keyForm)) &&
+      (bound.upper === undefined || boundHolds(entityLike._schema, casing, bound.upper, keyForm))
     )
   }
 
@@ -709,7 +736,15 @@ const planCompositeWithin = <A>(args: {
         checked: [...bounds.keys()].filter((j) => j > i),
       }
     }
-    return { condition: { beginsWith: q }, checked: [...bounds.keys()].filter((j) => j >= i) }
+    // The eq bounds end at a value with nothing after it bounded. On a secondary
+    // index a row truncated there belongs too (`pinCondition`).
+    return {
+      condition:
+        indexDef.index === undefined
+          ? { beginsWith: q }
+          : KeyComposer.pinCondition(entityLike._schema, q.slice(0, -1)),
+      checked: [...bounds.keys()].filter((j) => j >= i),
+    }
   }
 
   /**
@@ -1281,7 +1316,7 @@ const planZOrderWithin = <A>(args: {
 
   // -- the prefix (§4.3, §7.5) --
   const casing = KeyComposer.effectiveCasing(entityLike._schema, indexDef)
-  const textOf = (value: unknown) => valueText(casing, value)
+  const textOf = (value: unknown) => valueText(entityLike._schema, casing, value)
   const segmentOf = (part: KeyComposer.ZOrderPrefixSegment) =>
     ZOrderCurve.prefixSegment(textOf(prefixValues.get(part.field)), part.hash)
   /** A given prefix composite, checked on the cased value — never a hash, which can collide. */
@@ -1910,6 +1945,8 @@ export interface CollectionQuery<TResult> {
   readonly startFrom: (cursor: string) => CollectionQuery<TResult>
   /** Stop after `n` DynamoDB requests. */
   readonly maxPages: (n: number) => CollectionQuery<TResult>
+  /** Requests a sharded collection sends at once (#183); default one per partition. */
+  readonly concurrency: (n: number) => CollectionQuery<TResult>
   /**
    * Strongly consistent reads. A collection over a GSI — every auto-discovered
    * one — is refused with a `ValidationError` when it runs: DynamoDB reads a
@@ -2274,18 +2311,25 @@ export interface TableOperations {
     },
   ) => Effect.Effect<void, DynamoClientError>
 
-  // --- 1.36 keys (#171) ---
+  // --- Key text (#171, #183) ---
 
   /**
-   * Move every row 1.36 wrote whose key text changed to its current key:
+   * Move every row under key text the schema's `escapeKeys` setting doesn't compose
+   * (1.36's, that of 1.37.0 and 1.38.0, or the other setting's) to the text it does:
    * items with their unique sentinels, version snapshots, tombstones,
    * time-series events, aggregates, and the event streams passed in
    * `options.streams` (copied, flipped, then deleted, while writers append).
-   * Index keys and vector partitions still holding 1.36 text are rewritten in
-   * place. Scans the table (`segments` in parallel); a row is moved only when
-   * it is stored under the key 1.36 composed for its values, so a rerun moves
-   * nothing. Conflicts are reported, never overwritten. `dryRun` counts what
-   * would move. See DESIGN.md §7 "Rows written by 1.36" and the upgrade guide.
+   * A sharded index's partition key is rewritten in place when it differs from what
+   * the row's values compose. Any other index key or vector partition is rewritten
+   * only when it is exactly its values' text under another form: anything else is left,
+   * with no conflict, and a key the row doesn't have isn't written. Scans the table
+   * (`segments` in parallel); a row is moved only when it is stored under a key its
+   * values composed under another form, so a rerun moves nothing. Conflicts are reported,
+   * never overwritten. `dryRun` counts what would move, judging each row on its own: a
+   * row whose destination is held by a row that can't move may be predicted as moved.
+   * This is the only thing that moves a row between key texts: no read or write looks
+   * under any text but the one the setting composes. See DESIGN.md §7 "Rows under other
+   * key text" and the upgrade guide.
    *
    * Fails with `ValidationError` (`EDD-9098`) for a bad option or resume
    * token, and with the `DynamoClientError` of a request that failed — resume
@@ -2329,7 +2373,6 @@ interface EntityLike {
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
   /** Where a stored row's values key it in an index now (#171). */
-  readonly _indexRows136?: ((index: IndexDefinition) => Query.KeyPassRows) | undefined
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
   /** Packed attributes an expression may not look inside (EDD-9076, #147). */
@@ -2582,13 +2625,15 @@ const makeFromConfig = (config: {
         }
         validateQueryComposites(_indexName, accessorDef, rawComposites)
         const compositesKeyForm = toCompositeKeyRecord(compositeKeyForm, rawComposites)
-        const pkValue = KeyComposer.composePk(
+        // One partition, or a sharded index's several (#183).
+        const read = KeyComposer.composeReadPartitions(
           entityLike._schema,
           entityLike.entityType,
           indexDef,
           compositesKeyForm,
         )
-        const query = Query.make({
+        const pkValue = read.partitions[0]!
+        const unpartitioned = Query.make({
           tableName: "",
           indexName: indexDef.index,
           pkField: indexDef.pk.field,
@@ -2613,18 +2658,20 @@ const makeFromConfig = (config: {
             label: `${entityLike.entityType}.${_indexName}`,
           },
         })
+        const query = Query.fanOut(unpartitioned, read)
 
         // Apply the SK condition from the provided composites
-        // (`composeSortKeyCondition`): a partial prefix is a `begins_with`
-        // terminated on a segment boundary, or it matches sibling values that
-        // merely start with the supplied one (`status_done` also matching
-        // `status_done_archived`, issue #115); a complete key is an exact `=`,
-        // or `seq: 3` also matches 3.14 and `name: "a"` also matches "ab".
+        // (`composeSortKeyCondition`): a partial prefix stops on a segment
+        // boundary, or it matches sibling values that merely start with the
+        // supplied one (`status_done` also matching `status_done_archived`,
+        // issue #115), and on a secondary index takes the row truncated at it; a
+        // complete key is an exact `=`, or `seq: 3` also matches 3.14 and
+        // `name: "a"` also matches "ab".
         const hasSkComposites =
           !zorder &&
           indexDef.sk.composite.some((attr: string) => compositesKeyForm[attr] !== undefined)
         const pinnedQuery = hasSkComposites
-          ? Query.where(
+          ? Query.whereUnderPins(
               query,
               KeyComposer.composeSortKeyCondition(
                 entityLike._schema,
@@ -2635,36 +2682,6 @@ const makeFromConfig = (config: {
               ),
             )
           : query
-
-        // Rows 1.36 wrote whose key text changed sit under the key 1.36
-        // composed for these pins until they move (#171): the query reads it
-        // too — the partition key, and the pins' `eq` / `begins_with`. A
-        // Z-order index is new in 1.37, so it has no 1.36 rows.
-        const pk136 =
-          !zorder && KeyText136.enabled(entityLike._schema)
-            ? KeyText136.composePk(
-                entityLike._schema,
-                entityLike.entityType,
-                indexDef,
-                compositesKeyForm,
-              )
-            : undefined
-        const finalQuery =
-          pk136 === undefined
-            ? pinnedQuery
-            : Query.alsoRead136(pinnedQuery, {
-                pkValue: pk136,
-                rows: entityLike._indexRows136?.(indexDef),
-                condition: hasSkComposites
-                  ? KeyText136.composeSortKeyCondition(
-                      entityLike._schema,
-                      entityLike.entityType,
-                      1,
-                      indexDef,
-                      compositesKeyForm,
-                    )
-                  : undefined,
-              })
 
         const pathBuilder = createPathBuilder()
         const conditionOps = createConditionOps()
@@ -2789,8 +2806,10 @@ const makeFromConfig = (config: {
           // drifting apart a second time.
           return composeRangeUnder(
             {
+              schema: entityLike._schema,
               casing: KeyComposer.effectiveCasing(entityLike._schema, indexDef),
               isLast: targetIndex === skComposites.length - 1,
+              secondary: indexDef.index !== undefined,
             },
             prefixText,
             targetAttr,
@@ -2799,53 +2818,11 @@ const makeFromConfig = (config: {
           )
         }
 
-        /**
-         * The 1.36 key a `.where()` also reads (#171): an `eq` or
-         * `beginsWith` extends the pins, so the rows it selects under 1.36's
-         * key text are read too. A range bound reads only the current key.
-         */
-        const where136 = (
-          condition: RawSortKeyCondition,
-          field: string | undefined,
-        ): Query.KeyPass | undefined => {
-          if (pk136 === undefined || !("eq" in condition || "beginsWith" in condition)) {
-            return undefined
-          }
-          const pinnedCount = skComposites.findIndex(
-            (attr: string) => compositesKeyForm[attr] === undefined,
-          )
-          const targetAttr =
-            field !== undefined && skComposites.includes(field)
-              ? field
-              : skComposites[pinnedCount === -1 ? skComposites.length - 1 : pinnedCount]!
-          const pinned: Record<string, unknown> = {}
-          for (const attr of skComposites.slice(0, skComposites.indexOf(targetAttr))) {
-            pinned[attr] = compositesKeyForm[attr]
-          }
-          const operand = (value: unknown) => compositeKeyForm(targetAttr, value)
-          return {
-            pkValue: pk136,
-            rows: entityLike._indexRows136?.(indexDef),
-            condition: KeyText136.composeBoundCondition(
-              entityLike._schema,
-              entityLike.entityType,
-              1,
-              indexDef,
-              pinned,
-              targetAttr,
-              "eq" in condition
-                ? { eq: operand(condition.eq) }
-                : { beginsWith: operand(condition.beginsWith) },
-            ),
-          }
-        }
-
         const bqConfig: BoundQueryConfig<unknown> = {
           pathBuilder,
           conditionOps,
           provide,
           composeSkCondition,
-          where136,
           // A Z-order accessor bounds its dimensions and prefix composites
           // (#171), and takes `.zorder()`.
           ...(zorder
@@ -2884,7 +2861,7 @@ const makeFromConfig = (config: {
           ...entityNaming(entityLike._resolveDbName),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
-        return new BoundQueryImpl(finalQuery, bqConfig)
+        return new BoundQueryImpl(pinnedQuery, bqConfig)
       }
     }
 
@@ -3010,6 +2987,10 @@ const makeFromConfig = (config: {
         collName,
         members.map((m) => ({ key: m.entityKey, schema: m.entityLike._schema, index: m.indexDef })),
       )
+      KeyComposer.assertCollectionShardsAgreement(
+        collName,
+        members.map((m) => ({ key: m.entityKey, index: m.indexDef })),
+      )
 
       boundCollections[collName] = (composites: Record<string, unknown>) => {
         // Use the first member for PK composition — verified above to agree
@@ -3054,11 +3035,13 @@ const makeFromConfig = (config: {
         // path use — without it `db.collections.window({ takenAt })` composed a
         // different PK from `db.entities.Readings.byWindow({ takenAt })` and
         // returned nothing.
-        const pkValue = KeyComposer.composePk(
+        // Members share the partitions, whatever each hashes: never pruned (#183).
+        const read = KeyComposer.composeReadPartitions(
           firstMember.entityLike._schema,
           firstMember.entityLike.entityType,
           indexDef,
           entityKeyForm(firstMember.entityLike, composites),
+          { prune: false },
         )
 
         // Always isolated — begins_with on collection SK prefix
@@ -3066,7 +3049,7 @@ const makeFromConfig = (config: {
           tableName: "",
           indexName: indexDef.index,
           pkField: indexDef.pk.field,
-          pkValue,
+          pkValue: read.partitions[0]!,
           skField: indexDef.sk.field,
           entityTypes,
           decoder: collDecoder as any,
@@ -3082,6 +3065,7 @@ const makeFromConfig = (config: {
           liveRows: indexDef.index === undefined ? collectionLiveRows(members) : undefined,
           keyConditionDiagnosis: { operation: "query", label: `collection "${collName}"` },
         })
+        query = Query.fanOut(query, read)
 
         // Add begins_with on collection SK prefix for clustered collections.
         // For isolated collections (default), each entity has its own entity-type
@@ -3101,20 +3085,6 @@ const makeFromConfig = (config: {
           const skPrefix = `${pre}#${casedNames.join("#")}`
           query = Query.where(query, { beginsWith: skPrefix })
         }
-
-        // A collection's sort key prefix holds names only, so its 1.36 key
-        // differs in the partition key alone — a number composite (#171).
-        query = Query.alsoReadPartition136(
-          query,
-          KeyText136.enabled(firstMember.entityLike._schema)
-            ? KeyText136.composePk(
-                firstMember.entityLike._schema,
-                firstMember.entityLike.entityType,
-                indexDef,
-                entityKeyForm(firstMember.entityLike, composites),
-              )
-            : undefined,
-        )
 
         // Wrap in BoundQuery that groups results by entity key
         const pathBuilder = createPathBuilder()

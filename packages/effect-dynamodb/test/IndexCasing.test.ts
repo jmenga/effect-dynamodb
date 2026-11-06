@@ -15,7 +15,7 @@ import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
 
-const AppSchema = DynamoSchema.make({ name: "App", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "App", version: 1, escapeKeys: true })
 
 class Device extends Schema.Class<Device>("Device")({
   deviceId: Schema.String,
@@ -112,24 +112,22 @@ describe("index-level casing", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("query accessors compose the PK, begins_with and .where() operands with it", () =>
+  it.effect("query accessors compose the PK, the pin's bounds and .where() operands with it", () =>
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: { Devices }, tables: { AppTable } })
 
       yield* db.entities.Devices.byOwner({ ownerId: "Own-A", serial: "SN-9" }).collect()
       const partial = mockQuery.mock.calls[0]![0]
       expect(partial.ExpressionAttributeValues[":pk"].S).toBe("$app#v1#Device#ownerId_Own-A")
-      expect(Object.values(partial.ExpressionAttributeValues).map((v: any) => v.S)).toContain(
-        "$app#v1#Device#serial_SN-9#",
-      )
+      expect(partial.ExpressionAttributeValues[":sk1"].S).toBe("$app#v1#Device#serial_SN-9")
+      expect(partial.ExpressionAttributeValues[":sk2"].S).toBe("$app#v1#Device#serial_SN-9#\uFFFF")
 
       yield* db.entities.Devices.byOwner({ ownerId: "Own-A" })
         .where((t, { eq }) => eq(t.serial, "SN-9"))
         .collect()
       const where = mockQuery.mock.calls[1]![0]
-      expect(Object.values(where.ExpressionAttributeValues).map((v: any) => v.S)).toContain(
-        "$app#v1#Device#serial_SN-9#",
-      )
+      expect(where.ExpressionAttributeValues[":sk1"].S).toBe("$app#v1#Device#serial_SN-9")
+      expect(where.ExpressionAttributeValues[":sk2"].S).toBe("$app#v1#Device#serial_SN-9#\uFFFF")
     }).pipe(Effect.provide(TestLayer)),
   )
 

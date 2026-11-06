@@ -29,6 +29,18 @@ export interface ZOrderMarker {
 /** Mirrors `KeyComposer.isZOrderHalf`: is this half a Z-order (binary) sort key? */
 export const isZOrderHalf = (part: KeyPart): boolean => part.zorder !== undefined
 
+/**
+ * A sharded index's layout (#183), as far as a source literal shows it. A hover
+ * has no item to hash, so it shows the marker with a shard placeholder.
+ */
+export interface IndexShards {
+  /** `undefined` when the count isn't a literal. */
+  readonly count: number | undefined
+  /** The `by` attributes; empty for the default source. */
+  readonly by: ReadonlyArray<string>
+  readonly previous: number | undefined
+}
+
 export interface IndexDefinition {
   readonly index?: string | undefined
   readonly collection?: string | ReadonlyArray<string> | undefined
@@ -36,12 +48,14 @@ export interface IndexDefinition {
   readonly pk: KeyPart
   readonly sk: KeyPart
   readonly casing?: Casing | undefined
+  readonly shards?: IndexShards | undefined
 }
 
 export interface SchemaConfig {
   readonly name: string
   readonly version: number
   readonly casing: Casing
+  readonly escapeKeys?: true | undefined
 }
 
 export interface ResolvedEntity {
@@ -415,7 +429,7 @@ function resolveDynamoSchema(
   ts: typeof import("typescript"),
   expr: ts.Expression,
 ): SchemaConfig | undefined {
-  // Match: DynamoSchema.make({ name: "...", version: N, casing?: "..." })
+  // Match: DynamoSchema.make({ name: "...", version: N, casing?: "...", escapeKeys?: true })
   if (!ts.isCallExpression(expr)) return undefined
   const callee = expr.expression
   if (!ts.isPropertyAccessExpression(callee)) return undefined
@@ -429,6 +443,7 @@ function resolveDynamoSchema(
   let name: string | undefined
   let version: number | undefined
   let casing: Casing = "lowercase"
+  let escapeKeys: true | undefined
 
   for (const prop of configObj.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
@@ -442,11 +457,14 @@ function resolveDynamoSchema(
       case "casing":
         casing = (extractStringLiteral(ts, prop.initializer) as Casing) ?? "lowercase"
         break
+      case "escapeKeys":
+        if (prop.initializer.kind === ts.SyntaxKind.TrueKeyword) escapeKeys = true
+        break
     }
   }
 
   if (!name || version === undefined) return undefined
-  return { name, version, casing }
+  return { name, version, casing, ...(escapeKeys === true ? { escapeKeys } : {}) }
 }
 
 function resolveIndexes(
@@ -510,12 +528,16 @@ function resolveGsiConfig(
   let collection: string | ReadonlyArray<string> | undefined
   let type: "isolated" | "clustered" | undefined
   let casing: Casing | undefined
+  let shards: IndexShards | undefined
 
   for (const prop of expr.properties) {
     if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
     switch (prop.name.text) {
       case "name":
         gsiName = extractStringLiteral(ts, prop.initializer)
+        break
+      case "shards":
+        shards = resolveShards(ts, prop.initializer)
         break
       case "pk":
         pk = resolveKeyPart(ts, prop.initializer, lookup)
@@ -544,7 +566,35 @@ function resolveGsiConfig(
     pk,
     sk,
     casing,
+    ...(shards === undefined ? {} : { shards }),
   }
+}
+
+/** Parse `shards: 20` or `shards: { count: 20, by: [...], previous: 1 }`. */
+function resolveShards(ts: typeof import("typescript"), expr: ts.Expression): IndexShards {
+  if (!ts.isObjectLiteralExpression(expr)) {
+    return { count: extractNumberLiteral(ts, expr), by: [], previous: undefined }
+  }
+  let count: number | undefined
+  let by: ReadonlyArray<string> = []
+  let previous: number | undefined
+  for (const prop of expr.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue
+    switch (prop.name.text) {
+      case "count":
+        count = extractNumberLiteral(ts, prop.initializer)
+        break
+      case "by": {
+        const names = extractStringOrStringArray(ts, prop.initializer)
+        by = names === undefined ? [] : typeof names === "string" ? [names] : names
+        break
+      }
+      case "previous":
+        previous = extractNumberLiteral(ts, prop.initializer)
+        break
+    }
+  }
+  return { count, by, previous }
 }
 
 function resolveIndexDefinition(

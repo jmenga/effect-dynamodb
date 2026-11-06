@@ -267,8 +267,18 @@ export interface BoundQueryBase<
     observer: (event: Query.QueryRequestEvent) => Effect.Effect<void>,
   ) => BoundQuery<Model, SkRemaining, A, W>
 
-  /** Set the maximum number of DynamoDB pages to fetch. */
+  /**
+   * Set the maximum number of DynamoDB pages to fetch. On a sharded index, the
+   * maximum number of rounds: each reads at most one page per partition.
+   */
   readonly maxPages: (n: number) => BoundQuery<Model, SkRemaining, A, W>
+
+  /**
+   * How many requests a query of a sharded index sends at once (#183). The
+   * default is one per partition. Has no effect on an unsharded index. Anything
+   * but a positive integer throws `[EDD-9105]`.
+   */
+  readonly concurrency: (n: number) => BoundQuery<Model, SkRemaining, A, W>
 
   /** Reverse the sort order (ScanIndexForward = false). */
   readonly reverse: () => BoundQuery<Model, SkRemaining, A, W>
@@ -539,16 +549,6 @@ export interface BoundQueryConfig<Model> {
     field: string | undefined,
   ) => Query.SortKeyCondition | undefined
   /**
-   * Optional: the 1.36 key `.where()`'s condition also reads (#171) — for an
-   * `eq` / `beginsWith` that extends an accessor's pins, the key 1.36
-   * composed for them. Called after {@link composeSkCondition} accepted the
-   * condition; `undefined` reads only the current key.
-   */
-  readonly where136?: (
-    condition: RawSortKeyCondition,
-    field: string | undefined,
-  ) => Query.KeyPass | undefined
-  /**
    * Optional: plan `.within(bounds)` on the query (#171) — an accessor's own
    * composites and encoders turn the bounds into key ranges and row checks.
    * Throws `[EDD-9093]` / `[EDD-9050]` for bounds it can't use. Without it,
@@ -816,9 +816,8 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
         "where",
       )
     }
-    const key136 = this._config.where136?.(condition, targetField())
     return new BoundQueryImpl<Model, never, A>(
-      Query.alsoRead136(Query.where(this._query, finalCondition), key136),
+      Query.whereUnderPins(this._query, finalCondition),
       this._config,
       "where",
     )
@@ -829,6 +828,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     bounds: Record<string, unknown>,
     options?: WithinOptions,
   ): BoundQueryImpl<Model, never, A> {
+    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._applied !== undefined) {
       refuseWithin(this._applied === "where" ? "within() after .where()" : "a second .within()")
     }
@@ -850,6 +850,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   // --- zorder ---
   zorder(options: Query.ZOrderOptions): BoundQueryImpl<Model, SkRemaining, A> {
+    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._config.zorder !== true) {
       throw new Error(
         `[EDD-9095] .zorder() applies only to a Z-order index accessor: this query's index ` +
@@ -922,6 +923,10 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   maxPages(n: number): BoundQueryImpl<Model, SkRemaining, A> {
     return new BoundQueryImpl(Query.maxPages(this._query, n), this._config, this._applied)
+  }
+
+  concurrency(n: number): BoundQueryImpl<Model, SkRemaining, A> {
+    return new BoundQueryImpl(Query.concurrency(this._query, n), this._config, this._applied)
   }
 
   reverse(): BoundQueryImpl<Model, SkRemaining, A> {

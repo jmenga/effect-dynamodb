@@ -29,7 +29,7 @@ import * as Table from "../src/Table.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 import { makePartition, type Row } from "./helpers/PartitionMock.js"
 
-const AppSchema = DynamoSchema.make({ name: "pinned", version: 1 })
+const AppSchema = DynamoSchema.make({ name: "pinned", version: 1, escapeKeys: true })
 
 // ---------------------------------------------------------------------------
 // Accessors given every sort key composite
@@ -215,12 +215,12 @@ describe("an accessor given every sort key composite matches the key exactly (#1
     }),
   )
 
-  it.effect("a partial pin is a terminated begins_with: tag t, every seq in order", () =>
+  it.effect("a partial pin selects the prefix and below: tag t, every seq in order", () =>
     Effect.gen(function* () {
       requests.length = 0
       const got = yield* collect("byTag", { sensorId: "s-1", tag: "t" }, false)
       expect(got.map((r) => r.seq)).toEqual([...SEQS].sort((a, b) => a - b))
-      expect(requests.at(-1)?.keyCondition).toBe("#pk = :pk AND begins_with(#sk, :sk)")
+      expect(requests.at(-1)?.keyCondition).toBe("#pk = :pk AND #sk BETWEEN :sk1 AND :sk2")
     }),
   )
 
@@ -231,11 +231,11 @@ describe("an accessor given every sort key composite matches the key exactly (#1
       eq: KeyComposer.composeSk(AppSchema, "Reading", 1, index, { tag: "t", seq: 3 }),
     })
     const partial = Readings.query.byTag({ sensorId: "s-1", tag: "t" } as never)
-    expect(partial._state.skConditions[0]!.condition).toEqual({
-      beginsWith: KeyComposer.composeSortKeyBeginsWith(AppSchema, "Reading", 1, index, {
-        tag: "t",
-      }),
-    })
+    expect(partial._state.skConditions[0]!.condition).toEqual(
+      KeyComposer.subtreeCondition(
+        KeyComposer.composeSortKeyPrefix(AppSchema, "Reading", 1, index, { tag: "t" }),
+      ),
+    )
   })
 
   // A number has no text prefix: `.where(beginsWith)` on a numeric composite
@@ -361,7 +361,7 @@ const tickRows = (): ReadonlyArray<Row> => {
       toAttributeMap({
         ...tick(at),
         pk,
-        sk: KeyComposer.composeEventSk(currentSk, at, AppSchema.casing),
+        sk: KeyComposer.composeEventSk(AppSchema, currentSk, at),
         __edd_e__: "Tick",
       }),
     )
@@ -768,7 +768,7 @@ describe(".history().where() on a string orderBy (#171 sort key escaping)", () =
           channel,
           stamp,
           pk,
-          sk: KeyComposer.composeEventSk(currentSk, stamp, AppSchema.casing),
+          sk: KeyComposer.composeEventSk(AppSchema, currentSk, stamp),
           __edd_e__: "Note",
         }),
       ),

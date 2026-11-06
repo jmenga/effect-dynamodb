@@ -4448,7 +4448,7 @@ describe("EventStore stream casing", () => {
   }
 
   // The layout streams were written with before `casing` existed.
-  const legacyKeys = {
+  const keysOfCasing = {
     lowercase: {
       pk: "$app#v1#orderbook#ord-1",
       eventSk: "$app#v1#orderbook.event_1#0000000001",
@@ -4475,7 +4475,7 @@ describe("EventStore stream casing", () => {
   for (const schemaCasing of ["lowercase", "uppercase", "preserve"] as const) {
     it.effect(`omitted keeps the existing layout (schema casing: "${schemaCasing}")`, () =>
       Effect.gen(function* () {
-        expect(yield* captureKeys(schemaCasing, undefined)).toEqual(legacyKeys[schemaCasing])
+        expect(yield* captureKeys(schemaCasing, undefined)).toEqual(keysOfCasing[schemaCasing])
       }),
     )
   }
@@ -4483,7 +4483,7 @@ describe("EventStore stream casing", () => {
   for (const schemaCasing of ["lowercase", "uppercase"] as const) {
     it.effect(`set to the schema's casing matches the existing layout ("${schemaCasing}")`, () =>
       Effect.gen(function* () {
-        expect(yield* captureKeys(schemaCasing, schemaCasing)).toEqual(legacyKeys[schemaCasing])
+        expect(yield* captureKeys(schemaCasing, schemaCasing)).toEqual(keysOfCasing[schemaCasing])
       }),
     )
   }

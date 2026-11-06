@@ -10,6 +10,7 @@
 
 import type { DescribeTableCommandOutput } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { refuseSharedKeyAttribute } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { type IndexDefinition, isZOrderHalf } from "@effect-dynamodb/schema/KeyComposer.js"
 import type { VectorIndexDefinition } from "@effect-dynamodb/schema/VectorIndex.js"
 import { toWireDistanceFunction } from "@effect-dynamodb/schema/VectorIndex.js"
@@ -176,6 +177,12 @@ export const make = <
   // can't share its attribute with a string key half or a vector filter
   // attribute of another type (EDD-9091).
   resolveKeyAttributeTypes(entities, aggregates, primary)
+  // Two of an entity's key halves in one attribute must have the same fields, order and
+  // casing (EDD-9106). `Entity.make` refused what no schema can reconcile; a casing an index
+  // leaves to the schema resolves only here.
+  for (const entity of Object.values(entities)) {
+    refuseSharedKeyAttribute(config.schema, entity.entityType ?? "(unnamed)", entity.indexes)
+  }
 
   // Configure all entities with this table's schema and tag — only once the
   // table is valid, so a rejected `Table.make` leaves its members bound to
@@ -873,7 +880,7 @@ export interface CreateTableOptions {
 }
 
 // ---------------------------------------------------------------------------
-// rekey — move rows still under their 1.36 keys (#171)
+// rekey — move rows under other key text to what the setting composes (#171, #183)
 // ---------------------------------------------------------------------------
 
 /**
@@ -930,12 +937,14 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
  * - `failed` — it could not be moved as stored (its values no longer decode,
  *   a stream id reads as more than one id, or a write was refused);
  *   `message` says why
+ * - `uncomposable` — its key on a sharded index is from another layout, and its
+ *   values can't compose a current one (a `by` attribute was cleared) (#183)
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */
   readonly member: string
   readonly kind: RekeyRowKind
-  readonly reason: "bothKeys" | "taken" | "contended" | "failed"
+  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable"
   /** The row's primary key, as stored. */
   readonly key: Readonly<Record<string, unknown>>
   /** Its current key: where it would move. */
@@ -992,7 +1001,11 @@ export interface RekeyReport {
 
 /** Options for `db.tables.<Table>.rekey()`. */
 export interface RekeyOptions {
-  /** Count what would move, reading but writing nothing. Default `false`. */
+  /**
+   * Count what would move, reading but writing nothing. Default `false`. Each row is
+   * judged on its own, so a row whose destination is held by a row that can't move
+   * may be predicted as moved.
+   */
   readonly dryRun?: boolean | undefined
   /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */
   readonly segments?: number | undefined

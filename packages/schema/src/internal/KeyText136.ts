@@ -1,400 +1,139 @@
 /**
- * KeyText136 — the key text effect-dynamodb 1.36 composed (#171).
+ * KeyText136 — the key texts rows can be stored under, for `rekey` (#171, #183).
  *
- * 1.37 composes some key text differently, so a row 1.36 wrote with such a
- * value sits under a key 1.37 does not compose:
+ * Every operation composes one key text, the one the schema's `escapeKeys` setting chooses, and
+ * reads and writes nothing else. A row stored under another text isn't found by any read until
+ * `db.tables.<Table>.rekey()` moves it. This module is what `rekey` recognises such a row by. The
+ * key texts differ in:
  *
- * - **Numbers** (`serializeValue`): 1.36 zero-padded `String(n)` to 16
- *   characters (a bigint to 38), which kept non-negative integers below 1e16
- *   in order and nothing else; 1.37 encodes every number in numeric order
- *   (`NumericKey.ts`). The text of a non-negative integer below 1e16 (1e38 for
- *   a bigint) is unchanged.
- * - **Sort key values** holding a code point U+0000–U+0025 — a control
- *   character, space, `!`, `"`, `#`, `$` or `%` — are escaped in 1.37
- *   (`KeyComposer.sortKeyText`) and were not in 1.36. Partition keys, unique
- *   sentinels and the structural parts of a key are not escaped.
- * - **Time-series event keys** carried the orderBy attribute's ENCODED value
- *   (a `NumberFromString` `"10"` as the string `10`); 1.37 composes its key
- *   form (`0000000000000010`).
+ * - **Numbers.** Up to 1.36, and with `escapeKeys` off, `String(n)` zero-padded to 16 characters
+ *   (a bigint to 38), which keeps non-negative integers below 1e16 in order and nothing else.
+ *   1.37.0, 1.38.0 and `escapeKeys: true` encode every number in numeric order (`NumericKey.ts`). The
+ *   text of a non-negative integer below 1e16 (1e38 for a bigint) is the same.
+ * - **Strings.** With `escapeKeys: true` a key value holding a code point U+0000–U+0025 is escaped
+ *   (`KeyComposer.escapeKeyText`) in every key. 1.37.0 and 1.38.0 escaped sort keys only. Off, and up to 1.36,
+ *   none. The structural parts of a key are never escaped.
+ * - **Time-series event keys.** Up to 1.36, and off, they hold the orderBy attribute's ENCODED
+ *   value (a `NumberFromString` `"10"` as the string `10`), and with numeric text its key form
+ *   (`0000000000000010`): `KeyComposer.eventOrderByValue`.
  *
- * Everything else — the key layout, casing, the history, sentinel, aggregate
- * and EventStore key shapes — is unchanged, so these functions compose 1.36's
- * bytes through the same `DynamoSchema` composers, fed 1.36's serialization.
- * Z-order sort keys are new in 1.37 and have no 1.36 form: `composeAllKeys`
- * leaves a Z-order index out.
+ * So there are four places a row can be, {@link forms}: each a pair of schemas whose composers give
+ * its partition and sort key text. `test/KeyText136.test.ts` checks the composers against golden
+ * vectors the published 1.36.0 packages composed.
  *
- * Every function takes the same key-form record its `KeyComposer` counterpart
- * does. `test/KeyText136.test.ts` checks them against golden vectors the
- * published 1.36.0 packages composed.
- *
- * The 1.37.x operations read and move rows still under their 1.36 keys while
- * the fallback is {@link enabled}; the fallback and this module go in the next
- * major release. Not part of the public API.
+ * Not part of the public API.
  */
 
-import { DateTime } from "effect"
 import * as DynamoSchema from "../DynamoSchema.js"
-import {
-  applyCasing,
-  composeClusteredSortKey,
-  composeCollectionKey,
-  composeIsolatedSortKey,
-  composeKey,
-  KEY_DELIMITER,
-} from "../DynamoSchema.js"
-import { effectiveCasing, type IndexDefinition, isZOrderHalf } from "../KeyComposer.js"
+import { composePk, composeSk, type IndexDefinition, unescapeKeyText } from "../KeyComposer.js"
+import { decodeBigInt, decodeNumber } from "./NumericKey.js"
 
-/** Whether operations read and move rows under their 1.36 keys (`DynamoSchema.make`'s `legacyKeys`). */
-export const enabled = (schema: DynamoSchema.DynamoSchema): boolean => schema.legacyKeys !== false
-
-/** `%`: the highest code point 1.37 escapes in sort key text, and the first of every escape. */
-const ESCAPE = 0x25
-
-/**
- * Does sort key value text `text` hold a code point 1.37 escapes (U+0000–
- * U+0025)? Then its key text differs from 1.36's — and holds an escape, which
- * 1.36's text of another value can spell: `foo%20bar` is `foo bar`'s key now.
- */
-export const holdsEscaped = (text: string): boolean => {
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) <= ESCAPE) return true
-  }
-  return false
-}
-
-/**
- * The first character of `text` below `%` (U+0000–U+0024), if any. Escaped
- * text never holds one, nor does any text whose casing is escaped text, so a
- * stored value holding it is not the 1.36 spelling of an escape.
- */
-export const firstBelowEscape = (text: string): string | undefined => {
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) < ESCAPE) return text[i]
-  }
-  return undefined
-}
-
-/**
- * 1.36's composite value text: a number zero-padded to 16 characters, a bigint
- * to 38 — `String(n)` padded, so `-3` is `00000000000000-3` and `2.5` is
- * `00000000000002.5` — a boolean as `true` / `false`, a date as its ISO
- * string. Never throws: 1.36 composed `NaN` as `0000000000000NaN`.
- */
-export const serializeValue = (value: unknown): string => {
-  if (typeof value === "string") return value
-  if (typeof value === "number") return String(value).padStart(16, "0")
-  if (typeof value === "bigint") return String(value).padStart(38, "0")
-  if (typeof value === "boolean") return value ? "true" : "false"
-  if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
-    return DateTime.formatIso(value)
-  }
-  if (value instanceof Date) return value.toISOString()
-  return String(value)
-}
-
-/** `KeyComposer.extractComposites` with 1.36's {@link serializeValue}. */
-export const extractComposites = (
-  composite: ReadonlyArray<string>,
-  record: Record<string, unknown>,
-): ReadonlyArray<string> =>
-  composite.map((attr) => {
-    const value = record[attr]
-    if (value === undefined || value === null) {
-      throw new Error(`Missing composite attribute "${attr}" in record`)
-    }
-    return serializeValue(value)
+/** The schema composing the key text 1.36 composed: what `escapeKeys` off composes. */
+export const schema136 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema =>
+  DynamoSchema.make({
+    name: schema.name,
+    version: schema.version,
+    casing: schema.casing,
+    escapeKeys: false,
   })
 
-/** {@link extractComposites}, or `undefined` when a composite is missing. */
-export const tryExtractComposites = (
-  composite: ReadonlyArray<string>,
-  record: Record<string, unknown>,
-): ReadonlyArray<string> | undefined =>
-  composite.every((attr) => record[attr] !== undefined && record[attr] !== null)
-    ? extractComposites(composite, record)
-    : undefined
-
-/** 1.36's partition key of `index` (`KeyComposer.composePk`). */
-export const composePk = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  index: IndexDefinition,
-  record: Record<string, unknown>,
-): string => {
-  const composites = extractComposites(index.pk.composite, record)
-  const names = [...index.pk.composite]
-  const collection = index.collection
-  if (collection !== undefined) {
-    const collectionName = Array.isArray(collection) ? collection[0]! : collection
-    return composeCollectionKey(schema, collectionName, composites, { casing: index.casing, names })
-  }
-  return composeKey(schema, entityType, composites, { casing: index.casing, names })
-}
-
-/** The sort key text 1.36 composed from `composites` (unescaped values). */
-const sortKeyOf = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  composites: ReadonlyArray<string>,
-  names: ReadonlyArray<string>,
-): string => {
-  const collection = index.collection
-  if (collection !== undefined) {
-    if ((index.type ?? "isolated") === "clustered") {
-      return composeClusteredSortKey(schema, collection, entityType, entityVersion, composites, {
-        casing: index.casing,
-        names,
-      })
-    }
-    return composeIsolatedSortKey(schema, entityType, entityVersion, composites, {
-      casing: index.casing,
-      names,
-    })
-  }
-  return composeKey(schema, entityType, composites, { casing: index.casing, names })
-}
-
-/** 1.36's sort key of a string-keyed `index` (`KeyComposer.composeSk`), values unescaped. */
-export const composeSk = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  record: Record<string, unknown>,
-): string =>
-  sortKeyOf(
-    schema,
-    entityType,
-    entityVersion,
-    index,
-    extractComposites(index.sk.composite, record),
-    index.sk.composite,
-  )
-
-/** Both 1.36 keys of a string-keyed `index`. */
-export const composeIndexKeys = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  record: Record<string, unknown>,
-): Record<string, string> => ({
-  [index.pk.field]: composePk(schema, entityType, index, record),
-  [index.sk.field]: composeSk(schema, entityType, entityVersion, index, record),
+/**
+ * The schema whose partition key text is what 1.37.0 and 1.38.0 stored: its numbers in numeric order, its
+ * strings unescaped.
+ */
+export const schema137 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema => ({
+  ...schema136(schema),
+  numericKeyText: true,
 })
 
-/** {@link composeIndexKeys}, or `undefined` when a composite is missing (a sparse index). */
-export const tryComposeIndexKeys = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  record: Record<string, unknown>,
-): Record<string, string> | undefined => {
-  const present = (composite: ReadonlyArray<string>) =>
-    composite.every((attr) => record[attr] !== undefined && record[attr] !== null)
-  if (!present(index.pk.composite) || !present(index.sk.composite)) return undefined
-  return composeIndexKeys(schema, entityType, entityVersion, index, record)
-}
-
-/**
- * Every index's 1.36 keys (`KeyComposer.composeAllKeys`): the primary index's
- * always, a GSI's when all its composites are present. A Z-order index is new
- * in 1.37, so it has none.
- */
-export const composeAllKeys = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  indexes: Record<string, IndexDefinition>,
-  record: Record<string, unknown>,
-): Record<string, string> => {
-  const result: Record<string, string> = {}
-  for (const [indexName, index] of Object.entries(indexes)) {
-    if (isZOrderHalf(index.sk)) continue
-    if (indexName === "primary") {
-      Object.assign(result, composeIndexKeys(schema, entityType, entityVersion, index, record))
-    } else {
-      const keys = tryComposeIndexKeys(schema, entityType, entityVersion, index, record)
-      if (keys !== undefined) Object.assign(result, keys)
-    }
-  }
-  return result
-}
-
-/**
- * 1.36's sort key prefix from the leading sort key composites present in
- * `record` (`KeyComposer.composeSortKeyPrefix`).
- */
-export const composeSortKeyPrefix = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  record: Record<string, unknown>,
-): string => {
-  const names: Array<string> = []
-  for (const attr of index.sk.composite) {
-    if (record[attr] === undefined || record[attr] === null) break
-    names.push(attr)
-  }
-  return sortKeyOf(
-    schema,
-    entityType,
-    entityVersion,
-    index,
-    extractComposites(names, record),
-    names,
-  )
-}
-
-/**
- * 1.36's `begins_with` operand: {@link composeSortKeyPrefix}, with the key
- * delimiter appended while composites remain unsupplied.
- */
-export const composeSortKeyBeginsWith = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  record: Record<string, unknown>,
-): string => {
-  const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
-  const supplied = index.sk.composite.findIndex(
-    (attr) => record[attr] === undefined || record[attr] === null,
-  )
-  return supplied === -1 ? prefix : `${prefix}${KEY_DELIMITER}`
-}
-
-/** How many leading sort key composites `record` holds. */
-const leadingSupplied = (index: IndexDefinition, record: Record<string, unknown>): number => {
-  const i = index.sk.composite.findIndex(
-    (attr) => record[attr] === undefined || record[attr] === null,
-  )
-  return i === -1 ? index.sk.composite.length : i
-}
-
-/**
- * The condition that selects, under 1.36's key text, the rows a query
- * accessor's pins select (`KeyComposer.composeSortKeyCondition`): `eq` on the
- * complete key, else `beginsWith` on the prefix and the delimiter.
- */
-export const composeSortKeyCondition = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  record: Record<string, unknown>,
-): { readonly eq: string } | { readonly beginsWith: string } => {
-  const prefix = composeSortKeyPrefix(schema, entityType, entityVersion, index, record)
-  return leadingSupplied(index, record) === index.sk.composite.length
-    ? { eq: prefix }
-    : { beginsWith: `${prefix}${KEY_DELIMITER}` }
-}
-
-/**
- * The condition that selects, under 1.36's key text, the rows an `eq` or
- * `beginsWith` bound on sort key composite `field` selects, every composite
- * before it pinned in `pinned` (`composeRangeUnder` in `DynamoClient.ts`):
- * `eq` on the last composite is its key, on any other the value's subtree (the
- * delimiter appended); a `beginsWith` is a prefix of the value's text, or `eq`
- * for a number, which has no text prefix.
- */
-export const composeBoundCondition = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  entityVersion: number,
-  index: IndexDefinition,
-  pinned: Record<string, unknown>,
-  field: string,
-  bound: { readonly eq: unknown } | { readonly beginsWith: unknown },
-): { readonly eq: string } | { readonly beginsWith: string } => {
-  const casing = effectiveCasing(schema, index)
-  const prefix = composeSortKeyBeginsWith(schema, entityType, entityVersion, index, pinned)
-  const segment = (value: unknown) =>
-    `${prefix}${applyCasing(field, casing)}_${applyCasing(serializeValue(value), casing)}`
-  if ("beginsWith" in bound) {
-    const operand = bound.beginsWith
-    if (typeof operand !== "number" && typeof operand !== "bigint") {
-      return { beginsWith: segment(operand) }
-    }
-  }
-  const value = "eq" in bound ? bound.eq : bound.beginsWith
-  const last = index.sk.composite.indexOf(field) === index.sk.composite.length - 1
-  return last ? { eq: segment(value) } : { beginsWith: `${segment(value)}${KEY_DELIMITER}` }
-}
-
-/**
- * 1.36's time-series event sort key: `currentSk` (the current item's 1.36 sort
- * key), the cased `e` infix and the orderBy attribute's ENCODED value — not
- * its key form — through 1.36's {@link serializeValue}, cased.
- */
-export const composeEventSk = (
-  currentSk: string,
-  encodedOrderBy: unknown,
-  casing: DynamoSchema.Casing = "lowercase",
-): string =>
-  `${currentSk}#${applyCasing("e", casing)}#${applyCasing(serializeValue(encodedOrderBy), casing)}`
-
-/** 1.36's unique-constraint sentinel key over the constraint's field values, in order. */
-export const composeUniqueKey = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  constraintName: string,
-  values: ReadonlyArray<unknown>,
-): { readonly pk: string; readonly sk: string } =>
-  DynamoSchema.composeUniqueKey(schema, entityType, constraintName, values.map(serializeValue))
-
-/** 1.36's vector index partition value, or `undefined` when a composite is missing. */
-export const tryComposeVectorPartition = (
-  schema: DynamoSchema.DynamoSchema,
-  entityType: string,
-  index: { readonly partition: ReadonlyArray<string>; readonly casing?: DynamoSchema.Casing },
-  record: Record<string, unknown>,
-): string | undefined => {
-  const composites = tryExtractComposites(index.partition, record)
-  if (composites === undefined) return undefined
-  return composeKey(schema, entityType, composites, {
-    casing: index.casing,
-    names: [...index.partition],
+/** The schema composing the key text of `escapeKeys: true`. */
+export const schemaEscaped = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema =>
+  DynamoSchema.make({
+    name: schema.name,
+    version: schema.version,
+    casing: schema.casing,
+    escapeKeys: true,
   })
+
+/** One place a row can be stored: the schemas that compose its partition and sort key text. */
+export interface KeyForm {
+  readonly pk: DynamoSchema.DynamoSchema
+  readonly sk: DynamoSchema.DynamoSchema
 }
 
 /**
- * The 1.36 primary key of the item at `record` when the fallback is
- * {@link enabled} and its text differs from `current` — the key 1.37
- * composes — else `undefined`: the item can only be at `current`.
+ * Every place a row can be stored, whatever the setting is now, the current one among them:
+ * up to 1.36 and off; 1.37.0 and 1.38.0; on.
  */
-export const changedPrimaryKey = (
+export const forms = (schema: DynamoSchema.DynamoSchema): ReadonlyArray<KeyForm> => {
+  const off = schema136(schema)
+  const on = schemaEscaped(schema)
+  return [
+    { pk: off, sk: off },
+    { pk: schema137(schema), sk: on },
+    { pk: on, sk: on },
+  ]
+}
+
+/**
+ * The row 1.37.0 and 1.38.0 stored on an entity with an index half in a table key attribute (inverted): each half
+ * was overwritten with the index's, so its partition key attribute holds the sort half's text
+ * (escaped), and its sort key attribute the partition half's (not).
+ */
+export const invertedForm137 = (schema: DynamoSchema.DynamoSchema): KeyForm => ({
+  pk: schemaEscaped(schema),
+  sk: schema137(schema),
+})
+
+/**
+ * A row holding no values (a projection's row tombstone or outbox item) says which text its key is
+ * by its `__edd_kt__` attribute: none, off's (1.36's), whose text every setting reads the same when
+ * nothing in it changes; 1, that of 1.37.0 and 1.38.0; 2, the text of `escapeKeys: true`.
+ */
+export const formOfMark = (
+  schema: DynamoSchema.DynamoSchema,
+  mark: string | undefined,
+): KeyForm => {
+  const off = schema136(schema)
+  const on = schemaEscaped(schema)
+  if (mark === "1") return { pk: schema137(schema), sk: on }
+  if (mark === "2") return { pk: on, sk: on }
+  return { pk: off, sk: off }
+}
+
+/** The `__edd_kt__` of a row holding no values, keyed for `record` under `schema` ({@link formOfMark}). */
+export const markOf = (
   schema: DynamoSchema.DynamoSchema,
   entityType: string,
   entityVersion: number,
-  primary: IndexDefinition,
+  index: IndexDefinition,
   record: Record<string, unknown>,
-  current: Readonly<Record<string, unknown>>,
-): Record<string, string> | undefined => {
-  if (!enabled(schema)) return undefined
-  const keys = composeIndexKeys(schema, entityType, entityVersion, primary, record)
-  return keys[primary.pk.field] === current[primary.pk.field] &&
-    keys[primary.sk.field] === current[primary.sk.field]
+): 2 | undefined => {
+  if (schema.escapeKeys !== true) return undefined
+  const off = schema136(schema)
+  const now = composeAt({ pk: schema, sk: schema }, entityType, entityVersion, index, record)
+  const then = composeAt({ pk: off, sk: off }, entityType, entityVersion, index, record)
+  return now[index.pk.field] === then[index.pk.field] &&
+    now[index.sk.field] === then[index.sk.field]
     ? undefined
-    : keys
+    : 2
 }
 
 /** The JavaScript type a composite's key form takes (`CompositeCodec.keyFormValueKind`). */
 export type ValueKind = "string" | "number" | "bigint" | "boolean" | undefined
 
 /**
- * A composite's 1.36 text back as the key-form value it was composed from:
- * a number or bigint without the zeros {@link serializeValue} padded it with,
- * a boolean from `true` / `false` in any casing, anything else as the (cased)
- * text. `undefined` when the text is no bigint or boolean; text that is no
- * number reads as `NaN`, which composes only `NaN`'s text.
+ * A composite's text under `under` back as the key-form value it was composed from: a number or
+ * bigint from its padded or numeric key text, a boolean from `true` / `false` in any casing,
+ * anything else as the (cased) text, unescaped where `under` escapes. `undefined` when the text is
+ * no bigint or boolean; text that is no number reads as `NaN`, which composes only `NaN`'s text.
  */
-const valueOf136 = (text: string, kind: ValueKind): unknown => {
+const valueOf = (under: DynamoSchema.DynamoSchema, rawText: string, kind: ValueKind): unknown => {
+  const text = under.escapeKeys === true ? unescapeKeyText(rawText) : rawText
   if (kind === "number" || kind === "bigint") {
+    if (under.escapeKeys === true || under.numericKeyText === true) {
+      return kind === "number" ? decodeNumber(text) : decodeBigInt(text)
+    }
     const digits = text.replace(/^0+/, "")
     const unpadded = digits === "" ? "0" : digits.startsWith(".") ? `0${digits}` : digits
     // Casing may have changed `Infinity`'s letters, which `Number` reads in one spelling.
@@ -418,24 +157,32 @@ const MAX_READINGS = 8
 /** Placeholder `i` in a key template: no casing changes it, and no prefix or label holds it. */
 const placeholder = (i: number): string => `\u0000${i}\u0000`
 
+/** The partition and sort key of `index` under `form`. Throws when a composite is missing. */
+export const composeAt = (
+  form: KeyForm,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): Record<string, string> => ({
+  [index.pk.field]: composePk(form.pk, entityType, index, record),
+  [index.sk.field]: composeSk(form.sk, entityType, entityVersion, index, record),
+})
+
 /**
- * The key-form values 1.36 composed `stored` — a primary key `index` stores
- * rows under — from, read back from its text, for a row that holds no values
- * of its own (a projection's row tombstone or outbox item, which carry only
- * the key they were written for). Each composite's text is what lies between
- * the key's fixed parts (the prefix, labels and delimiters {@link
- * composeIndexKeys} writes around it), turned back into a value by `kindOf`
- * ({@link valueOf136}); a reading counts only when {@link composeIndexKeys}
- * composes exactly `stored` from it. `undefined` unless exactly one reading
- * does: none, when `stored` is not 1.36 text of any values (1.37 text of a
- * changed number, say), and more than one when a string value holds the
- * delimiter and the next composite's label.
+ * The key-form values `form` composed `stored` — a primary key `index` stores rows under — from,
+ * read back from its text, for a row that holds no values of its own (a projection's row
+ * tombstone or outbox item, which carry only the key they were written for). Each composite's
+ * text is what lies between the key's fixed parts (the prefix, labels and delimiters {@link
+ * composeAt} writes around it), turned back into a value by `kindOf` ({@link valueOf}); a reading
+ * counts only when {@link composeAt} composes exactly `stored` from it. `undefined` unless exactly
+ * one reading does: none, when `stored` is not `form`'s text of any values, and more than one when
+ * a string value holds the delimiter and the next composite's label.
  *
- * A string comes back cased, which composes the same key text, in 1.36 and
- * 1.37 alike, as the value it was cased from.
+ * A string comes back cased, which composes the same key text as the value it was cased from.
  */
 export const readIndexKeys = (
-  schema: DynamoSchema.DynamoSchema,
+  form: KeyForm,
   entityType: string,
   entityVersion: number,
   index: IndexDefinition,
@@ -443,8 +190,10 @@ export const readIndexKeys = (
   kindOf: (attr: string) => ValueKind,
 ): Record<string, unknown> | undefined => {
   const attrs = [...new Set([...index.pk.composite, ...index.sk.composite])]
-  const template = composeIndexKeys(
-    schema,
+  // The fixed parts are the same under every form, and off leaves a placeholder as it is.
+  const off = schema136(form.pk)
+  const template = composeAt(
+    { pk: off, sk: off },
     entityType,
     entityVersion,
     index,
@@ -481,15 +230,23 @@ export const readIndexKeys = (
     for (const fromSk of readings(sk, template[index.sk.field]!)) {
       const record: Record<string, unknown> = {}
       let consistent = true
-      for (const [slot, text] of [...fromPk, ...fromSk]) {
-        const attr = attrs[slot]!
-        const value = valueOf136(text, kindOf(attr))
-        if (value === undefined || (attr in record && record[attr] !== value)) consistent = false
-        record[attr] = value
+      const read = (halves: Map<number, string>, under: DynamoSchema.DynamoSchema) => {
+        for (const [slot, text] of halves) {
+          const attr = attrs[slot]!
+          const value = valueOf(under, text, kindOf(attr))
+          if (value === undefined || (attr in record && record[attr] !== value)) consistent = false
+          record[attr] = value
+        }
       }
+      read(fromPk, form.pk)
+      read(fromSk, form.sk)
       if (!consistent) continue
-      const keys = composeIndexKeys(schema, entityType, entityVersion, index, record)
-      if (keys[index.pk.field] === pk && keys[index.sk.field] === sk) fits.push(record)
+      try {
+        const keys = composeAt(form, entityType, entityVersion, index, record)
+        if (keys[index.pk.field] === pk && keys[index.sk.field] === sk) fits.push(record)
+      } catch {
+        // `NaN` read from no number: not this form's text.
+      }
     }
   }
   return fits.length === 1 ? fits[0] : undefined

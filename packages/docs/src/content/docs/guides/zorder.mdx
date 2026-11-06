@@ -125,7 +125,7 @@ The same rules hold at runtime, for untyped callers, when `Entity.make` runs:
 - **The facet can be left out.** A partition key composite is required on every query. A prefix composite can be omitted, and the query then [skip-scans](#reading-across-prefix-values) over its values.
 - **Hierarchies.** `prefix: ["agencyId", "officeId"]` serves agency-only and agency-plus-office queries.
 
-Each prefix value is stored as its byte length and its UTF-8 bytes, after the index's casing, so prefix matching is case-insensitive like any composite and no value is a prefix of another. For long IDs, `{ field: "officeId", hash: 8 }` stores the first `n` bytes (1 to 8) of the value's FNV-1a-64 hash instead; queries then check the value on each row, since two values can share a hash.
+Each prefix value is stored as its byte length and its UTF-8 bytes, after the index's casing (and, with `escapeKeys: true`, as its [escaped key text](/effect-dynamodb/guides/indexes/#key-text)), so prefix matching is case-insensitive like any composite and no value is a prefix of another. For long IDs, `{ field: "officeId", hash: 8 }` stores the first `n` bytes (1 to 8) of the value's FNV-1a-64 hash instead; queries then check the value on each row, since two values can share a hash.
 
 ### The binary attribute
 

@@ -1,16 +1,14 @@
 /**
- * Guide: Upgrading from 1.36 — effect-dynamodb
+ * Guide: Upgrading — effect-dynamodb
  *
- * Demonstrates the upgrade path documented in the upgrade guide:
- *   - 1.37 runs over rows 1.36 wrote, with the key fallback on (the default)
+ * Demonstrates turning `escapeKeys` on over existing data, as the upgrade guide documents:
+ *   - A table written with the default, off: the key text 1.36 composed
+ *   - With the flag on, a row whose key text changed isn't found until `rekey` has moved it
  *   - `rekey({ dryRun: true })`: what would move, and any conflicts
  *   - `rekey()`: move every row, in parallel segments, checkpointing a resume token
  *   - A bounded run (`maxPages`) resumed until the table is done
- *   - A rerun moves nothing; the fallback can then be turned off
- *
- * The example first writes a few rows as 1.36 did — written by 1.37, then
- * rewritten under the key text 1.36 composed — standing in for a table a
- * 1.36 deployment wrote.
+ *   - A rerun moves nothing
+ *   - `rekey` under the default moves them back, the same way
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -23,12 +21,9 @@ import { Config, Console, Effect, Layer, Option, Ref, Schema } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
-import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
-import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 
 // =============================================================================
@@ -42,14 +37,17 @@ const assertEq = <T>(actual: T, expected: T, label: string): void => {
 }
 
 // =============================================================================
-// 1. Models, entities, a stream
+// 1. The settings, models, entities, a stream
 // =============================================================================
 
 // #region schema
-// The same schema as under 1.36: the 1.36 key fallback is on by default
-// throughout 1.37.x, so the deployment keeps reading and writing the rows
-// 1.36 wrote while `rekey` moves them.
-const AppSchema = DynamoSchema.make({ name: "upgrade", version: 1 })
+// The default: keys are the text 1.36 composed, for strings and for numbers.
+const DefaultSchema = DynamoSchema.make({ name: "upgrade", version: 1 })
+// #endregion
+
+// #region schema-on
+// Opting in. A table with rows in it needs `rekey` before it serves traffic.
+const AppSchema = DynamoSchema.make({ name: "upgrade", version: 1, escapeKeys: true })
 // #endregion
 
 class Sensor extends Schema.Class<Sensor>("Sensor")({
@@ -59,116 +57,84 @@ class Sensor extends Schema.Class<Sensor>("Sensor")({
   offset: Schema.Number,
 }) {}
 
-const Sensors = Entity.make({
-  model: Sensor,
-  entityType: "Sensor",
-  primaryKey: {
-    pk: { field: "pk", composite: ["siteId"] },
-    sk: { field: "sk", composite: ["sensorId"] },
-  },
-  indexes: {
-    byLabel: {
-      name: "gsi1",
-      pk: { field: "gsi1pk", composite: ["siteId"] },
-      sk: { field: "gsi1sk", composite: ["label"] },
-    },
-  },
-  timestamps: true,
-  versioned: { retain: true },
-  softDelete: true,
-})
-
-const MainTable = Table.make({ schema: AppSchema, entities: { Sensors } })
-const tableName = "guide-upgrade-table"
-
 class Calibrated extends Schema.TaggedClass<Calibrated>()("Calibrated", {
   offset: Schema.Number,
 }) {}
 
-const Calibrations = EventStore.makeStream({
-  table: MainTable,
-  streamName: "Calibrations",
-  events: [Calibrated],
-  streamId: { composite: ["siteId"] },
-})
+const tableName = "guide-upgrade-table"
 
-// =============================================================================
-// 2. Rows as 1.36 wrote them
-// =============================================================================
-
-/**
- * Move a sensor's rows — its item, version snapshots and tombstone — under
- * the key text 1.36 composed for it: each row's sort key holds the sensor's
- * key segment, and the item holds its index keys too.
- */
-const writeAs136 = (record: { readonly siteId: string; readonly sensorId: number }) =>
-  Effect.gen(function* () {
-    const client = yield* DynamoClient
-    const current = KeyComposer.composeAllKeys(AppSchema, "Sensor", 1, Sensors.indexes, record)
-    const old = KeyText136.composeAllKeys(AppSchema, "Sensor", 1, Sensors.indexes, record)
-    // The sensor's segment of a sort key: `#sensorid_<text>`.
-    const segment = (keys: Record<string, unknown>) => {
-      const sk = String(keys.sk)
-      return sk.slice(sk.lastIndexOf("#"))
-    }
-    const { Items = [] } = yield* client.query({
-      TableName: tableName,
-      KeyConditionExpression: "pk = :pk",
-      FilterExpression: "sensorId = :id",
-      ExpressionAttributeValues: toAttributeMap({ ":pk": current.pk, ":id": record.sensorId }),
-      ConsistentRead: true,
-    })
-    for (const item of Items) {
-      const sk = item.sk!.S!
-      yield* client.deleteItem({ TableName: tableName, Key: { pk: item.pk!, sk: item.sk! } })
-      yield* client.putItem({
-        TableName: tableName,
-        Item: {
-          ...item,
-          ...(sk === current.sk ? toAttributeMap(old) : {}),
-          sk: { S: sk.replace(segment(current), segment(old)) },
-        },
-      })
-    }
+/** The table's members, under one setting. */
+const membersUnder = (schema: DynamoSchema.DynamoSchema) => {
+  const Sensors = Entity.make({
+    model: Sensor,
+    entityType: "Sensor",
+    primaryKey: {
+      pk: { field: "pk", composite: ["siteId"] },
+      sk: { field: "sk", composite: ["sensorId"] },
+    },
+    indexes: {
+      byLabel: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["siteId"] },
+        sk: { field: "gsi1sk", composite: ["label"] },
+      },
+    },
+    timestamps: true,
+    versioned: { retain: true },
+    softDelete: true,
   })
+  const MainTable = Table.make({ schema, entities: { Sensors } })
+  const Calibrations = EventStore.makeStream({
+    table: MainTable,
+    streamName: "Calibrations",
+    events: [Calibrated],
+    streamId: { composite: ["siteId"] },
+  })
+  return { Sensors, MainTable, Calibrations }
+}
+
+const Default = membersUnder(DefaultSchema)
+const { Sensors, MainTable, Calibrations } = membersUnder(AppSchema)
 
 // =============================================================================
-// 3. The upgrade
+// 2. The upgrade
 // =============================================================================
 
 const program = Effect.gen(function* () {
-  const db = yield* DynamoClient.make({ entities: { Sensors }, tables: { MainTable } })
-
-  yield* Console.log("=== Setup: a table 1.36 wrote ===\n")
+  yield* Console.log("=== Setup: a table written with the default ===\n")
+  const before = yield* DynamoClient.make({
+    entities: { Sensors: Default.Sensors },
+    tables: { MainTable: Default.MainTable },
+  })
   // A table left by an earlier, interrupted run is started afresh.
-  yield* db.tables.MainTable.delete().pipe(Effect.ignore)
-  yield* db.tables.MainTable.create()
+  yield* before.tables.MainTable.delete().pipe(Effect.ignore)
+  yield* before.tables.MainTable.create()
   const sensors = [
     { siteId: "north", sensorId: -3, label: "intake valve", offset: 0.5 },
     { siteId: "north", sensorId: 1.5, label: "outlet", offset: 0.25 },
     { siteId: "north", sensorId: 7, label: "pump", offset: 0 },
   ]
   for (const sensor of sensors) {
-    yield* db.entities.Sensors.put(sensor)
-    yield* db.entities.Sensors.update({ siteId: "north", sensorId: sensor.sensorId }).set({
+    yield* before.entities.Sensors.put(sensor)
+    yield* before.entities.Sensors.update({ siteId: "north", sensorId: sensor.sensorId }).set({
       offset: sensor.offset + 1,
     })
   }
   // The outlet sensor is soft-deleted: a tombstone beside its snapshots.
-  yield* db.entities.Sensors.delete({ siteId: "north", sensorId: 1.5 })
-  yield* Calibrations.append({ siteId: "north" }, [new Calibrated({ offset: 0.5 })], 0)
-  for (const sensor of sensors.slice(0, 2)) yield* writeAs136(sensor)
-  // 1.37 reads them where 1.36 wrote them.
-  const before = yield* db.entities.Sensors.get({ siteId: "north", sensorId: -3 })
-  assertEq(before.label, "intake valve", "read under its 1.36 key")
-  const versionsBefore = yield* db.entities.Sensors.versions({
-    siteId: "north",
-    sensorId: -3,
-  }).collect()
-  assertEq(versionsBefore.length, 1, "its snapshot read under its 1.36 key")
-  yield* Console.log(
-    "Two sensors' rows under their 1.36 keys (one soft-deleted), one under its current key.",
-  )
+  yield* before.entities.Sensors.delete({ siteId: "north", sensorId: 1.5 })
+  yield* Default.Calibrations.append({ siteId: "north" }, [new Calibrated({ offset: 0.5 })], 0)
+  yield* Console.log("Three sensors (one soft-deleted) and a stream.")
+
+  const db = yield* DynamoClient.make({ entities: { Sensors }, tables: { MainTable } })
+
+  // #region not-found
+  // With the flag on and before `rekey`, a row whose key text changed isn't found.
+  const missing = yield* db.entities.Sensors.get({ siteId: "north", sensorId: -3 }).pipe(Effect.flip)
+  // missing._tag → "ItemNotFound"
+  // #endregion
+  assertEq(missing._tag, "ItemNotFound", "a number whose text changed isn't found before rekey")
+  const unchanged = yield* db.entities.Sensors.get({ siteId: "north", sensorId: 7 })
+  assertEq(unchanged.label, "pump", "a value whose text is the same is")
 
   // --- Dry run ---
   yield* Console.log("\n=== Dry run ===\n")
@@ -261,22 +227,28 @@ const program = Effect.gen(function* () {
   )
   yield* Console.log(`Nothing left to move; ${again.unchanged} rows already current.`)
 
+  // --- Back to the default ---
+  yield* Console.log("\n=== Back to the default ===\n")
+
+  // #region back
+  // `rekey` moves rows to whatever the setting composes: under the default, back again.
+  const backAgain = yield* before.tables.MainTable.rekey({ streams: [Default.Calibrations] })
+  // backAgain.moved  → the rows the first run moved
+  // #endregion
+  assertEq(backAgain.moved, report.moved, "the same rows move back")
+  assertEq(backAgain.conflicts.length, 0, "with no conflicts")
+  const backHome = yield* before.entities.Sensors.get({ siteId: "north", sensorId: -3 })
+  assertEq(backHome.label, "intake valve", "found again under the default")
+  yield* Console.log(`Moved back: ${JSON.stringify(backAgain.moved)}`)
+
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===\n")
-  yield* db.tables.MainTable.delete()
+  yield* before.tables.MainTable.delete()
   yield* Console.log("Table deleted.")
 })
 
-// #region fallback-off
-// Once a rerun moves nothing and reports no conflicts — and no 1.36
-// deployment is left to write a 1.36 key again — turn the fallback off:
-// requests are then exactly those of a build without it.
-const UpgradedSchema = DynamoSchema.make({ name: "upgrade", version: 1, legacyKeys: false })
-// #endregion
-assertEq(UpgradedSchema.legacyKeys, false, "the fallback is off")
-
 // =============================================================================
-// 4. Provide dependencies and run
+// 3. Provide dependencies and run
 // =============================================================================
 
 const AppLayer = Layer.mergeAll(
@@ -286,6 +258,7 @@ const AppLayer = Layer.mergeAll(
     credentials: Config.succeed({ accessKeyId: "local", secretAccessKey: "local" }),
   }),
   MainTable.layer({ name: tableName }),
+  Default.MainTable.layer({ name: tableName }),
 )
 
 const main = program.pipe(Effect.provide(AppLayer))

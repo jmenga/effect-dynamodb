@@ -728,7 +728,7 @@ describe("DynamoClient", () => {
   // -------------------------------------------------------------------------
 
   describe(".where() sort key conditions", () => {
-    const AppSchema = DynamoSchema.make({ name: "wheretest", version: 1 })
+    const AppSchema = DynamoSchema.make({ name: "wheretest", version: 1, escapeKeys: true })
 
     /** Build a client layer that captures `query` inputs into the provided array. */
     const makeQueryCapturingClient = (captured: Array<unknown>) =>
@@ -1210,15 +1210,15 @@ describe("DynamoClient", () => {
         }),
       )
 
-      it.effect("eq on a non-terminal composite becomes a subtree begins_with", () =>
+      it.effect("eq on a non-terminal composite selects the value and its subtree", () =>
         Effect.gen(function* () {
           const input = yield* capture((db: any) =>
             db.entities.Readings.byDevice({ deviceId: "d-1" })
               .where((t: any, ops: any) => ops.eq(t.status, "done"))
               .collect(),
           )
-          expect(input.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
-          expect(skValue(input)).toBe("$wheretest#v1#reading#status_done#")
+          const done = "$wheretest#v1#reading#status_done"
+          expect(skCondition(input)).toEqual(["between", done, `${done}#\uFFFF`])
         }),
       )
 
@@ -1322,7 +1322,7 @@ describe("DynamoClient", () => {
   // -------------------------------------------------------------------------
 
   describe("sort key prefix + operand serialization", () => {
-    const AppSchema = DynamoSchema.make({ name: "skprefix", version: 1 })
+    const AppSchema = DynamoSchema.make({ name: "skprefix", version: 1, escapeKeys: true })
 
     const makeQueryCapturingClient = (captured: Array<unknown>) =>
       mockDynamoClientLayer({
@@ -1443,18 +1443,23 @@ describe("DynamoClient", () => {
     // --- #115 accessor prefix delimiter --------------------------------
 
     describe("accessor begins_with delimiter (#115)", () => {
-      it.effect("partial SK composites terminate the prefix on a segment boundary", () =>
+      it.effect("partial SK composites stop on a segment boundary", () =>
         Effect.gen(function* () {
+          const done = "$skprefix#v1#task#status_done"
+          // A secondary index: the row truncated at the prefix, and what's below it.
           const gsi = yield* capture((db) =>
             db.entities.Tasks.byTenant({ tenantId: "acme", status: "done" }).collect(),
           )
-          expect(gsi.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
-          expect(skValue(gsi)).toBe("$skprefix#v1#task#status_done#")
+          expect(gsi.KeyConditionExpression).toContain("BETWEEN :sk1 AND :sk2")
+          expect(gsi.ExpressionAttributeValues![":sk1"]!.S).toBe(done)
+          expect(gsi.ExpressionAttributeValues![":sk2"]!.S).toBe(`${done}#\uFFFF`)
 
+          // The primary index holds no truncated row.
           const pk = yield* capture((db) =>
             db.entities.Tasks.primary({ tenantId: "acme", status: "done" }).collect(),
           )
-          expect(skValue(pk)).toBe("$skprefix#v1#task#status_done#")
+          expect(pk.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
+          expect(skValue(pk)).toBe(`${done}#`)
         }),
       )
 
@@ -1482,12 +1487,14 @@ describe("DynamoClient", () => {
         }),
       )
 
-      it.effect("the delimiter excludes sibling values the operand is a prefix of", () =>
+      it.effect("the bounds exclude sibling values the operand is a prefix of", () =>
         Effect.gen(function* () {
           const input = yield* capture((db) =>
             db.entities.Tasks.byTenant({ tenantId: "acme", status: "done" }).collect(),
           )
-          const operand = skValue(input)
+          const low = input.ExpressionAttributeValues![":sk1"]!.S!
+          const high = input.ExpressionAttributeValues![":sk2"]!.S!
+          const selected = (key: string) => low <= key && key <= high
           // Compose the stored keys the write path would produce.
           const stored = (status: string, taskId: string) =>
             KeyComposer.composeSk(
@@ -1500,9 +1507,9 @@ describe("DynamoClient", () => {
               },
               { status, taskId },
             )
-          expect(stored("done", "t1").startsWith(operand)).toBe(true)
-          expect(stored("done_archived", "t3").startsWith(operand)).toBe(false)
-          expect(stored("doneish", "t4").startsWith(operand)).toBe(false)
+          expect(selected(stored("done", "t1"))).toBe(true)
+          expect(selected(stored("done_archived", "t3"))).toBe(false)
+          expect(selected(stored("doneish", "t4"))).toBe(false)
         }),
       )
     })
@@ -1524,15 +1531,17 @@ describe("DynamoClient", () => {
         }),
       )
 
-      it.effect("eq on a non-terminal composite is a delimiter-terminated subtree", () =>
+      it.effect("eq on a non-terminal composite is the value and its subtree", () =>
         Effect.gen(function* () {
           const input = yield* capture((db) =>
             db.entities.Tasks.byTenant({ tenantId: "acme" })
               .where((t, { eq }) => eq(t.status, "done"))
               .collect(),
           )
-          expect(input.KeyConditionExpression).toContain("begins_with(#sk, :sk)")
-          expect(skValue(input)).toBe("$skprefix#v1#task#status_done#")
+          const done = "$skprefix#v1#task#status_done"
+          expect(input.KeyConditionExpression).toContain("BETWEEN :sk1 AND :sk2")
+          expect(input.ExpressionAttributeValues![":sk1"]!.S).toBe(done)
+          expect(input.ExpressionAttributeValues![":sk2"]!.S).toBe(`${done}#${MAX}`)
         }),
       )
 
@@ -1800,7 +1809,7 @@ describe(".within() on composite accessors (#171)", () => {
           )
           const under = (bound: any, isLast = false, prefix = prefixText) =>
             composeRangeUnder(
-              { casing: effective, isLast },
+              { schema, casing: effective, isLast, secondary: true },
               prefix,
               isLast ? "id" : "value",
               bound,
@@ -1821,16 +1830,10 @@ describe(".within() on composite accessors (#171)", () => {
           })
           // …an upper one ends at it…
           expect(under({ lt: value }), context).toEqual({ between: [prefixText, composed] })
-          // …an eq bound is the value's subtree, as a begins_with of the record…
-          expect(under({ eq: value }), context).toEqual({
-            beginsWith: KeyComposer.composeSortKeyBeginsWith(
-              schema,
-              "Thing",
-              1,
-              index,
-              recordKeyForm,
-            ),
-          })
+          // …an eq bound is the value's subtree, as a pin on the record is…
+          expect(under({ eq: value }), context).toEqual(
+            KeyComposer.composeSortKeyCondition(schema, "Thing", 1, index, recordKeyForm),
+          )
           // …and on the last composite it is the whole stored key.
           const fullKeyForm = { ...recordKeyForm, id: "X-1" }
           const lastPrefix = KeyComposer.composeSortKeyBeginsWith(

@@ -139,4 +139,35 @@ export const scenarios: ReadonlyArray<Scenario> = [
       },
     },
   },
+  {
+    name: "Device Fleet",
+    description: "A sharded index: one tenant's write rate spread over 20 partitions",
+    schema: { name: "fleet", version: 1, casing: "lowercase" },
+    entityType: "DeviceState",
+    entityVersion: 1,
+    tableName: "FleetTable",
+    fields: [
+      { name: "channel", type: "string", defaultValue: "channel-a" },
+      { name: "deviceId", type: "string", defaultValue: "device-1" },
+      { name: "tenantId", type: "string", defaultValue: "t-123" },
+      { name: "groupId", type: "string", defaultValue: "group-a" },
+    ],
+    indexes: {
+      primary: {
+        pk: { field: "pk", composite: ["channel"] },
+        sk: { field: "sk", composite: ["deviceId"] },
+      },
+      byTenant: {
+        index: "gsi5",
+        pk: { field: "gsi5pk", composite: ["tenantId"] },
+        sk: { field: "gsi5sk", composite: ["groupId", "channel", "deviceId"] },
+        shards: {
+          count: 20,
+          by: undefined,
+          previous: undefined,
+          source: ["channel", "deviceId"],
+        },
+      },
+    },
+  },
 ]
