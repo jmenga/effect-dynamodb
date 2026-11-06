@@ -2739,7 +2739,7 @@ immutable field; and a second operation on the same field. `.add()` /
 `.subtract()` / `.append()` / `.deleteFromSet()` on a GSI composite recompose
 the index key on every entity.
 
-**Clearing a field (#177, #178).** `.set({ f: undefined })` is `.remove(["f"])`: `normalizeClears` moves it once, at the top of `runUpdate`, so the sentinel release, the composer's per-half gate and policy, the vector gate, the retain snapshot and the transactional planner (which runs this same op) see one form. A value that encodes to nothing (`Option.none()` on a `Schema.OptionFromOptional` field) clears the same way. Three names aren't clears: a library-generated `updatedAt` (`undefined` means generate it), a sparse map (`.set()` merges entries, and no entries merge nothing), and a name the model doesn't know, which the payload's schema drops.
+**Clearing a field (#177, #178).** `.set({ f: undefined })` is `.remove(["f"])`, unless the field stores `undefined` as a value (`storesUndefined`), which is written like any other: `normalizeClears` moves it once, at the top of `runUpdate`, so the sentinel release, the composer's per-half gate and policy, the vector gate, the retain snapshot and the transactional planner (which runs this same op) see one form. A value that encodes to nothing (`Option.none()` on a `Schema.OptionFromOptional` field) clears the same way. Three names aren't clears: a library-generated `updatedAt` (`undefined` means generate it), a sparse map (`.set()` merges entries, and no entries merge nothing), and a name the model doesn't know, which the payload's schema drops.
 
 Clearing a field a row can't lack is refused with a `ValidationError` before anything is sent, for `.set({ f: undefined })`, `.remove(["f"])`, a top-level `pathRemove(["f"])` and an `append`'s `.remove`, because the write would land and the row could not then be read. A row can lack a field if it still decodes without it (`rowCanLack`: optional on its stored side, and a real decode of `{}` isn't refused), so a decoding default can be cleared and a `NullOr` can't. A ref can't, whatever its model field declares: its read schema points at the required target. `pathRemove` of a property below a field is judged by walking the stored side of the field's schema (`pathIsRequired`): structs, classes and recursive schemas are followed, a record's entry and a list's element are open (a list closes up, so which element went says nothing about the row), and a union requires a property only if every member declaring it does. A `.check()` that a removal would fail, such as a minimum length on a list, is not judged. `null` follows the same line: on a field a row can lack it clears, on one it can't (a required `NullOr`) it is stored.
 
@@ -2994,13 +2994,14 @@ writes for a changed value carries its constraint's `ttl`, as a put's does.
 **`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
 sentinel, snapshot the replaced item, or tell whether to store a default or keep
 the stored value. So an entity with `unique` constraints or `versioned: { retain:
-true }`, or an input that omits a defaulted index composite, takes
+true }`, an input that omits a defaulted index composite, or an input clearing a
+secondary index composite, takes
 `guardedUpsert`: it validates the whole input (required fields included) and
 reads the item once. Missing: `create`, sentinels guarded by
 `attribute_not_exists`, the retain snapshot written, omitted defaults stored.
 Present: an update of the upserted fields (primary-key composites, immutable
 fields, `createdAt` and the version dropped, so they keep their stored values,
-as do fields the input omits) from that same read, with sentinels rotated for
+as do fields the input omits or leaves unset) from that same read, with sentinels rotated for
 changed values only and the replaced item snapshotted, under the update's
 version / incarnation guard (versioned) or attribute guard (unversioned). A
 concurrent create or delete between the read and the write is retried the other
@@ -3009,6 +3010,18 @@ way, and a sentinel release that raced is planned again from a fresh read
 `OptimisticLockError` / `ConcurrentModification`, never a
 `ConditionalCheckFailed` the caller didn't ask for, and every error names the
 `upsert`. Other entities keep the single `if_not_exists` `UpdateItem`.
+
+**An `undefined` in an upsert's input means the same on either path.** The answer goes by what the input encodes to:
+
+| The field, given `undefined` | What the upsert does | Read first? |
+|---|---|---|
+| Merely optional (`Schema.optional`): left unset | Keeps the attribute and any key holding it | Only if another reason says so |
+| `undefined` is a value with no stored form (`Schema.UndefinedOr`): a clear | Removes the attribute | Only if a secondary index holds it |
+| `undefined` is a value with a stored form (a transform writing `"none"`) | Writes that | Only if another reason says so |
+| A default no key holds | Writes the default | Only if another reason says so |
+| A defaulted index composite: omitted, as `omitsIndexedDefault` reads it | Keeps what the row holds; on a new row, the default | Yes |
+
+An empty set follows the second row. **Clearing a secondary index composite reads first**, because what's left of a half depends on the row, and the result is what `.set(...).remove([...])` leaves: `[owner, und]` given `und: undefined` truncates to `owner_o1`, and `[und]` loses the half under `'sparse'` and `'preserve'` alike, a clear being the cascade override. Without it the key would outlive its value. A primary composite, an immutable field, and a date the library stamps aren't cleared this way, so those stay one write. So does a clear no key holds. This read happens only when the input clears a composite: no other upsert pays for it.
 
 **Transaction puts.** `transactWrite` and `EventStore.append`'s
 `additionalItems` plan a put of a versioned or unique-constrained entity with

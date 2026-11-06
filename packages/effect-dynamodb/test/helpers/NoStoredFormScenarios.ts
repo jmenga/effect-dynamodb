@@ -2887,7 +2887,584 @@ const positionScenarios: ReadonlyArray<Scenario> = [
   },
 ]
 
+// ---------------------------------------------------------------------------
+// An upsert given `undefined` or an empty set: the same answer on every route
+// ---------------------------------------------------------------------------
+
+const orNone = Schema.String.pipe(
+  Schema.decodeTo(Schema.UndefinedOr(Schema.String), {
+    decode: SchemaGetter.transform((stored) => (stored === "none" ? undefined : stored)),
+    encode: SchemaGetter.transform((value) => value ?? "none"),
+  }),
+)
+const defaultedLevel = Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("info")))
+
+const upsertIndexes = {
+  byNote: {
+    name: "gsi1",
+    pk: { field: "gsi1pk", composite: ["group"] },
+    sk: { field: "gsi1sk", composite: ["note"] },
+  },
+  byUnd: {
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: ["group"] },
+    sk: { field: "gsi2sk", composite: ["und"] },
+  },
+}
+
+const upsertFields = {
+  id: Schema.String,
+  group: Schema.String,
+  /** Optional, and a key holds it. */
+  note: Schema.optional(Schema.String),
+  /** Optional, and no key holds it. */
+  plain: Schema.optional(Schema.String),
+  /** `undefined` is a value, stored absent, and a key holds it. */
+  und: Schema.UndefinedOr(Schema.String),
+  /** `undefined` is a value, stored absent, and no key holds it. */
+  blank: Schema.UndefinedOr(Schema.String),
+  tags: Strings,
+  /** `undefined` is a value, with a stored form. */
+  orNone,
+  /** A default no key holds. */
+  defaulted: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("d"))),
+  code: Schema.optional(Schema.String),
+}
+
+const upsertSeed = () => ({
+  id: "1",
+  group: "g",
+  note: "n1",
+  plain: "p1",
+  und: "u1",
+  blank: "b1",
+  tags: new Set(["a"]),
+  orNone: "x",
+  defaulted: "stored",
+  code: "c1",
+})
+
+/** Each way an upsert goes. All but the first read the row before they write. */
+const UPSERT_ROUTES: ReadonlyArray<{
+  readonly name: string
+  readonly world: () => ReturnType<typeof worldOf>
+  readonly singleWrite: boolean
+  /** What the input leaves out, for the route to be taken. */
+  readonly input: (input: Record<string, unknown>) => Record<string, unknown>
+}> = [
+  {
+    name: "the single write",
+    world: () => worldOf(Schema.Struct(upsertFields), { indexes: upsertIndexes }),
+    singleWrite: true,
+    input: (input) => input,
+  },
+  {
+    name: "`unique`, which reads first",
+    world: () =>
+      worldOf(Schema.Struct(upsertFields), {
+        indexes: upsertIndexes,
+        unique: { byCode: ["code"] },
+      }),
+    singleWrite: false,
+    input: (input) => input,
+  },
+  {
+    name: "`retain`, which reads first",
+    world: () =>
+      worldOf(Schema.Struct(upsertFields), {
+        indexes: upsertIndexes,
+        versioned: { retain: true },
+      }),
+    singleWrite: false,
+    input: (input) => input,
+  },
+  {
+    name: "an omitted defaulted composite, which reads first",
+    world: () =>
+      worldOf(Schema.Struct({ ...upsertFields, level: defaultedLevel }), {
+        indexes: {
+          ...upsertIndexes,
+          byLevel: {
+            name: "gsi3",
+            pk: { field: "gsi3pk", composite: ["group"] },
+            sk: { field: "gsi3sk", composite: ["level"] },
+          },
+        },
+      }),
+    singleWrite: false,
+    input: ({ level: _level, ...input }) => input,
+  },
+]
+
+const seedAndUpsert = (
+  db: any,
+  probe: Probe,
+  route: (typeof UPSERT_ROUTES)[number],
+  given: Record<string, unknown>,
+) =>
+  Effect.gen(function* () {
+    yield* db.entities.Rows.put({ ...upsertSeed(), level: "warn" }).asEffect()
+    const before = probe.sent()
+    yield* db.entities.Rows.upsert(route.input({ ...upsertSeed(), ...given })).asEffect()
+    return { row: live(yield* probe.rows())!, requests: probe.sent() - before }
+  })
+
+const upsertRouteScenarios: ReadonlyArray<Scenario> = UPSERT_ROUTES.flatMap(
+  (route): ReadonlyArray<Scenario> => {
+    const thisRoute = (requests: number) =>
+      route.singleWrite ? expect(requests).toBe(1) : expect(requests).toBeGreaterThan(1)
+    return [
+      {
+        name: `${route.name}: an optional field left undefined keeps its attribute and its key`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row, requests } = yield* seedAndUpsert(db, probe, route, { note: undefined })
+              thisRoute(requests)
+              expect(row.note).toEqual({ S: "n1" })
+              expect(row.gsi1sk?.S).toContain("note_n1")
+              expect(yield* probe.inIndex("gsi1")).toHaveLength(1)
+              expect((yield* db.entities.Rows.get(key)).note).toBe("n1")
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: an optional field no key holds, left undefined, stays`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row, requests } = yield* seedAndUpsert(db, probe, route, { plain: undefined })
+              thisRoute(requests)
+              expect(row.plain).toEqual({ S: "p1" })
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: every optional field left undefined leaves the row as it was`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row } = yield* seedAndUpsert(db, probe, route, {
+                note: undefined,
+                plain: undefined,
+                code: undefined,
+              })
+              expect(row.note).toEqual({ S: "n1" })
+              expect(row.plain).toEqual({ S: "p1" })
+              expect(row.code).toEqual({ S: "c1" })
+              expect(row.gsi1sk?.S).toContain("note_n1")
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: a value given beside it is written, and it stays`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row } = yield* seedAndUpsert(db, probe, route, {
+                note: undefined,
+                plain: "p2",
+              })
+              expect(row.note).toEqual({ S: "n1" })
+              expect(row.plain).toEqual({ S: "p2" })
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: a composite whose undefined is a value clears, with its key`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row, requests } = yield* seedAndUpsert(db, probe, route, { und: undefined })
+              // What's left of a half is the update's to say, and that takes the stored row.
+              expect(requests).toBeGreaterThan(1)
+              expect(row.und).toBeUndefined()
+              expect(row.gsi2sk).toBeUndefined()
+              expect(row.gsi1sk?.S).toContain("note_n1")
+              expect(yield* probe.inIndex("gsi2")).toHaveLength(0)
+              expect((yield* db.entities.Rows.get(key)).und).toBeUndefined()
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: one field cleared and another left unset each get their own answer`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row } = yield* seedAndUpsert(db, probe, route, {
+                und: undefined,
+                note: undefined,
+              })
+              expect(row.und).toBeUndefined()
+              expect(row.gsi2sk).toBeUndefined()
+              expect(row.note).toEqual({ S: "n1" })
+              expect(row.gsi1sk?.S).toContain("note_n1")
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: a clear no key holds is the same, on the route's own requests`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row, requests } = yield* seedAndUpsert(db, probe, route, {
+                blank: undefined,
+                tags: empty(),
+              })
+              thisRoute(requests)
+              expect(row.blank).toBeUndefined()
+              expect(row.tags).toBeUndefined()
+              expect(row.gsi1sk?.S).toContain("note_n1")
+              expect(row.gsi2sk?.S).toContain("und_u1")
+              const read = yield* db.entities.Rows.get(key)
+              expect(read.blank).toBeUndefined()
+              isEmptySet(read.tags)
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: an undefined with a stored form is written`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row, requests } = yield* seedAndUpsert(db, probe, route, {
+                orNone: undefined,
+              })
+              thisRoute(requests)
+              expect(row.orNone).toEqual({ S: "none" })
+              expect((yield* db.entities.Rows.get(key)).orNone).toBeUndefined()
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: a default given as undefined is stored`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              const { row, requests } = yield* seedAndUpsert(db, probe, route, {
+                defaulted: undefined,
+              })
+              thisRoute(requests)
+              expect(row.defaulted).toEqual({ S: "d" })
+            }),
+          ),
+      },
+      {
+        name: `${route.name}: a new row has neither what was left unset nor its key`,
+        run: (h) =>
+          h.on(route.world(), (db, probe) =>
+            Effect.gen(function* () {
+              yield* db.entities.Rows.upsert(
+                route.input({ ...upsertSeed(), note: undefined, und: undefined }),
+              ).asEffect()
+              const row = live(yield* probe.rows())!
+              expect(row.note).toBeUndefined()
+              expect(row.gsi1sk).toBeUndefined()
+              expect(row.und).toBeUndefined()
+              expect(row.gsi2sk).toBeUndefined()
+              const read = yield* db.entities.Rows.get(key)
+              expect("note" in read).toBe(false)
+              expect(read.und).toBeUndefined()
+            }),
+          ),
+      },
+    ]
+  },
+)
+
+/** `pk: [owner]` and a sort key over a composite an upsert can clear. */
+const clearingWorld = (sk: ReadonlyArray<string>, options: Record<string, unknown> = {}) =>
+  worldOf(
+    Schema.Struct({
+      id: Schema.String,
+      owner: Schema.String,
+      note: Schema.optional(Schema.String),
+      und: Schema.UndefinedOr(Schema.String),
+    }),
+    {
+      indexes: {
+        byOwner: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["owner"] },
+          sk: { field: "gsi1sk", composite: sk },
+          ...options,
+        },
+      },
+    },
+  )
+
+const clearingSeed = { id: "1", owner: "o1", note: "n1", und: "u1" }
+const textAfterPrefix = (attribute: AttributeValue | undefined) =>
+  attribute?.S?.split("#").slice(3).join("#")
+
+const upsertClearScenarios: ReadonlyArray<Scenario> = [
+  ...(["sparse", "preserve"] as const).map(
+    (policy): Scenario => ({
+      name: `an upsert clearing a sort key's only composite removes the half, under ${policy}`,
+      run: (h) =>
+        h.on(clearingWorld(["und"], { indexPolicy: { pk: policy, sk: policy } }), (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put(clearingSeed).asEffect()
+            yield* db.entities.Rows.upsert({ ...clearingSeed, und: undefined }).asEffect()
+            const row = live(yield* probe.rows())!
+            expect(row.und).toBeUndefined()
+            expect(row.gsi1sk).toBeUndefined()
+          }),
+        ),
+    }),
+  ),
+  {
+    name: "an upsert clearing one half still moves the other",
+    run: (h) =>
+      h.on(clearingWorld(["und"]), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(clearingSeed).asEffect()
+          yield* db.entities.Rows.upsert({
+            ...clearingSeed,
+            owner: "o2",
+            und: undefined,
+          }).asEffect()
+          const row = live(yield* probe.rows())!
+          expect(textAfterPrefix(row.gsi1pk)).toBe("owner_o2")
+          expect(row.gsi1sk).toBeUndefined()
+        }),
+      ),
+  },
+  {
+    name: "an upsert clearing a half's last composite truncates it, as .set().remove() does",
+    run: (h) =>
+      h.on(clearingWorld(["note", "und"]), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(clearingSeed).asEffect()
+          yield* db.entities.Rows.upsert({ ...clearingSeed, und: undefined }).asEffect()
+          const upserted = live(yield* probe.rows())!
+          expect(upserted.und).toBeUndefined()
+          expect(textAfterPrefix(upserted.gsi1sk)).toBe("note_n1")
+
+          yield* db.entities.Rows.put({ ...clearingSeed, id: "2" }).asEffect()
+          yield* db.entities.Rows.update({ id: "2" }).set({ note: "n1" }).remove(["und"]).asEffect()
+          expect(textAfterPrefix(live(yield* probe.rows(), "2")!.gsi1sk)).toBe(
+            textAfterPrefix(upserted.gsi1sk),
+          )
+        }),
+      ),
+  },
+  {
+    name: "an upsert clearing a half's first composite removes it, though the rest is there",
+    run: (h) =>
+      h.on(clearingWorld(["und", "note"]), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put(clearingSeed).asEffect()
+          yield* db.entities.Rows.upsert({ ...clearingSeed, und: undefined }).asEffect()
+          const row = live(yield* probe.rows())!
+          expect(row.gsi1sk).toBeUndefined()
+          expect(row.note).toEqual({ S: "n1" })
+        }),
+      ),
+  },
+  {
+    name: "an upsert of an immutable composite keeps it, and asks for no read",
+    run: (h) =>
+      h.on(
+        worldOf(
+          DynamoModel.configure(
+            Schema.Struct({
+              id: Schema.String,
+              owner: Schema.String,
+              und: Schema.UndefinedOr(Schema.String),
+            }),
+            { und: { immutable: true } },
+          ),
+          {
+            indexes: {
+              byOwner: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["owner"] },
+                sk: { field: "gsi1sk", composite: ["und"] },
+              },
+            },
+          },
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ id: "1", owner: "o1", und: "u1" }).asEffect()
+            const before = probe.sent()
+            yield* db.entities.Rows.upsert({ id: "1", owner: "o1", und: undefined }).asEffect()
+            expect(probe.sent() - before).toBe(1)
+            expect(live(yield* probe.rows())!.und).toEqual({ S: "u1" })
+          }),
+      ),
+  },
+  ...(["createdAt", "updatedAt"] as const).map(
+    (stamp): Scenario => ({
+      name: `an upsert given undefined for a stamped ${stamp} stamps it, and asks for no read`,
+      run: (h) =>
+        h.on(
+          worldOf(
+            DynamoModel.configure(
+              Schema.Struct({
+                id: Schema.String,
+                owner: Schema.String,
+                [stamp]: Schema.UndefinedOr(Schema.DateTimeUtc),
+              }),
+              { [stamp]: { storedAs: DynamoModel.DateString } } as never,
+            ),
+            {
+              timestamps: true,
+              indexes: {
+                byOwner: {
+                  name: "gsi1",
+                  pk: { field: "gsi1pk", composite: ["owner"] },
+                  sk: { field: "gsi1sk", composite: [stamp] },
+                },
+              },
+            },
+          ),
+          (db, probe) =>
+            Effect.gen(function* () {
+              const before = probe.sent()
+              yield* db.entities.Rows.upsert({
+                id: "1",
+                owner: "o1",
+                [stamp]: undefined,
+              }).asEffect()
+              expect(probe.sent() - before).toBe(1)
+              expect(live(yield* probe.rows())![stamp]?.S).toBeDefined()
+            }),
+        ),
+    }),
+  ),
+  {
+    name: "an omitted defaulted composite given as undefined keeps what the row holds",
+    run: (h) => {
+      const route = UPSERT_ROUTES[3]!
+      return h.on(route.world(), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ ...upsertSeed(), level: "warn" }).asEffect()
+          yield* db.entities.Rows.upsert({ ...upsertSeed(), level: undefined }).asEffect()
+          const row = live(yield* probe.rows())!
+          expect(row.level).toEqual({ S: "warn" })
+          expect(row.gsi3sk?.S).toContain("level_warn")
+        }),
+      )
+    },
+  },
+  {
+    name: "on a new row, that composite is the default",
+    run: (h) => {
+      const route = UPSERT_ROUTES[3]!
+      return h.on(route.world(), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.upsert({ ...upsertSeed(), level: undefined }).asEffect()
+          const row = live(yield* probe.rows())!
+          expect(row.level).toEqual({ S: "info" })
+          expect(row.gsi3sk?.S).toContain("level_info")
+        }),
+      )
+    },
+  },
+]
+
+/** `.set({ f: undefined })` where the field stores `undefined` as a value. */
+const storedUndefinedScenarios: ReadonlyArray<Scenario> = [
+  {
+    name: ".set({ f: undefined }) writes what undefined is stored as",
+    run: (h) =>
+      h.on(worldOf(Schema.Struct({ id: Schema.String, f: orNone })), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ id: "1", f: "x" }).asEffect()
+          yield* db.entities.Rows.update(key).set({ f: undefined }).asEffect()
+          expect(live(yield* probe.rows())!.f).toEqual({ S: "none" })
+          expect((yield* db.entities.Rows.get(key)).f).toBeUndefined()
+        }),
+      ),
+  },
+  {
+    name: ".remove() of it is still refused: a row can't be without what's stored",
+    run: (h) =>
+      h.on(worldOf(Schema.Struct({ id: Schema.String, f: orNone })), (db, probe) =>
+        Effect.gen(function* () {
+          yield* db.entities.Rows.put({ id: "1", f: "x" }).asEffect()
+          yield* refused(
+            db,
+            probe,
+            () => db.entities.Rows.update(key).remove(["f"]).asEffect(),
+            /requires "f"/,
+          )
+        }),
+      ),
+  },
+  {
+    name: "a transform whose undefined has no stored form clears",
+    run: (h) =>
+      h.on(
+        worldOf(
+          Schema.Struct({
+            id: Schema.String,
+            f: Schema.UndefinedOr(Schema.String).pipe(
+              Schema.decodeTo(Schema.UndefinedOr(Schema.String), {
+                decode: SchemaGetter.passthrough(),
+                encode: SchemaGetter.passthrough(),
+              }),
+            ),
+          }),
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ id: "1", f: "x" }).asEffect()
+            yield* db.entities.Rows.update(key).set({ f: undefined }).asEffect()
+            expect(live(yield* probe.rows())!.f).toBeUndefined()
+          }),
+      ),
+  },
+  {
+    name: "a transform over an optional field clears: only the clear can remove it",
+    run: (h) =>
+      h.on(
+        worldOf(
+          Schema.Struct({
+            id: Schema.String,
+            f: Schema.optional(Schema.String).pipe(
+              Schema.decodeTo(Schema.optional(Schema.String), {
+                decode: SchemaGetter.passthrough(),
+                encode: SchemaGetter.passthrough(),
+              }),
+            ),
+          }),
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ id: "1", f: "x" }).asEffect()
+            yield* db.entities.Rows.update(key).set({ f: undefined }).asEffect()
+            expect(live(yield* probe.rows())!.f).toBeUndefined()
+          }),
+      ),
+  },
+  {
+    name: "a default isn't a stored undefined: .set({ f: undefined }) clears, and it reads back",
+    run: (h) =>
+      h.on(
+        worldOf(
+          Schema.Struct({
+            id: Schema.String,
+            f: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("d"))),
+          }),
+        ),
+        (db, probe) =>
+          Effect.gen(function* () {
+            yield* db.entities.Rows.put({ id: "1", f: "x" }).asEffect()
+            yield* db.entities.Rows.update(key).set({ f: undefined }).asEffect()
+            expect(live(yield* probe.rows())!.f).toBeUndefined()
+            expect((yield* db.entities.Rows.get(key)).f).toBe("d")
+          }),
+      ),
+  },
+]
+
 export const allScenarios = {
+  noStoredFormUpsertRoutes: upsertRouteScenarios,
+  noStoredFormUpsertClears: upsertClearScenarios,
+  noStoredFormStoredUndefined: storedUndefinedScenarios,
   noStoredForm: kindScenarios,
   noStoredFormLifecycle: kindLifecycleScenarios,
   noStoredFormSets: setScenarios,

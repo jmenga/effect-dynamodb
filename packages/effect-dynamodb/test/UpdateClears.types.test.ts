@@ -6,7 +6,7 @@
  * effect built inside `compiles` is never executed.
  */
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
-import { Effect, Schema } from "effect"
+import { Effect, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import { DynamoClient, DynamoModel, DynamoSchema, Entity, Table } from "../src/index.js"
 import type { BoundAppend, BoundUpdate } from "../src/internal/BoundCrud.js"
@@ -187,6 +187,38 @@ describe("BoundUpdate", () => {
       u.set({ note: undefined, code: undefined })
       u.set({ note: "n", nullable: null })
     })
+    expect(true).toBe(true)
+  })
+})
+
+describe("a field whose undefined has a stored form", () => {
+  const WritesNone = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      orNone: Schema.String.pipe(
+        Schema.decodeTo(Schema.UndefinedOr(Schema.String), {
+          decode: SchemaGetter.transform((stored) => (stored === "none" ? undefined : stored)),
+          encode: SchemaGetter.transform((value) => value ?? "none"),
+        }),
+      ),
+    }),
+    entityType: "WritesNone",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const client = () =>
+    DynamoClient.make({
+      entities: { WritesNone },
+      tables: { MainTable: Table.make({ schema: AppSchema, entities: { WritesNone } }) },
+    })
+
+  it(".set({ f: undefined }) compiles: it's a value, and writes what it's stored as", () => {
+    compiles(() =>
+      Effect.gen(function* () {
+        const db = yield* client()
+        db.entities.WritesNone.update({ id: "1" }).set({ orNone: undefined })
+        db.entities.WritesNone.upsert({ id: "1", orNone: undefined })
+      }),
+    )
     expect(true).toBe(true)
   })
 })

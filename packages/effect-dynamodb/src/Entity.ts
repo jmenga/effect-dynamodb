@@ -2838,7 +2838,7 @@ const makeImpl = <
    * non-empty set) isn't a clear, and that schema goes on to refuse it.
    */
   const encodesToNothing = (field: string, value: unknown): boolean => {
-    if (value === undefined) return true
+    if (value === undefined) return !storesUndefined(field)
     if (modelFieldSchemas[field]?.ast.encoding === undefined && !isEmptySet(value)) return false
     const updateField = getSchemaFields(schemas.updateSchema as unknown as Schema.Top)?.[field]
     if (updateField === undefined) return false
@@ -2881,6 +2881,23 @@ const makeImpl = <
       if (!remove.includes(field)) remove.push(field)
     }
     return cleared ? { ...uState, updates: payload, remove } : uState
+  }
+
+  /**
+   * Whether `undefined` is a value of this field that has a stored form, one a transform
+   * writes as `"none"`. Setting it writes that, like any other value.
+   */
+  const storesUndefined = (field: string): boolean => {
+    const schema = modelFieldSchemas[field]
+    if (schema === undefined) return false
+    try {
+      const encoded = Schema.encodeUnknownExit(schema as unknown as Schema.Codec<unknown, unknown>)(
+        undefined,
+      )
+      return Exit.isSuccess(encoded) && !hasNoStoredForm(encoded.value)
+    } catch {
+      return false
+    }
   }
 
   /**
@@ -3712,14 +3729,17 @@ const makeImpl = <
     >
   }
 
-  const fillDecodingDefaults = (input: unknown): Effect.Effect<unknown, ValidationError> => {
+  const fillDecodingDefaults = (
+    input: unknown,
+    fills: (field: string, given: globalThis.Record<string, unknown>) => boolean = (field) =>
+      indexedDefaultFields().has(field),
+  ): Effect.Effect<unknown, ValidationError> => {
     if (defaultedFields.length === 0 || typeof input !== "object" || input === null) {
       return Effect.succeed(input)
     }
     const record = input as globalThis.Record<string, unknown>
-    const keyed = indexedDefaultFields()
     const missing = defaultedFields.filter(
-      ([name]) => keyed.has(name) && record[name] === undefined,
+      ([name]) => fills(name, record) && record[name] === undefined,
     )
     if (missing.length === 0) return Effect.succeed(input)
     return Schema.decodeUnknownEffect(
@@ -3738,6 +3758,14 @@ const makeImpl = <
     const record = input as globalThis.Record<string, unknown>
     return [...indexedDefaultFields()].some((name) => record[name] === undefined)
   }
+
+  /**
+   * A value with no stored form is an absent attribute, so an upsert's replaces what the row
+   * holds. A field left unset (an optional `undefined`) doesn't, nor does an immutable one.
+   */
+  const upsertClears = (field: string, value: unknown): boolean =>
+    (isEmptySet(value) || (value === undefined && fieldAbsentReading(field) !== undefined)) &&
+    !immutableFields.has(field)
 
   /** Attach the model class prototype to a decoded plain object (when model is Schema.Class). */
   const attachPrototype = (decoded: any) =>
@@ -9204,7 +9232,7 @@ const makeImpl = <
    * by `attribute_not_exists`, the retain snapshot, omitted defaults stored).
    * Present: an update of the upserted fields — sentinels rotate for changed
    * values, unchanged ones are left alone, immutable fields, `createdAt` and
-   * fields the input omits keep their stored values, retain snapshots the
+   * fields the input omits or leaves unset keep their stored values, retain snapshots the
    * replaced item — under the update's version / incarnation or attribute
    * guards, from that one read. The whole input is validated either way. A
    * concurrent create or delete between the read and the write is retried the
@@ -9243,9 +9271,25 @@ const makeImpl = <
         ...(systemFields.createdAt ? [systemFields.createdAt] : []),
         ...(systemFields.version ? [systemFields.version] : []),
       ])
-      const updates = Object.fromEntries(
-        Object.entries(record).filter(([field]) => !dropped.has(field)),
-      )
+      // An `undefined` means what it means on the single write. A merely optional field is left
+      // unset, and a defaulted index composite is omitted (`omitsIndexedDefault`), so either keeps
+      // what the row holds. Any other default is stored.
+      const keyedDefaults = indexedDefaultFields()
+      const updates = (yield* fillDecodingDefaults(
+        Object.fromEntries(
+          Object.entries(record).filter(
+            ([field, value]) =>
+              !dropped.has(field) &&
+              !(
+                value === undefined &&
+                (keyedDefaults.has(field) ||
+                  ((encodedInput as globalThis.Record<string, unknown>)[field] === undefined &&
+                    fieldAbsentReading(field) === undefined))
+              ),
+          ),
+        ),
+        (field, given) => field in given,
+      )) as globalThis.Record<string, unknown>
       const read = () =>
         client
           .getItem({ TableName: tableName, Key: marshalledKey, ConsistentRead: true })
@@ -9362,6 +9406,18 @@ const makeImpl = <
             { ...(encodedInput as globalThis.Record<string, unknown>), ...opts.withVectors },
             "upsert",
           )
+          // Clearing a composite clears what a half says, and one write can't tell what's left of
+          // it: the update's own rule says, and that needs the stored row.
+          if (
+            [...indexCompositeFields()].some(
+              (field) =>
+                upsertClears(field, (encodedInput as globalThis.Record<string, unknown>)[field]) &&
+                field !== systemFields.createdAt &&
+                field !== systemFields.updatedAt,
+            )
+          ) {
+            return yield* guardedUpsert(input, mode, opts)
+          }
 
           // Hydrate refs: replace ID fields with full entity domain data
           const encoded = hasRefs
@@ -9412,12 +9468,7 @@ const makeImpl = <
           for (const [attr, val] of Object.entries(item)) {
             if (keyAttributeFields.has(resolveDbName(attr))) continue
             if (systemColliders.has(attr)) continue
-            // A value with no stored form is an absent attribute, so it replaces what
-            // the row holds. A field left unset (an optional `undefined`) doesn't.
-            if (
-              (isEmptySet(val) || (val === undefined && fieldAbsentReading(attr) !== undefined)) &&
-              !immutableFields.has(attr)
-            ) {
+            if (upsertClears(attr, val)) {
               const nameKey = `#u${counter}`
               names[nameKey] = resolveDbName(attr)
               upsertRemoveClauses.push(nameKey)
