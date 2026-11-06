@@ -10,7 +10,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -593,17 +593,17 @@ describe.each(SETTINGS)("an aggregate's move, %s", (_direction, escapeKeys) => {
     id: edgesFirst,
   }
   /** The bounded run's rows: edges where the move put them, root where it was. */
-  const halfMoved = (table: ReturnType<typeof tableOf>) => {
+  const halfMoved = (table: ReturnType<typeof tableOf>, id = edgesFirst) => {
     const pkFor = (schema: DynamoSchema.DynamoSchema) =>
       DynamoSchema.composeCollectionKey(schema, "routes", [
-        KeyComposer.keyText(schema, edgesFirst, "lowercase"),
+        KeyComposer.keyText(schema, id, "lowercase"),
       ])
     const entry = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
     table.items.delete(entry[0])
     store(table, { ...entry[1], pk: { S: pkFor(old) } })
     const rows = [...table.items.values()].map((row) => row.pk?.S).sort()
-    expect(rows[0]).toBe(pkFor(w.schema))
-    expect(rows.at(-1)).toBe(pkFor(old))
+    expect(rows[0]).toBe(pkFor(id === edgesFirst ? w.schema : old))
+    expect(rows.at(-1)).toBe(pkFor(id === edgesFirst ? old : w.schema))
   }
 
   it.effect("a run that stopped before the root says nothing of the edges it met", () => {
@@ -669,6 +669,31 @@ describe.each(SETTINGS)("an aggregate's move, %s", (_direction, escapeKeys) => {
       } while (resume !== undefined)
       expect(pages.length).toBeGreaterThan(1)
       expect(pages.map((page) => page.skipped.unrecognizedKey)).toEqual(pages.map(() => 0))
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run resumed to the end of the table didn't read what came before its token", () => {
+    const table = tableOf()
+    // The other order: the root's old key sorts first, so an earlier page held it.
+    const rootFirst = escapeKeys ? "r 1" : "%z"
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create({ ...route, id: rootFirst })
+      halfMoved(table, rootFirst)
+      const first: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        maxPages: 1,
+      })
+      expect(first.scanned).toBe(1)
+      const rest: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        resume: Option.getOrThrow(first.resume),
+      })
+      expect(rest.resume._tag).toBe("None")
+      expect(rest.skipped.unrecognizedKey).toBe(0)
+      expect(rest.skipped.rootNotSeen).toBe(2)
     }).pipe(on(w, table))
   })
 
