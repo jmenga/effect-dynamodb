@@ -370,10 +370,10 @@ const Widgets = Entity.make({
 })
 ```
 
-`version` defaults to `"v4"` (random); pass `version: "v7"` for time-ordered ids. On `put`/`create`/`upsert` the field is optional in the input — omit it to auto-generate, or supply your own to override:
+`version` defaults to `"v4"` (random); pass `version: "v7"` for time-ordered ids, which sort in the order one client generated them. On `put`/`create`/`upsert` the field is optional in the input — omit it to auto-generate, or supply your own to override:
 
 ```typescript region="put" example="generated-id.ts"
-// No `widgetId` supplied — the library fills it from the Crypto service.
+// No `widgetId` supplied — the library fills it from the SecureRandom service.
 const created = yield* db.entities.Widgets.put({
   owner: "alice",
   label: "Sprocket",
@@ -381,7 +381,7 @@ const created = yield* db.entities.Widgets.put({
 // created.widgetId is a freshly-generated UUID
 ```
 
-The id is sourced from the bundled [`Crypto`](https://github.com/Effect-TS/effect) service. `DynamoClient.make` provides a default `globalThis.crypto`-backed implementation (no extra dependency), so bound `put` stays `R = never` — your program needs no Crypto layer. Pass `DynamoClient.make({ crypto })` to override with a platform implementation (e.g. `@effect/platform-node`).
+The id is sourced from the bundled [`SecureRandom`](https://github.com/Effect-TS/effect) service from `effect/crypto`. `DynamoClient.make` provides a default `globalThis.crypto`-backed implementation (no extra dependency), so bound `put` stays `R = never` — your program needs no `SecureRandom` layer. Pass `DynamoClient.make({ crypto })` to override it with a `SecureRandom` service of your own, built with `SecureRandom.make` or read from a platform layer.
 
 ### Unique Constraints
 

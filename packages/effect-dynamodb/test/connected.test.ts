@@ -6594,7 +6594,7 @@ describeConnected("TableConfig.ttlAttributeName override (closes #51)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// generatedId — auto-generated UUID primary keys via the Crypto service (#57)
+// generatedId — auto-generated UUID primary keys via the SecureRandom service (#57)
 // ---------------------------------------------------------------------------
 
 const genIdSchema = DynamoSchema.make({ name: "genid-test", version: 1 })
@@ -6662,8 +6662,8 @@ describeConnected("generatedId integration tests (closes #57)", () => {
   const UUID = Schema.String.check(Schema.isUUID())
 
   it.effect("put WITHOUT id → read back → id present, valid UUID, queryable by PK + GSI", () =>
-    // The typed client requires NO Crypto layer (R = never end-to-end): the
-    // default Crypto is bundled by DynamoClient.make. GenIdTestLayer provides
+    // The typed client requires NO SecureRandom layer (R = never end-to-end): the
+    // default SecureRandom is bundled by DynamoClient.make. GenIdTestLayer provides
     // only DynamoClient + TableConfig.
     Effect.gen(function* () {
       const db = yield* DynamoClient.make({
@@ -6671,7 +6671,7 @@ describeConnected("generatedId integration tests (closes #57)", () => {
         tables: { GenIdTable },
       })
 
-      // No widgetId supplied — the library fills it from the bundled Crypto.
+      // No widgetId supplied — the library fills it from the bundled SecureRandom.
       const created = yield* db.entities.GenWidgets.put({ owner: "alice", label: "Sprocket" })
 
       // id present and a valid UUID.
@@ -6695,7 +6695,7 @@ describeConnected("generatedId integration tests (closes #57)", () => {
 
   // #120 — the multi-item write paths gated on the entity's CONFIGURATION, so
   // a `generatedId` entity was barred from `transactWrite` / `Batch.write`
-  // outright, citing a `Crypto` dependency that a supplied id removes. Proven
+  // outright, citing a `SecureRandom` dependency that a supplied id removes. Proven
   // end-to-end here: the item lands, decodes, and is queryable by the primary
   // key and by the GSI its id composes into — same as a plain `put`.
   it.effect("transactWrite accepts a supplied generated id and writes a well-formed item", () =>

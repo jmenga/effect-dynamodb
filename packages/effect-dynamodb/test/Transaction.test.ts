@@ -2199,13 +2199,13 @@ describe("Transaction", () => {
 
     // #120 — the gate is on the INPUT, not the entity configuration.
     //
-    // `Entity.put` reaches `Crypto` only when the caller omitted the field
+    // `Entity.put` reaches `SecureRandom` only when the caller omitted the field
     // (`fillGeneratedId` returns the input untouched when it is present), so a
     // supplied id needs nothing this path lacks. Gating on the configuration
     // barred the entity outright and named a dependency that did not apply —
     // while the workaround the message pointed at (supply the id) was already
     // in effect.
-    it.effect("rejects a generatedId entity when the id is OMITTED — that needs Crypto", () =>
+    it.effect("rejects a generatedId entity when the id is OMITTED — that needs SecureRandom", () =>
       Effect.gen(function* () {
         const error = yield* Transaction.transactWrite([GenDocs.put({ title: "t" } as never)]).pipe(
           Effect.flip,

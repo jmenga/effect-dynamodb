@@ -13,7 +13,7 @@ Geospatial index and proximity search for [`effect-dynamodb`](https://www.npmjs.
 pnpm add @effect-dynamodb/geo effect-dynamodb effect
 ```
 
-`effect` and `effect-dynamodb` are peer dependencies.
+`effect` (`^4.1.0`) and `effect-dynamodb` are peer dependencies.
 
 ## What it does
 

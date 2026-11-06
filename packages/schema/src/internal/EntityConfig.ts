@@ -118,7 +118,7 @@ export type TimeSeriesConfig<
  *
  * When set, `put` / `create` / `upsert` fill the named field with a freshly
  * generated UUID at write time **when the caller omits it** — a caller-supplied
- * value is always respected. The id is sourced from the bundled `Crypto`
+ * value is always respected. The id is sourced from the bundled `SecureRandom`
  * service (`DynamoClient.make` provides a default; override via
  * `DynamoClient.make({ crypto })`), so bound operations keep `R = never`.
  *

@@ -153,7 +153,6 @@ import type {
 import {
   Config,
   Context,
-  Crypto,
   DateTime,
   Duration,
   Effect,
@@ -163,6 +162,7 @@ import {
   SchemaAST,
   type Stream,
 } from "effect"
+import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
@@ -1761,7 +1761,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
       readonly entities: TEntities
       readonly aggregates: TAggregates
       readonly tables: TTables
-      readonly crypto?: Crypto.Crypto
+      readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
@@ -1776,7 +1776,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
     >(config: {
       readonly entities: TEntities
       readonly aggregates: TAggregates
-      readonly crypto?: Crypto.Crypto
+      readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
@@ -1791,7 +1791,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
     >(config: {
       readonly entities: TEntities
       readonly tables: TTables
-      readonly crypto?: Crypto.Crypto
+      readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
@@ -1802,7 +1802,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
 
     <TEntities extends Record<string, { readonly _tag: "Entity" }>>(config: {
       readonly entities: TEntities
-      readonly crypto?: Crypto.Crypto
+      readonly crypto?: SecureRandom.SecureRandom["Service"]
       readonly embedder?: EmbedderService
       readonly compressors?: ReadonlyArray<Compressor>
     }): Effect.Effect<
@@ -2395,24 +2395,24 @@ const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
   readonly aggregates?: Record<string, AggregateType<any, any, any>>
   readonly tables?: Record<string, TableLike>
-  readonly crypto?: Crypto.Crypto
+  readonly crypto?: SecureRandom.SecureRandom["Service"]
   readonly embedder?: EmbedderService
   readonly compressors?: ReadonlyArray<Compressor>
 }): Effect.Effect<any, never, DynamoClient | TableConfig> =>
   Effect.gen(function* () {
     // 1. Resolve the provide function from context.
     //
-    // Bundle a `Crypto` service into the captured context so that bound entity
+    // Bundle a `SecureRandom` service into the captured context so that bound entity
     // operations (auto-generated UUID primary keys via `generatedId`) resolve a
     // cryptographically-secure source WITHOUT widening the public `R` of bound
     // methods — bound `put` stays `R = never`. A caller-supplied `crypto`
     // override (e.g. `@effect/platform-node`) takes precedence over the default
     // `globalThis.crypto`-backed wrapper. The `provide` helper is widened to
-    // admit `Crypto.Crypto`. See `DESIGN.md` for the `R = never` rationale.
+    // admit `SecureRandom`. See `DESIGN.md` for the `R = never` rationale.
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const baseCtx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
     const cryptoService = config.crypto ?? makeDefaultCrypto()
-    const withCrypto = Context.add(baseCtx, Crypto.Crypto, cryptoService)
+    const withCrypto = Context.add(baseCtx, SecureRandom.SecureRandom, cryptoService)
     // Bundle the Embedder the same way, so entities with `vectorIndexes` keep
     // `R = never` on their bound operations. An explicit `embedder` wins; an
     // ambient one already in context is honoured; otherwise nothing is added
@@ -2462,7 +2462,7 @@ const makeFromConfig = (config: {
         ? Context.add(withEmbedder, Compression, compressionRegistry)
         : withEmbedder
     const provide = <A, E>(
-      effect: Effect.Effect<A, E, DynamoClient | TableConfig | Crypto.Crypto>,
+      effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
 
     // Dimension agreement between the Embedder and every bound vector index is
@@ -2909,11 +2909,11 @@ const makeFromConfig = (config: {
         typeof (rawEntity as { get?: unknown }).get === "function"
           ? rawEntity
           : entityFromDefinition(rawEntity as unknown as EntityDefinition)
-      // Provide the resolved services (Crypto, Embedder, Compression) into the
+      // Provide the resolved services (SecureRandom, Embedder, Compression) into the
       // bind: `bind` captures its context at bind time, so the bound CRUD
       // methods resolve the explicit `crypto`, `embedder` and `compressors`
       // given here — keeping them at `R = never`. `bind` respects an
-      // already-present Crypto and only fills its own default when absent, so
+      // already-present SecureRandom and only fills its own default when absent, so
       // the override is honored.
       const bound = yield* provide(entityBind(entity as EntityType))
       const entityLike = entity as unknown as EntityLike

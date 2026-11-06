@@ -574,14 +574,15 @@ Entity.make({ …, generatedId?: { field: string; version?: "v4" | "v7" } })  //
 
 **Injection point.** The id is filled on the raw `input` **before** the encode in `Entity.put` (the `encodeOrDecodeEncode` call). `create`/`upsert` inherit via delegation. The filled id then flows through input validation → key composition (PK/SK + any GSI composites it participates in) → stored item → returned record in a single pass.
 
-**`R = never` is preserved — the crux.** `DynamoClient.make(...)` returns bound methods with `R = never`, enforced by hard-typed `provide` helpers. Filling the id requires the cryptographically-secure `Crypto` service (`effect/Crypto`), and `effect-core` ships **no default Crypto layer**. Yielding `Crypto.Crypto` in `put` would naively widen `R` to `… | Crypto.Crypto` and fail at runtime with "Service not found".
+**`R = never` is preserved — the crux.** `DynamoClient.make(...)` returns bound methods with `R = never`, enforced by hard-typed `provide` helpers. Filling the id requires the cryptographically-secure `SecureRandom` service (`effect/crypto`), and `effect-core` ships **no default SecureRandom layer**. Yielding `SecureRandom.SecureRandom` in `put` would naively widen `R` to `… | SecureRandom` and fail at runtime with "Service not found".
 
-The chosen solution (Option 1, the issue's recommendation): **bundle a default `Crypto` service into the context the typed client already captures, and widen the `provide` helpers to admit `Crypto.Crypto`.** Concretely:
+The chosen solution (Option 1, the issue's recommendation): **bundle a default `SecureRandom` service into the context the typed client already captures, and widen the `provide` helpers to admit `SecureRandom`.** Concretely:
 
-- A thin default service (`internal/DefaultCrypto.ts`) is built from `Crypto.make({ randomBytes, digest })` over `globalThis.crypto.getRandomValues` / `crypto.subtle.digest` — **no new dependency** (the global Web Crypto API is available on Node 19+ — Node 18 only with `--experimental-global-webcrypto` — browsers, and edge runtimes).
-- `Entity.bind` (where bound `put` actually runs) and `DynamoClient.makeFromConfig` each add the default via `Context.add(ctx, Crypto.Crypto, makeDefaultCrypto())` and widen their `provide` helper's input type from `Effect<A, E, DynamoClient | TableConfig>` to `… | Crypto.Crypto`. `Entity.bind` only fills the default when Crypto is absent (`Context.getOption`), so an override is respected.
-- Bound `put` stays `R = never`; the public method signatures are unchanged. Entities **without** `generatedId` never yield `Crypto` (the fill helper returns early), so their unbound ops keep `R = DynamoClient | TableConfig` exactly as before.
-- **Optional platform override:** `DynamoClient.make({ …, crypto?: Crypto.Crypto })` accepts a platform implementation (e.g. from `@effect/platform-node`) which takes precedence over the default. Crypto is **never** surfaced in the public `R` (the rejected Option 2).
+- A thin default service (`internal/DefaultCrypto.ts`) is built from `SecureRandom.make` over `globalThis.crypto.getRandomValues` — **no new dependency** (the global Web Crypto API is available on Node 19+ — Node 18 only with `--experimental-global-webcrypto` — browsers, and edge runtimes).
+- `Entity.bind` (where bound `put` actually runs) and `DynamoClient.makeFromConfig` each add the default via `Context.add(ctx, SecureRandom.SecureRandom, makeDefaultCrypto())` and widen their `provide` helper's input type from `Effect<A, E, DynamoClient | TableConfig>` to `… | SecureRandom`. `Entity.bind` only fills the default when `SecureRandom` is absent (`Context.getOption`), so an override is respected.
+- Bound `put` stays `R = never`; the public method signatures are unchanged. Entities **without** `generatedId` never yield `SecureRandom` (the fill helper returns early), so their unbound ops keep `R = DynamoClient | TableConfig` exactly as before.
+- **Optional override:** `DynamoClient.make({ …, crypto?: SecureRandom.SecureRandom["Service"] })` accepts another implementation, built with `SecureRandom.make` or read from a platform layer, which takes precedence over the default. `SecureRandom` is **never** surfaced in the public `R` (the rejected Option 2).
+- **Version 7 ids are monotonic per service.** Since Effect 4.1, each `SecureRandom` keeps its UUIDv7s in order: within a millisecond a 42-bit counter orders them, and the timestamp can run slightly ahead of the `Clock`. The default service is per client, so ordering holds within one client and not between clients or processes. The id's text form is unchanged.
 
 ### Unique Constraints
 
@@ -4881,7 +4882,7 @@ for every consumer.
 
 `DynamoClient.make({ ..., embedder })` accepts an explicit service; otherwise the
 `Embedder` service is resolved from context if present. Resolution mirrors the
-`Crypto` bundling pattern exactly, so bound entity operations stay `R = never`.
+`SecureRandom` bundling pattern exactly, so bound entity operations stay `R = never`.
 Dimension agreement between the layer and every bound vector index is validated at
 `DynamoClient.make` time — a mismatch is a construction-time failure, never a
 runtime surprise on the thousandth write.

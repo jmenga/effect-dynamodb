@@ -7,7 +7,8 @@ import type {
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Crypto, Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
+import { SecureRandom } from "effect/crypto"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
@@ -213,14 +214,14 @@ describe("Entity.make({ generatedId }) — schema optionality", () => {
   })
 })
 
-describe("Entity.make({ generatedId }) — runtime injection (R = never via bundled Crypto)", () => {
+describe("Entity.make({ generatedId }) — runtime injection (R = never via bundled SecureRandom)", () => {
   it.effect("auto-fills the id when omitted and flows into pk/sk + record", () => {
     const store: Store = { items: new Map() }
     const ClientLayer = makeInMemoryClient(store)
     const TableLayer = OrdersTable.layer({ name: "orders-table" })
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({ entities: { Orders }, tables: { Orders: OrdersTable } })
-      // NOTE: no `id` supplied — and no manual Crypto layer provided.
+      // NOTE: no `id` supplied — and no manual SecureRandom layer provided.
       const created = yield* db.entities.Orders.put({ customer: "acme", total: 42 })
 
       expect(created.customer).toBe("acme")
@@ -275,6 +276,26 @@ describe("Entity.make({ generatedId }) — runtime injection (R = never via bund
       const stored = [...store.items.values()][0]!
       expect(typeof stored.gsi1sk).toBe("string")
       expect(stored.gsi1sk as string).toContain((created.invoiceId as string).toLowerCase())
+    }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
+  })
+
+  it.effect("v7 ids from one client sort in creation order within a millisecond", () => {
+    const store: Store = { items: new Map() }
+    const ClientLayer = makeInMemoryClient(store)
+    const TableLayer = InvoicesTable.layer({ name: "invoices-table" })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Invoices },
+        tables: { Invoices: InvoicesTable },
+      })
+      // The test clock does not advance, so every put falls in one millisecond.
+      const ids: Array<string> = []
+      for (let i = 0; i < 20; i++) {
+        const created = yield* db.entities.Invoices.put({ customer: "globex", amount: i })
+        ids.push(created.invoiceId as string)
+      }
+      expect(ids).toEqual([...ids].sort())
+      expect(new Set(ids).size).toBe(20)
     }).pipe(Effect.provide(Layer.merge(ClientLayer, TableLayer)))
   })
 
@@ -362,12 +383,9 @@ describe("Entity.make({ generatedId }) — runtime injection (R = never via bund
     const store: Store = { items: new Map() }
     const ClientLayer = makeInMemoryClient(store)
     const TableLayer = OrdersTable.layer({ name: "orders-table" })
-    // Deterministic Crypto: all-zero bytes → fixed UUID. Proves the override
+    // Deterministic SecureRandom: all-zero bytes → fixed UUID. Proves the override
     // path in DynamoClient.make({ crypto }) is honored.
-    const fixedCrypto = Crypto.make({
-      randomBytes: (size) => new Uint8Array(size),
-      digest: (_algorithm, data) => Effect.succeed(data),
-    })
+    const fixedCrypto = SecureRandom.make((size) => new Uint8Array(size))
     return Effect.gen(function* () {
       const db = yield* DynamoClient.make({
         entities: { Orders },

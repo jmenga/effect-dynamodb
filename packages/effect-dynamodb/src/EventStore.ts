@@ -6593,9 +6593,9 @@ export type AdditionalItemsInput<State, Event, E2 = never, R2 = never> =
  * requirements.
  *
  * Function-only: the number of events is known only once `decide` has run.
- * The `Effect` form lets ids be minted through the `Crypto` service
- * (`crypto.randomULID`, or `randomUUIDv7`), which keeps them deterministic
- * under `TestClock` and a test `Crypto` layer with fixed bytes.
+ * The `Effect` form lets ids be minted through the `SecureRandom` service
+ * (`random.ulid`, or `random.uuidV7()`), which keeps them deterministic under
+ * `TestClock` and a fresh test `SecureRandom` with fixed bytes for each run.
  */
 export type EventMetadataInput<State, Event, TMetadata, E3 = never, R3 = never> = (
   decision: Decision<State, Event>,
@@ -6668,8 +6668,8 @@ export type CommandMetadataOptions<TMetadata, State, Event, E3 = never, R3 = nev
        * `DuplicateCommand`, so the first commit's ids are the only ones written:
        *
        * ```ts
-       * // `crypto` is the `Crypto.Crypto` service; a ULID takes its time from the
-       * // `Clock`, so `TestClock` plus a fixed-bytes `Crypto` make it deterministic
+       * // `random` is the `SecureRandom` service; a ULID takes its time from the
+       * // `Clock`, so `TestClock` plus a fixed-bytes `SecureRandom` make it deterministic
        * const handle = EventStore.commandHandler(decider, stream, {
        *   idempotency: { ttl: Duration.days(1) },
        * })
@@ -6677,7 +6677,7 @@ export type CommandMetadataOptions<TMetadata, State, Event, E3 = never, R3 = nev
        *   commandId: deliveryId,
        *   eventMetadata: ({ events }) =>
        *     Effect.forEach(events, () =>
-       *       Effect.map(crypto.randomULID, (eventId) => ({ eventId })),
+       *       Effect.map(random.ulid, (eventId) => ({ eventId })),
        *     ),
        * })
        * ```
@@ -7655,10 +7655,10 @@ const makeCommandHandlerImpl = <
  * })
  *
  * // Per-event metadata derived from the decision: entry i is written onto event i
- * // (`crypto` is the `Crypto.Crypto` service; `randomUUIDv7` works the same way)
+ * // (`random` is the `SecureRandom` service; `random.uuidV7()` works the same way)
  * yield* handle({ matchId: "m-1" }, command, {
  *   eventMetadata: ({ events }) =>
- *     Effect.forEach(events, () => Effect.map(crypto.randomULID, (eventId) => ({ eventId }))),
+ *     Effect.forEach(events, () => Effect.map(random.ulid, (eventId) => ({ eventId }))),
  * })
  *
  * // Per-event timestamps derived from the decision (undefined → the Clock time)
