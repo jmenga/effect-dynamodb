@@ -180,6 +180,12 @@ import {
   makeBoundVectorQuery,
 } from "./internal/BoundVectorQuery.js"
 import * as Capacity from "./internal/Capacity.js"
+import {
+  acquireSdkClient,
+  type ClientOptions,
+  type ClientOptionsFromConfig,
+  readClientOptions,
+} from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
 import { createConditionOps, type Expr, ExprTag } from "./internal/Expr.js"
 import {
@@ -1635,7 +1641,7 @@ export interface DynamoClientService {
 }
 
 /** Static client configuration accepted by {@link DynamoClient.layer}. */
-type ClientConfig = {
+type ClientConfig = ClientOptions & {
   readonly region: string
   readonly endpoint?: string | undefined
   readonly credentials?:
@@ -1644,7 +1650,7 @@ type ClientConfig = {
 }
 
 /** Config-provider client configuration accepted by {@link DynamoClient.layerConfig}. */
-type ClientConfigFromConfig = {
+type ClientConfigFromConfig = ClientOptionsFromConfig & {
   readonly region: Config.Config<string>
   readonly endpoint?: Config.Config<string> | undefined
   readonly credentials?:
@@ -1685,6 +1691,13 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - AWS region
    * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
    * @param config.credentials - Optional static credentials
+   * @param config.requestHandler - Optional HTTP handler, or the options of the
+   *   runtime's handler (`{ socketTimeout: 5000 }`), passed to the SDK client.
+   *   None is set by default, so without one a connection that stays open and
+   *   never answers keeps a call waiting until it is interrupted. A handler you
+   *   pass is destroyed with the layer.
+   * @param config.maxAttempts - Optional attempts per request, the first
+   *   included, passed to the SDK client (its default is 3)
    * @param config.compressors - Optional compressors for packed storage
    *   (`DynamoModel.Packed` with `compression`). When given, the layer also
    *   provides the `Compression` service built from them. That reaches whatever
@@ -1715,7 +1728,10 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
     ): Layer.Layer<DynamoClient>
   } = (config: ClientConfig & { readonly compressors?: ReadonlyArray<Compressor> | undefined }) =>
     withCompressors(
-      Layer.effect(DynamoClient, buildService(config.region, config.endpoint, config.credentials)),
+      Layer.effect(
+        DynamoClient,
+        buildService(config.region, config.endpoint, config.credentials, config),
+      ),
       config.compressors,
     ) as never
 
@@ -1726,6 +1742,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
    * @param config.credentials - Optional Config for static credentials
+   * @param config.requestHandler - Optional Config for each of the handler's
+   *   timeouts (`connectionTimeout`, `socketTimeout`, `requestTimeout`,
+   *   `throwOnRequestTimeout`), which an operator tunes per environment, or an
+   *   HTTP handler, which is code and is passed as itself. A timeout missing
+   *   from the provider stays unset.
+   * @param config.maxAttempts - Optional Config for the attempts per request
    * @param config.compressors - Optional compressors for packed storage; when
    *   given, the layer also provides the `Compression` service (see {@link layer}
    *   for why a separate `Compression.layer([...])` is the recommended form).
@@ -1756,10 +1778,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
           const credentials = config.credentials
             ? yield* Config.option(config.credentials)
             : undefined
+          const options = yield* readClientOptions(config)
           return yield* buildService(
             region,
             endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
             credentials && credentials._tag === "Some" ? credentials.value : undefined,
+            options,
           )
         }),
       ),
@@ -3619,170 +3643,178 @@ const buildService = (
   region: string,
   endpoint: string | undefined,
   credentials: { readonly accessKeyId: string; readonly secretAccessKey: string } | undefined,
+  options: ClientOptions,
 ) =>
   Effect.gen(function* () {
     const clientConfig: ConstructorParameters<typeof DynamoDBClient>[0] = { region }
     if (endpoint !== undefined) clientConfig.endpoint = endpoint
     if (credentials !== undefined) clientConfig.credentials = credentials
-    const client = yield* Effect.acquireRelease(
-      Effect.sync(() => new DynamoDBClient(clientConfig)),
-      (c) => Effect.sync(() => c.destroy()),
-    )
+    if (options.requestHandler !== undefined) clientConfig.requestHandler = options.requestHandler
+    if (options.maxAttempts !== undefined) clientConfig.maxAttempts = options.maxAttempts
+    const client = yield* acquireSdkClient(() => new DynamoDBClient(clientConfig))
     return {
       createTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new CreateTableCommand(input)),
+          try: (signal) => client.send(new CreateTableCommand(input), { abortSignal: signal }),
           catch: classifyError("CreateTable"),
         }),
       deleteTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DeleteTableCommand(input)),
+          try: (signal) => client.send(new DeleteTableCommand(input), { abortSignal: signal }),
           catch: classifyError("DeleteTable"),
         }),
       describeTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeTableCommand(input)),
+          try: (signal) => client.send(new DescribeTableCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeTable"),
         }),
       putItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new PutItemCommand(input)),
+          try: (signal) => client.send(new PutItemCommand(input), { abortSignal: signal }),
           catch: classifyError("PutItem"),
         }),
       getItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new GetItemCommand(input)),
+          try: (signal) => client.send(new GetItemCommand(input), { abortSignal: signal }),
           catch: classifyError("GetItem"),
         }),
       deleteItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DeleteItemCommand(input)),
+          try: (signal) => client.send(new DeleteItemCommand(input), { abortSignal: signal }),
           catch: classifyError("DeleteItem"),
         }),
       updateItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateItemCommand(input)),
+          try: (signal) => client.send(new UpdateItemCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateItem"),
         }),
       query: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new QueryCommand(input)),
+          try: (signal) => client.send(new QueryCommand(input), { abortSignal: signal }),
           catch: classifyError("Query"),
         }),
       scan: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ScanCommand(input)),
+          try: (signal) => client.send(new ScanCommand(input), { abortSignal: signal }),
           catch: classifyError("Scan"),
         }),
       searchVectors: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new SearchVectorsCommand(input)),
+          try: (signal) => client.send(new SearchVectorsCommand(input), { abortSignal: signal }),
           catch: classifyError("SearchVectors"),
         }),
       batchGetItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new BatchGetItemCommand(input)),
+          try: (signal) => client.send(new BatchGetItemCommand(input), { abortSignal: signal }),
           catch: classifyError("BatchGetItem"),
         }),
       batchWriteItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new BatchWriteItemCommand(input)),
+          try: (signal) => client.send(new BatchWriteItemCommand(input), { abortSignal: signal }),
           catch: classifyError("BatchWriteItem"),
         }),
       transactGetItems: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new TransactGetItemsCommand(input)),
+          try: (signal) => client.send(new TransactGetItemsCommand(input), { abortSignal: signal }),
           catch: classifyError("TransactGetItems"),
         }),
       transactWriteItems: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new TransactWriteItemsCommand(input)),
+          try: (signal) =>
+            client.send(new TransactWriteItemsCommand(input), { abortSignal: signal }),
           catch: classifyError("TransactWriteItems"),
         }),
       // --- Table management ---
       updateTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateTableCommand(input)),
+          try: (signal) => client.send(new UpdateTableCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateTable"),
         }),
       listTables: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ListTablesCommand(input)),
+          try: (signal) => client.send(new ListTablesCommand(input), { abortSignal: signal }),
           catch: classifyError("ListTables"),
         }),
       // --- Backup ---
       createBackup: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new CreateBackupCommand(input)),
+          try: (signal) => client.send(new CreateBackupCommand(input), { abortSignal: signal }),
           catch: classifyError("CreateBackup"),
         }),
       deleteBackup: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DeleteBackupCommand(input)),
+          try: (signal) => client.send(new DeleteBackupCommand(input), { abortSignal: signal }),
           catch: classifyError("DeleteBackup"),
         }),
       listBackups: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ListBackupsCommand(input)),
+          try: (signal) => client.send(new ListBackupsCommand(input), { abortSignal: signal }),
           catch: classifyError("ListBackups"),
         }),
       restoreTableFromBackup: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new RestoreTableFromBackupCommand(input)),
+          try: (signal) =>
+            client.send(new RestoreTableFromBackupCommand(input), { abortSignal: signal }),
           catch: classifyError("RestoreTableFromBackup"),
         }),
       // --- PITR ---
       describeContinuousBackups: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeContinuousBackupsCommand(input)),
+          try: (signal) =>
+            client.send(new DescribeContinuousBackupsCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeContinuousBackups"),
         }),
       updateContinuousBackups: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateContinuousBackupsCommand(input)),
+          try: (signal) =>
+            client.send(new UpdateContinuousBackupsCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateContinuousBackups"),
         }),
       restoreTableToPointInTime: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new RestoreTableToPointInTimeCommand(input)),
+          try: (signal) =>
+            client.send(new RestoreTableToPointInTimeCommand(input), { abortSignal: signal }),
           catch: classifyError("RestoreTableToPointInTime"),
         }),
       // --- Export ---
       exportTableToPointInTime: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ExportTableToPointInTimeCommand(input)),
+          try: (signal) =>
+            client.send(new ExportTableToPointInTimeCommand(input), { abortSignal: signal }),
           catch: classifyError("ExportTableToPointInTime"),
         }),
       describeExport: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeExportCommand(input)),
+          try: (signal) => client.send(new DescribeExportCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeExport"),
         }),
       // --- TTL ---
       updateTimeToLive: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateTimeToLiveCommand(input)),
+          try: (signal) => client.send(new UpdateTimeToLiveCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateTimeToLive"),
         }),
       describeTimeToLive: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeTimeToLiveCommand(input)),
+          try: (signal) =>
+            client.send(new DescribeTimeToLiveCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeTimeToLive"),
         }),
       // --- Tags ---
       tagResource: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new TagResourceCommand(input)),
+          try: (signal) => client.send(new TagResourceCommand(input), { abortSignal: signal }),
           catch: classifyError("TagResource"),
         }),
       untagResource: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UntagResourceCommand(input)),
+          try: (signal) => client.send(new UntagResourceCommand(input), { abortSignal: signal }),
           catch: classifyError("UntagResource"),
         }),
       listTagsOfResource: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ListTagsOfResourceCommand(input)),
+          try: (signal) =>
+            client.send(new ListTagsOfResourceCommand(input), { abortSignal: signal }),
           catch: classifyError("ListTagsOfResource"),
         }),
     } satisfies DynamoClientService
