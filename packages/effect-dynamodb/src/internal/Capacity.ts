@@ -521,9 +521,10 @@ const runIn = <A, E, R>(
 }
 
 /**
- * A value the library refuses to compose or send, thrown where there's no error channel to fail
- * into: no key text (`[EDD-9096]`), no Z-order level (`[EDD-9092]`), no shard source (`[EDD-9100]`),
- * no DynamoDB form (`[EDD-9124]`).
+ * A value the library refuses to compose into a key, thrown where there's no error channel to fail
+ * into: no key text (`[EDD-9096]`), no Z-order level (`[EDD-9092]`), no shard source (`[EDD-9100]`).
+ * A value DynamoDB can't store is `Marshaller.UnstorableValue`, which every path that marshals a
+ * caller's value refuses itself, naming the field (`marshalOrFail`).
  */
 export const isRefusedValue = (u: unknown): boolean =>
   isKeyValueError(u) || isZOrderValueError(u) || isShardSourceError(u)
@@ -547,10 +548,10 @@ const refusalOf = (
 }
 
 /**
- * A caller's value that can't be composed or sent is the caller's error, on every path, never a
- * defect: anything thrown below an operation fails it with a `ValidationError`, which each operation
- * that takes a value has in its error channel. Thrown by the composer or the marshaller, it means
- * nothing was sent for that item.
+ * A caller's value that can't be composed is the caller's error, on every path, never a defect:
+ * anything thrown below an operation fails it with a `ValidationError`, which each operation that
+ * takes a value has in its error channel. Thrown by the composer, it means nothing was sent for that
+ * item.
  */
 export const refusalsFail = <A, E, R>(
   name: string,
@@ -648,7 +649,7 @@ export const delegate = <A, E, R>(
  * run (each run is one operation), and carries the resolved setting and
  * scope to every page pull, which happens later from the consumer's fiber.
  */
-export const scopedStream = <A, E, R>(
+export const operationStream = <A, E, R>(
   name: string,
   options: OperationOptions | undefined,
   stream: Stream.Stream<A, E, R>,
@@ -669,41 +670,24 @@ export const scopedStream = <A, E, R>(
             return Effect.succeed(Stream.provideService(withSettings, CurrentOperation, parent))
           return Effect.gen(function* () {
             const scope = newScope(name, options, settings, parent)
-            let scopedRun = Stream.provideService(withSettings, CurrentOperation, scope)
+            let scoped = Stream.provideService(withSettings, CurrentOperation, scope)
             if (settings.spans) {
               const span = yield* Effect.makeSpanScoped(spanName(name), {
                 kind: spanKind(scope),
                 attributes: startAttributes(scope),
               })
               scope.span = span
-              scopedRun = Stream.provideService(scopedRun, Tracer.ParentSpan, span)
+              scoped = Stream.provideService(scoped, Tracer.ParentSpan, span)
             }
             // Added after the span, so it runs first: the span is annotated
             // before it ends.
             yield* Effect.addFinalizer((exit) => finish(scope, exit))
-            return scopedRun
+            return scoped
           })
         }),
       ),
     )
   })
-
-/** {@link scopedStream} as a library operation, with {@link refusalsFail}'s rule. */
-export const operationStream = <A, E, R>(
-  name: string,
-  options: OperationOptions | undefined,
-  stream: Stream.Stream<A, E, R>,
-  mode: "operation" | "delegate" = "operation",
-): Effect.Effect<Stream.Stream<A, E, R>> =>
-  scopedStream(
-    name,
-    options,
-    Stream.catchCause(stream, (cause) => {
-      const refusal = refusalOf(name, options, cause)
-      return refusal === undefined ? Stream.failCause(cause) : (Stream.fail(refusal) as never)
-    }),
-    mode,
-  )
 
 /**
  * Strip per-call state from a context captured for later use: the current

@@ -80,19 +80,14 @@ describeConnected("values that can't be stored, on DynamoDB", () => {
       cases: ReadonlyArray<
         readonly [string, (client: any) => Effect.Effect<unknown, unknown, any>]
       >,
-      tag: string,
-      code: string,
+      refused: (run: Effect.Effect<unknown, unknown, any>) => Effect.Effect<void, unknown, any>,
     ) => {
       for (const [name, run] of cases) {
         it.effect(name, () =>
           onTable(w.MainTable, w.Base, (tableName) =>
             Effect.gen(function* () {
               const client = yield* w.client as Effect.Effect<any>
-              yield* RefusedValues.expectRefused(
-                Effect.suspend(() => run(client)),
-                tag,
-                code,
-              )
+              yield* refused(Effect.suspend(() => run(client)))
               expect(yield* rowsOf(tableName)).toEqual([])
             }),
           ),
@@ -101,17 +96,15 @@ describeConnected("values that can't be stored, on DynamoDB", () => {
     }
 
     describe("[EDD-9096] NaN as a key", () => {
-      each(RefusedValues.keyCases(w, Number.NaN), "KeyValueError", "[EDD-9096]")
+      each(RefusedValues.keyCases(w, Number.NaN), (run) =>
+        RefusedValues.expectRefused(run, "KeyValueError", "[EDD-9096]"),
+      )
     })
     describe("[EDD-9124] NaN as a value", () => {
-      each(RefusedValues.valueCases(w, Number.NaN), "UnstorableValueError", "[EDD-9124]")
+      each(RefusedValues.valueCases(w, Number.NaN), RefusedValues.expectUnstorable)
     })
     describe("[EDD-9124] Infinity as a value", () => {
-      each(
-        RefusedValues.valueCases(w, Number.POSITIVE_INFINITY),
-        "UnstorableValueError",
-        "[EDD-9124]",
-      )
+      each(RefusedValues.valueCases(w, Number.POSITIVE_INFINITY), RefusedValues.expectUnstorable)
     })
 
     it.effect("a row 1.36 stored under NaN's text is scanned, and rekey leaves it", () => {

@@ -719,7 +719,7 @@ describe("a value DynamoDB can't store", () => {
       const db = yield* DynamoClient.make({ entities: { Products }, tables: { MainTable } })
       for (const [value, says] of [
         [Number.NaN, /"category": .*NaN/],
-        [new Set(), /"category": DynamoDB has no empty set\. Nothing was sent\./],
+        [new Set(), /"category": DynamoDB has no empty set\. \[EDD-9124\] Nothing was sent\./],
         [[new Set()], /"category\[0\]": .*no empty set/],
       ] as const) {
         const error: any = yield* Effect.flip(

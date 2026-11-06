@@ -81,11 +81,22 @@ export const refusedWorld = (escapeKeys: boolean, prefix = "refused") => {
     },
   })
   const Retained = Entity.make({
-    model: Schema.Struct({ retainedId: Schema.String, slot: Schema.Number }),
+    model: Schema.Struct({
+      retainedId: Schema.String,
+      slot: Schema.Number,
+      score: Schema.optional(Schema.Number),
+    }),
     entityType: "Retained",
     primaryKey: {
       pk: { field: "pk", composite: ["retainedId"] },
       sk: { field: "sk", composite: ["slot"] },
+    },
+    indexes: {
+      byScore: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["retainedId"] },
+        sk: { field: "gsi1sk", composite: ["score"] },
+      },
     },
     versioned: { retain: true },
   })
@@ -191,6 +202,10 @@ export const keyCases = (w: RefusedWorld, v: number): ReadonlyArray<Case> => {
     [
       "upsert of an index composite",
       (c) => c.entities.Gauges.upsert({ gaugeId: "g", slot: 1, score: v }).asEffect(),
+    ],
+    [
+      "upsert that reads first, of an index composite",
+      (c) => c.entities.Retained.upsert({ retainedId: "r", slot: 1, score: v }).asEffect(),
     ],
     ["restore", (c) => c.entities.Gauges.restore(key)],
     ["purge", (c) => c.entities.Gauges.purge(key)],
@@ -364,4 +379,11 @@ export const expectRefused = (
     expect(error._tag).toBe("ValidationError")
     expect(error.cause._tag).toBe(tag)
     expect(error.cause.message).toContain(code)
+  })
+
+/** `run` refused as a value DynamoDB can't store: a `ValidationError` saying so in words. */
+export const expectUnstorable = (run: Effect.Effect<unknown, unknown, any>) =>
+  Effect.map(Effect.flip(run), (error: any) => {
+    expect(error._tag).toBe("ValidationError")
+    expect(String(error.cause)).toContain("[EDD-9124]")
   })

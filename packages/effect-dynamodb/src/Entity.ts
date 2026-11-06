@@ -2655,7 +2655,7 @@ const makeImpl = <
 
   /**
    * For a path that has composed its keys: a `NaN` `fieldsToStore` left to key composition,
-   * which didn't refuse it. It fed a half that wasn't composed, or `escapeKeys` is off.
+   * which didn't refuse it, because it fed a half that wasn't composed.
    */
   const refuseUncomposed = (
     encoded: unknown,
@@ -2930,7 +2930,7 @@ const makeImpl = <
         return (
           `pathSet on "${path}": DynamoDB can't store this value, and a list element can't be ` +
           "left out without moving the elements after it. Use pathRemove to remove the " +
-          "element. Nothing was sent."
+          "element. [EDD-9124] Nothing was sent."
         )
       }
       pathRemoves.push(op.segments)

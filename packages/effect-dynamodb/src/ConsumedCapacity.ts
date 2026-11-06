@@ -131,7 +131,7 @@ export const withOperationStream: {
     self: Stream.Stream<A, E, R>,
     name: string,
     options?: Capacity.OperationOptions,
-  ): Stream.Stream<A, E, R> => Stream.unwrap(Capacity.scopedStream(name, options, self)),
+  ): Stream.Stream<A, E, R> => Stream.unwrap(Capacity.operationStream(name, options, self)),
 )
 
 /** Span attribute names, so applications and tests need no string literals. */

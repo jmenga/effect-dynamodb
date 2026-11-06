@@ -13,7 +13,7 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
@@ -566,31 +566,31 @@ describe.each(
     describe(`[EDD-9124] ${label} has no DynamoDB form`, () => {
       for (const [name, run] of RefusedValues.valueCases(w, value)) {
         it.effect(name, () =>
-          provided((client) =>
-            RefusedValues.expectRefused(
-              Effect.suspend(() => run(client)),
-              "UnstorableValueError",
-              "[EDD-9124]",
-            ),
-          ),
+          provided((client) => RefusedValues.expectUnstorable(Effect.suspend(() => run(client)))),
         )
       }
     })
   }
 
-  it.effect("[EDD-9124] an empty set has no DynamoDB form either", () =>
-    provided((client) =>
-      RefusedValues.expectRefused(
-        client.entities.Gauges.put({
-          gaugeId: "g",
-          slot: 1,
-          score: 1,
-          tags: new Set<string>(),
-        }).asEffect(),
-        "UnstorableValueError",
-        "[EDD-9124]",
+  it.effect(
+    "an empty set isn't refused where a row can be without it: it's an absent attribute",
+    () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          const put = yield* Effect.exit(
+            client.entities.Gauges.put({
+              gaugeId: "g",
+              slot: 1,
+              score: 1,
+              tags: new Set<string>(),
+            }).asEffect(),
+          )
+          // Refused here only by the layer's dying write, past the marshaller.
+          expect(String(Exit.isFailure(put) ? Cause.squash(put.cause) : "")).not.toContain(
+            "EDD-9124",
+          )
+        }),
       ),
-    ),
   )
 })
 

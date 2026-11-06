@@ -160,7 +160,7 @@ describe("values with no stored form", () => {
       expect(bare.path).toEqual([0])
       expect(refusal(() => toAttributeValue(new Set())).path).toEqual([])
       expect(refusal(() => toAttributeValue(new Set())).describe()).toBe(
-        "DynamoDB has no empty set.",
+        "DynamoDB has no empty set. [EDD-9124]",
       )
       expect(refusal(() => toAttributeValue(new Set(), "a")).path).toEqual(["a"])
       expect(refusal(() => toAttributeValue({ b: [new Set()] }, "a")).path).toEqual(["a", "b", 0])
@@ -222,7 +222,6 @@ describe("Marshaller", () => {
       ["Infinity", Number.POSITIVE_INFINITY],
       ["-Infinity", Number.NEGATIVE_INFINITY],
       ["a number past MAX_SAFE_INTEGER", 1e21],
-      ["an empty set", new Set()],
     ] as const
 
     for (const [name, value] of refused) {
@@ -238,17 +237,16 @@ describe("Marshaller", () => {
           } catch (error) {
             thrown = error
           }
-          expect(thrown).toBeInstanceOf(UnstorableValueError)
-          expect(isUnstorableValueError(thrown)).toBe(true)
-          expect((thrown as UnstorableValueError).message).toContain("[EDD-9124]")
-          expect((thrown as UnstorableValueError).cause).toBeInstanceOf(Error)
+          expect(isUnstorableValue(thrown)).toBe(true)
+          expect((thrown as UnstorableValue).message).toContain("[EDD-9124]")
+          expect((thrown as UnstorableValue).describe()).toContain("[EDD-9124]")
         }
       })
     }
 
     it("anything else isn't one", () => {
-      expect(isUnstorableValueError(new Error("x"))).toBe(false)
-      expect(isUnstorableValueError(undefined)).toBe(false)
+      expect(isUnstorableValue(new Error("x"))).toBe(false)
+      expect(isUnstorableValue(undefined)).toBe(false)
       expect(toAttributeValue(0)).toEqual({ N: "0" })
       expect(toAttributeValue(10n ** 30n)).toEqual({ N: String(10n ** 30n) })
     })
