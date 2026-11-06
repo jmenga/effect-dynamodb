@@ -158,8 +158,9 @@ const conflict = yield* db.entities.Vehicles.update({ vehicleId: "v-2" })
   .pipe(Effect.catchTag("UniqueConstraintViolation", (e) => Effect.succeed(e.constraint)))
 // "deviceBinding"
 
-// defined → undefined: the value is released and can be claimed elsewhere
-yield* db.entities.Vehicles.update({ vehicleId: "v-1" }).pipe(Entity.remove(["deviceBinding"]))
+// defined → undefined: the value is released and can be claimed elsewhere.
+// .set({ deviceBinding: undefined }) is the same write
+yield* db.entities.Vehicles.update({ vehicleId: "v-1" }).remove(["deviceBinding"])
 yield* db.entities.Vehicles.update({ vehicleId: "v-2" }).set({ deviceBinding: "device-xyz" })
 // Succeeds — v-1 released the value
 ```

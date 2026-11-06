@@ -362,7 +362,7 @@ These functions transform entity operations via pipe:
 | `expectedVersion(n)` | `EntityUpdate` | Optimistic lock — fail if version doesn't match. Requires a `versioned` entity: on any other it fails with a `ValidationError` before anything is sent |
 | `consistentRead` | `EntityGet` | Enable strongly consistent reads |
 | `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression`. A later one replaces an earlier one. It is ANDed with the op's own guard (`create`'s not-exists, `patch`'s and `deleteIfExists`'s exists), never in its place. An empty condition (`{}`, `and()`) is no condition. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before anything is sent. An `isIn` with no values is sent, and DynamoDB's rejection of its `IN ()` is a `ValidationError` naming it |
-| `remove(fields)` | `EntityUpdate` | REMOVE attributes from the item |
+| `remove(fields)` | `EntityUpdate` | REMOVE model fields a row can lack; `set({ field: undefined })` is the same write. A required field, a stored attribute name or an attribute the library manages doesn't compile, and fails with a `ValidationError` before anything is sent. Use `pathRemove` for an attribute the model no longer declares |
 | `add(values)` | `EntityUpdate` | Atomically ADD to numeric attributes |
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
 | `append(values)` | `EntityUpdate` | Append to list attributes (`list_append`) |
@@ -942,7 +942,7 @@ import {
 | Combinator | Description |
 |------------|-------------|
 | `Entity.pathSet(op)` | SET nested path or attribute-to-attribute copy |
-| `Entity.pathRemove(segments)` | REMOVE nested path or array element |
+| `Entity.pathRemove(segments)` | REMOVE nested path or array element. A path the model requires, or a name that isn't the model's, fails with a `ValidationError`, as `remove` does. An attribute the model doesn't know is allowed |
 | `Entity.pathAdd(op)` | ADD to nested numeric/set |
 | `Entity.pathSubtract(op)` | Subtract from nested numeric |
 | `Entity.pathAppend(op)` | Append to nested list |

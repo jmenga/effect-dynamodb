@@ -261,6 +261,46 @@ All combinators chain as methods on the `BoundUpdate` builder. They compile to a
     .expectedVersion(6)
 ```
 
+### Clearing a Field
+
+`.remove(["field"])` and `.set({ field: undefined })` are one operation. The attribute goes, any index key built from it goes (see [Index Policy](/effect-dynamodb/guides/index-policy/)), and a unique value it held is released. A value that encodes to nothing clears the same way, such as `Option.none()` on a `Schema.OptionFromOptional` field.
+
+```typescript region="update-clear" example="guide-expressions.ts"
+  // One operation, two spellings: the attribute goes, any index key built from it goes,
+  // and a unique value it held is released.
+  yield* db.entities.Products.update({ productId: "p-4" }).remove(["description"])
+  yield* db.entities.Products.update({ productId: "p-4" }).set({ description: undefined })
+
+  // A field no row can be without doesn't compile, and is refused before anything is sent:
+  // the row would no longer be readable.
+  const refusal = yield* db.entities.Products.update({ productId: "p-4" })
+    // @ts-expect-error `name` is required
+    .remove(["name"])
+    .asEffect()
+    .pipe(Effect.flip)
+
+  // An attribute the model no longer declares is cleaned up with a path.
+  yield* db.entities.Products.update({ productId: "p-4" }).pathRemove(["retiredAttribute"])
+```
+
+A row can lack a field if it still decodes without it: `Schema.optional`, `Schema.optionalKey`, the `Schema.OptionFromOptional` family, or a decoding default, which is what the field reads back as. Anything else is refused with a `ValidationError`, for `.remove`, `.set({ field: undefined })`, a `pathRemove`, and the `.remove` on a time-series `.append`. So is a required property below a field, such as `pathRemove(["address", "city"])` when `city` is required, even if `address` itself is optional.
+
+`Schema.NullOr` requires the key and allows an empty value, so `.set({ field: null })` stores a `null` rather than clearing it. On an optional field, `null` clears as `undefined` does.
+
+Every update operation names model fields, never what the library stores. These are refused the same way, for `.remove`, `.add`, `.subtract`, `.append`, `.deleteFromSet` and every path operation:
+
+| Name | Why, and what to do instead |
+|---|---|
+| Another field's stored name (`g` for `configure(M, { region: { field: "g" } })`) | Name the model field, `region` |
+| A secondary index's key attribute (`gsi1pk`) | The library composes it. Clear the composite it's built from |
+| `__edd_e__` and any other `__edd_*` attribute | The library manages them |
+| The version attribute, `createdAt`, `updatedAt`, `deletedAt`, the TTL attribute | The library manages them, on an entity configured to use them |
+| A primary-key composite, or `pk` / `sk` | It identifies the item |
+| An immutable field | It can't change after creation |
+| A sparse map, or one of its entries by stored name | Use `.removeEntries` or `.clearMap` |
+
+An attribute the model simply doesn't know stays allowed at run time, because that's the only way to clean up one it no longer declares. The types only offer the model's own names to `.remove`, so use `.pathRemove(["attribute"])` for it.
+
 ### Path-Based Combinators
 
 For nested attributes, array elements, and attribute-to-attribute operations, use the path-based combinators. These take the update operation as the first argument, so wrap them in a lambda when passing as a combinator to `update()`:
@@ -310,7 +350,7 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 | Operation | Record Combinator | Path Combinator | DynamoDB |
 |---|---|---|---|
 | Set value | `Entity.set({ field: value })` | `Entity.pathSet(...)` | `SET #f = :v` |
-| Remove attribute | `Entity.remove(["field"])` | `Entity.pathRemove(segs)` | `REMOVE #f` |
+| Remove attribute a row can lack | `Entity.remove(["field"])` | `Entity.pathRemove(segs)` | `REMOVE #f` |
 | Atomic add | `Entity.add({ field: n })` | `Entity.pathAdd(...)` | `ADD #f :v` |
 | Subtract | `Entity.subtract({ field: n })` | `Entity.pathSubtract(...)` | `SET #f = #f - :v` |
 | Append to list | `Entity.append({ field: [...] })` | `Entity.pathAppend(...)` | `SET #f = list_append(#f, :v)` |

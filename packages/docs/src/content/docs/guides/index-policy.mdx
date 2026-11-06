@@ -115,7 +115,7 @@ The roll-up is **per-key** — each half's outcome applies to its own key attrib
 | **REMOVE** this half's key | Half evaluated, can't compose (empty leading prefix OR hole pattern), AND policy is `'sparse'` OR a composite is in `Entity.remove([...])` (cascade override under preserve) |
 | **noop** (stored key may go stale) | Half evaluated, can't compose, policy is `'preserve'`, AND no composite is in `Entity.remove` |
 
-The "noop with stale risk" row is the one place sparse vs preserve actually differ at runtime. Under preserve, if you `set({ X: undefined })` for an optional composite without supplying surrounding context, the GSI key isn't updated — it retains whatever was stored last. To force a clean cleanup under preserve, use `Entity.remove(["X"])`: the cascade override fires and REMOVEs the half.
+The "noop with stale risk" row is the one place sparse vs preserve actually differ at runtime. Under preserve, if an update names one composite of a half and leaves out the one before it, the GSI key isn't updated: it retains whatever was stored last. Leaving a composite out says nothing about it. Clearing it does, with `.remove(["X"])` or `.set({ X: undefined })`: the cascade override fires and REMOVEs the half.
 
 ## 7. Worked examples
 
@@ -133,9 +133,9 @@ yield* db.entities.Devices.put({
   timestamp: "2026-04-30T10:00:00Z",
 })
 
-// "No alert this event" — alertState explicitly undefined. sk touched
-// (alertState is in payload), can't compose (empty leading prefix) →
-// sparse → REMOVE sk. pk untouched → preserved.
+// "No alert this event" — alertState cleared, the same write as
+// .remove(["alertState"]). sk can't compose without it → REMOVE sk.
+// pk untouched → preserved.
 yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({
   alertState: undefined,
   timestamp: "2026-04-30T11:00:00Z",
@@ -179,7 +179,7 @@ yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
   timestamp: "2026-04-30T11:00:00Z",
 })
 
-// Telemetry "no alert" event — sk touched, can't compose, sparse →
+// Telemetry "no alert" event — alertState cleared, sk can't compose →
 // REMOVE sk. pk preserved. Item invisible in GSI but gsi1pk persists.
 yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
   alertState: undefined,
@@ -255,24 +255,18 @@ Composites can never be `null` (EDD-9025 — see [§10](#10-make-time-guarantees
 // payload doesn't widen beyond model)
 yield* db.entities.X.update(key).set({ X: null })
 
-// ✅ Use undefined for an optional composite, or Entity.remove for required
-yield* db.entities.X.update(key).set({ X: undefined })       // X must be Schema.optional
-yield* db.entities.X.update(key).remove(["X"])               // works for required + optional
+// ✅ Clear an optional composite, by either spelling
+yield* db.entities.X.update(key).set({ X: undefined })       // X must be one a row can lack
+yield* db.entities.X.update(key).remove(["X"])               // the same write
 ```
 
-### Preserve + `set({ X: undefined })` leaves stale risk
+### `set({ X: undefined })` is `remove(["X"])`
 
-Under preserve, an `set({ X: undefined })` on an optional composite touches the half but can't compose without `X`. Per the per-half outcome rule, preserve + can't-compose + no `removedSet` → noop. The stored gsi1sk **is not updated** — it retains whatever was last composed, possibly a stale value derived from the old `X`.
+They're one operation: the attribute goes and the cascade override fires, under `preserve` as under `sparse`. Before this was the rule, `set({ X: undefined })` under preserve removed the attribute and left the key, so the index kept a row under a value it no longer had. A row left that way by an earlier release is put right by the next update that clears `X`, or by rewriting it.
 
-To force the cleanup, use `Entity.remove(["X"])` instead. The composite is added to `removedSet`, the cascade override fires, and the half's key is REMOVE'd cleanly:
+A composite a row can't lack can't be cleared at all: it doesn't compile, and it's refused with a `ValidationError` before anything is sent, because the row would no longer be readable. Make it optional if a row can really be without it. See [Clearing a Field](/effect-dynamodb/guides/expressions/#clearing-a-field).
 
-```typescript
-// Stale risk — stored gsi1sk may reflect old X
-yield* db.entities.X.update(key).set({ X: undefined })
-
-// Force cleanup — REMOVE the half's key via cascade override
-yield* db.entities.X.update(key).remove(["X"])
-```
+To leave a half alone under preserve, leave the composite out of the update.
 
 ### `Entity.remove(["X"])` doesn't truncate without supplied parents (set/remove asymmetry)
 

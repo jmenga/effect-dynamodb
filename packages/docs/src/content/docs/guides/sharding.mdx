@@ -316,7 +316,7 @@ yield* db.entities.Devices.update(key).set({ tenantId: TENANT, groupId: "group-b
 | Sets `by` only | `EDD-9100`, under both [policies](/effect-dynamodb/guides/index-policy/): the new key can't be composed, and leaving it would make pruned queries miss the item |
 | Sets the partition key composites without `by` | `EDD-9100`: the new key's shard can't be computed |
 | Sets `by` and the partition key composites, with the sort key missing another composite | `EDD-9100` under `preserve`: the sort key would stay at the old value in the new value's shard, where no query could find it. Include the composite, or `.remove()` it to take the item out of the index. This holds even if the value you named is the one already stored, since nothing is read to tell |
-| `.remove(["groupId"])` | The entry is removed, under both policies. No unsharded key is written |
+| `.remove(["groupId"])` or `.set({ groupId: undefined })` | The entry is removed, under both policies. No unsharded key is written |
 | A `sparse` partition key half that can't compose | The entry is removed as on any index. No unsharded key is written |
 | A `preserve` half with nothing touched | Left as it is |
 | An unrelated `.set({ status })` | Touches no key, even if `by` is unknown to this writer |

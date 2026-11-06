@@ -1300,12 +1300,13 @@ indexes: {
 - `indexPolicy: { pk: 'sparse' | 'preserve', sk: 'sparse' | 'preserve' }`. Both halves default to `'preserve'` if `indexPolicy` is omitted entirely or either half is unspecified.
 - The standard composition path has no per-composite information to discriminate within a half (it has only the merged payload, no read-before-write), so per-attribute policy callbacks were removed. A half is a single concatenated string; per-attribute mixing within a half has no coherent semantic.
 
-**Two-way payload classification.** v1.7.x collapses the v1.6 three-way classification (present / explicit-clear / omitted) to two states: **present** or **absent**. `attr: null`, `attr: undefined`, and "key omitted from payload" all mean "absent" for GSI-composition purposes.
+**Two-way payload classification.** v1.7.x collapses the v1.6 three-way classification (present / explicit-clear / omitted) to two states: **present** or **absent**. `attr: null`, an `append`'s `attr: undefined`, and "key omitted from payload" all mean "absent" for GSI-composition purposes. An update's `attr: undefined` never reaches the composer as a payload value: it is `.remove([attr])` (see "Clearing a field" below).
 
 | Payload state | What library does for GSI composition |
 |---|---|
 | `attr: <value>` | Use the value as a slot in the composed half |
-| `attr: null` *or* `attr: undefined` *or* (key omitted) | Treat as **absent** — the composition is built from the leading prefix of present values |
+| `attr: null` *or* an `append`'s `attr: undefined` *or* (key omitted) | Treat as **absent** — the composition is built from the leading prefix of present values |
+| An update's `attr: undefined` | In `removedSet`, not in the payload — the same as `.remove([attr])` |
 
 `set({ attr: null })` is no longer a separate "drop signal" — it still REMOVEs the attribute from the item (the data-attribute REMOVE clause), but it does not separately cascade-drop the GSI keys. Drop-via-cascade goes through `Entity.remove([attr])` instead.
 
@@ -1412,10 +1413,10 @@ If you want to demote (truncate) hierarchically, you must `set` the surviving co
 
 #### How to drop a half (call-site syntax)
 
-| Composite is... | Method 1: `Entity.remove` (always works) | Method 2: `set` with `undefined` |
+| Composite is... | `Entity.remove` | `set` with `undefined`, the same write |
 |---|---|---|
-| **Required** in model (e.g. `Schema.String`) | `update(key).remove(["composite"])` | not available — TS rejects `undefined` for non-optional fields under `exactOptionalPropertyTypes` (the v1.7.0 NullishOr revert ensures payload types match model declarations) |
-| **Optional** in model (`Schema.optional(...)`) | `update(key).remove(["composite"])` | `update(key).set({ composite: undefined })` |
+| **One a row can lack** (`Schema.optional`, `Schema.optionalKey`, the `OptionFromOptional` family; a decoding default stores the default instead of dropping the half) | `update(key).remove(["composite"])` | `update(key).set({ composite: undefined })` |
+| **One a row can't lack** (`Schema.String`, a primary-key composite) | Refused: a compile error, and a `ValidationError` before anything is sent | The same |
 
 Naming any one composite of a half is enough — `Entity.remove` doesn't require enumerating all of them. `null` is **never** valid for a composite (EDD-9025 rejects nullable composites at make-time).
 
@@ -1450,7 +1451,7 @@ For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { 
 
 The semantic justification: composites participate in string composition (`acc#X#alert#Y`); null is not a meaningful slot value, only present-with-value or absent. Allowing `Schema.NullOr` on a composite would let `set({ composite: null })` typecheck and then immediately blow up at runtime (or worse, silently produce a key with the literal string `"null"` as a slot). EDD-9025 catches this at make-time.
 
-The sparse pattern is still expressible — use `Schema.optional(...)`, which produces `T | undefined` (without `null`). `undefined` is "absent" under the two-way classification.
+The sparse pattern is still expressible — use `Schema.optional(...)`, which produces `T | undefined` (without `null`). An update's `undefined` clears the composite; an `append`'s is "absent" under the two-way classification.
 
 **Footgun closed at the type level — `set({ composite: null })` no longer compiles.** Two changes work together (both shipped in v1.7.0, kept in v1.7.1):
 
@@ -1483,7 +1484,7 @@ entity.update(key).remove(['alertState']).asEffect()
 | Enrichment | `{ accountId: "newAcct" }` | touched, SET full → new `account#newAcct` | untouched, **noop** | Visible under new account, sk position unchanged |
 | Telemetry (active alert) | `{ alertState: "active", timestamp: T2 }` | untouched, **noop** | touched, SET full → fresh `alert#active#ts#T2` | Visible under last accountId, fresh sk |
 | Telemetry (no alert) | `{ timestamp: T2 }` (alertState omitted, optional) | untouched, **noop** | touched (timestamp), can't compose (hole) + sparse → REMOVE gsi1sk | Invisible (DDB needs both); gsi1pk preserved |
-| Telemetry (explicit clear) | `{ alertState: undefined, timestamp: T2 }` | untouched, **noop** | touched, can't compose + sparse → REMOVE gsi1sk | Same — invisible, gsi1pk preserved |
+| Telemetry (explicit clear) | `{ alertState: undefined, timestamp: T2 }` | untouched, **noop** | `alertState` in `removedSet`, can't compose → REMOVE gsi1sk, and the attribute | Same — invisible, gsi1pk preserved |
 | Stamp (unrelated write) | `{ published: {...} }` | untouched, **noop** | untouched, **noop** | Unchanged — both halves preserved (the v1.7.0 leak is closed) |
 | Telemetry (rejoin) | `{ alertState: "active", timestamp: T3 }` | untouched, **noop** | touched, SET full → `alert#active#ts#T3` | Re-visible under preserved gsi1pk + new gsi1sk; **no enrichment re-fire needed** |
 | Hierarchical demote (different entity, multi-composite SK) | `update(key).set({ region, country, city }).remove(["site"])` | n/a | touched (set + removedSet), trailing-absent → SET truncated to `region#APAC#country#AU#city#Sydney` | Re-indexed at city scope |
@@ -1500,7 +1501,7 @@ entity.update(key).remove(['alertState']).asEffect()
 
 `by` attributes are sort key composites, and the skip-predicate looks only at a half's own composites, so an update setting only `groupId` would leave the stored shard stale and pruned queries would miss the item. **`by` attributes are therefore dependencies of the PK half, but only when the writer touches them.** `keyRecord` membership doesn't count: the retain path's `keyRecord` holds the whole item, and a default source is immutable, so neither is evidence of a change.
 
-Over the `by` attributes only: **T** one has a value in the payload; **N** one is `null` / `undefined` in the payload; **R** one is in `removedSet`; **A** a source attribute is absent from the merged record; **PT** a PK composite has a value in the payload.
+Over the `by` attributes only: **T** one has a value in the payload; **N** one is `null` in the payload, or `undefined` in an `append`'s (an update's `undefined` is **R**); **R** one is in `removedSet`; **A** a source attribute is absent from the merged record; **PT** a PK composite has a value in the payload.
 
 **Gate.** The PK half is skipped iff the existing skip-predicate holds and not (T or N or R). An empty PK half with `by` is no longer a constant, so it is skipped when `by` is absent from payload and `keyRecord` and not T / N / R. An empty PK half without `by` is never skipped, as before.
 
@@ -1560,7 +1561,7 @@ The retain path holds the whole item in `keyRecord`, so a mixed half whose compo
 
 11. **A half stored in a table key attribute** (#183) — a local index's `pk`, an inverted index, or `sk: { field: "sk", composite: ["id"] }` shared with the table. DynamoDB refuses an update that writes a table key attribute, so the composer never returns one, in `sets` or `removes`: such a half holds what the table key does, out of composites an update can't change, and dropping the index entry takes the other half. Snapshots, tombstones and events keep the attribute too.
 
-12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. `.set({ note: undefined })` under `preserve` composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
+12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. An update that names `note` with a leading composite missing under `preserve`, or one of a row an earlier release cleared with `.set({ note: undefined })` (which composed nothing, and left the attribute's key behind), composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike, until an update clears `note`, which removes the half. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
 
 13. **Two accessors storing their halves in one attribute** (#183) — `byRegion: { pk: [region], sk: [id] }` and `byGroup: { pk: [group], sk: [extra] }` on one physical index, or `byName: { pk: [name], sk: [id] }` with a sparse `byOther: { pk: [other], sk: [name] }` in one attribute. **Refused: `EDD-9106` at `Entity.make`, or at `Table.make` for a casing left to the schema.** A row can't show which accessor owns the attribute, so no composer can be right: an ordinary update replaces one half and leaves a mismatched pair, including on a row that only ever populated one accessor, and a table key move composes from the whole row with the later accessor winning. Fixing the writes would mean patching every path, which is how this kept regressing. The check runs per entity, so overloading one index across entity types is unaffected. To keep such access patterns, give each half its own attribute, which means a new index, and re-put existing rows.
 
@@ -2737,6 +2738,16 @@ path below such a field; any path operation on a primary-key composite or an
 immutable field; and a second operation on the same field. `.add()` /
 `.subtract()` / `.append()` / `.deleteFromSet()` on a GSI composite recompose
 the index key on every entity.
+
+**Clearing a field (#177, #178).** `.set({ f: undefined })` is `.remove(["f"])`: `normalizeClears` moves it once, at the top of `runUpdate`, so the sentinel release, the composer's per-half gate and policy, the vector gate, the retain snapshot and the transactional planner (which runs this same op) see one form. A value that encodes to nothing (`Option.none()` on a `Schema.OptionFromOptional` field) clears the same way. Three names aren't clears: a library-generated `updatedAt` (`undefined` means generate it), a sparse map (`.set()` merges entries, and no entries merge nothing), and a name the model doesn't know, which the payload's schema drops.
+
+Clearing a field a row can't lack is refused with a `ValidationError` before anything is sent, for `.set({ f: undefined })`, `.remove(["f"])`, a top-level `pathRemove(["f"])` and an `append`'s `.remove`, because the write would land and the row could not then be read. A row can lack a field if it still decodes without it (`rowCanLack`: optional on its stored side, and a real decode of `{}` isn't refused), so a decoding default can be cleared and a `NullOr` can't. A ref can't, whatever its model field declares: its read schema points at the required target. `pathRemove` of a property below a field is judged by walking the stored side of the field's schema (`pathIsRequired`): structs, classes and recursive schemas are followed, a record's entry and a list's element are open (a list closes up, so which element went says nothing about the row), and a union requires a property only if every member declaring it does. A `.check()` that a removal would fail, such as a minimum length on a list, is not judged. `null` follows the same line: on a field a row can lack it clears, on one it can't (a required `NullOr`) it is stored.
+
+An update names model fields, never what the library stores. `refusedAttributeNames` refuses, in every record and path operation, another field's stored name (naming the field to use), a secondary index's key attribute, any `__edd_*` attribute, the version and timestamp attributes, `deletedAt` and the TTL attribute on an entity configured to use them, an immutable field and a sparse map; `.remove` and a single-segment `pathRemove` also refuse a sparse entry's stored name, naming `.removeEntries`, while the other path operations keep it, as that's how a counter entry is added to. A name the model simply doesn't know stays allowed, since it's the only way to clean up an attribute the model no longer declares.
+
+The types narrow to match. `.remove` takes `RemovableFields` (`AppendRemovableFields` on an `append`, which also needs the name in `appendInput` and excludes `orderBy`), on `BoundUpdate`, `BoundAppend` and `Entity.remove`, and the unbound update's payload carries the names as a phantom so `Entity.remove` works data-last in a `pipe`. `updateSchema` declares a field a row can't lack with `optionalKey`, not `optional`, so `.set({ required: undefined })` doesn't compile under `exactOptionalPropertyTypes`, and JSON `null` for it is a decode error for anyone serving the schema over HTTP. `.pathRemove` stays `ReadonlyArray<string | number>`.
+
+An `append`'s own `{ f: undefined }` is not a clear. The attribute stays, and it counts as naming the composite (**N**), so a half it feeds drops under `sparse` and stays under `preserve`. `.remove` clears.
 
 **Guarded read-then-write (#133).** Updates that read first (a unique-field
 change, a computed change to an index composite, every retain update) write a
@@ -5315,8 +5326,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9108` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | One entity uses one physical index twice, even over the same fields |
 | `EDD-9109` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | A model attribute, a system timestamp or a version field is stored in a table key attribute, by rename or by name |
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
+| `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, without what its key needs beside it: the partition key's composites, the other `by` attributes, or (under `preserve`) a sort key composite before it. Every append carrying it would fail with `EDD-9100` |
 
-Next free code: **`EDD-9113`** (`9110` and `9111` are reserved for #189; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: **`EDD-9114`** (`9110` and `9111` are reserved for #189; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

@@ -364,6 +364,32 @@ const program = Effect.gen(function* () {
   yield* Console.log("Composed update applied\n")
 
   // -----------------------------------------------------------------------
+  // Update Expressions — Clearing a Field
+  // -----------------------------------------------------------------------
+  yield* Console.log("=== Clearing a Field ===\n")
+
+  // #region update-clear
+  // One operation, two spellings: the attribute goes, any index key built from it goes,
+  // and a unique value it held is released.
+  yield* db.entities.Products.update({ productId: "p-4" }).remove(["description"])
+  yield* db.entities.Products.update({ productId: "p-4" }).set({ description: undefined })
+
+  // A field no row can be without doesn't compile, and is refused before anything is sent:
+  // the row would no longer be readable.
+  const refusal = yield* db.entities.Products.update({ productId: "p-4" })
+    // @ts-expect-error `name` is required
+    .remove(["name"])
+    .asEffect()
+    .pipe(Effect.flip)
+
+  // An attribute the model no longer declares is cleaned up with a path.
+  yield* db.entities.Products.update({ productId: "p-4" }).pathRemove(["retiredAttribute"])
+  // #endregion
+  yield* Console.log(`Clearing a required field: ${refusal._tag}\n`)
+
+  yield* Console.log("Field cleared\n")
+
+  // -----------------------------------------------------------------------
   // Update Expressions — Path-Based Combinators
   // -----------------------------------------------------------------------
   yield* Console.log("=== Update Expressions — Path-Based ===\n")
