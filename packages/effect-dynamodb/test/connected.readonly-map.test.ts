@@ -9,12 +9,14 @@
 
 import { DynamoDBClient, PutItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Config, Effect, Layer, Schema, SchemaGetter } from "effect"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as EventStore from "../src/EventStore.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 
@@ -151,6 +153,134 @@ describeConnected("what [EDD-9125] leaves standing", () => {
       }),
     )
   })
+
+  const emptyTable = () => Table.make({ schema: AppSchema, entities: {} })
+  const noted = (field: Schema.Top) =>
+    Schema.Struct({ _tag: Schema.tag("Noted"), m: field as never })
+  const Plain = Schema.Struct({ _tag: Schema.tag("Plain") })
+  const Packed = DynamoModel.Packed({ format: "json" })
+
+  for (const [name, field] of [
+    ["a map decoded from a record", Decoded],
+    ["Schema.toCodecJson of a map", Schema.toCodecJson(Counts)],
+  ] as const) {
+    for (const [storage, storedAs] of [
+      ["native", undefined],
+      ["packed", Packed],
+    ] as const) {
+      it.effect(`${name}, ${storage}, in an event, metadata and a snapshot, reads back`, () => {
+        const Base = emptyTable()
+        const State = Schema.Struct({ m: field as never })
+        const Events = EventStore.makeStream({
+          table: Base,
+          streamName: "Tally",
+          events: [noted(field)],
+          streamId: { composite: ["id"] },
+          metadata: Schema.Struct({ m: field as never }),
+          snapshot: { schema: State, ...(storedAs === undefined ? {} : { storedAs }) },
+          ...(storedAs === undefined ? {} : { storedAs: { data: storedAs } }),
+        } as never) as any
+        return onTable(Keys, Base, () =>
+          Effect.gen(function* () {
+            const id = { id: "a" }
+            yield* Events.append(id, [{ _tag: "Noted", m: counts }], 0, {
+              metadata: { m: counts },
+            })
+            const [event] = yield* Events.read(id)
+            expect(event.data.m).toEqual(counts)
+            expect(event.metadata.m).toEqual(counts)
+            yield* Events.writeSnapshot(id, { m: counts }, 1)
+            const latest = yield* Events.readLatest(id)
+            expect(latest.snapshot.value.state.m).toEqual(counts)
+          }),
+        )
+      })
+    }
+  }
+
+  it.effect("Schema.Record reads the events, metadata and snapshot a map stored", () => {
+    const Base = emptyTable()
+    const State = Schema.Struct({ m: Text })
+    const Events = EventStore.makeStream({
+      table: Base,
+      streamName: "Tally",
+      events: [noted(Text), Plain],
+      streamId: { composite: ["id"] },
+      metadata: Schema.Struct({ m: Text }),
+      snapshot: { schema: State },
+    } as never) as any
+    return onTable(Keys, Base, (tableName) =>
+      Effect.gen(function* () {
+        const id = { id: "a" }
+        yield* Events.append(id, [{ _tag: "Noted", m: { b: 2 } }], 0, { metadata: { m: { b: 2 } } })
+        yield* Events.writeSnapshot(id, { m: { b: 2 } }, 1)
+
+        // Each row as it was stored when these fields were maps: the same bytes.
+        const stored = yield* rowsOf(tableName)
+        const asMap = toAttributeMap({ m: new Map([["b", 2]]) })
+        const event = stored.find((row) => row.data !== undefined)!
+        expect(event.data?.M?.m).toEqual(asMap.m)
+        expect(event.metadata?.M?.m).toEqual(asMap.m)
+        const snapshot = stored.find((row) => row.state !== undefined)!
+        expect(snapshot.state?.M?.m).toEqual(asMap.m)
+
+        const [read] = yield* Events.read(id)
+        expect(read.data.m).toEqual({ b: 2 })
+        expect(read.metadata.m).toEqual({ b: 2 })
+        const latest = yield* Events.readLatest(id)
+        expect(latest.snapshot.value.state.m).toEqual({ b: 2 })
+      }),
+    )
+  })
+
+  for (const [name, field, value] of [
+    ["a map decoded from a record", Decoded, counts],
+    ["Schema.toCodecJson of a map", Schema.toCodecJson(Counts), counts],
+    ["a record", Text, { a: 1 }],
+  ] as const) {
+    it.effect(`${name} in an outbox effect is committed and delivered`, () => {
+      const Summaries = Entity.make({
+        model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
+        entityType: "Summary",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      })
+      const Base = Table.make({ schema: AppSchema, entities: { Summaries } })
+      const Events = EventStore.makeStream({
+        table: Base,
+        streamName: "Tally",
+        events: [Plain],
+        streamId: { composite: ["id"] },
+      } as never) as any
+      const Projected = EventStore.projection({
+        stream: Events,
+        readModel: Summaries,
+        key: (id: { readonly id: string }) => ({ id: id.id }),
+        initial: (id: { readonly id: string }) => ({ id: id.id, version: 0, rev: 0 }),
+        evolve: (state: unknown) => Effect.succeed(state),
+        checkpoint: "version",
+        revision: "rev",
+        outbox: { schema: Schema.Struct({ m: field as never }), effects: () => [{ m: value }] },
+      } as never) as any
+      return onTable(Keys, Base, (tableName) =>
+        Effect.gen(function* () {
+          const id = { id: "a" }
+          yield* Events.append(id, [{ _tag: "Plain" }], 0)
+          const [event] = yield* Events.read(id)
+          yield* Projected.apply(event)
+          const delivered: Array<unknown> = []
+          const drained = yield* Projected.drain(id, (effect: unknown) =>
+            Effect.sync(() => {
+              delivered.push(effect)
+            }),
+          )
+          expect(drained.delivered).toBe(1)
+          expect(delivered).toEqual([{ m: value }])
+          const rows = yield* rowsOf(tableName)
+          expect(rows.filter((row) => row.__edd_e__?.S === "Summary#outbox")).toEqual([])
+        }),
+      )
+    })
+  }
 
   it.effect("a many edge over a record is created, read and updated", () => {
     const Line = Schema.Struct({ sku: Schema.String, qty: Schema.Number })

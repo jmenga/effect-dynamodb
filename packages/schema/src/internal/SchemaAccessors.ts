@@ -330,11 +330,15 @@ const readonlyMapPath = (
  * holding one can't work and fails at load. The stored side is what's read: a map decoded from a
  * record, or under `Schema.toCodecJson`, is stored as that and reads back.
  */
-export const refuseReadonlyMaps = (owner: string, model: Schema.Top): void => {
+export const refuseReadonlyMaps = (
+  owner: string,
+  model: Schema.Top,
+  whole: string = "the model",
+): void => {
   const at = readonlyMapPath(SchemaAST.toEncoded(model.ast), "", new Set())
   if (at === undefined) return
   throw new Error(
-    `[EDD-9125] ${owner}: ${at === "" ? "the model" : `field "${at}"`} is a Schema.ReadonlyMap, ` +
+    `[EDD-9125] ${owner}: ${at === "" ? whole : `field "${at}"`} is a Schema.ReadonlyMap, ` +
       "which can't be read back: it's stored as a map, a map reads back as a plain object, and the " +
       "row no longer decodes. Use Schema.Record, which is stored the same way and reads back.",
   )
