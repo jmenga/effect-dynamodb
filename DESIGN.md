@@ -1575,11 +1575,24 @@ A `put` missing a `by` value writes no index entry at all (`tryComposeIndexKeys`
 
 **`version` isn't known without a read**, so an index over it is refused (`EDD-9121`, at `Entity.make` and at the type level) unless `retain`, whose every write reads the item. On that path the next version is a stamp like `updatedAt`. A primary key over `updatedAt` or `version`, and `shards.by` over either, are refused whatever `retain` says: a primary key never changes, and a shard would go stale on every write. `createdAt` is allowed in both.
 
-**Reading first where one `UpdateItem` can't say.** An `upsert` writes `createdAt = if_not_exists(...)` and an immutable field likewise, so a key composed from the input would disagree with what the write keeps. With either as a secondary index composite it takes the guarded path (`upsertKeyDependsOnStored`). With a primary key over an unsupplied `createdAt` there's no existing item to name, so it creates. A time-series `append` has no `updatedAt` (`orderBy` is its clock); an index over `createdAt` makes it read the row first and compose for what it finds, guarded on the `orderBy` it read, and it re-reads when a concurrent append moves it.
+**An upsert over a value it keeps.** An `upsert` writes `createdAt = if_not_exists(...)` and an immutable field likewise, so a key composed from the input can disagree with what the write keeps, and no expression can splice a stored attribute into a key. It doesn't read to find out. Each half of a secondary key is judged on its own (`upsertKeyPlan`):
 
-**Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Any other is the caller's (rule b, above), and the types agree: `WithSystemCollisions` makes only a managed date optional. An aggregate's stamp overwrites what a caller supplied, so its optional dates stay the caller's. A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
+| Half | Written | Stands on an existing row when |
+|---|---|---|
+| Holds nothing kept | SET from the input, as ever | Always |
+| Holds only kept values and primary composites (`[createdAt]`, `[region]`, `[id, region]`) | `if_not_exists`: the key stays | The row has the key |
+| Also holds something the upsert overwrites, and the input has every value (`[region, status]`, `[region, updatedAt]`, `[status, createdAt]` with `createdAt` supplied) | SET from the input | Each kept value is stored as the input has it, or isn't stored |
+| Holds a `createdAt` the input doesn't supply, and something the upsert overwrites (`[status, createdAt]`) | `if_not_exists`: the key stays | The row has the key, and the other values are the input's: the key is then already right |
 
-**Aggregates.** An aggregate's list key composes from the same stamps as the root row (`buildDynamoItems`), so the key and the attribute agree.
+A new row takes the composed key. A write that doesn't stand is rejected with `ReturnValuesOnConditionCheckFailure: ALL_OLD`, which returns the row at no read, and the upsert composes from that row and writes again (`guardedUpsert`, through `runUpdate`'s `upsertOver`, with `fill` for what the row lacks). So a stored value always wins, and no key disagrees with its row. That second write is a fact of three cases: an input that contradicts a stored immutable value or `createdAt`, a row without the key (1.38 wrote none, and it's then there), and a changed value under an unsupplied `createdAt`. A rejected write is charged write capacity for the item, where a `GetItem` would cost less: on a definition whose upserts change `status` on every call, a read would be the cheaper request. It's deliberately not the one chosen: most upserts of such a row change nothing the key holds, and a read would be paid on every one of them, and on every new row. `unique`, `retain` and an omitted defaulted composite read first as they always did, for their own reasons, and share the merge.
+
+With a primary key over an unsupplied `createdAt` there's no existing item to name, so an upsert creates.
+
+A time-series `append` has no `updatedAt` (`orderBy` is its clock), and it does the same over `createdAt`: every half holding it is `if_not_exists`, and the CAS also requires the key and that the half's other values are the ones written (`keptValues`). A rejection returns the row. If the key can't stay, the append composes from the row and sends again, guarded on the `orderBy` it was handed (`appendOverRead`); otherwise the rejection was the CAS or the caller's condition, as it always was, and the row saves that follow-up read. With `skipFollowUp` an append over `createdAt` sends no read at all.
+
+**Which field is stamped.** A model field of that name is managed if it's a date, including under `Schema.optional` (the value schema is what's read: an entity unwraps it, so `optional` agrees with `optionalKey`), with a supplied value winning. Any other is the caller's (rule b, above), and the types agree: `WithSystemCollisions` makes only a managed date optional. A `configure` `field:` rename of `createdAt` or `updatedAt` is written under the renamed attribute on every path (`resolveDbName`); a rename of the version attribute is refused (`EDD-9122`), and `versioned: { field }` names it.
+
+**Aggregates.** See "Aggregate System Timestamps" (§11). An aggregate's list key and collection sort key compose from the same stamps as the root row (`buildDynamoItems`), so the key and the attribute agree. A partition key over a stamped `updatedAt` and a `many` edge's sort key over one are refused (`EDD-9121`): both name rows, and neither can move.
 
 **Repair.** `judgeIndexHalf` judges these halves like any other (see "Index keys that differ"): a row 1.38 wrote with no key is `missing`, and a key that only lags `updatedAt` is no difference.
 
@@ -1632,7 +1645,7 @@ The retain path holds the whole item in `keyRecord`, so a mixed half whose compo
 
 17. **`sk: [status, updatedAt]`** — with `status` in the payload or the `keyRecord` it moves with the new stamp; with neither, it's left under both policies, never dropped and never truncated. **This is the trap:** treating the stamp as touching the half drops the row under `sparse` on every unrelated update. `.remove(["status"])` still REMOVEs it. 17a: `[status, region, updatedAt]` with one of the two named is left whole. 17b: a Z-order half with `updatedAt` as a dimension is all-or-nothing on the same rule: every other dimension and prefix composite known means SET the address, otherwise left, under either policy.
 
-18. **`sk: [createdAt]` and `pk: [createdAt]`** — written by whichever write builds the item, from the stamp or the supplied value, and left by every update: the key survives an update, an `upsert` (which reads first), a guarded `put` over an existing item and a `restore`. 18a: `[status, createdAt]` on `.set({ status })` truncates to `status_b` under both policies, the partial-payload rule.
+18. **`sk: [createdAt]` and `pk: [createdAt]`** — written by whichever write builds the item, from the stamp or the supplied value, and left by every update: the key survives an update, an `upsert` (one write, no read), a guarded `put` over an existing item and a `restore`. 18a: `[status, createdAt]` on `.set({ status })` truncates to `status_b` under both policies, the partial-payload rule.
 
 All three are covered on the composer (`schema/test/KeyComposer.test.ts`), through the entity on a recording table (`IndexPolicyV3.test.ts`) and on DynamoDB Local (`connected.test.ts`), both from `test/helpers/StampedComposites.ts`, under both `escapeKeys` settings.
 
@@ -3738,6 +3751,28 @@ configuration that could add one (#98).
    items during decomposition; timestamp injection runs later, so a root field
    propagated via `context` under the same name is overwritten by the generated
    value rather than racing it.
+5. **What a row declares is decided per row, as on an entity.** Each node (root,
+   sub-aggregate root, `one` edge, `many` element) resolves the stamps against its
+   own value's fields (`rowStampsOf`). A date that value declares, under
+   `Schema.optional` as well, is managed: the input doesn't need it, and a supplied
+   value wins, in the row and in any key holding it. A field of that name of another
+   type is the caller's, on that row. Undeclared, the row is stamped and it's stripped
+   from what's read. A root field of that name that isn't a date turns the stamp off
+   for every row, as it always did (`resolveAggregateStamps`).
+6. **What `create` and `update` return is what they stored.** `create` fills the
+   declared dates before it validates (`fillStamps`), so the value it returns holds
+   them. `update` keeps `createdAt` whatever the mutation did, as an entity's update
+   has no `createdAt` to name. A mutation that changes `updatedAt` wins; otherwise a
+   rewritten row is stamped, and a row the diff left keeps its value. When a node
+   declares a stamp, the result is assembled from the rows written, with no I/O. When
+   none does, it's the decoded value, and nothing extra runs.
+
+**A key with no value.** A composite of an aggregate key can be optional. What happens without a value depends on what the key does:
+
+- **List key: the row is left out of that list**, as a sparse index on an entity leaves it out. An aggregate is fully there without its list entry: `get` reads the partition, and a later write with the value lists it. Whole index or nothing: half a list key writes neither attribute, as on an entity, and aggregate writes are whole-row `Put`s, so a row that loses the value leaves the list. Sharded lists do the same.
+- **Collection sort key or partition key: a `ValidationError` (`EDD-9123`) before anything is written.** A root missing from a collection index can't be assembled (`Missing root item`), so leaving it out would write an aggregate nothing can read. The partition key is how the aggregate is found at all. `delete` says the same through `AggregateAssemblyError`, since its error channel has no `ValidationError`.
+
+A `list` filter that leaves out a composite of the list's partition key is the same `ValidationError`: there's no partition to query.
 
 **Read path.** The configured timestamp attribute names are stripped from
 assembled items alongside the other DynamoDB metadata (`__edd_e__`, keys, index
@@ -5424,10 +5459,11 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
 | `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, without what its key needs beside it: the partition key's composites, the other `by` attributes, or (under `preserve`) a sort key composite before it. Every append carrying it would fail with `EDD-9100` |
 
-| `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by` (§7 "Composites the library stamps") |
+| `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites; `Aggregate.make` (`AggregateSchemas.refuseAggregateKeyOverMovingValue`, and the many edge check in `effect-dynamodb`) | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by`; a stamped `updatedAt` in an aggregate's partition key or a `many` edge's sort key (§7 "Composites the library stamps") |
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
+| `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
 
-Next free code: **`EDD-9123`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: **`EDD-9124`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

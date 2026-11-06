@@ -497,8 +497,16 @@ const shut = yield* db.entities.Tickets.byStatus({ owner: "ana" })
 - **`[status, createdAt]` on `.set({ status })` truncates.** It's the [partial-payload rule](#5-the-structural-rule-longest-valid-leading-prefix): `status` is in the payload and `createdAt` isn't, and an update can't name `createdAt`, so the key becomes `status_b` under either policy until `rekey({ repairIndexKeys: true })` restores it. An entity whose update reads the item first (`retain`, or a `unique` rotation) has `createdAt` and composes the whole key.
 - **A stamped Z-order dimension** follows the same rule. With every other dimension and prefix composite known the address moves; otherwise it's left under either policy. It's never truncated, since a partial address means nothing.
 - **`version`:** the library adds one to it without reading the item, so no key can follow it, and `Entity.make` refuses it as a composite (`EDD-9121`). `versioned: { retain: true }` reads the item on every write, so there it works and moves with each write. It's refused in a primary key and in `shards.by` whatever `retain` says, and so is `updatedAt`.
-- **An `upsert` over `createdAt` or an `immutable` composite reads the item first.** One `UpdateItem` can't keep the stored value and compose a key from it. With the primary key over an unsupplied `createdAt`, nothing can name an existing item, so it creates one.
-- **A time-series `.append()`** has no `updatedAt`: the `orderBy` attribute is its clock. An index over `createdAt` reads the row first, for the same reason.
+- **An `upsert` over `createdAt` or an `immutable` composite doesn't read.** It keeps the stored value, in the attribute and the key, under a condition on its one `UpdateItem`. A key that holds only such values stays. One that also holds something else is written from the input, where the input has every value, and the write stands only over the stored values it names. One with a `createdAt` the input doesn't supply stays if the rest of the key is unchanged. Where one write can't get the key right, DynamoDB rejects it and returns the row at no read charge, and the upsert writes again from that row:
+
+  | Index sort key | New row, or nothing in the key changed | Something in the key changed |
+  |---|---|---|
+  | `[createdAt]`, `[region]` (`immutable`) | One write | One write, and the key stays |
+  | `[region, status]`, `[region, updatedAt]` | One write | One write. Two if the input names another `region`: the stored one wins |
+  | `[status, createdAt]`, `createdAt` not supplied | One write | Two writes |
+
+  The rejected write is charged write capacity, so if every upsert of a row changes `status`, passing the stored `createdAt` in the input costs less: it's then one write. With the primary key over an unsupplied `createdAt`, nothing can name an existing item, so it creates one.
+- **A time-series `.append()`** has no `updatedAt`: the `orderBy` attribute is its clock. An index over `createdAt` works the same way: no read before the write, and a rejected transaction and a second one where the rest of the key changed.
 
 Rows an earlier release wrote have no key in these indexes unless the caller supplied the value, because `put` composed before stamping. `rekey({ repairIndexKeys: true })` [brings them in](/effect-dynamodb/guides/upgrading/#repairing-index-keys).
 

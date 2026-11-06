@@ -365,9 +365,19 @@ rewritten row would otherwise lose its original create instant. The stored value
 back off the partition the update already fetched and re-emitted unchanged.
 
 Timestamp attributes are stripped on the read path, so they never appear on the assembled
-domain object. If you want them *in* the domain model, declare the field on the root schema
-under the same name — the library then manages it using the model's own encoding and the
-value is decoded normally.
+domain object. If you want them *in* the domain model, declare the field under the same name,
+on the root or on any row below it: a sub-aggregate root, a `one` edge or a `many` element.
+That row then works like an entity:
+
+- The input doesn't need the date, required or optional. The library stamps it, using the
+  model's own encoding, and a value you supply wins.
+- `create` and `update` return what they stored, and the value is decoded normally on read.
+- On `update`, `createdAt` stays what's stored whatever the mutation did. A mutation that
+  changes `updatedAt` gives it; otherwise a rewritten row gets a new stamp.
+- A field of that name that isn't a date is yours, on that row, and the library leaves it
+  alone. On the root it turns that stamp off for every row.
+- A partition key or a `many` edge's sort key over a stamped `updatedAt` is refused at
+  `Aggregate.make` (`EDD-9121`): those keys name rows, and it moves on every write.
 
 #### Do You Need a Secondary Index?
 
@@ -708,6 +718,18 @@ const latest = yield* TournamentMatchAggregate.list(
 :::caution[Sharded lists cannot be resumed]
 With `list.cardinality`, the list index is spread across _n_ partitions and `list` fans out across all of them. `limit` bounds the merged result, but there is no resumable position across shards — `cursor` is always `None`, and passing one fails with a `ValidationError` (`EDD-9051`) rather than being silently ignored.
 :::
+
+#### An optional composite with no value
+
+A composite of an aggregate's keys can be optional. What happens without a value depends on the key:
+
+| Key | No value |
+|---|---|
+| `list` partition or sort key, sharded or not | The row is stored without either list attribute, so it isn't in that list. `get` still finds the aggregate, a later write with the value adds it, and one without takes it out |
+| `collection` sort key | `ValidationError` (`EDD-9123`), nothing written. A root outside the collection index couldn't be read back |
+| `pk` | `ValidationError` (`EDD-9123`) on `create`, `get` and `update`; `AggregateAssemblyError` on `delete`. Nothing can find an aggregate without its partition key |
+
+A `list` filter that leaves out a composite of the list's partition key is the same `ValidationError`.
 
 ### Type Extractors
 
