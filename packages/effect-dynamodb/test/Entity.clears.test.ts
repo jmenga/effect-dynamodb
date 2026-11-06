@@ -8,8 +8,12 @@
 import { it } from "@effect/vitest"
 import { describe } from "vitest"
 import * as Clears from "./helpers/ClearScenarios.js"
+import * as NoStoredForm from "./helpers/NoStoredFormScenarios.js"
 
-for (const [group, scenarios] of Object.entries(Clears.allScenarios)) {
+for (const [group, scenarios] of Object.entries({
+  ...Clears.allScenarios,
+  ...NoStoredForm.allScenarios,
+})) {
   describe(group, () => {
     for (const scenario of scenarios) {
       it.effect(scenario.name, () => scenario.run(Clears.recordingHarness))

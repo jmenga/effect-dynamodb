@@ -1,12 +1,21 @@
 /**
  * What a stored row can be without (#178), and what a field's derived update schema
  * takes because of it. `rowCanLack` and `pathIsRequired` judge from the schema: a
- * name list couldn't see a decoding default or a transformation.
+ * name list couldn't see a decoding default or a transformation. A row can be without a
+ * field two ways: the model lets it (`rowOmits`), or the field holds a value DynamoDB can't
+ * store, which an absent attribute stands for (`absentReading`).
  */
-import { Effect, Exit, Option, Schema } from "effect"
+import { Effect, Exit, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
+import * as DynamoModel from "../src/DynamoModel.js"
 import * as Entity from "../src/Entity.js"
-import { pathIsRequired, rowCanLack } from "../src/internal/SchemaAccessors.js"
+import { readingAbsentValues } from "../src/internal/EntitySchemas.js"
+import {
+  absentReading,
+  pathIsRequired,
+  rowCanLack,
+  rowOmits,
+} from "../src/internal/SchemaAccessors.js"
 
 describe("rowCanLack", () => {
   const CAN: ReadonlyArray<readonly [string, Schema.Top]> = [
@@ -22,6 +31,32 @@ describe("rowCanLack", () => {
     ["OptionFromOptionalKey", Schema.OptionFromOptionalKey(Schema.String)],
     ["optional transformation", Schema.optional(Schema.NumberFromString)],
   ]
+  const STANDS_FOR: ReadonlyArray<readonly [string, Schema.Top, unknown]> = [
+    ["UndefinedOr", Schema.UndefinedOr(Schema.String), undefined],
+    ["a set", Schema.ReadonlySet(Schema.String), new Set()],
+    ["a number set", Schema.ReadonlySet(Schema.Number), new Set()],
+    ["NullOr of a set", Schema.NullOr(Schema.ReadonlySet(Schema.String)), new Set()],
+    [
+      "UndefinedOr of a set: undefined wins",
+      Schema.UndefinedOr(Schema.ReadonlySet(Schema.String)),
+      undefined,
+    ],
+    ["NullishOr", Schema.NullishOr(Schema.String), undefined],
+    ["Unknown", Schema.Unknown, undefined],
+    ["Void", Schema.Void, undefined],
+    ["Any", Schema.Any, undefined],
+    [
+      "a set stored by a transformation",
+      Schema.ReadonlySet(Schema.String).pipe(
+        Schema.decodeTo(Schema.Array(Schema.String), {
+          decode: SchemaGetter.transform((set: ReadonlySet<string>) => [...set]),
+          encode: SchemaGetter.transform((list: ReadonlyArray<string>) => new Set(list)),
+        } as never),
+      ),
+      [],
+    ],
+    ["a recursive set", Schema.suspend(() => Schema.ReadonlySet(Schema.String)), new Set()],
+  ]
   const CANNOT: ReadonlyArray<readonly [string, Schema.Top]> = [
     ["required", Schema.String],
     ["a required struct", Schema.Struct({ a: Schema.optional(Schema.String) })],
@@ -30,13 +65,27 @@ describe("rowCanLack", () => {
       class Inner extends Schema.Class<Inner>("RCLInner")({ a: Schema.String }) {},
     ],
     ["NullOr, whose key is required", Schema.NullOr(Schema.String)],
-    ["UndefinedOr, whose key is required", Schema.UndefinedOr(Schema.String)],
     ["OptionFromNullOr", Schema.OptionFromNullOr(Schema.String)],
     ["a required transformation", Schema.NumberFromString],
     ["a date", Schema.DateTimeUtcFromString],
     ["a record", Schema.Record(Schema.String, Schema.String)],
     ["an array", Schema.Array(Schema.String)],
-    ["a set", Schema.ReadonlySet(Schema.String)],
+    ["a set that must not be empty", Schema.ReadonlySet(Schema.String).check(Schema.isMinSize(1))],
+    [
+      "a set stored as a list",
+      Schema.Array(Schema.String).pipe(
+        Schema.decodeTo(Schema.ReadonlySet(Schema.String), {
+          decode: SchemaGetter.transform((list: ReadonlyArray<string>) => new Set(list)),
+          encode: SchemaGetter.transform((set: ReadonlySet<string>) => [...set]),
+        } as never),
+      ),
+    ],
+    [
+      "a defined value that must hold",
+      Schema.UndefinedOr(Schema.String).check(
+        Schema.makeFilter((value: string | undefined) => value !== undefined),
+      ),
+    ],
     [
       "optional when stored, required once decoded",
       Schema.optionalKey(Schema.String).pipe(Schema.decodeTo(Schema.String)),
@@ -49,12 +98,24 @@ describe("rowCanLack", () => {
     it(`cannot: ${name}`, () => expect(rowCanLack(field)).toBe(false))
   }
 
-  it("agrees with a decode of a row without the field, for every kind above", () => {
-    for (const [, field] of [...CAN, ...CANNOT]) {
+  for (const [name, field, value] of STANDS_FOR) {
+    it(`can, because an absent attribute stands for its value: ${name}`, () => {
+      expect(rowCanLack(field)).toBe(true)
+      expect(rowOmits(field)).toBe(false)
+      expect(absentReading(field)?.value).toEqual(value)
+    })
+  }
+
+  it("what an absent attribute stands for isn't something the model would omit", () => {
+    for (const [, field] of CAN) expect(absentReading(field)).toBeUndefined()
+  })
+
+  it("rowOmits agrees with a decode of a row without the field, for every kind above", () => {
+    for (const [, field] of [...CAN, ...CANNOT, ...STANDS_FOR]) {
       const decoded = Schema.decodeUnknownExit(
         Schema.Struct({ field }) as unknown as Schema.Codec<unknown, unknown>,
       )({})
-      expect(Exit.isSuccess(decoded)).toBe(rowCanLack(field))
+      expect(Exit.isSuccess(decoded)).toBe(rowOmits(field))
     }
   })
 
@@ -63,6 +124,171 @@ describe("rowCanLack", () => {
       Schema.withDecodingDefault(Effect.promise(() => Promise.resolve("d"))),
     )
     expect(rowCanLack(later)).toBe(true)
+  })
+})
+
+describe("the derived read schema", () => {
+  class Part extends Schema.Class<Part>("RCLPart")({
+    tags: Schema.ReadonlySet(Schema.String),
+    note: Schema.UndefinedOr(Schema.String),
+  }) {}
+  class Row extends Schema.Class<Row>("RCLRow")({
+    id: Schema.String,
+    tags: Schema.ReadonlySet(Schema.String),
+    numbers: Schema.ReadonlySet(Schema.Number),
+    note: Schema.UndefinedOr(Schema.String),
+    part: Part,
+    parts: Schema.Array(Part),
+    maybePart: Schema.optional(Part),
+    choice: Schema.Union([Part, Schema.Struct({ other: Schema.Number })]),
+    strict: Schema.Union([Part, Schema.Struct({ other: Schema.Number })], { mode: "oneOf" }),
+    optionalTags: Schema.optional(Schema.ReadonlySet(Schema.String)),
+    filled: Schema.optional(Schema.ReadonlySet(Schema.String).check(Schema.isMinSize(1))),
+  }) {}
+  const Rows = Entity.make({
+    model: Row,
+    entityType: "Row",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const read = (row: unknown): any =>
+    Schema.decodeUnknownSync(Rows.schemas.modelSchema as Schema.Codec<unknown, unknown>)(row)
+  const stored = {
+    id: "1",
+    part: {},
+    parts: [{}],
+    choice: {},
+    strict: { other: 1 },
+  }
+
+  it("an absent attribute reads as the value, wherever it's nested", () => {
+    const row = read(stored)
+    expect(row.tags).toEqual(new Set())
+    expect(row.numbers).toEqual(new Set())
+    expect("note" in row).toBe(true)
+    expect(row.part).toBeInstanceOf(Part)
+    expect(row.part.tags).toEqual(new Set())
+    expect("note" in row.part).toBe(true)
+    expect(row.parts[0].tags).toEqual(new Set())
+    expect(row.choice.tags).toEqual(new Set())
+  })
+
+  it("each read gets its own set", () => {
+    expect(read(stored).tags).not.toBe(read(stored).tags)
+  })
+
+  it("a field left optional stays absent", () => {
+    const row = read(stored)
+    expect("optionalTags" in row).toBe(false)
+    expect("maybePart" in row).toBe(false)
+  })
+
+  it("a union member with a lenient reading doesn't take a later member's row", () => {
+    expect(read({ ...stored, choice: { other: 2 } }).choice).toEqual({ other: 2 })
+  })
+
+  it("a union keeps a member's own values, and a value decodes as declared", () => {
+    expect(read({ ...stored, choice: { tags: new Set(["a"]) } }).choice.tags).toEqual(
+      new Set(["a"]),
+    )
+    expect(read({ ...stored, tags: new Set(["a"]) }).tags).toEqual(new Set(["a"]))
+  })
+
+  it("a oneOf union stays strict: an empty row isn't both members", () => {
+    expect(read(stored).strict).toEqual({ other: 1 })
+    const decoded = Schema.decodeUnknownExit(
+      Rows.schemas.modelSchema as Schema.Codec<unknown, unknown>,
+    )({ ...stored, strict: {} })
+    expect(Exit.isFailure(decoded)).toBe(true)
+  })
+
+  it("the input schema stays strict: a write names its required fields", () => {
+    const decoded = Schema.decodeUnknownExit(
+      Rows.schemas.inputSchema as Schema.Codec<unknown, unknown>,
+    )({ id: "1" })
+    expect(Exit.isFailure(decoded)).toBe(true)
+  })
+})
+
+describe("readingAbsentValues", () => {
+  const Set_ = Schema.ReadonlySet(Schema.String)
+  const reader = (schema: Schema.Top) =>
+    Schema.decodeUnknownSync(readingAbsentValues(schema) as Schema.Codec<any, unknown>)
+
+  it("a schema with nothing to read as absent is returned unchanged", () => {
+    // Entity derivation would swap this date for a tolerant one. A schema it doesn't own stays.
+    const Dated = Schema.Struct({ at: Schema.DateTimeUtc, n: Schema.Number })
+    expect(readingAbsentValues(Dated)).toBe(Dated)
+  })
+
+  it("finds a field through a list, an optional, a record and a union", () => {
+    const list = reader(Schema.Struct({ list: Schema.Array(Schema.Struct({ tags: Set_ })) }))
+    expect(list({ list: [{}] }).list[0].tags).toEqual(new Set())
+    const maybe = reader(Schema.Struct({ maybe: Schema.optional(Schema.Struct({ tags: Set_ })) }))
+    expect(maybe({ maybe: {} }).maybe.tags).toEqual(new Set())
+    expect("maybe" in maybe({})).toBe(false)
+    const keyed = reader(Schema.Record(Schema.String, Schema.Struct({ tags: Set_ })))
+    expect(keyed({ k: {} }).k.tags).toEqual(new Set())
+  })
+
+  it("a check on a list it rebuilds still holds", () => {
+    const read = reader(
+      Schema.Struct({
+        list: Schema.Array(Schema.Struct({ tags: Set_ })).check(Schema.isMinLength(1)),
+      }),
+    )
+    expect(read({ list: [{}] }).list).toHaveLength(1)
+    expect(() => read({ list: [] })).toThrow()
+  })
+
+  it("a union's other members stay as declared: a date isn't made tolerant", () => {
+    const read = reader(
+      Schema.Union([
+        Schema.Struct({ at: Schema.DateTimeUtc, tags: Set_ }),
+        Schema.Struct({ other: Schema.Number }),
+      ]),
+    )
+    expect(() => read({ at: "2024-01-01T00:00:00.000Z", tags: new Set(["a"]) })).toThrow()
+  })
+
+  it("a union isn't judged as entity derivation judges one: a date beside a number is allowed", () => {
+    expect(() =>
+      readingAbsentValues(
+        Schema.Union([
+          Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+          Schema.Number,
+          Schema.Struct({ tags: Set_ }),
+        ]),
+      ),
+    ).not.toThrow()
+  })
+
+  it("reads what it can, and leaves the rest as declared", () => {
+    const Holding = Schema.Struct({
+      at: Schema.DateTimeUtcFromString,
+      tags: Schema.ReadonlySet(Schema.String),
+      nested: Schema.Struct({ note: Schema.UndefinedOr(Schema.String) }),
+    })
+    const read = Schema.decodeUnknownSync(
+      readingAbsentValues(Holding) as Schema.Codec<any, unknown>,
+    )({ at: "2024-01-01T00:00:00.000Z", nested: {} })
+    expect(read.tags).toEqual(new Set())
+    expect("note" in read.nested).toBe(true)
+    expect(() =>
+      Schema.decodeUnknownSync(readingAbsentValues(Holding) as Schema.Codec<any, unknown>)({
+        at: new Date(0),
+        nested: {},
+      }),
+    ).toThrow()
+  })
+
+  it("a member of a union reads as absent only for a row no member takes as declared", () => {
+    const Union = Schema.Union([
+      Schema.Struct({ tags: Schema.ReadonlySet(Schema.String) }),
+      Schema.Struct({ other: Schema.Number }),
+    ])
+    const read = Schema.decodeUnknownSync(readingAbsentValues(Union) as Schema.Codec<any, unknown>)
+    expect(read({ other: 1 })).toEqual({ other: 1 })
+    expect(read({}).tags).toEqual(new Set())
   })
 })
 
@@ -115,6 +341,20 @@ describe("pathIsRequired", () => {
       ["city"],
       true,
     ],
+    ["a nested set", Schema.Struct({ s: Schema.ReadonlySet(Schema.String) }), ["s"], false],
+    ["a nested UndefinedOr", Schema.Struct({ s: Schema.UndefinedOr(Schema.String) }), ["s"], false],
+    [
+      "a nested set that must not be empty",
+      Schema.Struct({ s: Schema.ReadonlySet(Schema.String).check(Schema.isMinSize(1)) }),
+      ["s"],
+      true,
+    ],
+    [
+      "a nested NullOr: its null is a value, and it has no absent reading",
+      Schema.Struct({ s: Schema.NullOr(Schema.String) }),
+      ["s"],
+      true,
+    ],
     ["a name the schema doesn't know", Address, ["nope"], false],
     ["a scalar's path", Schema.String, ["x"], false],
     ["a string key into a list", Schema.Array(Schema.String), ["x"], false],
@@ -134,6 +374,9 @@ describe("the derived update schema", () => {
     defaulted: Schema.String.pipe(Schema.withDecodingDefault(Effect.succeed("d"))),
     nullable: Schema.NullOr(Schema.String),
     maybe: Schema.OptionFromOptional(Schema.String),
+    tags: Schema.ReadonlySet(Schema.String),
+    undefinable: Schema.UndefinedOr(Schema.String),
+    filled: Schema.ReadonlySet(Schema.String).check(Schema.isMinSize(1)),
   }) {}
   const Items = Entity.make({
     model: Item,
@@ -161,6 +404,21 @@ describe("the derived update schema", () => {
       expect(Exit.isSuccess(decode({ [field]: undefined }))).toBe(true)
     }
     expect(Exit.isSuccess(decode({ maybe: undefined }))).toBe(true)
+  })
+
+  it("takes `undefined` for a field whose value has no stored form", () => {
+    for (const field of ["tags", "undefinable"]) {
+      expect(Exit.isSuccess(decode({ [field]: undefined }))).toBe(true)
+    }
+  })
+
+  it("refuses `undefined` for a set that must not be empty", () => {
+    expect(Exit.isFailure(decode({ filled: undefined }))).toBe(true)
+  })
+
+  it("takes an empty set for a set, and refuses one for a set that must not be empty", () => {
+    expect(Exit.isSuccess(decode({ tags: new Set() }))).toBe(true)
+    expect(Exit.isFailure(decode({ filled: new Set() }))).toBe(true)
   })
 
   it("keeps `null` for a field that declares it", () => {
@@ -202,6 +460,10 @@ describe("the derived update schema", () => {
     })
     it("an optional field: `null` means clear it", () => {
       expect(Exit.isSuccess(json()({ code: null }))).toBe(true)
+    })
+    it("a field whose value has no stored form: `null` means clear it", () => {
+      expect(Exit.isSuccess(json()({ tags: null }))).toBe(true)
+      expect(Exit.isSuccess(json()({ undefinable: null }))).toBe(true)
     })
   })
 })

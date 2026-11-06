@@ -283,7 +283,7 @@ All combinators chain as methods on the `BoundUpdate` builder. They compile to a
   yield* db.entities.Products.update({ productId: "p-4" }).pathRemove(["retiredAttribute"])
 ```
 
-A row can lack a field if it still decodes without it: `Schema.optional`, `Schema.optionalKey`, the `Schema.OptionFromOptional` family, or a decoding default, which is what the field reads back as. Anything else is refused with a `ValidationError`, for `.remove`, `.set({ field: undefined })`, a `pathRemove`, and the `.remove` on a time-series `.append`. So is a required property below a field, such as `pathRemove(["address", "city"])` when `city` is required, even if `address` itself is optional.
+A row can lack a field if it still decodes without it: `Schema.optional`, `Schema.optionalKey`, the `Schema.OptionFromOptional` family, or a decoding default, which is what the field reads back as. It can also lack a field holding a [value DynamoDB can't store](#values-dynamodb-cant-store). Anything else is refused with a `ValidationError`, for `.remove`, `.set({ field: undefined })`, a `pathRemove`, and the `.remove` on a time-series `.append`. So is a required property below a field, such as `pathRemove(["address", "city"])` when `city` is required, even if `address` itself is optional.
 
 `Schema.NullOr` requires the key and allows an empty value, so `.set({ field: null })` stores a `null` rather than clearing it. On an optional field, `null` clears as `undefined` does.
 
@@ -300,6 +300,89 @@ Every update operation names model fields, never what the library stores. These 
 | A sparse map, or one of its entries by stored name | Use `.removeEntries` or `.clearMap` |
 
 An attribute the model simply doesn't know stays allowed at run time, because that's the only way to clean up one it no longer declares. The types only offer the model's own names to `.remove`, so use `.pathRemove(["attribute"])` for it.
+
+### Values DynamoDB Can't Store
+
+DynamoDB has no form for `undefined` or an empty set. On a field whose type includes one, that value is stored as an absent attribute, and an absent attribute reads back as that value.
+
+```typescript region="model-no-stored-form" example="guide-expressions.ts"
+class Device extends Schema.Class<Device>("Device")({
+  deviceId: Schema.String,
+  // Required, and both can hold a value DynamoDB can't store.
+  labels: Schema.ReadonlySet(Schema.String),
+  lastError: Schema.UndefinedOr(Schema.String),
+}) {}
+```
+
+```typescript region="update-no-stored-form" example="guide-expressions.ts"
+  // Stored as a row without either attribute. Every read gives the values back.
+  const device = yield* db.entities.Devices.put({
+    deviceId: "d-1",
+    labels: new Set(),
+    lastError: undefined,
+  })
+
+  // The ordinary operations, then. Emptying the set takes the attribute away.
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).add({ labels: new Set(["indoor"]) })
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).deleteFromSet({
+    labels: new Set(["indoor"]),
+  })
+
+  // So these are clears as well, and the field can be cleared by name.
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).set({ labels: new Set() })
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).remove(["lastError"])
+
+  const read = yield* db.entities.Devices.get({ deviceId: "d-1" })
+  // read.labels is an empty Set, and read.lastError is undefined
+
+  // A condition or a filter comparing with an empty set asks whether the attribute is there.
+  const unlabelled = yield* db.entities.Devices.scan()
+    .filter({ labels: new Set() })
+    .collect()
+```
+
+This holds at any depth (a struct, a class, the elements of a list), and on every path that writes or reads an item: `put`, `update`, `upsert`, `append`, `Batch`, `Transaction`, version snapshots, soft delete and restore, aggregates, and the events and snapshots of an event stream. Any other value is stored exactly as before. A field left `Schema.optional` keeps its own reading: an empty set stored there reads back as no field.
+
+| The field | Stored | Reads back |
+|---|---|---|
+| `Schema.ReadonlySet(...)` holding nothing | No attribute | An empty set |
+| `Schema.UndefinedOr(...)` holding `undefined` | No attribute | `undefined` |
+| `Schema.NullOr(Schema.ReadonlySet(...))` holding `null` | `NULL` | `null` |
+| `Schema.NullOr(Schema.ReadonlySet(...))` holding nothing | No attribute | An empty set |
+| `Schema.UndefinedOr(Schema.ReadonlySet(...))` holding nothing | No attribute | `undefined`, the one value an absent attribute can mean there |
+| `Schema.optional(Schema.ReadonlySet(...))` holding nothing | No attribute | No field |
+| A set with `.check(Schema.isMinSize(1))` | Refused: the schema says it can't hold nothing | |
+
+Some places have no attribute to leave out, or no way to say so:
+
+- **A list element.** Leaving one out moves the elements after it, so an empty set in a `Schema.Array` of sets is refused with a `ValidationError`, as is a `pathSet` of one onto an element. Use `pathRemove` to remove the element.
+- **A record entry.** An entry holding an empty set isn't stored, so the record reads back without that key.
+- **A `.select()`.** A projection returns what's stored, undecoded, so the attribute stays absent.
+- **A comparison.** Only `eq` and `ne` have a meaning for an empty set, as `attribute_not_exists` and `attribute_exists`. Any other comparison with one is refused. `eq(t.field, undefined)` is left as it is, since an `undefined` there is more often a mistake.
+
+### Relative Updates Aren't Checked Against the Model
+
+`.set` is checked before anything is sent, because the value is in hand. `.add`, `.subtract`, `.append`, `.deleteFromSet` and most path operations change a value only DynamoDB holds, so a `.check()` on the field can't be judged without reading the row first, and an update doesn't read. Guard them with `.condition()`, which DynamoDB judges against the stored value.
+
+```typescript region="update-relative" example="guide-expressions.ts"
+  // DynamoDB applies `.subtract` to a value only it holds, so the model can't judge the result
+  // first. A condition can: refused, it writes nothing.
+  const refusedByCondition = yield* db.entities.Products.update({ productId: "p-5" })
+    .subtract({ stock: 3 })
+    .condition((t, { gte }) => gte(t.stock, 3))
+    .asEffect()
+    .pipe(Effect.flip)
+  // ConditionalCheckFailed, and the stock is still 2
+
+  // Without one the write lands, and the ValidationError says so: "The update WAS applied, and
+  // the stored row no longer matches the model: ..."
+  const landed = yield* db.entities.Products.update({ productId: "p-5" })
+    .subtract({ stock: 3 })
+    .asEffect()
+    .pipe(Effect.flip)
+```
+
+An unguarded update that breaks a `.check()` fails with a `ValidationError` that says the update was applied and names the field, and reads of that row then fail until it's repaired. `.returnValues("none")` decodes nothing, so it doesn't report the problem at all, and neither does a `Transaction.transactWrite`, which returns no row.
 
 ### Path-Based Combinators
 

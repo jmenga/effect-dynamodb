@@ -645,7 +645,7 @@ export interface EntityDefinition<
    * @internal Phantom — never read at runtime. Carries the fields
    * `.remove()` refuses by configuration (immutable, sparse map).
    */
-  readonly _unremovableFields?: ReadonlyArray<TUnremovable>
+  _unremovableFields?(field: TUnremovable): void
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{

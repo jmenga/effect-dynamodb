@@ -161,9 +161,9 @@ const primaryKey = {
   sk: { field: "sk", composite: [] },
 } as const
 
-const key = { id: "1" }
+export const key = { id: "1" }
 
-const worldOf = (model: unknown, options: Record<string, unknown> = {}): World => {
+export const worldOf = (model: unknown, options: Record<string, unknown> = {}): World => {
   const Rows = Entity.make({
     model,
     entityType: "Row",
@@ -174,7 +174,7 @@ const worldOf = (model: unknown, options: Record<string, unknown> = {}): World =
 }
 
 /** The row an operation addresses, leaving out sentinels, snapshots and tombstones. */
-const live = (rows: ReadonlyArray<StoredRow>, id = "1"): StoredRow | undefined =>
+export const live = (rows: ReadonlyArray<StoredRow>, id = "1"): StoredRow | undefined =>
   rows.find((row) => row.id?.S === id && row.__edd_e__?.S === "Row" && row.sk?.S?.endsWith("#row"))
 
 // ---------------------------------------------------------------------------
@@ -380,7 +380,7 @@ const REFUSED: ReadonlyArray<{
 ]
 
 /** The row and everything sent are what they were: the refusal came first. */
-const refused = (
+export const refused = (
   db: any,
   probe: Probe,
   failing: () => Effect.Effect<unknown, unknown, any>,

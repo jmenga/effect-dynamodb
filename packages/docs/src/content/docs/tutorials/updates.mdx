@@ -143,6 +143,8 @@ Entity.deleteFromSet({ fieldName: new Set(["value-to-remove"]) })
 // → Produces DynamoDB DELETE clause for the Set attribute
 ```
 
+DynamoDB can't store an empty set, so removing the last element takes the attribute away, and a required set reads back empty. See [Values DynamoDB Can't Store](/effect-dynamodb/guides/expressions/#values-dynamodb-cant-store).
+
 ---
 
 ## Step 9: Composing Multiple Update Types

@@ -57,10 +57,11 @@ export type ModelFieldName<TModel extends Schema.Top> = keyof ModelFields<TModel
 
 /**
  * The model fields a stored row can be without: those whose stored side is
- * optional, so `optional`, `optionalKey`, a decoding default and the
- * `OptionFromOptional` family, but not `NullOr` or `UndefinedOr`. It is the
- * type-level {@link rowCanLack}. A model whose fields aren't declared in its
- * type has any field, so generic code still compiles and the runtime decides.
+ * optional (`optional`, `optionalKey`, a decoding default, the
+ * `OptionFromOptional` family) or includes a value with no stored form
+ * (`UndefinedOr`, a set), but not `NullOr`. It is the type-level
+ * {@link rowCanLack}. A model whose fields aren't declared in its type has any
+ * field, so generic code still compiles and the runtime decides.
  */
 export type ClearableFields<TModel extends Schema.Top> =
   IsAny<TModel> extends true
@@ -72,8 +73,23 @@ export type ClearableFields<TModel extends Schema.Top> =
             readonly "~encoded.optionality": "optional"
           }
             ? K
-            : never
+            : StoredWithoutForm<DeclaredFields<TModel>[K]> extends true
+              ? K
+              : never
         }[keyof DeclaredFields<TModel> & string]
+
+/**
+ * Whether a field's stored side includes a value DynamoDB has no form for:
+ * `undefined` or a set. A type can't see a `.check()` that refuses the value, so
+ * a field whose set must not be empty compiles and is refused at run time.
+ */
+type StoredWithoutForm<S> = S extends { readonly Encoded: infer E }
+  ? undefined extends E
+    ? true
+    : [Extract<E, ReadonlySet<any>>] extends [never]
+      ? false
+      : true
+  : false
 
 /**
  * The names `.remove()` takes: model fields a row can lack, less what no update

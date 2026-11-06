@@ -42,6 +42,7 @@ import {
   withVector as withVectorCombinator,
 } from "./EntityCombinators.js"
 import type {
+  AddOperand,
   CascadeTarget,
   EntityDelete,
   EntityGet,
@@ -333,10 +334,10 @@ export interface BoundUpdate<
    * refused at run time, before anything is sent. To clean up an attribute the
    * model no longer declares, use `.pathRemove(["attribute"])`.
    */
-  readonly remove: (fields: ReadonlyArray<RN>) => BoundUpdate<Model, A, U, E, VN, P, RN>
-  /** Atomic numeric ADD. */
+  remove(fields: ReadonlyArray<RN>): BoundUpdate<Model, A, U, E, VN, P, RN>
+  /** Atomic ADD: a number adds, a set unions. */
   readonly add: (
-    values: globalThis.Record<string, number>,
+    values: globalThis.Record<string, AddOperand>,
   ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Numeric SET subtraction (synthesized as `SET #f = #f - :v`). */
   readonly subtract: (
@@ -462,7 +463,7 @@ export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
     )
   }
 
-  add(values: globalThis.Record<string, number>): BoundUpdateImpl<Model, A, U, E, VN> {
+  add(values: globalThis.Record<string, AddOperand>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(addCombinator(this._op, values))
   }
 
@@ -765,7 +766,7 @@ export interface BoundAppend<
    *
    * Chained `.remove()` calls accumulate.
    */
-  readonly remove: (attrs: ReadonlyArray<RN>) => BoundAppend<Model, A, E, ESkip, P, RN>
+  remove(attrs: ReadonlyArray<RN>): BoundAppend<Model, A, E, ESkip, P, RN>
   /** Skip the follow-up GetItem; success becomes `void`. */
   readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip, P, RN>
   /** Convert to an executable Effect for Effect combinator interop. */

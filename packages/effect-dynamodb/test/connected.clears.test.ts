@@ -7,6 +7,7 @@ import { it } from "@effect/vitest"
 import { Config, Effect } from "effect"
 import { describe } from "vitest"
 import * as Clears from "./helpers/ClearScenarios.js"
+import * as NoStoredForm from "./helpers/NoStoredFormScenarios.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -26,7 +27,10 @@ const describeConnected = dynamoAvailable ? describe : describe.skip
 const harness = Clears.connectedHarness(ENDPOINT)
 
 describeConnected("clearing a field, on DynamoDB", () => {
-  for (const [group, scenarios] of Object.entries(Clears.allScenarios)) {
+  for (const [group, scenarios] of Object.entries({
+    ...Clears.allScenarios,
+    ...NoStoredForm.allScenarios,
+  })) {
     describe(group, () => {
       for (const scenario of scenarios) {
         it.effect(scenario.name, () => scenario.run(harness), { timeout: 20_000 })

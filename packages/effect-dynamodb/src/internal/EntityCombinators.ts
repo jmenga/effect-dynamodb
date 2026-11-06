@@ -12,6 +12,7 @@ import type {
 import { type Effect, Function as Fn } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import {
+  type AddOperand,
   type CascadeConfig,
   type CascadeTarget,
   type EntityDelete,
@@ -472,8 +473,10 @@ export const returnValues: {
  */
 declare const RemovableTypeId: unique symbol
 /** @internal */
-export interface Removable<in out N extends string> {
-  readonly [RemovableTypeId]?: (_: N) => N
+export interface Removable<N extends string> {
+  // A method: its parameter is compared both ways, so an update that takes fewer names
+  // still fits a type written without them.
+  [RemovableTypeId]?(_: N): void
 }
 /** @internal The names a payload type allows, `string` when it doesn't say. */
 export type RemovableOf<U> = typeof RemovableTypeId extends keyof U
@@ -521,17 +524,17 @@ export const remove: {
  */
 export const add: {
   (
-    values: globalThis.Record<string, number>,
+    values: globalThis.Record<string, AddOperand>,
   ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
   <A, Rec, U, E, R>(
     self: EntityUpdate<A, Rec, U, E, R>,
-    values: globalThis.Record<string, number>,
+    values: globalThis.Record<string, AddOperand>,
   ): EntityUpdate<A, Rec, U, E, R>
 } = Fn.dual(
   2,
   <A, Rec, U, E, R>(
     self: EntityUpdate<A, Rec, U, E, R>,
-    values: globalThis.Record<string, number>,
+    values: globalThis.Record<string, AddOperand>,
   ): EntityUpdate<A, Rec, U, E, R> => {
     const existing = self._updateState.add ?? {}
     return new EntityUpdateImpl<A, Rec, U, E, R>(

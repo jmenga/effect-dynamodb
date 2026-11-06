@@ -56,7 +56,12 @@ import {
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacked.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
-import { pathIsRequired, rowCanLack } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import {
+  absentReading,
+  pathIsRequired,
+  rowCanLack,
+  rowOmits,
+} from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -76,6 +81,7 @@ import {
   Exit,
   Option,
   Schema,
+  SchemaIssue,
   Stream,
 } from "effect"
 import { SecureRandom } from "effect/crypto"
@@ -153,6 +159,8 @@ import {
   decodeSparseFields,
   encodeSparseFields,
   fromAttributeMap,
+  hasNoStoredForm,
+  isEmptySet,
   toAttributeMap,
   toAttributeValue,
 } from "./Marshaller.js"
@@ -204,6 +212,7 @@ export {
 
 import * as Projection from "@effect-dynamodb/schema/Projection.js"
 import {
+  type AddOperand,
   type CascadeConfig,
   type CascadeTarget,
   type DecodeMode,
@@ -488,6 +497,18 @@ const keyFormFor = (
  * @internal A plain update of a complete item found no item: the caller
  * creates it instead (`updateOrCreate`). Never escapes the update operation.
  */
+/**
+ * What a failed decode says, naming the field when the schema does: `"stock":
+ * Expected a value greater than or equal to 0, got -2.`
+ */
+const decodeProblem = (cause: unknown): string => {
+  if (!Schema.isSchemaError(cause)) return `${String(cause)}.`
+  const first = SchemaIssue.makeFormatterStandardSchemaV1()(cause.issue).issues[0]
+  if (first === undefined) return `${cause.message}.`
+  const path = (first.path ?? []).map((segment) => String(segment)).join(".")
+  return path === "" ? `${first.message}.` : `"${path}": ${first.message}.`
+}
+
 class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
   readonly input: unknown
 }> {}
@@ -625,7 +646,7 @@ export interface Entity<
    * @internal Phantom — never read at runtime. Carries the fields
    * `.remove()` refuses by configuration (immutable, sparse map).
    */
-  readonly _unremovableFields?: ReadonlyArray<TUnremovable>
+  _unremovableFields?(field: TUnremovable): void
 
   /**
    * @internal Pack, in place, the packed attributes of an item keyed by stored
@@ -2386,7 +2407,7 @@ const makeImpl = <
       ...((uState.updates as globalThis.Record<string, unknown> | undefined) ?? {}),
     }
     const remove = [...(uState.remove ?? [])]
-    const add: globalThis.Record<string, number> = { ...uState.add }
+    const add: globalThis.Record<string, AddOperand> = { ...uState.add }
     const subtract: globalThis.Record<string, number> = { ...uState.subtract }
     const targeted = new Set<string>([
       ...Object.keys(updates),
@@ -2599,6 +2620,18 @@ const makeImpl = <
   }
 
   /**
+   * Whether a field's key is one a row may leave out. A `null` clears such a field. On a
+   * field a row lacks only because absent is one of its values, a `NullOr` of a set, `null`
+   * is a stored value of its own.
+   */
+  const fieldOmits = (field: string): boolean =>
+    !isModelField(field) || rowOmits(modelFieldSchemas[field]!)
+
+  /** What an absent attribute reads back as on this field, if that's one of its values. */
+  const fieldAbsentReading = (field: string) =>
+    isModelField(field) ? absentReading(modelFieldSchemas[field]!) : undefined
+
+  /**
    * Why an update can't address `name` as a top-level attribute, or `undefined` when it
    * can: it's a model field an update may write, a primary-key composite (refused
    * separately, whichever way it's named), or an attribute the model doesn't know,
@@ -2733,10 +2766,14 @@ const makeImpl = <
     )
   }
 
-  /** A `.set()` value that writes nothing at all, so it clears the field. */
+  /**
+   * A `.set()` value that writes nothing at all, so it clears the field: `undefined`, or
+   * what encodes to it or to an empty set. A schema refusing the value (a `.check()` for a
+   * non-empty set) isn't a clear, and that schema goes on to refuse it.
+   */
   const encodesToNothing = (field: string, value: unknown): boolean => {
     if (value === undefined) return true
-    if (modelFieldSchemas[field]?.ast.encoding === undefined || !fieldCanLack(field)) return false
+    if (modelFieldSchemas[field]?.ast.encoding === undefined && !isEmptySet(value)) return false
     const updateField = getSchemaFields(schemas.updateSchema as unknown as Schema.Top)?.[field]
     if (updateField === undefined) return false
     try {
@@ -2746,7 +2783,7 @@ const makeImpl = <
           globalThis.Record<string, unknown>
         >,
       )({ [field]: value })
-      return Exit.isSuccess(encoded) && encoded.value[field] === undefined
+      return Exit.isSuccess(encoded) && hasNoStoredForm(encoded.value[field])
     } catch {
       return false
     }
@@ -2778,6 +2815,48 @@ const makeImpl = <
       if (!remove.includes(field)) remove.push(field)
     }
     return cleared ? { ...uState, updates: payload, remove } : uState
+  }
+
+  /**
+   * The other operations holding a value with no stored form, which DynamoDB refuses as
+   * an operand. Adding or deleting nothing, or defaulting to nothing, is nothing to do. A
+   * `pathSet` of one clears the path, as `.set()` clears a field. A list element is
+   * refused: it can't be absent without moving the elements after it.
+   */
+  const normalizeNoStoredForm = (uState: UpdateState): UpdateState | string => {
+    const keptValues = (record: object | undefined) =>
+      record === undefined
+        ? undefined
+        : Object.fromEntries(Object.entries(record).filter(([, value]) => !hasNoStoredForm(value)))
+    const keptOps = <O extends { readonly value: unknown }>(ops: ReadonlyArray<O> | undefined) =>
+      ops?.filter((op) => !hasNoStoredForm(op.value))
+    const pathRemoves = [...(uState.pathRemoves ?? [])]
+    const pathSets: Array<NonNullable<UpdateState["pathSets"]>[number]> = []
+    for (const op of uState.pathSets ?? []) {
+      if (op.isPath || !hasNoStoredForm(op.value)) {
+        pathSets.push(op)
+        continue
+      }
+      if (typeof op.segments[op.segments.length - 1] === "number") {
+        const path = op.segments.map((segment) => String(segment)).join(".")
+        return (
+          `pathSet on "${path}": DynamoDB can't store this value, and a list element can't be ` +
+          "left out without moving the elements after it. Use pathRemove to remove the " +
+          "element. Nothing was sent."
+        )
+      }
+      pathRemoves.push(op.segments)
+    }
+    return {
+      ...uState,
+      add: keptValues(uState.add),
+      deleteFromSet: keptValues(uState.deleteFromSet),
+      pathAdds: keptOps(uState.pathAdds),
+      pathDeletes: keptOps(uState.pathDeletes),
+      pathIfNotExists: keptOps(uState.pathIfNotExists),
+      pathSets: uState.pathSets === undefined ? undefined : pathSets,
+      pathRemoves: pathRemoves.length === 0 ? uState.pathRemoves : pathRemoves,
+    } as UpdateState
   }
 
   /**
@@ -2908,10 +2987,15 @@ const makeImpl = <
    * the item it writes decodes. Anything less on a missing item would leave a
    * partial row behind — those updates require the item to exist.
    */
-  const completeUpsertPayload = (updates: unknown): boolean => {
+  const completeUpsertPayload = (
+    updates: unknown,
+    removed: ReadonlyArray<string> = [],
+  ): boolean => {
     if (typeof updates !== "object" || updates === null) return false
     const record = updates as globalThis.Record<string, unknown>
-    const present = (field: string) => record[field] !== undefined && record[field] !== null
+    const present = (field: string) =>
+      (record[field] !== undefined && record[field] !== null) ||
+      (removed.includes(field) && fieldAbsentReading(field) !== undefined)
     const primary = allIndexes.primary
     if (primary && ![...primary.pk.composite, ...primary.sk.composite].every(present)) return false
     for (const [field, fieldSchema] of Object.entries(
@@ -4588,21 +4672,51 @@ const makeImpl = <
     mode: DecodeMode,
     encodedKey: globalThis.Record<string, unknown>,
   ): Effect.Effect<unknown, ValidationError | ItemNotFound> => {
+    const landed = rv === "allOld" || rv === "updatedOld" ? "replaced" : "stored"
     switch (rv) {
       case "none":
         return Effect.succeed(undefined)
       case "updatedOld":
-        return decodePartial(old, written, mode)
+        return appliedUpdate(decodePartial(old, written, mode), landed)
       case "updatedNew":
-        return decodePartial(next, written, mode)
+        return appliedUpdate(decodePartial(next, written, mode), landed)
       default: {
         const image = rv === "allOld" ? old : next
         if (image === undefined)
           return Effect.fail(new ItemNotFound({ entityType, key: encodedKey }))
-        return decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, mode)
+        return appliedUpdate(
+          decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, mode),
+          landed,
+        )
       }
     }
   }
+
+  /**
+   * A row that won't decode after its update has landed. The write can't be judged
+   * before it's sent: `.subtract()`, `.add()`, `.append()` and the path operations are
+   * DynamoDB's to apply to a value only it holds, and a read to check them would cost
+   * every update. So the failure says what happened, or a caller reads "validation
+   * failed" as "nothing changed".
+   */
+  const appliedUpdate = <A>(
+    decoding: Effect.Effect<A, ValidationError>,
+    row: "stored" | "replaced",
+  ): Effect.Effect<A, ValidationError> =>
+    Effect.mapError(decoding, (error) => {
+      const problem = decodeProblem(error.cause)
+      return new ValidationError({
+        entityType,
+        operation: "update",
+        cause:
+          row === "stored"
+            ? `The update WAS applied, and the stored row no longer matches the model: ${problem} ` +
+              "An update that changes a value relative to what's stored (.add, .subtract, " +
+              ".append, the path operations) isn't checked against the model. Guard it with " +
+              ".condition()."
+            : `The update WAS applied, but the row it replaced doesn't match the model: ${problem}`,
+      })
+    })
 
   /**
    * The history keys (version snapshots, soft-delete tombstones) of the item
@@ -6154,8 +6268,11 @@ const makeImpl = <
           cause: refusedName,
         })
       }
-      // `.set({ field: undefined })` becomes `.remove([field])`, once, here.
-      const cleared = normalizeClears(requested)
+      // `.set({ field: undefined })` becomes `.remove([field])`, once, here. So does
+      // anything else the update holds that DynamoDB can't store.
+      const clearedFields = normalizeClears(requested)
+      const cleared =
+        typeof clearedFields === "string" ? clearedFields : normalizeNoStoredForm(clearedFields)
       if (typeof cleared === "string") {
         return yield* new ValidationError({
           entityType,
@@ -6211,7 +6328,18 @@ const makeImpl = <
           cause: immutables,
         })
       }
-      const upsertable = completeUpsertPayload(uState.updates)
+      const upsertable = completeUpsertPayload(uState.updates, uState.remove)
+      // What `put` takes to create the item on a missing row: a field cleared here whose
+      // absent attribute is one of its values is that value, and `put` requires its key.
+      const createInput = (): unknown => {
+        const absent = (uState.remove ?? []).flatMap((field) => {
+          const reading = fieldAbsentReading(field)
+          return reading === undefined ? [] : [[field, reading.value] as const]
+        })
+        return absent.length === 0
+          ? uState.updates
+          : { ...(uState.updates as object), ...Object.fromEntries(absent) }
+      }
       const requestedRv = uState.returnValues ?? "allNew"
       // A cascade propagates the NEW item; a mode returning the OLD one then
       // needs both images exactly — the read-then-write branch has both.
@@ -6433,7 +6561,7 @@ const makeImpl = <
         for (const [attr, val] of Object.entries(
           hydratedUpdates as globalThis.Record<string, unknown>,
         )) {
-          if (val === undefined || (val === null && fieldCanLack(attr))) {
+          if (val === undefined || (val === null && fieldOmits(attr))) {
             delete newItem[attr]
             continue
           }
@@ -6472,7 +6600,13 @@ const makeImpl = <
         }
         if (uState.add) {
           for (const [attr, val] of Object.entries(uState.add)) {
-            newItem[attr] = ((newItem[attr] as number) ?? 0) + val
+            // DynamoDB's ADD: a number adds, a set unions, and a row without the attribute
+            // starts from nothing.
+            const held = newItem[attr]
+            newItem[attr] =
+              typeof val === "number"
+                ? ((held as number) ?? 0) + val
+                : new Set<unknown>([...(held instanceof Set ? held : []), ...val])
           }
         }
         if (uState.subtract) {
@@ -7111,10 +7245,13 @@ const makeImpl = <
         // Execute cascade if configured (retain path) — from the new item.
         if (uState.cascade) {
           const domainData = {
-            ...((yield* decodeAs(
-              fromAttributeMap(newImage) as globalThis.Record<string, unknown>,
-              newImage,
-              "model",
+            ...((yield* appliedUpdate(
+              decodeAs(
+                fromAttributeMap(newImage) as globalThis.Record<string, unknown>,
+                newImage,
+                "model",
+              ),
+              "stored",
             )) as object),
           }
           const sourceId =
@@ -7249,7 +7386,7 @@ const makeImpl = <
         const stored = yield* readCurrent(tableName, marshalledKey)
         if (stored.Item === undefined) {
           return yield* createsOnMissing
-            ? new MissingForCreate({ input: uState.updates })
+            ? new MissingForCreate({ input: createInput() })
             : missingItem()
         }
         const packedChange = yield* packedImmutableMismatch(immutables, stored.Item)
@@ -7288,10 +7425,12 @@ const makeImpl = <
       // model-declared-nullable attributes. See DESIGN.md §7. A field a row
       // can't lack keeps its `null`: it's stored, or the row couldn't be read.
       const nullClears: Array<string> = []
+      // A sparse map's entries with no stored form, by their placeholders.
+      const entryClears: Array<string> = []
       for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
         if (updateSystemColliders.has(attr)) continue
 
-        if (val === undefined || (val === null && fieldCanLack(attr))) {
+        if (val === undefined || (val === null && fieldOmits(attr))) {
           // Sparse fields: clearing a sparse field with null is a no-op
           // here — the `.removeEntries` API is the explicit per-key
           // remove. Skip to avoid REMOVE'ing the whole prefix erroneously.
@@ -7314,8 +7453,13 @@ const makeImpl = <
               })
             }
             const nameKey = `#u${counter}`
-            const valKey = `:u${counter}`
             names[nameKey] = `${sparse.prefix}#${k}`
+            if (hasNoStoredForm(v)) {
+              entryClears.push(nameKey)
+              counter++
+              continue
+            }
+            const valKey = `:u${counter}`
             values[valKey] = toAttributeValue(v)
             setClauses.push(`${nameKey} = ${valKey}`)
             counter++
@@ -7427,6 +7571,7 @@ const makeImpl = <
         names[nameKey] = resolveDbName(attr)
         removeClauses.push(nameKey)
       }
+      removeClauses.push(...entryClears)
 
       // Policy-aware GSI key composition (v1.7.1 — per-half evaluation
       // gate, structural rule, and per-half cascade). One call covers
@@ -7817,10 +7962,9 @@ const makeImpl = <
               ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
               : undefined
           if (sourceId == null) return
-          const domainData = yield* decodeAs(
-            fromAttributeMap(image) as globalThis.Record<string, unknown>,
-            image,
-            "model",
+          const domainData = yield* appliedUpdate(
+            decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, "model"),
+            "stored",
           )
           yield* executeCascade(uState.cascade, { ...(domainData as object) }, String(sourceId))
         })
@@ -7957,7 +8101,7 @@ const makeImpl = <
               const stored = err.cause.Item
               if (stored === undefined && !uState.patch) {
                 return createsOnMissing
-                  ? new MissingForCreate({ input: uState.updates })
+                  ? new MissingForCreate({ input: createInput() })
                   : new ItemNotFound({ entityType, key: encodedKey })
               }
               const corrupt = versionCorruption(stored, "update")
@@ -8088,7 +8232,7 @@ const makeImpl = <
     request: {
       readonly payload: globalThis.Record<string, unknown>
       /** Values `.add()` / `.subtract()` change by, for the reported reservation. */
-      readonly deltas?: globalThis.Record<string, number> | undefined
+      readonly deltas?: globalThis.Record<string, AddOperand> | undefined
       /** The caller's own `.condition()` — not `patch`'s or `deleteIfExists`'s guard. */
       readonly callerCondition: boolean
       readonly expectedVersion?: number | undefined
@@ -8154,6 +8298,7 @@ const makeImpl = <
           : { ...read, ...request.payload }
       if (mainPut === undefined) {
         for (const [field, delta] of Object.entries(request.deltas ?? {})) {
+          if (typeof delta !== "number") continue
           const base = read[field]
           after[field] = (typeof base === "number" ? base : 0) + delta
         }
@@ -9090,7 +9235,19 @@ const makeImpl = <
           for (const [attr, val] of Object.entries(item)) {
             if (keyAttributeFields.has(resolveDbName(attr))) continue
             if (systemColliders.has(attr)) continue
-            if (val === undefined) continue
+            // A value with no stored form is an absent attribute, so it replaces what
+            // the row holds. A field left unset (an optional `undefined`) doesn't.
+            if (
+              (isEmptySet(val) || (val === undefined && fieldAbsentReading(attr) !== undefined)) &&
+              !immutableFields.has(attr)
+            ) {
+              const nameKey = `#u${counter}`
+              names[nameKey] = resolveDbName(attr)
+              upsertRemoveClauses.push(nameKey)
+              counter++
+              continue
+            }
+            if (val === undefined || isEmptySet(val)) continue
 
             // Sparse fields: expand into one SET per bucket. Each bucket
             // attribute is named `<prefix>#<key>` and goes through
@@ -9111,8 +9268,13 @@ const makeImpl = <
                   })
                 }
                 const nameKey = `#u${counter}`
-                const valKey = `:u${counter}`
                 names[nameKey] = `${sparse.prefix}#${k}`
+                if (hasNoStoredForm(v)) {
+                  upsertRemoveClauses.push(nameKey)
+                  counter++
+                  continue
+                }
+                const valKey = `:u${counter}`
                 values[valKey] = toAttributeValue(v)
                 setClauses.push(`${nameKey} = ${valKey}`)
                 counter++
@@ -9525,7 +9687,7 @@ const makeImpl = <
       const removes = [...(requestedRemoves ?? [])].filter(
         (attr) => !removedToDefault.some(([name]) => name === attr),
       )
-      const removedSet = removes.length > 0 ? new Set(removes) : undefined
+      const namedRemoves = removes.length > 0 ? new Set(removes) : undefined
 
       // Encode user input via appendInputSchema (see `put` for strategy).
       const encodedInput = yield* encodeOrDecodeEncode(
@@ -9541,8 +9703,8 @@ const makeImpl = <
       // The SET loop (below) skips entries with `undefined` values, so the
       // conflict is only real when the payload carries a non-undefined value
       // for an attribute also named in `.remove()`.
-      if (removedSet !== undefined) {
-        for (const attr of removedSet) {
+      if (namedRemoves !== undefined) {
+        for (const attr of namedRemoves) {
           if (
             attr in encoded &&
             (encoded as globalThis.Record<string, unknown>)[attr] !== undefined
@@ -9557,6 +9719,29 @@ const makeImpl = <
           }
         }
       }
+
+      // A value with no stored form is an absent attribute, on the current item as on
+      // the event item, so it's a `.remove()` of that field. A field left unset (an
+      // optional `undefined`) isn't: it leaves the current item's attribute alone.
+      const absentValues = Object.keys(encoded).filter(
+        (attr) =>
+          isEmptySet(encoded[attr]) ||
+          (encoded[attr] === undefined && fieldAbsentReading(attr) !== undefined),
+      )
+      for (const attr of absentValues) {
+        const refused = clearRefusal(".append()", attr)
+        if (refused !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "append",
+            cause: refused,
+          })
+        }
+      }
+      const removedSet =
+        absentValues.length === 0
+          ? namedRemoves
+          : new Set([...(namedRemoves ?? []), ...absentValues])
 
       // Compose current-item primary key (pk + sk derived from PK/SK composites),
       // and the event key, before anything is marshalled: a value with no key
@@ -9620,7 +9805,7 @@ const makeImpl = <
       // never change, writing them on every append makes the first append
       // (where the row doesn't yet exist) materialise the row correctly.
       for (const [attr, val] of Object.entries(serialisedInput)) {
-        if (val === undefined) continue
+        if (val === undefined || isEmptySet(val)) continue
         const nameKey = `#a${counter}`
         const valKey = `:a${counter}`
         const storedName = resolveDbName(attr)

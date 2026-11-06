@@ -7,7 +7,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { ConditionInput } from "../Expression.js"
-import { toAttributeValue } from "../Marshaller.js"
+import { isEmptySet, toAttributeValue } from "../Marshaller.js"
 import {
   compilePath,
   type PackedPath,
@@ -351,6 +351,13 @@ export const compileExpr = (
       case "gt":
       case "gte": {
         const ops = { eq: "=", ne: "<>", lt: "<", lte: "<=", gt: ">", gte: ">=" } as const
+        // DynamoDB has no empty set: a row holding one is a row without the attribute.
+        const emptySide = isEmptySetOperand(node.left) || isEmptySetOperand(node.right)
+        if (emptySide && (node._tag === "eq" || node._tag === "ne")) {
+          const other = isEmptySetOperand(node.left) ? node.right : node.left
+          const test = node._tag === "eq" ? "attribute_not_exists" : "attribute_exists"
+          return `${test}(${compileOperand(other)})`
+        }
         return `${compileOperand(node.left)} ${ops[node._tag]} ${compileOperand(node.right)}`
       }
       case "between":
@@ -456,7 +463,35 @@ export const emptyPartProblem = (expr: Expr): string | undefined => {
       }
       return emptyPartProblem(expr.expr)
     default:
-      return undefined
+      return emptySetOperands(expr).some(isEmptySetOperand)
+        ? "DynamoDB has no empty set, so a row holding one is a row without the attribute. " +
+            "Only eq() and ne() can compare with one, by whether the attribute exists."
+        : undefined
+  }
+}
+
+/** Whether an operand is an empty set, which marshals to nothing. */
+const isEmptySetOperand = (operand: Operand): boolean =>
+  operand._tag === "value" && isEmptySet(operand.value)
+
+/** The operands that can't take an empty set: `eq` and `ne` compile it to an existence test. */
+const emptySetOperands = (expr: Expr): ReadonlyArray<Operand> => {
+  switch (expr._tag) {
+    case "lt":
+    case "lte":
+    case "gt":
+    case "gte":
+      return [expr.left, expr.right]
+    case "between":
+      return [expr.operand, expr.low, expr.high]
+    case "in":
+      return [expr.operand, ...expr.values]
+    case "beginsWith":
+      return [expr.operand, expr.prefix]
+    case "contains":
+      return [expr.operand, expr.value]
+    default:
+      return []
   }
 }
 

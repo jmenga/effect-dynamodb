@@ -241,9 +241,18 @@ export const makeRecordingTable = (options?: {
         const examined = input.Limit === undefined ? rows : rows.slice(0, input.Limit)
         const last = examined[examined.length - 1]
         const more = examined.length < rows.length && last !== undefined
+        const names = input.ExpressionAttributeNames ?? {}
+        const values = input.ExpressionAttributeValues ?? {}
+        const returned = examined
+          .map(([, item]) => item)
+          .filter(
+            (item) =>
+              input.FilterExpression === undefined ||
+              holds(input.FilterExpression, item, names, values),
+          )
         return {
-          Items: examined.map(([, item]) => item),
-          Count: examined.length,
+          Items: returned,
+          Count: returned.length,
           ScannedCount: examined.length,
           ...(more && { LastEvaluatedKey: { pk: last[1].pk!, sk: last[1].sk! } }),
         } as never

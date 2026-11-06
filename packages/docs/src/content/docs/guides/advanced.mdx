@@ -56,6 +56,8 @@ Removes specific elements from a DynamoDB Set attribute (StringSet, NumberSet):
   })
 ```
 
+Removing the last element is fine. DynamoDB can't store an empty set, so the attribute goes, and a required set reads back empty. See [Values DynamoDB Can't Store](/effect-dynamodb/guides/expressions/#values-dynamodb-cant-store).
+
 ### Composing Multiple Update Types
 
 All update combinators compose as arguments — they are merged into one `UpdateItem` call:

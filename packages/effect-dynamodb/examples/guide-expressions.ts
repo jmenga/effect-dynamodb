@@ -47,7 +47,7 @@ class Product extends Schema.Class<Product>("Product")({
   role: Schema.String,
   category: Schema.String,
   price: Schema.Number,
-  stock: Schema.Number,
+  stock: Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)),
   inStock: Schema.Boolean,
   viewCount: Schema.Number,
   email: Schema.optional(Schema.String),
@@ -60,6 +60,15 @@ class Product extends Schema.Class<Product>("Product")({
   tags: Schema.Array(Schema.String),
   categories: Schema.optional(Schema.ReadonlySet(Schema.String)),
   metadata: Schema.optional(Schema.Struct({ temporary: Schema.optional(Schema.String) })),
+}) {}
+// #endregion
+
+// #region model-no-stored-form
+class Device extends Schema.Class<Device>("Device")({
+  deviceId: Schema.String,
+  // Required, and both can hold a value DynamoDB can't store.
+  labels: Schema.ReadonlySet(Schema.String),
+  lastError: Schema.UndefinedOr(Schema.String),
 }) {}
 // #endregion
 
@@ -88,7 +97,16 @@ const Products = Entity.make({
   versioned: true,
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
+const Devices = Entity.make({
+  model: Device,
+  entityType: "Device",
+  primaryKey: {
+    pk: { field: "pk", composite: ["deviceId"] },
+    sk: { field: "sk", composite: [] },
+  },
+})
+
+const MainTable = Table.make({ schema: AppSchema, entities: { Products, Devices } })
 // #endregion
 
 // ---------------------------------------------------------------------------
@@ -97,7 +115,7 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Products } })
 
 const program = Effect.gen(function* () {
   const db = yield* DynamoClient.make({
-    entities: { Products },
+    entities: { Products, Devices },
   })
 
   // --- Setup ---
@@ -388,6 +406,78 @@ const program = Effect.gen(function* () {
   yield* Console.log(`Clearing a required field: ${refusal._tag}\n`)
 
   yield* Console.log("Field cleared\n")
+
+  // -----------------------------------------------------------------------
+  // Update Expressions — Values DynamoDB Can't Store
+  // -----------------------------------------------------------------------
+  yield* Console.log("=== Values DynamoDB Can't Store ===\n")
+
+  // #region update-no-stored-form
+  // Stored as a row without either attribute. Every read gives the values back.
+  const device = yield* db.entities.Devices.put({
+    deviceId: "d-1",
+    labels: new Set(),
+    lastError: undefined,
+  })
+
+  // The ordinary operations, then. Emptying the set takes the attribute away.
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).add({ labels: new Set(["indoor"]) })
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).deleteFromSet({
+    labels: new Set(["indoor"]),
+  })
+
+  // So these are clears as well, and the field can be cleared by name.
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).set({ labels: new Set() })
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).remove(["lastError"])
+
+  const read = yield* db.entities.Devices.get({ deviceId: "d-1" })
+  // read.labels is an empty Set, and read.lastError is undefined
+
+  // A condition or a filter comparing with an empty set asks whether the attribute is there.
+  const unlabelled = yield* db.entities.Devices.scan()
+    .filter({ labels: new Set() })
+    .collect()
+  // #endregion
+  yield* Console.log(
+    `Put ${device.labels.size} labels, read ${read.labels.size}, ` +
+      `${unlabelled.length} device without any\n`,
+  )
+
+  // -----------------------------------------------------------------------
+  // Update Expressions — Relative Updates
+  // -----------------------------------------------------------------------
+  yield* Console.log("=== Relative Updates ===\n")
+
+  yield* db.entities.Products.put({
+    ...baseProduct,
+    productId: "p-5",
+    name: "Spare",
+    category: "parts",
+    price: 1,
+    stock: 2,
+  })
+
+  // #region update-relative
+  // DynamoDB applies `.subtract` to a value only it holds, so the model can't judge the result
+  // first. A condition can: refused, it writes nothing.
+  const refusedByCondition = yield* db.entities.Products.update({ productId: "p-5" })
+    .subtract({ stock: 3 })
+    .condition((t, { gte }) => gte(t.stock, 3))
+    .asEffect()
+    .pipe(Effect.flip)
+  // ConditionalCheckFailed, and the stock is still 2
+
+  // Without one the write lands, and the ValidationError says so: "The update WAS applied, and
+  // the stored row no longer matches the model: ..."
+  const landed = yield* db.entities.Products.update({ productId: "p-5" })
+    .subtract({ stock: 3 })
+    .asEffect()
+    .pipe(Effect.flip)
+  // #endregion
+  yield* Console.log(`Guarded: ${refusedByCondition._tag}. Unguarded: ${landed._tag}\n`)
+
+  // The row no longer reads, so it goes before anything reads the table.
+  yield* db.entities.Products.delete({ productId: "p-5" })
 
   // -----------------------------------------------------------------------
   // Update Expressions — Path-Based Combinators

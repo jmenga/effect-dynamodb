@@ -71,6 +71,7 @@ import {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
+import { readingAbsentValues } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import {
   isDispatchEligible,
@@ -2970,6 +2971,17 @@ export const makeStream = <
   // ---------------------------------------------------------------------------
 
   const decodeEnvelope = Schema.decodeUnknownEffect(EventEnvelope)
+  // `undefined` and an empty set are stored as absent attributes, in an event as
+  // anywhere else, and read back as those values.
+  const decodeEventData = Schema.decodeUnknownEffect(
+    readingAbsentValues(eventUnion) as Schema.Codec<unknown>,
+  )
+  const decodeMetadata = Schema.decodeUnknownEffect(
+    readingAbsentValues(metadataSchema ?? Schema.Unknown) as Schema.Codec<unknown>,
+  )
+  const decodeSnapshotState = Schema.decodeUnknownEffect(
+    readingAbsentValues(snapshot?.schema ?? Schema.Unknown) as Schema.Codec<unknown>,
+  )
 
   /**
    * An event's stored `data` → its wire form (plain JSON), by the stored
@@ -3021,8 +3033,7 @@ export const makeStream = <
       // JSON string (`S`) parsed, compressed binary (`B`) decompressed and
       // parsed — whatever the stream's current `storedAs` says.
       const wireData = yield* unpackData(raw.data, "EventStore.decode")
-      const decoder = Schema.decodeUnknownEffect(eventUnion as Schema.Schema<TEvent>)
-      const data = yield* (decoder(wireData) as Effect.Effect<TEvent, unknown>).pipe(
+      const data = yield* (decodeEventData(wireData) as Effect.Effect<TEvent, unknown>).pipe(
         Effect.mapError(toValidationError("EventStore.decode")),
       )
 
@@ -3032,9 +3043,9 @@ export const makeStream = <
       let metadata: unknown
       if (raw.metadata !== undefined) {
         metadata = metadataSchema
-          ? yield* Schema.decodeUnknownEffect(metadataSchema as Schema.Schema<unknown>)(
-              raw.metadata,
-            ).pipe(Effect.mapError(toValidationError("EventStore.decode.metadata")))
+          ? yield* decodeMetadata(raw.metadata).pipe(
+              Effect.mapError(toValidationError("EventStore.decode.metadata")),
+            )
           : raw.metadata
       }
 
@@ -4595,9 +4606,7 @@ export const makeStream = <
       : Effect.succeed(raw.state)
     ).pipe(
       Effect.flatMap((state) =>
-        Schema.decodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
-          state,
-        ).pipe(
+        decodeSnapshotState(state).pipe(
           Effect.mapError(
             (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
           ),

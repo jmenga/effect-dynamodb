@@ -38,6 +38,23 @@ describe("SchemaAST canary tests", () => {
     })
   })
 
+  describe("what a set is told apart by", () => {
+    it("Schema.ReadonlySet has representation.id === 'effect/schema/ReadonlySet'", () => {
+      const ast = Schema.ReadonlySet(Schema.String).ast
+      expect(ast._tag).toBe("Declaration")
+      const rep = (ast.annotations as Record<string, unknown>).representation as { id: string }
+      expect(rep.id).toBe("effect/schema/ReadonlySet")
+    })
+
+    it("toEncoded keeps a set's .check(), and its element schema", () => {
+      const encoded = SchemaAST.toEncoded(
+        Schema.ReadonlySet(Schema.String).check(Schema.isMinSize(1)).ast,
+      )
+      expect(encoded.checks?.length).toBe(1)
+      expect((encoded as SchemaAST.Declaration).typeParameters[0]?._tag).toBe("String")
+    })
+  })
+
   describe("DateTime.Zoned detection via inferDefaultEncoding", () => {
     it("detects DateTime.Zoned from Schema.DateTimeZoned", () => {
       const enc = inferDefaultEncoding(Schema.DateTimeZoned)

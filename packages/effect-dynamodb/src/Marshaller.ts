@@ -12,17 +12,73 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
 import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 
+const MARSHALL_OPTIONS = { removeUndefinedValues: true, convertClassInstanceToMap: true } as const
+
+/** A set DynamoDB can't store: nothing in it, once `undefined` values are removed. */
+export const isEmptySet = (value: unknown): boolean =>
+  value instanceof Set && [...value].every((element) => element === undefined)
+
+/** `undefined` or an empty set: stored as an absent attribute. */
+export const hasNoStoredForm = (value: unknown): boolean => value === undefined || isEmptySet(value)
+
+/**
+ * The value without the empty sets in its maps, the same reference when it has
+ * none. A list keeps its elements: leaving one out would move those after it, so
+ * marshalling refuses an empty set there.
+ */
+const withoutEmptySets = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null) return value
+  if (Array.isArray(value)) {
+    const elements = value.map((element) => withoutEmptySets(element))
+    return elements.some((element, index) => element !== value[index]) ? elements : value
+  }
+  if (value instanceof Map) {
+    const entries = [...value].filter(([, entry]) => !isEmptySet(entry))
+    const next = entries.map(([key, entry]) => [key, withoutEmptySets(entry)] as const)
+    const same =
+      entries.length === value.size && next.every(([key, entry]) => entry === value.get(key))
+    return same ? value : new Map(next)
+  }
+  const entries = Object.entries(value)
+  const next = entries
+    .filter(([, entry]) => !isEmptySet(entry))
+    .map(([key, entry]) => [key, withoutEmptySets(entry)] as const)
+  const same =
+    next.length === entries.length &&
+    next.every(([key, entry]) => entry === (value as Record<string, unknown>)[key])
+  return same ? value : Object.fromEntries(next)
+}
+
+/**
+ * DynamoDB can't store an empty set, so one is an absent attribute. Marshalling
+ * refuses it, and only then are the item's empty sets looked for: an item without
+ * any costs nothing and marshals exactly as it did.
+ */
+const marshallStorable = (item: Record<string, unknown>): Record<string, AttributeValue> => {
+  try {
+    return marshall(item, MARSHALL_OPTIONS)
+  } catch (cause) {
+    const storable = withoutEmptySets(item)
+    if (storable === item) throw cause
+    return marshall(storable as Record<string, unknown>, MARSHALL_OPTIONS)
+  }
+}
+
 /** Marshall a JS object to a DynamoDB attribute map */
 export const toAttributeMap = (item: Record<string, unknown>): Record<string, AttributeValue> =>
-  marshall(item, { removeUndefinedValues: true, convertClassInstanceToMap: true })
+  marshallStorable(item)
 
 /** Unmarshall a DynamoDB attribute map to a JS object */
 export const fromAttributeMap = (item: Record<string, AttributeValue>): Record<string, unknown> =>
   unmarshall(item)
 
-/** Marshall a single value to a DynamoDB attribute value */
+/**
+ * Marshall a single value to a DynamoDB attribute value. An empty set directly
+ * here is refused, as marshalling refuses it: a caller holding a value to send has
+ * no attribute to leave out, and has to decide what no value means.
+ */
 export const toAttributeValue = (value: unknown): AttributeValue =>
-  marshall({ v: value }, { removeUndefinedValues: true, convertClassInstanceToMap: true }).v!
+  (isEmptySet(value) ? marshall({ v: value }, MARSHALL_OPTIONS) : marshallStorable({ v: value })).v!
 
 /** Unmarshall a single DynamoDB attribute value */
 export const fromAttributeValue = (value: AttributeValue): unknown => unmarshall({ v: value }).v

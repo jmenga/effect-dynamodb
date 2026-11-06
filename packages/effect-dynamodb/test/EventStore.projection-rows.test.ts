@@ -332,6 +332,38 @@ describe("projection outbox", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  it.effect("an effect holding a value with no stored form drains with that value", () =>
+    Effect.gen(function* () {
+      const Bare = EventStore.projection({
+        ...base,
+        revision: "rev",
+        outbox: {
+          schema: Schema.Struct({
+            orderId: Schema.String,
+            note: Schema.UndefinedOr(Schema.String),
+            tags: Schema.ReadonlySet(Schema.String),
+          }),
+          effects: (event) => [
+            { orderId: event.streamId, note: undefined, tags: new Set<string>() },
+          ],
+        },
+      })
+      yield* Bare.applyBatch(yield* seed("o1", [new Placed({ amount: 1 })]))
+      const pending = items("read", "Summary#outbox")
+      expect(pending).toHaveLength(1)
+      expect(pending[0]!.effect).toEqual({ orderId: "o1" })
+      const delivered: Array<any> = []
+      yield* Bare.drain({ orderId: "o1" }, (effect) =>
+        Effect.sync(() => {
+          delivered.push(effect)
+        }),
+      )
+      expect(delivered).toHaveLength(1)
+      expect(delivered[0].tags).toEqual(new Set())
+      expect("note" in delivered[0]).toBe(true)
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("a write without effects stays a single put", () =>
     Effect.gen(function* () {
       const events = yield* seed("o1", [new Placed({ amount: 1 })])

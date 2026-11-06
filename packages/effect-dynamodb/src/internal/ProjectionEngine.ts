@@ -25,6 +25,7 @@ import {
   ProjectionSourceConflict,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { readingAbsentValues } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   DateTime,
@@ -1195,6 +1196,10 @@ export const makeEngine = (config: EngineConfig) => {
   // Outbox drain (#155)
   // -------------------------------------------------------------------------
 
+  const decodeEffect = S.decodeUnknownEffect(
+    readingAbsentValues(config.outbox?.schema ?? S.Unknown) as S.Codec<unknown>,
+  )
+
   /**
    * Deliver a row's pending effects in order: claim the head item, deliver it,
    * delete it, repeat. A claim another drainer holds stops the drain; a crash
@@ -1248,7 +1253,7 @@ export const makeEngine = (config: EngineConfig) => {
           )
         // Another drainer holds the head: it delivers in order; stop here.
         if (!claimed) return { delivered, undelivered: Option.none() }
-        const effect = yield* S.decodeUnknownEffect(outbox.schema)(raw.effect).pipe(
+        const effect = yield* decodeEffect(raw.effect).pipe(
           Effect.mapError(
             (cause) =>
               new ValidationError({ entityType, operation: `${config.label}.drain`, cause }),

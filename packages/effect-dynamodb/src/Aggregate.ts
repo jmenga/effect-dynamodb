@@ -1260,13 +1260,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
   //   - update re-decodes the mutated state, which carries domain `DateTime`
   //     values → accepted as-is (a strict `*FromString` decoder would reject
   //     them). It is decode-only, so making transforms tolerant is safe — the
-  //     stored wire format is still produced by the attribute encoders.
+  //     stored wire format is still produced by the attribute encoders;
+  //   - an absent attribute reads as the value it stands for: `undefined`, or an
+  //     empty set, neither of which DynamoDB can store (`absentReading`).
   // Nested edge / ref classes round-trip with their class instance identity
   // preserved (Option A). Returns the raw `schema` unchanged when it carries no
   // such leaf at all (zero overhead).
   const decodeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
     resolveRef,
+    absentReads: true,
   }) as unknown as Schema.Codec<any>
   // The same schema for WRITES — `create` input and `update`'s mutated state —
   // with the container `.check()` refinements the substitution rebuilds kept, so
@@ -1276,6 +1279,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
     tolerantTransforms: true,
     resolveRef,
     enforceChecks: true,
+  }) as unknown as Schema.Codec<any>
+
+  // `update`'s mutated state: the plain state a mutation is handed holds a set as a list
+  // (`Schema.toIso`), and it can hand that straight back.
+  const mutatedStateSchema = substituteSchemaDeep(schema, {
+    tolerantTransforms: true,
+    resolveRef,
+    enforceChecks: true,
+    listedSets: true,
   }) as unknown as Schema.Codec<any>
 
   // Validate the collection index against the table's primary key. Best effort: a
@@ -1653,7 +1665,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       //    for every date field (root + nested edges, Pattern A and Pattern B),
       //    so update no longer trips the "Expected string, got DateTime" decode
       //    that a strict `*FromString` schema would raise (#72 update path).
-      const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(updated).pipe(
+      const decoded = yield* Schema.decodeUnknownEffect(mutatedStateSchema)(updated).pipe(
         Effect.mapError(
           (cause) =>
             new ValidationError({
@@ -2733,6 +2745,16 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
     return a.every((item, i) => deepEqual(item, b[i]))
   }
   if (Array.isArray(a) || Array.isArray(b)) return false
+  // A set has no own keys: compared below, any two would be equal, and a change to one
+  // would never be written. Members are strings, numbers or binary values, by identity.
+  if (a instanceof Set || b instanceof Set) {
+    return (
+      a instanceof Set &&
+      b instanceof Set &&
+      a.size === b.size &&
+      [...a].every((member) => b.has(member))
+    )
+  }
 
   const aObj = a as Record<string, unknown>
   const bObj = b as Record<string, unknown>
