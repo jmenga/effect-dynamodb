@@ -27,7 +27,6 @@ import {
   getSchemaFields,
   holdsUndefined,
   isSchemaLike,
-  isSetDeclaration,
   numericTypeWithStringEncoding,
   rowCanLack,
   transformWireKind as transformWireKindImpl,
@@ -419,7 +418,9 @@ export const isSelfDateSchema = (schema: Schema.Top): boolean => {
  * the inner AST with an optional context, so it needs no case of its own. The
  * tolerant `substituteSchemaDeep` walks the same containers (see
  * `walkedContainer`), except `Suspend`: a recursive schema keeps its own
- * codec, so the aggregate encodes it through its own `encode`.
+ * codec, so the aggregate encodes it through its own `encode`. A declaration's
+ * type parameters are walked too: `Schema.Option(Schema.DateFromString)` stores
+ * a string only if it's encoded, and `holdsTransformation` lets it be taken.
  *
  * `hasEncodingTransformation` asks the same question of the TOP-LEVEL node
  * only, and an `Arrays` / `Objects` node never carries an encoding itself — so a
@@ -436,7 +437,11 @@ const astContainsWireTransform = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>):
   if (SchemaAST.isDeclaration(ast)) {
     const resolved = SchemaAST.resolve(ast) as globalThis.Record<string, unknown> | undefined
     const rep = resolved?.representation as { readonly id?: string } | undefined
-    return matchDateRepresentation(resolved) !== undefined || rep?.id === "effect/schema/Redacted"
+    return (
+      matchDateRepresentation(resolved) !== undefined ||
+      rep?.id === "effect/schema/Redacted" ||
+      ast.typeParameters.some((parameter) => astContainsWireTransform(parameter, seen))
+    )
   }
   const walk = (child: SchemaAST.AST) => astContainsWireTransform(child, seen)
   if (SchemaAST.isArrays(ast)) return ast.elements.some(walk) || ast.rest.some(walk)
@@ -796,6 +801,30 @@ const isLeafEncodingTransform = (schema: Schema.Top): boolean =>
   transformWireKindImpl(schema) !== undefined
 
 /**
+ * What an aggregate takes in either form: any transformation that isn't a class or a struct, whose
+ * fields are walked, whatever it's stored as, such as `Schema.Defect()`, a `Schema.toCodecJson` over
+ * a map, a map decoded from a record, `Schema.OptionFromNullOr` or a list held as JSON. A step
+ * encoded as optional has been unwrapped by now (`decodingDefaultField`), and it has to keep filling
+ * a missing key.
+ */
+const isTolerantLeaf = (schema: Schema.Top): boolean =>
+  schemaFieldsOf(schema) === undefined && schema.ast.encoding !== undefined
+
+/** What the unmarshaller can hand back. Anything else was given by the caller. */
+const STORED_PROTOTYPES: ReadonlySet<unknown> = new Set([
+  Object.prototype,
+  Array.prototype,
+  Set.prototype,
+  Uint8Array.prototype,
+])
+
+/** A value that can't be a stored form. */
+const isClassInstance = (value: unknown): boolean =>
+  typeof value === "object" &&
+  value !== null &&
+  !STORED_PROTOTYPES.has(Object.getPrototypeOf(value))
+
+/**
  * Build a TOLERANT substitute for an arbitrary leaf transform — the general
  * form of what `buildDateTransform` does for dates.
  *
@@ -823,6 +852,12 @@ const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
   return Schema.Any.pipe(
     Schema.decodeTo(typeSide, {
       decode: SchemaGetter.transformEffect((value: unknown) => {
+        // A class instance is asked as the domain value first: a `Map` passes a record's check as
+        // a record with no keys, so a map decoded from a record would come out empty.
+        if (isClassInstance(value)) {
+          const given = validateDomain(value)
+          if (given._tag === "Some") return Effect.succeed(given.value)
+        }
         const fromWire = decodeWire(value)
         if (fromWire._tag === "Some") return Effect.succeed(fromWire.value)
         // A marshalled `DateTime` (#133) is rebuilt before it is validated: a
@@ -1180,11 +1215,12 @@ export interface DeepSubstitutionOptions {
    */
   readonly absentReads?: boolean | "only" | undefined
   /**
-   * An aggregate's mutated state only: a set also decodes from the list its plain state
-   * holds it as (`Schema.toIso` gives a set as an array), so a mutation can hand the state
-   * back. `create` input stays a set. Propagated through the recursion.
+   * An aggregate's mutated state only: a declaration also decodes from the form its plain
+   * state holds it as (`Schema.toIso` gives a set as an array, an `Option` as a tagged
+   * object), so a mutation can hand the state back. `create` input stays the declared type.
+   * Propagated through the recursion.
    */
-  readonly listedSets?: boolean | undefined
+  readonly plainStateForms?: boolean | undefined
   /** See {@link writingTuplePositions}. Propagated through the recursion. */
   readonly undefinedPositionsOnly?: boolean | undefined
 }
@@ -1198,7 +1234,7 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
   opts?.path ||
   opts?.enforceChecks ||
   opts?.absentReads ||
-  opts?.listedSets ||
+  opts?.plainStateForms ||
   opts?.undefinedPositionsOnly
     ? {
         ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
@@ -1208,7 +1244,7 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
         ...(opts?.path ? { path: opts.path } : {}),
         ...(opts?.enforceChecks ? { enforceChecks: true } : {}),
         ...(opts?.absentReads ? { absentReads: opts.absentReads } : {}),
-        ...(opts?.listedSets ? { listedSets: true } : {}),
+        ...(opts?.plainStateForms ? { plainStateForms: true } : {}),
         ...(opts?.undefinedPositionsOnly ? { undefinedPositionsOnly: true } : {}),
       }
     : undefined
@@ -1667,9 +1703,10 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   if (tryGetRedactedInner(schema) !== undefined) return true
   // Any other leaf transform, tolerant mode only — same reason as the date
   // case: after a mutation the field may hold either form (#116).
-  if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) return true
+  if (opts?.tolerantTransforms && isTolerantLeaf(schema)) return true
   if (needsLegacyRead(schema, opts) || needsBigIntLift(schema, opts)) return true
-  if (opts?.listedSets && isSetDeclaration(schema.ast)) return true
+  if (opts?.plainStateForms && holdsPlainForm(schema.ast)) return true
+  if (opts?.tolerantTransforms && holdsTransformation(schema.ast)) return true
   const container = walkedContainer(schema)
   if (container !== undefined) {
     return container.children.some((child, index) =>
@@ -1693,22 +1730,39 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   return false
 }
 
-/** A set, or the list an aggregate's plain state holds it as. See `listedSets`. */
-const acceptingListedSet = (set: Schema.Top): Schema.Top =>
+/**
+ * Whether a mutation can hold this as something else: a declaration of Effect's or a custom one,
+ * as opposed to a `Schema.Class`, whose AST is a declaration encoded as its struct and whose
+ * fields are walked. See `plainStateForms`.
+ */
+const holdsPlainForm = (ast: SchemaAST.AST): boolean =>
+  ast._tag === "Declaration" && ast.encoding === undefined
+
+/**
+ * A declaration with a transformation inside, such as `Schema.Option(Schema.DateFromString)`. The
+ * tolerant substitution doesn't reach under a declaration, so an aggregate's `create` would be
+ * handed the domain value and refuse it.
+ */
+const holdsTransformation = (ast: SchemaAST.AST): boolean =>
+  holdsPlainForm(ast) &&
+  (ast as SchemaAST.Declaration).typeParameters.some(
+    (parameter) => SchemaAST.toType(parameter) !== parameter,
+  )
+
+/** A declaration, or its domain value. See `holdsTransformation`. */
+const acceptingDomainForm = (declaration: Schema.Top): Schema.Top =>
+  Schema.Union([declaration, Schema.toType(declaration)] as never) as unknown as Schema.Top
+
+/**
+ * A declaration, or either of what a mutation can hand back for it: the domain value it was
+ * given, or the form its plain state holds it as. See `plainStateForms`.
+ */
+const acceptingPlainForm = (declaration: Schema.Top): Schema.Top =>
   Schema.Union([
-    set,
-    Schema.Array(Schema.make((set.ast as SchemaAST.Declaration).typeParameters[0]!)).pipe(
-      Schema.decodeTo(
-        set as Schema.Codec<unknown, unknown>,
-        {
-          decode: SchemaGetter.transform(
-            (list: unknown) => new Set(list as ReadonlyArray<unknown>),
-          ),
-          encode: SchemaGetter.transform((held: unknown) => [...(held as ReadonlySet<unknown>)]),
-        } as never,
-      ),
-    ),
-  ])
+    declaration,
+    Schema.toType(declaration),
+    Schema.toCodecIso(declaration as never),
+  ] as never) as unknown as Schema.Top
 
 /**
  * Recursively substitute self-date and `RedactedFromValue` leaves wherever they
@@ -1785,14 +1839,22 @@ export const substituteSchemaDeep = (
   // after the date and Redacted branches so those keep their dedicated
   // substitutes, and before the array / struct recursion so containers are
   // still walked rather than swallowed (#116).
-  if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) {
-    return buildTolerantTransform(schema)
+  if (opts?.tolerantTransforms && isTolerantLeaf(schema)) {
+    const tolerant = buildTolerantTransform(schema)
+    const domain = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
+    return opts.plainStateForms && holdsPlainForm(domain.ast)
+      ? (Schema.Union([
+          tolerant,
+          Schema.toCodecIso(domain as never),
+        ] as never) as unknown as Schema.Top)
+      : tolerant
   }
   // Leaf: read leniency for legacy domain-form values (entity read schemas) and
   // the plain-bigint lift (#133).
   if (needsLegacyRead(schema, opts)) return buildLegacyReadTransform(schema)
   if (needsBigIntLift(schema, opts)) return buildBigIntLift(schema)
-  if (opts?.listedSets && isSetDeclaration(schema.ast)) return acceptingListedSet(schema)
+  if (opts?.plainStateForms && holdsPlainForm(schema.ast)) return acceptingPlainForm(schema)
+  if (holdsTransformation(schema.ast)) return acceptingDomainForm(schema)
 
   // Union / Record / Tuple / *WithRest: substitute every child and rebuild the
   // same container kind, metadata included (#133). Without `tolerantTransforms`

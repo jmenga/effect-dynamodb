@@ -1363,13 +1363,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
     enforceChecks: true,
   }) as unknown as Schema.Codec<any>
 
-  // `update`'s mutated state: the plain state a mutation is handed holds a set as a list
-  // (`Schema.toIso`), and it can hand that straight back.
+  // `update`'s mutated state: the plain state a mutation is handed holds a set as a list and
+  // an `Option` as a tagged object (`Schema.toIso`), and it can hand that straight back.
   const mutatedStateSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
     resolveRef,
     enforceChecks: true,
-    listedSets: true,
+    plainStateForms: true,
   }) as unknown as Schema.Codec<any>
 
   // Validate the collection index against the table's primary key. Best effort: a
