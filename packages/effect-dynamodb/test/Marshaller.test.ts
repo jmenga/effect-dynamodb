@@ -1,5 +1,7 @@
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { marshall } from "@aws-sdk/util-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Cause, Effect, Schema } from "effect"
+import { Cause, Effect, Exit, Option, Result, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import * as Expression from "../src/Expression.js"
 import { marshalOrFail } from "../src/internal/TransactableOps.js"
@@ -26,6 +28,105 @@ class Location extends Schema.Class<Location>("Location")({
 }) {}
 
 describe("values with no stored form", () => {
+  describe("an empty set in a value whose prototype carries part of what's stored", () => {
+    class Inherited {
+      readonly tags = new Set<string>()
+    }
+    Object.assign(Inherited.prototype, { kind: "inherited", drop: () => 1 })
+    class Tagged extends Schema.TaggedClass<Tagged>("Tagged")("Tagged", {
+      tags: Schema.ReadonlySet(Schema.String),
+    }) {}
+    class Plain extends Schema.Class<Plain>("Plain")({
+      tags: Schema.ReadonlySet(Schema.String),
+      n: Schema.Number,
+    }) {}
+    const holding = (tags: ReadonlySet<string>) => ({
+      option: Option.some({ tags, n: 1 }),
+      optionOfOption: Option.some(Option.some({ tags })),
+      optionOfSet: Option.some(tags),
+      none: Option.none(),
+      success: Result.succeed({ tags }),
+      failure: Result.fail({ tags }),
+      exit: Exit.succeed({ tags }),
+      exitFailure: Exit.fail({ tags }),
+      cause: Cause.fail({ tags }),
+      tagged: new Tagged({ tags }),
+      plain: new Plain({ tags, n: 1 }),
+      list: [Option.some({ tags }), Exit.succeed({ tags }), new Tagged({ tags })],
+      record: { a: Option.some({ tags }), b: Cause.fail({ tags }) },
+      map: new Map([["k", Option.some({ tags })]]),
+    })
+    /** What marshalling stores for a value, without the attributes holding a set. */
+    const withoutSets = (attribute: AttributeValue): AttributeValue => {
+      if (attribute.L !== undefined) return { L: attribute.L.map(withoutSets) }
+      if (attribute.M === undefined) return attribute
+      return {
+        M: Object.fromEntries(
+          Object.entries(attribute.M)
+            .filter(([, part]) => part.SS === undefined)
+            .map(([key, part]) => [key, withoutSets(part)]),
+        ),
+      }
+    }
+    const direct = (item: Record<string, unknown>) =>
+      marshall(item, { removeUndefinedValues: true, convertClassInstanceToMap: true })
+
+    it("keeps everything else, the prototype's included", () => {
+      const full = direct(holding(new Set(["a"])))
+      const stored = toAttributeMap(holding(new Set()))
+      expect(stored).toEqual(
+        Object.fromEntries(Object.entries(full).map(([key, part]) => [key, withoutSets(part)])),
+      )
+      expect(stored.option?.M?._tag).toEqual({ S: "Some" })
+      expect(stored.option?.M?._op).toEqual({ S: "Some" })
+      expect(stored.option?.M?.["~effect/Option"]).toEqual({ M: {} })
+      expect(stored.success?.M?._tag).toEqual({ S: "Success" })
+      expect(stored.exit?.M?._tag).toEqual({ S: "Success" })
+      expect(stored.exit?.M?.["~effect/Exit"]).toEqual({ S: "~effect/Exit" })
+      expect(stored.cause?.M?.["~effect/Cause"]).toEqual({ S: "~effect/Cause" })
+      expect(stored.tagged?.M?._tag).toEqual({ S: "Tagged" })
+    })
+
+    it("a class's own prototype goes the same way, leaving out what marshalling leaves out", () => {
+      expect(toAttributeMap({ a: new Inherited() })).toEqual({
+        a: { M: { kind: { S: "inherited" } } },
+      })
+      expect(toAttributeValue({ a: new Inherited() })).toEqual({
+        M: { a: { M: { kind: { S: "inherited" } } } },
+      })
+    })
+
+    it("is left alone when marshalling takes it, without looking inside", () => {
+      const item = holding(new Set(["a"]))
+      const stored = toAttributeMap(item)
+      expect(stored).toEqual(direct(item))
+      expect(Object.keys(stored.option?.M ?? {})).toEqual(Object.keys(direct(item).option?.M ?? {}))
+      let reads = 0
+      const counted = {
+        get n() {
+          reads += 1
+          return 1
+        },
+      }
+      expect(toAttributeMap({ counted })).toEqual({ counted: { M: { n: { N: "1" } } } })
+      expect(reads).toBe(1)
+    })
+
+    it("a refusal names a path through what's on the prototype", () => {
+      class Refusing {}
+      // `NaN !== NaN`, so a NaN gets its holder rewritten, and the walk then wouldn't see a prototype.
+      Object.assign(Refusing.prototype, { held: { bad: Number.POSITIVE_INFINITY } })
+      const refused = (() => {
+        try {
+          return toAttributeMap({ a: new Set(), r: new Refusing() })
+        } catch (error) {
+          return error as UnstorableValue
+        }
+      })() as UnstorableValue
+      expect(refused.path).toEqual(["r", "held", "bad"])
+    })
+  })
+
   it("an empty set is an absent attribute, in a map at any depth", () => {
     expect(
       toAttributeMap({

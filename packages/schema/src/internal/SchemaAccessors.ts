@@ -1066,6 +1066,43 @@ export const rowOmits = (field: Schema.Top): boolean => {
 }
 
 /**
+ * Whether what's stored for this can leave out a value that reads back all the same: a struct's
+ * field ({@link absentReading}), or the set an `Option` holds as its value. An `undefined` there
+ * reads as what it is without anything being done about it.
+ */
+export const holdsAbsentValue = (
+  ast: SchemaAST.AST,
+  seen: ReadonlySet<SchemaAST.AST> = new Set(),
+): boolean => {
+  const found = forced(ast, seen)
+  if (found === undefined) return false
+  const { node } = found
+  const reading = (part: SchemaAST.AST) => absentReading(Schema.make<Schema.Top>(part))
+  const within = (asts: ReadonlyArray<SchemaAST.AST>) =>
+    asts.some((part) => holdsAbsentValue(part, found.seen))
+  switch (node._tag) {
+    case "Declaration":
+      return (
+        node.typeParameters.some((part) => reading(part)?.stored !== undefined) ||
+        within(node.typeParameters)
+      )
+    case "Union":
+      return within(node.types)
+    case "Arrays":
+      return within([...node.elements, ...node.rest])
+    case "Objects": {
+      const fields = node.propertySignatures.map((property) => property.type)
+      return (
+        fields.some((part) => reading(part) !== undefined) ||
+        within([...fields, ...node.indexSignatures.map((signature) => signature.type)])
+      )
+    }
+    default:
+      return false
+  }
+}
+
+/**
  * Whether a stored row can be without this field and still be read: its key may
  * be left out ({@link rowOmits}), or an absent attribute is one of its values
  * ({@link absentReading}). A required field cannot, nor can a `NullOr`, whose key
