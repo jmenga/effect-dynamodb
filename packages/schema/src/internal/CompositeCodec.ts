@@ -65,17 +65,27 @@ export type CompositeKeyForm = (attr: string, value: unknown) => unknown
  *    like `gte(t.status, "d")` on a `Schema.Literals` composite is deliberately
  *    not a valid value and must not be rejected by a codec. Otherwise `encode`,
  *    with `decode -> encode` as the fallback so an already-encoded value
- *    round-trips to itself (`Entity.put`'s strategy).
+ *    round-trips to itself (`Entity.put`'s strategy), and then, for a value
+ *    neither takes, the same two from the numeric kind the Encoded side is
+ *    stored as: a row read back holds a stored `bigint` as a number.
  *
- * `onError` fires when the value reaches neither target form — refuse loudly
- * rather than compose a key that silently matches nothing.
+ * `onError` fires when the value of an attribute a key is composed from
+ * reaches neither target form — refuse loudly rather than compose a key that
+ * silently matches nothing. `reads` names those attributes, when the records
+ * normalised hold others too (a whole row read back from DynamoDB): any other
+ * attribute's value is never key text, so one that reaches neither form is
+ * left as it is. Without `reads`, every attribute is one.
  */
 export const makeCompositeKeyForm = (
   source: Schema.Top,
   onError: (attr: string, value: unknown) => never,
+  options?: { readonly reads?: ((attr: string) => boolean) | undefined },
 ): CompositeKeyForm => {
   const fields = getSchemaFields(source)
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
+  const reads = options?.reads
+  const refuse = (attr: string, value: unknown): unknown =>
+    reads === undefined || reads(attr) ? onError(attr, value) : value
 
   const resolve = (attr: string): ((value: unknown) => unknown) | null => {
     const cached = cache.get(attr)
@@ -108,11 +118,11 @@ export const makeCompositeKeyForm = (
         if (typeof value === "bigint") return wantsBigInt ? value : Number(value)
         if (typeof value === "number") {
           if (!wantsBigInt) return value
-          return Number.isInteger(value) ? BigInt(value) : onError(attr, value)
+          return Number.isInteger(value) ? BigInt(value) : refuse(attr, value)
         }
         const decoded = decode(value)
         if (Option.isSome(decoded)) return decoded.value
-        return onError(attr, value)
+        return refuse(attr, value)
       }
       cache.set(attr, fn)
       return fn
@@ -139,15 +149,25 @@ export const makeCompositeKeyForm = (
     // Case 3b — target is the Encoded side.
     const encode = Schema.encodeUnknownOption(codec)
     const decode = Schema.decodeUnknownOption(codec)
-    const fn = (value: unknown): unknown => {
+    const toEncoded = (value: unknown): Option.Option<unknown> => {
       const direct = encode(value)
-      if (Option.isSome(direct)) return direct.value
-      const decoded = decode(value)
-      if (Option.isSome(decoded)) {
-        const reencoded = encode(decoded.value)
-        if (Option.isSome(reencoded)) return reencoded.value
+      if (Option.isSome(direct)) return direct
+      return Option.flatMap(decode(value), (decoded) => encode(decoded))
+    }
+    // The stored form, as case 3a takes it (`OptionFromNullOr(BigInt)`, a
+    // `BigInt` under a decoding default): asked only when the value as given
+    // reaches neither form. It is the value `put` handed this rule (the write
+    // path holds encoded records), so it takes the steps `put`'s value took.
+    const stored = storedNumericForm(field)
+    const fn = (value: unknown): unknown => {
+      const given = toEncoded(value)
+      if (Option.isSome(given)) return given.value
+      const lifted = stored?.(value)
+      if (lifted !== undefined) {
+        const fromStored = toEncoded(lifted)
+        if (Option.isSome(fromStored)) return fromStored.value
       }
-      return onError(attr, value)
+      return refuse(attr, value)
     }
     cache.set(attr, fn)
     return fn
@@ -158,6 +178,26 @@ export const makeCompositeKeyForm = (
     const fn = resolve(attr)
     return fn === null ? value : fn(value)
   }
+}
+
+/**
+ * The value a field held when it was stored, from what the unmarshaller hands
+ * back for it. A field whose Encoded side is a `bigint` is stored as `N` and
+ * comes back as a number while it is a safe integer; one whose Encoded side is
+ * a number comes back as a `bigint` past 2^53. `undefined` when the field's
+ * Encoded side isn't one numeric kind, and from the function returned for a
+ * value already of that kind (or not a number at all).
+ */
+export const storedNumericForm = (field: Schema.Top): ((value: unknown) => unknown) | undefined => {
+  const kind = astKeyFormValueKind(SchemaAST.toEncoded(field.ast))
+  if (kind === "bigint") {
+    return (value) =>
+      typeof value === "number" && Number.isSafeInteger(value) ? BigInt(value) : undefined
+  }
+  if (kind === "number") {
+    return (value) => (typeof value === "bigint" ? Number(value) : undefined)
+  }
+  return undefined
 }
 
 /**

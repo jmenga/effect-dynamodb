@@ -883,20 +883,14 @@ const dateAttrEncoder = (
 }
 
 /**
- * The field's own encode, with `decode -> encode` as the fallback so a caller
- * who already supplied wire form round-trips to itself (the same strategy
- * `Entity.put` uses). `None` when neither works: the value is neither Type nor
- * Encoded for this field, and what's stored is the caller's to decide.
+ * The field's own encode, for a sort-key composite read off an item
+ * (`buildKeyAttrEncoders`). Decomposition hands it the domain value, so there
+ * is no stored form to take back: a value the encode refuses is composed from
+ * as it is.
  */
-const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => Option.Option<unknown>) => {
-  const codec = fieldSchema as unknown as Schema.Codec<any>
-  const encode = Schema.encodeUnknownOption(codec)
-  const decode = Schema.decodeUnknownOption(codec)
-  return (value) => {
-    const direct = encode(value)
-    if (Option.isSome(direct)) return direct
-    return Option.flatMap(decode(value), encode)
-  }
+const ownKeyEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) => {
+  const encode = Schema.encodeUnknownOption(fieldSchema as unknown as Schema.Codec<any>)
+  return (value) => Option.getOrElse(encode(value), () => value)
 }
 
 /**
@@ -921,11 +915,11 @@ const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => Option.Op
  *    `tolerantTransforms`, with the aggregate's ref resolver), so the stored
  *    form is exactly what assembly reads back — nested date leaves included —
  *    and a `DynamoModel.ref`-annotated field is encoded through the ref
- *    target's model. The field's own encode is the fallback. A value none of
- *    them takes is stored as given, and reported through `asGiven`: the write
- *    then stores it only if its rows read back (`refuseNotReadBack`,
- *    `EDD-9127`). A schema that can't encode a value it decodes to, such as a
- *    transformation over itself, gets here with every value a caller holds.
+ *    target's model. A value it can't encode is stored as given, and reported
+ *    through `asGiven`: the write then stores it only if its rows read back
+ *    (`refuseNotReadBack`, `EDD-9127`). A schema that can't encode a value it
+ *    decodes to, such as a transformation over itself, gets here with every
+ *    value a caller holds.
  *
  *    Gating on the TOP-LEVEL node instead (as before #133) skipped every
  *    container, because an `Arrays` / `Objects` node carries no encoding of its
@@ -981,11 +975,10 @@ const buildAttrEncoders = (
     // always what the field's own schema takes: a redacted value of another label. What's stored
     // is the first's; this only keeps such a value from being marshalled as it is.
     const encodeAsRead = encoderOver({ decodeOnly: true })
-    const own = ownAttrEncoder(fieldSchema)
+    // A value neither takes is stored as given.
     encoders[field] = (value, asGiven) =>
       encodeSubstituted(value).pipe(
         Option.orElse(() => encodeAsRead(value)),
-        Option.orElse(() => own(value)),
         Option.getOrElse(() => {
           asGiven?.()
           return value
@@ -1026,11 +1019,7 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
           return value
         }
       }
-    } else if (hasEncodingTransformation(fieldSchema)) {
-      // A key composed from a value no encoder takes is composed from the value as it is.
-      const own = ownAttrEncoder(fieldSchema)
-      encoders[field] = (value) => Option.getOrElse(own(value), () => value)
-    }
+    } else if (hasEncodingTransformation(fieldSchema)) encoders[field] = ownKeyEncoder(fieldSchema)
   }
   return encoders
 }

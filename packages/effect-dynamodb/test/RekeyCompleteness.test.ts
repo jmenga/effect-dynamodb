@@ -494,8 +494,23 @@ describe("a NaN in a key", () => {
             const db: any = yield* w.client
             const before = [...table.items.values()]
             const report = yield* db.tables.MainTable.rekey(options)
-            // The row whose own key holds it; the row whose index key does has no difference to judge.
-            expect(report.skipped.unrecognizedKey).toBe(1)
+            // The row whose own key holds it is reported, as a row it couldn't move; the row whose
+            // index key does has no difference to judge.
+            expect(report.conflicts).toEqual([
+              {
+                member: "Keyed",
+                kind: "item",
+                reason: "uncomposable",
+                key: {
+                  pk: "$nanrows#v1#keyed#id_a",
+                  sk: "$nanrows#v1#keyed#level_0000000000000nan",
+                },
+                target: undefined,
+                message: expect.stringMatching(/^Its values compose no key: \[EDD-9096\]/),
+              },
+            ])
+            expect(report.byMember.Keyed?.conflicts).toBe(1)
+            expect(report.skipped.unrecognizedKey).toBe(0)
             expect(report.unchanged).toBe(1)
             expect(report.moved.item).toBe(0)
             expect(report.indexKeysRewritten).toBe(0)

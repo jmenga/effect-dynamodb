@@ -770,8 +770,9 @@ bigint is its digits and `Infinity` is `00000000infinity` (then cased), and neit
 `NaN` alone isn't composed, since no order or lookup can use it. `KeyText136.schema136` still
 composes `0000000000000NaN` for the fixture and for `rekey`, `text136` being what lets it: no write
 or query has that text. Only a `NumberFromString` ever stored it (the marshaller refused a number),
-and 1.37 and 1.38 refused it too. Such a row still decodes on a scan. `rekey` leaves it: its own key
-holding `NaN` is `skipped.unrecognizedKey`, and an index key holding it has no difference to judge.
+and 1.37 and 1.38 refused it too. Such a row still decodes on a scan. `rekey` leaves it and names
+it: a row whose own key needs the `NaN` is the conflict `uncomposable` (since 1.40.0; earlier it was
+counted in `skipped.unrecognizedKey`), and an index key holding it has no difference to judge.
 
 **History.** 1.37.0 composed numeric text unconditionally, and 1.38.0 kept it. Since 1.39.0
 it belongs to `escapeKeys: true`.
@@ -1097,7 +1098,8 @@ different snapshot of the version), `taken` (another row
 holds the target), `contended` (concurrent writes on every attempt, or the attempts exhausted),
 `failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, or an
 aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
-compose a current one). An aggregate whose root is under both
+compose a current one; a row whose own key holds a value with no key text, `NaN`, or one of whose key
+composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or
 rows are gone since the scan read them (moved or deleted by a write) is
 nothing. A `DynamoClientError` fails the run.
@@ -1106,9 +1108,10 @@ nothing. A `DynamoClientError` fails the run.
 that is no form's text for its row's values; a sentinel with no row behind it, or whose row's values
 compose no such sentinel; an aggregate's rows below no root in their partition, including what a 1.37.0
 or 1.38.0 run cut short left (root at the current key, edges at the old partition); an aggregate root
-under no text; a projection tombstone or outbox item whose key reads as more than one set of values; a
-row holding `NaN` in its own key. `conflicts`, `failed`: a row whose Z-order value no
-longer places a key; a stream id whose rows read as two different ids. `skipped.rootNotSeen`: an aggregate's
+under no text; a projection tombstone or outbox item whose key reads as more than one set of values.
+`conflicts`, `failed`: a row whose Z-order value no
+longer places a key; a stream id whose rows read as two different ids. `conflicts`, `uncomposable`: a
+row whose own key holds `NaN`, or one of whose key composites holds a value no form of its schema takes. `skipped.rootNotSeen`: an aggregate's
 rows below no root, met by a run that didn't read the whole table (`maxPages`, `resume`). Such a run can't
 say the root isn't there, since a root at its old key on a page it didn't read could claim them, so a run
 over the whole table judges them; only that run counts them `unrecognizedKey`.
@@ -1158,13 +1161,35 @@ Resolution per attribute:
 | Not a model field (ref-derived `<ref>Id`) | Pass through — already wire-shaped. |
 | Numeric Type, string Encoded | Keep a `number` / `bigint`; otherwise `decode` to reach it. |
 | No encoding transformation (`ast.encoding === undefined`, documented as "type and encoded forms are identical") | Pass through WITHOUT encoding, so an open bound like `gte(t.status, "d")` on a `Schema.Literals` composite is not rejected by a codec. |
-| Has an encoding transformation | `encode`, with `decode -> encode` as fallback so an already-encoded value round-trips to itself. |
-| Resolves to neither | **EDD-9050**, naming the attribute. |
+| Has an encoding transformation | `encode`, with `decode -> encode` as fallback so an already-encoded value round-trips to itself; for a value neither takes, the same two from its **stored form** (below). |
+| Resolves to neither | **EDD-9050**, naming the attribute, when a key is composed from it. |
 
 Public key and composite input is always the **Type** side — the value the
 domain model holds and `.where()` accepts. Internal paths (retain, restore,
-soft-delete) hold wire-shaped records read back from DynamoDB and reach the
-composer directly.
+soft-delete, the update and delete paths that read the item first, `rekey`) hold
+whole rows read back from DynamoDB and reach the composer directly.
+
+**Stored form.** The unmarshaller hands a stored `N` back as a `number` while it
+is a safe integer and as a `bigint` past 2^53 (`{N:"5"}` → `5`,
+`{N:"1152921504606846977"}` → `1152921504606846977n`), whatever the field's
+schema says. A field whose Encoded side is a `bigint` and whose schema transforms
+(`OptionFromNullOr(BigInt)`, a `BigInt` under a decoding default) takes neither
+`5` nor its decode, so the rule lifts a safe-integer `number` to a `bigint` (and,
+for a numeric Encoded side, a `bigint` to a `number`). That is the value `put`
+handed the rule (the write path holds encoded records), so it takes the same two
+steps `put`'s value took: the key `put` composed from `5n`, byte for byte
+(`storedNumericForm`). A value as given is tried first: a domain `bigint` stored
+as a number is encoded, never taken for its stored form. One rule
+for every path: `Batch`, `Transaction`, `Aggregate` and geo compose the same key
+from the same row. Unique-constraint sentinels are composed from the Encoded
+value, lifted the same way, so a sentinel released by a delete is the one `put`
+reserved.
+
+**Reader attributes.** A whole row holds attributes no key is composed from.
+`Entity` builds the form with `reads` (the composites of every index, shard `by`
+sources, unique fields, vector partitions and the time-series `orderBy`): a
+value of any other attribute that reaches neither form is left as it is rather
+than refused, since it is never key text.
 
 ### Isolated vs Clustered Key Prefixes
 
@@ -3757,7 +3782,7 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 | Rule | Behaviour |
 |------|-----------|
 | **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` / `Record` / `Tuple` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` / `Union` node carries no encoding of its own; that included `Schema.optional(X)` and `NullOr(X)` around a transform. Fields with nothing to encode get no encoder and their bytes are unchanged. |
-| **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
+| **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), then through it as a read reaches beneath a decoding default (`decodeOnly`); a value neither takes is stored as given and reported (`EDD-9127`, below). A `many` edge's sort-key composites and a root list index's are composed from the field's own `encode` (`buildKeyAttrEncoders`). |
 | **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
 | **Union members** | `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` in every mode (`walkedContainer`), rebuilding each container kind around substituted children with the original node's annotations and `.check()` refinements (`withMetadataOf`). Under `tolerantTransforms` (aggregates) every transformed leaf is substituted; for entity derivation only self-date and `Redacted` leaves are. Union members follow the union rules in §8 (Self dates nested in containers): a self date accepts only its own wire kind, its domain or a legacy map; on a storage-kind collision only its exact canonical form, decoded first; an epoch date next to a numeric member is rejected (**EDD-9058**). The collision set propagates into nested unions. A transform date member keeps its own decode, so a stored `5` in `Union([DateTimeUtcFromString, Number])` stays a number. |
@@ -3915,9 +3940,8 @@ package.
 side, without encoding it, since the attribute encoders encode it next anyway and an encode here would be
 paid on every write. A schema that can't encode a value it decodes to, such as a transformation over
 itself (`s.pipe(Schema.decodeTo(s, passthrough))` where `s` holds a transformation), passes that check and
-reaches an encoder that can't put it in its stored form, neither the substituted schema nor the field's
-own encode nor decode then encode (`ownAttrEncoder`). Up to 1.39.0 the wire side was asked first and
-refused it. That value is stored as given, and the encoder reports it (`asGiven`, the item's
+reaches an encoder that can't put it in its stored form: neither the substituted schema nor the same
+beneath a decoding default takes it. Up to 1.39.0 the wire side was asked first and refused it. That value is stored as given, and the encoder reports it (`asGiven`, the item's
 `storedAsGiven`), so the write runs `refuseNotReadBack` over its rows: the real marshaller, unmarshaller
 and `assembleAggregate`, as a `get` reads them. Rows that don't read back are refused with a
 `ValidationError` naming each field as `"field" of "member"`, on `create` and `update`, and nothing is

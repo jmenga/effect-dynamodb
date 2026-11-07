@@ -941,8 +941,11 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" 
  * - `failed` — it could not be moved as stored (its values no longer decode,
  *   a stream id reads as more than one id, or a write was refused);
  *   `message` says why
- * - `uncomposable` — its key on a sharded index is from another layout, and its
- *   values can't compose a current one (a `by` attribute was cleared) (#183)
+ * - `uncomposable` — its values can't compose a current key: a composite holds a
+ *   value with no key text (`NaN`) or one no form of its schema takes
+ *   (`EDD-9050`); `message` says which. Or its key on a sharded index is from
+ *   another layout, and its values can't compose a current one (a `by`
+ *   attribute was cleared) (#183)
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */

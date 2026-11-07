@@ -7,7 +7,7 @@
  * strings for a transformed composite.
  */
 
-import { DateTime, Schema } from "effect"
+import { DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import { DateEpochMs } from "../src/DynamoModel.js"
 import { makeCompositeKeyForm, toCompositeKeyRecord } from "../src/internal/CompositeCodec.js"
@@ -124,6 +124,93 @@ describe("CompositeCodec", () => {
 
     it("a non-numeric field is untouched", () => {
       expect(fromRow("label", 5)).toBe(5)
+    })
+  })
+
+  describe("a transformed field read back from its stored form", () => {
+    // `OptionFromNullOr(BigInt)` and a `BigInt` under a decoding default store a bigint as `N`,
+    // which the unmarshaller hands back as a number below 2^53. Neither encode nor decode takes
+    // a number, so the rule tries the bigint it was stored from.
+    const BIG = 2n ** 60n + 1n
+    const Stored = Schema.Struct({
+      opt: Schema.OptionFromNullOr(Schema.BigInt),
+      dflt: Schema.BigInt.pipe(Schema.withDecodingDefault(Effect.succeed(7n))),
+      optNum: Schema.OptionFromNullOr(Schema.Number),
+      bfs: Schema.BigIntFromString,
+    })
+    const fromRow = makeCompositeKeyForm(Stored, refuse)
+
+    it("a safe-integer number is the bigint put composed from", () => {
+      expect(fromRow("opt", 5)).toBe(5n)
+      expect(fromRow("opt", Option.some(5n))).toBe(5n)
+      expect(serializeValue(fromRow("opt", 5))).toBe(
+        serializeValue(fromRow("opt", Option.some(5n))),
+      )
+      expect(fromRow("dflt", 5)).toBe(5n)
+      expect(fromRow("dflt", 5n)).toBe(5n)
+    })
+
+    it("past 2^53 the unmarshaller already hands back a bigint", () => {
+      expect(fromRow("opt", BIG)).toBe(BIG)
+      expect(fromRow("opt", Option.some(BIG))).toBe(BIG)
+      expect(fromRow("dflt", BIG)).toBe(BIG)
+    })
+
+    it("a number Encoded side takes a bigint as a number", () => {
+      expect(fromRow("optNum", 12n)).toBe(12)
+      expect(fromRow("optNum", 12)).toBe(12)
+    })
+
+    it("the stored value takes the steps put's value took", () => {
+      // One type on both sides. The write path hands the rule the encoded record, 5n for a domain
+      // 50n, stored as `{N:"5"}`: read back as 5, it composes what put composed from 5n.
+      const Tenfold = Schema.BigInt.pipe(
+        Schema.decodeTo(Schema.BigInt, {
+          decode: SchemaGetter.transform((n: bigint) => n * 10n),
+          encode: SchemaGetter.transform((n: bigint) => n / 10n),
+        }),
+      )
+      const form = makeCompositeKeyForm(Schema.Struct({ t: Tenfold }), refuse)
+      expect(form("t", 5)).toBe(form("t", 5n))
+    })
+
+    it("a value as given is tried before its stored form", () => {
+      // A domain bigint stored as a number: encoded, never taken for the number it's stored as.
+      const Tenth = Schema.Number.pipe(
+        Schema.decodeTo(Schema.BigInt, {
+          decode: SchemaGetter.transform((n: number) => BigInt(n) * 10n),
+          encode: SchemaGetter.transform((n: bigint) => Number(n / 10n)),
+        }),
+      )
+      const form = makeCompositeKeyForm(Schema.Struct({ t: Tenth }), refuse)
+      expect(form("t", 50n)).toBe(5)
+    })
+
+    it("a stored value no form takes is still refused", () => {
+      const Positive = Schema.OptionFromNullOr(Schema.BigInt.check(Schema.isGreaterThanBigInt(0n)))
+      const form = makeCompositeKeyForm(Schema.Struct({ p: Positive }), refuse)
+      expect(form("p", 5)).toBe(5n)
+      expect(() => form("p", -5)).toThrow(/EDD-9050.*p/)
+    })
+
+    it("a value that was never stored is still refused", () => {
+      expect(() => fromRow("opt", 2.5)).toThrow(/EDD-9050.*opt/)
+      expect(() => fromRow("opt", Number.MAX_SAFE_INTEGER + 2)).toThrow(/EDD-9050.*opt/)
+      expect(() => fromRow("opt", "abc")).toThrow(/EDD-9050.*opt/)
+    })
+
+    it("`reads` refuses only an attribute a key is composed from", () => {
+      const keyed = makeCompositeKeyForm(Stored, refuse, { reads: (attr) => attr === "opt" })
+      expect(() => keyed("opt", "abc")).toThrow(/EDD-9050.*opt/)
+      // Not key text: left as it is, in both the Encoded and the numeric-Type branch.
+      expect(keyed("dflt", "abc")).toBe("abc")
+      expect(keyed("bfs", "abc")).toBe("abc")
+      expect(() => fromRow("bfs", "abc")).toThrow(/EDD-9050.*bfs/)
+      expect(keyed("bfs", 2.5)).toBe(2.5)
+      expect(() => fromRow("bfs", 2.5)).toThrow(/EDD-9050.*bfs/)
+      // A value either form takes is the same whatever `reads` says.
+      expect(keyed("dflt", 5)).toBe(5n)
+      expect(keyed("bfs", "5")).toBe(5n)
     })
   })
 
