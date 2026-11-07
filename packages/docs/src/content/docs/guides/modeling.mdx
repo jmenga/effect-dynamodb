@@ -138,7 +138,7 @@ A `Map` in your domain model is fine as long as its encoded side isn't one: deco
 | `Schema.ReadonlyMap` | See [Maps](#maps) | `Schema.Record` |
 | A bigint `Schema.Literal` | Stored as a number, and the row doesn't decode | A string or number literal |
 
-A few more depend on what stores them. An entity's and an aggregate's fields are substituted before they're marshalled, so these read back there, in a struct, an array, a record, a tuple or a union. A stream, a snapshot and an outbox encode through the schema alone, and nothing reaches inside another declaration such as `Schema.Option` or `Schema.ReadonlySet`, a `Schema.suspend`, or a transformation over a container. In those places they're refused too. So are a `Schema.Date` and a `Schema.Redacted` in a struct, a record, a tuple or a union with a decoding default, where a read reaches them and a write doesn't:
+A few more depend on what stores them. An entity's and an aggregate's fields are substituted before they're marshalled, so these read back there, in a struct, an array, a record, a tuple or a union. A stream, a snapshot and an outbox encode through the schema alone, and nothing reaches inside another declaration such as `Schema.Option` or `Schema.ReadonlySet`, a `Schema.suspend`, or a transformation, such as `Schema.OptionFromOptional`, unless it's a transformation onto the same type or between two lists holding the same type. In those places they're refused too. So are a `Schema.Date` and a `Schema.Redacted` in a struct, a record, a tuple or a union with a decoding default, where a read reaches them and a write doesn't:
 
 | Refused | What happens without the refusal | Use |
 |---------|----------------------------------|-----|

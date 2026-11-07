@@ -1395,6 +1395,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     decodeOnly: true,
     resolveRef,
     enforceChecks: true,
+    domainValues: true,
   }) as unknown as Schema.Codec<any>
 
   // `update`'s mutated state: the plain state a mutation is handed holds a set as a list and
@@ -1405,6 +1406,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     resolveRef,
     enforceChecks: true,
     plainStateForms: true,
+    domainValues: true,
   }) as unknown as Schema.Codec<any>
 
   // Validate the collection index against the table's primary key. Best effort: a

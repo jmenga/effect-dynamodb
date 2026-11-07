@@ -397,8 +397,9 @@ export type StoredBy = "entity" | "aggregate" | "schema"
 
 /**
  * An encoding the owner's substitution can't see through, because the runtime accessors it walks
- * aren't on the node: a decoding default on a container, seen through only by a read, an
- * array-to-array transformation on an entity, whose lists it rebuilds, and any other transformation.
+ * aren't on the node: a decoding default on a container, seen through only by a read, a transformation
+ * between lists holding the same things, which an entity and an aggregate rebuild from the type side,
+ * and any other transformation.
  */
 type EncodingStep = "default" | "list" | "transformation"
 
@@ -439,7 +440,12 @@ const unreadableAt = (ast: SchemaAST.AST, walk: UnreadableWalk): Unreadable | un
         if (isTransformed(walk)) return TRANSFORMED_DATE
         return stored ? undefined : PLAIN_DATE
       }
-      if (id === REDACTED) return stored ? undefined : PLAIN_REDACTED
+      if (id === REDACTED) {
+        // A step ending in a redacted value is substituted whole. A step onto anything else, such as
+        // `Schema.OptionFromOptional`, writes what's beneath it as declared.
+        const overAnother = isTransformed(walk) && representationIdOf(walk.declared!) !== REDACTED
+        return stored && !overAnother ? undefined : PLAIN_REDACTED
+      }
       return NEVER_READ_BACK[id]
     }
     default:
@@ -736,16 +742,29 @@ const isClassStep = (ast: SchemaAST.AST, to: SchemaAST.AST): boolean =>
 const isOptionalOfOne = (ast: SchemaAST.Union): boolean =>
   ast.types.filter((member) => !SchemaAST.isUndefined(member)).length === 1
 
-/** Whether a stored side has a type's shape: the same kind of node, with the same fields. */
+/** Whether a stored side has a type's shape: the same kind of node, with the same fields or elements. */
 const sameShape = (type: SchemaAST.AST, stored: SchemaAST.AST): boolean => {
   if (type._tag !== stored._tag || representationIdOf(type) !== representationIdOf(stored)) {
     return false
   }
+  if (SchemaAST.isArrays(type) && SchemaAST.isArrays(stored)) return sameElements(type, stored)
   if (!SchemaAST.isObjects(type) || !SchemaAST.isObjects(stored)) return true
   const names = new Set(stored.propertySignatures.map((property) => property.name))
   return (
     type.propertySignatures.length === names.size &&
     type.propertySignatures.every((property) => names.has(property.name))
+  )
+}
+
+/** Whether two lists hold the same things, which is what makes a step between them invisible. */
+const sameElements = (type: SchemaAST.Arrays, stored: SchemaAST.Arrays): boolean => {
+  const same = (a: SchemaAST.AST, b: SchemaAST.AST) =>
+    sameShape(SchemaAST.toType(a), SchemaAST.toType(b))
+  return (
+    type.elements.length === stored.elements.length &&
+    type.rest.length === stored.rest.length &&
+    type.elements.every((element, at) => same(element, stored.elements[at]!)) &&
+    type.rest.every((element, at) => same(element, stored.rest[at]!))
   )
 }
 
@@ -763,6 +782,15 @@ export const isDecodingDefault = (ast: SchemaAST.AST, to: SchemaAST.AST): boolea
   return sides.some((side) => sameShape(type, side))
 }
 
+/** The list a step's stored side is, if it's one: `Schema.UndefinedOr(Schema.Array(X))` is that array. */
+export const storedList = (to: SchemaAST.AST): SchemaAST.Arrays | undefined => {
+  const side =
+    SchemaAST.isUnion(to) && isOptionalOfOne(to)
+      ? to.types.find((member) => !SchemaAST.isUndefined(member))
+      : to
+  return side !== undefined && SchemaAST.isArrays(side) ? side : undefined
+}
+
 /** The encoding step onto `to`, unless a class's own. */
 const encodingStep = (
   ast: SchemaAST.AST,
@@ -771,7 +799,9 @@ const encodingStep = (
 ): EncodingStep | undefined => {
   if (isClassStep(ast, to) || walk.beneath === "transformation") return walk.beneath
   if (isDecodingDefault(ast, to)) return "default"
-  return walk.by === "entity" && ast._tag === "Arrays" ? "list" : "transformation"
+  if (walk.by === "schema" || !SchemaAST.isArrays(ast)) return "transformation"
+  const list = storedList(to)
+  return list !== undefined && sameElements(ast, list) ? "list" : "transformation"
 }
 
 /** What the children of a container beneath an encoding are. A list stays seen through. */

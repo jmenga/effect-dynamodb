@@ -6,7 +6,7 @@
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Schema } from "effect"
+import { Effect, Schema, SchemaTransformation } from "effect"
 import { describe, expect, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
@@ -77,6 +77,44 @@ describe("[EDD-9125] the operational makes", () => {
       expect(refusal(() => build(modelOf(Schema.Option(Schema.Date))))).toContain(
         'field "f" is a Schema.Date',
       )
+    })
+
+    it(`${name} refuses a redacted value beneath a step onto another type, and takes its replacement`, () => {
+      for (const field of [
+        Schema.OptionFromOptional(Schema.Redacted(Schema.String)),
+        Schema.OptionFromOptionalKey(Schema.Redacted(Schema.String)),
+        Schema.OptionFromUndefinedOr(Schema.Redacted(Schema.String)),
+      ]) {
+        expect(refusal(() => build(modelOf(field)))).toContain('field "f" is a Schema.Redacted')
+      }
+      expect(
+        refusal(() =>
+          build(modelOf(Schema.OptionFromOptional(Schema.RedactedFromValue(Schema.String)))),
+        ),
+      ).toBe("nothing refused")
+    })
+
+    it(`${name} takes what's beneath a transformation onto the same type, and refuses what it writes as declared`, () => {
+      const over = <S extends Schema.Top>(from: S) =>
+        from.pipe(Schema.decodeTo(from as never, SchemaTransformation.passthrough() as never))
+      expect(refusal(() => build(modelOf(over(Schema.Redacted(Schema.String)))))).toBe(
+        "nothing refused",
+      )
+      expect(refusal(() => build(modelOf(over(Schema.Array(Schema.Date)))))).toBe("nothing refused")
+      expect(
+        refusal(() =>
+          build(
+            modelOf(
+              Schema.Array(Schema.Date).pipe(
+                Schema.decodeTo(
+                  Schema.Array(Schema.Number),
+                  SchemaTransformation.passthrough() as never,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ).toContain('field "f[]" is a Schema.Date')
     })
 
     it(`${name} takes a bigint under a union, a number next to it included`, () => {
