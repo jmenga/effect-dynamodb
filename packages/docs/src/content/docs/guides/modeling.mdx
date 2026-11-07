@@ -115,11 +115,57 @@ Offsets that aren't whole minutes, such as historical local-mean-time offsets or
 
 #### Maps
 
-Use `Schema.Record` for a keyed collection of values. A `Schema.ReadonlyMap` is refused when the model loads (`EDD-9125`), at any depth: it would be stored as a DynamoDB map, which reads back as a plain object, so the row wouldn't decode. `Schema.Record` is stored the same way, so rows a map field wrote read back without a rewrite.
+Use `Schema.Record` for a keyed collection of values. A `Schema.ReadonlyMap` is refused when the model loads (`EDD-9125`), at any depth: it would be stored as a DynamoDB map, which reads back as a plain object, so the row wouldn't decode. `Schema.Record` is stored the same way, so rows a map field wrote read back with no rewrite.
 
-A `Map` in your domain model is fine as long as its encoded side isn't one: decode it from a `Schema.Record` with `Schema.decodeTo`, or wrap it in `Schema.toCodecJson`.
+A `Map` in your domain model is fine as long as its encoded side isn't one: decode it from a `Schema.Record` with `Schema.decodeTo`, or wrap it in `Schema.toCodecJson`. The field of a `many` edge can also be one, since its collection is taken apart into rows and never stored itself.
 
-`EventStore.makeStream` applies the same rule to each event, to `metadata` and to the snapshot state, and `EventStore.projection` and `EventStore.multiProjection` to `outbox.schema`.
+#### Types that can't be read back
+
+`Entity.make`, `Aggregate.make`, `EventStore.makeStream` (each event, `metadata` and the snapshot state) and `outbox.schema` on `EventStore.projection` and `EventStore.multiProjection` refuse these when the definition loads (`EDD-9125`), at any depth, naming the path:
+
+| Refused | What happens without the refusal | Use |
+|---------|----------------------------------|-----|
+| `Schema.URL` | Stored as a map of its parts, and the row doesn't decode | `Schema.URLFromString` |
+| `Schema.ByteSize` | Stored as a number, and the row doesn't decode | `Schema.ByteSizeFromString` or `Schema.ByteSizeFromNumber` |
+| `Schema.URLSearchParams` | Stored as a map of its size alone | `Schema.String`, holding the parameters as text |
+| `Schema.RegExp` | Stored as an empty map | `Schema.String`, holding the pattern as text |
+| `Schema.FormData` | Stored as an empty map | `Schema.Record` |
+| `Schema.Headers` | Stored as a map, and the row doesn't decode | `Schema.Record` |
+| `Schema.File` | Stored as bytes, without its name or type | `Schema.Uint8Array` |
+| `Schema.ErrorInstance` | Stored as an empty map | `Schema.Defect()` |
+| `Schema.Chunk` | The write overflows the stack, and nothing is stored | `Schema.Array` |
+| `Schema.HashMap` | A non-empty one can't be written, and an empty one doesn't decode | `Schema.Record` |
+| `Schema.ReadonlyMap` | See [Maps](#maps) | `Schema.Record` |
+| A bigint `Schema.Literal` | Stored as a number, and the row doesn't decode | A string or number literal |
+| `Schema.DurationFromNanos`, `Schema.ByteSizeFromBigInt`, or any transformation over `Schema.BigInt` | Stored as a number, and the row doesn't decode | `Schema.DurationFromMillis`, `Schema.ByteSizeFromString` |
+
+A few more depend on what stores them. An entity's and an aggregate's fields are substituted before they're marshalled, so these read back there, in a struct, an array, a record, a tuple or a union, and `Schema.BigInt` in everything but a union. A stream, a snapshot and an outbox encode through the schema alone, and nothing reaches inside another declaration such as `Schema.Option` or `Schema.ReadonlySet`. In those places they're refused too:
+
+| Refused | What happens without the refusal | Use |
+|---------|----------------------------------|-----|
+| `Schema.Date` | Stored as an empty map, so the instant is lost | `Schema.DateFromString` or `Schema.DateFromMillis` |
+| `Schema.Redacted` | The value isn't stored, and the read dies | `Schema.RedactedFromValue` |
+| `Schema.BigInt` | Stored as a number, and the row doesn't decode | `Schema.BigIntFromString` |
+
+A `Schema.BigInt` value past 2^53 is the exception: it reads back as a `bigint`, and a smaller one stops every read of the stream it's in. `Schema.BigIntFromString` is stored as a string, so it doesn't read a number already stored. To read those, declare the field with `Schema.declare` over `bigint`.
+
+`Schema.DateTimeUtcFromDate` and any other transformation over `Schema.Date` are refused on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or `Schema.NullOr`, or when it decodes to something other than a date. Use `Schema.DateTimeUtcFromString` or `Schema.DateTimeUtcFromMillis`.
+
+What's read is the stored side, so any of these under `Schema.toCodecJson`, or decoded from a type that reads back, isn't refused.
+
+#### Types that read back changed
+
+These aren't refused, because rows exist and read, but what comes back isn't quite what was written. Prefer the form on the right for a new field.
+
+- **`Schema.Duration`.** Stored as Effect's internal form, and reads back as a plain object with no prototype. `Duration.toMillis`, `Duration.sum` and `Duration.format` work on it. `Equal.equals` with the same duration is `false`, and `.pipe` is `undefined`. Use `Schema.DurationFromMillis`, which is stored as a number and comes back as a `Duration`.
+- **`Schema.Option`.** Comes back as a real `Option`, equal to the one written, but it's stored as Effect's internal form: a map with `_op`, `_tag`, `value` and a `~effect/Option` marker. `Schema.OptionFromNullOr` stores the value or `null`, and comes back as an `Option` too. On an aggregate, `Schema.OptionFromOptional` and `Schema.OptionFromOptionalKey` read back, but `create` takes the value as it's stored, not an `Option`, and `update` refuses them, so use `Schema.OptionFromNullOr` there.
+- **`Schema.BigDecimal`.** Below 2^53 it reads back with a `number` where a `bigint` belongs, so `BigDecimal.format` works and `BigDecimal.sum` throws. Above that it works. A value that's been normalised, which `BigDecimal.equals` does to it, holds a reference to itself, so `put` dies with a stack overflow and writes nothing. Use `Schema.BigDecimalFromString`, which has neither problem.
+- **`Schema.HashSet`.** A non-empty one is refused at write (`EDD-9124`), naming the field, with nothing written, and only an empty one reads back. Use `Schema.ReadonlySet`.
+- **`Schema.SemVer`, `Schema.TimeZone`, `Schema.Cookie`, the IP, MAC, socket and DNS record types, and the crypto keys.** Read back as plain objects with no prototype. `Schema.DateTimeUtc` and `Schema.DateTimeZoned` do too on a stream, a snapshot and an outbox, as they don't on an entity or an aggregate. Prefer a form stored as a string, such as `Schema.SemVerFromString` or `Schema.DateTimeUtcFromString`.
+
+Under `DynamoModel.Packed`, nothing here can leave a row you can't read. A value JSON can't represent fails the write with a `ValidationError` naming the path, and nothing is written.
+
+A `Schema.instanceOf` over a class of your own can't be judged when the model loads: it has the same AST as a duck-typed `Schema.declare`, and only the second reads back. A `put` of one succeeds and its `get` fails with a `ValidationError`, so use a `Schema.Class` or decode the class from something that's stored, with `Schema.decodeTo`.
 
 #### Container checks
 
