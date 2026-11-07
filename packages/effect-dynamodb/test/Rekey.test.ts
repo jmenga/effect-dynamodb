@@ -597,7 +597,12 @@ describe.each([
           }),
         ])
         expect(table.items.has(at(m.old))).toBe(true)
-        expect(report.skipped).toEqual({ notLibrary: 1, unregistered: 1, unrecognizedKey: 1 })
+        expect(report.skipped).toEqual({
+          notLibrary: 1,
+          unregistered: 1,
+          unrecognizedKey: 1,
+          rootNotSeen: 0,
+        })
         expect(report.byMember.Meter?.conflicts).toBe(1)
       }),
     )

@@ -379,12 +379,12 @@ const report = yield* movingDb.tables.MainTable.rekey({ segments: 2 })
 A dry run reports what the real run does, chains included: a row whose destination is held by a row that can't move is a conflict in both.
 
 :::caution[A key that no longer matches its row's values]
-`rekey` leaves a key that isn't exactly what any setting or release composed for the values the row holds, with no conflict, as nothing on the row says what its text meant. Under `preserve` there are two ways to get one: `.set({ x: undefined })` removes the value and keeps the key, and an update naming a composite it can't recompose the half from changes the value and keeps the key. If the key's text is one the setting doesn't compose (a number other than a positive integer, or a value holding a character up to `%`):
+`rekey` doesn't rewrite a key that isn't exactly what any setting or release composed for the values the row holds, as nothing on the row says what its text meant. It counts it in `indexKeys`, and [`repairIndexKeys`](/effect-dynamodb/guides/upgrading/#repairing-index-keys) writes it when the row holds every composite. Under `preserve` there are two ways to get one: `.set({ x: undefined })` removes the value and keeps the key, and an update naming a composite it can't recompose the half from changes the value and keeps the key. If the key's text is one the setting doesn't compose (a number other than a positive integer, or a value holding a character up to `%`):
 
 - **A sort key:** a broader query finds the row, where its old text sorts. A pin on the old value misses it, and so does a pin on the value the row holds now.
 - **A partition key on an index with no shards:** a pin on the old value misses it. `get` still reads the row.
 
-Writing the composites again puts the row back.
+Writing the composites again, or `repairIndexKeys`, puts the row back.
 :::
 
 **Step 3: remove `previous`,** once a run reports no conflicts. Don't do it sooner: `previous` is what reads rows still in the old layout, so leaving it early hides them. Nothing enforces this, since nothing at `make` can know. Nothing reads what's left after that.

@@ -448,6 +448,45 @@ describe("no write sets a table key attribute", () => {
             Effect.provide(Layer.merge(table.layer, world.MainTable.layer({ name: "t" }))),
           ) as never
         })
+        it.effect("rekey repairing index keys, whatever it finds", () => {
+          const world = worldOf(indexes, {}, setting.schema)
+          const table = tableFor(indexes as Record<string, any>)
+          return Effect.gen(function* () {
+            const db = (yield* DynamoClient.make({
+              entities: { Rows: world.Rows },
+              tables: { MainTable: world.MainTable },
+            } as never)) as any
+            yield* db.entities.Rows.put(row).asEffect()
+            // Every key not in a table key attribute: gone, or holding another value.
+            const held = [...table.items.entries()]
+            for (const [at, item] of held) {
+              const { lsk: _lsk, gsk: _gsk, gpk, ...rest } = item as Record<string, any>
+              table.items.set(at, {
+                ...rest,
+                ...(gpk === undefined ? {} : { gpk: { S: `${gpk.S}x` } }),
+              })
+            }
+            const before = table.requests.length
+            yield* db.tables.MainTable.rekey({ repairIndexKeys: true, dryRun: true })
+            const report = yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+            yield* db.tables.MainTable.rekey({ repairIndexKeys: true })
+            const sent = table.requests.slice(before)
+            expectNoTableKeyWrite(sent)
+            expectPutsKeepTheirKeys(sent, world)
+            // A half in a table key attribute isn't counted: only those in an attribute of its own.
+            // A sharded partition key that differs is the text rewrite's, whatever it holds.
+            const own = Object.values(indexes as Record<string, any>).flatMap((index) =>
+              [index.pk.field, index.sk.field].filter((field) => field !== "pk" && field !== "sk"),
+            )
+            expect(report.indexKeys.repaired + report.indexKeysRewritten).toBe(own.length)
+            expect(updatesIn(sent).length).toBe(own.length === 0 ? 0 : 1)
+            for (const [, item] of table.items) {
+              for (const field of own) expect(item[field], field).toBeDefined()
+            }
+          }).pipe(
+            Effect.provide(Layer.merge(table.layer, world.MainTable.layer({ name: "t" }))),
+          ) as never
+        })
         it.effect("writes beside rows 1.36 wrote", () => {
           const world = worldOf(indexes, { unique: { contact: ["email"] } }, setting.schema)
           const table = tableFor(indexes as Record<string, any>)

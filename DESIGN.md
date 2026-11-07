@@ -986,18 +986,49 @@ is a text half like any other, and its sort half is rewritten only when a prefix
 differs: the address keeps its bytes. A run that moves an item reads the moved row and does
 the same (`rekeyAfterMove`). The move itself recomposes index keys as an update would.
 
-**The accepted limit.** An index key that isn't any form's text stays, as when a row cleared a
-composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
+**The accepted limit.** The text rewrite leaves an index key that isn't any form's text, as when a row
+cleared a composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
 broader query finds it where its old text sorts, and under a partition key half `get` still reads it.
-Writing the composites puts it back. Telling such text apart from current text would take parsing it,
-and a value can spell anything.
+Writing the composites puts it back, and so does `repairIndexKeys`, below. Telling such text apart from
+current text would take parsing it, and a value can spell anything.
+
+**Index keys that differ, and `repairIndexKeys` (`rekey-repair.md`).** Separately from the text rewrite, each
+half of each secondary index of a live item at its current table key is judged against what a `put` of the row's
+values writes (`KeyComposer.judgeIndexHalf`, through the key form, a ref's id read from the stored ref). Every
+run counts the result in `report.indexKeys` and per member, for no read: `missing`, `truncated`, `lagging`,
+`ambiguous`. `rekey({ repairIndexKeys: true })` writes it, off by default: one `UpdateItem` per row with work,
+conditioned on the row existing and on each key it writes and each composite those keys come from, as read or
+absent (`repairRequest`), so a writer changing any of them wins. On a failed condition it reads once
+consistently, judges again and tries once more, then counts the keys in `skipped`; `repaired` counts the keys
+written. A key DynamoDB refuses is a `failed` conflict. A dry run makes no write and counts `repaired` as what
+it would write, judging what the move would leave for a row that moves.
+
+| Composites on the row | Stored key | `sparse` | `preserve` |
+|---|---|---|---|
+| All | Equal | Nothing | Nothing |
+| All | Differs | SET (`truncated` when the stored key is a leading run of them under any form, else `lagging`) | SET |
+| All, and the other half's too | None | SET (`missing`), or `ambiguous` with 2+ composites outside the primary key | SET (`missing`) |
+| All, but not the other half's | None | Nothing: `put` wrote no entry | Nothing |
+| Trailing ones missing | None, or the truncated text | Nothing (shape 3) | Nothing |
+| Trailing ones missing | Anything else | SET the truncated text (`lagging`) | Nothing |
+| A hole, or none leading | None | Nothing | Nothing |
+| A hole, or none leading | Any | REMOVE (`lagging`) | Nothing |
+
+`ambiguous` is written by nothing: a `sparse` half with two or more composites outside the primary key and no
+key is byte for byte the documented drop (§7, "Telemetry (no alert)"), so a repair could re-admit an alert a
+writer ended. Not judged: a half in a table key attribute (no write names one); a half with a library-stamped
+composite (`put` composes before stamping, and `updatedAt` moves on every update), including as the other half of
+an index with no key; a half whose values compose no key; a sharded partition key already stored, or without its
+shard source (the text rewrite owns those). A Z-order half compares bytes and never truncates. For the same
+reason a move keeps a half absent that's `ambiguous` or holds a stamped composite (`keptAbsent` in `movedRowOf`).
+Aggregates compose their own rows and never called the gate; sentinels and history rows have no index keys.
 
 **A dry run agrees with the real run.** It judges the row the move would write (`movedRowOf`), and
 follows a chain: what holds a row's current key is judged by its own handler (`Rekey.displace`,
 counting nothing and claiming nothing, since the scan counts it when it reaches it), and what would
 stop it is reported, for it and for the row it holds up. Rootless aggregate rows are
 judged after the scan, so a dry run agrees with the real run whichever order the scan met them; a run
-stopped early by `maxPages` can count one whose root a later page brings in.
+that didn't read the whole table reports them as `rootNotSeen`, since a later page could bring the root in.
 
 **A row under both keys.** `clearTarget` reports `bothKeys` only if the row is still
 at its old key when it finds it at the new one. A page's rows run concurrently, and a
@@ -1016,7 +1047,7 @@ again or reports the row (`contended`).
 | Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
 | Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
@@ -1063,12 +1094,16 @@ compose no such sentinel; an aggregate's rows below no root in their partition, 
 or 1.38.0 run cut short left (root at the current key, edges at the old partition); an aggregate root
 under no text; a projection tombstone or outbox item whose key reads as more than one set of values; a
 row holding `NaN` in a key under `escapeKeys: true`. `conflicts`, `failed`: a row whose Z-order value no
-longer places a key; a stream id whose rows read as two different ids.
+longer places a key; a stream id whose rows read as two different ids. `skipped.rootNotSeen`: an aggregate's
+rows below no root, met by a run that didn't read the whole table (`maxPages`, `resume`). Such a run can't
+say the root isn't there, since a root at its old key on a page it didn't read could claim them, so a run
+over the whole table judges them; only that run counts them `unrecognizedKey`.
 
 **Capacity.** The run is one `Table.rekey` operation measured whatever the
 `ConsumedCapacity` setting (`Capacity.measured`): every request asks for its
 capacity, and `report.capacity` carries the totals; the span and the observer
-follow the context's setting.
+follow the context's setting. Judging index keys adds no request: `repairIndexKeys` on a table with nothing to
+repair is the scan alone.
 
 **Dry run.** The same scan and consistent reads, no writes: an item's
 sentinels are read to count them, a stream's both partitions to judge it.
@@ -1352,7 +1387,7 @@ if (shouldSkip) continue  // leave this half's key attribute alone
 - **v1.7.0** introduced the touched-predicate (`updatePayload`-only) to fix the v1.6 GSI-wide cascade. Closed the original GSI-blast bug but introduced the multi-writer leak.
 - **v1.7.1** added the `removedSet` arm to the touched-predicate (multi-writer leak fix — #41).
 - **v1.7.2** added the `keyRecord` arm to the touched-predicate (PK-composites-only fix — #43).
-- **1.39** (#183) narrowed the `keyRecord` arm to halves wholly known from the key record, closing shape 10. The skip-predicate's `every(absent in both)` clause had evaluated any half with one composite in the key record, which is what the #43 idempotence rationale never covered. No stored key text changes; a row an earlier release already damaged stays as it is until a write names the half's composites.
+- **1.39** (#183) narrowed the `keyRecord` arm to halves wholly known from the key record, closing shape 10. The skip-predicate's `every(absent in both)` clause had evaluated any half with one composite in the key record, which is what the #43 idempotence rationale never covered. No stored key text changes; a row an earlier release already damaged stays as it is until a write names the half's composites, or `rekey({ repairIndexKeys: true })` repairs it.
 - **v1.7.3** reframed the predicate from "list cases for which to evaluate" to "list the single condition for which it is safe to skip." Closes the empty-composite-half regression (#46) and any future degenerate-case gap of the same shape — the skip predicate's negation is the cumulative `||`-chain of all prior tactical fixes plus the structural `length === 0` short-circuit.
 
 End-to-end consequences for the canonical multi-writer scenarios:

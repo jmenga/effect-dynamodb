@@ -776,7 +776,12 @@ describeConnected("#171 rekey — connected", () => {
             ["Meter", "item", "bothKeys"],
             ["RouteItem", "aggregate", "bothKeys"],
           ])
-          expect(dry.skipped).toEqual({ notLibrary: 1, unregistered: 1, unrecognizedKey: 0 })
+          expect(dry.skipped).toEqual({
+            notLibrary: 1,
+            unregistered: 1,
+            unrecognizedKey: 0,
+            rootNotSeen: 0,
+          })
           expect(dry.scanned).toBe(before.length)
           expect(dry.capacity.requests).toBeGreaterThan(0)
           expect(yield* scanAll).toEqual(before)

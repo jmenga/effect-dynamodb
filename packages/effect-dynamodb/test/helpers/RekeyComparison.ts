@@ -69,16 +69,41 @@ const byKey = (rows: ReadonlyArray<StoredRow>) =>
  * A run over what the writes left: every row is judged, none is touched. It compares the
  * stored rows whole, which is what makes this more than `rekey` reporting no work.
  */
-const nothingToDo = (db: any, table: StoredRows) =>
+const nothingToDo = (db: any, table: StoredRows, lagging = 0) =>
   Effect.gen(function* () {
     const before = byKey(yield* table.rows())
     const report: Table.RekeyReport = yield* db.tables.MainTable.rekey()
     expect(report.conflicts).toEqual([])
     expect(report.indexKeysRewritten).toBe(0)
-    expect(report.skipped).toEqual({ notLibrary: 0, unregistered: 0, unrecognizedKey: 0 })
+    expect(report.skipped).toEqual({
+      notLibrary: 0,
+      unregistered: 0,
+      unrecognizedKey: 0,
+      rootNotSeen: 0,
+    })
+    // What a write stored is what a `put` of the row's values writes, or a state a write leaves on
+    // purpose, which the repair has nothing to say about. A key lagging its values is the one kind
+    // of write it does count, and this run writes nothing either way.
+    expect(report.indexKeys).toEqual({
+      missing: 0,
+      truncated: 0,
+      lagging,
+      ambiguous: 0,
+      repaired: 0,
+      skipped: 0,
+    })
     expect(before.length).toBeGreaterThan(0)
     expect(report.unchanged).toBe(before.length)
     expect(byKey(yield* table.rows())).toEqual(before)
+    // And a repair of it has nothing to do, on a healthy row of any kind of value or write path.
+    if (lagging === 0) {
+      const repaired: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        repairIndexKeys: true,
+      })
+      expect(repaired.indexKeys.repaired).toBe(0)
+      expect(repaired.unchanged).toBe(before.length)
+      expect(byKey(yield* table.rows())).toEqual(before)
+    }
   })
 
 const key = { tenant: "t", id: "1" }
@@ -305,6 +330,7 @@ export const writePathScenarios: ReadonlyArray<{
     },
     {
       name: "an update naming one composite: the keys lag the row",
+      lagging: 1,
       run: (db) =>
         Effect.gen(function* () {
           yield* db.entities.Rows.put({ ...key, ...WHOLE }).asEffect()
@@ -329,16 +355,17 @@ export const writePathScenarios: ReadonlyArray<{
     },
   ] as ReadonlyArray<{
     readonly name: string
+    readonly lagging?: number
     readonly run: (db: any, world: any) => Effect.Effect<unknown, unknown, any>
   }>
-).map(({ name, run }) => ({
+).map(({ name, lagging, run }) => ({
   name,
   run: (h: Harness) => {
     const world = shapedWorld()
     return h.on(world, (db, table) =>
       Effect.gen(function* () {
         yield* run(db, world)
-        yield* nothingToDo(db, table)
+        yield* nothingToDo(db, table, lagging)
       }),
     )
   },
@@ -950,7 +977,8 @@ export const shardLayoutMoveScenario = (h: Harness) => {
       const [row] = yield* table.rows()
       expect(row!.gpk.S).toBe(after)
       expect(row!.gsk.S).toBe(gsk)
-      yield* nothingToDo(db, table)
+      // The sort key beside it holds another region: `rekey` left it, and reports it.
+      yield* nothingToDo(db, table, 1)
     }),
   )
 }

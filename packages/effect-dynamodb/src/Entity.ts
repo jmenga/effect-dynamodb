@@ -11851,6 +11851,265 @@ const makeImpl = <
       )
     })
 
+  /** What judging an index key needs of this entity; `allIndexes.primary` never changes. */
+  const indexKeyJudging = (() => {
+    let judging: KeyComposer.IndexKeyJudging | undefined
+    return (): KeyComposer.IndexKeyJudging => {
+      if (judging === undefined) {
+        const primary = config.indexes.primary
+        judging = {
+          schema,
+          entityType,
+          entityVersion,
+          forms: KeyText136.forms(schema),
+          primaryComposites: new Set([...primary.pk.composite, ...primary.sk.composite]),
+          stamped: new Set(
+            [systemFields.createdAt, systemFields.updatedAt, systemFields.version].filter(
+              (field): field is string => typeof field === "string",
+            ),
+          ),
+        }
+      }
+      return judging
+    }
+  })()
+
+  /**
+   * A stored row's values as a `put` composed from them. A `put` is given a ref's id and stores the
+   * ref (`team: { id, ... }`, no `teamId`), so it's read back from there, as `.within()` does.
+   */
+  const putValuesOf = (row: StoredRow): globalThis.Record<string, unknown> => {
+    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
+    if (resolvedRefs.length === 0) return values
+    const withIds = { ...values }
+    for (const ref of resolvedRefs) {
+      const id = (values[ref.fieldName] as globalThis.Record<string, unknown> | undefined)?.[
+        ref.identifierField
+      ]
+      if (id !== undefined) withIds[ref.idFieldName] = id
+    }
+    return withIds
+  }
+
+  /** The stored attribute a composite is read from: a ref's id lives in the ref. */
+  const compositeAttribute = (composite: string): string =>
+    resolveDbName(resolvedRefs.find((ref) => ref.idFieldName === composite)?.fieldName ?? composite)
+
+  type IndexKeyWork = {
+    readonly sets: globalThis.Record<string, AttributeValue>
+    readonly removes: ReadonlyArray<string>
+    /** The stored attributes of the composites the keys written here are composed from. */
+    readonly composites: ReadonlyArray<string>
+    readonly found: Partial<Rekey.RekeyTally["indexKeys"]>
+    /** Halves with no key that a `put` wouldn't be expected to have written: see the caller. */
+    readonly keptAbsent: ReadonlyArray<string>
+  }
+  const NO_INDEX_KEY_WORK: IndexKeyWork = {
+    sets: {},
+    removes: [],
+    composites: [],
+    found: {},
+    keptAbsent: [],
+  }
+
+  /**
+   * Each index half of a live item against what its values compose (`KeyComposer.judgeIndexHalf`).
+   * Reads nothing and writes nothing. A half in a table key attribute isn't judged: no write names
+   * one, on any path. Halves sharing an attribute have one definition (`EDD-9106`), so it's judged
+   * once.
+   */
+  const judgeIndexKeys = (row: StoredRow): IndexKeyWork => {
+    let rowKeyForm: globalThis.Record<string, unknown>
+    try {
+      rowKeyForm = keyForm(putValuesOf(row))
+    } catch {
+      return NO_INDEX_KEY_WORK
+    }
+    const judging = indexKeyJudging()
+    const sets: globalThis.Record<string, AttributeValue> = {}
+    const removes: Array<string> = []
+    const composites = new Set<string>()
+    const found = { missing: 0, truncated: 0, lagging: 0, ambiguous: 0 }
+    const keptAbsent: Array<string> = []
+    const judged = new Set<string>()
+    for (const [name, index] of Object.entries(allIndexes)) {
+      if (name === "primary") continue
+      for (const half of ["pk", "sk"] as const) {
+        const { field, composite } = index[half]
+        if (isTableKeyField(field) || judged.has(field)) continue
+        judged.add(field)
+        const attribute = row[field]
+        const stored = attribute === undefined ? undefined : (attribute.S ?? attribute.B)
+        if (attribute !== undefined && stored === undefined) continue
+        if (stored === undefined && composite.some((attr) => judging.stamped.has(attr))) {
+          keptAbsent.push(field)
+        }
+        const verdict = KeyComposer.judgeIndexHalf(judging, index, half, stored, rowKeyForm)
+        if (verdict.kind === "fine") continue
+        if (verdict.kind === "ambiguous") {
+          found.ambiguous++
+          keptAbsent.push(field)
+          continue
+        }
+        if (verdict.kind === "remove") {
+          found.lagging++
+          removes.push(field)
+        } else {
+          found[verdict.drift]++
+          sets[field] =
+            typeof verdict.value === "string" ? { S: verdict.value } : { B: verdict.value }
+        }
+        for (const attr of composite) composites.add(compositeAttribute(attr))
+        if (half === "pk") {
+          for (const attr of index.shards?.source ?? []) composites.add(compositeAttribute(attr))
+        }
+      }
+    }
+    return { sets, removes, composites: [...composites], found, keptAbsent }
+  }
+
+  const indexKeyWorkSize = (work: IndexKeyWork): number =>
+    Object.keys(work.sets).length + work.removes.length
+
+  /**
+   * The `UpdateItem` a repair sends for `work`, judged from `row`: guarded on each key it writes and
+   * each composite they're composed from as read, or on their absence, so a writer changing any of
+   * them wins (`rekey-repair.md`).
+   */
+  const repairRequest = (
+    tableName: string,
+    row: StoredRow,
+    at: StoredKey,
+    work: IndexKeyWork,
+  ): UpdateItemCommandInput => {
+    const names: globalThis.Record<string, string> = { "#pk": rekeyPk }
+    const operands: globalThis.Record<string, AttributeValue> = {}
+    const guards: Array<string> = ["attribute_exists(#pk)"]
+    const guardAs = (name: string, operand: string, attribute: string) => {
+      names[name] = attribute
+      const read = row[attribute]
+      if (read === undefined) {
+        guards.push(`attribute_not_exists(${name})`)
+      } else {
+        operands[operand] = read
+        guards.push(`${name} = ${operand}`)
+      }
+    }
+    const sets: Array<string> = []
+    for (const [i, [field, value]] of Object.entries(work.sets).entries()) {
+      guardAs(`#k${i}`, `:o${i}`, field)
+      operands[`:n${i}`] = value
+      sets.push(`#k${i} = :n${i}`)
+    }
+    const removes: Array<string> = []
+    for (const [i, field] of work.removes.entries()) {
+      guardAs(`#r${i}`, `:r${i}`, field)
+      removes.push(`#r${i}`)
+    }
+    for (const [i, attribute] of work.composites.entries()) {
+      guardAs(`#c${i}`, `:c${i}`, attribute)
+    }
+    return {
+      TableName: tableName,
+      Key: toAttributeMap(at),
+      UpdateExpression: [
+        ...(sets.length > 0 ? [`SET ${sets.join(", ")}`] : []),
+        ...(removes.length > 0 ? [`REMOVE ${removes.join(", ")}`] : []),
+      ].join(" "),
+      ConditionExpression: guards.join(" AND "),
+      ExpressionAttributeNames: names,
+      ...(Object.keys(operands).length > 0 && { ExpressionAttributeValues: operands }),
+    }
+  }
+
+  /**
+   * Count the index keys of a live item at its current table key that differ, once per run, and with
+   * `repairIndexKeys` write them (`rekey-repair.md`). `row` holds what the run's text rewrite left.
+   * A row with nothing to do costs nothing here, whatever the option says. `wrote` says the row was
+   * acted on, so isn't `unchanged`.
+   */
+  const repairIndexKeys = (
+    ctx: Rekey.RekeyRowContext,
+    row: StoredRow,
+    at: StoredKey,
+  ): Effect.Effect<
+    { readonly tally: Rekey.RekeyTally; readonly wrote: boolean },
+    DynamoClientError,
+    DynamoClient | TableConfig
+  > =>
+    Effect.gen(function* () {
+      if (!ctx.claim(`${entityType}\u0000indexKeys\u0000${at[rekeyPk]}\u0000${at[rekeySk]}`)) {
+        return { tally: {}, wrote: false }
+      }
+      let work = judgeIndexKeys(row)
+      const found = work.found
+      if (!ctx.repairIndexKeys || indexKeyWorkSize(work) === 0) {
+        return { tally: { indexKeys: found }, wrote: false }
+      }
+      if (ctx.dryRun) {
+        return { tally: { indexKeys: { ...found, repaired: indexKeyWorkSize(work) } }, wrote: true }
+      }
+      const client = yield* Capacity.client
+      let judged = row
+      for (let attempt = 0; ; attempt++) {
+        const request = repairRequest(ctx.tableName, judged, at, work)
+        const outcome = yield* client.updateItem(request).pipe(
+          Effect.as({ _tag: "Done" as const }),
+          Effect.catch((err: DynamoClientError) =>
+            isAwsConditionalCheckFailed(err.cause)
+              ? Effect.succeed({ _tag: "Raced" as const })
+              : Effect.fail(err),
+          ),
+          diagnoseItemWrite("rekey", {
+            Update: request as NonNullable<TransactWriteItem["Update"]>,
+          }),
+          Effect.catchTag("ValidationError", (error) =>
+            Effect.succeed({ _tag: "Refused" as const, error }),
+          ),
+        )
+        if (outcome._tag === "Done") {
+          return {
+            tally: { indexKeys: { ...found, repaired: indexKeyWorkSize(work) } },
+            wrote: true,
+          }
+        }
+        if (outcome._tag === "Refused") {
+          return {
+            tally: Rekey.mergeTallies(
+              { indexKeys: found },
+              rekeyConflict(
+                "item",
+                "failed",
+                at,
+                at,
+                String(outcome.error.cause ?? outcome.error.message),
+              ),
+            ),
+            wrote: true,
+          }
+        }
+        // A writer got there first: judge the item as it is now, and try once more.
+        if (attempt > 0) {
+          return {
+            tally: { indexKeys: { ...found, skipped: indexKeyWorkSize(work) } },
+            wrote: false,
+          }
+        }
+        const { Item: fresh } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(at),
+          ConsistentRead: true,
+        })
+        const targets = fresh === undefined ? undefined : rowTargets(fresh)
+        if (targets?.kind !== "item" || !sameStoredKey(targets.current, at)) {
+          return { tally: { indexKeys: found }, wrote: false }
+        }
+        judged = fresh!
+        work = judgeIndexKeys(judged)
+        if (indexKeyWorkSize(work) === 0) return { tally: { indexKeys: found }, wrote: false }
+      }
+    })
+
   /**
    * What a move writes for `read` at its current key `current`: index keys recomposed as
    * an update would, so a half that can't compose keeps its text. Reads nothing and
@@ -11885,6 +12144,9 @@ const makeImpl = <
       for (const field of gsi.removes) {
         if (!isTableKeyField(field)) delete moved[field]
       }
+      // A move recomposes as an update naming everything would, which writes a key the row went
+      // without on purpose: it isn't damage (`rekey-repair.md`), so it stays that way.
+      for (const field of judgeIndexKeys(read).keptAbsent) delete moved[field]
       for (const [, definition] of vectorIndexEntries) {
         if (read[definition.vectorField] === undefined) continue
         const partition = KeyComposer.tryComposeVectorPartition(
@@ -11949,11 +12211,13 @@ const makeImpl = <
         if (ctx.dryRun) {
           // The real run goes on to rewrite or report what the move leaves on the row.
           const left = staleIndexKeys(moved.row)
+          const repair = yield* repairIndexKeys(ctx, { ...moved.row, ...left.sets }, to)
           return Rekey.mergeTallies(
             countMove(ctx, "item", to, tally),
             { sentinelsMoved: sentinels.moved },
             Object.keys(left.sets).length === 0 ? {} : { indexKeysRewritten: 1 },
             heldBackIndexKeys(to, left.uncomposable),
+            repair.tally,
           )
         }
         const guard = deleteGuard(read!, "item", undefined)
@@ -12171,9 +12435,12 @@ const makeImpl = <
       let row = scanned
       let rewritten = false
       let uncomposable: ReadonlyArray<string> = []
+      // What the text rewrite leaves on the row, for judging what's left of its index keys.
+      let left = scanned
       for (let attempt = 0; ; attempt++) {
         const stale = staleIndexKeys(row)
         uncomposable = stale.uncomposable
+        left = { ...row, ...stale.sets }
         const fields = Object.keys(stale.sets)
         if (fields.length === 0) break
         if (ctx.dryRun) {
@@ -12236,16 +12503,19 @@ const makeImpl = <
         if (fresh === undefined) return {}
         row = fresh
       }
+      const repair = yield* repairIndexKeys(ctx, left, at)
       const sentinels = yield* rekeySentinels(ctx, "item", row, [at], at, depth)
       const refused = heldBackIndexKeys(at, uncomposable)
       return Rekey.mergeTallies(
         rewritten ||
+          repair.wrote ||
           (refused.conflicts ?? []).length > 0 ||
           (sentinels.sentinelsMoved ?? 0) > 0 ||
           (sentinels.conflicts ?? []).length > 0
           ? {}
           : { unchanged: 1 },
         rewritten ? { indexKeysRewritten: 1 } : {},
+        repair.tally,
         sentinels,
         refused,
       )
@@ -12270,7 +12540,11 @@ const makeImpl = <
       )
       if (predicted === undefined) return {}
       const stale = staleIndexKeys(predicted)
-      if (Object.keys(stale.sets).length === 0 && stale.uncomposable.length === 0) return {}
+      if (Object.keys(stale.sets).length === 0 && stale.uncomposable.length === 0) {
+        // Judged from what the move wrote, with no read: a repair is conditioned on what's judged,
+        // so a prediction that's wrong fails its condition, and the item is read then.
+        return (yield* repairIndexKeys(ctx, predicted, at)).tally
+      }
       const client = yield* Capacity.client
       const { Item: moved } = yield* client.getItem({
         TableName: ctx.tableName,
