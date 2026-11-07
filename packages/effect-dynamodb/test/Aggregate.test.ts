@@ -9,7 +9,7 @@ import {
   type RefNotFound,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Fiber, Layer, Option, Schema } from "effect"
+import { Effect, Exit, Fiber, Layer, Option, Schema, SchemaGetter } from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
@@ -2081,6 +2081,112 @@ describe("Aggregate write path", () => {
         const item = mockTransactWrite.mock.calls[0]![0].TransactItems[0].Put.Item
         // ...and it is written in the ENCODED form.
         expect(item.amount).toEqual({ S: "999" })
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    // A transformation with one type on both sides, where nothing but the order of the two sides
+    // tells a stored value from a domain one.
+    const X10 = Schema.Number.pipe(
+      Schema.decodeTo(Schema.Number, {
+        decode: SchemaGetter.transform((value) => value * 10),
+        encode: SchemaGetter.transform((value) => value / 10),
+      }),
+    )
+    class RateRow extends Schema.Class<RateRow>("RateRow")({
+      rowId: Schema.String,
+      rate: X10,
+      note: Schema.String,
+    }) {}
+    const RateRowAggregate = Aggregate.make(RateRow, {
+      table: MainTable,
+      schema: AppSchema,
+      pk: { field: "pk", composite: ["rowId"] },
+      collection: { index: "lsi1", name: "raterow", sk: { field: "lsi1sk", composite: [] } },
+      root: { entityType: "RateRowItem" },
+      edges: {},
+    })
+    const storedRateRow = (rowId: string) => ({
+      Items: [
+        toAttributeMap({
+          pk: `$myapp#v1#raterow#${rowId}`,
+          sk: "$myapp#v1#raterowitem",
+          lsi1sk: "$myapp#v1#raterow",
+          __edd_e__: "RateRowItem",
+          rowId,
+          rate: 5,
+          note: "n",
+        }),
+      ],
+      LastEvaluatedKey: undefined,
+    })
+
+    it.effect("skips write when nothing changed, on a transformation with one type", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce(storedRateRow("r-1"))
+
+        const result = yield* RateRowAggregate.update({ rowId: "r-1" }, ({ state }) => state)
+
+        expect(result.rate).toBe(50)
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("leaves a field it didn't change as it was stored", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce(storedRateRow("r-2"))
+        mockTransactWrite.mockResolvedValueOnce({})
+
+        const result = yield* RateRowAggregate.update({ rowId: "r-2" }, ({ state }) => ({
+          ...state,
+          note: "changed",
+        }))
+
+        expect(result.rate).toBe(50)
+        const item = mockTransactWrite.mock.calls[0]![0].TransactItems[0].Put.Item
+        expect(item.rate).toEqual({ N: "5" })
+        expect(item.note).toEqual({ S: "changed" })
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("stores the encoded form of a value a mutation sets", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce(storedRateRow("r-3"))
+        mockTransactWrite.mockResolvedValueOnce({})
+
+        const result = yield* RateRowAggregate.update({ rowId: "r-3" }, ({ state }) => ({
+          ...state,
+          rate: 70,
+        }))
+
+        expect(result.rate).toBe(70)
+        const item = mockTransactWrite.mock.calls[0]![0].TransactItems[0].Put.Item
+        expect(item.rate).toEqual({ N: "7" })
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("refuses nonsense a mutation sets, and writes nothing", () =>
+      Effect.gen(function* () {
+        mockWriteQuery.mockResolvedValueOnce(storedRateRow("r-4"))
+
+        const exit = yield* RateRowAggregate.update(
+          { rowId: "r-4" },
+          ({ state }) => ({ ...state, rate: "nonsense" }) as never,
+        ).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(mockTransactWrite).not.toHaveBeenCalled()
+      }).pipe(Effect.provide(WriteLayer)),
+    )
+
+    it.effect("takes a create value as a domain value", () =>
+      Effect.gen(function* () {
+        mockTransactWrite.mockResolvedValueOnce({})
+
+        const result = yield* RateRowAggregate.create({ rowId: "r-5", rate: 50, note: "n" })
+
+        expect(result.rate).toBe(50)
+        const item = mockTransactWrite.mock.calls[0]![0].TransactItems[0].Put.Item
+        expect(item.rate).toEqual({ N: "5" })
       }).pipe(Effect.provide(WriteLayer)),
     )
 

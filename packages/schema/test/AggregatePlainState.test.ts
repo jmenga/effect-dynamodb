@@ -202,9 +202,13 @@ describe("a transformation that isn't stored as a string or a number", () => {
   )
 
   it("a map decoded from a record keeps its entries: an instance isn't read as a record", () => {
-    decodesTo<Map<string, number>>(over(mapFromRecord), new Map([["a", 1]]), (read) => {
-      expect([...read.entries()]).toEqual([["a", 1]])
-    })
+    decodesTo<Map<string, number>>(
+      over(mapFromRecord, { domainValues: true }),
+      new Map([["a", 1]]),
+      (read) => {
+        expect([...read.entries()]).toEqual([["a", 1]])
+      },
+    )
   })
 
   it("a map decoded from a record reads the record it's stored as", () => {

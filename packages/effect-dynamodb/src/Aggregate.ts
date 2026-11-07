@@ -1388,7 +1388,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }) as unknown as Schema.Codec<any>
   // The same schema for WRITES — `create` input and `update`'s mutated state —
   // with the container `.check()` refinements the substitution rebuilds kept, so
-  // a write that breaks one is rejected (#133). Assembly keeps `decodeSchema`:
+  // a write that breaks one is rejected (#133), and a value is asked as the domain
+  // value first, since that's what a caller holds. Assembly keeps `decodeSchema`:
   // a row written while those checks were not enforced must stay readable.
   const writeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
@@ -1802,11 +1803,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
         current: current as Schema.Schema.Type<TSchema>,
       })
 
-      // 3. Validate the mutated state via `decodeSchema` — its tolerant date
-      //    transforms accept the domain `DateTime` values the mutation yields
-      //    for every date field (root + nested edges, Pattern A and Pattern B),
-      //    so update no longer trips the "Expected string, got DateTime" decode
-      //    that a strict `*FromString` schema would raise (#72 update path).
+      // 3. Validate the mutated state — its tolerant transforms take the domain
+      //    values the mutation yields as what they are, for every field (root +
+      //    nested edges), so update no longer trips the "Expected string, got
+      //    DateTime" decode that a strict `*FromString` schema would raise (#72
+      //    update path), and a transformation with one type on both sides isn't
+      //    applied again to a value it already made.
       //    A row the mutation added doesn't need the dates the library stamps.
       const decoded = yield* Schema.decodeUnknownEffect(mutatedStateSchema)(
         fillStamps(rootNode, updated, now, "required"),
@@ -3651,16 +3653,14 @@ const hydrateAggregateRefs = (
       // operation, so promote a pure edge target to a full operational Entity (a
       // thin op-attach over its retained `_data`); runtime-authored targets already
       // carry `.get` and pass through untouched. Mirrors `DynamoClient.make()`'s
-      // entity binding. The promoted entity also exposes `.schemas`, used by the
-      // encode-back below (issue #72). The loop is already grouped by entity type,
-      // so this promotes once per distinct edge entity type per hydrate (issue #71).
+      // entity binding. The loop is already grouped by entity type, so this promotes
+      // once per distinct edge entity type per hydrate (issue #71).
       const runtimeEntity = (
         typeof (entity as { readonly get?: unknown }).get === "function"
           ? entity
           : entityFromDefinition(entity as unknown as EntityDefinition)
       ) as RefEntity & {
         readonly get: (key: any) => any
-        readonly schemas: { readonly recordSchema: Schema.Codec<any> }
       }
 
       // Build EntityGet intermediates for batch fetching
@@ -3682,26 +3682,10 @@ const hydrateAggregateRefs = (
             refId: id,
           })
         }
-        // `Batch.get` returns the DECODED record — transform fields are lifted to
-        // their domain form (e.g. `Schema.DateTimeUtcFromString` → `DateTime`). The
-        // denormalized ref is spliced into `input` and decoded again by the
-        // aggregate's strict `schema`, whose nested edge field is the ORIGINAL ref
-        // class expecting the wire form. Re-encode through the ref's substituted
-        // `recordSchema` so the spliced value is wire-form and decoded exactly once
-        // (issue #72) — this also keeps it marshall-safe for decompose.
-        const wire = yield* Schema.encodeUnknownEffect(runtimeEntity.schemas.recordSchema)(
-          result,
-        ).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ValidationError({
-                entityType: aggregateName,
-                operation: "aggregate.hydrateRefs.encode",
-                cause,
-              }),
-          ),
-        )
-        hydratedLookup.set(`${entityType}:${id}`, wire as Record<string, unknown>)
+        // `Batch.get` returns the decoded record: domain values, as a caller holds, and
+        // `writeSchema` takes them as that. Encoded here, a field with one type on both
+        // sides of a transformation would be taken for a domain value and encoded twice.
+        hydratedLookup.set(`${entityType}:${id}`, result as Record<string, unknown>)
       }
     }
 

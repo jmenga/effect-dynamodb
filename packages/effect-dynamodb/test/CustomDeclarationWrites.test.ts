@@ -414,10 +414,7 @@ describe("a new write path can't go unnoticed", () => {
    * way for a value to be stored: route it through the check, or say here why it isn't one.
    */
   const ENCODES: Readonly<Record<string, readonly [number, string]>> = {
-    "Aggregate.ts": [
-      5,
-      "attribute encoders, feeding rows `refuseNotReadBack` reads; a ref's stored row",
-    ],
+    "Aggregate.ts": [4, "attribute encoders, feeding rows `refuseNotReadBack` reads"],
     "Entity.ts": [
       7,
       "`encodeOrDecodeEncode` (2), two probes that store nothing, a key (2), a ref's stored row",

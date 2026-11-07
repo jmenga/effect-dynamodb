@@ -485,6 +485,38 @@ Container `.check()` refinements are enforced on `create` and `update`, as they 
 A `many` edge with a custom `decompose` that **renames** element fields (`{ noteId, at }` → `{ nid, when }`) is the one exception. Encoders are matched to the element's own field names, so a renamed field is stored as its domain value, and a `DateTime` there is still written as a map. It reads back as a real `DateTime`. To store it in wire form, keep the element's field names in `decompose`, or encode the value yourself before returning it.
 :::
 
+#### What `create` and `update` take
+
+A value you hand to `create` or `update` is a domain value, as it is on an entity: in the input, in `state`, `cursor` and `current`, and in what a mutation returns. It's stored in its wire form and reads back as you gave it. An `update` leaves a field it doesn't change, and one that changes nothing writes nothing. A value that can't be a domain value but is the wire form, such as `"5"` for a `Schema.NumberFromString`, is still taken. Anything else is refused with a `ValidationError`.
+
+A transformation that changes a value on decode, such as `SchemaTransformation.toLowerCase()`, reads the same on both. `create` returns what a read gives, as an entity's `put` does, and an aggregate stores that, where an entity stores what it was given.
+
+:::caution[Rows written by 1.39.0 or earlier]
+Up to 1.39.0, where a transformation has one type on both sides, an aggregate took a value as its stored form if the stored side accepted it. On a field that multiplies by 10 on decode:
+
+| | Returned | Stored | `get` |
+|---|---|---|---|
+| `create(50)` now, and on an entity | 50 | 5 | 50 |
+| `create(50)` on 1.39.0 | 500 | 50 | 500 |
+| Then an `update` of another field on 1.39.0 | | 500 | 5000 |
+| Then another | | 5000 | 50000 |
+
+Every `update` did this again to every such field in every row of the aggregate, whatever the mutation changed. That includes context fields and the fields of a hydrated ref.
+
+**This affected** a custom transformation with one type on both sides, whatever the value, and `Schema.StringFromBase64`, `Schema.StringFromBase64Url`, `Schema.StringFromHex`, `Schema.StringFromUriComponent` and `Schema.fromJsonString`, for a value that was already valid in that form: `create("aGVsbG8=")` on `Schema.StringFromBase64` returned and read back `"hello"`. An `update` left those as they were, unless the decoded text was valid in that form too. A plain word that happens to be valid base64 went the same way, and what it was given is gone: `create("test")` on `Schema.StringFromBase64` returned `"��-"` and stored `77+977+9LQ==`, where an entity stores `dGVzdA==` and reads `"test"`. It didn't affect a transformation that gives the same result twice, such as `Schema.Trim`, or one with different types on its two sides, such as `Schema.NumberFromString`.
+
+**If you pass the stored form to `create`, change it. Nothing will warn you.** On 1.39.0 the stored form was the only input on these fields that read back as you meant. It's a valid domain value too, and no check can tell the two apart, so it's now taken as one, with no error, and you read back what you passed:
+
+| Field | Code | 1.39.0: stored, `get` | 1.39.0, after an `update` of another field | Now: stored, `get`, the same after an `update` |
+|---|---|---|---|---|
+| Multiplies by 10 | `create(5)` | 5, 50 | 50, 500 | 0.5, 5 |
+| `Schema.StringFromBase64` | `create("aGVsbG8=")` | `aGVsbG8=`, `"hello"` | `aGVsbG8=`, `"hello"` | `YUdWc2JHOD0=`, `"aGVsbG8="` |
+
+Pass the value you want to read instead: `create(50)` and `create("hello")` store `5` and `aGVsbG8=`, what those two calls stored before. If you encode a value before passing it to `create`, or set an encoded value in an `update`, stop encoding it.
+
+**Rows already stored stay as they are.** The library can't tell what such a row should have held, so it can't recover it and doesn't try. Those rows keep what they store and read as they did on 1.39.0, and a row that went through `update` has compounded, once for each update. An `update` no longer makes it worse. To repair a row you need to know the right value yourself: set it in an `update`, which stores its encoded form.
+:::
+
 #### Upgrading from 1.22.0 or earlier
 
 :::caution[Upgrade readers first]
