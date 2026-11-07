@@ -3407,7 +3407,27 @@ MainTable.layer({ name: "my-prod-table" })
 // Config-based (reads from environment variables)
 DynamoClient.layerConfig({ region: Config.String("AWS_REGION") })
 MainTable.layerConfig({ name: Config.String("TABLE_NAME") })
+
+// Passed to the SDK client. No defaults here, and no platform handler imported.
+DynamoClient.layer({
+  region: "us-east-1",
+  requestHandler: { connectionTimeout: 1_000, socketTimeout: 5_000 },
+  maxAttempts: 2,
+})
+DynamoClient.layerConfig({
+  region: Config.String("AWS_REGION"),
+  requestHandler: { socketTimeout: Config.Int("DYNAMODB_SOCKET_TIMEOUT_MS") },
+  maxAttempts: Config.Int("DYNAMODB_MAX_ATTEMPTS"),
+})
 ```
+
+**Options passed to the SDK (#190).** `requestHandler` is a handler or the options of the runtime's handler: the SDK's build for the runtime constructs its own from a plain object (`NodeHttpHandler` on Node and Bun, `FetchHttpHandler` in browsers and Workers). The type excludes the SDK's `Record<string, unknown>` arm, under which a misspelt `socketTimout` would compile and leave the call with no timeout. In `layerConfig`, `maxAttempts` and the four handler scalars (`connectionTimeout`, `socketTimeout`, `requestTimeout`, `throwOnRequestTimeout`) are read per field through `Config`, because an operator tunes them per environment: a missing one stays unset, and a malformed one is a `ConfigError`. A handler instance holds code (agents, a logger), so it is passed as itself, as `compressors` is. A handler passed in is destroyed with the layer.
+
+**Interruption ends the request (#190).** Every `send` passes `Effect.tryPromise`'s signal as `abortSignal` (guarded by `test/abort-signal-guard.test.ts`, which fails on a `.send(` without one). An interrupted fiber's request closes its connection and the SDK makes no further attempt: `AbortError` isn't retried, and a retry waiting out its backoff finds the signal aborted and sends nothing. The fiber has never waited for the promise, before or after this. It ends the wait, not the request: a write already sent may still be applied, and the caller settles that with a conditional write or an idempotency token. An interrupted request counts once in consumed capacity, under `unreportedRequests`.
+
+A timeout from the handler and an `AbortError` both classify as `DynamoError` with the SDK's error as `cause`, through `redactCredentialRefusal` like any other. The feed's retries tell a request timeout (`name: "TimeoutError"`, `code` unset or `ETIMEDOUT`) from a dropped connection, which Node's handler also names `TimeoutError` (`code: "ECONNRESET"` or `"EPIPE"`).
+
+**Closing the layer.** `destroy()` closes in-flight sockets, which the SDK takes for dropped connections and retries on new ones, with no timeout unless one is configured, and a write goes out again. So each layer's client carries a `finalizeRequest` middleware (`internal/ClientOptions.acquireSdkClient`, inside the retry loop) that fails a further attempt of a request sent before the close with `ClientClosedError`. A request sent after the close still goes out, since the SDK client stays usable. `layerFromSdkClient` owns nothing and adds nothing.
 
 ---
 
@@ -4750,7 +4770,8 @@ yield* runChangeFeed(feed, { projections: { summaries: OrderSummaryProjection } 
 
 - **Services.** `DynamoStreamsClient` (`Context.Service`; `DescribeStream`,
   `GetShardIterator`, `GetRecords`, `ListStreams`; `layer` / `layerConfig` /
-  `layerFromSdkClient`) and `CheckpointStore` (`Context.Service`; `load`, `commit`,
+  `layerFromSdkClient`, the first two taking `requestHandler` and `maxAttempts`, §10) and
+  `CheckpointStore` (`Context.Service`; `load`, `commit`,
   `acquireLease` / `renewLease` / `releaseLease`; `layerMemory`, `layerDynamoDB({ tableName })`
   over `DynamoClient` (`finishedTtl` at least 28 h, `[EDD-9084]`), `tableDefinition(name)`
   for its `pk`/`sk` table).
