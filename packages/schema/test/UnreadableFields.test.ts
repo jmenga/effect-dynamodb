@@ -201,10 +201,8 @@ const BY_OWNER: ReadonlyArray<
 > = (() => {
   const date = "a Schema.Date"
   const redacted = "a Schema.Redacted"
-  const bigint = "a Schema.BigInt"
   const besideANumber = "a union of Schema.BigInt and something else stored as a number"
   const overDate = "a transformation over Schema.Date"
-  const overBigint = "a transformation over Schema.BigInt"
   const same = SchemaTransformation.passthrough() as never
   const literal = "a bigint Schema.Literal"
   const F = Schema.DateTimeUtcFromDate
@@ -526,7 +524,7 @@ const BY_OWNER: ReadonlyArray<
       undefined,
       undefined,
     ],
-    ["a suspended bigint", Schema.suspend(() => Schema.BigInt), bigint, bigint, undefined],
+    ["a suspended bigint", Schema.suspend(() => Schema.BigInt), undefined, undefined, undefined],
     ["a suspended date", Schema.suspend(() => Schema.Date), date, date, date],
     [
       "a suspended redacted value",
@@ -648,20 +646,20 @@ const BY_OWNER: ReadonlyArray<
       undefined,
       overDate,
     ],
-    ["a bigint over itself", overItself(Schema.BigInt), overBigint, overBigint, overBigint],
+    ["a bigint over itself", overItself(Schema.BigInt), undefined, undefined, undefined],
     [
       "a bigint over itself, or null",
       Schema.NullOr(overItself(Schema.BigInt)),
-      overBigint,
-      overBigint,
-      overBigint,
+      undefined,
+      undefined,
+      undefined,
     ],
     [
       "a bigint over itself with a decoding default",
       overItself(Schema.BigInt).pipe(Schema.withDecodingDefault(Effect.die("unused"))),
-      overBigint,
-      overBigint,
-      overBigint,
+      undefined,
+      undefined,
+      undefined,
     ],
     [
       "a bigint in a class with a decoding default",
@@ -675,9 +673,9 @@ const BY_OWNER: ReadonlyArray<
       Schema.optionalKey(Schema.BigInt).pipe(
         Schema.decodeTo(Schema.Number, SchemaTransformation.passthrough() as never),
       ),
-      overBigint,
-      overBigint,
-      overBigint,
+      undefined,
+      undefined,
+      undefined,
     ],
     [
       "a date on an optional stored side, decoded to something of your own",
@@ -699,8 +697,8 @@ const BY_OWNER: ReadonlyArray<
           SchemaTransformation.passthrough() as never,
         ),
       ),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
@@ -711,8 +709,8 @@ const BY_OWNER: ReadonlyArray<
           SchemaTransformation.passthrough() as never,
         ),
       ),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
@@ -723,8 +721,8 @@ const BY_OWNER: ReadonlyArray<
           SchemaTransformation.passthrough() as never,
         ),
       ),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
@@ -735,8 +733,8 @@ const BY_OWNER: ReadonlyArray<
           SchemaTransformation.passthrough() as never,
         ),
       ),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
@@ -745,9 +743,9 @@ const BY_OWNER: ReadonlyArray<
         Schema.decodeTo(Schema.BigInt, same),
         Schema.decodeTo(Schema.BigInt, same),
       ),
-      overBigint,
-      overBigint,
-      overBigint,
+      undefined,
+      undefined,
+      undefined,
     ],
     [
       "a bigint transformed from one on an optional stored side, in one chain of three",
@@ -759,9 +757,9 @@ const BY_OWNER: ReadonlyArray<
           same,
         ),
       ),
-      overBigint,
-      overBigint,
-      overBigint,
+      undefined,
+      undefined,
+      undefined,
     ],
     [
       "a bigint on an optional stored side that's a transformation itself",
@@ -777,9 +775,9 @@ const BY_OWNER: ReadonlyArray<
       Schema.optionalKey(Schema.BigInt.pipe(Schema.decodeTo(Schema.Number, same))).pipe(
         Schema.decodeTo(Schema.Number, same),
       ),
-      overBigint,
-      overBigint,
-      overBigint,
+      undefined,
+      undefined,
+      undefined,
     ],
     [
       "a date on an optional stored side that's transformed to a number there",
@@ -796,7 +794,7 @@ const BY_OWNER: ReadonlyArray<
         Schema.decodeTo(Schema.Array(Schema.BigInt), same),
       ),
       undefined,
-      bigint,
+      undefined,
       undefined,
     ],
     [
@@ -843,8 +841,8 @@ const BY_OWNER: ReadonlyArray<
     [
       "a transformation over a struct with a bigint",
       overItself(Schema.Struct({ n: Schema.BigInt })),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
@@ -865,21 +863,21 @@ const BY_OWNER: ReadonlyArray<
       "a list of bigints transformed to one",
       overItself(Schema.Array(Schema.BigInt)),
       undefined,
-      bigint,
+      undefined,
       undefined,
     ],
     [
       "a list of lists of bigints transformed to one",
       overItself(Schema.Array(Schema.Array(Schema.BigInt))),
       undefined,
-      bigint,
+      undefined,
       undefined,
     ],
     [
       "a list of a bigint or null transformed to one",
       overItself(Schema.Array(Schema.NullOr(Schema.BigInt))),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
@@ -892,15 +890,15 @@ const BY_OWNER: ReadonlyArray<
     [
       "an Option from a struct with a bigint or null",
       Schema.OptionFromNullOr(Schema.Struct({ n: Schema.BigInt })),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
       "an Option from an optional key's struct with a bigint",
       Schema.OptionFromOptionalKey(Schema.Struct({ n: Schema.BigInt })),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       undefined,
     ],
     [
@@ -917,10 +915,10 @@ const BY_OWNER: ReadonlyArray<
       date,
       date,
     ],
-    ["a bigint under an Option", Schema.Option(Schema.BigInt), bigint, bigint, undefined],
-    ["a bigint in a set", Schema.ReadonlySet(Schema.BigInt), bigint, bigint, undefined],
-    ["Schema.DurationFromNanos", Schema.DurationFromNanos, overBigint, overBigint, overBigint],
-    ["Schema.ByteSizeFromBigInt", Schema.ByteSizeFromBigInt, overBigint, overBigint, overBigint],
+    ["a bigint under an Option", Schema.Option(Schema.BigInt), undefined, undefined, undefined],
+    ["a bigint in a set", Schema.ReadonlySet(Schema.BigInt), undefined, undefined, undefined],
+    ["Schema.DurationFromNanos", Schema.DurationFromNanos, undefined, undefined, undefined],
+    ["Schema.ByteSizeFromBigInt", Schema.ByteSizeFromBigInt, undefined, undefined, undefined],
     [
       "your own over a bigint, to a number",
       Schema.BigInt.pipe(
@@ -929,9 +927,9 @@ const BY_OWNER: ReadonlyArray<
           encode: SchemaGetter.transform((n: number) => BigInt(n)),
         }),
       ),
-      overBigint,
-      overBigint,
-      overBigint,
+      undefined,
+      undefined,
+      undefined,
     ],
     [
       "a bigint in an optional field, in a struct, or null",
@@ -1005,12 +1003,7 @@ describe("[EDD-9125] what depends on what stores it", () => {
     }
   }
 
-  it("says the positions it doesn't reach, and a union isn't one of them for a bigint", () => {
-    const beneath = judged("entity", Schema.Option(Schema.BigInt))
-    expect(beneath).toContain(
-      "isn't under another declaration, a Schema.suspend or a transformation",
-    )
-    expect(beneath).not.toContain("union")
+  it("says the positions it doesn't reach", () => {
     expect(judged("entity", Schema.Option(Schema.Date))).toContain(
       "isn't under another declaration, a Schema.suspend, a transformation or a decoding default on a container",
     )
@@ -1058,11 +1051,12 @@ describe("[EDD-9125] what depends on what stores it", () => {
     expect(judged("schema", Schema.Union([Schema.Number, Schema.BigInt]))).toContain(
       "Use Schema.BigIntFromString.",
     )
-    expect(judged("entity", Schema.Option(Schema.BigInt))).toContain("Use Schema.BigIntFromString.")
+    expect(judged("entity", Schema.Option(Schema.Union([Schema.Number, Schema.BigInt])))).toContain(
+      "Use Schema.BigIntFromString.",
+    )
     expect(judged("entity", Schema.DateTimeUtcFromDate)).toContain(
       "Use Schema.DateTimeUtcFromString or Schema.DateTimeUtcFromMillis.",
     )
-    expect(judged("entity", Schema.DurationFromNanos)).toContain("Schema.DurationFromMillis")
     expect(judged("entity", Schema.Literal(1n))).toContain("Use a string or a number literal.")
   })
 

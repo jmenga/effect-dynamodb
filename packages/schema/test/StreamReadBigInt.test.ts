@@ -190,8 +190,19 @@ describe("[EDD-9125] a union a stream can't read a bigint from", () => {
     ["the same struct over a number", Schema.Union([WithB(Schema.BigInt), WithB(Schema.Number)])],
     ["the struct the other way", Schema.Union([WithB(Schema.Number), WithB(Schema.BigInt)])],
     [
-      "a struct with one more field",
-      Schema.Union([Schema.Struct({ b: Schema.BigInt, c: Schema.String }), WithB(Schema.Number)]),
+      "a first member that keeps its number, whatever more the bigint's has",
+      Schema.Union([WithB(Schema.Number), Schema.Struct({ b: Schema.BigInt, c: Schema.String })]),
+    ],
+    [
+      "a later member it would lift, whatever more that has",
+      Schema.Union([WithB(Schema.BigInt), Schema.Struct({ b: Schema.Number, c: Schema.String })]),
+    ],
+    [
+      "that, under a struct",
+      Schema.Union([
+        WithB(WithB(Schema.BigInt)),
+        WithB(Schema.Struct({ b: Schema.Number, c: Schema.String })),
+      ]),
     ],
     [
       "a struct over a record",
@@ -231,10 +242,77 @@ describe("[EDD-9125] a union a stream can't read a bigint from", () => {
     ],
     ["two Options", Schema.Union([Schema.Option(Schema.BigInt), Schema.Option(Schema.Number)])],
     [
-      "an Option over a struct",
-      Schema.Union([Schema.Option(Schema.BigInt), Schema.Struct({ _tag: Schema.String })]),
+      "a struct that takes an Option's value first",
+      Schema.Union([Schema.Struct({ value: Schema.Number }), Schema.Option(Schema.BigInt)]),
     ],
-    ["a struct over an Option", Schema.Union([WithB(Schema.BigInt), Schema.Option(Schema.String)])],
+    [
+      "a record that takes an Option first",
+      Schema.Union([Schema.Record(Schema.String, Schema.Unknown), Schema.Option(Schema.BigInt)]),
+    ],
+    [
+      "a struct that takes a Result's success first",
+      Schema.Union([
+        Schema.Struct({ success: Schema.Number }),
+        Schema.Result(Schema.BigInt, Schema.String),
+      ]),
+    ],
+    [
+      "a struct that takes a Result's failure first",
+      Schema.Union([
+        Schema.Struct({ failure: Schema.Number }),
+        Schema.Result(Schema.String, Schema.BigInt),
+      ]),
+    ],
+    [
+      "a declaration of no known map, after a struct",
+      Schema.Union([
+        Schema.Struct({ a: Schema.Number }),
+        Schema.Exit(Schema.BigInt, Schema.String, Schema.Unknown),
+      ]),
+    ],
+    [
+      "a struct it would take an Option's value for",
+      Schema.Union([Schema.Struct({ value: Schema.BigInt }), Schema.Option(Schema.Number)]),
+    ],
+    [
+      "a struct it would take a Result's success for",
+      Schema.Union([
+        Schema.Struct({ success: Schema.BigInt }),
+        Schema.Result(Schema.Number, Schema.String),
+      ]),
+    ],
+    [
+      "a struct carrying an Option's marker, after that Option",
+      Schema.Union([
+        Schema.Option(Schema.Number),
+        Schema.Struct({ value: Schema.BigInt, "~effect/Option": Schema.Struct({}) }),
+      ]),
+    ],
+    [
+      "an Option, before a struct carrying its marker",
+      Schema.Union([
+        Schema.Option(Schema.BigInt),
+        Schema.Struct({ value: Schema.Number, "~effect/Option": Schema.Struct({}) }),
+      ]),
+    ],
+    [
+      "Schema.Unknown before an Option",
+      Schema.Union([Schema.Unknown, Schema.Option(Schema.BigInt)]),
+    ],
+    [
+      "a oneOf, whichever comes first",
+      Schema.Union([Schema.Struct({ b: Schema.Number, c: Schema.String }), WithB(Schema.BigInt)], {
+        mode: "oneOf",
+      }),
+    ],
+    [
+      "a oneOf, the other way",
+      Schema.Union([WithB(Schema.BigInt), Schema.Struct({ b: Schema.Number, c: Schema.String })], {
+        mode: "oneOf",
+      }),
+    ],
+    ["a transformation over a bigint", Schema.Union([Schema.DurationFromNanos, Schema.Number])],
+    ["that, the other way", Schema.Union([Schema.Number, Schema.DurationFromNanos])],
     ["a recursive number", Schema.Union([Schema.BigInt, Recursive])],
     ["a nested struct", Schema.Union([WithB(WithB(Schema.BigInt)), WithB(WithB(Schema.Number))])],
     [
@@ -354,6 +432,84 @@ describe("[EDD-9125] a union a stream can't read a bigint from", () => {
     ["under a list", Schema.Array(Schema.Union([Schema.Number, Schema.BigInt]))],
     ["under a struct", Schema.Struct({ s: Schema.Union([Schema.Number, Schema.BigInt]) })],
     ["under an Option", Schema.Option(Schema.Union([Schema.Number, Schema.BigInt]))],
+    [
+      "a struct it requires less than, with an optional field of its own",
+      Schema.Union([
+        Schema.Struct({ a: Schema.BigInt, x: Schema.optional(Schema.String) }),
+        Schema.Struct({ a: Schema.Number }),
+      ]),
+    ],
+    [
+      "a struct taking an Option's map by its op, first",
+      Schema.Union([
+        Schema.Struct({ _op: Schema.String, value: Schema.Number }),
+        Schema.Option(Schema.BigInt),
+      ]),
+    ],
+    [
+      "a struct taking an Option's map by its marker, first",
+      Schema.Union([
+        Schema.Struct({ "~effect/Option": Schema.Struct({}), value: Schema.Number }),
+        Schema.Option(Schema.BigInt),
+      ]),
+    ],
+    [
+      "a struct whose field takes only an Option's none, first",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Struct({ _tag: Schema.Literal("None") }), b: Schema.Number }),
+        Schema.Struct({ k: Schema.Option(Schema.String), b: Schema.BigInt }),
+      ]),
+    ],
+    [
+      "a struct whose field could be a declaration of no known map, first",
+      Schema.Union([
+        Schema.Struct({
+          k: Schema.Struct({ x: Schema.optional(Schema.String) }),
+          b: Schema.Number,
+        }),
+        Schema.Struct({ k: Schema.Duration, b: Schema.BigInt }),
+      ]),
+    ],
+    [
+      "a struct whose field is another of Effect's declarations",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Duration, b: Schema.BigInt }),
+        Schema.Struct({ k: Schema.DateTimeUtc, b: Schema.Number }),
+      ]),
+    ],
+    [
+      "a record, with an optional field its values don't fit",
+      Schema.Union([
+        Schema.Struct({ a: Schema.BigInt, x: Schema.optional(Schema.String) }),
+        Schema.Record(Schema.String, Schema.Number),
+      ]),
+    ],
+    [
+      "a record with a field the struct's field is, whatever its values",
+      Schema.Union([
+        Schema.Struct({ a: Schema.BigInt, c: Schema.String }),
+        Schema.StructWithRest(Schema.Struct({ c: Schema.String }), [
+          Schema.Record(Schema.String, Schema.Number),
+        ]),
+      ]),
+    ],
+    [
+      "a record keyed by a pattern, which says nothing of a key outside it",
+      Schema.Union([
+        Schema.Struct({ a: Schema.BigInt, c: Schema.String }),
+        Schema.Record(Schema.TemplateLiteral(["a", Schema.String]), Schema.Number),
+      ]),
+    ],
+    [
+      "a oneOf with a struct requiring more first",
+      Schema.Union(
+        [
+          Schema.Struct({ a: Schema.BigInt, c: Schema.String }),
+          Schema.Struct({ a: Schema.Number }),
+        ],
+        { mode: "oneOf" },
+      ),
+    ],
   ]
 
   for (const [name, schema] of REFUSED) {
@@ -364,6 +520,44 @@ describe("[EDD-9125] a union a stream can't read a bigint from", () => {
   }
 
   const TAKEN: ReadonlyArray<readonly [string, Schema.Top]> = [
+    [
+      "an Option of a number beside a struct with its marker, no bigint in either",
+      Schema.Union([
+        Schema.Option(Schema.Number),
+        Schema.Struct({ "~effect/Option": Schema.Struct({}), value: Schema.Number }),
+      ]),
+    ],
+    [
+      "a struct with a name that isn't a marker",
+      Schema.Union([
+        Schema.Option(Schema.BigInt),
+        Schema.Struct({ "~x": Schema.optional(Schema.String) }),
+      ]),
+    ],
+    [
+      "a struct whose field an Option's map can't be",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Struct({ value: Schema.String }), b: Schema.Number }),
+        Schema.Struct({ k: Schema.Option(Schema.Number), b: Schema.BigInt }),
+      ]),
+    ],
+    [
+      "a struct whose field an Option's map can't be, first",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Option(Schema.Number), b: Schema.BigInt }),
+        Schema.Struct({ k: Schema.Struct({ value: Schema.String }), b: Schema.Number }),
+      ]),
+    ],
+    [
+      "a struct whose field has another declaration's marker",
+      Schema.Union([
+        Schema.Struct({
+          k: Schema.Struct({ "~effect/Result": Schema.Struct({}) }),
+          b: Schema.Number,
+        }),
+        Schema.Struct({ k: Schema.Option(Schema.String), b: Schema.BigInt }),
+      ]),
+    ],
     ["null", Schema.NullOr(Schema.BigInt)],
     ["undefined", Schema.UndefinedOr(Schema.BigInt)],
     ["both", Schema.NullishOr(Schema.BigInt)],
@@ -401,8 +595,172 @@ describe("[EDD-9125] a union a stream can't read a bigint from", () => {
       Schema.Union([WithB(Schema.BigInt), Schema.Struct({ c: Schema.Number })]),
     ],
     [
-      "a required field it hasn't",
-      Schema.Union([WithB(Schema.BigInt), Schema.Struct({ b: Schema.Number, c: Schema.String })]),
+      "an earlier member that requires a field it hasn't",
+      Schema.Union([Schema.Struct({ b: Schema.Number, c: Schema.String }), WithB(Schema.BigInt)]),
+    ],
+    [
+      "a later member without a field it requires",
+      Schema.Union([Schema.Struct({ b: Schema.BigInt, c: Schema.String }), WithB(Schema.Number)]),
+    ],
+    [
+      "a record of numbers it holds a string in",
+      Schema.Union([
+        Schema.Struct({ b: Schema.BigInt, c: Schema.String }),
+        Schema.Record(Schema.String, Schema.Number),
+      ]),
+    ],
+    [
+      "that, the other way",
+      Schema.Union([
+        Schema.Record(Schema.String, Schema.Number),
+        Schema.Struct({ b: Schema.BigInt, c: Schema.String }),
+      ]),
+    ],
+    [
+      "a record of numbers an Option's map has strings in",
+      Schema.Union([Schema.Option(Schema.BigInt), Schema.Record(Schema.String, Schema.Number)]),
+    ],
+    [
+      "a record over keys that don't take this field, whose values it doesn't fit",
+      Schema.Union([
+        Schema.Struct({ c: Schema.String }),
+        Schema.Record(Schema.TemplateLiteral(["x-", Schema.String]), Schema.BigInt),
+      ]),
+    ],
+    [
+      "a date, with its bigint in a struct",
+      Schema.Union([WithB(Schema.BigInt), Schema.DateTimeUtc]),
+    ],
+    ["that, the other way", Schema.Union([Schema.DateTimeUtc, WithB(Schema.BigInt)])],
+    ["a Duration", Schema.Union([WithB(Schema.BigInt), Schema.Duration])],
+    ["a BigDecimal", Schema.Union([WithB(Schema.BigInt), Schema.BigDecimal])],
+    ["a time zone", Schema.Union([WithB(Schema.BigInt), Schema.TimeZone])],
+    ["bytes", Schema.Union([WithB(Schema.BigInt), Schema.Uint8Array])],
+    ["a set of numbers", Schema.Union([WithB(Schema.BigInt), Schema.ReadonlySet(Schema.Number)])],
+    [
+      "an Option of a string, in a struct",
+      Schema.Union([WithB(Schema.BigInt), Schema.Option(Schema.String)]),
+    ],
+    [
+      "an Option of a number, in a struct",
+      Schema.Union([WithB(Schema.BigInt), Schema.Option(Schema.Number)]),
+    ],
+    [
+      "a record's Option",
+      Schema.Union([Schema.Record(Schema.String, Schema.BigInt), Schema.Option(Schema.Number)]),
+    ],
+    ["a list's Option", Schema.Union([Schema.Array(Schema.BigInt), Schema.Option(Schema.Number)])],
+    [
+      "an Option of a number, before a struct under its value",
+      Schema.Union([Schema.Option(Schema.Number), Schema.Struct({ value: Schema.BigInt })]),
+    ],
+    [
+      "a struct holding a string, with an Option's bigint",
+      Schema.Union([Schema.Option(Schema.BigInt), Schema.Struct({ a: Schema.String })]),
+    ],
+    [
+      "that, the other way",
+      Schema.Union([Schema.Struct({ a: Schema.String }), Schema.Option(Schema.BigInt)]),
+    ],
+    [
+      "a struct holding a number elsewhere, after an Option",
+      Schema.Union([Schema.Option(Schema.BigInt), Schema.Struct({ a: Schema.Number })]),
+    ],
+    [
+      "that, before it: an Option's map has no such field",
+      Schema.Union([Schema.Struct({ a: Schema.Number }), Schema.Option(Schema.BigInt)]),
+    ],
+    [
+      "a struct under an Option's value, after it",
+      Schema.Union([Schema.Option(Schema.BigInt), Schema.Struct({ value: Schema.Number })]),
+    ],
+    [
+      "that, with a tag an Option's value hasn't, before it",
+      Schema.Union([
+        Schema.Struct({ value: Schema.Number, _tag: Schema.Literal("None") }),
+        Schema.Option(Schema.BigInt),
+      ]),
+    ],
+    [
+      "a string under an Option's value, before it",
+      Schema.Union([Schema.Struct({ value: Schema.String }), Schema.Option(Schema.BigInt)]),
+    ],
+    [
+      "another bigint under an Option's value, before it",
+      Schema.Union([Schema.Struct({ value: Schema.BigInt }), Schema.Option(Schema.BigInt)]),
+    ],
+    [
+      "a field that may be left out, before an Option",
+      Schema.Union([
+        Schema.Struct({ x: Schema.optional(Schema.Number) }),
+        Schema.Option(Schema.BigInt),
+      ]),
+    ],
+    [
+      "a Result's other side",
+      Schema.Union([
+        Schema.Struct({ failure: Schema.Number }),
+        Schema.Result(Schema.BigInt, Schema.String),
+      ]),
+    ],
+    [
+      "a Result's value, after it",
+      Schema.Union([
+        Schema.Result(Schema.BigInt, Schema.String),
+        Schema.Struct({ success: Schema.Number }),
+      ]),
+    ],
+    [
+      "a set, before a struct",
+      Schema.Union([Schema.ReadonlySet(Schema.BigInt), Schema.Struct({ a: Schema.Number })]),
+    ],
+    [
+      "a set, after a struct: nothing in it is a field",
+      Schema.Union([Schema.Struct({ a: Schema.Number }), Schema.ReadonlySet(Schema.BigInt)]),
+    ],
+    [
+      "Schema.Unknown after an Option",
+      Schema.Union([Schema.Option(Schema.BigInt), Schema.Unknown]),
+    ],
+    ["Schema.Json after an Option", Schema.Union([Schema.Option(Schema.BigInt), Schema.Json])],
+    [
+      "a date telling it from a number",
+      Schema.Union([
+        Schema.Struct({ k: Schema.DateTimeUtc, b: Schema.BigInt }),
+        Schema.Struct({ k: Schema.Number, b: Schema.Number }),
+      ]),
+    ],
+    [
+      "that, the other way",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Number, b: Schema.BigInt }),
+        Schema.Struct({ k: Schema.DateTimeUtc, b: Schema.Number }),
+      ]),
+    ],
+    [
+      "an Option telling it from a string",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Option(Schema.String), b: Schema.BigInt }),
+        Schema.Struct({ k: Schema.String, b: Schema.Number }),
+      ]),
+    ],
+    [
+      "an Option telling it from a struct of other fields",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Option(Schema.String), b: Schema.BigInt }),
+        Schema.Struct({ k: Schema.Struct({ x: Schema.String }), b: Schema.Number }),
+      ]),
+    ],
+    [
+      "a list telling it from a date",
+      Schema.Union([
+        Schema.Struct({ k: Schema.Array(Schema.String), b: Schema.BigInt }),
+        Schema.Struct({ k: Schema.DateTimeUtc, b: Schema.Number }),
+      ]),
+    ],
+    [
+      "a transformation over a bigint, beside a string",
+      Schema.Union([Schema.DurationFromNanos, Schema.String]),
     ],
     ["a string under the same name", Schema.Union([WithB(Schema.BigInt), WithB(Schema.String)])],
     ["no field at all", Schema.Union([WithB(Schema.BigInt), Schema.Struct({})])],
@@ -470,6 +828,72 @@ describe("[EDD-9125] a union a stream can't read a bigint from", () => {
   for (const [name, schema] of TAKEN) {
     it(`takes a bigint beside ${name}`, () => {
       expect(refusal(schema)).toBe("nothing refused")
+    })
+  }
+
+  const READS: ReadonlyArray<
+    readonly [string, Schema.Top, ReadonlyArray<readonly [unknown, unknown]>]
+  > = [
+    [
+      "a struct of other fields",
+      Schema.Union([WithB(Schema.BigInt), Schema.Struct({ c: Schema.String })]),
+      [
+        [{ b: 5 }, { b: 5n }],
+        [{ c: "x" }, { c: "x" }],
+      ],
+    ],
+    [
+      "the member first that requires what a bigint's hasn't",
+      Schema.Union([Schema.Struct({ b: Schema.Number, c: Schema.String }), WithB(Schema.BigInt)]),
+      [
+        [{ b: 5 }, { b: 5n }],
+        [
+          { b: 5, c: "x" },
+          { b: 5, c: "x" },
+        ],
+      ],
+    ],
+    [
+      "the bigint first that requires what a number's hasn't",
+      Schema.Union([Schema.Struct({ b: Schema.BigInt, c: Schema.String }), WithB(Schema.Number)]),
+      [
+        [
+          { b: 5, c: "x" },
+          { b: 5n, c: "x" },
+        ],
+        [{ b: 5 }, { b: 5 }],
+      ],
+    ],
+    [
+      "an Option before a struct under its value",
+      Schema.Union([Schema.Option(Schema.BigInt), Schema.Struct({ value: Schema.Number })]),
+      [
+        [{ _op: "Some", _tag: "Some", "~effect/Option": {}, value: 5 }, Option.some(5n)],
+        [{ value: 5 }, { value: 5 }],
+      ],
+    ],
+    [
+      "a number's Option before a struct under its value",
+      Schema.Union([Schema.Option(Schema.Number), Schema.Struct({ value: Schema.BigInt })]),
+      [
+        [{ _op: "Some", _tag: "Some", "~effect/Option": {}, value: 5 }, Option.some(5)],
+        [{ value: 5 }, { value: 5n }],
+      ],
+    ],
+    [
+      "a struct beside an Option of a number, without its value",
+      Schema.Union([WithB(Schema.BigInt), Schema.Option(Schema.Number)]),
+      [
+        [{ b: 5 }, { b: 5n }],
+        [{ _op: "Some", _tag: "Some", "~effect/Option": {}, value: 5 }, Option.some(5)],
+      ],
+    ],
+  ]
+
+  for (const [name, schema, rows] of READS) {
+    it(`what it takes reads as what was written: ${name}`, () => {
+      expect(refusal(schema)).toBe("nothing refused")
+      for (const [stored, read] of rows) expect(reader(schema)(stored)).toEqual(read)
     })
   }
 
@@ -542,11 +966,40 @@ describe("[EDD-9125] a union a stream can't read a bigint from", () => {
     ).toContain(BESIDE)
   })
 
-  it("an entity and an aggregate aren't judged by it: a member's try tells them apart", () => {
+  it("an entity and an aggregate aren't judged by it where a member's try tells them apart", () => {
     for (const by of ["entity", "aggregate"] as const) {
-      expect(() =>
-        refuseUnreadable("Owner", by, Schema.Union([Schema.Number, Schema.BigInt])),
-      ).not.toThrow()
+      for (const schema of [
+        Schema.Union([Schema.Number, Schema.BigInt]),
+        Schema.Union([Schema.Option(Schema.BigInt), Schema.Option(Schema.Number)]),
+        Schema.Union([Schema.DurationFromNanos, Schema.Number]),
+        Schema.Union([Schema.suspend(() => Schema.BigInt), Schema.Number]),
+        Schema.Union([Schema.Number, Schema.BigInt]).pipe(
+          Schema.withDecodingDefault(Effect.succeed(0)),
+        ),
+      ]) {
+        expect(() => refuseUnreadable("Owner", by, schema)).not.toThrow()
+      }
+    }
+  })
+
+  it("they are where the lift sits on the bigint: under a declaration, a suspend or a transformation", () => {
+    const beside = Schema.Union([Schema.Number, Schema.BigInt])
+    for (const by of ["entity", "aggregate"] as const) {
+      for (const schema of [
+        Schema.Option(beside),
+        Schema.suspend(() => beside),
+        beside.pipe(Schema.decodeTo(Schema.String, SchemaTransformation.passthrough() as never)),
+        Schema.Option(Schema.Array(beside)),
+        Schema.Struct({ o: Schema.Option(beside) }),
+      ]) {
+        expect(() => refuseUnreadable("Owner", by, schema)).toThrow(BESIDE)
+      }
+      for (const schema of [
+        Schema.Option(Schema.Union([Schema.String, Schema.BigInt])),
+        Schema.suspend(() => Schema.NullOr(Schema.BigInt)),
+      ]) {
+        expect(() => refuseUnreadable("Owner", by, schema)).not.toThrow()
+      }
     }
   })
 })

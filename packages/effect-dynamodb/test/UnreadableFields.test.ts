@@ -93,13 +93,27 @@ describe("[EDD-9125] the operational makes", () => {
       }
     })
 
-    it(`${name} refuses a bigint under a declaration or a suspend, which it doesn't reach`, () => {
+    it(`${name} takes a bigint under a declaration, a suspend or a transformation`, () => {
       for (const field of [
         Schema.Option(Schema.BigInt),
         Schema.NullOr(Schema.Option(Schema.BigInt)),
         Schema.suspend(() => Schema.BigInt),
+        Schema.DurationFromNanos,
+        Schema.ByteSizeFromBigInt,
+        Schema.OptionFromNullOr(Schema.BigInt),
       ]) {
-        expect(refusal(() => build(modelOf(field)))).toContain('field "f" is a Schema.BigInt')
+        expect(refusal(() => build(modelOf(field)))).toBe("nothing refused")
+      }
+    })
+
+    it(`${name} refuses a bigint beside a number where the lift sits on the bigint`, () => {
+      for (const field of [
+        Schema.Option(Schema.Union([Schema.Number, Schema.BigInt])),
+        Schema.suspend(() => Schema.Union([Schema.BigInt, Schema.Number])),
+      ]) {
+        expect(refusal(() => build(modelOf(field)))).toContain(
+          'field "f" is a union of Schema.BigInt and something else stored as a number',
+        )
       }
     })
 
@@ -169,12 +183,6 @@ describe("[EDD-9125] EventStore.makeStream", () => {
       "Schema.DateTimeUtcFromString",
       Schema.DateTimeUtcFromString,
     ],
-    [
-      "a transformation over Schema.BigInt",
-      Schema.DurationFromNanos,
-      "Schema.DurationFromMillis",
-      Schema.DurationFromMillis,
-    ],
     ["a Schema.URL", Schema.URL, "Schema.URLFromString", Schema.URLFromString],
     ["a Schema.Chunk", Schema.Chunk(Schema.String), "Schema.Array", Schema.Array(Schema.String)],
   ]
@@ -240,6 +248,9 @@ describe("[EDD-9125] EventStore.makeStream", () => {
       ["in a list", Schema.Array(Schema.BigInt)],
       ["in an Option", Schema.Option(Schema.BigInt)],
       ["suspended", Schema.suspend(() => Schema.BigInt)],
+      ["under Schema.DurationFromNanos", Schema.DurationFromNanos],
+      ["under Schema.ByteSizeFromBigInt", Schema.ByteSizeFromBigInt],
+      ["under Schema.OptionFromNullOr", Schema.OptionFromNullOr(Schema.BigInt)],
     ] as const) {
       it(`takes one ${name}, in an event, metadata and a snapshot`, () => {
         expect(refused({ events: [eventOver(field)] })).toBe("nothing refused")

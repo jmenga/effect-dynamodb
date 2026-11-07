@@ -2298,6 +2298,20 @@ which is why a number inside another member doesn't compete with a bigint in thi
 one (`Union([Number, Struct({ b: BigInt })])`), and a member that takes only some
 numbers takes only those (`Union([Literal(5), BigInt])`, `6n` stays `6n`).
 
+**A `Schema.BigInt` the walk can't reach.** Under another declaration
+(`Schema.Option`, `Schema.Result`, `Schema.ReadonlySet`), a `Schema.suspend` or a
+transformation (`Schema.DurationFromNanos`, `Schema.ByteSizeFromBigInt`,
+`Schema.OptionFromNullOr(Schema.BigInt)`, a custom one), `substituteSchemaDeep`
+stops. A read schema hands what it stops at to `liftingBigIntsWithin`, the pass a
+stream reads with: a number becomes a `bigint` just before the node, through the
+encoded side and what's suspended. Write schemas never get it, so what's stored
+can't move. `holdsUnwalkedBigInt` looks at the encoded side, so a transformation
+with no bigint stored is returned as it came, and `needsDeepSubstitution` uses it to
+reach a field like this one in a struct. A union reached by the walk still gives
+every member its try as declared first. A union beyond it has the lift on the node,
+so a member taking a number can lose to an earlier one, which is what
+`hasBigintBesideANumber` refuses there, as on a stream.
+
 **Beneath a decoding default.** A field with `withDecodingDefault` or
 `withDecodingDefaultKey` carries no runtime accessors below the step, so a
 substitution working from the node (`decodingDefaultField`'s `inner`) can't walk
@@ -3780,9 +3794,19 @@ its own try, so a union in which something else is stored as a number can't be
 told apart: `5n` and `5` are the same row. `hasBigintBesideANumber` refuses those at
 load (`EDD-9125`, `BIGINT_BESIDE_A_NUMBER`), for every ordered pair of members and
 for a stream's events as one union, looking through the encoded side and forcing
-what's suspended. It's cautious where it can't see in: a struct holding a bigint
-beside one of Effect's other declarations, or `Schema.Option(Schema.BigInt)` beside a
-struct, is refused too. Packed storage doesn't change: `stringifyStrict` refuses a
+what's suspended. A pair is judged in the order a read tries it (`confusesItsBigint`,
+`first`): the earlier member takes what the later one stored if it has every field
+the earlier one requires (`hasFieldsOf`), so
+`Union([Struct({ a: BigInt }), Struct({ a: Number, c: String })])` is refused and the
+reverse order isn't. A `oneOf` is judged both ways, as two members taking one value
+fail it. Beside an object, Effect's `Schema.Option` and `Schema.Result` are judged as
+the maps they store (`STORED_MAPS`), so `Union([Option(BigInt), Struct({ x:
+optional(String) })])` is taken: a value lost to an earlier member with no place for
+it is what any union does, and has nothing to do with a bigint. A declaration that
+doesn't say what it takes (a custom one, `Schema.IpAddress`, which has no
+representation id) is treated as taking anything, and other declarations are treated
+as maps of unknown fields, so a bigint beside them stays refused even when the values
+would have read back. Packed storage doesn't change: `stringifyStrict` refuses a
 `bigint`, so a packed stream's append fails with nothing written, as it did, and a
 number already packed reads lifted.
 
@@ -5619,7 +5643,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
 | `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
-| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal, a transformation over `Schema.BigInt`. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container: `Schema.Date`, `Schema.Redacted`. `Schema.BigInt` on an entity or an aggregate under those, and on a stream, a snapshot and an outbox a union in which something else is stored as a number (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field, or another event), since `5n` and `5` are stored the same. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
+| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container: `Schema.Date`, `Schema.Redacted`. A union a read can't tell a bigint from something else stored as a number in (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field that a read would try first, or another event), since `5n` and `5` are stored the same: on a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 
 Next free code: **`EDD-9127`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
