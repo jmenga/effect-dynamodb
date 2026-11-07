@@ -6,7 +6,12 @@
 
 import { Effect, Option, Schema, type SchemaAST } from "effect"
 import { describe, expect, it } from "vitest"
-import { optionalField, substituteSchemaDeep } from "../src/internal/EntitySchemas.js"
+import {
+  optionalField,
+  readingAbsentValues,
+  substituteSchemaDeep,
+  writingTuplePositions,
+} from "../src/internal/EntitySchemas.js"
 
 const big = 2n ** 60n
 
@@ -528,6 +533,53 @@ describe("a Schema.BigInt under a union, read back", () => {
   })
 })
 
+describe("Schema.optionalKey over a union, its later members looked through", () => {
+  const K = (...members: ReadonlyArray<Schema.Top>) =>
+    Schema.optionalKey(Schema.Union(members as never) as never) as unknown as Schema.Top
+
+  for (const [name, options] of READERS) {
+    it(`a later bigint keeps a number for a member declared to take it, on ${name}`, () => {
+      const field = Schema.Union([
+        Schema.Struct({ a: K(Schema.String, Schema.BigInt) as never }),
+        Schema.Struct({ a: K(Schema.String, Schema.Number) as never }),
+      ])
+      expect(reads(options, field, { a: 5 })).toEqual({ a: 5 })
+    })
+
+    it(`a later absent read doesn't claim a row of a later union member, on ${name}`, () => {
+      const field = Schema.Union([
+        Schema.Struct({
+          a: K(Schema.String, Schema.Struct({ b: Schema.UndefinedOr(Schema.String) })) as never,
+        }),
+        Schema.Struct({ a: Schema.Struct({ c: Schema.String }) }),
+      ])
+      expect(reads(options, field, { a: { c: "x" } })).toEqual({ a: { c: "x" } })
+    })
+  }
+
+  it("a stream reads an absent attribute under a later member", () => {
+    const schema = Schema.Struct({
+      f: K(Schema.String, Schema.Struct({ b: Schema.UndefinedOr(Schema.String) })) as never,
+    })
+    const read = readingAbsentValues(schema) as Schema.Codec<any>
+    expect(Schema.decodeUnknownSync(read)({ f: {} })).toEqual({ f: { b: undefined } })
+    expect(Schema.decodeUnknownSync(read)({ f: "x" })).toEqual({ f: "x" })
+  })
+
+  it("a stream refuses an undefined position under a later member", () => {
+    const schema = Schema.Struct({
+      f: K(
+        Schema.String,
+        Schema.Tuple([Schema.UndefinedOr(Schema.String), Schema.String]),
+      ) as never,
+    })
+    const write = writingTuplePositions(schema) as Schema.Codec<any>
+    expect(Option.isNone(Schema.encodeUnknownOption(write)({ f: [undefined, "a"] }))).toBe(true)
+    expect(Schema.encodeUnknownSync(write)({ f: ["b", "a"] })).toEqual({ f: ["b", "a"] })
+    expect(Schema.encodeUnknownSync(write)({ f: "x" })).toEqual({ f: "x" })
+  })
+})
+
 describe("optionalField", () => {
   const inner = (field: Schema.Top) => optionalField(field)?.inner
 
@@ -536,13 +588,39 @@ describe("optionalField", () => {
     expect(inner(Schema.optional(nullable))).toBe(nullable)
   })
 
-  it("Schema.optionalKey(X) is X, whichever X", () => {
+  it("Schema.optionalKey(X) is X", () => {
     expect(inner(Schema.optionalKey(Schema.String))).toBe(Schema.String)
-    expect(inner(Schema.optionalKey(nullable))).toBe(nullable)
+    expect(optionalField(Schema.optionalKey(Schema.String))?.union).toBeUndefined()
+  })
+
+  it("Schema.optionalKey over several members is the first, with the whole union alongside", () => {
     const three = Schema.Union([Schema.String, Schema.Number, Schema.Undefined])
-    expect(inner(Schema.optionalKey(three))).toBe(three)
-    const one = Schema.Union([Schema.String])
-    expect(inner(Schema.optionalKey(one))).toBe(one)
+    for (const [union, first] of [
+      [nullable, Schema.BigInt],
+      [three, Schema.String],
+    ] as const) {
+      const opt = optionalField(Schema.optionalKey(union))
+      expect(opt?.inner).toBe(first)
+      expect(opt?.union).toBe(union)
+    }
+  })
+
+  it("Schema.optionalKey over one member is that member, with no union", () => {
+    const opt = optionalField(Schema.optionalKey(Schema.Union([Schema.String])))
+    expect(opt?.inner).toBe(Schema.String)
+    expect(opt?.union).toBeUndefined()
+    const beside = optionalField(
+      Schema.optionalKey(Schema.Union([Schema.Undefined, Schema.String])),
+    )
+    expect(beside?.inner).toBe(Schema.String)
+    expect(beside?.union).toBeUndefined()
+  })
+
+  it("a union under Schema.optional is one member, however many it has", () => {
+    const union = Schema.Union([Schema.String, Schema.Number])
+    const opt = optionalField(Schema.optional(union))
+    expect(opt?.inner).toBe(union)
+    expect(opt?.union).toBeUndefined()
   })
 
   it("an optional key's union keeps every member through the substitution", () => {

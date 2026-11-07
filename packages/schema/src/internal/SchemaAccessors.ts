@@ -589,15 +589,25 @@ const firstUnreadable = (
       seen.add(ast)
       return firstUnreadable(ast.thunk(), path, seen, { ...walk, unreached: true })
     }
-    case "Union":
-      return firstIn(ast.types, path, {
+    case "Union": {
+      const members: UnreadableWalk = {
         ...walk,
         // The union `Schema.optional(X)` makes under a default on X, which is X to the substitution.
         ...(isOptionalOfOne(ast) && walk.declared?._tag !== "Union"
           ? {}
           : unreachedBy(walk, false)),
         inUnion: walk.inUnion || ast.context?.isOptional !== true,
-      })
+      }
+      if (ast.context?.isOptional !== true) return firstIn(ast.types, path, members)
+      // `Schema.optionalKey` over several members: the first is written in its stored form, and the
+      // rest as they're declared, unless an aggregate's date encoder finds them in its own attribute.
+      const defined = ast.types.filter((member) => !SchemaAST.isUndefined(member))
+      const encoded = walk.by === "aggregate" && !/[.[]/.test(path) && isNullablePlainDate(ast)
+      return (
+        firstIn(defined.slice(0, 1), path, members) ??
+        firstIn(defined.slice(1), path, encoded ? members : { ...members, writtenAsIs: true })
+      )
+    }
     case "Arrays":
       return firstIn(
         [...ast.elements, ...ast.rest],

@@ -15,6 +15,7 @@ import {
   UpdateItemCommand,
 } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   BigDecimal,
@@ -1101,77 +1102,308 @@ describeConnected("a date beneath a decoding default, on real rows", () => {
   })
 })
 
-describeConnected("Schema.optionalKey over a union keeps every member", () => {
-  it.effect("a date or a string: each comes back, whichever is declared first", () =>
-    Effect.gen(function* () {
-      for (const field of [
-        Schema.optionalKey(Schema.Union([Schema.String, Schema.DateTimeUtc])),
-        Schema.optionalKey(Schema.Union([Schema.DateTimeUtc, Schema.String])),
-      ]) {
-        yield* onEntity(field, (rows, tableName) =>
-          Effect.gen(function* () {
-            yield* rows.put({ id: "a", f: instant }).asEffect()
-            expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: "2025-01-01T00:00:00.000Z" })
-            expect(Equal.equals((yield* rows.get({ id: "a" })).f, instant)).toBe(true)
-            yield* rows.put({ id: "a", f: "text" }).asEffect()
-            expect((yield* rows.get({ id: "a" })).f).toBe("text")
-          }),
-        )
-      }
-    }),
-  )
+describeConnected(
+  "Schema.optionalKey over a union: its first member's stored form, the rest as declared",
+  () => {
+    const INTERNAL = {
+      M: {
+        epochMilliseconds: { N: String(at.getTime()) },
+        "~effect/DateTime": { S: "~effect/DateTime" },
+        _tag: { S: "Utc" },
+      },
+    }
+    const K = (...members: ReadonlyArray<Schema.Top>) =>
+      Schema.optionalKey(Schema.Union(members as never) as never) as unknown as Schema.Top
+    const expectValue = (read: unknown, value: unknown) => {
+      if (DateTime.isDateTime(value)) expect(Equal.equals(read, value)).toBe(true)
+      else expect(read).toEqual(value)
+    }
+    const ISO = "2025-01-01T00:00:00.000Z"
 
-  it.effect("a row 1.38 stored as a map for a string-first union still reads", () =>
-    onEntity(
-      Schema.optionalKey(Schema.Union([Schema.String, Schema.DateTimeUtc])),
-      (rows, tableName) =>
+    const STORED: ReadonlyArray<
+      readonly [name: string, field: Schema.Top, value: unknown, stored: unknown]
+    > = [
+      ["a date after a string", K(Schema.String, Schema.DateTimeUtc), instant, INTERNAL],
+      ["a date before a string", K(Schema.DateTimeUtc, Schema.String), instant, { S: ISO }],
+      ["a string before a date", K(Schema.String, Schema.DateTimeUtc), "x", { S: "x" }],
+      ["a string after a date", K(Schema.DateTimeUtc, Schema.String), "x", { S: "x" }],
+      ["a date before null", K(Schema.DateTimeUtc, Schema.Null), instant, { S: ISO }],
+      ["null after a date", K(Schema.DateTimeUtc, Schema.Null), null, { NULL: true }],
+      [
+        "null after a date from a string",
+        K(Schema.DateFromString, Schema.Null),
+        null,
+        { NULL: true },
+      ],
+      ["a date from a string before null", K(Schema.DateFromString, Schema.Null), at, { S: ISO }],
+      ["a number after a date", K(Schema.DateTimeUtc, Schema.Number), 5, { N: "5" }],
+      ["a Date before a string", K(Schema.Date, Schema.String), at, { S: ISO }],
+      [
+        "a nested union, the date later",
+        Schema.Struct({ a: K(Schema.String, Schema.DateTimeUtc) }),
+        { a: instant },
+        { M: { a: INTERNAL } },
+      ],
+      [
+        "a nested union, the date first",
+        Schema.Struct({ a: K(Schema.DateTimeUtc, Schema.String) }),
+        { a: instant },
+        { M: { a: { S: ISO } } },
+      ],
+      [
+        "a list of dates, later",
+        K(Schema.String, Schema.Array(Schema.DateTimeUtc)),
+        [instant],
+        { L: [INTERNAL] },
+      ],
+      [
+        "a list of dates, first",
+        K(Schema.Array(Schema.DateTimeUtc), Schema.String),
+        [instant],
+        { L: [{ S: ISO }] },
+      ],
+    ]
+
+    for (const [name, field, value, stored] of STORED) {
+      it.effect(`${name}: stored, read back and updated on an entity`, () =>
+        onEntity(field, (rows, tableName) =>
+          Effect.gen(function* () {
+            yield* rows.put({ id: "a", f: value }).asEffect()
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual(stored)
+            expectValue((yield* rows.get({ id: "a" })).f, value)
+            yield* rows.update({ id: "a" }).set({ n: 1 }).asEffect()
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual(stored)
+            expectValue((yield* rows.get({ id: "a" })).f, value)
+            if (value !== null) {
+              yield* rows.put({ id: "b", f: value }).asEffect()
+              yield* rows.update({ id: "b" }).set({ f: value }).asEffect()
+              const row = (yield* rowsOf(tableName)).find((r) => r.pk?.S?.includes("b"))
+              expect(row?.f).toEqual(stored)
+              expectValue((yield* rows.get({ id: "b" })).f, value)
+            }
+          }),
+        ),
+      )
+
+      it.effect(`${name}: stored, read back and updated on an aggregate`, () =>
+        onAggregate(rootOver(field), {}, (agg, tableName) =>
+          Effect.gen(function* () {
+            yield* agg.create({ id: "a", f: value })
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual(stored)
+            expectValue((yield* agg.get({ id: "a" })).f, value)
+            yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+            const [row] = yield* rowsOf(tableName)
+            expect(row?.f).toEqual(stored)
+            expect(row?.note).toEqual({ S: "n" })
+            expectValue((yield* agg.get({ id: "a" })).f, value)
+          }),
+        ),
+      )
+    }
+
+    const EPOCH = Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs))
+    for (const [name, field, value] of [
+      ["optionalKey(Null, DateTimeUtc storedAs)", K(Schema.Null, EPOCH), instant],
+      ["NullOr(DateTimeUtc storedAs)", Schema.NullOr(EPOCH), instant],
+      ["optionalKey(Null, DateEpochMs)", K(Schema.Null, DynamoModel.DateEpochMs), instant],
+      ["NullOr(DateFromMillis)", Schema.NullOr(Schema.DateFromMillis), at],
+    ] as const) {
+      it.effect(`an aggregate reads what its date encoder stores under ${name}`, () =>
+        onAggregate(rootOver(field), {}, (agg, tableName) =>
+          Effect.gen(function* () {
+            yield* agg.create({ id: "a", f: value })
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: ISO })
+            expectValue((yield* agg.get({ id: "a" })).f, value)
+            yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: ISO })
+            expectValue((yield* agg.get({ id: "a" })).f, value)
+          }),
+        ),
+      )
+    }
+
+    for (const [name, field, value, read] of [
+      ["a Date under a first DateTime", K(Schema.DateTimeUtc, Schema.DateFromString), at, instant],
+      [
+        "a Date under a first epoch",
+        K(DynamoModel.DateEpochMs, Schema.DateFromMillis),
+        at,
+        instant,
+      ],
+      [
+        "a DateTime under a first Date, a plain union",
+        Schema.Union([Schema.DateFromMillis, DynamoModel.DateEpochMs]),
+        instant,
+        at,
+      ],
+    ] as const) {
+      it.effect(`two kinds of date on an aggregate: ${name}`, () =>
+        onAggregate(rootOver(field), {}, (agg, tableName) =>
+          Effect.gen(function* () {
+            yield* agg.create({ id: "a", f: value })
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: ISO })
+            expectValue((yield* agg.get({ id: "a" })).f, read)
+            yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: ISO })
+          }),
+        ),
+      )
+    }
+
+    it.effect(
+      "the text of a date is that text under a first string, and a date under a first date",
+      () =>
         Effect.gen(function* () {
-          yield* rows.put({ id: "a", f: "text" }).asEffect()
+          yield* onEntity(K(Schema.String, Schema.DateTimeUtc), (rows) =>
+            Effect.gen(function* () {
+              yield* rows.put({ id: "a", f: ISO }).asEffect()
+              expect((yield* rows.get({ id: "a" })).f).toBe(ISO)
+            }),
+          )
+          yield* onEntity(K(Schema.DateTimeUtc, Schema.String), (rows) =>
+            Effect.gen(function* () {
+              yield* rows.put({ id: "a", f: ISO }).asEffect()
+              expectValue((yield* rows.get({ id: "a" })).f, instant)
+            }),
+          )
+        }),
+    )
+
+    it.effect("a value of a later member is stored and comes back as it is, not as a date", () =>
+      Effect.gen(function* () {
+        for (const [field, value, stored] of [
+          [K(Schema.DateTimeUtc, Schema.Number), 5, { N: "5" }],
+          [K(Schema.DateTimeUtc, Schema.String), "5", { S: "5" }],
+          [K(Schema.DateTimeUtc, Schema.String), "2025-01-01", { S: "2025-01-01" }],
+        ] as const) {
+          yield* onEntity(field, (rows, tableName) =>
+            Effect.gen(function* () {
+              yield* rows.put({ id: "a", f: value }).asEffect()
+              expect((yield* rowsOf(tableName))[0]?.f).toEqual(stored)
+              expect((yield* rows.get({ id: "a" })).f).toBe(value)
+            }),
+          )
+          yield* onAggregate(rootOver(field), {}, (agg, tableName) =>
+            Effect.gen(function* () {
+              yield* agg.create({ id: "a", f: value })
+              expect((yield* rowsOf(tableName))[0]?.f).toEqual(stored)
+              expect((yield* agg.get({ id: "a" })).f).toBe(value)
+            }),
+          )
+        }
+      }),
+    )
+
+    it.effect("a row a date was converted into still reads as that date", () =>
+      onEntity(K(Schema.DateTimeUtc, Schema.Number), (rows, tableName) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a" }).asEffect()
           const [row] = yield* rowsOf(tableName)
           yield* Effect.promise(() =>
             raw.send(
               new PutItemCommand({
                 TableName: tableName,
-                Item: {
-                  ...row!,
-                  f: {
-                    M: {
-                      epochMilliseconds: { N: String(at.getTime()) },
-                      "~effect/DateTime": { S: "~effect/DateTime" },
-                      _tag: { S: "Utc" },
-                    },
-                  },
-                },
+                Item: { ...row!, f: { S: "1970-01-01T00:00:00.005Z" } },
               }),
             ),
           )
-          const read = (yield* rows.get({ id: "a" })).f
-          expect(DateTime.isDateTime(read)).toBe(true)
-          expect(DateTime.formatIso(read)).toBe("2025-01-01T00:00:00.000Z")
+          expectValue((yield* rows.get({ id: "a" })).f, DateTime.makeUnsafe(5))
         }),
-    ),
-  )
+      ),
+    )
 
-  it.effect("null comes back, for what needs substituting, on both owners", () =>
-    Effect.gen(function* () {
-      const field = Schema.optionalKey(Schema.NullOr(Schema.DateFromString))
-      yield* onEntity(field, (rows) =>
+    it.effect("an aggregate reads what it stores for a first date transform", () =>
+      Effect.gen(function* () {
+        for (const field of [
+          K(Schema.DateFromMillis, Schema.Null),
+          K(Schema.DateFromMillis, Schema.String),
+        ]) {
+          yield* onAggregate(rootOver(field), {}, (agg, tableName) =>
+            Effect.gen(function* () {
+              yield* agg.create({ id: "a", f: at })
+              expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: ISO })
+              expect((yield* agg.get({ id: "a" })).f).toEqual(at)
+              yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+              expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: ISO })
+              expect((yield* agg.get({ id: "a" })).f).toEqual(at)
+            }),
+          )
+        }
+      }),
+    )
+
+    it.effect("a path write follows the member it goes through", () =>
+      Effect.gen(function* () {
+        const next = DateTime.makeUnsafe("2026-02-02T00:00:00.000Z")
+        yield* onEntity(
+          K(Schema.String, Schema.Struct({ d: Schema.DateTimeUtc })),
+          (rows, tableName) =>
+            Effect.gen(function* () {
+              yield* rows.put({ id: "a", f: { d: instant } }).asEffect()
+              yield* rows
+                .update({ id: "a" })
+                .pathSet({ segments: ["f", "d"], value: next, isPath: false })
+                .asEffect()
+              const stored = (yield* rowsOf(tableName))[0]?.f?.M?.d
+              expect(stored?.M?.epochMilliseconds).toEqual({
+                N: String(DateTime.toEpochMillis(next)),
+              })
+              expectValue(((yield* rows.get({ id: "a" })).f as { d: unknown }).d, next)
+            }),
+        )
+        yield* onEntity(
+          K(Schema.Struct({ d: Schema.DateTimeUtc }), Schema.String),
+          (rows, tableName) =>
+            Effect.gen(function* () {
+              yield* rows.put({ id: "a", f: { d: instant } }).asEffect()
+              yield* rows
+                .update({ id: "a" })
+                .pathSet({ segments: ["f", "d"], value: next, isPath: false })
+                .asEffect()
+              expect((yield* rowsOf(tableName))[0]?.f?.M?.d).toEqual({
+                S: "2026-02-02T00:00:00.000Z",
+              })
+              expectValue(((yield* rows.get({ id: "a" })).f as { d: unknown }).d, next)
+            }),
+        )
+        yield* onEntity(K(Schema.Array(Schema.DateTimeUtc), Schema.String), (rows, tableName) =>
+          Effect.gen(function* () {
+            yield* rows.put({ id: "a", f: [instant] }).asEffect()
+            yield* rows
+              .update({ id: "a" })
+              .append({ f: [next] })
+              .asEffect()
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual({
+              L: [{ S: ISO }, { S: "2026-02-02T00:00:00.000Z" }],
+            })
+          }),
+        )
+      }),
+    )
+
+    it.effect("an aggregate's update keeps a list where a later member is one", () =>
+      onAggregate(
+        rootOver(K(Schema.ReadonlySet(Schema.String), Schema.Array(Schema.String))),
+        {},
+        (agg, tableName) =>
+          Effect.gen(function* () {
+            yield* agg.create({ id: "a", f: ["a"] })
+            yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual({ L: [{ S: "a" }] })
+          }),
+      ),
+    )
+
+    it.effect("a number under a first bigint reads as that bigint, as it always has", () =>
+      onEntity(K(Schema.BigInt, Schema.Number), (rows) =>
         Effect.gen(function* () {
-          yield* rows.put({ id: "a", f: null }).asEffect()
-          expect((yield* rows.get({ id: "a" })).f).toBeNull()
-          yield* rows.put({ id: "a", f: at }).asEffect()
-          expect((yield* rows.get({ id: "a" })).f).toEqual(at)
+          yield* rows.put({ id: "a", f: 5n }).asEffect()
+          expect((yield* rows.get({ id: "a" })).f).toBe(5n)
         }),
-      )
-      yield* onAggregate(rootOver(field), {}, (agg) =>
-        Effect.gen(function* () {
-          yield* agg.create({ id: "a", f: null })
-          expect((yield* agg.get({ id: "a" })).f).toBeNull()
-        }),
-      )
-    }),
-  )
-})
+      ),
+    )
+  },
+)
 
 describeConnected("what can't be judged at load", () => {
   class Point {

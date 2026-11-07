@@ -1102,6 +1102,11 @@ export interface OptionalField {
   readonly inner: Schema.Top
   /** Re-apply the field's optionality to a substituted inner. */
   readonly rewrap: (substituted: Schema.Top) => Schema.Top
+  /**
+   * `Schema.optionalKey` over a union of several members: the whole union, with `inner` its first
+   * member. See {@link writesFirstMemberOnly}.
+   */
+  readonly union?: Schema.Top
 }
 
 /**
@@ -1128,15 +1133,15 @@ export const optionalField = (field: Schema.Top): OptionalField | undefined => {
     const defined = members?.filter(
       (m) => (m.ast as { readonly _tag?: string })._tag !== "Undefined",
     )
-    if (defined?.length === 1 && defined.length < (members?.length ?? 0)) {
-      return {
-        inner: defined[0]!,
-        rewrap: (s) => Schema.optional(s as Schema.Codec<any>) as unknown as Schema.Top,
-      }
+    const inner = defined?.[0]
+    if (inner === undefined) return undefined
+    return {
+      inner,
+      rewrap: (s) => Schema.optional(s as Schema.Codec<any>) as unknown as Schema.Top,
+      ...(defined !== undefined && defined.length > 1 ? { union: value! } : {}),
     }
   }
-  // `Schema.optionalKey(X)`: the value type is X directly (`.schema`), a union of
-  // several members included: they all stay.
+  // `Schema.optionalKey(X)`: the value type is X directly (`.schema`).
   if (value === undefined) return undefined
   return {
     inner: value,
@@ -1243,6 +1248,8 @@ export interface DeepSubstitutionOptions {
    * Propagated through the recursion.
    */
   readonly plainStateForms?: boolean | undefined
+  /** See {@link writesFirstMemberOnly}. For this union alone, so not propagated. */
+  readonly declaredOrder?: boolean | undefined
   /** See {@link writingTuplePositions}. Propagated through the recursion. */
   readonly undefinedPositionsOnly?: boolean | undefined
 }
@@ -1415,6 +1422,15 @@ const containerShape = (schema: Schema.Top): WalkedContainer | undefined => {
   return undefined
 }
 
+/** Whether a container holds nothing but dates, `Null` and `Undefined`: what an aggregate's date encoder takes. */
+const holdsOnlyDates = (container: WalkedContainer): boolean =>
+  container.children.every(
+    (member) =>
+      SchemaAST.isNull(member.ast) ||
+      SchemaAST.isUndefined(member.ast) ||
+      inferDefaultEncoding(member) !== undefined,
+  )
+
 /** Options for a tolerant container's children: a Union's members decode strictly by kind. */
 const childOptions = (
   container: WalkedContainer,
@@ -1501,6 +1517,18 @@ const decodingDefaultField = (
     },
   }
 }
+
+/**
+ * Whether this substitution is an entity's or an aggregate's write, which substitutes only the first
+ * member of a union under `Schema.optionalKey`. Later members are written as declared, so what's
+ * stored for them stays what every release has stored: a `Schema.DateTimeUtc` declared after a
+ * `Schema.String` is Effect's internal form, and one declared before it is a string. Changing that
+ * would change a stored format. A read takes each member's forms in the order they're declared
+ * (`declaredOrder`), as a later date isn't stored as the text a string before it takes, and a number
+ * under a first `Schema.BigInt` was written as that bigint.
+ */
+const writesFirstMemberOnly = (opts: DeepSubstitutionOptions | undefined): boolean =>
+  !opts?.decodeOnly && !opts?.absentReads && !opts?.undefinedPositionsOnly
 
 const throughOptional = (
   opts: DeepSubstitutionOptions | undefined,
@@ -1607,7 +1635,8 @@ const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
 
 /** Whether a plain `Schema.BigInt` is anywhere the substitution walks. */
 const holdsBigInt = (schema: Schema.Top): boolean => {
-  const inner = optionalField(schema)?.inner ?? decodingDefaultField(schema)?.declared
+  const opt = optionalField(schema)
+  const inner = opt?.union ?? opt?.inner ?? decodingDefaultField(schema)?.declared
   if (inner !== undefined) return holdsBigInt(inner)
   if (isSelfBigInt(schema)) return true
   const container = walkedContainer(schema)
@@ -1649,7 +1678,7 @@ const readingAbsent = (field: Schema.Top): Schema.Top => {
 /** Whether a struct field anywhere in the schema reads an absent attribute as a value. */
 const holdsAbsentRead = (schema: Schema.Top): boolean => {
   const opt = optionalField(schema)
-  if (opt !== undefined) return holdsAbsentRead(opt.inner)
+  if (opt !== undefined) return holdsAbsentRead(opt.union ?? opt.inner)
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) return holdsAbsentRead(defaulted.inner)
   const container = walkedContainer(schema)
@@ -1673,7 +1702,8 @@ const hasUndefinedPosition = (schema: Schema.Top): boolean =>
 
 /** Whether a tuple with a position that can hold `undefined` is anywhere in the schema. */
 const holdsUndefinedPosition = (schema: Schema.Top): boolean => {
-  const inner = optionalField(schema)?.inner ?? decodingDefaultField(schema)?.inner
+  const opt = optionalField(schema)
+  const inner = opt?.union ?? opt?.inner ?? decodingDefaultField(schema)?.inner
   if (inner !== undefined) return holdsUndefinedPosition(inner)
   if (hasUndefinedPosition(schema)) return true
   const container = walkedContainer(schema)
@@ -1760,7 +1790,10 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // required date and drop the optionality; and an `optionalKey(Array)` wrapper
   // has the `Arrays` AST but no runtime `.value`.
   const opt = optionalField(schema)
-  if (opt !== undefined) return needsDeepSubstitution(opt.inner, throughOptional(opts))
+  if (opt !== undefined) {
+    const read = writesFirstMemberOnly(opts) ? undefined : opt.union
+    return needsDeepSubstitution(read ?? opt.inner, throughOptional(opts))
+  }
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
     return needsDeepSubstitution(beneathDefault(schema, defaulted, opts), opts)
@@ -1872,7 +1905,34 @@ export const substituteSchemaDeep = (
   // the optional key), and an optional array's `.value` lives only on the inner.
   const opt = optionalField(schema)
   if (opt !== undefined) {
-    return opt.rewrap(substituteSchemaDeep(opt.inner, throughOptional(opts)))
+    const first = substituteSchemaDeep(opt.inner, throughOptional(opts))
+    if (opt.union === undefined) return opt.rewrap(first)
+    if (!writesFirstMemberOnly(opts)) {
+      const read = substituteSchemaDeep(opt.union, {
+        ...throughOptional(opts),
+        declaredOrder: true,
+      })
+      // A member of a union reads only its own forms, so it doesn't claim a later member's rows.
+      // The first was read as the whole field until now, and a row it took then still reads.
+      return opt.rewrap(
+        first === opt.inner
+          ? read
+          : (Schema.Union([
+              read as Schema.Codec<any>,
+              first as Schema.Codec<any>,
+            ]) as unknown as Schema.Top),
+      )
+    }
+    // Over the members themselves, so `optionalField` still tells them apart in what's built here.
+    return Schema.optionalKey(
+      (opt.union as unknown as Schema.Union<ReadonlyArray<Schema.Top>>).mapMembers(
+        (members) => [
+          ...members.map((member) => (member === opt.inner ? first : member)),
+          Schema.Undefined,
+        ],
+        { unsafePreserveChecks: true },
+      ) as unknown as Schema.Codec<any>,
+    ) as unknown as Schema.Top
   }
   // A decoding default (or any optional-encoded step) on top: substitute the
   // field beneath it and keep the step, so a missing key still defaults (#133).
@@ -1934,21 +1994,47 @@ export const substituteSchemaDeep = (
   if (container !== undefined) {
     const children = container.children.map((child, index) => {
       const childOpts = childOptions(container, deeper, index, opts)
+      const member = substituteSchemaDeep(child, childOpts)
+      // An aggregate stores a first date transform in its date encoding, not its own wire form, and
+      // a date in a union of nothing else but null in the form its domain infers, whatever it declares.
+      const stored = !opts?.tolerantTransforms
+        ? undefined
+        : holdsOnlyDates(container)
+          ? inferDefaultEncoding(child)
+          : index === 0 && opts.declaredOrder
+            ? (getEncoding(child) ?? inferDefaultEncoding(child))
+            : undefined
       return {
         child,
         childOpts,
-        substituted: substituteSchemaDeep(child, childOpts),
+        substituted:
+          stored === undefined
+            ? member
+            : (Schema.Union([
+                member as Schema.Codec<any>,
+                buildDateTransform(stored, {
+                  strictWireKind: true,
+                  canonicalOnly: true,
+                }) as Schema.Codec<any>,
+              ]) as unknown as Schema.Top),
         first:
           container.isUnion &&
           opts?.absentReads !== "only" &&
+          !opts?.declaredOrder &&
           isCanonicalDateMember(child, childOpts),
       }
     })
     const ordered = [...children.filter((c) => c.first), ...children.filter((c) => !c.first)]
     const lifting = (c: (typeof ordered)[number]) =>
-      container.isUnion && liftsBigInts(c.childOpts) && holdsBigInt(c.child)
+      container.isUnion &&
+      liftsBigInts(c.childOpts) &&
+      holdsBigInt(c.child) &&
+      !(opts?.declaredOrder && c === ordered[0])
     const lenient = ordered.filter(
-      (c) => (opts?.absentReads && holdsAbsentRead(c.child)) || lifting(c),
+      (c) =>
+        (opts?.absentReads && holdsAbsentRead(c.child)) ||
+        lifting(c) ||
+        (opts?.plainStateForms && holdsPlainForm(c.child.ast)),
     )
     if (!container.isUnion || lenient.length === 0) {
       const rebuilt = container.rebuild(ordered.map((c) => c.substituted))
@@ -1966,6 +2052,7 @@ export const substituteSchemaDeep = (
         : substituteSchemaDeep(c.child, {
             ...c.childOpts,
             absentReads: undefined,
+            plainStateForms: undefined,
             exactBigInts: true,
           })
     if ((schema.ast as SchemaAST.Union).options?.mode === "oneOf") {
@@ -2624,7 +2711,8 @@ export const resolveUniqueFields = (def: UniqueConstraintDef): ReadonlyArray<str
 
 /** The schema one path segment addresses inside `schema`, or `undefined`. */
 const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.Top | undefined => {
-  const inner = optionalField(schema)?.inner ?? schema
+  const opt = optionalField(schema)
+  const inner = opt?.union ?? opt?.inner ?? schema
   const s = inner as unknown as globalThis.Record<string, unknown>
   const fields = schemaFieldsOf(inner)
   if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
@@ -2671,7 +2759,17 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
 
 /** The element schema of the list a path addresses (for append / prepend). */
 const listElementOf = (schema: Schema.Top): Schema.Top | undefined => {
-  const inner = optionalField(schema)?.inner ?? schema
+  const opt = optionalField(schema)
+  if (opt?.union !== undefined) {
+    const members = (opt.union as unknown as { readonly members: ReadonlyArray<Schema.Top> })
+      .members
+    for (const member of members) {
+      const element = listElementOf(member)
+      if (element !== undefined) return element
+    }
+    return undefined
+  }
+  const inner = opt?.inner ?? schema
   if (!SchemaAST.isArrays(inner.ast)) return undefined
   const value = (inner as unknown as { readonly value?: unknown }).value
   if (isSchemaLike(value)) return value
@@ -2909,25 +3007,36 @@ export const makePathValueEncoder = (
     }
     return out
   }
-  /** The model's own schema at a path, before any substitution. */
-  const originalAt = (segments: ReadonlyArray<string | number>): Schema.Top | undefined => {
+  /**
+   * The model's own schema at a path, before any substitution, and whether the path goes through a
+   * later member of an optional union, which is written as declared ({@link writesFirstMemberOnly}).
+   */
+  const originalAt = (segments: ReadonlyArray<string | number>) => {
     const [head, ...rest] = segments
     if (typeof head !== "string") return undefined
     let current: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    let asDeclared = false
     for (const segment of rest) {
       if (current === undefined) return undefined
+      const opt = optionalField(current)
+      if (opt?.union !== undefined && childAtSegment(opt.inner, segment) === undefined) {
+        asDeclared = true
+      }
       current = childAtSegment(current, segment)
     }
-    return current
+    return current === undefined ? undefined : { schema: current, asDeclared }
   }
   const schemaAt = (segments: ReadonlyArray<string | number>) => {
-    const original = originalAt(segments)
-    if (original === undefined) return undefined
+    const at = originalAt(segments)
+    if (at === undefined) return undefined
+    const original = at.schema
     const head = segments[0] as string
     const stored =
       segments.length === 1
         ? recordFields[head]
-        : substituteSchemaDeep(original, { enforceChecks: true })
+        : at.asDeclared
+          ? original
+          : substituteSchemaDeep(original, { enforceChecks: true })
     return stored === undefined ? undefined : { original, stored }
   }
   const validators = new Map<string, ((encoded: unknown) => unknown) | null>()

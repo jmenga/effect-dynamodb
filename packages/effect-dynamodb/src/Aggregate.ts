@@ -788,42 +788,39 @@ type ASTNode = Record<string, unknown> & {
 }
 
 /**
- * Infer date encoding from a schema AST, handling Schema.optional() wrappers.
+ * The date encodings a schema AST holds, handling Schema.optional() wrappers: one, or one per date
+ * member of a union, in the order they're declared.
  * Optional fields have Union AST with [InnerType, Undefined] — unwrap to find dates.
  */
-const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined => {
+const inferDateEncodings = (ast: Schema.Top["ast"]): ReadonlyArray<DynamoEncoding> => {
   // Try SchemaAST.resolve first (works for non-optional date fields)
   const resolved = SchemaAST.resolve(ast) as ASTNode | undefined
   if (resolved) {
     const direct = matchDateRepresentation(resolved)
-    if (direct) return direct
+    if (direct) return [direct]
   }
   // Handle optional wrapper: Union with Undefined + inner type.
   // SchemaAST.resolve returns undefined for Union ASTs, so check the raw AST.
   const rawAst = ast as unknown as ASTNode
-  if (rawAst._tag === "Union" && rawAst.types) {
-    for (const member of rawAst.types) {
-      if (member._tag === "Undefined") continue
-      // Try SchemaAST.resolve on the inner member (e.g., Declaration for Schema.Date)
-      const memberResolved = SchemaAST.resolve(member as unknown as Schema.Top["ast"]) as
-        | ASTNode
-        | undefined
-      if (memberResolved) {
-        const enc = matchDateRepresentation(memberResolved)
-        if (enc) return enc
-      }
-      // Fallback: check raw member annotations (same record shape, nested under .annotations)
-      const enc = matchDateRepresentation(member.annotations)
-      if (enc) return enc
-    }
-  }
-  return undefined
+  if (rawAst._tag !== "Union" || !rawAst.types) return []
+  return rawAst.types.flatMap((member) => {
+    if (member._tag === "Undefined") return []
+    // Try SchemaAST.resolve on the inner member (e.g., Declaration for Schema.Date)
+    const memberResolved = SchemaAST.resolve(member as unknown as Schema.Top["ast"]) as
+      | ASTNode
+      | undefined
+    // Fallback: check raw member annotations (same record shape, nested under .annotations)
+    const encoding =
+      (memberResolved ? matchDateRepresentation(memberResolved) : undefined) ??
+      matchDateRepresentation(member.annotations)
+    return encoding ? [encoding] : []
+  })
 }
 
 /**
  * A union that holds a date member alongside a member that is neither a date
  * nor `Undefined` / `Null` — `Union([DateTimeUtcFromString, Number])`.
- * `inferDateEncoding` looks through unions to find the date in `optional(date)`,
+ * `inferDateEncodings` looks through unions to find the date in `optional(date)`,
  * so it reports such a field as a date, and encoding a `5` through a date
  * transform throws. Its stored form is the union's own business: it is encoded
  * member by member through the substituted union instead.
@@ -857,10 +854,24 @@ const dateAttrEncoder = (
   options?: { readonly mixedUnions?: boolean },
 ): ((value: unknown) => unknown) | undefined => {
   if (options?.mixedUnions !== true && isMixedDateUnion(fieldSchema.ast)) return undefined
-  const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
-  if (!encoding) return undefined
-  const encode = Schema.encodeUnknownSync(buildDateTransform(encoding) as Schema.Codec<any>)
-  return (value) => encode(value)
+  const explicit = DynamoModel.getEncoding(fieldSchema)
+  const encodings = explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)
+  const last = encodings.at(-1)
+  if (!last) return undefined
+  // A union of dates of different kinds: a value is stored in the form of the kind it is.
+  const earlier = encodings
+    .slice(0, -1)
+    .map((encoding) =>
+      Schema.encodeUnknownOption(buildDateTransform(encoding) as Schema.Codec<any>),
+    )
+  const encode = Schema.encodeUnknownSync(buildDateTransform(last) as Schema.Codec<any>)
+  return (value) => {
+    for (const encodeEarlier of earlier) {
+      const encoded = encodeEarlier(value)
+      if (Option.isSome(encoded)) return encoded.value
+    }
+    return encode(value)
+  }
 }
 
 /**
