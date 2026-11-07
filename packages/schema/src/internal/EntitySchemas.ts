@@ -4,7 +4,16 @@
  * Extracted from Entity.ts for decomposition. Not part of the public API.
  */
 
-import { DateTime, Effect, Redacted, Schema, SchemaAST, SchemaGetter, SchemaIssue } from "effect"
+import {
+  DateTime,
+  Effect,
+  Option,
+  Redacted,
+  Schema,
+  SchemaAST,
+  SchemaGetter,
+  SchemaIssue,
+} from "effect"
 import {
   type ConfiguredModel,
   type DynamoEncoding,
@@ -33,6 +42,7 @@ import {
   isSchemaLike,
   numericTypeWithStringEncoding,
   rowCanLack,
+  storedList,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
 import { parseZonedIso } from "./ZonedIso.js"
@@ -814,10 +824,15 @@ const isLeafEncodingTransform = (schema: Schema.Top): boolean =>
  * fields are walked, whatever it's stored as, such as `Schema.Defect()`, a `Schema.toCodecJson` over
  * a map, a map decoded from a record, `Schema.OptionFromNullOr` or a list held as JSON. A step
  * encoded as optional has been unwrapped by now (`decodingDefaultField`), and it has to keep filling
- * a missing key.
+ * a missing key. A list whose elements are substituted is walked from its type side, whatever it's
+ * stored as, as an entity's is: what that stores decides what's in rows already written.
  */
-const isTolerantLeaf = (schema: Schema.Top): boolean =>
-  schemaFieldsOf(schema) === undefined && schema.ast.encoding !== undefined
+const isTolerantLeaf = (schema: Schema.Top): boolean => {
+  if (schemaFieldsOf(schema) !== undefined || schema.ast.encoding === undefined) return false
+  if (!SchemaAST.isArrays(schema.ast) || schema.ast.elements.length > 0) return true
+  const element = arrayElementOf(schema)
+  return element === undefined || !needsDeepSubstitution(element, { tolerantTransforms: true })
+}
 
 /** What the unmarshaller can hand back. Anything else was given by the caller. */
 const STORED_PROTOTYPES: ReadonlySet<unknown> = new Set([
@@ -832,6 +847,14 @@ const isClassInstance = (value: unknown): boolean =>
   typeof value === "object" &&
   value !== null &&
   !STORED_PROTOTYPES.has(Object.getPrototypeOf(value))
+
+/**
+ * What a step encoded as optional reads an absent field as, on its way past the leaf beneath the step.
+ * It's a domain value with no stored form, so the leaf mustn't take it for what's stored.
+ */
+class AbsentReading {
+  constructor(readonly value: unknown) {}
+}
 
 /**
  * Build a TOLERANT substitute for an arbitrary leaf transform — the general
@@ -861,6 +884,7 @@ const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
   return Schema.Any.pipe(
     Schema.decodeTo(typeSide, {
       decode: SchemaGetter.transformEffect((value: unknown) => {
+        if (value instanceof AbsentReading) return Effect.succeed(value.value)
         // A class instance is asked as the domain value first: a `Map` passes a record's check as
         // a record with no keys, so a map decoded from a record would come out empty.
         if (isClassInstance(value)) {
@@ -1252,6 +1276,12 @@ export interface DeepSubstitutionOptions {
    * Propagated through the recursion.
    */
   readonly plainStateForms?: boolean | undefined
+  /**
+   * An aggregate's `create` input and mutated state: what a caller holds. A step encoded as optional
+   * that isn't a default, such as `Schema.OptionFromOptional`, turns what's stored into something else,
+   * and a caller holds that something else, so the step is gone round. Propagated through the recursion.
+   */
+  readonly domainValues?: boolean | undefined
   /** See {@link writesFirstMemberOnly}. For this union alone, so not propagated. */
   readonly declaredOrder?: boolean | undefined
   /** See {@link writingTuplePositions}. Propagated through the recursion. */
@@ -1270,6 +1300,7 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
   opts?.enforceChecks ||
   opts?.absentReads ||
   opts?.plainStateForms ||
+  opts?.domainValues ||
   opts?.undefinedPositionsOnly
     ? {
         ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
@@ -1282,6 +1313,7 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
         ...(opts?.enforceChecks ? { enforceChecks: true } : {}),
         ...(opts?.absentReads ? { absentReads: opts.absentReads } : {}),
         ...(opts?.plainStateForms ? { plainStateForms: true } : {}),
+        ...(opts?.domainValues ? { domainValues: true } : {}),
         ...(opts?.undefinedPositionsOnly ? { undefinedPositionsOnly: true } : {}),
       }
     : undefined
@@ -1479,7 +1511,9 @@ const decodingDefaultField = (
       readonly inner: Schema.Top
       /** The field beneath the step with its runtime accessors, without a check added after the step. */
       readonly declared: Schema.Top
-      readonly rewrap: (s: Schema.Top) => Schema.Top
+      readonly rewrap: (s: Schema.Top, decode?: unknown) => Schema.Top
+      /** The step is a default, with what the field stores on both sides of it. */
+      readonly defaults: boolean
       /**
        * The step is a transformation: it goes onto another type, as `Schema.OptionFromOptional` does,
        * or what it comes from has an encoding of its own, which `rewrap` wouldn't keep.
@@ -1516,13 +1550,20 @@ const decodingDefaultField = (
     inner,
     transforms: !isDecodingDefault(ast, lastTo) || lastTo.encoding !== undefined,
     declared: (field as { readonly to?: Schema.Top }).to ?? inner,
-    rewrap: (substitute) => {
+    defaults: isDecodingDefault(SchemaAST.toEncoded(innerAst), lastTo),
+    rewrap: (substitute, decode = transformation.decode) => {
       const encodedSide = Schema.toEncoded(substitute as Schema.Codec<any>)
       const optionalEncoded = withUndefined
         ? Schema.optional(encodedSide)
         : Schema.optionalKey(encodedSide)
       return optionalEncoded.pipe(
-        Schema.decodeTo(substitute as Schema.Codec<any>, transformation as any),
+        Schema.decodeTo(
+          substitute as Schema.Codec<any>,
+          {
+            decode,
+            encode: transformation.encode,
+          } as any,
+        ),
       ) as unknown as Schema.Top
     },
   }
@@ -1647,6 +1688,24 @@ const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
 const holdsUnwalkedBigInt = (schema: Schema.Top): boolean =>
   holdsPlainBigint(SchemaAST.toEncoded(schema.ast))
 
+/**
+ * A list with a step on it that an entity writes through as declared, which is one with no date or
+ * redacted value on its type side. A read walking that type side would skip the step, so it finds what
+ * the step makes where the stored form is. This reads it as declared, with its bigints lifted, unless
+ * nothing's in the way of the walk: a list stored as one, with no plain bigint on either side.
+ */
+const readsListAsDeclared = (schema: Schema.Top, opts: DeepSubstitutionOptions | undefined) => {
+  if (opts?.legacyReads !== true) return false
+  const { ast } = schema
+  if (!SchemaAST.isArrays(ast) || ast.encoding === undefined) return false
+  if (needsDeepSubstitution(schema, undefined)) return false
+  return (
+    storedList(ast.encoding[ast.encoding.length - 1]!.to) === undefined ||
+    holdsUnwalkedBigInt(schema) ||
+    [...ast.elements, ...ast.rest].some((element) => holdsPlainBigint(SchemaAST.toEncoded(element)))
+  )
+}
+
 /** Whether what's stored for a schema the substitution can't walk can leave a value out. */
 const holdsUnwalkedAbsent = (schema: Schema.Top): boolean =>
   holdsAbsentValue(SchemaAST.toEncoded(schema.ast))
@@ -1654,7 +1713,10 @@ const holdsUnwalkedAbsent = (schema: Schema.Top): boolean =>
 /** Whether a plain `Schema.BigInt` is anywhere the substitution walks. */
 const holdsBigInt = (schema: Schema.Top): boolean => {
   const opt = optionalField(schema)
-  const inner = opt?.union ?? opt?.inner ?? decodingDefaultField(schema)?.declared
+  const defaulted = decodingDefaultField(schema)
+  // What's beneath a step that isn't a default isn't what's stored, and it isn't walked.
+  if (defaulted !== undefined && !defaulted.defaults) return holdsUnwalkedBigInt(schema)
+  const inner = opt?.union ?? opt?.inner ?? defaulted?.declared
   if (inner !== undefined) return holdsBigInt(inner)
   if (isSelfBigInt(schema)) return true
   const container = walkedContainer(schema)
@@ -1683,6 +1745,24 @@ const beneathDefault = (
   !(opts.enforceChecks && defaulted.declared.ast.checks !== schema.ast.checks)
     ? defaulted.declared
     : defaulted.inner
+
+/**
+ * What's absent where a step encoded as optional isn't a default, as the field reads it, and anything
+ * else as it was given. See `domainValues`.
+ */
+const absentThroughStep = (schema: Schema.Top) => {
+  const read = Schema.decodeUnknownEffect(
+    Schema.Struct({ field: schema }) as unknown as Schema.Codec<{ readonly field: unknown }>,
+  )
+  return SchemaGetter.transformOptionalEffect((input: Option.Option<unknown>) =>
+    Option.isSome(input)
+      ? Effect.succeed(input)
+      : read({}).pipe(
+          Effect.map(({ field }) => Option.some(new AbsentReading(field))),
+          Effect.mapError((error) => error.issue),
+        ),
+  )
+}
 
 /**
  * The field, reading an absent attribute as the value it stands for (`absentReading`), which is what
@@ -1819,11 +1899,12 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   }
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
-    return (
-      (defaulted.transforms && liftsBigInts(opts) && holdsUnwalkedBigInt(schema)) ||
-      needsDeepSubstitution(beneathDefault(schema, defaulted, opts), opts)
-    )
+    return defaulted.defaults
+      ? (defaulted.transforms && liftsBigInts(opts) && holdsUnwalkedBigInt(schema)) ||
+          needsDeepSubstitution(beneathDefault(schema, defaulted, opts), opts)
+      : opts?.domainValues === true || (liftsBigInts(opts) && holdsUnwalkedBigInt(schema))
   }
+  if (readsListAsDeclared(schema, opts)) return readingUnwalked(schema, opts) !== schema
   if (isSelfDateSchema(schema)) return true
   if (opts?.tolerantTransforms && isDateTransform(schema)) return true
   if (tryGetRedactedInner(schema) !== undefined) return true
@@ -1891,6 +1972,22 @@ const acceptingPlainForm = (declaration: Schema.Top): Schema.Top =>
     Schema.toType(declaration),
     Schema.toCodecIso(declaration as never),
   ] as never) as unknown as Schema.Top
+
+/** A tolerant substitute for a field a read makes `read` of. See `buildTolerantTransform`. */
+const tolerantLeaf = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+  read: Schema.Top,
+): Schema.Top => {
+  const tolerant = buildTolerantTransform(read)
+  const domain = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
+  return opts?.plainStateForms && holdsPlainForm(domain.ast)
+    ? (Schema.Union([
+        tolerant,
+        Schema.toCodecIso(domain as never),
+      ] as never) as unknown as Schema.Top)
+    : tolerant
+}
 
 /**
  * Recursively substitute self-date and `RedactedFromValue` leaves wherever they
@@ -1968,6 +2065,13 @@ export const substituteSchemaDeep = (
 
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
+    // A step that isn't a default turns what's stored into something else. What's beneath it isn't
+    // what's stored, so it stays as declared, and a caller, who holds that something else, goes round it.
+    if (!defaulted.defaults) {
+      return opts?.domainValues
+        ? defaulted.rewrap(tolerantLeaf(schema, opts, schema), absentThroughStep(schema))
+        : unwalked()
+    }
     if (defaulted.transforms && unwalked() !== schema) return unwalked()
     const beneath = substituteSchemaDeep(beneathDefault(schema, defaulted, opts), opts)
     return defaulted.rewrap(
@@ -1977,6 +2081,7 @@ export const substituteSchemaDeep = (
     )
   }
 
+  if (readsListAsDeclared(schema, opts)) return unwalked()
   // Leaf: self-date schema → tolerant bidirectional date transform.
   if (isSelfDateSchema(schema)) return selfDateSubstitute(schema, opts)
   // Leaf: Pattern B transform date schema (only under `tolerantTransforms`) →
@@ -2000,14 +2105,7 @@ export const substituteSchemaDeep = (
   // substitutes, and before the array / struct recursion so containers are
   // still walked rather than swallowed (#116).
   if (opts?.tolerantTransforms && isTolerantLeaf(schema)) {
-    const tolerant = buildTolerantTransform(unwalked())
-    const domain = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
-    return opts.plainStateForms && holdsPlainForm(domain.ast)
-      ? (Schema.Union([
-          tolerant,
-          Schema.toCodecIso(domain as never),
-        ] as never) as unknown as Schema.Top)
-      : tolerant
+    return tolerantLeaf(schema, opts, unwalked())
   }
   // Leaf: read leniency for legacy domain-form values (entity read schemas) and
   // the plain-bigint lift (#133).
@@ -2317,7 +2415,8 @@ const readingStored = (
     let read: SchemaAST.AST
     const rebuild = rebuildOf(ast)
     if (rebuild !== undefined) {
-      read = Schema.Unknown.pipe(
+      const stored = ast.context?.isOptional ? Schema.optionalKey(Schema.Unknown) : Schema.Unknown
+      read = stored.pipe(
         Schema.decodeTo(Schema.make<Schema.Top>(ast) as never, rebuild as never),
       ).ast
     } else {

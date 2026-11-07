@@ -1,0 +1,2340 @@
+{
+  "writtenBy": {
+    "effect-dynamodb": "1.39.0",
+    "effect": "4.1.2"
+  },
+  "shapes": {
+    "OptionFromNullishOr(Struct{optionalKey BigInt})": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "b8d6507a425ccc48c4744682ac993793"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.969Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.972Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.972Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "eea0bb15389c1959ed90b921b8fcbcfb"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.970Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.971Z"
+          }
+        }
+      ]
+    },
+    "OptionFromOptional(Array(BigIntFromString))": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "L": [
+              {
+                "S": "5"
+              }
+            ]
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "id": {
+            "S": "abs"
+          },
+          "pk": {
+            "S": "$s#v1#agg#abs"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "L": [
+              {
+                "S": "5"
+              }
+            ]
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "L": [
+              {
+                "S": "5"
+              }
+            ]
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "id": {
+            "S": "pa"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_pa"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "L": [
+              {
+                "S": "5"
+              }
+            ]
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "5a137c28e11b37589dac559aa804f282"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "L": [
+                  {
+                    "S": "5"
+                  }
+                ]
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "L": [
+                  {
+                    "S": "5"
+                  }
+                ]
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.556Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "L": [
+                  {
+                    "S": "5"
+                  }
+                ]
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.560Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "L": [
+                  {
+                    "S": "5"
+                  }
+                ]
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.560Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "3e8cb4a432b227e4463423d95050247f"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "L": [
+                  {
+                    "S": "5"
+                  }
+                ]
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.557Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "L": [
+                  {
+                    "S": "5"
+                  }
+                ]
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.558Z"
+          }
+        }
+      ]
+    },
+    "OptionFromOptional(BigIntFromString)": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "id": {
+            "S": "abs"
+          },
+          "pk": {
+            "S": "$s#v1#agg#abs"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "id": {
+            "S": "pa"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_pa"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "bb2e54aad24bb4821f3d4e981ad44707"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:48.676Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:48.681Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:48.681Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "9130d032a047349257bb34128f594676"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:48.678Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:48.679Z"
+          }
+        }
+      ]
+    },
+    "OptionFromOptional(ReadonlySet)": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "SS": [
+              "a"
+            ]
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "id": {
+            "S": "abs"
+          },
+          "pk": {
+            "S": "$s#v1#agg#abs"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "SS": [
+              "a"
+            ]
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "SS": [
+              "a"
+            ]
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "id": {
+            "S": "pa"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_pa"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "SS": [
+              "a"
+            ]
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "5c82a2f0ffdcbf81584274e732ddcc5d"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "SS": [
+                  "a"
+                ]
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "SS": [
+                  "a"
+                ]
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.112Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "SS": [
+                  "a"
+                ]
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.117Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "SS": [
+                  "a"
+                ]
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.117Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "327435e56323c65d2a7715f773162191"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "SS": [
+                  "a"
+                ]
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.114Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "SS": [
+                  "a"
+                ]
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.115Z"
+          }
+        }
+      ]
+    },
+    "OptionFromOptional(Struct{BigIntFromString})": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "M": {
+              "b": {
+                "S": "5"
+              }
+            }
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "id": {
+            "S": "abs"
+          },
+          "pk": {
+            "S": "$s#v1#agg#abs"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "b": {
+                "S": "5"
+              }
+            }
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "b": {
+                "S": "5"
+              }
+            }
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "id": {
+            "S": "pa"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_pa"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "b": {
+                "S": "5"
+              }
+            }
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "107a3d993ec5d8718f350a46d307fd36"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "b": {
+                    "S": "5"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "M": {
+                  "b": {
+                    "S": "5"
+                  }
+                }
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.255Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "b": {
+                    "S": "5"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.259Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "M": {
+                  "b": {
+                    "S": "5"
+                  }
+                }
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.259Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "e42a5fc90e10d29e08f99e9d24f39329"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "b": {
+                    "S": "5"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.256Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "M": {
+                  "b": {
+                    "S": "5"
+                  }
+                }
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.257Z"
+          }
+        }
+      ]
+    },
+    "OptionFromOptionalKey(BigInt)": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "N": "5"
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "id": {
+            "S": "abs"
+          },
+          "pk": {
+            "S": "$s#v1#agg#abs"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "N": "5"
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "N": "5"
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "id": {
+            "S": "pa"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_pa"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "N": "5"
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "dc91308e21b2a095d1d43c74856ac0b1"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "N": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "N": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.636Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "N": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.639Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "N": "5"
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.639Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "a21a30f739aa6a778648f7741dd58db5"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "N": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.637Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "N": "5"
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.638Z"
+          }
+        }
+      ]
+    },
+    "OptionFromOptionalKey(BigIntFromString)": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "id": {
+            "S": "abs"
+          },
+          "pk": {
+            "S": "$s#v1#agg#abs"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "id": {
+            "S": "pa"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_pa"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "S": "5"
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "051586a39c54feea97c00120e8d428db"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.730Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.735Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.735Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "9549a552a47205a8b0354e3ae1a7b902"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.732Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "S": "5"
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:49.733Z"
+          }
+        }
+      ]
+    },
+    "OptionFromUndefinedOr(Struct{optionalKey BigInt})": {
+      "agg": [
+        {
+          "__edd_e__": {
+            "S": "Root"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "w"
+          },
+          "pk": {
+            "S": "$s#v1#agg#w"
+          },
+          "sk": {
+            "S": "$s#v1#root"
+          }
+        }
+      ],
+      "entity": [
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "up"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_up"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "c"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_c"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "E"
+          },
+          "f": {
+            "M": {
+              "c": {
+                "S": "x"
+              }
+            }
+          },
+          "id": {
+            "S": "p"
+          },
+          "note": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$s#v1#e#id_p"
+          },
+          "sk": {
+            "S": "$s#v1#e"
+          }
+        }
+      ],
+      "stream": [
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "6a1eddb5ded94cad53baeb344b4abb34"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "metadata": {
+            "M": {
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "pk": {
+            "S": "$s#v1#t#a"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "a"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.081Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.085Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#i"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "streamId": {
+            "S": "i"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.085Z"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.event"
+          },
+          "__edd_wt__": {
+            "S": "21eb7b03fb2fdd80ca285ec6d588fa40"
+          },
+          "data": {
+            "M": {
+              "_tag": {
+                "S": "Noted"
+              },
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "eventType": {
+            "S": "Noted"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.event_1#0000000001"
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.083Z"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "t.snapshot"
+          },
+          "asOfVersion": {
+            "N": "1"
+          },
+          "pk": {
+            "S": "$s#v1#t#s"
+          },
+          "sk": {
+            "S": "$s#v1#t.snapshot"
+          },
+          "state": {
+            "M": {
+              "f": {
+                "M": {
+                  "c": {
+                    "S": "x"
+                  }
+                }
+              }
+            }
+          },
+          "streamId": {
+            "S": "s"
+          },
+          "timestamp": {
+            "S": "2026-11-07T15:23:52.084Z"
+          }
+        }
+      ]
+    }
+  }
+}

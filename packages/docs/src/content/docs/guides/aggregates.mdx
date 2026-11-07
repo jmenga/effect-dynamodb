@@ -560,7 +560,7 @@ The create operation:
 4. Adds partition keys, sort keys, entity type discriminators, and context fields
 5. Writes items in sub-aggregate transaction groups (each sub-aggregate = one `transactWriteItems`). The root item goes first, in the first transaction, conditioned on `attribute_not_exists`
 
-Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`. These are kept intact while ref IDs are replaced with hydrated data.
+Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`, including the `Option` a `Schema.OptionFromOptional` makes. These are kept intact while ref IDs are replaced with hydrated data.
 
 Returns `RefNotFound` if a ref ID doesn't resolve. Each sub-aggregate group is its own transaction, written in turn, so a multi-group write is not atomic. DynamoDB's limits are not checked before sending: a group over 100 items (DynamoDB's transaction limit) is rejected by DynamoDB and fails with `AggregateTransactionOverflow`; an item over 400 KB, a group over 4 MB, or a key over its size limit (2048 bytes for a partition key, 1024 for a sort key) fails with a `ValidationError` naming the item and its key. Nothing from the rejected group is written, DynamoDB's error is the `cause`, and the error says which groups were already committed (`AggregateTransactionOverflow.committed` and its `message`, or the `ValidationError`'s message). A `create` whose root group committed fails on the existing root if retried: `update` or `delete` the partial aggregate instead.
 
