@@ -78,6 +78,41 @@ describe("[EDD-9125] the operational makes", () => {
         'field "f" is a Schema.Date',
       )
     })
+
+    it(`${name} takes a bigint under a union, a number next to it included`, () => {
+      for (const field of [
+        Schema.NullOr(Schema.BigInt),
+        Schema.Union([Schema.String, Schema.BigInt]),
+        Schema.Union([Schema.Number, Schema.BigInt]),
+        Schema.Union([Schema.BigInt, Schema.Number]),
+        Schema.NullOr(Schema.Struct({ b: Schema.BigInt })),
+        Schema.Array(Schema.NullOr(Schema.BigInt)),
+        Schema.Union([Schema.Number, Schema.Struct({ b: Schema.BigInt })]),
+      ]) {
+        expect(refusal(() => build(modelOf(field)))).toBe("nothing refused")
+      }
+    })
+
+    it(`${name} refuses a bigint under a declaration or a suspend, which it doesn't reach`, () => {
+      for (const field of [
+        Schema.Option(Schema.BigInt),
+        Schema.NullOr(Schema.Option(Schema.BigInt)),
+        Schema.suspend(() => Schema.BigInt),
+      ]) {
+        expect(refusal(() => build(modelOf(field)))).toContain('field "f" is a Schema.BigInt')
+      }
+    })
+
+    it(`${name} refuses a date beneath a decoding default on a struct, and takes its replacement`, () => {
+      const over = (date: Schema.Top) =>
+        Schema.Struct({ d: date as never }).pipe(
+          Schema.withDecodingDefaultKey(Effect.die("unused")),
+        )
+      expect(refusal(() => build(modelOf(over(Schema.Date))))).toContain(
+        'field "f.d" is a Schema.Date',
+      )
+      expect(refusal(() => build(modelOf(over(Schema.DateFromString))))).toBe("nothing refused")
+    })
   }
 
   it("Entity.make refuses a Schema.DateTimeUtcFromDate; Aggregate.make, under a union", () => {

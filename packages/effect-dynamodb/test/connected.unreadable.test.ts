@@ -8,7 +8,12 @@
  *   (or set DYNAMODB_ENDPOINT to another port)
  */
 
-import { DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb"
+import {
+  DynamoDBClient,
+  PutItemCommand,
+  ScanCommand,
+  UpdateItemCommand,
+} from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
@@ -33,10 +38,12 @@ import {
 } from "effect"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
+import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -164,13 +171,7 @@ const same = (a: unknown, b: unknown) => expect(a).toEqual(b)
 
 /** Every replacement a refusal names, with a value, and how to tell it came back. */
 const REPLACEMENTS: ReadonlyArray<
-  readonly [
-    name: string,
-    field: Schema.Top,
-    value: unknown,
-    check: (read: unknown) => void,
-    skipOwners?: ReadonlyArray<string>,
-  ]
+  readonly [name: string, field: Schema.Top, value: unknown, check: (read: unknown) => void]
 > = [
   ["Schema.URLFromString", Schema.URLFromString, url, (r) => same(String(r), url.href)],
   ["Schema.ByteSizeFromString", Schema.ByteSizeFromString, kib, (r) => same(r, kib)],
@@ -266,6 +267,46 @@ const REPLACEMENTS: ReadonlyArray<
     Schema.Result(Schema.DateFromString, Schema.String),
     Result.succeed(at),
     (r) => same(r, Result.succeed(at)),
+  ],
+  [
+    "a suspended Schema.DateFromString",
+    Schema.suspend(() => Schema.DateFromString),
+    at,
+    (r) => same(r, at),
+  ],
+  [
+    "a suspended Schema.BigIntFromString",
+    Schema.suspend(() => Schema.BigIntFromString),
+    5n,
+    (r) => same(r, 5n),
+  ],
+  [
+    "a suspended Schema.RedactedFromValue",
+    Schema.suspend(() => Schema.RedactedFromValue(Schema.String, { label: "a" })),
+    Redacted.make("a", { label: "a" }),
+    (r) => same(Redacted.value(r as Redacted.Redacted<string>), "a"),
+  ],
+  [
+    "Schema.DateFromString in a struct with a decoding default",
+    Schema.Struct({ d: Schema.DateFromString }).pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed({ d: at.toISOString() })),
+    ),
+    { d: at },
+    (r) => same(r, { d: at }),
+  ],
+  [
+    "Schema.DateFromString or null with a decoding default",
+    Schema.NullOr(Schema.DateFromString).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
+    at,
+    (r) => same(r, at),
+  ],
+  [
+    "Schema.RedactedFromValue in a struct with a decoding default",
+    Schema.Struct({ r: Schema.RedactedFromValue(Schema.String, { label: "a" }) }).pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed({ r: "a" })),
+    ),
+    { r: Redacted.make("a", { label: "a" }) },
+    (r) => same(Redacted.value((r as { readonly r: Redacted.Redacted<string> }).r), "a"),
   ],
 ]
 
@@ -512,6 +553,623 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
         expect(HashSet.size((yield* rows.get({ id: "a" })).f)).toBe(0)
       }),
     ),
+  )
+})
+
+describeConnected("a Schema.BigInt under a union, on real rows", () => {
+  const big = 2n ** 60n
+  const bigN = { N: String(big) }
+  const small = { N: "5" }
+  const nullable = Schema.NullOr(Schema.BigInt)
+  const WithB = Schema.Struct({ b: Schema.BigInt })
+
+  /** Each value: what it's written as, what's stored, and what it reads back as. */
+  type Reading = readonly [written: unknown, stored: unknown, read: unknown]
+  const smallBigNull: ReadonlyArray<Reading> = [
+    [5n, small, 5n],
+    [big, bigN, big],
+    [null, { NULL: true }, null],
+  ]
+
+  const CASES: ReadonlyArray<readonly [string, Schema.Top, ReadonlyArray<Reading>]> = [
+    ["Schema.NullOr(Schema.BigInt)", nullable, smallBigNull],
+    ["Schema.NullishOr(Schema.BigInt)", Schema.NullishOr(Schema.BigInt), smallBigNull],
+    ["Schema.optional(Schema.NullOr(Schema.BigInt))", Schema.optional(nullable), smallBigNull],
+    [
+      "Schema.optionalKey(Schema.NullOr(Schema.BigInt))",
+      Schema.optionalKey(nullable),
+      smallBigNull,
+    ],
+    [
+      "Schema.NullOr(Schema.BigInt) with a decoding default",
+      nullable.pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
+      smallBigNull,
+    ],
+    [
+      "Schema.Union([Schema.String, Schema.BigInt])",
+      Schema.Union([Schema.String, Schema.BigInt]),
+      [
+        [5n, small, 5n],
+        [big, bigN, big],
+        ["5", { S: "5" }, "5"],
+      ],
+    ],
+    [
+      "Schema.Union([Schema.BigInt, Schema.String])",
+      Schema.Union([Schema.BigInt, Schema.String]),
+      [
+        [5n, small, 5n],
+        [big, bigN, big],
+        ["5", { S: "5" }, "5"],
+      ],
+    ],
+    [
+      "a oneOf Schema.Union([Schema.BigInt, Schema.String])",
+      Schema.Union([Schema.BigInt, Schema.String], { mode: "oneOf" }),
+      [
+        [5n, small, 5n],
+        [big, bigN, big],
+        ["a", { S: "a" }, "a"],
+      ],
+    ],
+    [
+      "Schema.NullOr(Schema.Struct({ b: Schema.BigInt }))",
+      Schema.NullOr(WithB),
+      [
+        [{ b: 5n }, { M: { b: small } }, { b: 5n }],
+        [{ b: big }, { M: { b: bigN } }, { b: big }],
+        [null, { NULL: true }, null],
+      ],
+    ],
+    [
+      "Schema.Struct({ b: Schema.NullOr(Schema.BigInt) })",
+      Schema.Struct({ b: nullable }),
+      [
+        [{ b: 5n }, { M: { b: small } }, { b: 5n }],
+        [{ b: big }, { M: { b: bigN } }, { b: big }],
+        [{ b: null }, { M: { b: { NULL: true } } }, { b: null }],
+      ],
+    ],
+    [
+      "Schema.Array(Schema.NullOr(Schema.BigInt))",
+      Schema.Array(nullable),
+      [[[5n, big, null], { L: [small, bigN, { NULL: true }] }, [5n, big, null]]],
+    ],
+    [
+      "Schema.Record(Schema.String, Schema.NullOr(Schema.BigInt))",
+      Schema.Record(Schema.String, nullable),
+      [
+        [
+          { s: 5n, b: big, n: null },
+          { M: { s: small, b: bigN, n: { NULL: true } } },
+          { s: 5n, b: big, n: null },
+        ],
+      ],
+    ],
+    [
+      "Schema.Union([Schema.Number, Schema.Struct({ b: Schema.BigInt })])",
+      Schema.Union([Schema.Number, WithB]),
+      [
+        [{ b: 5n }, { M: { b: small } }, { b: 5n }],
+        [{ b: big }, { M: { b: bigN } }, { b: big }],
+        [7, { N: "7" }, 7],
+      ],
+    ],
+    [
+      "Schema.Union([Schema.Struct({ b: Schema.BigInt }), Schema.Number])",
+      Schema.Union([WithB, Schema.Number]),
+      [
+        [{ b: 5n }, { M: { b: small } }, { b: 5n }],
+        [7, { N: "7" }, 7],
+      ],
+    ],
+    [
+      "Schema.Struct({ b: Schema.BigInt }) with a decoding default",
+      WithB.pipe(Schema.withDecodingDefaultKey(Effect.succeed({ b: 0n }))),
+      [
+        [{ b: 5n }, { M: { b: small } }, { b: 5n }],
+        [{ b: big }, { M: { b: bigN } }, { b: big }],
+      ],
+    ],
+
+    // The guide's "read back changed": a number member takes what a number can hold.
+    [
+      "Schema.Union([Schema.Number, Schema.BigInt])",
+      Schema.Union([Schema.Number, Schema.BigInt]),
+      [
+        [5n, small, 5],
+        [big, bigN, big],
+        [5, small, 5],
+      ],
+    ],
+    [
+      "Schema.Union([Schema.BigInt, Schema.Number])",
+      Schema.Union([Schema.BigInt, Schema.Number]),
+      [
+        [5n, small, 5],
+        [big, bigN, big],
+        [5, small, 5],
+      ],
+    ],
+    [
+      "Schema.Union([Schema.Literal(5), Schema.BigInt])",
+      Schema.Union([Schema.Literal(5), Schema.BigInt]),
+      [
+        [5n, small, 5],
+        [6n, { N: "6" }, 6n],
+        [big, bigN, big],
+      ],
+    ],
+  ]
+
+  const stored = (tableName: string) =>
+    Effect.map(rowsOf(tableName), (rows) => rows.find((row) => row.f !== undefined)?.f)
+
+  for (const [name, field, readings] of CASES) {
+    it.effect(`${name}, on an entity: put, get, query, update`, () =>
+      onEntity(field, (rows, tableName) =>
+        Effect.gen(function* () {
+          for (const [written, kept, read] of readings) {
+            yield* rows.put({ id: "a", f: written }).asEffect()
+            expect(yield* stored(tableName)).toEqual(kept)
+            expect((yield* rows.get({ id: "a" })).f).toEqual(read)
+            expect((yield* rows.scan().collect())[0].f).toEqual(read)
+            expect((yield* rows.update({ id: "a" }).set({ n: 1 }).asEffect()).f).toEqual(read)
+            expect(yield* stored(tableName)).toEqual(kept)
+            if (written !== null) {
+              expect((yield* rows.update({ id: "a" }).set({ f: written }).asEffect()).f).toEqual(
+                read,
+              )
+              expect(yield* stored(tableName)).toEqual(kept)
+            }
+          }
+        }),
+      ),
+    )
+
+    it.effect(`${name}, on an aggregate: create, get, update`, () =>
+      onAggregate(rootOver(field), {}, (agg, tableName) =>
+        Effect.gen(function* () {
+          for (const [written, kept, read] of readings) {
+            yield* Effect.ignore(agg.delete({ id: "a" }))
+            yield* agg.create({ id: "a", f: written })
+            expect(yield* stored(tableName)).toEqual(kept)
+            expect((yield* agg.get({ id: "a" })).f).toEqual(read)
+
+            yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+            expect((yield* agg.get({ id: "a" })).f).toEqual(read)
+            expect(yield* stored(tableName)).toEqual(kept)
+
+            yield* agg.update({ id: "a" }, ({ state }: any) => ({
+              ...state,
+              f: written,
+              note: "m",
+            }))
+            expect((yield* agg.get({ id: "a" })).f).toEqual(read)
+          }
+        }),
+      ),
+    )
+  }
+
+  it.effect("in a one edge and in a many edge's rows, past 2^53 and below it, and null", () => {
+    const Row = Schema.Struct({ sku: Schema.String, qty: nullable })
+    const model = Schema.Struct({
+      id: Schema.String,
+      note: Schema.optional(Schema.String),
+      head: Row,
+      lines: Schema.Array(Row),
+    })
+    const value = {
+      id: "a",
+      head: { sku: "h", qty: 5n },
+      lines: [
+        { sku: "s", qty: 5n },
+        { sku: "n", qty: null },
+        { sku: "b", qty: big },
+      ],
+    }
+    const sorted = (read: any) => ({
+      ...read,
+      lines: [...read.lines].sort((a: any, b: any) => (a.sku < b.sku ? 1 : -1)),
+    })
+    return onAggregate(
+      model,
+      {
+        head: Aggregate.one({ entityType: "Head" }),
+        lines: Aggregate.many({ entityType: "Line", sk: { composite: ["sku"] } } as never),
+      },
+      (agg, tableName) =>
+        Effect.gen(function* () {
+          yield* agg.create(value)
+          const rows = yield* rowsOf(tableName)
+          expect(rows.find((row) => row.__edd_e__?.S === "Head")?.qty).toEqual(small)
+          expect(rows.find((row) => row.sku?.S === "b")?.qty).toEqual(bigN)
+          expect(rows.find((row) => row.sku?.S === "n")?.qty).toEqual({ NULL: true })
+          expect(sorted(yield* agg.get({ id: "a" }))).toMatchObject(value)
+
+          yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+          const handedBack = sorted(yield* agg.get({ id: "a" }))
+          expect(handedBack).toMatchObject(value)
+          expect(handedBack.note).toBe("n")
+        }),
+    )
+  })
+
+  it.effect("a null set by an update: stored on a required one, a removal on an optional one", () =>
+    Effect.gen(function* () {
+      yield* onEntity(nullable, (rows, tableName) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: 5n }).asEffect()
+          expect((yield* rows.update({ id: "a" }).set({ f: null }).asEffect()).f).toBeNull()
+          expect((yield* rowsOf(tableName))[0]?.f).toEqual({ NULL: true })
+        }),
+      )
+      yield* onEntity(Schema.optionalKey(nullable), (rows, tableName) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: 5n }).asEffect()
+          expect((yield* rows.update({ id: "a" }).set({ f: null }).asEffect()).f).toBeUndefined()
+          expect((yield* rowsOf(tableName))[0]?.f).toBeUndefined()
+        }),
+      )
+    }),
+  )
+
+  it.effect("through Batch.get and Transaction.transactGet", () =>
+    onEntity(nullable, (rows) =>
+      Effect.gen(function* () {
+        yield* rows.put({ id: "s", f: 5n }).asEffect()
+        yield* rows.put({ id: "b", f: big }).asEffect()
+        yield* rows.put({ id: "n", f: null }).asEffect()
+        const batch: any = yield* Batch.get([
+          rows.get({ id: "s" }),
+          rows.get({ id: "b" }),
+          rows.get({ id: "n" }),
+        ] as never)
+        expect(batch.map((row: any) => row.f)).toEqual([5n, big, null])
+        const transact: any = yield* Transaction.transactGet([
+          rows.get({ id: "s" }),
+          rows.get({ id: "b" }),
+          rows.get({ id: "n" }),
+        ] as never)
+        expect(transact.map((row: any) => row.f)).toEqual([5n, big, null])
+      }),
+    ),
+  )
+
+  it.effect("an optional one left out stays out, on both owners", () =>
+    Effect.gen(function* () {
+      yield* onEntity(Schema.optionalKey(nullable), (rows, tableName) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a" }).asEffect()
+          expect((yield* rows.get({ id: "a" })).f).toBeUndefined()
+          expect((yield* rowsOf(tableName))[0]?.f).toBeUndefined()
+        }),
+      )
+      yield* onAggregate(rootOver(Schema.optionalKey(nullable)), {}, (agg, tableName) =>
+        Effect.gen(function* () {
+          yield* agg.create({ id: "a" })
+          expect((yield* agg.get({ id: "a" })).f).toBeUndefined()
+          expect((yield* rowsOf(tableName))[0]?.f).toBeUndefined()
+        }),
+      )
+    }),
+  )
+
+  it.effect("a row without the attribute takes the decoding default, on both owners", () => {
+    const defaulted = nullable.pipe(Schema.withDecodingDefaultKey(Effect.succeed(3n)))
+    const removed = (tableName: string) =>
+      Effect.promise(async () => {
+        const { Items = [] } = await raw.send(new ScanCommand({ TableName: tableName }))
+        const row = Items[0]!
+        await raw.send(
+          new UpdateItemCommand({
+            TableName: tableName,
+            Key: { pk: row.pk!, sk: row.sk! },
+            UpdateExpression: "REMOVE f",
+          }),
+        )
+      })
+    return Effect.gen(function* () {
+      yield* onEntity(defaulted, (rows, tableName) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: 5n }).asEffect()
+          yield* removed(tableName)
+          expect((yield* rows.get({ id: "a" })).f).toBe(3n)
+        }),
+      )
+      yield* onAggregate(rootOver(defaulted), {}, (agg, tableName) =>
+        Effect.gen(function* () {
+          yield* agg.create({ id: "a", f: 5n })
+          yield* removed(tableName)
+          expect((yield* agg.get({ id: "a" })).f).toBe(3n)
+        }),
+      )
+    })
+  })
+
+  it.effect("a value no member takes is still refused at the read", () =>
+    Effect.gen(function* () {
+      const overString = entityOver(Schema.String)
+      const Base = Table.make({ schema: AppSchema, entities: { Rows: overString } })
+      yield* onTable(Base, (tableName) =>
+        Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: { Rows: overString },
+            tables: { MainTable: Base },
+          })
+          yield* db.entities.Rows.put({ id: "a", f: "text" }).asEffect()
+          const Nullable = entityOver(nullable)
+          const Read = Table.make({ schema: AppSchema, entities: { Rows: Nullable } })
+          const failure = yield* Effect.gen(function* () {
+            const again: any = yield* DynamoClient.make({
+              entities: { Rows: Nullable },
+              tables: { MainTable: Read },
+            })
+            return yield* Effect.flip(again.entities.Rows.get({ id: "a" }))
+          }).pipe(Effect.provide(Read.layer({ name: tableName }) as Layer.Layer<never>))
+          expect((failure as { readonly _tag: string })._tag).toBe("ValidationError")
+        }),
+      )
+    }),
+  )
+})
+
+describeConnected("a labelled redacted value, on real rows", () => {
+  const labelled = Schema.RedactedFromValue(Schema.String, { label: "a" })
+  const secret = Redacted.make("s", { label: "a" })
+  const kept = (read: unknown) => {
+    const value = read as Redacted.Redacted<string>
+    expect(Redacted.value(value)).toBe("s")
+    expect(value.label).toBe("a")
+  }
+
+  const CASES: ReadonlyArray<
+    readonly [string, Schema.Top, unknown, unknown, (read: any) => unknown]
+  > = [
+    ["on its own", labelled, secret, { S: "s" }, (read) => read],
+    [
+      "in a struct",
+      Schema.Struct({ r: labelled }),
+      { r: secret },
+      { M: { r: { S: "s" } } },
+      (read) => read.r,
+    ],
+    [
+      "in a struct with a decoding default",
+      Schema.Struct({ r: labelled }).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed({ r: "s" })),
+      ),
+      { r: secret },
+      { M: { r: { S: "s" } } },
+      (read) => read.r,
+    ],
+    [
+      "or null with a decoding default",
+      Schema.NullOr(labelled).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
+      secret,
+      { S: "s" },
+      (read) => read,
+    ],
+    [
+      "in a record with a decoding default",
+      Schema.Record(Schema.String, labelled).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed({})),
+      ),
+      { x: secret },
+      { M: { x: { S: "s" } } },
+      (read) => read.x,
+    ],
+  ]
+
+  for (const [name, field, value, kept_, inside] of CASES) {
+    it.effect(`${name}: keeps its value and its label, on both owners`, () =>
+      Effect.gen(function* () {
+        yield* onEntity(field, (rows, tableName) =>
+          Effect.gen(function* () {
+            yield* rows.put({ id: "a", f: value }).asEffect()
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual(kept_)
+            kept(inside((yield* rows.get({ id: "a" })).f))
+          }),
+        )
+        yield* onAggregate(rootOver(field), {}, (agg, tableName) =>
+          Effect.gen(function* () {
+            yield* agg.create({ id: "a", f: value })
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual(kept_)
+            kept(inside((yield* agg.get({ id: "a" })).f))
+            yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual(kept_)
+            kept(inside((yield* agg.get({ id: "a" })).f))
+          }),
+        )
+      }),
+    )
+  }
+
+  it.effect(
+    "another label set on an aggregate's update stores the value, not its internals",
+    () => {
+      const field = Schema.Struct({ r: labelled }).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed({ r: "s" })),
+      )
+      return onAggregate(rootOver(field), {}, (agg, tableName) =>
+        Effect.gen(function* () {
+          yield* agg.create({ id: "a", f: { r: secret } })
+          yield* agg.update({ id: "a" }, ({ state }: any) => ({
+            ...state,
+            f: { r: Redacted.make("t") },
+          }))
+          expect((yield* rowsOf(tableName))[0]?.f).toEqual({ M: { r: { S: "t" } } })
+          const read = (yield* agg.get({ id: "a" })).f.r
+          expect(Redacted.value(read)).toBe("t")
+        }),
+      )
+    },
+  )
+})
+
+describeConnected("a date beneath a decoding default, on real rows", () => {
+  const stamped = (read: unknown) => {
+    expect(DateTime.isDateTime(read)).toBe(true)
+    expect(Equal.equals(read, instant)).toBe(true)
+  }
+
+  it.effect("Schema.NullOr(Schema.DateTimeUtc): a DateTime and null, on both owners", () => {
+    const field = Schema.NullOr(Schema.DateTimeUtc).pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed(null)),
+    )
+    return Effect.gen(function* () {
+      yield* onEntity(field, (rows) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: instant }).asEffect()
+          stamped((yield* rows.get({ id: "a" })).f)
+          stamped((yield* rows.update({ id: "a" }).set({ n: 1 }).asEffect()).f)
+          yield* rows.put({ id: "a", f: null }).asEffect()
+          expect((yield* rows.get({ id: "a" })).f).toBeNull()
+        }),
+      )
+      yield* onAggregate(rootOver(field), {}, (agg, tableName) =>
+        Effect.gen(function* () {
+          yield* agg.create({ id: "a", f: instant })
+          expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: "2025-01-01T00:00:00.000Z" })
+          stamped((yield* agg.get({ id: "a" })).f)
+          yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+          stamped((yield* agg.get({ id: "a" })).f)
+        }),
+      )
+    })
+  })
+
+  it.effect("Schema.Struct({ d: Schema.DateTimeUtc }): a DateTime, on both owners", () => {
+    const field = Schema.Struct({ d: Schema.DateTimeUtc }).pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed({ d: instant })),
+    )
+    return Effect.gen(function* () {
+      const storedAsItIs = (tableName: string) =>
+        Effect.map(rowsOf(tableName), ([row]) =>
+          expect(Object.keys(row?.f?.M?.d?.M ?? {})).toContain("epochMilliseconds"),
+        )
+      yield* onEntity(field, (rows, tableName) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: { d: instant } }).asEffect()
+          yield* storedAsItIs(tableName)
+          stamped((yield* rows.get({ id: "a" })).f.d)
+        }),
+      )
+      yield* onAggregate(rootOver(field), {}, (agg, tableName) =>
+        Effect.gen(function* () {
+          yield* agg.create({ id: "a", f: { d: instant } })
+          yield* storedAsItIs(tableName)
+          stamped((yield* agg.get({ id: "a" })).f.d)
+          yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+          stamped((yield* agg.get({ id: "a" })).f.d)
+        }),
+      )
+    })
+  })
+
+  it.effect("a recursive model over Schema.DateFromString, on both owners", () => {
+    interface Node {
+      readonly at: Date
+      readonly next: Node | null
+    }
+    interface NodeEncoded {
+      readonly at: string
+      readonly next: NodeEncoded | null
+    }
+    const Node: Schema.Codec<Node, NodeEncoded> = Schema.Struct({
+      at: Schema.DateFromString,
+      next: Schema.NullOr(Schema.suspend((): Schema.Codec<Node, NodeEncoded> => Node)),
+    })
+    const value = { at, next: { at, next: null } }
+    return Effect.gen(function* () {
+      yield* onEntity(Node, (rows) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: value }).asEffect()
+          expect((yield* rows.get({ id: "a" })).f).toEqual(value)
+        }),
+      )
+      yield* onAggregate(rootOver(Node), {}, (agg) =>
+        Effect.gen(function* () {
+          yield* agg.create({ id: "a", f: value })
+          expect((yield* agg.get({ id: "a" })).f).toEqual(value)
+          yield* agg.update({ id: "a" }, ({ state }: any) => ({ ...state, note: "n" }))
+          expect((yield* agg.get({ id: "a" })).f).toEqual(value)
+        }),
+      )
+    })
+  })
+})
+
+describeConnected("Schema.optionalKey over a union keeps every member", () => {
+  it.effect("a date or a string: each comes back, whichever is declared first", () =>
+    Effect.gen(function* () {
+      for (const field of [
+        Schema.optionalKey(Schema.Union([Schema.String, Schema.DateTimeUtc])),
+        Schema.optionalKey(Schema.Union([Schema.DateTimeUtc, Schema.String])),
+      ]) {
+        yield* onEntity(field, (rows, tableName) =>
+          Effect.gen(function* () {
+            yield* rows.put({ id: "a", f: instant }).asEffect()
+            expect((yield* rowsOf(tableName))[0]?.f).toEqual({ S: "2025-01-01T00:00:00.000Z" })
+            expect(Equal.equals((yield* rows.get({ id: "a" })).f, instant)).toBe(true)
+            yield* rows.put({ id: "a", f: "text" }).asEffect()
+            expect((yield* rows.get({ id: "a" })).f).toBe("text")
+          }),
+        )
+      }
+    }),
+  )
+
+  it.effect("a row 1.38 stored as a map for a string-first union still reads", () =>
+    onEntity(
+      Schema.optionalKey(Schema.Union([Schema.String, Schema.DateTimeUtc])),
+      (rows, tableName) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: "text" }).asEffect()
+          const [row] = yield* rowsOf(tableName)
+          yield* Effect.promise(() =>
+            raw.send(
+              new PutItemCommand({
+                TableName: tableName,
+                Item: {
+                  ...row!,
+                  f: {
+                    M: {
+                      epochMilliseconds: { N: String(at.getTime()) },
+                      "~effect/DateTime": { S: "~effect/DateTime" },
+                      _tag: { S: "Utc" },
+                    },
+                  },
+                },
+              }),
+            ),
+          )
+          const read = (yield* rows.get({ id: "a" })).f
+          expect(DateTime.isDateTime(read)).toBe(true)
+          expect(DateTime.formatIso(read)).toBe("2025-01-01T00:00:00.000Z")
+        }),
+    ),
+  )
+
+  it.effect("null comes back, for what needs substituting, on both owners", () =>
+    Effect.gen(function* () {
+      const field = Schema.optionalKey(Schema.NullOr(Schema.DateFromString))
+      yield* onEntity(field, (rows) =>
+        Effect.gen(function* () {
+          yield* rows.put({ id: "a", f: null }).asEffect()
+          expect((yield* rows.get({ id: "a" })).f).toBeNull()
+          yield* rows.put({ id: "a", f: at }).asEffect()
+          expect((yield* rows.get({ id: "a" })).f).toEqual(at)
+        }),
+      )
+      yield* onAggregate(rootOver(field), {}, (agg) =>
+        Effect.gen(function* () {
+          yield* agg.create({ id: "a", f: null })
+          expect((yield* agg.get({ id: "a" })).f).toBeNull()
+        }),
+      )
+    }),
   )
 })
 

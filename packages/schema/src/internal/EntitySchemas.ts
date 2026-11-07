@@ -768,13 +768,18 @@ const tryGetRedactedInner = (schema: Schema.Top): Schema.Top | undefined => {
  * branch logic in `decode`/`encode` then steers the value to the right
  * representation.
  */
-const buildRedactedSubstitute = (inner: Schema.Top): Schema.Top => {
+const buildRedactedSubstitute = (schema: Schema.Top, inner: Schema.Top): Schema.Top => {
+  const resolved = SchemaAST.resolve(schema.ast) as
+    | { readonly representation?: { readonly payload?: { readonly label?: unknown } | null } }
+    | undefined
+  const declared = resolved?.representation?.payload?.label
+  const label = typeof declared === "string" ? declared : undefined
   return Schema.Any.pipe(
     Schema.decodeTo(
       Schema.Redacted(inner) as unknown as Schema.Top,
       {
         decode: SchemaGetter.transform((value: unknown) =>
-          Redacted.isRedacted(value) ? value : Redacted.make(value),
+          Redacted.isRedacted(value) ? value : Redacted.make(value, { label }),
         ),
         encode: SchemaGetter.transform((r: unknown) =>
           Redacted.isRedacted(r) ? Redacted.value(r as Redacted.Redacted<unknown>) : r,
@@ -1120,14 +1125,18 @@ export const optionalField = (field: Schema.Top): OptionalField | undefined => {
     // `Schema.optional(X)`: the value type is `UndefinedOr(X)`; `.members` exposes
     // the real X alongside the `Undefined` member.
     const members = (value as { readonly members?: ReadonlyArray<Schema.Top> } | undefined)?.members
-    const inner = members?.find((m) => (m.ast as { readonly _tag?: string })._tag !== "Undefined")
-    if (inner === undefined) return undefined
-    return {
-      inner,
-      rewrap: (s) => Schema.optional(s as Schema.Codec<any>) as unknown as Schema.Top,
+    const defined = members?.filter(
+      (m) => (m.ast as { readonly _tag?: string })._tag !== "Undefined",
+    )
+    if (defined?.length === 1 && defined.length < (members?.length ?? 0)) {
+      return {
+        inner: defined[0]!,
+        rewrap: (s) => Schema.optional(s as Schema.Codec<any>) as unknown as Schema.Top,
+      }
     }
   }
-  // `Schema.optionalKey(X)`: the value type is X directly (`.schema`).
+  // `Schema.optionalKey(X)`: the value type is X directly (`.schema`), a union of
+  // several members included: they all stay.
   if (value === undefined) return undefined
   return {
     inner: value,
@@ -1173,12 +1182,25 @@ export interface DeepSubstitutionOptions {
   readonly strictWireKind?: boolean | undefined
   /**
    * Entity READ schemas only (#133): also accept the domain-form values earlier
-   * releases stored on transform fields (see `buildLegacyReadTransform`) and
-   * lift an unmarshalled number back to a plain `Schema.BigInt`. Never inside a
-   * union, where a lenient member could claim another member's value.
-   * Propagated through the recursion.
+   * releases stored on transform fields (see `buildLegacyReadTransform`), never
+   * inside a union, where a lenient member could claim another member's value,
+   * and lift an unmarshalled number back to a plain `Schema.BigInt` (see
+   * `exactBigInts` for a union). Propagated through the recursion.
    */
   readonly legacyReads?: boolean | undefined
+  /**
+   * Set internally on a union's members for their first try: no read lift. A lifting member
+   * accepts any safe integer, enough to claim a value another member holds as a number, so every
+   * member gets its try as declared and only a value none of them takes is lifted. Propagated
+   * through the recursion.
+   */
+  readonly exactBigInts?: boolean | undefined
+  /**
+   * A schema nothing is stored through: a read, or the validation of a value before it's encoded.
+   * It can see beneath a decoding default on a container, whose runtime accessors the default hides
+   * (see `decodingDefaultField`), without changing what's stored. Propagated through the recursion.
+   */
+  readonly decodeOnly?: boolean | undefined
   /**
    * Set internally on a union's members: the primitive kinds the OTHER members
    * are stored as — and, under `tolerantTransforms`, their domain kinds too,
@@ -1231,6 +1253,8 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
   opts?.resolveRef ||
   opts?.strictWireKind ||
   opts?.legacyReads ||
+  opts?.exactBigInts ||
+  opts?.decodeOnly ||
   opts?.path ||
   opts?.enforceChecks ||
   opts?.absentReads ||
@@ -1241,6 +1265,8 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
         ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
         ...(opts?.strictWireKind ? { strictWireKind: true } : {}),
         ...(opts?.legacyReads ? { legacyReads: true } : {}),
+        ...(opts?.exactBigInts ? { exactBigInts: true } : {}),
+        ...(opts?.decodeOnly ? { decodeOnly: true } : {}),
         ...(opts?.path ? { path: opts.path } : {}),
         ...(opts?.enforceChecks ? { enforceChecks: true } : {}),
         ...(opts?.absentReads ? { absentReads: opts.absentReads } : {}),
@@ -1428,7 +1454,14 @@ const childOptions = (
  */
 const decodingDefaultField = (
   field: Schema.Top,
-): { readonly inner: Schema.Top; readonly rewrap: (s: Schema.Top) => Schema.Top } | undefined => {
+):
+  | {
+      readonly inner: Schema.Top
+      /** The field beneath the step with its runtime accessors, without a check added after the step. */
+      readonly declared: Schema.Top
+      readonly rewrap: (s: Schema.Top) => Schema.Top
+    }
+  | undefined => {
   const ast = field.ast
   const encoding = ast.encoding
   if (encoding === undefined || encoding.length === 0) return undefined
@@ -1456,6 +1489,7 @@ const decodingDefaultField = (
     SchemaAST.isUnion(lastTo) && lastTo.types.some((t) => SchemaAST.isUndefined(t))
   return {
     inner,
+    declared: (field as { readonly to?: Schema.Top }).to ?? inner,
     rewrap: (substitute) => {
       const encodedSide = Schema.toEncoded(substitute as Schema.Codec<any>)
       const optionalEncoded = withUndefined
@@ -1564,11 +1598,42 @@ const needsLegacyRead = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
   !isArraySchema(schema) &&
   (isDateTransform(schema) || numericTypeWithStringEncoding(schema))
 
-/** Whether a plain `Schema.BigInt` leaf gets the read lift (aggregate decode, entity reads). */
+/** Whether a plain `Schema.BigInt` gets the read lift here (aggregate decode, entity reads). */
+const liftsBigInts = (opts: DeepSubstitutionOptions | undefined) =>
+  (opts?.tolerantTransforms === true || opts?.legacyReads === true) && opts.exactBigInts !== true
+
 const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | undefined) =>
-  (opts?.tolerantTransforms === true || opts?.legacyReads === true) &&
-  opts.strictWireKind !== true &&
-  isSelfBigInt(schema)
+  liftsBigInts(opts) && isSelfBigInt(schema)
+
+/** Whether a plain `Schema.BigInt` is anywhere the substitution walks. */
+const holdsBigInt = (schema: Schema.Top): boolean => {
+  const inner = optionalField(schema)?.inner ?? decodingDefaultField(schema)?.declared
+  if (inner !== undefined) return holdsBigInt(inner)
+  if (isSelfBigInt(schema)) return true
+  const container = walkedContainer(schema)
+  if (container !== undefined) return container.children.some((child) => holdsBigInt(child))
+  if (isArraySchema(schema)) {
+    const element = arrayElementOf(schema)
+    return element !== undefined && holdsBigInt(element)
+  }
+  const fields = schemaFieldsOf(schema)
+  return fields !== undefined && Object.values(fields).some((field) => holdsBigInt(field))
+}
+
+/**
+ * What the substitution works on beneath a decoding default (see `decodeOnly`). A read doesn't
+ * enforce a check on what it rebuilds (see `enforceChecks`), and a write schema keeps the one added
+ * after the default.
+ */
+const beneathDefault = (
+  schema: Schema.Top,
+  defaulted: NonNullable<ReturnType<typeof decodingDefaultField>>,
+  opts: DeepSubstitutionOptions | undefined,
+): Schema.Top =>
+  (opts?.legacyReads || opts?.decodeOnly) &&
+  !(opts.enforceChecks && defaulted.declared.ast.checks !== schema.ast.checks)
+    ? defaulted.declared
+    : defaulted.inner
 
 /** The field, reading an absent attribute as the value it stands for (`absentReading`). */
 const readingAbsent = (field: Schema.Top): Schema.Top => {
@@ -1686,7 +1751,7 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // model is annotated, and `Schema.annotate` drops a `Schema.Class`'s `.fields`,
   // so the walker cannot see through it and the target's own transformed fields
   // keep their strict schemas. Only callers that pass `resolveRef` are affected
-  // — the entity derivation passes no options at all (#116).
+  // — the entity derivation passes none (#116).
   const deeper = descend(opts)
   // Optional wrapper FIRST — unwrap to the REAL inner before the leaf / array /
   // struct checks. `optionalKey(X)` is a bare AST (Declaration/Arrays) with an
@@ -1697,7 +1762,9 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   const opt = optionalField(schema)
   if (opt !== undefined) return needsDeepSubstitution(opt.inner, throughOptional(opts))
   const defaulted = decodingDefaultField(schema)
-  if (defaulted !== undefined) return needsDeepSubstitution(defaulted.inner, opts)
+  if (defaulted !== undefined) {
+    return needsDeepSubstitution(beneathDefault(schema, defaulted, opts), opts)
+  }
   if (isSelfDateSchema(schema)) return true
   if (opts?.tolerantTransforms && isDateTransform(schema)) return true
   if (tryGetRedactedInner(schema) !== undefined) return true
@@ -1739,17 +1806,19 @@ const holdsPlainForm = (ast: SchemaAST.AST): boolean =>
   ast._tag === "Declaration" && ast.encoding === undefined
 
 /**
- * A declaration with a transformation inside, such as `Schema.Option(Schema.DateFromString)`. The
- * tolerant substitution doesn't reach under a declaration, so an aggregate's `create` would be
- * handed the domain value and refuse it.
+ * A declaration with a transformation inside, such as `Schema.Option(Schema.DateFromString)`, or a
+ * `Schema.suspend` with one. The tolerant substitution doesn't reach under either, so an aggregate's
+ * `create` would be handed the domain value and refuse it.
  */
 const holdsTransformation = (ast: SchemaAST.AST): boolean =>
-  holdsPlainForm(ast) &&
-  (ast as SchemaAST.Declaration).typeParameters.some(
-    (parameter) => SchemaAST.toType(parameter) !== parameter,
-  )
+  SchemaAST.isSuspend(ast)
+    ? astContainsWireTransform(ast, new Set())
+    : holdsPlainForm(ast) &&
+      (ast as SchemaAST.Declaration).typeParameters.some(
+        (parameter) => SchemaAST.toType(parameter) !== parameter,
+      )
 
-/** A declaration, or its domain value. See `holdsTransformation`. */
+/** A declaration or a suspended schema, or its domain value. See `holdsTransformation`. */
 const acceptingDomainForm = (declaration: Schema.Top): Schema.Top =>
   Schema.Union([declaration, Schema.toType(declaration)] as never) as unknown as Schema.Top
 
@@ -1793,7 +1862,7 @@ export const substituteSchemaDeep = (
   // model is annotated, and `Schema.annotate` drops a `Schema.Class`'s `.fields`,
   // so the walker cannot see through it and the target's own transformed fields
   // keep their strict schemas. Only callers that pass `resolveRef` are affected
-  // — the entity derivation passes no options at all (#116).
+  // — the entity derivation passes none (#116).
   const deeper = descend(opts)
 
   // Optional wrapper FIRST — unwrap to the REAL inner, substitute it, then
@@ -1809,7 +1878,7 @@ export const substituteSchemaDeep = (
   // field beneath it and keep the step, so a missing key still defaults (#133).
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
-    const beneath = substituteSchemaDeep(defaulted.inner, opts)
+    const beneath = substituteSchemaDeep(beneathDefault(schema, defaulted, opts), opts)
     return defaulted.rewrap(
       refusesUndefinedPositions(defaulted.inner, opts)
         ? refusingUndefinedPositions(beneath)
@@ -1832,7 +1901,7 @@ export const substituteSchemaDeep = (
   }
   // Leaf: RedactedFromValue → tolerant Redacted transform.
   const redactedInner = tryGetRedactedInner(schema)
-  if (redactedInner !== undefined) return buildRedactedSubstitute(redactedInner)
+  if (redactedInner !== undefined) return buildRedactedSubstitute(schema, redactedInner)
 
   // Leaf: any OTHER encoding transform (only under `tolerantTransforms`) →
   // a substitute whose decode accepts the wire form and the domain form. Placed
@@ -1876,21 +1945,35 @@ export const substituteSchemaDeep = (
       }
     })
     const ordered = [...children.filter((c) => c.first), ...children.filter((c) => !c.first)]
-    const lenient = opts?.absentReads ? ordered.filter((c) => holdsAbsentRead(c.child)) : []
+    const lifting = (c: (typeof ordered)[number]) =>
+      container.isUnion && liftsBigInts(c.childOpts) && holdsBigInt(c.child)
+    const lenient = ordered.filter(
+      (c) => (opts?.absentReads && holdsAbsentRead(c.child)) || lifting(c),
+    )
     if (!container.isUnion || lenient.length === 0) {
       const rebuilt = container.rebuild(ordered.map((c) => c.substituted))
       return refusesUndefinedPositions(schema, opts) ? refusingUndefinedPositions(rebuilt) : rebuilt
     }
-    // A member reading an absent attribute as a value accepts more than it
-    // declares, enough to claim a row of a later member. So every member gets
-    // its try as declared first, and only a row none of them takes reads absent.
-    // A `oneOf` union refuses a value two members accept: it stays as declared.
+    // A member reading an absent attribute as a value, or lifting a number to a
+    // bigint, accepts more than it declares, enough to claim a row of a later
+    // member. So every member gets its try as declared first, and only a row none
+    // of them takes reads absent or is lifted. A `oneOf` union refuses a value two
+    // members accept: it stays as declared, with only the lift tried outside it,
+    // since a row as a bigint is what it was written as.
     const declared = (c: (typeof ordered)[number]) =>
       opts?.absentReads === "only"
         ? c.child
-        : substituteSchemaDeep(c.child, { ...c.childOpts, absentReads: undefined })
+        : substituteSchemaDeep(c.child, {
+            ...c.childOpts,
+            absentReads: undefined,
+            exactBigInts: true,
+          })
     if ((schema.ast as SchemaAST.Union).options?.mode === "oneOf") {
-      return container.rebuild(ordered.map((c) => declared(c)))
+      const exact = container.rebuild(ordered.map((c) => declared(c)))
+      const lifted = ordered.filter((c) => lifting(c)).map((c) => c.substituted)
+      return lifted.length === 0
+        ? exact
+        : withMetadataOf(schema, Schema.Union([exact, ...lifted] as never) as unknown as Schema.Top)
     }
     return container.rebuild([
       ...ordered.map((c) => (lenient.includes(c) ? declared(c) : c.substituted)),
@@ -2050,7 +2133,7 @@ export const substituteSchemas = (
     //    transform so the round-trip works for storage.
     const redactedInner = tryGetRedactedInner(schema)
     if (redactedInner !== undefined) {
-      out[name] = buildRedactedSubstitute(redactedInner)
+      out[name] = buildRedactedSubstitute(schema, redactedInner)
       continue
     }
     // 3. Default: recurse for nested substitution. Pattern B transforms

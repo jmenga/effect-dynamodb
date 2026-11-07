@@ -5,7 +5,15 @@
  * suite.
  */
 
-import { Chunk, DateTime, Effect, Schema, SchemaGetter } from "effect"
+import {
+  Chunk,
+  DateTime,
+  Effect,
+  Redacted,
+  Schema,
+  SchemaGetter,
+  SchemaTransformation,
+} from "effect"
 import { describe, expect, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as DynamoModel from "../src/DynamoModel.js"
@@ -196,6 +204,7 @@ const BY_OWNER: ReadonlyArray<
   const bigint = "a Schema.BigInt"
   const overDate = "a transformation over Schema.Date"
   const overBigint = "a transformation over Schema.BigInt"
+  const same = SchemaTransformation.passthrough() as never
   const literal = "a bigint Schema.Literal"
   const F = Schema.DateTimeUtcFromDate
   const customDate = Schema.Date.pipe(
@@ -204,6 +213,10 @@ const BY_OWNER: ReadonlyArray<
       encode: SchemaGetter.transform((n: number) => new Date(n)),
     }),
   )
+  class WithDate extends Schema.Class<WithDate>("WithDate")({ d: Schema.Date }) {}
+  class WithBigint extends Schema.Class<WithBigint>("WithBigint")({ n: Schema.BigInt }) {}
+  const overItself = <S extends Schema.Top>(from: S) =>
+    from.pipe(Schema.decodeTo(from as never, SchemaTransformation.passthrough() as never))
   const customInstant = Schema.Date.pipe(
     Schema.decodeTo(Schema.DateTimeUtc, {
       decode: SchemaGetter.transform((d: Date) => DateTime.fromDateUnsafe(d)),
@@ -250,6 +263,47 @@ const BY_OWNER: ReadonlyArray<
       undefined,
       date,
     ],
+    [
+      "a redacted value with a decoding default",
+      Schema.Redacted(Schema.String).pipe(
+        Schema.withDecodingDefault(Effect.succeed(Redacted.make("a"))),
+      ),
+      undefined,
+      undefined,
+      redacted,
+    ],
+    [
+      "a date or a string with a decoding default, either way",
+      Schema.Union([Schema.Date, Schema.String]).pipe(
+        Schema.withDecodingDefault(Effect.succeed("a")),
+      ),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a date or null with a decoding default on an optional stored side",
+      Schema.NullOr(Schema.Date).pipe(Schema.withDecodingDefault(Effect.succeed(null))),
+      date,
+      undefined,
+      date,
+    ],
+    [
+      "a date in a struct with a decoding default on an optional stored side",
+      Schema.Struct({ d: Schema.Date }).pipe(
+        Schema.withDecodingDefault(Effect.succeed({ d: new Date(0) })),
+      ),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a date under an Option with a decoding default",
+      Schema.Option(Schema.Date).pipe(Schema.withDecodingDefault(Effect.die("unused"))),
+      date,
+      date,
+      date,
+    ],
 
     ["Schema.Redacted", Schema.Redacted(Schema.String), undefined, undefined, redacted],
     [
@@ -279,9 +333,450 @@ const BY_OWNER: ReadonlyArray<
       undefined,
       bigint,
     ],
-    ["a bigint or null", Schema.NullOr(Schema.BigInt), bigint, bigint, bigint],
-    ["a bigint or undefined", Schema.UndefinedOr(Schema.BigInt), bigint, bigint, bigint],
-    ["a bigint in a union", Schema.Union([Schema.BigInt, Schema.String]), bigint, bigint, bigint],
+    ["a bigint or null", Schema.NullOr(Schema.BigInt), undefined, undefined, bigint],
+    ["a bigint or undefined", Schema.UndefinedOr(Schema.BigInt), undefined, undefined, bigint],
+    [
+      "a bigint in a union",
+      Schema.Union([Schema.BigInt, Schema.String]),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a bigint next to a number",
+      Schema.Union([Schema.Number, Schema.BigInt]),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a bigint in a oneOf union",
+      Schema.Union([Schema.BigInt, Schema.String], { mode: "oneOf" }),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a bigint in a struct or null",
+      Schema.NullOr(Schema.Struct({ n: Schema.BigInt })),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a list of a bigint or null",
+      Schema.Array(Schema.NullOr(Schema.BigInt)),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a bigint or null with a decoding default",
+      Schema.NullOr(Schema.BigInt).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a bigint in a struct with a decoding default",
+      Schema.Struct({ n: Schema.BigInt }).pipe(
+        Schema.withDecodingDefault(Effect.succeed({ n: 0n })),
+      ),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    ["a suspended bigint", Schema.suspend(() => Schema.BigInt), bigint, bigint, bigint],
+    ["a suspended date", Schema.suspend(() => Schema.Date), date, date, date],
+    [
+      "a suspended redacted value",
+      Schema.suspend(() => Schema.Redacted(Schema.String)),
+      redacted,
+      redacted,
+      redacted,
+    ],
+    [
+      "a date in a suspended struct",
+      Schema.suspend(() => Schema.Struct({ d: Schema.Date })),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a date in a struct with a decoding default",
+      Schema.Struct({ d: Schema.Date }).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed({ d: new Date(0) })),
+      ),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a date in a record with a decoding default",
+      Schema.Record(Schema.String, Schema.Date).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed({})),
+      ),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a date in a tuple with a decoding default",
+      Schema.Tuple([Schema.Date]).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed([new Date(0)] as const)),
+      ),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a date or null with a decoding default",
+      Schema.NullOr(Schema.Date).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
+      date,
+      undefined,
+      date,
+    ],
+    [
+      "a field of a date or null with a decoding default",
+      Schema.Struct({
+        x: Schema.NullOr(Schema.Date).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
+      }),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a date or a string with a decoding default",
+      Schema.Union([Schema.Date, Schema.String]).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed("a")),
+      ),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a transformed date or null with a decoding default",
+      Schema.NullOr(F).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a list of dates with a decoding default",
+      Schema.Array(Schema.Date).pipe(Schema.withDecodingDefaultKey(Effect.succeed([]))),
+      undefined,
+      undefined,
+      date,
+    ],
+    [
+      "a list of a date or null with a decoding default",
+      Schema.Array(Schema.NullOr(Schema.Date)).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed([])),
+      ),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a redacted value in a struct with a decoding default",
+      Schema.Struct({ r: Schema.Redacted(Schema.String) }).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed({ r: Redacted.make("a") })),
+      ),
+      redacted,
+      redacted,
+      redacted,
+    ],
+    [
+      "a date in a class with a decoding default",
+      WithDate.pipe(Schema.withDecodingDefaultKey(Effect.succeed({ d: new Date(0) }))),
+      date,
+      date,
+      date,
+    ],
+    ["a date over itself", overItself(Schema.Date), overDate, undefined, overDate],
+    [
+      "a date over itself, or null",
+      Schema.NullOr(overItself(Schema.Date)),
+      overDate,
+      overDate,
+      overDate,
+    ],
+    [
+      "a date over itself with a decoding default",
+      overItself(Schema.Date).pipe(Schema.withDecodingDefault(Effect.die("unused"))),
+      overDate,
+      undefined,
+      overDate,
+    ],
+    ["a bigint over itself", overItself(Schema.BigInt), overBigint, overBigint, overBigint],
+    [
+      "a bigint over itself, or null",
+      Schema.NullOr(overItself(Schema.BigInt)),
+      overBigint,
+      overBigint,
+      overBigint,
+    ],
+    [
+      "a bigint over itself with a decoding default",
+      overItself(Schema.BigInt).pipe(Schema.withDecodingDefault(Effect.die("unused"))),
+      overBigint,
+      overBigint,
+      overBigint,
+    ],
+    [
+      "a bigint in a class with a decoding default",
+      WithBigint.pipe(Schema.withDecodingDefaultKey(Effect.succeed({ n: 0n }))),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a bigint on an optional stored side, decoded to a number",
+      Schema.optionalKey(Schema.BigInt).pipe(
+        Schema.decodeTo(Schema.Number, SchemaTransformation.passthrough() as never),
+      ),
+      overBigint,
+      overBigint,
+      overBigint,
+    ],
+    [
+      "a date on an optional stored side, decoded to something of your own",
+      Schema.optionalKey(Schema.Date).pipe(
+        Schema.decodeTo(
+          Schema.declare((input: unknown): input is number => typeof input === "number"),
+          SchemaTransformation.passthrough() as never,
+        ),
+      ),
+      overDate,
+      overDate,
+      overDate,
+    ],
+    [
+      "a struct with a bigint on an optional stored side, decoded to another struct",
+      Schema.optionalKey(Schema.Struct({ n: Schema.BigInt })).pipe(
+        Schema.decodeTo(
+          Schema.Struct({ x: Schema.String }),
+          SchemaTransformation.passthrough() as never,
+        ),
+      ),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "a struct with a bigint on an optional stored side, decoded to one more field",
+      Schema.optionalKey(Schema.Struct({ n: Schema.BigInt })).pipe(
+        Schema.decodeTo(
+          Schema.Struct({ n: Schema.BigInt, x: Schema.String }),
+          SchemaTransformation.passthrough() as never,
+        ),
+      ),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "a struct with a bigint or a string on an optional stored side, decoded to the struct",
+      Schema.optionalKey(Schema.Union([Schema.Struct({ n: Schema.BigInt }), Schema.String])).pipe(
+        Schema.decodeTo(
+          Schema.Struct({ n: Schema.BigInt }),
+          SchemaTransformation.passthrough() as never,
+        ),
+      ),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "a struct with a bigint and more on an optional stored side, decoded to fewer fields",
+      Schema.optionalKey(Schema.Struct({ n: Schema.BigInt, x: Schema.String })).pipe(
+        Schema.decodeTo(
+          Schema.Struct({ n: Schema.BigInt }),
+          SchemaTransformation.passthrough() as never,
+        ),
+      ),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "a bigint transformed from one on an optional stored side, a node at a time",
+      Schema.optionalKey(Schema.BigInt).pipe(
+        Schema.decodeTo(Schema.BigInt, same),
+        Schema.decodeTo(Schema.BigInt, same),
+      ),
+      overBigint,
+      overBigint,
+      overBigint,
+    ],
+    [
+      "a bigint transformed from one on an optional stored side, in one chain of three",
+      Schema.optionalKey(Schema.BigInt).pipe(
+        Schema.decodeTo(
+          Schema.BigInt.pipe(
+            Schema.decodeTo(Schema.BigInt.pipe(Schema.decodeTo(Schema.BigInt, same)), same),
+          ),
+          same,
+        ),
+      ),
+      overBigint,
+      overBigint,
+      overBigint,
+    ],
+    [
+      "a bigint on an optional stored side that's a transformation itself",
+      Schema.optionalKey(Schema.BigInt.pipe(Schema.decodeTo(Schema.BigInt, same))).pipe(
+        Schema.decodeTo(Schema.BigInt, same),
+      ),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a bigint on an optional stored side that's transformed to a number there",
+      Schema.optionalKey(Schema.BigInt.pipe(Schema.decodeTo(Schema.Number, same))).pipe(
+        Schema.decodeTo(Schema.Number, same),
+      ),
+      overBigint,
+      overBigint,
+      overBigint,
+    ],
+    [
+      "a date on an optional stored side that's transformed to a number there",
+      Schema.optionalKey(Schema.Date.pipe(Schema.decodeTo(Schema.Number, same))).pipe(
+        Schema.decodeTo(Schema.Number, same),
+      ),
+      overDate,
+      overDate,
+      overDate,
+    ],
+    [
+      "a list of bigints or undefined, decoded to the list",
+      Schema.UndefinedOr(Schema.Array(Schema.BigInt)).pipe(
+        Schema.decodeTo(Schema.Array(Schema.BigInt), same),
+      ),
+      undefined,
+      bigint,
+      bigint,
+    ],
+    [
+      "a date or undefined with a decoding default",
+      Schema.UndefinedOr(Schema.Date).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed(undefined)),
+      ),
+      date,
+      undefined,
+      date,
+    ],
+    [
+      "a date or undefined with a decoding default on an optional stored side",
+      Schema.UndefinedOr(Schema.Date).pipe(Schema.withDecodingDefault(Effect.succeed(undefined))),
+      date,
+      undefined,
+      date,
+    ],
+    [
+      "a bigint or undefined with a decoding default",
+      Schema.UndefinedOr(Schema.BigInt).pipe(
+        Schema.withDecodingDefaultKey(Effect.succeed(undefined)),
+      ),
+      undefined,
+      undefined,
+      bigint,
+    ],
+    [
+      "a transformed date, optional, in a struct or null",
+      Schema.NullOr(Schema.Struct({ a: Schema.optional(F) })),
+      overDate,
+      overDate,
+      overDate,
+    ],
+    ["a date in a class", WithDate, undefined, undefined, date],
+    ["a bigint in a class", WithBigint, undefined, undefined, bigint],
+    [
+      "a transformation over a struct with a date",
+      overItself(Schema.Struct({ d: Schema.Date })),
+      date,
+      date,
+      date,
+    ],
+    [
+      "a transformation over a struct with a bigint",
+      overItself(Schema.Struct({ n: Schema.BigInt })),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "a transformation over a struct with a redacted value",
+      overItself(Schema.Struct({ r: Schema.Redacted(Schema.String) })),
+      redacted,
+      redacted,
+      redacted,
+    ],
+    [
+      "a list of dates transformed to one",
+      overItself(Schema.Array(Schema.Date)),
+      undefined,
+      date,
+      date,
+    ],
+    [
+      "a list of bigints transformed to one",
+      overItself(Schema.Array(Schema.BigInt)),
+      undefined,
+      bigint,
+      bigint,
+    ],
+    [
+      "a list of lists of bigints transformed to one",
+      overItself(Schema.Array(Schema.Array(Schema.BigInt))),
+      undefined,
+      bigint,
+      bigint,
+    ],
+    [
+      "a list of a bigint or null transformed to one",
+      overItself(Schema.Array(Schema.NullOr(Schema.BigInt))),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "renamed keys over a date",
+      Schema.Struct({ d: Schema.Date }).pipe(Schema.encodeKeys({ d: "e" })),
+      date,
+      date,
+      date,
+    ],
+    [
+      "an Option from a struct with a bigint or null",
+      Schema.OptionFromNullOr(Schema.Struct({ n: Schema.BigInt })),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "an Option from an optional key's struct with a bigint",
+      Schema.OptionFromOptionalKey(Schema.Struct({ n: Schema.BigInt })),
+      bigint,
+      bigint,
+      bigint,
+    ],
+    [
+      "a map from a record of dates",
+      Schema.Record(Schema.String, Schema.Date).pipe(
+        Schema.decodeTo(Schema.ReadonlyMap(Schema.String, Schema.Date), {
+          decode: SchemaGetter.transform(
+            (r: Readonly<Record<string, Date>>) => new Map(Object.entries(r)),
+          ),
+          encode: SchemaGetter.transform((m: ReadonlyMap<string, Date>) => Object.fromEntries(m)),
+        }),
+      ),
+      date,
+      date,
+      date,
+    ],
     ["a bigint under an Option", Schema.Option(Schema.BigInt), bigint, bigint, bigint],
     ["a bigint in a set", Schema.ReadonlySet(Schema.BigInt), bigint, bigint, bigint],
     ["Schema.DurationFromNanos", Schema.DurationFromNanos, overBigint, overBigint, overBigint],
@@ -301,8 +796,8 @@ const BY_OWNER: ReadonlyArray<
     [
       "a bigint in an optional field, in a struct, or null",
       Schema.NullOr(Schema.Struct({ n: Schema.optional(Schema.BigInt) })),
-      bigint,
-      bigint,
+      undefined,
+      undefined,
       bigint,
     ],
     ["a bigint literal", Schema.Literal(1n), literal, literal, literal],
@@ -369,6 +864,49 @@ describe("[EDD-9125] what depends on what stores it", () => {
       })
     }
   }
+
+  it("says the positions it doesn't reach, and a union isn't one of them for a bigint", () => {
+    const beneath = judged("entity", Schema.Option(Schema.BigInt))
+    expect(beneath).toContain(
+      "isn't under another declaration, a Schema.suspend or a transformation",
+    )
+    expect(beneath).not.toContain("union")
+    expect(judged("entity", Schema.Option(Schema.Date))).toContain(
+      "isn't under another declaration, a Schema.suspend, a transformation or a decoding default on a container",
+    )
+    expect(
+      judged(
+        "entity",
+        Schema.suspend(() => Schema.Redacted(Schema.String)),
+      ),
+    ).toContain(
+      "isn't under another declaration, a Schema.suspend, a transformation or a decoding default on a container",
+    )
+  })
+
+  it("the date encoder's exception is an attribute's own nullable plain date", () => {
+    const defaulted = (field: Schema.Top) =>
+      (field as Schema.Codec<any>).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null)))
+    expect(judged("aggregate", defaulted(Schema.NullOr(Schema.Date)))).toBe("nothing refused")
+    expect(judged("aggregate", defaulted(Schema.NullishOr(Schema.Date)))).toBe("nothing refused")
+    expect(judged("aggregate", defaulted(Schema.NullOr(Schema.Redacted(Schema.String))))).toContain(
+      "a Schema.Redacted",
+    )
+    expect(judged("aggregate", defaulted(Schema.NullOr(Schema.DateTimeUtcFromDate)))).toContain(
+      "a Schema.Date",
+    )
+    expect(judged("aggregate", Schema.Array(defaulted(Schema.NullOr(Schema.Date))))).toContain(
+      "a Schema.Date",
+    )
+    expect(
+      judged(
+        "aggregate",
+        Schema.NullOr(Schema.Date).pipe(
+          Schema.decodeTo(Schema.NullOr(Schema.Date), SchemaTransformation.passthrough() as never),
+        ),
+      ),
+    ).toContain("a transformation over Schema.Date")
+  })
 
   it("says what to use", () => {
     expect(judged("schema", Schema.Date)).toContain(

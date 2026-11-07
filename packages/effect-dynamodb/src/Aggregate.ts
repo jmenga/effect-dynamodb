@@ -41,6 +41,7 @@ import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityCo
 import {
   buildDateTransform,
   containsWireTransform,
+  type DeepSubstitutionOptions,
   matchDateRepresentation,
   optionalField,
   substituteSchemaDeep,
@@ -944,17 +945,32 @@ const buildAttrEncoders = (
     // 2. Encode through the read path's own (substituted, tolerant) schema. A
     //    one-field struct carries the field's optionality and lets `resolveRef`
     //    re-point the field itself, exactly as it does inside `decodeSchema`.
-    const substituted = substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
-      tolerantTransforms: true,
-      resolveRef,
-    }) as unknown as Schema.Codec<any>
-    const encodeSubstituted = Schema.encodeUnknownOption(substituted)
-    const own = ownAttrEncoder(fieldSchema)
-    encoders[field] = (value) => {
-      const encoded = encodeSubstituted({ [field]: value })
-      if (Option.isSome(encoded)) return (encoded.value as Record<string, unknown>)[field]
-      return own(value)
+    const encoderOver = (options: DeepSubstitutionOptions) => {
+      const encode = Schema.encodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+          ...options,
+          tolerantTransforms: true,
+          resolveRef,
+        }) as unknown as Schema.Codec<any>,
+      )
+      return (value: unknown) => {
+        const encoded = encode({ [field]: value })
+        return Option.isSome(encoded)
+          ? Option.some((encoded.value as Record<string, unknown>)[field])
+          : Option.none()
+      }
     }
+    const encodeSubstituted = encoderOver({})
+    // A read reaches beneath a decoding default and this doesn't, and what it takes there isn't
+    // always what the field's own schema takes: a redacted value of another label. What's stored
+    // is the first's; this only keeps such a value from being marshalled as it is.
+    const encodeAsRead = encoderOver({ decodeOnly: true })
+    const own = ownAttrEncoder(fieldSchema)
+    encoders[field] = (value) =>
+      encodeSubstituted(value).pipe(
+        Option.orElse(() => encodeAsRead(value)),
+        Option.getOrElse(() => own(value)),
+      )
   }
   return encoders
 }
@@ -1353,6 +1369,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // such leaf at all (zero overhead).
   const decodeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
     absentReads: true,
   }) as unknown as Schema.Codec<any>
@@ -1362,6 +1379,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // a row written while those checks were not enforced must stay readable.
   const writeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
     enforceChecks: true,
   }) as unknown as Schema.Codec<any>
@@ -1370,6 +1388,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // an `Option` as a tagged object (`Schema.toIso`), and it can hand that straight back.
   const mutatedStateSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
     enforceChecks: true,
     plainStateForms: true,

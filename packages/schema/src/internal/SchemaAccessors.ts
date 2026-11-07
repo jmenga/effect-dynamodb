@@ -364,7 +364,7 @@ const DATE_DOMAINS: ReadonlySet<string | undefined> = new Set([
 
 const PLAIN_DATE: Unreadable = {
   name: "Schema.Date",
-  why: `${NO_LONGER_DECODES}. Only an entity or an aggregate field stores one as a string, and not under another declaration`,
+  why: `${NO_LONGER_DECODES}. An entity or an aggregate stores one as a string only where it reaches it, which isn't under another declaration, a Schema.suspend, a transformation or a decoding default on a container`,
   use: "Schema.DateFromString or Schema.DateFromMillis",
 }
 const TRANSFORMED_DATE: Unreadable = {
@@ -374,12 +374,12 @@ const TRANSFORMED_DATE: Unreadable = {
 }
 const PLAIN_REDACTED: Unreadable = {
   name: "Schema.Redacted",
-  why: "its value isn't stored, and reading it fails. Only an entity or an aggregate field stores the value, and not under another declaration",
+  why: "its value isn't stored, and reading it fails. An entity or an aggregate stores the value only where it reaches it, which isn't under another declaration, a Schema.suspend, a transformation or a decoding default on a container",
   use: "Schema.RedactedFromValue",
 }
 const PLAIN_BIGINT: Unreadable = {
   name: "Schema.BigInt",
-  why: "it's stored as a number, which reads back as a number and no longer decodes. Only an entity or an aggregate field lifts it back, and not under a union or another declaration",
+  why: "it's stored as a number, which reads back as a number and no longer decodes. An entity or an aggregate lifts it back only where it reaches it, which isn't under another declaration, a Schema.suspend or a transformation",
   use: "Schema.BigIntFromString",
 }
 const TRANSFORMED_BIGINT: Unreadable = {
@@ -400,13 +400,24 @@ const BIGINT_LITERAL: Unreadable = {
  */
 export type StoredBy = "entity" | "aggregate" | "schema"
 
+/**
+ * An encoding the owner's substitution can't see through, because the runtime accessors it walks
+ * aren't on the node: a decoding default on a container, seen through only by a read, an
+ * array-to-array transformation on an entity, whose lists it rebuilds, and any other transformation.
+ */
+type EncodingStep = "default" | "list" | "transformation"
+
 interface UnreadableWalk {
   readonly by: StoredBy
   readonly manyEdges: ReadonlySet<string>
   /** The type this node is the encoding of, when it was reached through one. */
   readonly declared: SchemaAST.AST | undefined
-  /** Under another declaration: the substitution doesn't reach it. */
-  readonly inDeclaration: boolean
+  /** The substitution doesn't reach it: see `unreachedBy`. */
+  readonly unreached: boolean
+  /** A read reaches it and a write doesn't, so what's stored is what the schema encodes. */
+  readonly writtenAsIs: boolean
+  /** The encoding this was reached through, if the substitution can't see through it. */
+  readonly beneath: EncodingStep | undefined
   /** Under a union, other than the one `Schema.optional` makes of a field. */
   readonly inUnion: boolean
   /** This field is a `many` edge: its collection is rows, and only the rows are stored. */
@@ -414,32 +425,31 @@ interface UnreadableWalk {
 }
 
 /**
- * Whether a field reached this node by changing type on the way. A decoding default doesn't: it's
- * the same type on both sides, and the owner's substitution sees through it.
+ * Whether a field reached this node through a transformation. A decoding default isn't one, and the
+ * owner's substitution sees through it. A transformation is one even when it ends in the type it
+ * started from, since the owner stores and reads what's beneath it.
  */
-const isTransformed = (ast: SchemaAST.AST, walk: UnreadableWalk): boolean => {
-  const declared = walk.declared
-  if (declared === undefined) return false
-  return declared._tag !== ast._tag || representationIdOf(declared) !== representationIdOf(ast)
-}
+const isTransformed = (walk: UnreadableWalk): boolean =>
+  walk.declared !== undefined && walk.beneath !== "default"
 
 /** Whether this node, on its own, is something this owner can't read back. */
 const unreadableAt = (ast: SchemaAST.AST, walk: UnreadableWalk): Unreadable | undefined => {
-  const substituted = walk.by !== "schema" && !walk.inDeclaration
+  const read = walk.by !== "schema" && !walk.unreached
+  const stored = read && !walk.writtenAsIs
   switch (ast._tag) {
     case "Literal":
       return typeof ast.literal === "bigint" ? BIGINT_LITERAL : undefined
     case "BigInt": {
-      if (isTransformed(ast, walk)) return TRANSFORMED_BIGINT
-      return substituted && !walk.inUnion ? undefined : PLAIN_BIGINT
+      if (isTransformed(walk)) return TRANSFORMED_BIGINT
+      return read ? undefined : PLAIN_BIGINT
     }
     case "Declaration": {
       const id = representationIdOf(ast) ?? ""
       if (id === DATE) {
-        if (isTransformed(ast, walk)) return TRANSFORMED_DATE
-        return substituted ? undefined : PLAIN_DATE
+        if (isTransformed(walk)) return TRANSFORMED_DATE
+        return stored ? undefined : PLAIN_DATE
       }
-      if (id === REDACTED) return substituted ? undefined : PLAIN_REDACTED
+      if (id === REDACTED) return stored ? undefined : PLAIN_REDACTED
       return NEVER_READ_BACK[id]
     }
     default:
@@ -447,20 +457,90 @@ const unreadableAt = (ast: SchemaAST.AST, walk: UnreadableWalk): Unreadable | un
   }
 }
 
+/** A `Schema.Class`'s own encoding step, onto the struct of its fields, which are walked. */
+const isClassStep = (ast: SchemaAST.AST, to: SchemaAST.AST): boolean =>
+  SchemaAST.isDeclaration(ast) && ast.typeParameters[0] === to
+
+/** A union of X and undefined, and nothing else, which is what `Schema.optional(X)` makes of X. */
+const isOptionalOfOne = (ast: SchemaAST.Union): boolean =>
+  ast.types.filter((member) => !SchemaAST.isUndefined(member)).length === 1
+
+/** Whether a stored side has a type's shape: the same kind of node, with the same fields. */
+const sameShape = (type: SchemaAST.AST, stored: SchemaAST.AST): boolean => {
+  if (type._tag !== stored._tag || representationIdOf(type) !== representationIdOf(stored)) {
+    return false
+  }
+  if (!SchemaAST.isObjects(type) || !SchemaAST.isObjects(stored)) return true
+  const names = new Set(stored.propertySignatures.map((property) => property.name))
+  return (
+    type.propertySignatures.length === names.size &&
+    type.propertySignatures.every((property) => names.has(property.name))
+  )
+}
+
+/**
+ * Whether a step onto `to` is a decoding default: the stored side may be absent, it's the same type
+ * on both sides, where `Schema.OptionFromOptionalKey` is a different one, and nothing else changes
+ * it on the way, as a transformation beneath the default would.
+ */
+const isDecodingDefault = (ast: SchemaAST.AST, to: SchemaAST.AST): boolean => {
+  if (to.context?.isOptional !== true) return false
+  const steps = ast.encoding ?? []
+  const type = steps.length === 2 ? steps[0]!.to : ast
+  if (steps.length > 2 || (steps.length === 2 && !isClassStep(ast, type))) return false
+  const sides = SchemaAST.isUnion(to) && isOptionalOfOne(to) ? [to, ...to.types] : [to]
+  return sides.some((side) => sameShape(type, side))
+}
+
+/** The encoding step onto `to`, unless a class's own. */
+const encodingStep = (
+  ast: SchemaAST.AST,
+  to: SchemaAST.AST,
+  walk: UnreadableWalk,
+): EncodingStep | undefined => {
+  if (isClassStep(ast, to) || walk.beneath === "transformation") return walk.beneath
+  if (isDecodingDefault(ast, to)) return "default"
+  return walk.by === "entity" && ast._tag === "Arrays" ? "list" : "transformation"
+}
+
+/** What the children of a container beneath an encoding are. A list stays seen through. */
+const unreachedBy = (walk: UnreadableWalk, list: boolean): Partial<UnreadableWalk> => {
+  if (walk.beneath === undefined || (list && walk.beneath !== "transformation")) return {}
+  return walk.beneath === "default" ? { writtenAsIs: true } : { unreached: true }
+}
+
+/** A plain date or nothing, as an aggregate's date encoder finds it in an attribute's union. */
+const isNullablePlainDate = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isUnion(ast) &&
+  ast.types.every(
+    (member) =>
+      SchemaAST.isNull(member) ||
+      SchemaAST.isUndefined(member) ||
+      (member.encoding === undefined && DATE_DOMAINS.has(representationIdOf(member))),
+  )
+
+/**
+ * A transformation to a date on an aggregate: its date encoder stores the domain value as a string,
+ * whatever the transformation is over, except under a union or another declaration. It finds one
+ * under a decoding default too, in an attribute of the aggregate's own and not deeper.
+ */
+const storedByDateEncoder = (
+  ast: SchemaAST.AST,
+  to: SchemaAST.AST,
+  path: string,
+  walk: UnreadableWalk,
+): boolean => {
+  if (walk.by !== "aggregate" || walk.unreached || walk.inUnion) return false
+  return (
+    DATE_DOMAINS.has(representationIdOf(SchemaAST.toType(ast))) ||
+    (to.context?.isOptional === true && !/[.[]/.test(path) && isNullablePlainDate(ast))
+  )
+}
+
 /**
  * The first thing in this AST that can't be read back, and its path. A cycle through
  * `Schema.suspend` ends where it starts, and a path segment says what kind of value it went through.
  */
-/**
- * A transformation to a date on an aggregate: its date encoder stores the domain value as a string,
- * whatever the transformation is over, except under a union or another declaration.
- */
-const storedByDateEncoder = (ast: SchemaAST.AST, walk: UnreadableWalk): boolean =>
-  walk.by === "aggregate" &&
-  !walk.inDeclaration &&
-  !walk.inUnion &&
-  DATE_DOMAINS.has(representationIdOf(SchemaAST.toType(ast)))
-
 const firstUnreadable = (
   ast: SchemaAST.AST,
   path: string,
@@ -474,17 +554,21 @@ const firstUnreadable = (
     }
     return undefined
   }
-  const child = (at: string): UnreadableWalk => ({
+  const child = (at: string, list = false): UnreadableWalk => ({
     ...walk,
+    ...unreachedBy(walk, list),
     declared: undefined,
     edge: walk.manyEdges.has(at),
   })
   const encoding = ast.encoding
   if (encoding !== undefined) {
-    if (walk.declared === undefined && storedByDateEncoder(ast, walk)) return undefined
-    return firstUnreadable(encoding[encoding.length - 1]!.to, path, seen, {
+    const to = encoding[encoding.length - 1]!.to
+    if (walk.declared === undefined && storedByDateEncoder(ast, to, path, walk)) return undefined
+    const beneath = encodingStep(ast, to, walk)
+    return firstUnreadable(to, path, seen, {
       ...walk,
       declared: SchemaAST.toType(ast),
+      beneath,
     })
   }
   if (!walk.edge) {
@@ -498,20 +582,28 @@ const firstUnreadable = (
         path,
         walk.edge
           ? { ...walk, declared: undefined, edge: false }
-          : { ...walk, declared: undefined, inDeclaration: true },
+          : { ...walk, declared: undefined, unreached: true },
       )
     case "Suspend": {
       if (seen.has(ast)) return undefined
       seen.add(ast)
-      return firstUnreadable(ast.thunk(), path, seen, walk)
+      return firstUnreadable(ast.thunk(), path, seen, { ...walk, unreached: true })
     }
     case "Union":
       return firstIn(ast.types, path, {
         ...walk,
+        // The union `Schema.optional(X)` makes under a default on X, which is X to the substitution.
+        ...(isOptionalOfOne(ast) && walk.declared?._tag !== "Union"
+          ? {}
+          : unreachedBy(walk, false)),
         inUnion: walk.inUnion || ast.context?.isOptional !== true,
       })
     case "Arrays":
-      return firstIn([...ast.elements, ...ast.rest], `${path}[]`, child(`${path}[]`))
+      return firstIn(
+        [...ast.elements, ...ast.rest],
+        `${path}[]`,
+        child(`${path}[]`, ast.elements.length === 0),
+      )
     case "Objects": {
       for (const property of ast.propertySignatures) {
         const name = String(property.name)
@@ -553,7 +645,9 @@ export const refuseUnreadable = (
     by,
     manyEdges: options?.manyEdges ?? new Set(),
     declared: undefined,
-    inDeclaration: false,
+    unreached: false,
+    writtenAsIs: false,
+    beneath: undefined,
     inUnion: false,
     edge: false,
   })
