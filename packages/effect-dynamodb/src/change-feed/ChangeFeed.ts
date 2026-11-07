@@ -106,8 +106,10 @@ export interface ChangeFeedLeaseOptions {
   /**
    * How often the holder renews it. Default a third of `duration`. Must be
    * less than half of `duration` (`[EDD-9083]` otherwise): a renewal the store
-   * fails to write is retried until `renewEvery` before the lease would lapse,
-   * which leaves `duration − 2 × renewEvery` to retry in.
+   * fails to write or doesn't answer is retried until `renewEvery` before the
+   * lease would lapse, which leaves `duration − 2 × renewEvery` to retry in.
+   * Each attempt waits `renewEvery` at most, and three quarters of the time left
+   * until one has gone unanswered, so a retry fits even at the default.
    */
   readonly renewEvery?: Duration.Input | undefined
   /**
@@ -202,8 +204,21 @@ type Position =
       readonly sequenceNumber: string
     }
 
-const isTransient = (error: { readonly _tag: string }): boolean =>
-  error._tag === "ThrottlingError" || error._tag === "InternalServerError"
+/**
+ * A request that timed out, by a timeout the application configured on the
+ * client's handler. Node's handler also names a dropped connection
+ * `TimeoutError`, keeping its `code` (`ECONNRESET`, `EPIPE`). The SDK has already
+ * retried one, and it still ends the feed here, as it always has.
+ */
+const isRequestTimeout = (cause: unknown): boolean => {
+  const { name, code } = (cause ?? {}) as { readonly name?: unknown; readonly code?: unknown }
+  return name === "TimeoutError" && (code === undefined || code === "ETIMEDOUT")
+}
+
+const isTransient = (error: { readonly _tag: string; readonly cause?: unknown }): boolean =>
+  error._tag === "ThrottlingError" ||
+  error._tag === "InternalServerError" ||
+  (error._tag === "DynamoError" && isRequestTimeout(error.cause))
 
 /**
  * A change feed over `options.streamArn`: a `Stream` of {@link ChangeFeedBatch}es.
@@ -293,9 +308,10 @@ const validate = (options: ChangeFeedOptions): void => {
 }
 
 /**
- * `effect`'s answer, or `None` once `limit` has passed. A store call may be stuck
- * somewhere that can't be interrupted, so the call is left to end on its own: this does
- * not wait for it, where `Effect.timeoutOption` would.
+ * `effect`'s answer, or `None` once `limit` has passed, when the call is interrupted, which
+ * on `DynamoClient` aborts its request. A custom store's call may be stuck somewhere that
+ * can't be interrupted, so this does not wait for it to end, where `Effect.timeoutOption`
+ * would.
  */
 const withinTime = <A, E, R>(
   effect: Effect.Effect<A, E, R>,
@@ -408,24 +424,41 @@ const run = (
       /**
        * Renew the lease. A store failure is retried until the lease is about
        * to lapse — `renewEvery` before it expires — and a lease taken over is
-       * not retried; either way the lease counts as lost. A call still
-       * unanswered at that deadline counts as a lease lost too, whatever
-       * happens to the call. A call that starts past the deadline, after the
-       * process stalled, can still find the lease unclaimed: it gets
-       * `renewEvery`.
+       * not retried; either way the lease counts as lost. A call unanswered
+       * after `renewEvery` is abandoned and tried again at once. Until one has
+       * gone unanswered, a call also leaves a quarter of the time left for that
+       * retry: at the default `renewEvery` of a third of `duration`, it could
+       * otherwise wait out the whole `duration − 2 × renewEvery`. A retry needs
+       * little, a fresh connection and a normal answer, and a slow store that
+       * is still answering needs the rest. A call still unanswered at the
+       * deadline counts as a lease lost,
+       * whatever happens to the call. A renewal abandoned here that lands later
+       * is harmless: it is conditional on `owner`, so it can't take the lease
+       * back from a rival or recreate a released one. A call that starts past
+       * the deadline, after the process stalled, can still find the lease
+       * unclaimed: it gets `renewEvery`.
        */
       const renew = Effect.gen(function* () {
-        const deadline = renewedAt + Duration.toMillis(duration) - Duration.toMillis(renewEvery)
+        const every = Duration.toMillis(renewEvery)
+        const deadline = renewedAt + Duration.toMillis(duration) - every
+        let unanswered = false
         for (let attempt = 0; ; attempt++) {
           const at = yield* Clock.currentTimeMillis
+          const left = deadline - at
           const answer = yield* withinTime(
             Effect.result(store.renewLease(feed, owner, duration)),
-            deadline > at ? Duration.millis(deadline - at) : renewEvery,
+            left > 0
+              ? Duration.millis(Math.min(every, unanswered ? left : Math.ceil((left * 3) / 4)))
+              : renewEvery,
           )
           if (Option.isNone(answer)) {
-            return yield* lost(
-              new ChangeFeedLeaseLost({ streamArn, consumer: feed.consumer, owner }),
-            )
+            if ((yield* Clock.currentTimeMillis) >= deadline) {
+              return yield* lost(
+                new ChangeFeedLeaseLost({ streamArn, consumer: feed.consumer, owner }),
+              )
+            }
+            unanswered = true
+            continue
           }
           const result = answer.value
           if (Result.isSuccess(result)) {

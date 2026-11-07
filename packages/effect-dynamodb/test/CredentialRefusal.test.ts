@@ -17,6 +17,7 @@ import { classifyError, DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { REDACTED_REPLY, redactCredentialRefusal } from "../src/internal/CredentialRefusal.js"
 import * as Table from "../src/Table.js"
+import { hang, localServer } from "./helpers/LocalServer.js"
 
 const SESSION_TOKEN = "SENTINEL-SESSION-TOKEN"
 const REQUEST_ID = "REQUEST-186"
@@ -524,4 +525,91 @@ describe("the SDK's $response on an error that keeps its wording", () => {
       expect(traces).toContain("AWS4-HMAC-SHA256")
     }),
   )
+})
+
+// ---------------------------------------------------------------------------
+// #190: a call can now end with no reply at all, or with what a handler passed
+// through a layer threw. Both clients keep those as a `cause` too.
+// ---------------------------------------------------------------------------
+describe("an error from the HTTP handler", () => {
+  type Options = Parameters<typeof DynamoStreamsClient.layer>[0]
+  const clients: Readonly<
+    Record<string, (options: Options) => Effect.Effect<unknown, { readonly _tag: string }>>
+  > = {
+    DynamoClient: (options) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        return yield* client.getItem({ TableName: "t", Key: { pk: { S: "a" } } })
+      }).pipe(Effect.provide(DynamoClient.layer(options))),
+    DynamoStreamsClient: (options) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoStreamsClient
+        return yield* client.listStreams({})
+      }).pipe(Effect.provide(DynamoStreamsClient.layer(options))),
+  }
+
+  for (const [name, call] of Object.entries(clients)) {
+    it.live(`a timeout keeps the SDK's error and no token, from ${name}`, () =>
+      Effect.gen(function* () {
+        const server = yield* localServer(() => hang)
+        const timedOut = Effect.flip(
+          call({
+            region: "us-east-1",
+            endpoint: server.endpoint,
+            credentials,
+            requestHandler: { socketTimeout: 30 },
+            maxAttempts: 1,
+          }),
+        )
+        let error = yield* timedOut
+        // Under load the socket can time out before the server has read the request.
+        while (server.requests.length === 0) error = yield* timedOut
+        // Not vacuous: the token went out on a request that timed out.
+        expect(server.requests[0]?.headers["x-amz-security-token"]).toBe(SESSION_TOKEN)
+        expect(error._tag).toBe("DynamoError")
+        expect((rootOf(error) as SdkError).name).toBe("TimeoutError")
+        expect((rootOf(error) as SdkError).message).not.toBe(REDACTED_REPLY)
+        for (const text of renderings(error)) expect(text).not.toContain(SESSION_TOKEN)
+      }),
+    )
+
+    it.live(`a handler's error quoting the token is redacted, from ${name}`, () =>
+      Effect.gen(function* () {
+        const handler = {
+          metadata: { handlerProtocol: "http/1.1" },
+          handle: () =>
+            Promise.reject(
+              Object.assign(new Error(QUOTED_REQUEST(SESSION_TOKEN)), { name: "TimeoutError" }),
+            ),
+          destroy: () => {},
+          updateHttpClientConfig: () => {},
+          httpHandlerConfigs: () => ({}),
+        }
+        const error = yield* Effect.flip(
+          call({
+            region: "us-east-1",
+            endpoint: "http://127.0.0.1:1",
+            credentials,
+            requestHandler: handler as never,
+            maxAttempts: 1,
+          }),
+        )
+        expect(error._tag).toBe("DynamoError")
+        expect((rootOf(error) as SdkError).message).toBe(REDACTED_REPLY)
+        for (const text of renderings(error)) expect(text).not.toContain(SESSION_TOKEN)
+      }),
+    )
+  }
+
+  it("an abort and a closed client's refusal keep no token, from both classifiers", () => {
+    const errors = ["AbortError", "ClientClosedError"].map((name) =>
+      Object.assign(new Error("Request aborted"), { name }),
+    )
+    for (const error of errors) {
+      for (const classified of [classifyError("Op")(error), classifyStreamsError("Op")(error)]) {
+        expect(classified._tag).toBe("DynamoError")
+        for (const text of renderings(classified)) expect(text).not.toContain(SESSION_TOKEN)
+      }
+    }
+  })
 })

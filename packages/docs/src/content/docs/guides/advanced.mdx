@@ -1,9 +1,9 @@
 ---
 title: "Advanced Topics"
-description: "Rich updates, batch operations, multi-table design, and expression builders"
+description: "Rich updates, batch operations, multi-table design, expression builders, timeouts and cancelling requests"
 ---
 
-This guide covers rich update operations, batch operations, multi-table design, and the low-level expression builder API.
+This guide covers rich update operations, batch operations, multi-table design, the low-level expression builder API, and timeouts and cancelling requests.
 
 ## Updating Items
 
@@ -284,6 +284,111 @@ const upd = Expression.update({
 ```
 
 See the [Expressions Guide](/effect-dynamodb/guides/expressions/) for the complete reference with DynamoDB mapping tables, all operators, and PathBuilder documentation.
+
+## Timeouts and Cancelling Requests
+
+The AWS SDK sets no request timeout by default, so a connection that stays open and never answers keeps the call waiting, for good. Two things end that wait: a timeout on the HTTP handler, and interrupting the fiber.
+
+### Setting Timeouts
+
+`DynamoClient.layer` and `DynamoStreamsClient.layer` pass `requestHandler` and `maxAttempts` to the SDK client. The library sets no default for either, so what you leave out stays the SDK's.
+
+```typescript region="request-timeouts" example="guide-advanced.ts"
+const WithTimeouts = DynamoClient.layer({
+  region: "us-east-1",
+  endpoint,
+  credentials,
+  requestHandler: {
+    connectionTimeout: 1_000, // to open the connection
+    socketTimeout: 5_000, // with no bytes moving on it
+  },
+  maxAttempts: 2, // the first included
+})
+```
+
+A plain object is handed to the SDK, whose build for your runtime makes its own HTTP handler from it. The library imports no handler, so the options you can use depend on where you run:
+
+| Option | Node and Bun (`NodeHttpHandler`) | Browsers and Workers (`FetchHttpHandler`) |
+|---|---|---|
+| `connectionTimeout` | Time to open the connection | Not available |
+| `socketTimeout` | Time with no bytes moving on the socket | Not available |
+| `requestTimeout` | **Only logs a warning**, unless `throwOnRequestTimeout` is set | Fails the attempt. The `fetch` itself runs on until the fiber is interrupted |
+| `throwOnRequestTimeout` | Makes `requestTimeout` fail the attempt | Not available |
+
+Or pass a handler you built, for agents or a logger. A handler you pass is destroyed with the layer.
+
+A timeout is an attempt like any other, and the SDK retries it: with its default of 3 attempts, `socketTimeout: 100` fails after about 400 ms. The call then fails with a `DynamoError` whose `cause` is the SDK's error, named `TimeoutError`. On Node the SDK gives that name to a dropped connection too, so `cause.code` tells them apart: `ECONNRESET` or `EPIPE` for a connection that dropped, and for a timeout `ETIMEDOUT` or nothing at all.
+
+`layerConfig` reads `maxAttempts` and the handler's timeouts through `Config`, because they are what an operator tunes per environment. One the provider doesn't hold stays unset, and one that doesn't parse fails the layer with its `ConfigError`. A handler instance holds code, so it is passed as itself.
+
+```typescript region="request-timeouts-config" example="guide-advanced.ts"
+const FromConfig = DynamoClient.layerConfig({
+  region: Config.String("AWS_REGION").pipe(Config.withDefault("us-east-1")),
+  endpoint: Config.succeed(endpoint),
+  credentials: Config.succeed(credentials),
+  requestHandler: {
+    connectionTimeout: Config.Int("DYNAMODB_CONNECTION_TIMEOUT_MS"),
+    socketTimeout: Config.Int("DYNAMODB_SOCKET_TIMEOUT_MS"),
+  },
+  maxAttempts: Config.Int("DYNAMODB_MAX_ATTEMPTS"),
+})
+```
+
+### Cancelling a Request
+
+Every operation passes Effect's abort signal to the SDK, so interrupting the fiber ends the request. That covers `Effect.timeout`, a sibling failing in `Effect.all`, and a `Stream` whose scope closes. The connection closes, the SDK makes no further attempt, and the fiber does not wait for an answer. The connection can't be reused afterwards, so the next request opens a new one.
+
+```typescript region="cancel-request" example="guide-advanced.ts"
+// Past 5 seconds this interrupts the call, which aborts its request.
+const answered = yield* db.entities.Products.get({ productId: "p-1" }).pipe(
+  Effect.timeoutOption("5 seconds"),
+)
+```
+
+An interrupted request counts once in [consumed capacity](/effect-dynamodb/guides/consumed-capacity/), under `unreportedRequests`, since no capacity came back for it.
+
+### Aborting Ends the Wait, Not the Request
+
+A write already sent may still be applied. The caller sees the same interrupt or timeout either way, and the library can't tell which it was, so a caller who needs to know has to settle it. Write so that doing it twice is safe, and do it again:
+
+```typescript region="settle-write" example="guide-advanced.ts"
+const order = {
+  productId: "p-order-1",
+  name: "Ordered",
+  price: 10,
+  stock: 1,
+  viewCount: 0,
+  tags: [],
+  category: "orders",
+  categories: new Set(["orders"]),
+}
+const create = db.entities.Products.create(order).asEffect()
+
+const first = yield* create.pipe(Effect.timeoutOption("5 seconds"))
+if (Option.isNone(first)) {
+  // The wait ended, not the request: the write may have been applied or may still be.
+  // Writing again settles it, because only one create can succeed.
+  yield* create.pipe(
+    Effect.catchTag("ConditionalCheckFailed", () =>
+      Effect.logInfo("The first attempt had been applied"),
+    ),
+  )
+}
+```
+
+What settles it depends on the write:
+
+- **`create`, or any `.condition()`:** the retry fails with `ConditionalCheckFailed` if the first was applied.
+- **`.expectedVersion(n)`:** the retry fails with `OptimisticLockError` if the first moved the version on.
+- **`Transaction.transactWrite`:** a conditioned item makes the retry fail with `TransactionCancelled`.
+- **`EventStream.append`:** the retry at the same `expectedVersion` fails with `VersionConflict`.
+- **`commandHandler` with `idempotency`:** the retry with the same `commandId` fails with `DuplicateCommand`.
+
+A plain `put` or an unconditional `update` has nothing to settle it with. Applying it again is safe when it writes the same values, and an `.add()` is applied twice.
+
+### When the Layer Closes
+
+A request in flight when the layer's scope closes has its connection closed by the client's `destroy()`. The SDK would take that for a dropped connection and send the request again on a new one, so the layer stops it: the request fails with a `DynamoError` whose `cause` is named `ClientClosedError`, and a write it carried may still have been applied. A fiber interrupted before the scope closes has aborted its request already. A request sent after the scope closed still goes out, since the SDK client stays usable.
 
 ## What's Next?
 

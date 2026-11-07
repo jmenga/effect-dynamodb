@@ -33,6 +33,12 @@ import {
   ThrottlingError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Config, Context, Effect, Layer } from "effect"
+import {
+  acquireSdkClient,
+  type ClientOptions,
+  type ClientOptionsFromConfig,
+  readClientOptions,
+} from "../internal/ClientOptions.js"
 import { redactCredentialRefusal } from "../internal/CredentialRefusal.js"
 import { ShardIteratorExpired, StreamDataTrimmed } from "./Errors.js"
 
@@ -92,16 +98,22 @@ export const classifyStreamsError =
 
 type Credentials = { readonly accessKeyId: string; readonly secretAccessKey: string }
 
-/** Static client configuration accepted by {@link DynamoStreamsClient.layer}. */
-export interface DynamoStreamsClientConfig {
+/**
+ * Static client configuration accepted by {@link DynamoStreamsClient.layer}, with
+ * the HTTP handler's options and `maxAttempts`, as `DynamoClient.layer` takes them.
+ */
+export interface DynamoStreamsClientConfig extends ClientOptions {
   readonly region: string
   /** Endpoint override — DynamoDB Local serves the Streams API on its own endpoint. */
   readonly endpoint?: string | undefined
   readonly credentials?: Credentials | undefined
 }
 
-/** Config-provider configuration accepted by {@link DynamoStreamsClient.layerConfig}. */
-export interface DynamoStreamsClientConfigFromConfig {
+/**
+ * Config-provider configuration accepted by {@link DynamoStreamsClient.layerConfig},
+ * with the handler's timeouts and `maxAttempts`, as `DynamoClient.layerConfig` takes them.
+ */
+export interface DynamoStreamsClientConfigFromConfig extends ClientOptionsFromConfig {
   readonly region: Config.Config<string>
   readonly endpoint?: Config.Config<string> | undefined
   readonly credentials?: Config.Config<Credentials> | undefined
@@ -111,22 +123,22 @@ export interface DynamoStreamsClientConfigFromConfig {
 export const fromSdkClient = (client: DynamoDBStreamsClient): DynamoStreamsClientService => ({
   describeStream: (input) =>
     Effect.tryPromise({
-      try: () => client.send(new DescribeStreamCommand(input)),
+      try: (signal) => client.send(new DescribeStreamCommand(input), { abortSignal: signal }),
       catch: classifyStreamsError("DescribeStream"),
     }),
   getShardIterator: (input) =>
     Effect.tryPromise({
-      try: () => client.send(new GetShardIteratorCommand(input)),
+      try: (signal) => client.send(new GetShardIteratorCommand(input), { abortSignal: signal }),
       catch: classifyStreamsError("GetShardIterator"),
     }),
   getRecords: (input) =>
     Effect.tryPromise({
-      try: () => client.send(new GetRecordsCommand(input)),
+      try: (signal) => client.send(new GetRecordsCommand(input), { abortSignal: signal }),
       catch: classifyStreamsError("GetRecords"),
     }),
   listStreams: (input) =>
     Effect.tryPromise({
-      try: () => client.send(new ListStreamsCommand(input)),
+      try: (signal) => client.send(new ListStreamsCommand(input), { abortSignal: signal }),
       catch: classifyStreamsError("ListStreams"),
     }),
 })
@@ -135,15 +147,15 @@ const buildService = (
   region: string,
   endpoint: string | undefined,
   credentials: Credentials | undefined,
+  options: ClientOptions,
 ) =>
   Effect.gen(function* () {
     const clientConfig: ConstructorParameters<typeof DynamoDBStreamsClient>[0] = { region }
     if (endpoint !== undefined) clientConfig.endpoint = endpoint
     if (credentials !== undefined) clientConfig.credentials = credentials
-    const client = yield* Effect.acquireRelease(
-      Effect.sync(() => new DynamoDBStreamsClient(clientConfig)),
-      (c) => Effect.sync(() => c.destroy()),
-    )
+    if (options.requestHandler !== undefined) clientConfig.requestHandler = options.requestHandler
+    if (options.maxAttempts !== undefined) clientConfig.maxAttempts = options.maxAttempts
+    const client = yield* acquireSdkClient(() => new DynamoDBStreamsClient(clientConfig))
     return fromSdkClient(client)
   })
 
@@ -168,10 +180,10 @@ export class DynamoStreamsClient extends Context.Service<
   static readonly layer = (config: DynamoStreamsClientConfig): Layer.Layer<DynamoStreamsClient> =>
     Layer.effect(
       DynamoStreamsClient,
-      buildService(config.region, config.endpoint, config.credentials),
+      buildService(config.region, config.endpoint, config.credentials, config),
     )
 
-  /** A layer over an SDK client you construct and own (custom configuration). */
+  /** A layer over an SDK client you construct and own. */
   static readonly layerFromSdkClient = (
     client: DynamoDBStreamsClient,
   ): Layer.Layer<DynamoStreamsClient> => Layer.succeed(DynamoStreamsClient, fromSdkClient(client))
@@ -188,10 +200,12 @@ export class DynamoStreamsClient extends Context.Service<
         const credentials = config.credentials
           ? yield* Config.option(config.credentials)
           : undefined
+        const options = yield* readClientOptions(config)
         return yield* buildService(
           region,
           endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
           credentials && credentials._tag === "Some" ? credentials.value : undefined,
+          options,
         )
       }),
     )
