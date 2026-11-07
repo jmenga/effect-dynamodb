@@ -716,6 +716,8 @@ const nextPage = yield* Option.match(completed.cursor, {
 })
 ```
 
+A cursor is opaque and belongs to the list that returned it. A cursor `list` can't decode fails with a `ValidationError` (`EDD-9094`, `operation: "list"`) before anything is sent, and so does an empty string. `list` can't tell another list's well-formed cursor from its own: DynamoDB may reject it, failing with a `DynamoValidationError`, or the list resumes from wherever the cursor points.
+
 ```typescript region="list-reverse" example="guide-aggregates.ts"
 const latest = yield* TournamentMatchAggregate.list(
   { tournament: "bgt-2025" },
