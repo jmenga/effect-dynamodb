@@ -377,20 +377,10 @@ const PLAIN_REDACTED: Unreadable = {
   why: "its value isn't stored, and reading it fails. An entity or an aggregate stores the value only where it reaches it, which isn't under another declaration, a Schema.suspend, a transformation or a decoding default on a container",
   use: "Schema.RedactedFromValue",
 }
-const PLAIN_BIGINT: Unreadable = {
-  name: "Schema.BigInt",
-  why: "it's stored as a number, which reads back as a number and no longer decodes. An entity or an aggregate lifts it back only where it reaches it, which isn't under another declaration, a Schema.suspend or a transformation",
-  use: "Schema.BigIntFromString",
-}
 const BIGINT_BESIDE_A_NUMBER: Unreadable = {
   name: "a union of Schema.BigInt and something else stored as a number",
   why: "5n and 5 are stored the same, so a read can't tell which one was written",
   use: "Schema.BigIntFromString",
-}
-const TRANSFORMED_BIGINT: Unreadable = {
-  name: "a transformation over Schema.BigInt, such as Schema.DurationFromNanos or Schema.ByteSizeFromBigInt",
-  why: "it's stored as a number, which reads back as a number and no longer decodes",
-  use: "a transformation over a string or a number, such as Schema.DurationFromMillis or Schema.ByteSizeFromString",
 }
 const BIGINT_LITERAL: Unreadable = {
   name: "a bigint Schema.Literal",
@@ -400,8 +390,8 @@ const BIGINT_LITERAL: Unreadable = {
 
 /**
  * What stores a schema. An entity's or an aggregate's fields are substituted before they're
- * marshalled, so a date, a redacted value and a plain bigint read back there; a stream, a snapshot
- * and an outbox encode through the schema alone, and a read lifts a date and a bigint.
+ * marshalled, so a date and a redacted value read back there; a stream, a snapshot and an outbox
+ * encode through the schema alone, and a read lifts a date. Every owner lifts a bigint.
  */
 export type StoredBy = "entity" | "aggregate" | "schema"
 
@@ -439,15 +429,10 @@ const isTransformed = (walk: UnreadableWalk): boolean =>
 
 /** Whether this node, on its own, is something this owner can't read back. */
 const unreadableAt = (ast: SchemaAST.AST, walk: UnreadableWalk): Unreadable | undefined => {
-  const read = walk.by !== "schema" && !walk.unreached
-  const stored = read && !walk.writtenAsIs
+  const stored = walk.by !== "schema" && !walk.unreached && !walk.writtenAsIs
   switch (ast._tag) {
     case "Literal":
       return typeof ast.literal === "bigint" ? BIGINT_LITERAL : undefined
-    case "BigInt": {
-      if (isTransformed(walk)) return TRANSFORMED_BIGINT
-      return read || walk.by === "schema" ? undefined : PLAIN_BIGINT
-    }
     case "Declaration": {
       const id = representationIdOf(ast) ?? ""
       if (id === DATE) {
@@ -499,6 +484,78 @@ const storedKind = (ast: SchemaAST.AST): string =>
           ? "boolean"
           : ast._tag
 
+/** Whether a struct's map is one a struct takes: it has every field the struct requires. */
+const hasFieldsOf = (writer: SchemaAST.Objects, taker: SchemaAST.Objects): boolean =>
+  taker.propertySignatures.every(
+    (theirs) =>
+      SchemaAST.isOptional(theirs.type) ||
+      writer.indexSignatures.length > 0 ||
+      writer.propertySignatures.some((mine) => mine.name === theirs.name),
+  )
+
+const storedMap = (
+  tag: string,
+  marker: string,
+  fields: Readonly<Record<string, SchemaAST.AST>>,
+): SchemaAST.Objects =>
+  Schema.Struct({
+    _op: Schema.String,
+    _tag: Schema.Literal(tag),
+    [marker]: Schema.Struct({}),
+    ...Object.fromEntries(
+      Object.entries(fields).map(([name, ast]) => [name, Schema.make<Schema.Top>(ast)]),
+    ),
+  }).ast
+
+/**
+ * The maps the marshaller makes of a declaration, where one holds a value in it. A struct takes a
+ * stored value by its fields, so these say which structs take one of these for their own.
+ */
+const STORED_MAPS: Readonly<
+  Record<string, (parameters: ReadonlyArray<SchemaAST.AST>) => ReadonlyArray<SchemaAST.Objects>>
+> = {
+  "effect/schema/Option": ([value]) => [
+    storedMap("Some", "~effect/Option", { value: value! }),
+    storedMap("None", "~effect/Option", {}),
+  ],
+  "effect/schema/Result": ([success, failure]) => [
+    storedMap("Success", "~effect/Result", { success: success! }),
+    storedMap("Failure", "~effect/Result", { failure: failure! }),
+  ],
+}
+
+const storedMapsOf = (ast: SchemaAST.Declaration) =>
+  STORED_MAPS[representationIdOf(ast) ?? ""]?.(ast.typeParameters)
+
+/**
+ * Whether a struct declares a marker. Each of Effect's declarations looks for its marker or a class,
+ * and none takes any other map or a primitive (measured, each of them), so a struct's map is one of
+ * theirs only with a marker in it.
+ */
+const declaresMarker = (ast: SchemaAST.Objects): boolean =>
+  ast.propertySignatures.some(
+    (property) => typeof property.name === "string" && property.name.startsWith("~effect/"),
+  )
+
+/**
+ * Whether a stored value could be one both a declaration of Effect's and this take. What a struct
+ * takes of one depends on the map it's stored as. Two declarations, or a struct beside a declaration
+ * whose map isn't known, count.
+ */
+const declarationCouldBe = (
+  declaration: SchemaAST.Declaration,
+  other: SchemaAST.AST,
+  seen: ReadonlySet<SchemaAST.AST>,
+): boolean => {
+  if (SchemaAST.isDeclaration(other)) return true
+  if (!SchemaAST.isObjects(other)) return false
+  const maps = storedMapsOf(declaration)
+  return (
+    maps === undefined ||
+    maps.some((map) => hasFieldsOf(map, other) && couldBeBoth(map, other, seen))
+  )
+}
+
 /** Whether a stored value could be one both of these take. What can't be told apart counts. */
 const couldBeBoth = (
   a: SchemaAST.AST,
@@ -512,23 +569,43 @@ const couldBeBoth = (
   if (SchemaAST.isUnion(l)) return l.types.some((type) => couldBeBoth(type, r, within))
   if (SchemaAST.isUnion(r)) return r.types.some((type) => couldBeBoth(l, type, within))
   if (takesAnything(l) || takesAnything(r)) return true
-  if (SchemaAST.isDeclaration(l) || SchemaAST.isDeclaration(r)) return true
+  if (SchemaAST.isDeclaration(l)) return declarationCouldBe(l, r, within)
+  if (SchemaAST.isDeclaration(r)) return declarationCouldBe(r, l, within)
   if (SchemaAST.isLiteral(l) && SchemaAST.isLiteral(r)) return l.literal === r.literal
   if (SchemaAST.isObjects(l) && SchemaAST.isObjects(r)) {
-    return l.propertySignatures.every((property) => {
-      const other = r.propertySignatures.find((candidate) => candidate.name === property.name)
-      return (
-        other === undefined ||
-        (SchemaAST.isOptional(property.type) && SchemaAST.isOptional(other.type)) ||
-        couldBeBoth(property.type, other.type, within)
+    // A record takes a field its values could be, and a key it doesn't cover says nothing.
+    const fitsRecord = (fields: SchemaAST.Objects, record: SchemaAST.Objects) =>
+      fields.propertySignatures.every(
+        (property) =>
+          SchemaAST.isOptional(property.type) ||
+          record.propertySignatures.some((named) => named.name === property.name) ||
+          record.indexSignatures.every(
+            (index) =>
+              !SchemaAST.isString(index.parameter) ||
+              couldBeBoth(property.type, index.type, within),
+          ),
       )
-    })
+    return (
+      fitsRecord(l, r) &&
+      fitsRecord(r, l) &&
+      l.propertySignatures.every((property) => {
+        const other = r.propertySignatures.find((candidate) => candidate.name === property.name)
+        return (
+          other === undefined ||
+          (SchemaAST.isOptional(property.type) && SchemaAST.isOptional(other.type)) ||
+          couldBeBoth(property.type, other.type, within)
+        )
+      })
+    )
   }
   return storedKind(l) === storedKind(r)
 }
 
 /** Whether a stored side holds a plain bigint anywhere. */
-const holdsPlainBigint = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST>): boolean => {
+export const holdsPlainBigint = (
+  ast: SchemaAST.AST,
+  seen: ReadonlySet<SchemaAST.AST> = new Set(),
+): boolean => {
   const found = forced(ast, seen)
   if (found === undefined) return false
   const { node } = found
@@ -554,14 +631,17 @@ const holdsPlainBigint = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST>):
 }
 
 /**
- * Whether a value `holder` stores with a number in a plain bigint's place is one `other` takes and
- * keeps as a number. A read has nothing to tell them apart by, whichever is declared first. Two
- * structs apart on a field, as tagged events are, or a field `other` requires and `holder` hasn't,
- * can't be confused. What can't be told apart counts.
+ * Whether a number can end up on the wrong side of a plain bigint, between two members of a union.
+ * The bigint is lifted where it sits and a union tries its members in order, so whichever of the two
+ * comes `first` takes what the other stored, if it has what the first requires: a bigint's number
+ * kept as a number, or another member's number lifted to a bigint. Two structs apart on a field, as
+ * tagged events are, can't. A value lost to an earlier member that has no place for it isn't this:
+ * a union of anything does that. What can't be told apart counts.
  */
 const confusesItsBigint = (
   holder: SchemaAST.AST,
   other: SchemaAST.AST,
+  first: boolean,
   seen: ReadonlySet<SchemaAST.AST>,
 ): boolean => {
   const left = forced(holder, seen)
@@ -569,11 +649,11 @@ const confusesItsBigint = (
   if (left === undefined || right === undefined) return false
   const [l, r, within] = [left.node, right.node, right.seen]
   const confused = (mine: SchemaAST.AST, theirs: SchemaAST.AST) =>
-    confusesItsBigint(mine, theirs, within)
+    confusesItsBigint(mine, theirs, first, within)
   if (SchemaAST.isUnion(l)) return l.types.some((type) => confused(type, r))
   if (SchemaAST.isUnion(r)) return r.types.some((type) => confused(l, type))
   if (SchemaAST.isBigInt(l)) return isNumeric(r) || takesAnything(r)
-  if (takesAnything(r)) return holdsPlainBigint(l, new Set())
+  if (takesAnything(r)) return !(first && SchemaAST.isDeclaration(l)) && holdsPlainBigint(l)
   if (SchemaAST.isArrays(l)) {
     if (!SchemaAST.isArrays(r)) return false
     const fixed = Math.min(l.elements.length, r.elements.length)
@@ -588,12 +668,12 @@ const confusesItsBigint = (
     )
   }
   if (SchemaAST.isObjects(l)) {
-    if (SchemaAST.isDeclaration(r)) return holdsPlainBigint(l, new Set())
+    if (SchemaAST.isDeclaration(r)) {
+      if (!first) return declaresMarker(l) && holdsPlainBigint(l)
+      return storedMapsOf(r)?.some((map) => confused(l, map)) ?? false
+    }
     if (!SchemaAST.isObjects(r)) return false
-    const writes = (name: PropertyKey) =>
-      l.indexSignatures.length > 0 || l.propertySignatures.some((mine) => mine.name === name)
-    const required = r.propertySignatures.filter((theirs) => !SchemaAST.isOptional(theirs.type))
-    if (!required.every((theirs) => writes(theirs.name)) || !couldBeBoth(l, r, new Set())) {
+    if (!(first ? hasFieldsOf(r, l) : hasFieldsOf(l, r)) || !couldBeBoth(l, r, new Set())) {
       return false
     }
     const records = r.indexSignatures.map((signature) => signature.type)
@@ -612,7 +692,12 @@ const confusesItsBigint = (
     )
   }
   if (SchemaAST.isDeclaration(l)) {
-    if (SchemaAST.isObjects(r)) return holdsPlainBigint(l, new Set())
+    if (SchemaAST.isObjects(r)) {
+      if (first) return declaresMarker(r) && holdsPlainBigint(l)
+      if (isSetDeclaration(l)) return false
+      const maps = storedMapsOf(l)
+      return maps === undefined ? holdsPlainBigint(l) : maps.some((map) => confused(map, r))
+    }
     return (
       SchemaAST.isDeclaration(r) &&
       representationIdOf(l) === representationIdOf(r) &&
@@ -625,12 +710,20 @@ const confusesItsBigint = (
   return false
 }
 
-/** Whether a union's members hold a bigint that another member would read as a number. */
+/**
+ * Whether a union's members can confuse a bigint with a number. A `oneOf` tries every member, so
+ * neither comes first and a value two of them take fails the read.
+ */
 const hasBigintBesideANumber = (union: SchemaAST.Union): boolean => {
   const members = union.types.map((member) => SchemaAST.toEncoded(member))
   return members.some((holder, at) =>
     members.some(
-      (other, position) => position !== at && confusesItsBigint(holder, other, new Set()),
+      (other, position) =>
+        position !== at &&
+        (union.options?.mode === "oneOf"
+          ? confusesItsBigint(holder, other, true, new Set()) ||
+            confusesItsBigint(holder, other, false, new Set())
+          : confusesItsBigint(holder, other, at < position, new Set())),
     ),
   )
 }
@@ -661,7 +754,7 @@ const sameShape = (type: SchemaAST.AST, stored: SchemaAST.AST): boolean => {
  * on both sides, where `Schema.OptionFromOptionalKey` is a different one, and nothing else changes
  * it on the way, as a transformation beneath the default would.
  */
-const isDecodingDefault = (ast: SchemaAST.AST, to: SchemaAST.AST): boolean => {
+export const isDecodingDefault = (ast: SchemaAST.AST, to: SchemaAST.AST): boolean => {
   if (to.context?.isOptional !== true) return false
   const steps = ast.encoding ?? []
   const type = steps.length === 2 ? steps[0]!.to : ast
@@ -768,7 +861,10 @@ const firstUnreadable = (
       return firstUnreadable(ast.thunk(), path, seen, { ...walk, unreached: true })
     }
     case "Union": {
-      if (walk.by === "schema" && hasBigintBesideANumber(ast)) {
+      // Where the substitution reaches a union, every member gets its try as declared and only a
+      // number none of them takes is lifted. Anywhere else the lift is on the bigint itself.
+      const lifted = walk.by === "schema" || walk.unreached || walk.beneath === "transformation"
+      if (lifted && hasBigintBesideANumber(ast)) {
         return { at: path, what: BIGINT_BESIDE_A_NUMBER }
       }
       const members: UnreadableWalk = {

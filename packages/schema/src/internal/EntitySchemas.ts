@@ -26,7 +26,9 @@ import {
   absentReading,
   firstTypeParameterAst,
   getSchemaFields,
+  holdsPlainBigint,
   holdsUndefined,
+  isDecodingDefault,
   isSchemaLike,
   numericTypeWithStringEncoding,
   rowCanLack,
@@ -1477,6 +1479,11 @@ const decodingDefaultField = (
       /** The field beneath the step with its runtime accessors, without a check added after the step. */
       readonly declared: Schema.Top
       readonly rewrap: (s: Schema.Top) => Schema.Top
+      /**
+       * The step is a transformation: it goes onto another type, as `Schema.OptionFromOptional` does,
+       * or what it comes from has an encoding of its own, which `rewrap` wouldn't keep.
+       */
+      readonly transforms: boolean
     }
   | undefined => {
   const ast = field.ast
@@ -1506,6 +1513,7 @@ const decodingDefaultField = (
     SchemaAST.isUnion(lastTo) && lastTo.types.some((t) => SchemaAST.isUndefined(t))
   return {
     inner,
+    transforms: !isDecodingDefault(ast, lastTo) || lastTo.encoding !== undefined,
     declared: (field as { readonly to?: Schema.Top }).to ?? inner,
     rewrap: (substitute) => {
       const encodedSide = Schema.toEncoded(substitute as Schema.Codec<any>)
@@ -1634,6 +1642,10 @@ const liftsBigInts = (opts: DeepSubstitutionOptions | undefined) =>
 const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | undefined) =>
   liftsBigInts(opts) && isSelfBigInt(schema)
 
+/** Whether what's stored for a schema the substitution can't walk holds a plain `Schema.BigInt`. */
+const holdsUnwalkedBigInt = (schema: Schema.Top): boolean =>
+  holdsPlainBigint(SchemaAST.toEncoded(schema.ast))
+
 /** Whether a plain `Schema.BigInt` is anywhere the substitution walks. */
 const holdsBigInt = (schema: Schema.Top): boolean => {
   const opt = optionalField(schema)
@@ -1647,7 +1659,9 @@ const holdsBigInt = (schema: Schema.Top): boolean => {
     return element !== undefined && holdsBigInt(element)
   }
   const fields = schemaFieldsOf(schema)
-  return fields !== undefined && Object.values(fields).some((field) => holdsBigInt(field))
+  return fields === undefined
+    ? holdsUnwalkedBigInt(schema)
+    : Object.values(fields).some((field) => holdsBigInt(field))
 }
 
 /**
@@ -1797,7 +1811,10 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   }
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
-    return needsDeepSubstitution(beneathDefault(schema, defaulted, opts), opts)
+    return (
+      (defaulted.transforms && liftsBigInts(opts) && holdsUnwalkedBigInt(schema)) ||
+      needsDeepSubstitution(beneathDefault(schema, defaulted, opts), opts)
+    )
   }
   if (isSelfDateSchema(schema)) return true
   if (opts?.tolerantTransforms && isDateTransform(schema)) return true
@@ -1828,7 +1845,7 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
       return needsDeepSubstitution(refTarget ?? field, deeper)
     })
   }
-  return false
+  return liftsBigInts(opts) && holdsUnwalkedBigInt(schema)
 }
 
 /**
@@ -1937,8 +1954,13 @@ export const substituteSchemaDeep = (
   }
   // A decoding default (or any optional-encoded step) on top: substitute the
   // field beneath it and keep the step, so a missing key still defaults (#133).
+  // What the walk below can't enter: a declaration, a `Schema.suspend` or a transformation. A plain
+  // bigint in one is lifted where it sits.
+  const unwalked = () => (liftsBigInts(opts) ? liftingBigIntsWithin(schema) : schema)
+
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
+    if (defaulted.transforms && unwalked() !== schema) return unwalked()
     const beneath = substituteSchemaDeep(beneathDefault(schema, defaulted, opts), opts)
     return defaulted.rewrap(
       refusesUndefinedPositions(defaulted.inner, opts)
@@ -1956,7 +1978,7 @@ export const substituteSchemaDeep = (
   // more (any epoch number, any parseable string) than the user's transform —
   // enough to claim a value that belongs to a later member (#133).
   if (opts?.tolerantTransforms && isDateTransform(schema)) {
-    if (opts.strictWireKind) return buildTolerantTransform(schema)
+    if (opts.strictWireKind) return buildTolerantTransform(unwalked())
     const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
     if (encoding) return buildDateTransform(encoding)
   }
@@ -1970,7 +1992,7 @@ export const substituteSchemaDeep = (
   // substitutes, and before the array / struct recursion so containers are
   // still walked rather than swallowed (#116).
   if (opts?.tolerantTransforms && isTolerantLeaf(schema)) {
-    const tolerant = buildTolerantTransform(schema)
+    const tolerant = buildTolerantTransform(unwalked())
     const domain = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
     return opts.plainStateForms && holdsPlainForm(domain.ast)
       ? (Schema.Union([
@@ -1981,10 +2003,10 @@ export const substituteSchemaDeep = (
   }
   // Leaf: read leniency for legacy domain-form values (entity read schemas) and
   // the plain-bigint lift (#133).
-  if (needsLegacyRead(schema, opts)) return buildLegacyReadTransform(schema)
+  if (needsLegacyRead(schema, opts)) return buildLegacyReadTransform(unwalked())
   if (needsBigIntLift(schema, opts)) return buildBigIntLift(schema)
-  if (opts?.plainStateForms && holdsPlainForm(schema.ast)) return acceptingPlainForm(schema)
-  if (holdsTransformation(schema.ast)) return acceptingDomainForm(schema)
+  if (opts?.plainStateForms && holdsPlainForm(schema.ast)) return acceptingPlainForm(unwalked())
+  if (holdsTransformation(schema.ast)) return acceptingDomainForm(unwalked())
 
   // Union / Record / Tuple / *WithRest: substitute every child and rebuild the
   // same container kind, metadata included (#133). Without `tolerantTransforms`
@@ -2128,7 +2150,7 @@ export const substituteSchemaDeep = (
     ) as unknown as Schema.Top
   }
 
-  return schema
+  return unwalked()
 }
 
 /**
@@ -2174,14 +2196,6 @@ const liftingMarshalledBigInt = {
   decode: SchemaGetter.transform((value: unknown): unknown => legacyBigInt(value) ?? value),
   encode: SchemaGetter.passthrough<unknown>(),
 }
-
-/** What a node's stored form needs before it meets the node, if it needs anything. */
-const rebuildOf = (ast: SchemaAST.AST) =>
-  isMarshalledDate(ast)
-    ? rebuildingMarshalledDate
-    : isMarshalledBigInt(ast)
-      ? liftingMarshalledBigInt
-      : undefined
 
 const astWith = <A extends SchemaAST.AST>(ast: A, changes: Partial<A>): A =>
   Object.assign(Object.create(Object.getPrototypeOf(ast)), ast, changes)
@@ -2230,31 +2244,50 @@ const withChildren = (ast: SchemaAST.AST, f: (child: SchemaAST.AST) => SchemaAST
   }
 }
 
-const readingMarshalledMemo = new WeakMap<SchemaAST.AST, SchemaAST.AST>()
+/** A schema with what `rebuildOf` names, wherever it sits, rebuilt before it meets its node. */
+const readingStored = (rebuildOf: (ast: SchemaAST.AST) => object | undefined) => {
+  const memo = new WeakMap<SchemaAST.AST, SchemaAST.AST>()
+  const reading = (ast: SchemaAST.AST): SchemaAST.AST => {
+    const known = memo.get(ast)
+    if (known !== undefined) return known
+    let read: SchemaAST.AST
+    const rebuild = rebuildOf(ast)
+    if (rebuild !== undefined) {
+      read = Schema.Unknown.pipe(
+        Schema.decodeTo(Schema.make<Schema.Top>(ast) as never, rebuild as never),
+      ).ast
+    } else {
+      read = withChildren(ast, reading)
+      const encoding =
+        ast.encoding &&
+        (SchemaAST.mapOrSame(ast.encoding, (link) => {
+          const to = reading(link.to)
+          return to === link.to ? link : new SchemaAST.Link(to, link.transformation)
+        }) as SchemaAST.Encoding)
+      if (encoding !== ast.encoding) read = astWith(read, { encoding })
+    }
+    memo.set(ast, read)
+    return read
+  }
+  return reading
+}
 
 /** Every marshalled date and bigint in a schema, wherever it sits, read back as a real one. */
-const readingMarshalled = (ast: SchemaAST.AST): SchemaAST.AST => {
-  const known = readingMarshalledMemo.get(ast)
-  if (known !== undefined) return known
-  let read: SchemaAST.AST
-  const rebuild = rebuildOf(ast)
-  if (rebuild !== undefined) {
-    read = Schema.Unknown.pipe(
-      Schema.decodeTo(Schema.make<Schema.Top>(ast) as never, rebuild as never),
-    ).ast
-  } else {
-    read = withChildren(ast, readingMarshalled)
-    const encoding =
-      ast.encoding &&
-      (SchemaAST.mapOrSame(ast.encoding, (link) => {
-        const to = readingMarshalled(link.to)
-        return to === link.to ? link : new SchemaAST.Link(to, link.transformation)
-      }) as SchemaAST.Encoding)
-    if (encoding !== ast.encoding) read = astWith(read, { encoding })
-  }
-  readingMarshalledMemo.set(ast, read)
-  return read
-}
+const readingMarshalled = readingStored((ast) =>
+  isMarshalledDate(ast)
+    ? rebuildingMarshalledDate
+    : isMarshalledBigInt(ast)
+      ? liftingMarshalledBigInt
+      : undefined,
+)
+
+const liftingBigInts = readingStored((ast) =>
+  isMarshalledBigInt(ast) ? liftingMarshalledBigInt : undefined,
+)
+
+/** A schema the substitution can't walk, with every plain bigint in it read back as one. */
+const liftingBigIntsWithin = (schema: Schema.Top): Schema.Top =>
+  holdsUnwalkedBigInt(schema) ? Schema.make<Schema.Top>(liftingBigInts(schema.ast)) : schema
 
 /**
  * The read schema of a value the library stores but doesn't derive: an event, its metadata, a
