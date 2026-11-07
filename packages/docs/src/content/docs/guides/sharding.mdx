@@ -108,15 +108,15 @@ Sharding costs on the read side, and it costs on every query, including those of
 
 ### What a real table showed
 
-A one-off run, not a CI check, on an on-demand table in us-east-1: one logical key, 20 shards, `ALL` projection, 1.3 KB rows at 2 WCU per index write, 50,000 items, written with `Batch.write` from outside the region.
+Two one-off runs, not a CI check, each on fresh on-demand tables in us-east-1: one logical key, 20 shards, `ALL` projection, 1.3 KB rows at 2 WCU per index write, 50,000 items, written with `Batch.write` from outside the region. The second run used the code released as 1.39.0.
 
-| Offered on the logical key | Result |
-|---|---|
-| 2,000 WCU/s, sharded, for 6 minutes | No throttle events, no failed batches |
-| 2,000 WCU/s, unsharded, for 5 minutes | The index stayed at about 1,000 WCU/s, 7,255 of 10,762 batches failed, and the base table was held to the same 1,000 WCU/s |
-| Stepping up to 3,000 WCU/s, sharded | About 2 minutes of throttling on both the index and the base table, 1,272 batches out of retries, then clean for the remaining 2 minutes or so |
+| Offered on the logical key | First run | Second run |
+|---|---|---|
+| 2,000 WCU/s, sharded, for 6 minutes | No throttle events, no failed batches | The same |
+| 2,000 WCU/s, unsharded, for 5 minutes | The index stayed at about 1,000 WCU/s, 7,255 of 10,762 batches failed, and the base table was held to the same 1,000 WCU/s | The same limit, 8,673 of 11,999 batches failed |
+| Stepping up to 3,000 WCU/s, sharded, for 4 minutes | About 2 minutes of throttling on both the index and the base table, 1,272 batches out of retries, then clean for the remaining 2 minutes or so | Clean for about 2 minutes, then about 2 minutes of throttling on the base table only, 4 batches out of retries. The index was never throttled |
 
-The base table's keys aren't sharded and it throttled at the same moment, which suggests the table scaling on a fresh table rather than the shard keys, though that cause is inferred, not proven. A new table may need the same warm-up. Items spread evenly, from 2,444 to 2,567 per shard.
+The base table's keys aren't sharded, and it throttled in both runs, which suggests the table scaling on a fresh table rather than the shard keys, though that cause is inferred, not proven. A new table may need the same warm-up. Items spread evenly, from 2,444 to 2,567 per shard.
 
 ## How an item picks its shard
 
@@ -139,6 +139,16 @@ Every terminal reads the shards and merges them. Each shard is sorted by the ind
 A round reads every shard that has nothing buffered and more to read, all at once, and takes about as long as the slowest of them. The first round is every shard. The merge then emits until it has what it owes or the first shard with more to read runs dry, and it stops there, since nothing further is proven in order until that shard answers. So later rounds usually read one shard each, one after another.
 
 `.fetch()` without a `limit` is one round. `.limit(n).fetch()` takes as many as the page needs, because each shard's first `Limit` is near `n / N`, so a shard running dry before the page is full is the ordinary case. On the table above, `.limit(100).fetch()` over 20 shards took 26 requests per page and a p50 of 2.1 s from outside the region, about 7 round trips at 265 ms, against 1 request and 264 ms unsharded. The cost is in round trips, so it scales with the round trip to the table. `.pageSize(n)` at the page's size makes it one round, and every shard then reads up to `n` rows.
+
+From a Lambda function in the same region, where one request took about 4 ms, the same table gave these times over 40 pages (15 at 1,000 items):
+
+| `.limit(n).fetch()` | Unsharded, p50 / p95 | 20 shards, p50 / p95 | Requests over 20 shards | Rows read over 20 shards |
+|---|---|---|---|---|
+| 10 | 3.8 / 4.6 ms | 30 / 55 ms | 22 | 46 |
+| 100 | 8.3 / 10.3 ms | 52 / 113 ms | 26 | 204 |
+| 1,000 | 59 / 88 ms | 67 / 127 ms | 21 | 1,286 |
+
+A small page is several times slower than unsharded, at tens of milliseconds rather than seconds, and the gap has nearly closed by 1,000 items. A query pruned to one shard took the same time as an unsharded one, 3.4 ms against 3.3 ms.
 
 ```typescript region="collect" example="guide-sharding.ts"
 // Reads all 8 shards and merges them into the index's order.
@@ -191,7 +201,7 @@ const paged = yield* Stream.paginate(firstPages, (query) =>
 
 `page.cursor` is an `Option<string>` as usual, and `None` means every shard is done. The cursor is opaque, and it differs from an unsharded query's in a few ways:
 
-- **It grows with N**, at about one key's text per shard still in progress. Keep that in mind if cursors travel in URLs.
+- **It grows with N**, at about one key's text per shard still in progress: 5.6 KB over 20 shards on the table above, against 356 bytes unsharded. Keep that in mind if cursors travel in URLs.
 - **It belongs to its layout.** A cursor from another query, another `count`, or from before an [adoption step](#adopting-sharding-on-a-populated-index) fails the terminal with `EDD-9094`. Restart the listing.
 - **It can't leave its partitions.** It holds positions and not partition keys, which the query recomposes. Its checksum catches a corrupted or hand-edited cursor, but it is an integrity check, not authentication.
 - **`limit`, `pageSize` and `concurrency` can change** between pages.
