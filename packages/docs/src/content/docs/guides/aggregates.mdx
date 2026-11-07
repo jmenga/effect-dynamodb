@@ -491,6 +491,8 @@ A value you hand to `create` or `update` is a domain value, as it is on an entit
 
 A transformation that changes a value on decode, such as `SchemaTransformation.toLowerCase()`, reads the same on both. `create` returns what a read gives, as an entity's `put` does, and an aggregate stores that, where an entity stores what it was given.
 
+A value its field's schema can't encode is stored as it was given, and only if the aggregate reads back that way. A one-way transformation, whose encode fails, does read back, so its value is stored. A transformation over itself, such as `s.pipe(Schema.decodeTo(s, SchemaTransformation.passthrough()))` where `s` holds a transformation, can't encode or decode any value, and stored as given its value reads back as something else: a bigint as a number, a class as a map. `create` and `update` refuse that value with a `ValidationError` naming the field (`EDD-9127`), and write nothing.
+
 :::caution[Rows written by 1.39.0 or earlier]
 Up to 1.39.0, where a transformation has one type on both sides, an aggregate took a value as its stored form if the stored side accepted it. On a field that multiplies by 10 on decode:
 
