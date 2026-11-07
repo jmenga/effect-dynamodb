@@ -2331,10 +2331,9 @@ beneath a step, its type side, is what it makes, not what's stored, so a
 substitution there would hand a stored value to the wrong side. A read and an
 encoder leave the step as declared, with only the lift above for a bigint on its
 encoded side. A caller holds what the step makes, so an aggregate's `create` input
-and mutated state (`domainValues`) go round it: a value is tried as a stored one,
-then against the step's type side, and absent goes through the step
-(`absentThroughStep`). What it reads absent as has no stored form, so it passes the
-tolerant leaf as it is (`AbsentReading`). A plain bigint under an optional key stays optional when
+and mutated state (`domainValues`) go round it: a value is asked against the step's
+type side, then as a stored one, and absent is read through the step
+(`absentAsDeclared`). A plain bigint under an optional key stays optional when
 it's lifted (`readingStored`), so an encoder gets nothing back for nothing stored,
 inside a declaration or a transformation too. A `Schema.Redacted` beneath a step is
 refused at load (`EDD-9125`): an encoder leaves it as declared, so its value is
@@ -3878,6 +3877,39 @@ because unmarshalling yields a `number`. The tolerant transform
 bigint domain, so those rows read. Domain objects with no enumerable state
 (`Schema.Date`, `URL`, `Duration`, `BigDecimal`) were stored as maps holding no
 value and cannot be recovered.
+
+**A caller's value is a domain value.** `create`'s input and `update`'s mutated state hold what a
+caller holds, so `writeSchema` and `mutatedStateSchema` set `domainValues` and a tolerant leaf asks
+its domain side first. Assembly keeps `decodeSchema`, which asks the wire side first, because that's
+what it's reading. Up to 1.39.0 both asked the wire side first, which can't be right where a
+transformation has one type on both sides: `create(50)` on a field multiplying by 10 on decode stored
+50 and read 500, and every `update` did it again to every such field in every row, because `state`
+holds what a read gave and the decode transformed it once more. Wire values no longer reach that decode
+from the library: `hydrateAggregateRefs` used to encode a hydrated ref back for it, and now hands over
+the decoded record. A caller can still give one where it can't be a domain value, such as `"5"` for a
+`Schema.NumberFromString`.
+
+What both sides take is the domain value, and comes out as a read of its stored form, so
+`SchemaTransformation.toLowerCase()` given `"A"` returns and stores `"a"`, as it did. An entity stores
+`"A"` there and reads `"a"`. A decoding default is in the stored form, so it's read through the field as
+declared and what's beneath it gets the domain value that gives (`absentAsDeclared`). A step encoded as
+optional that isn't a default, such as `Schema.OptionFromOptional`, turns what it's given into something
+else, so it's gone round (`tolerantLeaf`). Keys come from the domain value through the key form, so a
+one-type composite keys on its encoded form and `get` finds it.
+
+`update`'s mutated state also holds a declaration as its plain form, wherever it sits in what a transformation
+decodes to. That's asked after the domain value and before the stored side (`plainForm`), so a set held as a
+list isn't taken for a stored list and transformed again.
+
+A caller who passed the stored form on 1.39.0 had the only input that read back as meant (`create(5)` on
+that field read 50). It's a valid domain value too, so it can't be told apart or warned about: it now
+stores 0.5 and reads 5, and the guide and the changeset say what such a caller changes.
+
+Rows already stored stay. Nothing can tell what they should have held, so they keep what they store and
+read as they did: a row that went through `update` has compounded, once per update. An `update` no longer
+adds to it, because a value read back encodes to what's stored, so the diff finds nothing.
+`test/fixtures/aggregate-same-type-1.39.0.json` holds such rows, generated once from the published
+package.
 
 **Create input cloning.** `replaceRefIds` deep-copies the create input with
 `cloneInput` rather than `structuredClone`, which reduced every Effect data type

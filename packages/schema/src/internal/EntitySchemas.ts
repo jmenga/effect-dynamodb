@@ -834,37 +834,14 @@ const isTolerantLeaf = (schema: Schema.Top): boolean => {
   return element === undefined || !needsDeepSubstitution(element, { tolerantTransforms: true })
 }
 
-/** What the unmarshaller can hand back. Anything else was given by the caller. */
-const STORED_PROTOTYPES: ReadonlySet<unknown> = new Set([
-  Object.prototype,
-  Array.prototype,
-  Set.prototype,
-  Uint8Array.prototype,
-])
-
-/** A value that can't be a stored form. */
-const isClassInstance = (value: unknown): boolean =>
-  typeof value === "object" &&
-  value !== null &&
-  !STORED_PROTOTYPES.has(Object.getPrototypeOf(value))
-
-/**
- * What a step encoded as optional reads an absent field as, on its way past the leaf beneath the step.
- * It's a domain value with no stored form, so the leaf mustn't take it for what's stored.
- */
-class AbsentReading {
-  constructor(readonly value: unknown) {}
-}
-
 /**
  * Build a TOLERANT substitute for an arbitrary leaf transform — the general
  * form of what `buildDateTransform` does for dates.
  *
- * Only reachable under `tolerantTransforms`, i.e. only from the aggregate's
- * `decodeSchema`. `Aggregate.update` re-decodes the mutated `state`, whose
- * fields may hold EITHER the domain value the caller set (a `bigint` for a
- * `Schema.BigIntFromString`) or the wire value that came back from storage (the
- * string). A strict transform accepts only the latter, so any update on such a
+ * Only reachable under `tolerantTransforms`, i.e. only from an aggregate's
+ * schemas. An aggregate's `create` and `update` decode what a caller holds, the
+ * domain value (a `bigint` for a `Schema.BigIntFromString`), where a strict
+ * transform accepts only the wire value (the string), so any update on such a
  * model failed before an item was ever built — regardless of which field the
  * mutation touched.
  *
@@ -872,25 +849,45 @@ class AbsentReading {
  * validates the value against the transform's own TYPE side (domain form). A
  * value that is neither is still rejected, exactly as before — this widens the
  * accepted input, it does not skip validation.
+ *
+ * `domainFirst` asks the domain side first, for a value a caller holds (see `domainValues`). What
+ * both sides take is the domain value, and comes out as what reading its stored form gives, as it
+ * would from an entity: a transformation lowercasing on decode gives the same text either way.
+ *
+ * `plainForm` also takes what a mutation's plain state holds for that domain (see `plainStateForms`),
+ * asked before the stored side: a set held as a list is a domain value, even where what's stored is a list.
  */
-const buildTolerantTransform = (schema: Schema.Top): Schema.Top => {
+const buildTolerantTransform = (
+  schema: Schema.Top,
+  domainFirst = false,
+  plainForm?: Schema.Top,
+): Schema.Top => {
   const typeSide = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
   const codec = schema as unknown as Schema.Codec<any>
   const decodeWire = Schema.decodeUnknownOption(codec)
   const validateDomain = Schema.decodeUnknownOption(typeSide as unknown as Schema.Codec<any>)
   const encodeDomain = Schema.encodeUnknownOption(codec)
   const bigintDomain = SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
+  const decodePlain =
+    plainForm === undefined
+      ? undefined
+      : Schema.decodeUnknownOption(Schema.toCodecIso(plainForm as never) as Schema.Codec<any>)
 
   return Schema.Any.pipe(
     Schema.decodeTo(typeSide, {
       decode: SchemaGetter.transformEffect((value: unknown) => {
-        if (value instanceof AbsentReading) return Effect.succeed(value.value)
-        // A class instance is asked as the domain value first: a `Map` passes a record's check as
-        // a record with no keys, so a map decoded from a record would come out empty.
-        if (isClassInstance(value)) {
-          const given = validateDomain(value)
-          if (given._tag === "Some") return Effect.succeed(given.value)
+        if (domainFirst) {
+          const given = validateDomain(reviveMarshalledDateTime(value) ?? value)
+          if (given._tag === "Some") {
+            const read =
+              decodeWire(value)._tag === "Some"
+                ? Option.flatMap(encodeDomain(given.value), decodeWire)
+                : given
+            return Effect.succeed(read._tag === "Some" ? read.value : given.value)
+          }
         }
+        const plain = decodePlain?.(value)
+        if (plain?._tag === "Some") return Effect.succeed(plain.value)
         const fromWire = decodeWire(value)
         if (fromWire._tag === "Some") return Effect.succeed(fromWire.value)
         // A marshalled `DateTime` (#133) is rebuilt before it is validated: a
@@ -1277,9 +1274,13 @@ export interface DeepSubstitutionOptions {
    */
   readonly plainStateForms?: boolean | undefined
   /**
-   * An aggregate's `create` input and mutated state: what a caller holds. A step encoded as optional
-   * that isn't a default, such as `Schema.OptionFromOptional`, turns what's stored into something else,
-   * and a caller holds that something else, so the step is gone round. Propagated through the recursion.
+   * An aggregate's `create` input and mutated state: what a caller holds, so a tolerant leaf asks
+   * its domain side first. Where a transformation has one type on both sides, a value asked as its
+   * stored form first comes out transformed, stores what the caller gave and reads back changed,
+   * and again on every update. A wire value still decodes where it can't be a domain one. A step
+   * encoded as optional that isn't a default, such as `Schema.OptionFromOptional`, turns what's
+   * stored into something else, and a caller holds that something else, so the step is gone round.
+   * Propagated through the recursion.
    */
   readonly domainValues?: boolean | undefined
   /** See {@link writesFirstMemberOnly}. For this union alone, so not propagated. */
@@ -1514,6 +1515,8 @@ const decodingDefaultField = (
       readonly rewrap: (s: Schema.Top, decode?: unknown) => Schema.Top
       /** The step is a default, with what the field stores on both sides of it. */
       readonly defaults: boolean
+      /** The default stands for `undefined` too, as `Schema.withDecodingDefault`'s does. */
+      readonly withUndefined: boolean
       /**
        * The step is a transformation: it goes onto another type, as `Schema.OptionFromOptional` does,
        * or what it comes from has an encoding of its own, which `rewrap` wouldn't keep.
@@ -1551,6 +1554,7 @@ const decodingDefaultField = (
     transforms: !isDecodingDefault(ast, lastTo) || lastTo.encoding !== undefined,
     declared: (field as { readonly to?: Schema.Top }).to ?? inner,
     defaults: isDecodingDefault(SchemaAST.toEncoded(innerAst), lastTo),
+    withUndefined,
     rewrap: (substitute, decode = transformation.decode) => {
       const encodedSide = Schema.toEncoded(substitute as Schema.Codec<any>)
       const optionalEncoded = withUndefined
@@ -1747,18 +1751,20 @@ const beneathDefault = (
     : defaulted.inner
 
 /**
- * What's absent where a step encoded as optional isn't a default, as the field reads it, and anything
- * else as it was given. See `domainValues`.
+ * What an absent field reads as, for what asks for the domain value first (see `domainValues`), and
+ * anything else as it was given. A decoding default is in the stored form and a step makes something
+ * else of nothing at all, so absent is read through the field as declared, and what's beneath gets
+ * the domain value that gives.
  */
-const absentThroughStep = (schema: Schema.Top) => {
+const absentAsDeclared = (schema: Schema.Top, withUndefined: boolean) => {
   const read = Schema.decodeUnknownEffect(
     Schema.Struct({ field: schema }) as unknown as Schema.Codec<{ readonly field: unknown }>,
   )
   return SchemaGetter.transformOptionalEffect((input: Option.Option<unknown>) =>
-    Option.isSome(input)
+    Option.isSome(input) && !(withUndefined && input.value === undefined)
       ? Effect.succeed(input)
       : read({}).pipe(
-          Effect.map(({ field }) => Option.some(new AbsentReading(field))),
+          Effect.map(({ field }) => Option.some(field)),
           Effect.mapError((error) => error.issue),
         ),
   )
@@ -1940,10 +1946,10 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
 /**
  * Whether a mutation can hold this as something else: a declaration of Effect's or a custom one,
  * as opposed to a `Schema.Class`, whose AST is a declaration encoded as its struct and whose
- * fields are walked. See `plainStateForms`.
+ * fields are walked, or whatever a `Schema.suspend` holds, which isn't. See `plainStateForms`.
  */
 const holdsPlainForm = (ast: SchemaAST.AST): boolean =>
-  ast._tag === "Declaration" && ast.encoding === undefined
+  (ast._tag === "Declaration" && ast.encoding === undefined) || SchemaAST.isSuspend(ast)
 
 /**
  * A declaration with a transformation inside, such as `Schema.Option(Schema.DateFromString)`, or a
@@ -1967,11 +1973,7 @@ const acceptingDomainForm = (declaration: Schema.Top): Schema.Top =>
  * given, or the form its plain state holds it as. See `plainStateForms`.
  */
 const acceptingPlainForm = (declaration: Schema.Top): Schema.Top =>
-  Schema.Union([
-    declaration,
-    Schema.toType(declaration),
-    Schema.toCodecIso(declaration as never),
-  ] as never) as unknown as Schema.Top
+  buildTolerantTransform(declaration, true, declaration)
 
 /** A tolerant substitute for a field a read makes `read` of. See `buildTolerantTransform`. */
 const tolerantLeaf = (
@@ -1979,14 +1981,11 @@ const tolerantLeaf = (
   opts: DeepSubstitutionOptions | undefined,
   read: Schema.Top,
 ): Schema.Top => {
-  const tolerant = buildTolerantTransform(read)
-  const domain = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
-  return opts?.plainStateForms && holdsPlainForm(domain.ast)
-    ? (Schema.Union([
-        tolerant,
-        Schema.toCodecIso(domain as never),
-      ] as never) as unknown as Schema.Top)
-    : tolerant
+  return buildTolerantTransform(
+    read,
+    opts?.domainValues,
+    opts?.plainStateForms ? Schema.make<Schema.Top>(SchemaAST.toType(schema.ast)) : undefined,
+  )
 }
 
 /**
@@ -2065,19 +2064,24 @@ export const substituteSchemaDeep = (
 
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
+    const domainValues = opts?.domainValues === true
     // A step that isn't a default turns what's stored into something else. What's beneath it isn't
     // what's stored, so it stays as declared, and a caller, who holds that something else, goes round it.
     if (!defaulted.defaults) {
-      return opts?.domainValues
-        ? defaulted.rewrap(tolerantLeaf(schema, opts, schema), absentThroughStep(schema))
+      return domainValues
+        ? defaulted.rewrap(
+            tolerantLeaf(schema, opts, schema),
+            absentAsDeclared(schema, defaulted.withUndefined),
+          )
         : unwalked()
     }
-    if (defaulted.transforms && unwalked() !== schema) return unwalked()
+    if (defaulted.transforms && !domainValues && unwalked() !== schema) return unwalked()
     const beneath = substituteSchemaDeep(beneathDefault(schema, defaulted, opts), opts)
     return defaulted.rewrap(
       refusesUndefinedPositions(defaulted.inner, opts)
         ? refusingUndefinedPositions(beneath)
         : beneath,
+      domainValues ? absentAsDeclared(schema, defaulted.withUndefined) : undefined,
     )
   }
 
@@ -2091,7 +2095,7 @@ export const substituteSchemaDeep = (
   // more (any epoch number, any parseable string) than the user's transform —
   // enough to claim a value that belongs to a later member (#133).
   if (opts?.tolerantTransforms && isDateTransform(schema)) {
-    if (opts.strictWireKind) return buildTolerantTransform(unwalked())
+    if (opts.strictWireKind) return buildTolerantTransform(unwalked(), opts.domainValues)
     const encoding = getEncoding(schema) ?? inferDefaultEncoding(schema)
     if (encoding) return buildDateTransform(encoding)
   }
@@ -2112,7 +2116,11 @@ export const substituteSchemaDeep = (
   if (needsLegacyRead(schema, opts)) return buildLegacyReadTransform(unwalked())
   if (needsBigIntLift(schema, opts)) return buildBigIntLift(schema)
   if (opts?.plainStateForms && holdsPlainForm(schema.ast)) return acceptingPlainForm(unwalked())
-  if (holdsTransformation(schema.ast)) return acceptingDomainForm(unwalked())
+  if (holdsTransformation(schema.ast)) {
+    return opts?.domainValues
+      ? buildTolerantTransform(unwalked(), true)
+      : acceptingDomainForm(unwalked())
+  }
 
   // Union / Record / Tuple / *WithRest: substitute every child and rebuild the
   // same container kind, metadata included (#133). Without `tolerantTransforms`
