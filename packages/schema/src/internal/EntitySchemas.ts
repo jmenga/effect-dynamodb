@@ -26,6 +26,7 @@ import {
   absentReading,
   firstTypeParameterAst,
   getSchemaFields,
+  holdsAbsentValue,
   holdsPlainBigint,
   holdsUndefined,
   isDecodingDefault,
@@ -1646,6 +1647,10 @@ const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
 const holdsUnwalkedBigInt = (schema: Schema.Top): boolean =>
   holdsPlainBigint(SchemaAST.toEncoded(schema.ast))
 
+/** Whether what's stored for a schema the substitution can't walk can leave a value out. */
+const holdsUnwalkedAbsent = (schema: Schema.Top): boolean =>
+  holdsAbsentValue(SchemaAST.toEncoded(schema.ast))
+
 /** Whether a plain `Schema.BigInt` is anywhere the substitution walks. */
 const holdsBigInt = (schema: Schema.Top): boolean => {
   const opt = optionalField(schema)
@@ -1679,9 +1684,12 @@ const beneathDefault = (
     ? defaulted.declared
     : defaulted.inner
 
-/** The field, reading an absent attribute as the value it stands for (`absentReading`). */
-const readingAbsent = (field: Schema.Top): Schema.Top => {
-  const reading = absentReading(field)
+/**
+ * The field, reading an absent attribute as the value it stands for (`absentReading`), which is what
+ * its `declared` schema says, if the field is that schema read some other way.
+ */
+const readingAbsent = (field: Schema.Top, declared: Schema.Top = field): Schema.Top => {
+  const reading = absentReading(declared)
   if (reading === undefined) return field
   return field.pipe(
     Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
@@ -1787,7 +1795,7 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
   if (opts?.undefinedPositionsOnly) return holdsUndefinedPosition(schema)
   if (opts?.absentReads === "only") return holdsAbsentRead(schema)
-  if (opts?.absentReads && holdsAbsentRead(schema)) return true
+  if (opts?.absentReads && holdsUnwalkedAbsent(schema)) return true
   if (opts?.enforceChecks && hasUndefinedPosition(schema)) return true
   // `tolerantTransforms` AND `resolveRef` propagate through the recursion;
   // `skipTopLevel` names top-level fields only, so it is dropped below.
@@ -1954,9 +1962,9 @@ export const substituteSchemaDeep = (
   }
   // A decoding default (or any optional-encoded step) on top: substitute the
   // field beneath it and keep the step, so a missing key still defaults (#133).
-  // What the walk below can't enter: a declaration, a `Schema.suspend` or a transformation. A plain
-  // bigint in one is lifted where it sits.
-  const unwalked = () => (liftsBigInts(opts) ? liftingBigIntsWithin(schema) : schema)
+  // What the walk below can't enter: a declaration, a `Schema.suspend` or a transformation. What a
+  // read makes of a plain bigint or an absent value in one, it makes of it where it sits.
+  const unwalked = () => readingUnwalked(schema, opts)
 
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
@@ -2056,6 +2064,7 @@ export const substituteSchemaDeep = (
     const lenient = ordered.filter(
       (c) =>
         (opts?.absentReads && holdsAbsentRead(c.child)) ||
+        (opts?.absentReads === true && holdsUnwalkedAbsent(c.child)) ||
         lifting(c) ||
         (opts?.plainStateForms && holdsPlainForm(c.child.ast)),
     )
@@ -2206,10 +2215,16 @@ const astWith = <A extends SchemaAST.AST>(ast: A, changes: Partial<A>): A =>
  * class's `.fields`, and a declaration's type parameters and a transformation's encoded side have no
  * accessor at all. A suspended schema is walked when it's forced, as a recursive one has no end.
  */
-const withChildren = (ast: SchemaAST.AST, f: (child: SchemaAST.AST) => SchemaAST.AST) => {
+const withChildren = (
+  ast: SchemaAST.AST,
+  f: (child: SchemaAST.AST) => SchemaAST.AST,
+  absentValues = false,
+) => {
   switch (ast._tag) {
     case "Declaration": {
-      const typeParameters = SchemaAST.mapOrSame(ast.typeParameters, f)
+      const typeParameters = SchemaAST.mapOrSame(ast.typeParameters, (parameter) =>
+        absentValues ? readingAbsentParameter(parameter, f(parameter)) : f(parameter),
+      )
       return typeParameters === ast.typeParameters ? ast : astWith(ast, { typeParameters })
     }
     case "Arrays": {
@@ -2219,7 +2234,10 @@ const withChildren = (ast: SchemaAST.AST, f: (child: SchemaAST.AST) => SchemaAST
     }
     case "Objects": {
       const propertySignatures = SchemaAST.mapOrSame(ast.propertySignatures, (property) => {
-        const type = f(property.type)
+        const read = f(property.type)
+        const type = absentValues
+          ? readingAbsent(Schema.make<Schema.Top>(read), Schema.make<Schema.Top>(property.type)).ast
+          : read
         return type === property.type
           ? property
           : new SchemaAST.PropertySignature(property.name, type)
@@ -2244,8 +2262,54 @@ const withChildren = (ast: SchemaAST.AST, f: (child: SchemaAST.AST) => SchemaAST
   }
 }
 
-/** A schema with what `rebuildOf` names, wherever it sits, rebuilt before it meets its node. */
-const readingStored = (rebuildOf: (ast: SchemaAST.AST) => object | undefined) => {
+/**
+ * A declaration's value, read as what it stands for when it's absent. The marshaller leaves an empty
+ * set out of what it stores, and an `Option`, a `Result`, an `Exit` or a `Cause` holding one then has
+ * no value at all. `undefined` needs nothing: it's what an absent one reads as already.
+ */
+const readingAbsentParameter = (declared: SchemaAST.AST, read: SchemaAST.AST): SchemaAST.AST => {
+  const stored = absentReading(Schema.make<Schema.Top>(declared))?.stored
+  if (stored === undefined) return read
+  return Schema.Unknown.pipe(
+    Schema.decodeTo(
+      Schema.make<Schema.Top>(read) as never,
+      {
+        decode: SchemaGetter.transform((value: unknown): unknown =>
+          value === undefined ? stored : value,
+        ),
+        encode: SchemaGetter.passthrough<unknown>(),
+      } as never,
+    ),
+  ).ast
+}
+
+/**
+ * A union where a member takes more than it declares, by reading an absent value, is what
+ * `substituteSchemaDeep` makes one it can walk: enough to claim a row of a later member, so the
+ * members as declared get their try first, and only a row none of them takes reads absent. Each side
+ * stays whole, so a `oneOf` one still refuses a value two members take.
+ */
+const tryingDeclaredFirst = (
+  ast: SchemaAST.Union,
+  read: SchemaAST.Union,
+  declared: (ast: SchemaAST.AST) => SchemaAST.AST,
+): SchemaAST.AST =>
+  ast.types.some((member) => holdsAbsentValue(SchemaAST.toEncoded(member)))
+    ? astWith(ast, {
+        types: [astWith(ast, { types: ast.types.map((member) => declared(member)) }), read],
+        options: { ...ast.options, mode: "anyOf" },
+      })
+    : read
+
+/**
+ * A schema with what `rebuildOf` names, wherever it sits, rebuilt before it meets its node, and with
+ * `absentValues` a value the marshaller left out read as what it stands for.
+ */
+const readingStored = (
+  rebuildOf: (ast: SchemaAST.AST) => object | undefined,
+  absentValues = false,
+) => {
+  const declared = absentValues ? readingStored(rebuildOf) : undefined
   const memo = new WeakMap<SchemaAST.AST, SchemaAST.AST>()
   const reading = (ast: SchemaAST.AST): SchemaAST.AST => {
     const known = memo.get(ast)
@@ -2257,7 +2321,13 @@ const readingStored = (rebuildOf: (ast: SchemaAST.AST) => object | undefined) =>
         Schema.decodeTo(Schema.make<Schema.Top>(ast) as never, rebuild as never),
       ).ast
     } else {
-      read = withChildren(ast, reading)
+      // What's stored is the encoded side: a type side holds what its transformation made, and
+      // nothing was left out of that.
+      const stored = declared !== undefined && ast.encoding === undefined
+      read = stored ? withChildren(ast, reading, true) : withChildren(ast, declared ?? reading)
+      if (stored && SchemaAST.isUnion(ast)) {
+        read = tryingDeclaredFirst(ast, read as SchemaAST.Union, declared)
+      }
       const encoding =
         ast.encoding &&
         (SchemaAST.mapOrSame(ast.encoding, (link) => {
@@ -2272,22 +2342,37 @@ const readingStored = (rebuildOf: (ast: SchemaAST.AST) => object | undefined) =>
   return reading
 }
 
-/** Every marshalled date and bigint in a schema, wherever it sits, read back as a real one. */
-const readingMarshalled = readingStored((ast) =>
-  isMarshalledDate(ast)
-    ? rebuildingMarshalledDate
-    : isMarshalledBigInt(ast)
-      ? liftingMarshalledBigInt
-      : undefined,
+/**
+ * Every marshalled date and bigint in a schema, wherever it sits, read back as a real one, and every
+ * value the marshaller left out as what it stands for.
+ */
+const readingMarshalled = readingStored(
+  (ast) =>
+    isMarshalledDate(ast)
+      ? rebuildingMarshalledDate
+      : isMarshalledBigInt(ast)
+        ? liftingMarshalledBigInt
+        : undefined,
+  true,
 )
 
-const liftingBigInts = readingStored((ast) =>
-  isMarshalledBigInt(ast) ? liftingMarshalledBigInt : undefined,
-)
+const bigIntRebuild = (ast: SchemaAST.AST) =>
+  isMarshalledBigInt(ast) ? liftingMarshalledBigInt : undefined
+const liftingBigInts = readingStored(bigIntRebuild)
+const liftingBigIntsAndAbsent = readingStored(bigIntRebuild, true)
 
-/** A schema the substitution can't walk, with every plain bigint in it read back as one. */
-const liftingBigIntsWithin = (schema: Schema.Top): Schema.Top =>
-  holdsUnwalkedBigInt(schema) ? Schema.make<Schema.Top>(liftingBigInts(schema.ast)) : schema
+/**
+ * A schema the substitution can't walk, read as the walk reads what it can reach: every plain bigint
+ * in it as one, and on a read that wants them, every absent value as what it stands for.
+ */
+const readingUnwalked = (schema: Schema.Top, opts: DeepSubstitutionOptions | undefined) => {
+  if (opts?.absentReads === true && holdsUnwalkedAbsent(schema)) {
+    return Schema.make<Schema.Top>(liftingBigIntsAndAbsent(schema.ast))
+  }
+  return liftsBigInts(opts) && holdsUnwalkedBigInt(schema)
+    ? Schema.make<Schema.Top>(liftingBigInts(schema.ast))
+    : schema
+}
 
 /**
  * The read schema of a value the library stores but doesn't derive: an event, its metadata, a

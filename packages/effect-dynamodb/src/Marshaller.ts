@@ -61,6 +61,17 @@ export const isUnstorableValue = (value: unknown): value is UnstorableValue =>
   value instanceof UnstorableValue
 
 /**
+ * What marshalling stores of an object, in the order it stores it: its enumerable properties, its
+ * prototype's included. An `Option`'s `_tag`, or a `Result`'s, is on the prototype, and a copy of
+ * the own properties alone is a row that can't be read.
+ */
+const propertiesOf = (value: object): ReadonlyArray<readonly [string, unknown]> => {
+  const properties: Array<readonly [string, unknown]> = []
+  for (const key in value) properties.push([key, (value as Record<string, unknown>)[key]])
+  return properties
+}
+
+/**
  * The value without the empty sets in its maps, the same reference when it has
  * none. A list keeps its elements: leaving one out would move those after it, so
  * marshalling refuses an empty set there.
@@ -78,7 +89,7 @@ const withoutEmptySets = (value: unknown): unknown => {
       entries.length === value.size && next.every(([key, entry]) => entry === value.get(key))
     return same ? value : new Map(next)
   }
-  const entries = Object.entries(value)
+  const entries = propertiesOf(value)
   const next = entries
     .filter(([, entry]) => !isEmptySet(entry))
     .map(([key, entry]) => [key, withoutEmptySets(entry)] as const)
@@ -102,7 +113,7 @@ const partsOf = (value: unknown): ReadonlyArray<readonly [string | number, unkno
   if (Array.isArray(value)) return value.map((element, index) => [index, element] as const)
   if (value instanceof Map) return [...value]
   if (typeof value !== "object" || value === null) return []
-  return Object.entries(value)
+  return propertiesOf(value)
 }
 
 /**

@@ -341,7 +341,7 @@ class Device extends Schema.Class<Device>("Device")({
     .collect()
 ```
 
-This holds at any depth (a struct, a class, the elements of a list), and on every path that writes or reads an item: `put`, `update`, `upsert`, `append`, `Batch`, `Transaction`, version snapshots, soft delete and restore, aggregates, and the events and snapshots of an event stream. Any other value is stored exactly as before. A field left `Schema.optional` keeps its own reading: an empty set stored there reads back as no field.
+This holds at any depth (a struct, a class, the elements of a list, what a `Schema.suspend` or a transformation holds, and what's inside an `Option`, a `Result`, an `Exit` or a `Cause`), and on every path that writes or reads an item: `put`, `update`, `upsert`, `append`, `Batch`, `Transaction`, version snapshots, soft delete and restore, aggregates, and the events and snapshots of an event stream. Any other value is stored exactly as before. A field left `Schema.optional` keeps its own reading: an empty set stored there reads back as no field.
 
 | The field | Stored | Reads back |
 |---|---|---|
@@ -351,6 +351,7 @@ This holds at any depth (a struct, a class, the elements of a list), and on ever
 | `Schema.NullOr(Schema.ReadonlySet(...))` holding nothing | No attribute | An empty set |
 | `Schema.UndefinedOr(Schema.ReadonlySet(...))` holding nothing | No attribute | `undefined`, the one value an absent attribute can mean there |
 | `Schema.optional(Schema.ReadonlySet(...))` holding nothing | No attribute | No field |
+| `Schema.Option(Schema.ReadonlySet(...))` holding `Option.some` of nothing | An `Option` with no value | `Option.some` of an empty set |
 | A set with `.check(Schema.isMinSize(1))` | Refused: the schema says it can't hold nothing | |
 
 Some places have no attribute to leave out, or no way to say so:
