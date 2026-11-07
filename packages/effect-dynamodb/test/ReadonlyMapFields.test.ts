@@ -66,7 +66,7 @@ describe("[EDD-9125] the operational makes", () => {
     })
   }
 
-  it("a many edge over one, the form `create` and `get` could reach but `update` couldn't", () => {
+  it("a many edge over one isn't: its collection is rows, and only the rows are stored", () => {
     const edges = {
       lines: Aggregate.many({
         entityType: "Line",
@@ -80,7 +80,7 @@ describe("[EDD-9125] the operational makes", () => {
         Schema.Struct({ id: Schema.String, lines: Schema.ReadonlyMap(Schema.String, Line) }),
         edges,
       ),
-    ).toThrow('field "lines" is a Schema.ReadonlyMap')
+    ).not.toThrow()
   })
 })
 

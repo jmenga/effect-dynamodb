@@ -255,7 +255,6 @@ export const numericTypeWithStringEncoding = (schema: Schema.Top): boolean => {
 
 /** The `representation` id Effect gives `Schema.ReadonlySet`, the one type stored as a set. */
 const READONLY_SET = "effect/schema/ReadonlySet"
-const READONLY_MAP = "effect/schema/ReadonlyMap"
 
 /**
  * What an absent attribute reads back as, on a field whose stored side includes
@@ -268,55 +267,262 @@ export interface AbsentReading {
   readonly value: unknown
 }
 
+/** The `representation` id Effect gives a declaration of its own. A custom one has none. */
+const representationIdOf = (ast: SchemaAST.AST): string | undefined => {
+  const representation = (ast.annotations as Record<string, unknown> | undefined)?.representation
+  const id = (representation as { readonly id?: unknown } | undefined)?.id
+  return typeof id === "string" ? id : undefined
+}
+
 /** Whether an AST is the declaration Effect represents under this id. */
 const isDeclarationOf = (ast: SchemaAST.AST, id: string): boolean =>
-  ast._tag === "Declaration" &&
-  (
-    (ast.annotations as Record<string, unknown> | undefined)?.representation as
-      | { readonly id?: unknown }
-      | undefined
-  )?.id === id
+  ast._tag === "Declaration" && representationIdOf(ast) === id
 
 /** Whether an AST is a `Schema.ReadonlySet`, by the id Effect gives its representation. */
 export const isSetDeclaration = (ast: SchemaAST.AST): boolean => isDeclarationOf(ast, READONLY_SET)
 
+/** Why a schema can't be stored and read back, and what to use instead. */
+interface Unreadable {
+  readonly name: string
+  readonly why: string
+  readonly use: string
+}
+
+const NO_LONGER_DECODES = "it's stored as an empty map, which no longer decodes"
+
 /**
- * The path to a `Schema.ReadonlyMap` in this AST, if there's one. A cycle through `Schema.suspend`
- * ends where it starts, and a path segment says what kind of value it went through.
+ * Effect's declarations that no owner can read back, by the `representation` id Effect gives them,
+ * each with a replacement measured on entities, aggregates, streams and outboxes.
  */
-const readonlyMapPath = (
+const NEVER_READ_BACK: Readonly<Record<string, Unreadable>> = {
+  "effect/schema/ReadonlyMap": {
+    name: "Schema.ReadonlyMap",
+    why: "it's stored as a map, a map reads back as a plain object, and the row no longer decodes",
+    use: "Schema.Record, which is stored the same way and reads back",
+  },
+  "effect/schema/HashMap": {
+    name: "Schema.HashMap",
+    why: "a non-empty one can't be written, and an empty one is stored as its internals, which no longer decode",
+    use: "Schema.Record",
+  },
+  "effect/schema/Chunk": {
+    name: "Schema.Chunk",
+    why: "writing one overflows the stack, so nothing is ever stored",
+    use: "Schema.Array",
+  },
+  "effect/schema/URL": {
+    name: "Schema.URL",
+    why: "it's stored as a map of its parts, which no longer decodes",
+    use: "Schema.URLFromString",
+  },
+  "effect/schema/URLSearchParams": {
+    name: "Schema.URLSearchParams",
+    why: "it's stored as a map of its size alone, which no longer decodes",
+    use: "Schema.String, holding the parameters as text",
+  },
+  "effect/schema/RegExp": {
+    name: "Schema.RegExp",
+    why: NO_LONGER_DECODES,
+    use: "Schema.String, holding the pattern as text",
+  },
+  "effect/schema/FormData": {
+    name: "Schema.FormData",
+    why: NO_LONGER_DECODES,
+    use: "Schema.Record",
+  },
+  "effect/http/Headers": {
+    name: "Schema.Headers",
+    why: "it's stored as a map, a map reads back as a plain object, and the row no longer decodes",
+    use: "Schema.Record",
+  },
+  "effect/schema/File": {
+    name: "Schema.File",
+    why: "it's stored as bytes without its name or type, which no longer decode",
+    use: "Schema.Uint8Array",
+  },
+  "effect/schema/ByteSize": {
+    name: "Schema.ByteSize",
+    why: "it's stored as a number, which no longer decodes",
+    use: "Schema.ByteSizeFromString or Schema.ByteSizeFromNumber",
+  },
+  "effect/schema/Error": {
+    name: "Schema.ErrorInstance",
+    why: NO_LONGER_DECODES,
+    use: "Schema.Defect()",
+  },
+}
+
+const DATE = "effect/schema/Date"
+const REDACTED = "effect/schema/Redacted"
+
+/** What an aggregate's date encoder stores as a string. */
+const DATE_DOMAINS: ReadonlySet<string | undefined> = new Set([
+  DATE,
+  "effect/schema/DateTimeUtc",
+  "effect/schema/DateTimeZoned",
+])
+
+const PLAIN_DATE: Unreadable = {
+  name: "Schema.Date",
+  why: `${NO_LONGER_DECODES}. Only an entity or an aggregate field stores one as a string, and not under another declaration`,
+  use: "Schema.DateFromString or Schema.DateFromMillis",
+}
+const TRANSFORMED_DATE: Unreadable = {
+  name: "a transformation over Schema.Date, such as Schema.DateTimeUtcFromDate",
+  why: "its stored form no longer decodes",
+  use: "Schema.DateTimeUtcFromString or Schema.DateTimeUtcFromMillis",
+}
+const PLAIN_REDACTED: Unreadable = {
+  name: "Schema.Redacted",
+  why: "its value isn't stored, and reading it fails. Only an entity or an aggregate field stores the value, and not under another declaration",
+  use: "Schema.RedactedFromValue",
+}
+const PLAIN_BIGINT: Unreadable = {
+  name: "Schema.BigInt",
+  why: "it's stored as a number, which reads back as a number and no longer decodes. Only an entity or an aggregate field lifts it back, and not under a union or another declaration",
+  use: "Schema.BigIntFromString",
+}
+const TRANSFORMED_BIGINT: Unreadable = {
+  name: "a transformation over Schema.BigInt, such as Schema.DurationFromNanos or Schema.ByteSizeFromBigInt",
+  why: "it's stored as a number, which reads back as a number and no longer decodes",
+  use: "a transformation over a string or a number, such as Schema.DurationFromMillis or Schema.ByteSizeFromString",
+}
+const BIGINT_LITERAL: Unreadable = {
+  name: "a bigint Schema.Literal",
+  why: "it's stored as a number, which reads back as a number and no longer decodes",
+  use: "a string or a number literal",
+}
+
+/**
+ * What stores a schema. An entity's or an aggregate's fields are substituted before they're
+ * marshalled, so a date, a redacted value and a plain bigint read back there; a stream, a snapshot
+ * and an outbox encode through the schema alone.
+ */
+export type StoredBy = "entity" | "aggregate" | "schema"
+
+interface UnreadableWalk {
+  readonly by: StoredBy
+  readonly manyEdges: ReadonlySet<string>
+  /** The type this node is the encoding of, when it was reached through one. */
+  readonly declared: SchemaAST.AST | undefined
+  /** Under another declaration: the substitution doesn't reach it. */
+  readonly inDeclaration: boolean
+  /** Under a union, other than the one `Schema.optional` makes of a field. */
+  readonly inUnion: boolean
+  /** This field is a `many` edge: its collection is rows, and only the rows are stored. */
+  readonly edge: boolean
+}
+
+/**
+ * Whether a field reached this node by changing type on the way. A decoding default doesn't: it's
+ * the same type on both sides, and the owner's substitution sees through it.
+ */
+const isTransformed = (ast: SchemaAST.AST, walk: UnreadableWalk): boolean => {
+  const declared = walk.declared
+  if (declared === undefined) return false
+  return declared._tag !== ast._tag || representationIdOf(declared) !== representationIdOf(ast)
+}
+
+/** Whether this node, on its own, is something this owner can't read back. */
+const unreadableAt = (ast: SchemaAST.AST, walk: UnreadableWalk): Unreadable | undefined => {
+  const substituted = walk.by !== "schema" && !walk.inDeclaration
+  switch (ast._tag) {
+    case "Literal":
+      return typeof ast.literal === "bigint" ? BIGINT_LITERAL : undefined
+    case "BigInt": {
+      if (isTransformed(ast, walk)) return TRANSFORMED_BIGINT
+      return substituted && !walk.inUnion ? undefined : PLAIN_BIGINT
+    }
+    case "Declaration": {
+      const id = representationIdOf(ast) ?? ""
+      if (id === DATE) {
+        if (isTransformed(ast, walk)) return TRANSFORMED_DATE
+        return substituted ? undefined : PLAIN_DATE
+      }
+      if (id === REDACTED) return substituted ? undefined : PLAIN_REDACTED
+      return NEVER_READ_BACK[id]
+    }
+    default:
+      return undefined
+  }
+}
+
+/**
+ * The first thing in this AST that can't be read back, and its path. A cycle through
+ * `Schema.suspend` ends where it starts, and a path segment says what kind of value it went through.
+ */
+/**
+ * A transformation to a date on an aggregate: its date encoder stores the domain value as a string,
+ * whatever the transformation is over, except under a union or another declaration.
+ */
+const storedByDateEncoder = (ast: SchemaAST.AST, walk: UnreadableWalk): boolean =>
+  walk.by === "aggregate" &&
+  !walk.inDeclaration &&
+  !walk.inUnion &&
+  DATE_DOMAINS.has(representationIdOf(SchemaAST.toType(ast)))
+
+const firstUnreadable = (
   ast: SchemaAST.AST,
   path: string,
   seen: Set<SchemaAST.AST>,
-): string | undefined => {
-  const firstIn = (asts: ReadonlyArray<SchemaAST.AST>, at: string) => {
+  walk: UnreadableWalk,
+): { readonly at: string; readonly what: Unreadable } | undefined => {
+  const firstIn = (asts: ReadonlyArray<SchemaAST.AST>, at: string, next: UnreadableWalk) => {
     for (const part of asts) {
-      const found = readonlyMapPath(part, at, seen)
+      const found = firstUnreadable(part, at, seen, next)
       if (found !== undefined) return found
     }
     return undefined
   }
+  const child = (at: string): UnreadableWalk => ({
+    ...walk,
+    declared: undefined,
+    edge: walk.manyEdges.has(at),
+  })
+  const encoding = ast.encoding
+  if (encoding !== undefined) {
+    if (walk.declared === undefined && storedByDateEncoder(ast, walk)) return undefined
+    return firstUnreadable(encoding[encoding.length - 1]!.to, path, seen, {
+      ...walk,
+      declared: SchemaAST.toType(ast),
+    })
+  }
+  if (!walk.edge) {
+    const what = unreadableAt(ast, walk)
+    if (what !== undefined) return { at: path, what }
+  }
   switch (ast._tag) {
     case "Declaration":
-      return isDeclarationOf(ast, READONLY_MAP) ? path : firstIn(ast.typeParameters, path)
+      return firstIn(
+        ast.typeParameters,
+        path,
+        walk.edge
+          ? { ...walk, declared: undefined, edge: false }
+          : { ...walk, declared: undefined, inDeclaration: true },
+      )
     case "Suspend": {
       if (seen.has(ast)) return undefined
       seen.add(ast)
-      return readonlyMapPath(ast.thunk(), path, seen)
+      return firstUnreadable(ast.thunk(), path, seen, walk)
     }
     case "Union":
-      return firstIn(ast.types, path)
+      return firstIn(ast.types, path, {
+        ...walk,
+        inUnion: walk.inUnion || ast.context?.isOptional !== true,
+      })
     case "Arrays":
-      return firstIn([...ast.elements, ...ast.rest], `${path}[]`)
+      return firstIn([...ast.elements, ...ast.rest], `${path}[]`, child(`${path}[]`))
     case "Objects": {
       for (const property of ast.propertySignatures) {
         const name = String(property.name)
-        const found = firstIn([property.type], path === "" ? name : `${path}.${name}`)
+        const at = path === "" ? name : `${path}.${name}`
+        const found = firstUnreadable(property.type, at, seen, child(at))
         if (found !== undefined) return found
       }
       return firstIn(
         ast.indexSignatures.map((signature) => signature.type),
         `${path}[key]`,
+        child(`${path}[key]`),
       )
     }
     default:
@@ -325,22 +531,38 @@ const readonlyMapPath = (
 }
 
 /**
- * `[EDD-9125]`: a model whose stored side holds a `Schema.ReadonlyMap`, at any depth. It's stored as
- * a DynamoDB map, a map reads back as a plain object, and the row no longer decodes, so a definition
- * holding one can't work and fails at load. The stored side is what's read: a map decoded from a
- * record, or under `Schema.toCodecJson`, is stored as that and reads back.
+ * `[EDD-9125]`: a model whose stored side holds something its owner can't read back, at any depth.
+ * Either the write fails in a way nothing can recover, or it succeeds and the row no longer decodes,
+ * so a definition holding one can't work and fails at load. The stored side is what's read: a map
+ * decoded from a record, or under `Schema.toCodecJson`, is stored as that and reads back, and the
+ * collection a `many` edge is declared as is rows, of which only the rows are stored.
+ *
+ * Only Effect's own declarations can be judged here. A `Schema.instanceOf` and a duck-typed
+ * `Schema.declare` have the same AST, and one reads back where the other doesn't.
  */
-export const refuseReadonlyMaps = (
+export const refuseUnreadable = (
   owner: string,
+  by: StoredBy,
   model: Schema.Top,
-  whole: string = "the model",
+  options?: {
+    readonly whole?: string | undefined
+    readonly manyEdges?: ReadonlySet<string> | undefined
+  },
 ): void => {
-  const at = readonlyMapPath(SchemaAST.toEncoded(model.ast), "", new Set())
-  if (at === undefined) return
+  const found = firstUnreadable(model.ast, "", new Set(), {
+    by,
+    manyEdges: options?.manyEdges ?? new Set(),
+    declared: undefined,
+    inDeclaration: false,
+    inUnion: false,
+    edge: false,
+  })
+  if (found === undefined) return
+  const { at, what } = found
   throw new Error(
-    `[EDD-9125] ${owner}: ${at === "" ? whole : `field "${at}"`} is a Schema.ReadonlyMap, ` +
-      "which can't be read back: it's stored as a map, a map reads back as a plain object, and the " +
-      "row no longer decodes. Use Schema.Record, which is stored the same way and reads back.",
+    `[EDD-9125] ${owner}: ${at === "" ? (options?.whole ?? "the model") : `field "${at}"`} is ` +
+      `${what.name.startsWith("Schema.") ? "a " : ""}${what.name}, which can't be read back: ` +
+      `${what.why}. Use ${what.use}.`,
   )
 }
 

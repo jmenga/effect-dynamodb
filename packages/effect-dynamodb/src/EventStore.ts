@@ -82,7 +82,7 @@ import {
   packValue,
   unpackStoredSync,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
-import { refuseReadonlyMaps } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { refuseUnreadable } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
   Context,
@@ -2765,13 +2765,17 @@ export const makeStream = <
   config.events.forEach((event, position) => {
     const identifier = (event as { readonly identifier?: unknown }).identifier
     const named = typeof identifier === "string" ? `event "${identifier}"` : `events[${position}]`
-    refuseReadonlyMaps(`${streamLabel}, ${named}`, event, "the event")
+    refuseUnreadable(`${streamLabel}, ${named}`, "schema", event, { whole: "the event" })
   })
   if (config.metadata !== undefined) {
-    refuseReadonlyMaps(`${streamLabel}, metadata`, config.metadata, "the metadata")
+    refuseUnreadable(`${streamLabel}, metadata`, "schema", config.metadata, {
+      whole: "the metadata",
+    })
   }
   if (snapshot !== undefined) {
-    refuseReadonlyMaps(`${streamLabel}, snapshot state`, snapshot.schema, "the state")
+    refuseUnreadable(`${streamLabel}, snapshot state`, "schema", snapshot.schema, {
+      whole: "the state",
+    })
   }
 
   if (snapshot !== undefined && snapshot.every !== undefined) {

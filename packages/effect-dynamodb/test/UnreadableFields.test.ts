@@ -1,0 +1,264 @@
+/**
+ * `[EDD-9125]` beyond maps, on the operational makes, streams and outboxes. The table of what each
+ * owner refuses is the schema package's test of this name; this covers that each make here asks, and
+ * as what. What's taken is stored and read back in `connected.unreadable.test.ts`.
+ */
+
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { Effect, Schema } from "effect"
+import { describe, expect, it } from "vitest"
+import * as Aggregate from "../src/Aggregate.js"
+import * as Entity from "../src/Entity.js"
+import * as EventStore from "../src/EventStore.js"
+import * as Table from "../src/Table.js"
+
+const AppSchema = DynamoSchema.make({ name: "app", version: 1 })
+const Base = Table.make({ schema: AppSchema, entities: {} })
+const Line = Schema.Struct({ sku: Schema.String })
+const modelOf = (field: Schema.Top) => Schema.Struct({ id: Schema.String, f: field as never })
+
+const entity = (model: unknown) =>
+  Entity.make({
+    model: model as never,
+    entityType: "E",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  } as never)
+
+const aggregate = (model: unknown, edges: Record<string, unknown> = {}) =>
+  (Aggregate.make as any)(model, {
+    table: Base,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "agg" },
+    root: { entityType: "Agg" },
+    edges,
+  })
+
+const subAggregate = (model: unknown, edges: Record<string, unknown> = {}) =>
+  (Aggregate.make as any)(model, { root: { entityType: "Sub" }, edges })
+
+const refusal = (run: () => unknown): string => {
+  try {
+    run()
+  } catch (error) {
+    return String((error as Error).message)
+  }
+  return "nothing refused"
+}
+
+describe("[EDD-9125] the operational makes", () => {
+  for (const [name, build, owner] of [
+    ["Entity.make", entity, 'Entity "E"'],
+    ["Aggregate.make", aggregate, 'Aggregate "Agg"'],
+    ["Aggregate.make, a sub-aggregate", subAggregate, 'Aggregate "Sub"'],
+  ] as const) {
+    it(`${name} refuses a Schema.URL, and takes Schema.URLFromString`, () => {
+      expect(refusal(() => build(modelOf(Schema.URL)))).toContain(
+        `[EDD-9125] ${owner}: field "f" is a Schema.URL, which can't be read back`,
+      )
+      expect(refusal(() => build(modelOf(Schema.URLFromString)))).toBe("nothing refused")
+    })
+
+    it(`${name} refuses a Schema.Chunk, and takes Schema.Array`, () => {
+      expect(refusal(() => build(modelOf(Schema.Chunk(Schema.String))))).toContain(
+        `field "f" is a Schema.Chunk`,
+      )
+      expect(refusal(() => build(modelOf(Schema.Array(Schema.String))))).toBe("nothing refused")
+    })
+
+    it(`${name} takes what it stores as something else: a date, a redacted value, a bigint`, () => {
+      expect(refusal(() => build(modelOf(Schema.Date)))).toBe("nothing refused")
+      expect(refusal(() => build(modelOf(Schema.Redacted(Schema.String))))).toBe("nothing refused")
+      expect(refusal(() => build(modelOf(Schema.BigInt)))).toBe("nothing refused")
+    })
+
+    it(`${name} refuses a date under another declaration, which it doesn't reach`, () => {
+      expect(refusal(() => build(modelOf(Schema.Option(Schema.Date))))).toContain(
+        'field "f" is a Schema.Date',
+      )
+    })
+  }
+
+  it("Entity.make refuses a Schema.DateTimeUtcFromDate; Aggregate.make, under a union", () => {
+    expect(refusal(() => entity(modelOf(Schema.DateTimeUtcFromDate)))).toContain(
+      "a transformation over Schema.Date",
+    )
+    expect(refusal(() => aggregate(modelOf(Schema.DateTimeUtcFromDate)))).toBe("nothing refused")
+    expect(refusal(() => aggregate(modelOf(Schema.NullOr(Schema.DateTimeUtcFromDate))))).toContain(
+      "a transformation over Schema.Date",
+    )
+  })
+
+  it("Aggregate.make reads its own many edges", () => {
+    const lines = Aggregate.many({
+      entityType: "Line",
+      sk: { composite: ["sku"] },
+      decompose: () => [],
+      assemble: (rows: ReadonlyArray<unknown>) => rows,
+    } as never)
+    const Lined = Schema.Struct({ id: Schema.String, lines: Schema.Chunk(Line) })
+    expect(refusal(() => aggregate(Lined, { lines }))).toBe("nothing refused")
+    expect(refusal(() => subAggregate(Lined, { lines }))).toBe("nothing refused")
+    expect(refusal(() => aggregate(Lined))).toContain('field "lines" is a Schema.Chunk')
+    expect(refusal(() => subAggregate(Lined))).toContain('field "lines" is a Schema.Chunk')
+  })
+})
+
+describe("[EDD-9125] EventStore.makeStream", () => {
+  const Packed = DynamoModel.Packed({ format: "json" })
+  const Plain = Schema.Struct({ _tag: Schema.tag("Plain") })
+  const stream = (config: Record<string, unknown>) =>
+    EventStore.makeStream({
+      table: Base,
+      streamName: "Tally",
+      events: [Plain],
+      streamId: { composite: ["id"] },
+      ...config,
+    } as never)
+  const eventOver = (field: Schema.Top) =>
+    Schema.Struct({ _tag: Schema.tag("Noted"), m: field as never })
+
+  /** A stream encodes through the schema alone, so these are refused as they aren't on an entity. */
+  const REFUSED: ReadonlyArray<readonly [string, Schema.Top, string, Schema.Top]> = [
+    ["a Schema.Date", Schema.Date, "Schema.DateFromString", Schema.DateFromString],
+    [
+      "a Schema.Redacted",
+      Schema.Redacted(Schema.String),
+      "Schema.RedactedFromValue",
+      Schema.RedactedFromValue(Schema.String),
+    ],
+    ["a Schema.BigInt", Schema.BigInt, "Schema.BigIntFromString", Schema.BigIntFromString],
+    [
+      "a transformation over Schema.Date",
+      Schema.DateTimeUtcFromDate,
+      "Schema.DateTimeUtcFromString",
+      Schema.DateTimeUtcFromString,
+    ],
+    [
+      "a transformation over Schema.BigInt",
+      Schema.DurationFromNanos,
+      "Schema.DurationFromMillis",
+      Schema.DurationFromMillis,
+    ],
+    ["a Schema.URL", Schema.URL, "Schema.URLFromString", Schema.URLFromString],
+    ["a Schema.Chunk", Schema.Chunk(Schema.String), "Schema.Array", Schema.Array(Schema.String)],
+  ]
+
+  for (const [name, field, use, replacement] of REFUSED) {
+    const refused = (config: Record<string, unknown>) => refusal(() => stream(config))
+
+    it(`refuses ${name} in an event, naming it, and takes ${use}`, () => {
+      expect(refused({ events: [eventOver(field)] })).toContain(
+        `[EDD-9125] EventStream "Tally", events[0]: field "m" is ${name}`,
+      )
+      expect(refused({ events: [eventOver(field)] })).toContain(use)
+      expect(refused({ events: [eventOver(replacement)] })).toBe("nothing refused")
+    })
+
+    it(`refuses ${name} in metadata and a snapshot, and takes ${use}`, () => {
+      expect(refused({ metadata: Schema.Struct({ m: field as never }) })).toContain(
+        `metadata: field "m" is ${name}`,
+      )
+      expect(refused({ snapshot: { schema: Schema.Struct({ m: field as never }) } })).toContain(
+        `snapshot state: field "m" is ${name}`,
+      )
+      expect(refused({ metadata: Schema.Struct({ m: replacement as never }) })).toBe(
+        "nothing refused",
+      )
+      expect(refused({ snapshot: { schema: Schema.Struct({ m: replacement as never }) } })).toBe(
+        "nothing refused",
+      )
+    })
+
+    it(`refuses ${name} packed, whose write would fail`, () => {
+      expect(refused({ events: [eventOver(field)], storedAs: { data: Packed } })).toContain(
+        `field "m" is ${name}`,
+      )
+    })
+  }
+
+  it("says what a whole event, metadata or state is", () => {
+    expect(refusal(() => stream({ events: [Schema.URL] }))).toContain("the event is a Schema.URL")
+    expect(refusal(() => stream({ metadata: Schema.Date }))).toContain(
+      "the metadata is a Schema.Date",
+    )
+    expect(refusal(() => stream({ snapshot: { schema: Schema.Date } }))).toContain(
+      "the state is a Schema.Date",
+    )
+  })
+
+  it("takes what a read gets back as a plain object, which still reads", () => {
+    for (const field of [Schema.Duration, Schema.DateTimeUtc, Schema.BigDecimal]) {
+      expect(refusal(() => stream({ events: [eventOver(field)] }))).toBe("nothing refused")
+    }
+  })
+})
+
+describe("[EDD-9125] a projection's outbox", () => {
+  const Tally = EventStore.makeStream({
+    table: Base,
+    streamName: "Tally",
+    events: [Schema.Struct({ _tag: Schema.tag("Plain") })],
+    streamId: { composite: ["id"] },
+  })
+  const Summaries = Entity.make({
+    model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
+    entityType: "Summary",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const single = (schema: Schema.Top) =>
+    EventStore.projection({
+      readModel: Summaries,
+      revision: "rev",
+      stream: Tally,
+      key: (id: { readonly id: string }) => ({ id: id.id }),
+      initial: (id: { readonly id: string }) => ({ id: id.id, version: 0, rev: 0 }),
+      evolve: (state: unknown) => Effect.succeed(state),
+      checkpoint: "version",
+      outbox: { schema, effects: () => [] },
+    } as never)
+  const multi = (schema: Schema.Top) =>
+    EventStore.multiProjection({
+      readModel: Summaries,
+      revision: "rev",
+      initial: (key: { readonly id: string }) => ({ id: key.id, version: 0, rev: 0 }),
+      sources: (source: (stream: unknown, config: unknown) => unknown) => ({
+        tally: source(Tally, {
+          key: (event: { readonly streamId: string }) => ({ id: event.streamId }),
+          evolve: (state: unknown) => Effect.succeed(state),
+        }),
+      }),
+      checkpoints: { field: "version" },
+      outbox: { schema, effects: () => [] },
+    } as never)
+
+  for (const [name, build, owner] of [
+    ["projection", single, 'EventStore.projection("Tally" → "Summary"), outbox schema'],
+    ["multiProjection", multi, 'EventStore.multiProjection("Summary"), outbox schema'],
+  ] as const) {
+    for (const [what, field, replacement] of [
+      ["a Schema.Date", Schema.Date, Schema.DateFromMillis],
+      [
+        "a Schema.Redacted",
+        Schema.Redacted(Schema.String),
+        Schema.RedactedFromValue(Schema.String),
+      ],
+      ["a Schema.BigInt", Schema.BigInt, Schema.BigIntFromString],
+      ["a Schema.URL", Schema.URL, Schema.URLFromString],
+    ] as const) {
+      it(`${name} refuses ${what}, and takes its replacement`, () => {
+        expect(refusal(() => build(Schema.Struct({ m: field as never })))).toContain(
+          `[EDD-9125] ${owner}: field "m" is ${what}`,
+        )
+        expect(refusal(() => build(Schema.Struct({ m: replacement as never })))).toBe(
+          "nothing refused",
+        )
+      })
+    }
+
+    it(`${name} says what a whole effect is`, () => {
+      expect(refusal(() => build(Schema.URL))).toContain(`${owner}: the effect is a Schema.URL`)
+    })
+  }
+})

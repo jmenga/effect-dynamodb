@@ -178,7 +178,7 @@ describe("[EDD-9125] what's refused", () => {
     expect(refusal(() => subAggregate(Counts))).toContain("the model is a Schema.ReadonlyMap")
   })
 
-  it("a many edge over one, whatever its decompose makes of it", () => {
+  it("a many edge over one isn't: its collection is rows, and only the rows are stored", () => {
     const Line = Schema.Struct({ sku: Schema.String })
     const message = refusal(() =>
       (Aggregate.make as any)(
@@ -200,6 +200,6 @@ describe("[EDD-9125] what's refused", () => {
         },
       ),
     )
-    expect(message).toContain('field "lines" is a Schema.ReadonlyMap')
+    expect(message).toBe("nothing refused")
   })
 })

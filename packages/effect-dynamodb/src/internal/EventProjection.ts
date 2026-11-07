@@ -22,7 +22,7 @@ import {
   StreamRecordIdentifierMissing,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { refuseReadonlyMaps } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { refuseUnreadable } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   Duration,
   Effect,
@@ -903,7 +903,7 @@ export const resolveOutbox = (
   outbox: ProjectionOutboxConfig<any, any, any> | undefined,
 ) => {
   if (outbox === undefined) return undefined
-  refuseReadonlyMaps(`${label}, outbox schema`, outbox.schema, "the effect")
+  refuseUnreadable(`${label}, outbox schema`, "schema", outbox.schema, { whole: "the effect" })
   return {
     schema: outbox.schema,
     effects: outbox.effects,
