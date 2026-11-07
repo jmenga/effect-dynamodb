@@ -64,6 +64,18 @@ describe("CheckpointStore", () => {
         yield* store.acquireLease(feed, "a", Duration.seconds(30))
       }),
     )
+
+    it.effect("a lease still holds at its expiry, as a DynamoDB table's does", () =>
+      Effect.gen(function* () {
+        const store = CheckpointStore.makeMemory()
+        yield* store.acquireLease(feed, "a", Duration.seconds(30))
+        yield* TestClock.adjust("30 seconds")
+        const held = yield* Effect.flip(store.acquireLease(feed, "b", Duration.seconds(30)))
+        expect(held).toMatchObject({ _tag: "ChangeFeedLeaseHeld", owner: "a" })
+        yield* TestClock.adjust("1 millis")
+        yield* store.acquireLease(feed, "b", Duration.seconds(30))
+      }),
+    )
   })
 
   describe("DynamoDB", () => {

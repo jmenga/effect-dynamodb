@@ -87,7 +87,7 @@ export const makeMemory = (): CheckpointStoreService => {
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis
         const held = leases.get(keyOf(feed))
-        if (held !== undefined && held.owner !== owner && held.expiresAt > now) {
+        if (held !== undefined && held.owner !== owner && held.expiresAt >= now) {
           return yield* new ChangeFeedLeaseHeld({
             streamArn: feed.streamArn,
             consumer: feed.consumer,

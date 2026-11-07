@@ -174,14 +174,25 @@ processes from consuming the same feed by accident:
   `renewEvery` must be less than half of `duration` — `changeFeed` throws
   `[EDD-9083]` otherwise — so that a renewal the store fails to write has
   `duration − 2 × renewEvery` to be retried in before the deadline below;
-- released when the stream ends;
+- released when the stream ends, or when an attempt to take it was interrupted
+  or failed, since that attempt may still have written it. A release that gets
+  no answer holds the end of the feed for `renewEvery` at most;
 - a second consumer fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or
   with `lease: { onHeld: "wait" }` retries until the lease is free or expires;
 - a renewal the store fails to write (`CheckpointStoreError`) is retried on
-  the backoff until `renewEvery` before the lease would lapse (the last
-  successful renewal + `duration` − `renewEvery`), then fails the feed with
-  that error; a renewal refused because another owner took over fails the feed
-  with `ChangeFeedLeaseLost`;
+  the backoff until the deadline, `renewEvery` before the lease would lapse,
+  then fails the feed with that error; a renewal refused because another owner
+  took over fails the feed with `ChangeFeedLeaseLost`;
+- the deadline is the time read before the last write that took or renewed the
+  lease + `duration` − `renewEvery`, so it can't fall after the lease's expiry
+  however slowly the store answers; renewals are due `renewEvery` after the
+  previous one started, for the same reason;
+- a renewal call still unanswered at the deadline fails the feed with
+  `ChangeFeedLeaseLost`, without waiting for the call, which may not be
+  interruptible (the SDK request is left to end on its own). One hung call uses
+  up the time to the deadline; a store whose calls time out by themselves has
+  those failures retried as above. A call starting past the deadline, after the
+  process stalled, gets `renewEvery`: the lease may still be unclaimed;
 - either way the lease counts as lost from then on: an acknowledgement still
   in flight fails with `ChangeFeedLeaseLost` instead of committing.
 

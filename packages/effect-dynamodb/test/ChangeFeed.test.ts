@@ -5,6 +5,8 @@
  * error classification is exercised too.
  */
 
+import { createServer, type ServerResponse } from "node:http"
+import type { AddressInfo } from "node:net"
 import {
   type _Record,
   DescribeStreamCommand,
@@ -20,7 +22,19 @@ import {
 } from "@aws-sdk/client-dynamodb-streams"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Deferred, Duration, Effect, Exit, Fiber, Layer, References, Schema, Stream } from "effect"
+import {
+  Clock,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Random,
+  References,
+  Schema,
+  Stream,
+} from "effect"
 import { TestClock } from "effect/testing"
 import { classifyStreamsError, fromSdkClient } from "../src/change-feed/DynamoStreamsClient.js"
 import {
@@ -31,8 +45,10 @@ import {
   type CheckpointStoreService,
   changeFeed,
   DynamoStreamsClient,
+  type FeedId,
   runChangeFeed,
 } from "../src/change-feed/index.js"
+import { DynamoClient } from "../src/DynamoClient.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Table from "../src/Table.js"
 
@@ -324,6 +340,43 @@ const until = (reached: () => boolean) =>
 /** Advance the test clock, then let the fake's promises settle. */
 const adjust = (duration: Duration.Input) =>
   TestClock.adjust(duration).pipe(Effect.andThen(flush), Effect.andThen(flush))
+
+/**
+ * A feed whose batches the test holds: unacknowledged, each stays in flight and its shard
+ * waits, and the feed's failure still ends the fiber.
+ */
+const feedKeepingBatches = (
+  options: ChangeFeedOptions,
+  fake: FakeStreams,
+  store: CheckpointStoreService,
+) =>
+  Effect.gen(function* () {
+    const batches: Array<ChangeFeedBatch> = []
+    const fiber = yield* changeFeed(options).pipe(
+      Stream.runForEach((batch) =>
+        Effect.sync(() => {
+          batches.push(batch)
+        }),
+      ),
+      Effect.provide(layerOf(fake, store)),
+      Effect.forkChild,
+    )
+    return { batches, fiber }
+  })
+
+/**
+ * Let the feed's fibers and the fake's promises run until `reached` holds, in real time and
+ * with the test clock standing still, however long that takes under load. It gives up
+ * eventually, for the assertion after it to report.
+ */
+const settle = (reached: () => boolean) =>
+  Effect.gen(function* () {
+    for (let i = 0; i < 100 && !reached(); i++) yield* flush
+  })
+
+const blip = (operation: string) => new CheckpointStoreError({ operation, cause: "blip" })
+
+const heldLease = { owner: "me", duration: "30 seconds", renewEvery: "10 seconds" } as const
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1202,6 +1255,335 @@ describe("changeFeed", () => {
         expect(failureOf(exit!)).toMatchObject({ _tag: "CheckpointStoreError" })
       }),
     )
+
+    describe("deadlines", () => {
+      const backoff = { initial: "100 millis", max: "1 second" } as const
+      const options = { streamArn: STREAM_ARN, backoff, lease: heldLease }
+      const ended = (fiber: Fiber.Fiber<unknown, unknown>) => () => fiber.pollUnsafe() !== undefined
+
+      for (const [kind, hung] of [
+        ["never returns", Effect.never],
+        ["never returns and can't be interrupted", Effect.uninterruptible(Effect.never)],
+      ] as const) {
+        it.effect(`a renewal that ${kind} loses the lease at the deadline`, () =>
+          Effect.gen(function* () {
+            const fake = new FakeStreams().addShard("s1").put("s1", 1)
+            const store = CheckpointStore.makeMemory()
+            const { batches, fiber } = yield* feedKeepingBatches(options, fake, {
+              ...store,
+              renewLease: () => hung,
+            })
+            yield* settle(() => batches.length === 1)
+            // The renewal starts at 10 s; the deadline is 30 - 10 = 20 s after acquiring.
+            yield* TestClock.adjust("19 seconds")
+            yield* flush
+            expect(fiber.pollUnsafe()).toBeUndefined()
+            yield* TestClock.adjust("1 second")
+            yield* settle(ended(fiber))
+            expect(failureOf(fiber.pollUnsafe()!)).toMatchObject({
+              _tag: "ChangeFeedLeaseLost",
+              owner: "me",
+            })
+            // The batch still in flight can't commit, and the lease is released.
+            const refused = yield* Effect.flip(batches[0]!.commit())
+            expect(refused).toMatchObject({ _tag: "ChangeFeedLeaseLost", owner: "me" })
+            expect((yield* store.load(feedId)).size).toBe(0)
+            yield* store.acquireLease(feedId, "next", Duration.seconds(30))
+          }),
+        )
+      }
+
+      it.effect("a renewal that hangs after failing loses the lease at the same deadline", () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1")
+          const store = CheckpointStore.makeMemory()
+          let attempts = 0
+          const { fiber } = yield* feedKeepingBatches(options, fake, {
+            ...store,
+            renewLease: () =>
+              Effect.suspend(() => (++attempts === 3 ? Effect.never : Effect.fail(blip("renew")))),
+          })
+          yield* settle(() => fake.log.length > 0)
+          yield* TestClock.adjust("19 seconds")
+          yield* settle(() => attempts === 3)
+          expect(attempts).toBe(3)
+          expect(fiber.pollUnsafe()).toBeUndefined()
+          yield* TestClock.adjust("1 second")
+          yield* settle(ended(fiber))
+          expect(failureOf(fiber.pollUnsafe()!)).toMatchObject({ _tag: "ChangeFeedLeaseLost" })
+        }),
+      )
+
+      it.effect("the last retry reaches the store whatever the backoff's jitter", () =>
+        Effect.gen(function* () {
+          for (let seed = 0; seed < 6; seed++) {
+            const fake = new FakeStreams().addShard("s1")
+            const store = CheckpointStore.makeMemory()
+            const { fiber } = yield* feedKeepingBatches(options, fake, {
+              ...store,
+              renewLease: () => Effect.fail(blip("renew")),
+            }).pipe(Random.withSeed(seed))
+            yield* settle(() => fake.log.length > 0)
+            yield* TestClock.adjust("20 seconds")
+            yield* settle(ended(fiber))
+            expect(failureOf(fiber.pollUnsafe()!), `seed ${seed}`).toMatchObject({
+              _tag: "CheckpointStoreError",
+            })
+          }
+        }),
+      )
+
+      it.effect("renewals keep their schedule when each call is slow", () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1")
+          const store = CheckpointStore.makeMemory()
+          const startedAt: Array<number> = []
+          const { fiber } = yield* feedKeepingBatches(options, fake, {
+            ...store,
+            renewLease: (feed, owner, duration) =>
+              Clock.currentTimeMillis.pipe(
+                Effect.tap((now) => Effect.sync(() => startedAt.push(now))),
+                Effect.andThen(store.renewLease(feed, owner, duration)),
+                Effect.andThen(Effect.sleep("5 seconds")),
+              ),
+          })
+          yield* settle(() => fake.log.length > 0)
+          yield* TestClock.adjust("41 seconds")
+          yield* settle(() => startedAt.length >= 4)
+          expect(startedAt).toEqual([10_000, 20_000, 30_000, 40_000])
+          expect(fiber.pollUnsafe()).toBeUndefined()
+        }),
+      )
+
+      /** A store whose `acquireLease` writes, then takes `seconds` more to answer. */
+      const slowToAcquire = (store: CheckpointStoreService, seconds: number) => {
+        let attempts = 0
+        return {
+          attempts: () => attempts,
+          store: {
+            ...store,
+            acquireLease: (feed: FeedId, owner: string, duration: Duration.Duration) =>
+              Effect.suspend(() => {
+                attempts++
+                return store
+                  .acquireLease(feed, owner, duration)
+                  .pipe(Effect.andThen(Effect.sleep(Duration.seconds(seconds))))
+              }),
+          } satisfies CheckpointStoreService,
+        }
+      }
+
+      it.effect("the deadline counts from before a slow acquire", () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1").put("s1", 1)
+          const store = CheckpointStore.makeMemory()
+          const slow = slowToAcquire(store, 15)
+          const { batches, fiber } = yield* feedKeepingBatches(options, fake, {
+            ...slow.store,
+            renewLease: () => Effect.fail(blip("renew")),
+          })
+          yield* settle(() => slow.attempts() === 1)
+          // The lease was written at 0 and expires at 30 s, so the deadline is 20 s.
+          yield* TestClock.adjust("15 seconds")
+          yield* settle(() => batches.length === 1)
+          expect(fiber.pollUnsafe()).toBeUndefined()
+          yield* TestClock.adjust("5 seconds")
+          yield* settle(ended(fiber))
+          expect(failureOf(fiber.pollUnsafe()!)).toMatchObject({ _tag: "CheckpointStoreError" })
+          const refused = yield* Effect.flip(batches[0]!.commit())
+          expect(refused).toMatchObject({ _tag: "ChangeFeedLeaseLost", owner: "me" })
+        }),
+      )
+
+      it.effect("a slow acquire renews before the lease it took expires", () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1")
+          const store = CheckpointStore.makeMemory()
+          const slow = slowToAcquire(store, 25)
+          const startedAt: Array<number> = []
+          const { fiber } = yield* feedKeepingBatches(options, fake, {
+            ...slow.store,
+            renewLease: (feed, owner, duration) =>
+              Clock.currentTimeMillis.pipe(
+                Effect.tap((now) => Effect.sync(() => startedAt.push(now))),
+                Effect.andThen(store.renewLease(feed, owner, duration)),
+              ),
+          })
+          yield* settle(() => slow.attempts() === 1)
+          yield* TestClock.adjust("31 seconds")
+          yield* settle(() => startedAt.length > 0)
+          expect(startedAt[0]).toBe(25_000)
+          const rival = yield* Effect.flip(store.acquireLease(feedId, "b", Duration.seconds(30)))
+          expect(rival).toMatchObject({ _tag: "ChangeFeedLeaseHeld", owner: "me" })
+          expect(fiber.pollUnsafe()).toBeUndefined()
+        }),
+      )
+
+      it.effect("a renewal past the deadline may still answer, for renewEvery at most", () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1")
+          const store = CheckpointStore.makeMemory()
+          const slow = slowToAcquire(store, 25)
+          const { fiber } = yield* feedKeepingBatches(options, fake, {
+            ...slow.store,
+            renewLease: () => Effect.never,
+          })
+          yield* settle(() => slow.attempts() === 1)
+          // Answered at 25 s, past the 20 s deadline: the renewal starts at once.
+          yield* TestClock.adjust("34 seconds")
+          yield* flush
+          expect(fiber.pollUnsafe()).toBeUndefined()
+          yield* TestClock.adjust("1 second")
+          yield* settle(ended(fiber))
+          expect(failureOf(fiber.pollUnsafe()!)).toMatchObject({ _tag: "ChangeFeedLeaseLost" })
+        }),
+      )
+
+      it.effect('onHeld: "wait" counts from before the attempt that took the lease', () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1")
+          const store = CheckpointStore.makeMemory()
+          yield* store.acquireLease(feedId, "other", Duration.hours(1))
+          const slow = slowToAcquire(store, 15)
+          const { fiber } = yield* feedKeepingBatches(
+            { ...options, lease: { ...heldLease, onHeld: "wait" } },
+            fake,
+            { ...slow.store, renewLease: () => Effect.fail(blip("renew")) },
+          )
+          yield* settle(() => slow.attempts() === 1)
+          // Attempts every 10 s: the one at 50 s takes it, and answers at 65 s.
+          yield* TestClock.adjust("45 seconds")
+          yield* store.releaseLease(feedId, "other")
+          yield* TestClock.adjust("24 seconds")
+          yield* flush
+          expect(fiber.pollUnsafe()).toBeUndefined()
+          // Written at 50 s: the deadline is 70 s.
+          yield* TestClock.adjust("1 second")
+          yield* settle(ended(fiber))
+          expect(failureOf(fiber.pollUnsafe()!)).toMatchObject({ _tag: "CheckpointStoreError" })
+        }),
+      )
+
+      it.effect("an acquire interrupted after its write landed still releases the lease", () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1")
+          const store = CheckpointStore.makeMemory()
+          let wrote = false
+          const { fiber } = yield* feedKeepingBatches(options, fake, {
+            ...store,
+            acquireLease: (feed, owner, duration) =>
+              store.acquireLease(feed, owner, duration).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    wrote = true
+                  }),
+                ),
+                Effect.andThen(Effect.never),
+              ),
+          })
+          yield* settle(() => wrote)
+          yield* Fiber.interrupt(fiber)
+          yield* store.acquireLease(feedId, "next", Duration.seconds(30))
+        }),
+      )
+
+      it.effect("a release that never returns holds the feed's end for renewEvery at most", () =>
+        Effect.gen(function* () {
+          const fake = new FakeStreams().addShard("s1").put("s1", 1).close("s1")
+          fake.status = "DISABLED"
+          const store = CheckpointStore.makeMemory()
+          let releasing = false
+          const run = yield* collect({ streamArn: STREAM_ARN, lease: heldLease }).pipe(
+            Effect.provide(
+              layerOf(fake, {
+                ...store,
+                releaseLease: () =>
+                  Effect.suspend(() => {
+                    releasing = true
+                    return Effect.never
+                  }),
+              }),
+            ),
+            Effect.forkChild,
+          )
+          yield* settle(() => releasing)
+          yield* TestClock.adjust("9 seconds")
+          yield* flush
+          expect(run.pollUnsafe()).toBeUndefined()
+          yield* TestClock.adjust("1 second")
+          yield* settle(ended(run))
+          const exit = run.pollUnsafe()
+          expect(exit).toBeDefined()
+          expect(Exit.isSuccess(exit!)).toBe(true)
+        }),
+      )
+
+      it.live("a hung request on the real client fails the feed without waiting for it", () =>
+        Effect.gen(function* () {
+          // DynamoDB's JSON protocol, except that an UpdateItem (the renewal) is never answered.
+          const seen: Array<string> = []
+          const unanswered: Array<ServerResponse> = []
+          const server = createServer((request, response) => {
+            const operation = String(request.headers["x-amz-target"]).split(".")[1] ?? ""
+            seen.push(operation)
+            request.resume()
+            request.on("end", () => {
+              if (operation === "UpdateItem") {
+                unanswered.push(response)
+                return
+              }
+              response.writeHead(200, { "content-type": "application/x-amz-json-1.0" })
+              response.end(operation === "Query" ? '{"Items":[]}' : "{}")
+            })
+          })
+          yield* Effect.acquireRelease(
+            Effect.promise(
+              () => new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve)),
+            ),
+            () =>
+              Effect.sync(() => {
+                server.closeAllConnections()
+                server.close()
+              }),
+          )
+          const { port } = server.address() as AddressInfo
+          const store = CheckpointStore.layerDynamoDB({ tableName: "checkpoints" }).pipe(
+            Layer.provide(
+              DynamoClient.layer({
+                region: "us-east-1",
+                endpoint: `http://127.0.0.1:${port}`,
+                credentials: { accessKeyId: "local", secretAccessKey: "local" },
+              }),
+            ),
+          )
+          const fake = new FakeStreams().addShard("s1")
+          const startedAt = Date.now()
+          const exit = yield* collect({
+            streamArn: STREAM_ARN,
+            ...fast,
+            lease: { owner: "me", duration: "600 millis", renewEvery: "100 millis" },
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(
+                  DynamoStreamsClient,
+                  fromSdkClient(fake as unknown as DynamoDBStreamsClient),
+                ),
+                store,
+              ),
+            ),
+            Effect.exit,
+          )
+          expect(failureOf(exit)).toMatchObject({ _tag: "ChangeFeedLeaseLost", owner: "me" })
+          // The feed ended with the request still open, at the deadline and not before it.
+          expect(unanswered).toHaveLength(1)
+          expect(unanswered[0]!.writableEnded).toBe(false)
+          expect(Date.now() - startedAt).toBeGreaterThanOrEqual(490)
+          // The release still went out, though the feed need not wait for its answer.
+          yield* until(() => seen.includes("DeleteItem"))
+        }),
+      )
+    })
 
     // Any scheduler budget: the feed records the loss some time after the store reports
     // it, so the test waits for the record, which only a commit can see.

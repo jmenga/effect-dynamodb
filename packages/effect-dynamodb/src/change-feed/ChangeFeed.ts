@@ -116,7 +116,10 @@ export interface ChangeFeedLeaseOptions {
    * released or expires.
    */
   readonly onHeld?: "fail" | "wait" | undefined
-  /** This process's owner id. Default: a random UUID. */
+  /**
+   * This process's owner id. Default: a random UUID. Two processes given one id
+   * both hold the lease: a lease is taken from nobody who shares its owner.
+   */
   readonly owner?: string | undefined
 }
 
@@ -289,6 +292,26 @@ const validate = (options: ChangeFeedOptions): void => {
   }
 }
 
+/**
+ * `effect`'s answer, or `None` once `limit` has passed. A store call may be stuck
+ * somewhere that can't be interrupted, so the call is left to end on its own: this does
+ * not wait for it, where `Effect.timeoutOption` would.
+ */
+const withinTime = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  limit: Duration.Duration,
+): Effect.Effect<Option.Option<A>, E, R> =>
+  Effect.gen(function* () {
+    const answer = yield* Deferred.make<A, E>()
+    const call = yield* Effect.forkDetach(
+      Effect.onExit(effect, (exit) => Deferred.done(answer, exit)),
+    )
+    return yield* Deferred.await(answer).pipe(
+      Effect.timeoutOption(limit),
+      Effect.ensuring(Effect.sync(() => call.interruptUnsafe())),
+    )
+  })
+
 const run = (
   options: ChangeFeedOptions,
   queue: Queue.Queue<ChangeFeedBatch, ChangeFeedError | Cause.Done>,
@@ -349,29 +372,62 @@ const run = (
       const lease = options.lease ?? {}
       const { duration, renewEvery } = leaseTiming(lease)
       const owner = lease.owner ?? globalThis.crypto.randomUUID()
-      const acquire = store.acquireLease(feed, owner, duration)
+      // Registered before the first attempt: one that fails or is interrupted may still have
+      // written the lease. Releasing a lease this owner doesn't hold does nothing.
+      yield* Effect.addFinalizer(() =>
+        Effect.ignore(withinTime(store.releaseLease(feed, owner), renewEvery)),
+      )
+      /**
+       * When the lease last written can have started, at the earliest: read before the
+       * write, so the deadline below can't fall after the lease's expiry however long the
+       * store takes to answer.
+       */
+      let renewedAt = 0
+      const acquire = Effect.gen(function* () {
+        const at = yield* Clock.currentTimeMillis
+        yield* store.acquireLease(feed, owner, duration)
+        renewedAt = at
+      })
       yield* lease.onHeld === "wait"
         ? Effect.retry(acquire, {
             schedule: Schedule.spaced(renewEvery),
             while: (error) => error._tag === "ChangeFeedLeaseHeld",
           })
         : acquire
-      yield* Effect.addFinalizer(() => Effect.ignore(store.releaseLease(feed, owner)))
-      let renewedAt = yield* Clock.currentTimeMillis
       const lost = (error: ChangeFeedLeaseLost | CheckpointStoreError) => {
         leaseLost = new ChangeFeedLeaseLost({ streamArn, consumer: feed.consumer, owner })
         return Effect.fail(error)
       }
+      /** Wait for the next renewal, due `renewEvery` after the last one started. */
+      const nextRenewal = Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis
+        yield* Effect.sleep(
+          Duration.millis(Math.max(0, renewedAt + Duration.toMillis(renewEvery) - now)),
+        )
+      })
       /**
        * Renew the lease. A store failure is retried until the lease is about
        * to lapse — `renewEvery` before it expires — and a lease taken over is
-       * not retried; either way the lease counts as lost.
+       * not retried; either way the lease counts as lost. A call still
+       * unanswered at that deadline counts as a lease lost too, whatever
+       * happens to the call. A call that starts past the deadline, after the
+       * process stalled, can still find the lease unclaimed: it gets
+       * `renewEvery`.
        */
       const renew = Effect.gen(function* () {
         const deadline = renewedAt + Duration.toMillis(duration) - Duration.toMillis(renewEvery)
         for (let attempt = 0; ; attempt++) {
           const at = yield* Clock.currentTimeMillis
-          const result = yield* Effect.result(store.renewLease(feed, owner, duration))
+          const answer = yield* withinTime(
+            Effect.result(store.renewLease(feed, owner, duration)),
+            deadline > at ? Duration.millis(deadline - at) : renewEvery,
+          )
+          if (Option.isNone(answer)) {
+            return yield* lost(
+              new ChangeFeedLeaseLost({ streamArn, consumer: feed.consumer, owner }),
+            )
+          }
+          const result = answer.value
           if (Result.isSuccess(result)) {
             renewedAt = at
             return
@@ -381,15 +437,16 @@ const run = (
             return yield* lost(result.failure)
           }
           const delay = yield* retryDelay(attempt)
-          yield* Effect.sleep(Duration.millis(Math.min(Duration.toMillis(delay), deadline - now)))
+          // Whole milliseconds, as the clock's: a sleep ending a sliver short of the deadline
+          // would leave the next call no time to answer.
+          const wait = Math.min(Math.ceil(Duration.toMillis(delay)), deadline - now)
+          yield* Effect.sleep(Duration.millis(wait))
         }
       })
       // Forked fibers run detached from any current operation, so each
       // checkpoint-store call is reported on its own (consumed capacity, #174).
       yield* Effect.forkIn(
-        Capacity.detached(
-          failStream(Effect.forever(Effect.sleep(renewEvery).pipe(Effect.andThen(renew)))),
-        ),
+        Capacity.detached(failStream(Effect.forever(nextRenewal.pipe(Effect.andThen(renew))))),
         scope,
       )
     }
