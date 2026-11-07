@@ -122,6 +122,7 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
+import { notReadBack, type ReadBack, readBackOf } from "./internal/RoundTrip.js"
 import { marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type AppendWriteOp,
@@ -2767,6 +2768,15 @@ export const makeStream = <
     const named = typeof identifier === "string" ? `event "${identifier}"` : `events[${position}]`
     refuseUnreadable(`${streamLabel}, ${named}`, "schema", event, { whole: "the event" })
   })
+  if (config.events.length > 1) {
+    // Read through one union, so what one event stores can be what another reads.
+    refuseUnreadable(
+      streamLabel,
+      "schema",
+      Schema.Union(config.events as unknown as ReadonlyArray<Schema.Top>),
+      { whole: "the union of its events" },
+    )
+  }
   if (config.metadata !== undefined) {
     refuseUnreadable(`${streamLabel}, metadata`, "schema", config.metadata, {
       whole: "the metadata",
@@ -2976,18 +2986,35 @@ export const makeStream = <
   }
 
   /**
+   * What checks a schema's stored values read back (`EDD-9126`), for one holding a custom
+   * declaration. An event is read through the union of the events; anything else through itself.
+   */
+  const readBacks = new Map<Schema.Top, ReadBack | undefined>()
+  const readBackFor = (declared: Schema.Top): ReadBack | undefined => {
+    if (readBacks.has(declared)) return readBacks.get(declared)
+    const isEvent = declared === eventUnion || config.events.includes(declared as never)
+    const readBack = readBackOf(declared, () =>
+      readingStreamValues(isEvent ? eventUnion : declared),
+    )
+    readBacks.set(declared, readBack)
+    return readBack
+  }
+
+  /**
    * Validate input and produce wire-form output: `Schema.encode` first, with a
-   * `decode → encode` fallback for inputs already in encoded shape. Mirrors
-   * the Entity write path (`encodeOrDecodeEncode` in `Entity.ts`).
+   * `decode → encode` fallback for inputs already in encoded shape, then refused if it wouldn't read
+   * back. Mirrors the Entity write path (`encodeForWrite` in `Entity.ts`). Everything a stream stores
+   * from its own schemas goes through this.
    */
   const encodeToWire = (
     declared: Schema.Codec<any>,
     input: unknown,
     operation: string,
     errorEntityType: string = entityType,
+    packed = false,
   ): Effect.Effect<unknown, ValidationError> => {
     const codec = writableCodec(declared)
-    return Schema.encodeUnknownEffect(codec)(input).pipe(
+    const wire = Schema.encodeUnknownEffect(codec)(input).pipe(
       Effect.catch((primaryCause) =>
         Schema.decodeUnknownEffect(codec)(input).pipe(
           Effect.flatMap((decoded) => Schema.encodeUnknownEffect(codec)(decoded)),
@@ -3001,6 +3028,24 @@ export const makeStream = <
         ),
       ),
     )
+    // What's packed doesn't go through the marshaller's map, and packing refuses an instance itself.
+    const readBack = packed ? undefined : readBackFor(declared)
+    return readBack === undefined
+      ? wire
+      : wire.pipe(
+          Effect.tap((encoded) =>
+            readBack(encoded).pipe(
+              Effect.mapError(
+                (issue) =>
+                  new ValidationError({
+                    entityType: errorEntityType,
+                    operation,
+                    cause: notReadBack("The value", issue),
+                  }),
+              ),
+            ),
+          ),
+        )
   }
 
   // ---------------------------------------------------------------------------
@@ -3206,6 +3251,7 @@ export const makeStream = <
       state,
       operation,
       snapshotEntityType,
+      stateStoredAs !== undefined,
     )
 
   /**
@@ -3851,6 +3897,8 @@ export const makeStream = <
               memberSchemaFor(event) as Schema.Codec<any>,
               event,
               "EventStore.append",
+              entityType,
+              dataStoredAs !== undefined,
             )
 
             // Inject _tag for plain Schema.Class events; Schema.TaggedClass

@@ -451,7 +451,7 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
   )
 
   it.effect(
-    "a Schema.BigInt past 2^53 is read by a declaration over bigint, not its replacement",
+    "a declaration over bigint reads a value past 2^53, and a smaller one is refused at write",
     () => {
       const Base = Table.make({ schema: AppSchema, entities: {} })
       const over = (field: Schema.Top) =>
@@ -475,9 +475,15 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
           const replaced = yield* Effect.flip(over(Schema.BigIntFromString).read(id))
           expect((replaced as { readonly _tag: string })._tag).toBe("ValidationError")
 
-          yield* overBigint.append({ id: "b" }, [{ _tag: "Noted", big: 5n }], 0)
-          const small = yield* Effect.flip(overBigint.read({ id: "b" }))
+          const [lifted] = yield* over(Schema.BigInt).read(id)
+          expect(lifted.data.big).toBe(big)
+
+          const small = yield* Effect.flip(
+            overBigint.append({ id: "b" }, [{ _tag: "Noted", big: 5n }], 0),
+          )
           expect((small as { readonly _tag: string })._tag).toBe("ValidationError")
+          expect(String((small as { readonly cause: unknown }).cause)).toContain("EDD-9126")
+          expect(yield* overBigint.read({ id: "b" })).toEqual([])
         }),
       )
     },
@@ -1413,12 +1419,13 @@ describeConnected("what can't be judged at load", () => {
     ) {}
   }
 
-  it.effect("a Schema.instanceOf is written and can't be read: the guide says so", () =>
+  it.effect("a Schema.instanceOf loads, and its write is refused", () =>
     onEntity(Schema.instanceOf(Point), (rows) =>
       Effect.gen(function* () {
-        yield* rows.put({ id: "a", f: new Point(1, 2) }).asEffect()
-        const failure = yield* Effect.flip(rows.get({ id: "a" }))
+        const failure = yield* Effect.flip(rows.put({ id: "a", f: new Point(1, 2) }).asEffect())
         expect((failure as { readonly _tag: string })._tag).toBe("ValidationError")
+        expect(String((failure as { readonly cause: unknown }).cause)).toContain("EDD-9126")
+        expect(yield* Effect.flip(rows.get({ id: "a" }))).toMatchObject({ _tag: "ItemNotFound" })
       }),
     ),
   )

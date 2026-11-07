@@ -202,6 +202,7 @@ const BY_OWNER: ReadonlyArray<
   const date = "a Schema.Date"
   const redacted = "a Schema.Redacted"
   const bigint = "a Schema.BigInt"
+  const besideANumber = "a union of Schema.BigInt and something else stored as a number"
   const overDate = "a transformation over Schema.Date"
   const overBigint = "a transformation over Schema.BigInt"
   const same = SchemaTransformation.passthrough() as never
@@ -328,7 +329,7 @@ const BY_OWNER: ReadonlyArray<
       Schema.optionalKey(Schema.Union([Schema.String, Schema.BigInt])),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a later member of an optionalKey union: a date from a string",
@@ -454,61 +455,67 @@ const BY_OWNER: ReadonlyArray<
       redacted,
     ],
 
-    ["Schema.BigInt", Schema.BigInt, undefined, undefined, bigint],
-    ["a bigint in a struct", Schema.Struct({ n: Schema.BigInt }), undefined, undefined, bigint],
-    ["a bigint in an array", Schema.Array(Schema.BigInt), undefined, undefined, bigint],
-    ["an optional bigint", Schema.optional(Schema.BigInt), undefined, undefined, bigint],
-    ["an optional key's bigint", Schema.optionalKey(Schema.BigInt), undefined, undefined, bigint],
+    ["Schema.BigInt", Schema.BigInt, undefined, undefined, undefined],
+    ["a bigint in a struct", Schema.Struct({ n: Schema.BigInt }), undefined, undefined, undefined],
+    ["a bigint in an array", Schema.Array(Schema.BigInt), undefined, undefined, undefined],
+    ["an optional bigint", Schema.optional(Schema.BigInt), undefined, undefined, undefined],
+    [
+      "an optional key's bigint",
+      Schema.optionalKey(Schema.BigInt),
+      undefined,
+      undefined,
+      undefined,
+    ],
     [
       "a bigint with a decoding default",
       Schema.BigInt.pipe(Schema.withDecodingDefault(Effect.succeed(0n))),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
-    ["a bigint or null", Schema.NullOr(Schema.BigInt), undefined, undefined, bigint],
-    ["a bigint or undefined", Schema.UndefinedOr(Schema.BigInt), undefined, undefined, bigint],
+    ["a bigint or null", Schema.NullOr(Schema.BigInt), undefined, undefined, undefined],
+    ["a bigint or undefined", Schema.UndefinedOr(Schema.BigInt), undefined, undefined, undefined],
     [
       "a bigint in a union",
       Schema.Union([Schema.BigInt, Schema.String]),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a bigint next to a number",
       Schema.Union([Schema.Number, Schema.BigInt]),
       undefined,
       undefined,
-      bigint,
+      besideANumber,
     ],
     [
       "a bigint in a oneOf union",
       Schema.Union([Schema.BigInt, Schema.String], { mode: "oneOf" }),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a bigint in a struct or null",
       Schema.NullOr(Schema.Struct({ n: Schema.BigInt })),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a list of a bigint or null",
       Schema.Array(Schema.NullOr(Schema.BigInt)),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a bigint or null with a decoding default",
       Schema.NullOr(Schema.BigInt).pipe(Schema.withDecodingDefaultKey(Effect.succeed(null))),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a bigint in a struct with a decoding default",
@@ -517,9 +524,9 @@ const BY_OWNER: ReadonlyArray<
       ),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
-    ["a suspended bigint", Schema.suspend(() => Schema.BigInt), bigint, bigint, bigint],
+    ["a suspended bigint", Schema.suspend(() => Schema.BigInt), bigint, bigint, undefined],
     ["a suspended date", Schema.suspend(() => Schema.Date), date, date, date],
     [
       "a suspended redacted value",
@@ -661,7 +668,7 @@ const BY_OWNER: ReadonlyArray<
       WithBigint.pipe(Schema.withDecodingDefaultKey(Effect.succeed({ n: 0n }))),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a bigint on an optional stored side, decoded to a number",
@@ -694,7 +701,7 @@ const BY_OWNER: ReadonlyArray<
       ),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a struct with a bigint on an optional stored side, decoded to one more field",
@@ -706,7 +713,7 @@ const BY_OWNER: ReadonlyArray<
       ),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a struct with a bigint or a string on an optional stored side, decoded to the struct",
@@ -718,7 +725,7 @@ const BY_OWNER: ReadonlyArray<
       ),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a struct with a bigint and more on an optional stored side, decoded to fewer fields",
@@ -730,7 +737,7 @@ const BY_OWNER: ReadonlyArray<
       ),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a bigint transformed from one on an optional stored side, a node at a time",
@@ -763,7 +770,7 @@ const BY_OWNER: ReadonlyArray<
       ),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a bigint on an optional stored side that's transformed to a number there",
@@ -790,7 +797,7 @@ const BY_OWNER: ReadonlyArray<
       ),
       undefined,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a date or undefined with a decoding default",
@@ -815,7 +822,7 @@ const BY_OWNER: ReadonlyArray<
       ),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     [
       "a transformed date, optional, in a struct or null",
@@ -825,7 +832,7 @@ const BY_OWNER: ReadonlyArray<
       overDate,
     ],
     ["a date in a class", WithDate, undefined, undefined, date],
-    ["a bigint in a class", WithBigint, undefined, undefined, bigint],
+    ["a bigint in a class", WithBigint, undefined, undefined, undefined],
     [
       "a transformation over a struct with a date",
       overItself(Schema.Struct({ d: Schema.Date })),
@@ -838,7 +845,7 @@ const BY_OWNER: ReadonlyArray<
       overItself(Schema.Struct({ n: Schema.BigInt })),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a transformation over a struct with a redacted value",
@@ -859,21 +866,21 @@ const BY_OWNER: ReadonlyArray<
       overItself(Schema.Array(Schema.BigInt)),
       undefined,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a list of lists of bigints transformed to one",
       overItself(Schema.Array(Schema.Array(Schema.BigInt))),
       undefined,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a list of a bigint or null transformed to one",
       overItself(Schema.Array(Schema.NullOr(Schema.BigInt))),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "renamed keys over a date",
@@ -887,14 +894,14 @@ const BY_OWNER: ReadonlyArray<
       Schema.OptionFromNullOr(Schema.Struct({ n: Schema.BigInt })),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "an Option from an optional key's struct with a bigint",
       Schema.OptionFromOptionalKey(Schema.Struct({ n: Schema.BigInt })),
       bigint,
       bigint,
-      bigint,
+      undefined,
     ],
     [
       "a map from a record of dates",
@@ -910,8 +917,8 @@ const BY_OWNER: ReadonlyArray<
       date,
       date,
     ],
-    ["a bigint under an Option", Schema.Option(Schema.BigInt), bigint, bigint, bigint],
-    ["a bigint in a set", Schema.ReadonlySet(Schema.BigInt), bigint, bigint, bigint],
+    ["a bigint under an Option", Schema.Option(Schema.BigInt), bigint, bigint, undefined],
+    ["a bigint in a set", Schema.ReadonlySet(Schema.BigInt), bigint, bigint, undefined],
     ["Schema.DurationFromNanos", Schema.DurationFromNanos, overBigint, overBigint, overBigint],
     ["Schema.ByteSizeFromBigInt", Schema.ByteSizeFromBigInt, overBigint, overBigint, overBigint],
     [
@@ -931,7 +938,7 @@ const BY_OWNER: ReadonlyArray<
       Schema.NullOr(Schema.Struct({ n: Schema.optional(Schema.BigInt) })),
       undefined,
       undefined,
-      bigint,
+      undefined,
     ],
     ["a bigint literal", Schema.Literal(1n), literal, literal, literal],
     ["bigint literals", Schema.Literals([1n, 2n]), literal, literal, literal],
@@ -1048,7 +1055,10 @@ describe("[EDD-9125] what depends on what stores it", () => {
     expect(judged("schema", Schema.Redacted(Schema.String))).toContain(
       "Use Schema.RedactedFromValue.",
     )
-    expect(judged("schema", Schema.BigInt)).toContain("Use Schema.BigIntFromString.")
+    expect(judged("schema", Schema.Union([Schema.Number, Schema.BigInt]))).toContain(
+      "Use Schema.BigIntFromString.",
+    )
+    expect(judged("entity", Schema.Option(Schema.BigInt))).toContain("Use Schema.BigIntFromString.")
     expect(judged("entity", Schema.DateTimeUtcFromDate)).toContain(
       "Use Schema.DateTimeUtcFromString or Schema.DateTimeUtcFromMillis.",
     )

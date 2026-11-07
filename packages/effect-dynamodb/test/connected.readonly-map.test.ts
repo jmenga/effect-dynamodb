@@ -282,6 +282,80 @@ describeConnected("what [EDD-9125] leaves standing", () => {
     })
   }
 
+  it.effect("a many edge over a Schema.ReadonlyMap is created, read and updated", () => {
+    const Line = Schema.Struct({ sku: Schema.String, qty: Schema.Number })
+    const Base = Table.make({ schema: AppSchema, entities: {} })
+    const Keyed = (Aggregate.make as any)(
+      Schema.Struct({
+        id: Schema.String,
+        note: Schema.optional(Schema.String),
+        lines: Schema.ReadonlyMap(Schema.String, Line),
+      }),
+      {
+        table: Base,
+        schema: Base.schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "keyed" },
+        root: { entityType: "Keyed" },
+        edges: {
+          lines: Aggregate.many({
+            entityType: "Line",
+            sk: { composite: ["sku"] },
+            decompose: (rows: ReadonlyMap<string, unknown>) => [...rows.values()],
+            assemble: (rows: ReadonlyArray<any>) => new Map(rows.map((row) => [row.sku, row])),
+          } as never),
+        },
+      },
+    )
+    const MainTable = { ...Base, aggregates: { Keyed } }
+    return onTable(Keys, Base, (tableName) =>
+      Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: {},
+          aggregates: { Keyed },
+          tables: { MainTable },
+        } as never)
+        const lines = new Map([
+          ["s", { sku: "s", qty: 1 }],
+          ["t", { sku: "t", qty: 2 }],
+        ])
+        const created = yield* db.aggregates.Keyed.create({ id: "a", lines })
+        expect(created.lines).toEqual(lines)
+        const read = yield* db.aggregates.Keyed.get({ id: "a" })
+        expect(read.lines).toBeInstanceOf(Map)
+        expect(read.lines).toEqual(lines)
+
+        // A mutation that leaves the map alone, and writes nothing below the root.
+        const noted = yield* db.aggregates.Keyed.update({ id: "a" }, ({ state }: any) => ({
+          ...state,
+          note: "n",
+        }))
+        expect(noted.note).toBe("n")
+        expect(noted.lines).toEqual(lines)
+
+        // One that changes the map: a row changed, a row added, a row taken away.
+        const changed = new Map([
+          ["s", { sku: "s", qty: 9 }],
+          ["u", { sku: "u", qty: 3 }],
+        ])
+        const updated = yield* db.aggregates.Keyed.update({ id: "a" }, ({ state }: any) => ({
+          ...state,
+          lines: changed,
+        }))
+        expect(updated.lines).toEqual(changed)
+        const again = yield* db.aggregates.Keyed.get({ id: "a" })
+        expect(again.lines).toBeInstanceOf(Map)
+        expect(again.lines).toEqual(changed)
+        expect(again.note).toBe("n")
+
+        // Only the rows are stored: nothing holds the collection.
+        const rows = yield* rowsOf(tableName)
+        expect(rows.filter((row) => row.__edd_e__?.S === "Line")).toHaveLength(2)
+        expect(rows.every((row) => row.lines === undefined)).toBe(true)
+      }),
+    )
+  })
+
   it.effect("a many edge over a record is created, read and updated", () => {
     const Line = Schema.Struct({ sku: Schema.String, qty: Schema.Number })
     const Base = Table.make({ schema: AppSchema, entities: {} })

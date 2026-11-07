@@ -3747,7 +3747,7 @@ snapshot state or an outbox effect, so it's stored as the map the marshaller mak
 of it (a class instance is marshalled with `for...in`, which skips functions), and
 Effect's guard (`DateTime.isDateTime`) looks only for the marker, so the plain map
 passed as a `DateTime` and threw once used. `readingStreamValues` adds a second
-pass after the absent-read one, `readingDates`, at the AST level so nothing about
+pass after the absent-read one, `readingMarshalled`, at the AST level so nothing about
 the write side or an entity path can change: each `Schema.DateTimeUtc` /
 `Schema.DateTimeZoned` declaration, kept through brand, check and annotate, in any
 struct, list, record, union, class, `Schema.suspend` (lazily, memoised, so
@@ -3770,6 +3770,43 @@ a date a read returned doesn't move by a byte (`fixtures/stream-dates-1.39.0.jso
 stored by the published 1.39.0, pins this). Real DynamoDB's map order isn't
 guaranteed, so that text was never fixed on that path. Anything else JSON can't
 represent is refused as before, beside a date too.
+
+**BigInts on a stream.** `Schema.BigInt` goes through the same pass: a number
+becomes a `bigint` before the node (`liftingMarshalledBigInt`, using the entity rule
+`legacyBigInt`), and anything else, a fraction included, is handed on for the guard
+to refuse. It's stored as a number, as it was, so nothing moves and rows already
+stored read. A union member that takes the number keeps it, since each member gets
+its own try, so a union in which something else is stored as a number can't be
+told apart: `5n` and `5` are the same row. `hasBigintBesideANumber` refuses those at
+load (`EDD-9125`, `BIGINT_BESIDE_A_NUMBER`), for every ordered pair of members and
+for a stream's events as one union, looking through the encoded side and forcing
+what's suspended. It's cautious where it can't see in: a struct holding a bigint
+beside one of Effect's other declarations, or `Schema.Option(Schema.BigInt)` beside a
+struct, is refused too. Packed storage doesn't change: `stringifyStrict` refuses a
+`bigint`, so a packed stream's append fails with nothing written, as it did, and a
+number already packed reads lifted.
+
+**Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
+`Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
+can. `holdsCustomDeclaration` finds a declaration with no `representation` id (and
+not a `Schema.Class`, which has an encoding) on the stored side when a member is
+built, and `internal/RoundTrip.ts` holds the check: the real marshaller and
+unmarshaller, then the read schema. The test is whether it decodes, never whether
+it's an instance, since `Schema.Cause`, `Schema.Graph`, `Schema.TimeZone` and an
+empty `Schema.HashSet` all are instances and read back, and a duck-typed declaration
+that takes the map keeps writing. A value the marshaller refuses is left to
+`marshalOrFail` (`EDD-9124`). The choke points are `encodeForWrite` and
+`_refuseNotReadBack` on an entity (`validateAndBuildPutItem` for Batch and
+`TransactWriteOps`), `notReadBackOperand` for an update's stored operands
+(`.append`, `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists`; `.add`,
+`.subtract` and `.deleteFromSet` apply a value, they don't store it),
+`refuseNotReadBack` on an aggregate, which runs the real `assembleAggregate` over the
+marshalled groups so a custom `decompose` and packed edges are covered,
+`encodeToWire` on a stream and `outboxItems` for an outbox. A member holding no custom
+declaration has no check object at all, so its requests don't change and it pays
+for the scan alone. `CustomDeclarationWrites.test.ts` fails on a write path that isn't
+in `test/helpers/CustomDeclarationPaths.ts`, and on a new `Schema.encode` call
+anywhere that writes. Rows already stored aren't touched and still fail on read.
 
 **Stored-type change.** Because the gate now looks through `optional` /
 `NullOr` and into refs, some attributes that ≤1.22.0 stored in domain form are
@@ -5582,9 +5619,10 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
 | `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
-| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal, a transformation over `Schema.BigInt`. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container: `Schema.Date`, `Schema.Redacted`, `Schema.BigInt`. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: a `Schema.BigInt` on a stream reads back past 2^53, and `Schema.Literals([1n, "a"])` reads back `"a"`. Members of a union aren't judged against each other, so a stream's `Union([Number, BigInt])`, whose values all read, is refused too. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back. |
+| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal, a transformation over `Schema.BigInt`. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container: `Schema.Date`, `Schema.Redacted`. `Schema.BigInt` on an entity or an aggregate under those, and on a stream, a snapshot and an outbox a union in which something else is stored as a number (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field, or another event), since `5n` and `5` are stored the same. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
+| `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 
-Next free code: **`EDD-9126`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: **`EDD-9127`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

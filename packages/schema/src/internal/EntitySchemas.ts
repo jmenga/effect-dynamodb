@@ -2160,6 +2160,29 @@ const rebuildingMarshalledDate = {
   encode: SchemaGetter.passthrough<unknown>(),
 }
 
+/** A plain `Schema.BigInt`, checked or branded or not, stored as `N`: a transformation is reached through. */
+const isMarshalledBigInt = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isBigInt(ast) && ast.encoding === undefined
+
+/**
+ * A stored bigint, lifted, before it meets its declaration: a number that's a safe integer becomes
+ * the bigint it was, and a bigint the unmarshaller returned stays one. Any other value goes on to the
+ * declaration as it was. The walker refuses a union in which another member takes the number
+ * (`EDD-9125`), so a number reaching this is a number no member takes.
+ */
+const liftingMarshalledBigInt = {
+  decode: SchemaGetter.transform((value: unknown): unknown => legacyBigInt(value) ?? value),
+  encode: SchemaGetter.passthrough<unknown>(),
+}
+
+/** What a node's stored form needs before it meets the node, if it needs anything. */
+const rebuildOf = (ast: SchemaAST.AST) =>
+  isMarshalledDate(ast)
+    ? rebuildingMarshalledDate
+    : isMarshalledBigInt(ast)
+      ? liftingMarshalledBigInt
+      : undefined
+
 const astWith = <A extends SchemaAST.AST>(ast: A, changes: Partial<A>): A =>
   Object.assign(Object.create(Object.getPrototypeOf(ast)), ast, changes)
 
@@ -2207,35 +2230,36 @@ const withChildren = (ast: SchemaAST.AST, f: (child: SchemaAST.AST) => SchemaAST
   }
 }
 
-const readingDatesMemo = new WeakMap<SchemaAST.AST, SchemaAST.AST>()
+const readingMarshalledMemo = new WeakMap<SchemaAST.AST, SchemaAST.AST>()
 
-/** Every marshalled date in a schema, wherever it sits, read back as a real one. */
-const readingDates = (ast: SchemaAST.AST): SchemaAST.AST => {
-  const known = readingDatesMemo.get(ast)
+/** Every marshalled date and bigint in a schema, wherever it sits, read back as a real one. */
+const readingMarshalled = (ast: SchemaAST.AST): SchemaAST.AST => {
+  const known = readingMarshalledMemo.get(ast)
   if (known !== undefined) return known
   let read: SchemaAST.AST
-  if (isMarshalledDate(ast)) {
+  const rebuild = rebuildOf(ast)
+  if (rebuild !== undefined) {
     read = Schema.Unknown.pipe(
-      Schema.decodeTo(Schema.make<Schema.Top>(ast) as never, rebuildingMarshalledDate as never),
+      Schema.decodeTo(Schema.make<Schema.Top>(ast) as never, rebuild as never),
     ).ast
   } else {
-    read = withChildren(ast, readingDates)
+    read = withChildren(ast, readingMarshalled)
     const encoding =
       ast.encoding &&
       (SchemaAST.mapOrSame(ast.encoding, (link) => {
-        const to = readingDates(link.to)
+        const to = readingMarshalled(link.to)
         return to === link.to ? link : new SchemaAST.Link(to, link.transformation)
       }) as SchemaAST.Encoding)
     if (encoding !== ast.encoding) read = astWith(read, { encoding })
   }
-  readingDatesMemo.set(ast, read)
+  readingMarshalledMemo.set(ast, read)
   return read
 }
 
 /**
  * The read schema of a value the library stores but doesn't derive: an event, its metadata, a
  * snapshot state, an outbox effect. Every read of one goes through it, so anything a stream's read
- * does differently from its declaration belongs here. Differently, as it stands, in two ways:
+ * does differently from its declaration belongs here. Differently, as it stands, in three ways:
  *
  * - An absent attribute reads as the value it stands for (`absentReading`).
  * - A `Schema.DateTimeUtc` or `Schema.DateTimeZoned` comes back as a real date. Nothing substitutes
@@ -2243,14 +2267,16 @@ const readingDates = (ast: SchemaAST.AST): SchemaAST.AST => {
  *   looks for the marker and the tag, which that map has. Left to the guard, it reads back as a plain
  *   object that passes `DateTime.isDateTime` and isn't one: `Equal` is false, and on a named zone
  *   `DateTime.getPart` throws.
+ * - A `Schema.BigInt` comes back as a bigint. The marshaller stores one as a number, and the
+ *   unmarshaller returns a safe integer as a number, so without this only the values past 2^53 read.
  *
- * Returned as it came when neither applies to it.
+ * Returned as it came when none applies to it.
  *
  * @internal
  */
 export const readingStreamValues = (schema: Schema.Top): Schema.Top => {
   const absent = substituteSchemaDeep(schema, { absentReads: "only", enforceChecks: true })
-  const read = readingDates(absent.ast)
+  const read = readingMarshalled(absent.ast)
   return read === absent.ast ? absent : Schema.make<Schema.Top>(read)
 }
 

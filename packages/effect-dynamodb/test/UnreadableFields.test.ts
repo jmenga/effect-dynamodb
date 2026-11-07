@@ -163,7 +163,6 @@ describe("[EDD-9125] EventStore.makeStream", () => {
       "Schema.RedactedFromValue",
       Schema.RedactedFromValue(Schema.String),
     ],
-    ["a Schema.BigInt", Schema.BigInt, "Schema.BigIntFromString", Schema.BigIntFromString],
     [
       "a transformation over Schema.Date",
       Schema.DateTimeUtcFromDate,
@@ -228,6 +227,75 @@ describe("[EDD-9125] EventStore.makeStream", () => {
       expect(refusal(() => stream({ events: [eventOver(field)] }))).toBe("nothing refused")
     }
   })
+
+  describe("a Schema.BigInt, which a read lifts", () => {
+    const BESIDE = "a union of Schema.BigInt and something else stored as a number"
+    const refused = (config: Record<string, unknown>) => refusal(() => stream(config))
+
+    for (const [name, field] of [
+      ["on its own", Schema.BigInt],
+      ["or null", Schema.NullOr(Schema.BigInt)],
+      ["optional", Schema.optional(Schema.BigInt)],
+      ["beside a string", Schema.Union([Schema.String, Schema.BigInt])],
+      ["in a list", Schema.Array(Schema.BigInt)],
+      ["in an Option", Schema.Option(Schema.BigInt)],
+      ["suspended", Schema.suspend(() => Schema.BigInt)],
+    ] as const) {
+      it(`takes one ${name}, in an event, metadata and a snapshot`, () => {
+        expect(refused({ events: [eventOver(field)] })).toBe("nothing refused")
+        expect(refused({ metadata: Schema.Struct({ m: field as never }) })).toBe("nothing refused")
+        expect(refused({ snapshot: { schema: Schema.Struct({ m: field as never }) } })).toBe(
+          "nothing refused",
+        )
+      })
+    }
+
+    it("takes one packed: its write is what fails, as it always has", () => {
+      expect(refused({ events: [eventOver(Schema.BigInt)], storedAs: { data: Packed } })).toBe(
+        "nothing refused",
+      )
+    })
+
+    for (const field of [
+      Schema.Union([Schema.Number, Schema.BigInt]),
+      Schema.Union([Schema.BigInt, Schema.Number]),
+      Schema.Union([Schema.Literal(5), Schema.BigInt]),
+    ]) {
+      it("refuses one a read can't tell from a number, in an event, metadata and a snapshot", () => {
+        expect(refused({ events: [eventOver(field)] })).toContain(
+          `EventStream "Tally", events[0]: field "m" is ${BESIDE}`,
+        )
+        expect(refused({ metadata: Schema.Struct({ m: field as never }) })).toContain(
+          `metadata: field "m" is ${BESIDE}`,
+        )
+        expect(refused({ snapshot: { schema: Schema.Struct({ m: field as never }) } })).toContain(
+          `snapshot state: field "m" is ${BESIDE}`,
+        )
+      })
+    }
+
+    it("refuses two events a read can't tell apart, each fine alone", () => {
+      const one = Schema.Struct({ amount: Schema.BigInt })
+      const other = Schema.Struct({ amount: Schema.Number })
+      expect(refused({ events: [one] })).toBe("nothing refused")
+      expect(refused({ events: [other] })).toBe("nothing refused")
+      expect(refused({ events: [one, other] })).toContain(
+        `EventStream "Tally": the union of its events is ${BESIDE}`,
+      )
+      expect(refused({ events: [other, one] })).toContain(BESIDE)
+    })
+
+    it("takes two events a tag tells apart", () => {
+      expect(
+        refused({
+          events: [
+            Schema.Struct({ _tag: Schema.tag("Paid"), amount: Schema.BigInt }),
+            Schema.Struct({ _tag: Schema.tag("Noted"), amount: Schema.Number }),
+          ],
+        }),
+      ).toBe("nothing refused")
+    })
+  })
 })
 
 describe("[EDD-9125] a projection's outbox", () => {
@@ -279,7 +347,6 @@ describe("[EDD-9125] a projection's outbox", () => {
         Schema.Redacted(Schema.String),
         Schema.RedactedFromValue(Schema.String),
       ],
-      ["a Schema.BigInt", Schema.BigInt, Schema.BigIntFromString],
       ["a Schema.URL", Schema.URL, Schema.URLFromString],
     ] as const) {
       it(`${name} refuses ${what}, and takes its replacement`, () => {
@@ -294,6 +361,15 @@ describe("[EDD-9125] a projection's outbox", () => {
 
     it(`${name} says what a whole effect is`, () => {
       expect(refusal(() => build(Schema.URL))).toContain(`${owner}: the effect is a Schema.URL`)
+    })
+
+    it(`${name} takes a Schema.BigInt, which a read lifts, unless it's beside a number`, () => {
+      expect(refusal(() => build(Schema.Struct({ m: Schema.BigInt })))).toBe("nothing refused")
+      expect(
+        refusal(() => build(Schema.Struct({ m: Schema.Union([Schema.Number, Schema.BigInt]) }))),
+      ).toContain(
+        `${owner}: field "m" is a union of Schema.BigInt and something else stored as a number`,
+      )
     })
   }
 })

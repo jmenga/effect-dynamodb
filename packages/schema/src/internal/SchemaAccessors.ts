@@ -382,6 +382,11 @@ const PLAIN_BIGINT: Unreadable = {
   why: "it's stored as a number, which reads back as a number and no longer decodes. An entity or an aggregate lifts it back only where it reaches it, which isn't under another declaration, a Schema.suspend or a transformation",
   use: "Schema.BigIntFromString",
 }
+const BIGINT_BESIDE_A_NUMBER: Unreadable = {
+  name: "a union of Schema.BigInt and something else stored as a number",
+  why: "5n and 5 are stored the same, so a read can't tell which one was written",
+  use: "Schema.BigIntFromString",
+}
 const TRANSFORMED_BIGINT: Unreadable = {
   name: "a transformation over Schema.BigInt, such as Schema.DurationFromNanos or Schema.ByteSizeFromBigInt",
   why: "it's stored as a number, which reads back as a number and no longer decodes",
@@ -396,7 +401,7 @@ const BIGINT_LITERAL: Unreadable = {
 /**
  * What stores a schema. An entity's or an aggregate's fields are substituted before they're
  * marshalled, so a date, a redacted value and a plain bigint read back there; a stream, a snapshot
- * and an outbox encode through the schema alone.
+ * and an outbox encode through the schema alone, and a read lifts a date and a bigint.
  */
 export type StoredBy = "entity" | "aggregate" | "schema"
 
@@ -441,7 +446,7 @@ const unreadableAt = (ast: SchemaAST.AST, walk: UnreadableWalk): Unreadable | un
       return typeof ast.literal === "bigint" ? BIGINT_LITERAL : undefined
     case "BigInt": {
       if (isTransformed(walk)) return TRANSFORMED_BIGINT
-      return read ? undefined : PLAIN_BIGINT
+      return read || walk.by === "schema" ? undefined : PLAIN_BIGINT
     }
     case "Declaration": {
       const id = representationIdOf(ast) ?? ""
@@ -455,6 +460,179 @@ const unreadableAt = (ast: SchemaAST.AST, walk: UnreadableWalk): Unreadable | un
     default:
       return undefined
   }
+}
+
+type Forced = { readonly node: SchemaAST.AST; readonly seen: ReadonlySet<SchemaAST.AST> }
+
+/** What a suspended node stands for, and the suspensions on the way to it. `undefined` is a cycle. */
+const forced = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST>): Forced | undefined => {
+  if (!SchemaAST.isSuspend(ast)) return { node: ast, seen }
+  return seen.has(ast) ? undefined : forced(ast.thunk(), new Set(seen).add(ast))
+}
+
+const JSON_VALUES: ReadonlySet<string | undefined> = new Set([
+  "effect/schema/Json",
+  "effect/schema/MutableJson",
+])
+
+/** A number may be what it takes: a custom declaration doesn't say, and the rest take any value. */
+const takesAnything = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isUnknown(ast) ||
+  SchemaAST.isAny(ast) ||
+  (SchemaAST.isDeclaration(ast) &&
+    (representationIdOf(ast) === undefined || JSON_VALUES.has(representationIdOf(ast))))
+
+const isNumeric = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isNumber(ast) ||
+  SchemaAST.isEnum(ast) ||
+  (SchemaAST.isLiteral(ast) && typeof ast.literal === "number")
+
+/** The kind of attribute a node takes, with a bigint's being a number's. */
+const storedKind = (ast: SchemaAST.AST): string =>
+  SchemaAST.isLiteral(ast)
+    ? typeof ast.literal
+    : isNumeric(ast) || SchemaAST.isBigInt(ast)
+      ? "number"
+      : SchemaAST.isString(ast) || SchemaAST.isTemplateLiteral(ast)
+        ? "string"
+        : SchemaAST.isBoolean(ast)
+          ? "boolean"
+          : ast._tag
+
+/** Whether a stored value could be one both of these take. What can't be told apart counts. */
+const couldBeBoth = (
+  a: SchemaAST.AST,
+  b: SchemaAST.AST,
+  seen: ReadonlySet<SchemaAST.AST>,
+): boolean => {
+  const left = forced(a, seen)
+  const right = forced(b, left?.seen ?? seen)
+  if (left === undefined || right === undefined) return true
+  const [l, r, within] = [left.node, right.node, right.seen]
+  if (SchemaAST.isUnion(l)) return l.types.some((type) => couldBeBoth(type, r, within))
+  if (SchemaAST.isUnion(r)) return r.types.some((type) => couldBeBoth(l, type, within))
+  if (takesAnything(l) || takesAnything(r)) return true
+  if (SchemaAST.isDeclaration(l) || SchemaAST.isDeclaration(r)) return true
+  if (SchemaAST.isLiteral(l) && SchemaAST.isLiteral(r)) return l.literal === r.literal
+  if (SchemaAST.isObjects(l) && SchemaAST.isObjects(r)) {
+    return l.propertySignatures.every((property) => {
+      const other = r.propertySignatures.find((candidate) => candidate.name === property.name)
+      return (
+        other === undefined ||
+        (SchemaAST.isOptional(property.type) && SchemaAST.isOptional(other.type)) ||
+        couldBeBoth(property.type, other.type, within)
+      )
+    })
+  }
+  return storedKind(l) === storedKind(r)
+}
+
+/** Whether a stored side holds a plain bigint anywhere. */
+const holdsPlainBigint = (ast: SchemaAST.AST, seen: ReadonlySet<SchemaAST.AST>): boolean => {
+  const found = forced(ast, seen)
+  if (found === undefined) return false
+  const { node } = found
+  const within = (asts: ReadonlyArray<SchemaAST.AST>) =>
+    asts.some((part) => holdsPlainBigint(part, found.seen))
+  switch (node._tag) {
+    case "BigInt":
+      return true
+    case "Declaration":
+      return within(node.typeParameters)
+    case "Union":
+      return within(node.types)
+    case "Arrays":
+      return within([...node.elements, ...node.rest])
+    case "Objects":
+      return within([
+        ...node.propertySignatures.map((property) => property.type),
+        ...node.indexSignatures.map((signature) => signature.type),
+      ])
+    default:
+      return false
+  }
+}
+
+/**
+ * Whether a value `holder` stores with a number in a plain bigint's place is one `other` takes and
+ * keeps as a number. A read has nothing to tell them apart by, whichever is declared first. Two
+ * structs apart on a field, as tagged events are, or a field `other` requires and `holder` hasn't,
+ * can't be confused. What can't be told apart counts.
+ */
+const confusesItsBigint = (
+  holder: SchemaAST.AST,
+  other: SchemaAST.AST,
+  seen: ReadonlySet<SchemaAST.AST>,
+): boolean => {
+  const left = forced(holder, seen)
+  const right = forced(other, left?.seen ?? seen)
+  if (left === undefined || right === undefined) return false
+  const [l, r, within] = [left.node, right.node, right.seen]
+  const confused = (mine: SchemaAST.AST, theirs: SchemaAST.AST) =>
+    confusesItsBigint(mine, theirs, within)
+  if (SchemaAST.isUnion(l)) return l.types.some((type) => confused(type, r))
+  if (SchemaAST.isUnion(r)) return r.types.some((type) => confused(l, type))
+  if (SchemaAST.isBigInt(l)) return isNumeric(r) || takesAnything(r)
+  if (takesAnything(r)) return holdsPlainBigint(l, new Set())
+  if (SchemaAST.isArrays(l)) {
+    if (!SchemaAST.isArrays(r)) return false
+    const fixed = Math.min(l.elements.length, r.elements.length)
+    const parts = (ast: SchemaAST.Arrays) => [...ast.elements, ...ast.rest]
+    return (
+      l.elements
+        .slice(0, fixed)
+        .every((element, i) => couldBeBoth(element, r.elements[i]!, new Set())) &&
+      parts(l).some((mine, i) =>
+        (i < fixed ? [r.elements[i]!] : parts(r)).some((theirs) => confused(mine, theirs)),
+      )
+    )
+  }
+  if (SchemaAST.isObjects(l)) {
+    if (SchemaAST.isDeclaration(r)) return holdsPlainBigint(l, new Set())
+    if (!SchemaAST.isObjects(r)) return false
+    const writes = (name: PropertyKey) =>
+      l.indexSignatures.length > 0 || l.propertySignatures.some((mine) => mine.name === name)
+    const required = r.propertySignatures.filter((theirs) => !SchemaAST.isOptional(theirs.type))
+    if (!required.every((theirs) => writes(theirs.name)) || !couldBeBoth(l, r, new Set())) {
+      return false
+    }
+    const records = r.indexSignatures.map((signature) => signature.type)
+    return (
+      l.propertySignatures.some((mine) => {
+        const named = r.propertySignatures.find((theirs) => theirs.name === mine.name)
+        return (named === undefined ? records : [named.type]).some((theirs) =>
+          confused(mine.type, theirs),
+        )
+      }) ||
+      l.indexSignatures.some((signature) =>
+        [...r.propertySignatures.map((theirs) => theirs.type), ...records].some((theirs) =>
+          confused(signature.type, theirs),
+        ),
+      )
+    )
+  }
+  if (SchemaAST.isDeclaration(l)) {
+    if (SchemaAST.isObjects(r)) return holdsPlainBigint(l, new Set())
+    return (
+      SchemaAST.isDeclaration(r) &&
+      representationIdOf(l) === representationIdOf(r) &&
+      l.typeParameters.some(
+        (parameter, i) =>
+          r.typeParameters[i] !== undefined && confused(parameter, r.typeParameters[i]!),
+      )
+    )
+  }
+  return false
+}
+
+/** Whether a union's members hold a bigint that another member would read as a number. */
+const hasBigintBesideANumber = (union: SchemaAST.Union): boolean => {
+  const members = union.types.map((member) => SchemaAST.toEncoded(member))
+  return members.some((holder, at) =>
+    members.some(
+      (other, position) => position !== at && confusesItsBigint(holder, other, new Set()),
+    ),
+  )
 }
 
 /** A `Schema.Class`'s own encoding step, onto the struct of its fields, which are walked. */
@@ -590,6 +768,9 @@ const firstUnreadable = (
       return firstUnreadable(ast.thunk(), path, seen, { ...walk, unreached: true })
     }
     case "Union": {
+      if (walk.by === "schema" && hasBigintBesideANumber(ast)) {
+        return { at: path, what: BIGINT_BESIDE_A_NUMBER }
+      }
       const members: UnreadableWalk = {
         ...walk,
         // The union `Schema.optional(X)` makes under a default on X, which is X to the substitution.
@@ -640,7 +821,8 @@ const firstUnreadable = (
  * collection a `many` edge is declared as is rows, of which only the rows are stored.
  *
  * Only Effect's own declarations can be judged here. A `Schema.instanceOf` and a duck-typed
- * `Schema.declare` have the same AST, and one reads back where the other doesn't.
+ * `Schema.declare` have the same AST, and one reads back where the other doesn't, so those are
+ * judged by value at write ({@link holdsCustomDeclaration}, `EDD-9126`).
  */
 export const refuseUnreadable = (
   owner: string,
@@ -668,6 +850,44 @@ export const refuseUnreadable = (
       `${what.name.startsWith("Schema.") ? "a " : ""}${what.name}, which can't be read back: ` +
       `${what.why}. Use ${what.use}.`,
   )
+}
+
+/**
+ * Whether a stored side holds a declaration Effect didn't make, such as a `Schema.instanceOf` or a
+ * duck-typed `Schema.declare`. Only a value can say whether one reads back (`internal/RoundTrip.ts`
+ * in `effect-dynamodb`), and this says which schemas have such values. A `Schema.Class`, and a struct
+ * decoded to a class, have an encoding: what's stored is the struct, and only what's in it counts.
+ */
+export const holdsCustomDeclaration = (
+  ast: SchemaAST.AST,
+  seen: Set<SchemaAST.AST> = new Set(),
+): boolean => {
+  const encoding = ast.encoding
+  if (encoding !== undefined) {
+    return holdsCustomDeclaration(encoding[encoding.length - 1]!.to, seen)
+  }
+  const within = (asts: ReadonlyArray<SchemaAST.AST>) =>
+    asts.some((part) => holdsCustomDeclaration(part, seen))
+  switch (ast._tag) {
+    case "Declaration":
+      return representationIdOf(ast) === undefined || within(ast.typeParameters)
+    case "Suspend": {
+      if (seen.has(ast)) return false
+      seen.add(ast)
+      return holdsCustomDeclaration(ast.thunk(), seen)
+    }
+    case "Union":
+      return within(ast.types)
+    case "Arrays":
+      return within([...ast.elements, ...ast.rest])
+    case "Objects":
+      return within([
+        ...ast.propertySignatures.map((property) => property.type),
+        ...ast.indexSignatures.map((signature) => signature.type),
+      ])
+    default:
+      return false
+  }
 }
 
 /**

@@ -132,6 +132,7 @@ import {
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
+import { asRead, notReadBack, type ReadBack, readBackOf } from "./internal/RoundTrip.js"
 import {
   composeKeysOrFail,
   freshIncarnationToken,
@@ -758,6 +759,15 @@ export interface Entity<
 
   /** @internal Fill omitted decoding-default fields of a put's input (see `put`). */
   readonly _fillDecodingDefaults: (input: unknown) => Effect.Effect<unknown, ValidationError>
+  /**
+   * Refuses an encoded payload holding a value of a custom declaration that wouldn't read back
+   * (`EDD-9126`). For a write path outside this entity's own operations.
+   * @internal
+   */
+  readonly _refuseNotReadBack: (
+    encoded: unknown,
+    operation: string,
+  ) => Effect.Effect<void, ValidationError>
 
   /** @internal Unique fields a put's input leaves to an index-stored default. */
   readonly _unsentineledDefaults: (input: unknown) => ReadonlyArray<string>
@@ -2945,6 +2955,106 @@ const makeImpl = <
       pathSets: uState.pathSets === undefined ? undefined : pathSets,
       pathRemoves: pathRemoves.length === 0 ? uState.pathRemoves : pathRemoves,
     } as UpdateState
+  }
+
+  /**
+   * The fields that can hold a value of a custom declaration, each with what checks one reads back.
+   * Empty for a model with none, which pays nothing more on a write.
+   */
+  const readBacks: ReadonlyMap<string, ReadBack> = new Map(
+    Object.entries(data.modelFields as globalThis.Record<string, Schema.Top>).flatMap(
+      ([field, schema]) => {
+        // What's packed doesn't go through the marshaller's map, and packing refuses an instance itself.
+        const read =
+          field in data.packedFields
+            ? undefined
+            : getSchemaFields(schemas.recordSchema as unknown as Schema.Top)?.[field]
+        const readBack = read === undefined ? undefined : readBackOf(schema, () => read)
+        return readBack === undefined ? [] : [[field, readBack] as const]
+      },
+    ),
+  )
+
+  /** Refuses a payload holding a value that wouldn't read back, before anything is read or sent. */
+  const refuseNotReadBack = (
+    encoded: unknown,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> =>
+    readBacks.size === 0
+      ? Effect.void
+      : Effect.forEach(
+          [...readBacks].filter(
+            ([field]) => (encoded as globalThis.Record<string, unknown>)[field] != null,
+          ),
+          ([field, readBack]) =>
+            readBack((encoded as globalThis.Record<string, unknown>)[field]).pipe(
+              Effect.mapError(
+                (issue) =>
+                  new ValidationError({
+                    entityType,
+                    operation,
+                    cause: notReadBack(`Field "${field}"`, issue),
+                  }),
+              ),
+            ),
+          { discard: true },
+        )
+
+  /**
+   * A write's payload, encoded (see `encodeOrDecodeEncode`) and refused if it wouldn't read back.
+   * Every write of the entity's own encodes through this.
+   */
+  const encodeForWrite = (
+    schema: Schema.Codec<any>,
+    input: unknown,
+    operation: string,
+  ): Effect.Effect<unknown, ValidationError> =>
+    readBacks.size === 0
+      ? encodeOrDecodeEncode(schema, input, entityType, operation)
+      : encodeOrDecodeEncode(schema, input, entityType, operation).pipe(
+          Effect.tap((encoded) => refuseNotReadBack(encoded, operation)),
+        )
+
+  /**
+   * An update's operand that wouldn't read back. An operand of `.add`, `.subtract` or `.deleteFromSet`
+   * is a number or a set to apply, not a value of the field, so only what's stored as given counts.
+   * `unstorableOperand` goes first, so each of these has already been through the marshaller.
+   */
+  const notReadBackOperand = (uState: UpdateState): string | undefined => {
+    if (readBacks.size === 0) return undefined
+    type Operand = {
+      readonly segments: ReadonlyArray<string | number>
+      readonly value: unknown
+    }
+    const operands: ReadonlyArray<
+      readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements"]
+    > = [
+      [
+        ".append() of",
+        Object.entries(uState.append ?? {}).map(([field, value]) => ({
+          segments: [field],
+          value,
+        })),
+        "elements",
+      ],
+      ["pathSet of", uState.pathSets, "value"],
+      ["pathAppend of", uState.pathAppends, "elements"],
+      ["pathPrepend of", uState.pathPrepends, "elements"],
+      ["pathIfNotExists of", uState.pathIfNotExists, "value"],
+    ]
+    for (const [op, ops, kind] of operands) {
+      for (const { segments, value } of ops ?? []) {
+        if (!readBacks.has(String(segments[0]))) continue
+        const { encoded } = encodePathValue(segments, value, kind)
+        const read = asRead(encoded)
+        const issue =
+          kind === "value"
+            ? pathValues.validate(segments, read)
+            : pathValues.validateElements(segments, read)
+        if (issue !== undefined) return notReadBack(`${op} "${segments.join(".")}"`, issue)
+      }
+    }
+    return undefined
   }
 
   /**
@@ -6282,10 +6392,9 @@ const makeImpl = <
           //      instances) and the substituted date/Redacted transforms
           //      tolerate either form. The subsequent `encode` produces
           //      the canonical wire shape.
-          const encodedInput = yield* encodeOrDecodeEncode(
+          const encodedInput = yield* encodeForWrite(
             schemas.inputSchema as Schema.Codec<any>,
             inputWithGeneratedId,
-            entityType,
             operation,
           )
 
@@ -6731,17 +6840,15 @@ const makeImpl = <
           : new ItemNotFound({ entityType, key: encodedKey })
 
       // Encode update payload → wire form (see `put` for the strategy).
-      const encodedUpdates = yield* encodeOrDecodeEncode(
+      const encodedUpdates = yield* encodeForWrite(
         schemas.updateSchema as Schema.Codec<any>,
         updates ?? {},
-        entityType,
         "update",
       )
 
-      const unstorable = unstorableOperand(
-        uState,
-        encodedUpdates as globalThis.Record<string, unknown>,
-      )
+      const unstorable =
+        unstorableOperand(uState, encodedUpdates as globalThis.Record<string, unknown>) ??
+        notReadBackOperand(uState)
       if (unstorable !== undefined) {
         return yield* new ValidationError({ entityType, operation: "update", cause: unstorable })
       }
@@ -9434,10 +9541,9 @@ const makeImpl = <
       const now = yield* DateTime.now
       yield* checkWithVectorNames(opts.withVectors, "upsert")
       // Required fields are required whether or not the item exists.
-      const encodedInput = (yield* encodeOrDecodeEncode(
+      const encodedInput = (yield* encodeForWrite(
         schemas.inputSchema as Schema.Codec<any>,
         yield* fillDecodingDefaults(input),
-        entityType,
         "upsert",
       )) as globalThis.Record<string, unknown>
       yield* refuseUnstorable({ ...encodedInput, ...opts.withVectors }, "upsert")
@@ -9609,10 +9715,9 @@ const makeImpl = <
           // Encode user input → wire form (see `put` for strategy). An input
           // that omits a defaulted index composite took the guarded path: the
           // default is stored on create, the stored value kept on update.
-          const encodedInput = yield* encodeOrDecodeEncode(
+          const encodedInput = yield* encodeForWrite(
             schemas.inputSchema as Schema.Codec<any>,
             input,
-            entityType,
             "upsert",
           )
           yield* refuseUnstorable(
@@ -10186,10 +10291,9 @@ const makeImpl = <
       const namedRemoves = removes.length > 0 ? new Set(removes) : undefined
 
       // Encode user input via appendInputSchema (see `put` for strategy).
-      const encodedInput = yield* encodeOrDecodeEncode(
+      const encodedInput = yield* encodeForWrite(
         appendInputSchema,
         removedToDefault.length === 0 ? input : { ...(input as object), ...(defaulted as object) },
-        entityType,
         "append",
       )
       const encoded = encodedInput as globalThis.Record<string, unknown>
@@ -13715,6 +13819,7 @@ const makeImpl = <
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
+    _refuseNotReadBack: refuseNotReadBack,
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),

@@ -54,6 +54,7 @@ import {
   extractArrayElement,
   getSchemaFields,
   hasEncodingTransformation,
+  holdsCustomDeclaration,
   refuseUnreadable,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
@@ -88,6 +89,7 @@ import { asReadGuard } from "./internal/ExpressionLimits.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
+import { notReadBack } from "./internal/RoundTrip.js"
 import { generateTimestampPrimitive, marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
@@ -1607,6 +1609,45 @@ const makeAggregate = <TSchema extends Schema.Top>(
       return { client, tableConfig, pkValue, allItems }
     })
 
+  const holdsCustom = holdsCustomDeclaration(schema.ast)
+
+  /**
+   * Refuses the rows of a write that wouldn't read back, for an aggregate holding a custom declaration
+   * (`EDD-9126`): the rows it's about to write, through the read path a `get` takes. An aggregate with
+   * none has nothing to do here.
+   */
+  const refuseNotReadBack = (
+    groups: ReadonlyArray<{ readonly items: ReadonlyArray<Record<string, AttributeValue>> }>,
+    key: Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> =>
+    !holdsCustom
+      ? Effect.void
+      : Effect.gen(function* () {
+          const rows = groups.flatMap((group) =>
+            group.items.map((item) => fromAttributeMap(item) as Record<string, unknown>),
+          )
+          yield* unpackAggregateItems(rows, dispatchByType, aggregateName)
+          yield* assembleAggregate(
+            decodeSchema,
+            rootNode,
+            rows,
+            contextFields,
+            key,
+            aggregateName,
+            systemAttrs,
+          ).pipe(
+            Effect.mapError(
+              (error) =>
+                new ValidationError({
+                  entityType: aggregateName,
+                  operation,
+                  cause: notReadBack("The aggregate", (error as ValidationError).cause ?? error),
+                }),
+            ),
+          )
+        })
+
   /** Shared: compose PK and query all items, a rejected read a `ValidationError`. */
   const fetchPartition = (key: Record<string, unknown>, operation: string, rekeyRead?: RekeyRead) =>
     readPartition(
@@ -1858,6 +1899,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           stampFor(now, existingCreated, undefined, updatedBefore),
         ),
       )
+      yield* refuseNotReadBack(newDynamo, key, "aggregate.update")
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
       const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
@@ -2556,6 +2598,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               stampFor(now, EMPTY_CREATED),
             ),
           )
+          yield* refuseNotReadBack(dynamoGroups, assembled, "aggregate.create")
 
           // 6. Write via sub-aggregate transactions. The root item goes first in
           //    the first transaction, guarded by `attribute_not_exists` (#134):

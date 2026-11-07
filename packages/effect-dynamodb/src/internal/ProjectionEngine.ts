@@ -50,6 +50,7 @@ import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
+import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
@@ -604,6 +605,11 @@ export const makeEngine = (config: EngineConfig) => {
 
   const pad = (n: number, width: number) => String(n).padStart(width, "0")
 
+  const outboxReadBack =
+    config.outbox === undefined
+      ? undefined
+      : readBackOf(config.outbox.schema, () => readingStreamValues(config.outbox!.schema))
+
   const outboxItems = (
     rowKey: Record<string, unknown>,
     revision: number,
@@ -616,6 +622,13 @@ export const makeEngine = (config: EngineConfig) => {
         const encoded = yield* S.encodeUnknownEffect(
           writingTuplePositions(outbox.schema) as S.Codec<unknown>,
         )(e.effect).pipe(
+          Effect.tap((wire) =>
+            outboxReadBack === undefined
+              ? Effect.void
+              : outboxReadBack(wire).pipe(
+                  Effect.mapError((issue) => notReadBack("The outbox effect", issue)),
+                ),
+          ),
           Effect.mapError(
             (cause) =>
               new ValidationError({ entityType, operation: `${config.label}.outbox`, cause }),

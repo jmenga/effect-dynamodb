@@ -383,7 +383,8 @@ That row then works like an entity:
   same way: its rows are taken apart, filled and put back, and the input type makes the date
   optional there too. Its `sk.composite` names are checked against the record's value. With a
   `decompose` and no `assemble`, an array still fills and anything else must supply its dates, since
-  nothing says how to put its rows back.
+  nothing says how to put its rows back. A `many` edge can be held as a `Schema.ReadonlyMap` the same
+  way, since it's the rows that are stored and not the map.
 - A `one` edge with no entity of its own takes its value in the input under its field name, with
   the date optional. Only an edge with an `entity` takes an id (`venueId`).
 
