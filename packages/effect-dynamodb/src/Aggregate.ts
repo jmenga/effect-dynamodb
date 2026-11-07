@@ -71,6 +71,7 @@ import * as Batch from "./Batch.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
 import * as Capacity from "./internal/Capacity.js"
+import { decodeKeyCursor, encodeKeyCursor } from "./internal/Cursor.js"
 import {
   type CompileResult,
   type ConditionOps,
@@ -278,7 +279,11 @@ export interface ListOptions<Model = Record<string, unknown>> {
    * request can return nothing and the loop simply asks again.
    */
   readonly pageSize?: number
-  /** Opaque cursor from a previous list call to resume pagination */
+  /**
+   * Opaque cursor from a previous list call to resume pagination. One that
+   * can't be decoded fails with a `ValidationError` (`[EDD-9094]`,
+   * `operation: "list"`); nothing is sent.
+   */
   readonly cursor?: string
   /**
    * `FilterExpression` applied to the **root-item** query, server-side.
@@ -455,7 +460,8 @@ export interface Aggregate<
    *
    * Supports cursor-based pagination via `options.limit` and `options.cursor`.
    * When `limit` is specified, returns at most that many aggregates plus a cursor
-   * for the next page. Without `limit`, returns all matching aggregates.
+   * for the next page. Without `limit`, returns all matching aggregates. A
+   * cursor that can't be decoded fails with `EDD-9094`.
    *
    * `options.filter` adds a server-side `FilterExpression` to the root-item
    * query; `limit` still means "this many aggregates", the loop accumulating
@@ -2708,6 +2714,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
             rootItems = limit === undefined ? merged : merged.slice(0, limit)
             nextKey = undefined
           } else {
+            // `!== undefined`, as above: an empty string is a cursor no list
+            // returned, not a way of saying "from the start".
+            const startKey =
+              options?.cursor === undefined ? undefined : decodeKeyCursor(options.cursor)
+            if (options?.cursor !== undefined && startKey === undefined) {
+              return yield* new ValidationError({
+                entityType: aggregateName,
+                operation: "list",
+                cause:
+                  `[EDD-9094] Aggregate "${aggregateName}": the cursor is not one a list returned. ` +
+                  "A cursor is opaque: pass back the text of a previous `list` result's `cursor`, " +
+                  "unchanged, to the same list. Nothing was sent.",
+              })
+            }
             const result = yield* queryListPartition(
               client,
               tableConfig,
@@ -2719,9 +2739,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 skComplete,
                 limit,
                 pageSize,
-                startKey: options?.cursor
-                  ? (JSON.parse(atob(options.cursor)) as Record<string, AttributeValue>)
-                  : undefined,
+                startKey,
                 filter: rootFilter,
                 accept: options?.filterBy,
                 reverse: options?.reverse === true,
@@ -2758,7 +2776,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             if (assembled !== undefined) aggregates.push(assembled)
           }
 
-          const cursor = nextKey ? Option.some(btoa(JSON.stringify(nextKey))) : Option.none()
+          const cursor = nextKey ? Option.some(encodeKeyCursor(nextKey)) : Option.none()
 
           return { data: aggregates, cursor }
         }),
