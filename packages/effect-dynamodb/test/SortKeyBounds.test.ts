@@ -888,6 +888,7 @@ describe("composeRangeUnder sends 1.36's condition over the escaped key text", (
         }
       }
     },
-    { arbitrary: { runs: 300 } },
+    // Seven operators, four flags and three value kinds per casing, per run: seconds in all.
+    { timeout: 60_000, arbitrary: { runs: 300 } },
   )
 })

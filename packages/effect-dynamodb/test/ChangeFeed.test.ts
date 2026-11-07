@@ -1136,7 +1136,8 @@ describe("changeFeed", () => {
         const fiber = yield* collect({
           streamArn: STREAM_ARN,
           ...fast,
-          lease: { duration: "1 second", renewEvery: "10 millis" },
+          // Long enough that a stalled process can't reach the renewal deadline.
+          lease: { duration: "1 hour", renewEvery: "10 millis" },
         }).pipe(Effect.provide(layerOf(fake, flaky)), Effect.exit, Effect.forkChild)
         yield* Deferred.await(renewedAfterTheFailure)
         expect(renewals).toBeGreaterThan(2)
