@@ -1,0 +1,1293 @@
+{
+ "generated": "Stored by the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (effect@4.1.2), on DynamoDB Local; each partition's items as a scan returned them, a binary value as base64. A packed date is the look-alike a read handed back, the only date that release could pack. Do not regenerate from this repo.",
+ "rows": {
+  "utc/native": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "_tag": {
+         "S": "Utc"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "utcnative"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "M": {
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "_tag": {
+         "S": "Utc"
+        }
+       }
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "b03f4e4a06e685eb81142f0d756e15cd"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#utcnative"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:12.886Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "utcnative"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#utcnative"
+    },
+    "state": {
+     "M": {
+      "m": {
+       "M": {
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "_tag": {
+         "S": "Utc"
+        }
+       }
+      },
+      "n": {
+       "N": "1"
+      }
+     }
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:12.934Z"
+    }
+   }
+  ],
+  "utc/json": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "_tag": {
+         "S": "Utc"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "utcjson"
+    },
+    "data": {
+     "S": "{\"_tag\":\"Noted\",\"f\":{\"epochMilliseconds\":1735689600000,\"~effect/DateTime\":\"~effect/DateTime\",\"_tag\":\"Utc\"}}"
+    },
+    "__edd_wt__": {
+     "S": "146f3f2690790aeed47e42218c9cf80f"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#utcjson"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:12.967Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "utcjson"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#utcjson"
+    },
+    "state": {
+     "S": "{\"m\":{\"epochMilliseconds\":1735689600000,\"~effect/DateTime\":\"~effect/DateTime\",\"_tag\":\"Utc\"},\"n\":1}"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:12.971Z"
+    }
+   }
+  ],
+  "utc/gzip": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "_tag": {
+         "S": "Utc"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "utcgzip"
+    },
+    "data": {
+     "B": "IR+LCAAAAAAAABOrVoovSUxXslLyyy9JTVHSUUpTsqpWSi3IT87wzczJySxOTc7PSylWsjI0NzY1s7A0MwABHaW61LS01OQSfZfEktSQzNxUJStMIR2Y2aElyUq1tQAAUV7GawAAAA=="
+    },
+    "__edd_wt__": {
+     "S": "c3aef69b7429a5ca896ea5342f694bff"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#utcgzip"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:12.979Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "utcgzip"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#utcgzip"
+    },
+    "state": {
+     "S": "{\"m\":{\"epochMilliseconds\":1735689600000,\"~effect/DateTime\":\"~effect/DateTime\",\"_tag\":\"Utc\"},\"n\":1}"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:12.985Z"
+    }
+   }
+  ],
+  "named/native": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "format": {
+           "M": {}
+          },
+          "id": {
+           "S": "Asia/Tokyo"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Named"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "namednative"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "format": {
+           "M": {}
+          },
+          "id": {
+           "S": "Asia/Tokyo"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Named"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "dc9c4f9b48c09d5fe705ec23a58e2252"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#namednative"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.090Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "namednative"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#namednative"
+    },
+    "state": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "format": {
+           "M": {}
+          },
+          "id": {
+           "S": "Asia/Tokyo"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Named"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      },
+      "n": {
+       "N": "1"
+      }
+     }
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.094Z"
+    }
+   }
+  ],
+  "named/json": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "format": {
+           "M": {}
+          },
+          "id": {
+           "S": "Asia/Tokyo"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Named"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "namedjson"
+    },
+    "data": {
+     "S": "{\"_tag\":\"Noted\",\"f\":{\"~effect/DateTime\":\"~effect/DateTime\",\"epochMilliseconds\":1735689600000,\"zone\":{\"format\":{},\"id\":\"Asia/Tokyo\",\"~effect/DateTime/TimeZone\":\"~effect/DateTime/TimeZone\",\"_tag\":\"Named\"},\"_tag\":\"Zoned\"}}"
+    },
+    "__edd_wt__": {
+     "S": "191a566d71ceeca35f936b8cdab007d9"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#namedjson"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.101Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "namedjson"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#namedjson"
+    },
+    "state": {
+     "S": "{\"m\":{\"~effect/DateTime\":\"~effect/DateTime\",\"epochMilliseconds\":1735689600000,\"zone\":{\"format\":{},\"id\":\"Asia/Tokyo\",\"~effect/DateTime/TimeZone\":\"~effect/DateTime/TimeZone\",\"_tag\":\"Named\"},\"_tag\":\"Zoned\"},\"n\":1}"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.105Z"
+    }
+   }
+  ],
+  "named/gzip": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "format": {
+           "M": {}
+          },
+          "id": {
+           "S": "Asia/Tokyo"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Named"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "namedgzip"
+    },
+    "data": {
+     "B": "IR+LCAAAAAAAABN9TrEKAjEU+5fMhSriqW8TXHW6yUVK+6rF6z2xXbTUb5c63HJghkASElJwyeYKwkkyOyh4UMGHvWeb9cFk7kNk0NxS4IfY2zEMQ0hsZXQJtNys1t121y0aFN4yctvz8owmg0pVCA6EfQpG93J/CdRsWjc6/6p/MjU9N5Ed6qRb6lDrF/acQRfbAAAA"
+    },
+    "__edd_wt__": {
+     "S": "d833d703e2667e16791450a1c141c49f"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#namedgzip"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.112Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "namedgzip"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#namedgzip"
+    },
+    "state": {
+     "B": "IR+LCAAAAAAAABN9jLEKwjAYhN/l5kAsYtV/E1x16uQiIfmjwSYpJouG+OySDi4Fbzj47rgr8KCCD1vLOsujyjw4z6BlJMBT1PeTG0eXWMdgEqjbrjf9bt+vmgTeMXD7s/HpVQaVKuAMCIfklBzi4xUhFtey2WWe/ukErlndQDgrzwb1x62dOYC6+gUKo0K80gAAAA=="
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.117Z"
+    }
+   }
+  ],
+  "offset/native": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "offset": {
+           "N": "32400000"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Offset"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "offsetnative"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "offset": {
+           "N": "32400000"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Offset"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "cfda8016b7f6bafe804dd4fc1e842dfa"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#offsetnative"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.158Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "offsetnative"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#offsetnative"
+    },
+    "state": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "offset": {
+           "N": "32400000"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Offset"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      },
+      "n": {
+       "N": "1"
+      }
+     }
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.162Z"
+    }
+   }
+  ],
+  "offset/json": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "offset": {
+           "N": "32400000"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Offset"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "offsetjson"
+    },
+    "data": {
+     "S": "{\"_tag\":\"Noted\",\"f\":{\"~effect/DateTime\":\"~effect/DateTime\",\"epochMilliseconds\":1735689600000,\"zone\":{\"offset\":32400000,\"~effect/DateTime/TimeZone\":\"~effect/DateTime/TimeZone\",\"_tag\":\"Offset\"},\"_tag\":\"Zoned\"}}"
+    },
+    "__edd_wt__": {
+     "S": "5e9068605058124ff3cd3ba5465c2a39"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#offsetjson"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.168Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "offsetjson"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#offsetjson"
+    },
+    "state": {
+     "S": "{\"m\":{\"~effect/DateTime\":\"~effect/DateTime\",\"epochMilliseconds\":1735689600000,\"zone\":{\"offset\":32400000,\"~effect/DateTime/TimeZone\":\"~effect/DateTime/TimeZone\",\"_tag\":\"Offset\"},\"_tag\":\"Zoned\"},\"n\":1}"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.171Z"
+    }
+   }
+  ],
+  "offset/gzip": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "offset": {
+           "N": "32400000"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Offset"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "streamId": {
+     "S": "offsetgzip"
+    },
+    "data": {
+     "B": "IR+LCAAAAAAAABOrVoovSUxXslLyyy9JTVHSUUpTsqpWqktNS0tNLtF3SSxJDcnMTVWywhTSUUotyE/O8M3MycksTk3Oz0spVrIyNDc2NbOwNDMAAR2lqvy8VJB5+WlpxaklSlbGRiZQGXTj9EFEFFg5HjkdmGv9IQbWwgVA0ilKtbUA9Z2oQ9AAAAA="
+    },
+    "__edd_wt__": {
+     "S": "e35d0435ad39fa5c0402c09a84b7542c"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#offsetgzip"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.177Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "offsetgzip"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "tally.snapshot"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.snapshot"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#offsetgzip"
+    },
+    "state": {
+     "B": "IR+LCAAAAAAAABOrVspVsqpWqktNS0tNLtF3SSxJDcnMTVWywhTSUUotyE/O8M3MycksTk3Oz0spVrIyNDc2NbOwNDMAAR2lqvy8VJB5+WlpxaklSlbGRiZQGXTj9EFEFFg5HjkdpfiSxHQlKyV/iIG1cAGQdAqIn6dkZVgLAF4MtWPHAAAA"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.179Z"
+    }
+   }
+  ]
+ },
+ "outbox": {
+  "utc": [
+   {
+    "sk": {
+     "S": "$dates#v1#summary"
+    },
+    "rev": {
+     "N": "1"
+    },
+    "id": {
+     "S": "utcoutbox"
+    },
+    "pk": {
+     "S": "$dates#v1#summary#id_utcoutbox"
+    },
+    "version": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "Summary"
+    }
+   },
+   {
+    "__edd_row_pk__": {
+     "S": "$dates#v1#summary#id_utcoutbox"
+    },
+    "streamId": {
+     "S": "utcoutbox"
+    },
+    "__edd_e__": {
+     "S": "Summary#outbox"
+    },
+    "effect": {
+     "M": {
+      "at": {
+       "M": {
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "_tag": {
+         "S": "Utc"
+        }
+       }
+      }
+     }
+    },
+    "sk": {
+     "S": "$dates#v1#summary#outbox#000000000001#0000"
+    },
+    "pk": {
+     "S": "$dates#v1#summary#id_utcoutbox"
+    },
+    "source": {
+     "S": "projection"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "__edd_row_sk__": {
+     "S": "$dates#v1#summary"
+    }
+   },
+   {
+    "streamId": {
+     "S": "utcoutbox"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "M": {
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "_tag": {
+         "S": "Utc"
+        }
+       }
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "575ff58b832b6c614fc0c113cc54cc1f"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#utcoutbox"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.042Z"
+    }
+   }
+  ],
+  "named": [
+   {
+    "sk": {
+     "S": "$dates#v1#summary"
+    },
+    "rev": {
+     "N": "1"
+    },
+    "id": {
+     "S": "namedoutbox"
+    },
+    "pk": {
+     "S": "$dates#v1#summary#id_namedoutbox"
+    },
+    "version": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "Summary"
+    }
+   },
+   {
+    "__edd_row_pk__": {
+     "S": "$dates#v1#summary#id_namedoutbox"
+    },
+    "streamId": {
+     "S": "namedoutbox"
+    },
+    "__edd_e__": {
+     "S": "Summary#outbox"
+    },
+    "effect": {
+     "M": {
+      "at": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "format": {
+           "M": {}
+          },
+          "id": {
+           "S": "Asia/Tokyo"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Named"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "sk": {
+     "S": "$dates#v1#summary#outbox#000000000001#0000"
+    },
+    "pk": {
+     "S": "$dates#v1#summary#id_namedoutbox"
+    },
+    "source": {
+     "S": "projection"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "__edd_row_sk__": {
+     "S": "$dates#v1#summary"
+    }
+   },
+   {
+    "streamId": {
+     "S": "namedoutbox"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "format": {
+           "M": {}
+          },
+          "id": {
+           "S": "Asia/Tokyo"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Named"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "4c6d3f271cdce556f0fcae3b2df0f509"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#namedoutbox"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.133Z"
+    }
+   }
+  ],
+  "offset": [
+   {
+    "sk": {
+     "S": "$dates#v1#summary"
+    },
+    "rev": {
+     "N": "1"
+    },
+    "id": {
+     "S": "offsetoutbox"
+    },
+    "pk": {
+     "S": "$dates#v1#summary#id_offsetoutbox"
+    },
+    "version": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "Summary"
+    }
+   },
+   {
+    "__edd_row_pk__": {
+     "S": "$dates#v1#summary#id_offsetoutbox"
+    },
+    "streamId": {
+     "S": "offsetoutbox"
+    },
+    "__edd_e__": {
+     "S": "Summary#outbox"
+    },
+    "effect": {
+     "M": {
+      "at": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "offset": {
+           "N": "32400000"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Offset"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      }
+     }
+    },
+    "sk": {
+     "S": "$dates#v1#summary#outbox#000000000001#0000"
+    },
+    "pk": {
+     "S": "$dates#v1#summary#id_offsetoutbox"
+    },
+    "source": {
+     "S": "projection"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "__edd_row_sk__": {
+     "S": "$dates#v1#summary"
+    }
+   },
+   {
+    "streamId": {
+     "S": "offsetoutbox"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "M": {
+        "~effect/DateTime": {
+         "S": "~effect/DateTime"
+        },
+        "epochMilliseconds": {
+         "N": "1735689600000"
+        },
+        "zone": {
+         "M": {
+          "offset": {
+           "N": "32400000"
+          },
+          "~effect/DateTime/TimeZone": {
+           "S": "~effect/DateTime/TimeZone"
+          },
+          "_tag": {
+           "S": "Offset"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Zoned"
+        }
+       }
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "ecb1d783eee5acd9680360c1f116e734"
+    },
+    "__edd_e__": {
+     "S": "tally.event"
+    },
+    "sk": {
+     "S": "$dates#v1#tally.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$dates#v1#tally#offsetoutbox"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-07T09:23:13.194Z"
+    }
+   }
+  ]
+ }
+}

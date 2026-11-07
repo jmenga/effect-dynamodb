@@ -21,6 +21,7 @@ import type {
   UniqueFieldsDef,
   VersionedConfig,
 } from "./EntityConfig.js"
+import { BETA_DATE_MARKER, DATE_MARKER } from "./PackedCodec.js"
 import {
   absentReading,
   firstTypeParameterAst,
@@ -2131,15 +2132,127 @@ export const substituteSchemaDeep = (
 }
 
 /**
- * A schema the library stores but doesn't derive (an event, a snapshot state, an
- * outbox effect), reading an absent attribute as the value it stands for
- * (`absentReading`) and otherwise exactly as declared. Unchanged when no field
- * of it does.
+ * What a declaration is, when its stored form is a marshalled `DateTime`. A `.check()`, a brand or an
+ * annotation keeps the declaration, so it's still the date it was; a transformation over one isn't,
+ * and the date beneath it is reached through its encoding.
+ */
+const isMarshalledDate = (ast: SchemaAST.AST): boolean => {
+  if (!SchemaAST.isDeclaration(ast) || ast.encoding !== undefined) return false
+  const domain = matchDateRepresentation(ast.annotations)?.domain
+  return domain === "DateTime.Utc" || domain === "DateTime.Zoned"
+}
+
+/**
+ * A stored date, rebuilt, before it meets its declaration. Only a value carrying the marker a
+ * marshalled date carries is touched: the declaration's guard takes the current one, so what it
+ * accepts doesn't change, and the one Effect's betas and early rcs wrote is the one form added. Any
+ * other value goes on to the declaration as it was, which refuses it or takes it as it always has, so
+ * a union picks the member it picked before.
+ */
+const rebuildingMarshalledDate = {
+  decode: SchemaGetter.transform((value: unknown): unknown =>
+    typeof value === "object" &&
+    value !== null &&
+    (DATE_MARKER in value || BETA_DATE_MARKER in value)
+      ? (reviveMarshalledDateTime(value) ?? value)
+      : value,
+  ),
+  encode: SchemaGetter.passthrough<unknown>(),
+}
+
+const astWith = <A extends SchemaAST.AST>(ast: A, changes: Partial<A>): A =>
+  Object.assign(Object.create(Object.getPrototypeOf(ast)), ast, changes)
+
+/**
+ * The same node with its children through `f`, or the node itself when none of them changed. Walks
+ * the AST, not the schema's accessors, so it reaches every position: a `Schema.annotate` drops a
+ * class's `.fields`, and a declaration's type parameters and a transformation's encoded side have no
+ * accessor at all. A suspended schema is walked when it's forced, as a recursive one has no end.
+ */
+const withChildren = (ast: SchemaAST.AST, f: (child: SchemaAST.AST) => SchemaAST.AST) => {
+  switch (ast._tag) {
+    case "Declaration": {
+      const typeParameters = SchemaAST.mapOrSame(ast.typeParameters, f)
+      return typeParameters === ast.typeParameters ? ast : astWith(ast, { typeParameters })
+    }
+    case "Arrays": {
+      const elements = SchemaAST.mapOrSame(ast.elements, f)
+      const rest = SchemaAST.mapOrSame(ast.rest, f)
+      return elements === ast.elements && rest === ast.rest ? ast : astWith(ast, { elements, rest })
+    }
+    case "Objects": {
+      const propertySignatures = SchemaAST.mapOrSame(ast.propertySignatures, (property) => {
+        const type = f(property.type)
+        return type === property.type
+          ? property
+          : new SchemaAST.PropertySignature(property.name, type)
+      })
+      const indexSignatures = SchemaAST.mapOrSame(ast.indexSignatures, (index) => {
+        const type = f(index.type)
+        return type === index.type ? index : new SchemaAST.IndexSignature(index.parameter, type)
+      })
+      return propertySignatures === ast.propertySignatures &&
+        indexSignatures === ast.indexSignatures
+        ? ast
+        : astWith(ast, { propertySignatures, indexSignatures })
+    }
+    case "Union": {
+      const types = SchemaAST.mapOrSame(ast.types, f)
+      return types === ast.types ? ast : astWith(ast, { types })
+    }
+    case "Suspend":
+      return astWith(ast, { thunk: () => f(ast.thunk()) })
+    default:
+      return ast
+  }
+}
+
+const readingDatesMemo = new WeakMap<SchemaAST.AST, SchemaAST.AST>()
+
+/** Every marshalled date in a schema, wherever it sits, read back as a real one. */
+const readingDates = (ast: SchemaAST.AST): SchemaAST.AST => {
+  const known = readingDatesMemo.get(ast)
+  if (known !== undefined) return known
+  let read: SchemaAST.AST
+  if (isMarshalledDate(ast)) {
+    read = Schema.Unknown.pipe(
+      Schema.decodeTo(Schema.make<Schema.Top>(ast) as never, rebuildingMarshalledDate as never),
+    ).ast
+  } else {
+    read = withChildren(ast, readingDates)
+    const encoding =
+      ast.encoding &&
+      (SchemaAST.mapOrSame(ast.encoding, (link) => {
+        const to = readingDates(link.to)
+        return to === link.to ? link : new SchemaAST.Link(to, link.transformation)
+      }) as SchemaAST.Encoding)
+    if (encoding !== ast.encoding) read = astWith(read, { encoding })
+  }
+  readingDatesMemo.set(ast, read)
+  return read
+}
+
+/**
+ * The read schema of a value the library stores but doesn't derive: an event, its metadata, a
+ * snapshot state, an outbox effect. Every read of one goes through it, so anything a stream's read
+ * does differently from its declaration belongs here. Differently, as it stands, in two ways:
+ *
+ * - An absent attribute reads as the value it stands for (`absentReading`).
+ * - A `Schema.DateTimeUtc` or `Schema.DateTimeZoned` comes back as a real date. Nothing substitutes
+ *   these on write, so one is stored as the map the marshaller makes of it, and Effect's guard only
+ *   looks for the marker and the tag, which that map has. Left to the guard, it reads back as a plain
+ *   object that passes `DateTime.isDateTime` and isn't one: `Equal` is false, and on a named zone
+ *   `DateTime.getPart` throws.
+ *
+ * Returned as it came when neither applies to it.
  *
  * @internal
  */
-export const readingAbsentValues = (schema: Schema.Top): Schema.Top =>
-  substituteSchemaDeep(schema, { absentReads: "only", enforceChecks: true })
+export const readingStreamValues = (schema: Schema.Top): Schema.Top => {
+  const absent = substituteSchemaDeep(schema, { absentReads: "only", enforceChecks: true })
+  const read = readingDates(absent.ast)
+  return read === absent.ast ? absent : Schema.make<Schema.Top>(read)
+}
 
 /**
  * A schema the library stores but doesn't derive, refusing a tuple position holding

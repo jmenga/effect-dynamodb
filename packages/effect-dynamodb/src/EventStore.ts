@@ -72,7 +72,7 @@ import {
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
-  readingAbsentValues,
+  readingStreamValues,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
@@ -3011,13 +3011,13 @@ export const makeStream = <
   // `undefined` and an empty set are stored as absent attributes, in an event as
   // anywhere else, and read back as those values.
   const decodeEventData = Schema.decodeUnknownEffect(
-    readingAbsentValues(eventUnion) as Schema.Codec<unknown>,
+    readingStreamValues(eventUnion) as Schema.Codec<unknown>,
   )
   const decodeMetadata = Schema.decodeUnknownEffect(
-    readingAbsentValues(metadataSchema ?? Schema.Unknown) as Schema.Codec<unknown>,
+    readingStreamValues(metadataSchema ?? Schema.Unknown) as Schema.Codec<unknown>,
   )
   const decodeSnapshotState = Schema.decodeUnknownEffect(
-    readingAbsentValues(snapshot?.schema ?? Schema.Unknown) as Schema.Codec<unknown>,
+    readingStreamValues(snapshot?.schema ?? Schema.Unknown) as Schema.Codec<unknown>,
   )
 
   /**

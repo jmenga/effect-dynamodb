@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as Entity from "../src/Entity.js"
 import {
-  readingAbsentValues,
+  readingStreamValues,
   substituteSchemaDeep,
   writingTuplePositions,
 } from "../src/internal/EntitySchemas.js"
@@ -213,15 +213,15 @@ describe("the derived read schema", () => {
   })
 })
 
-describe("readingAbsentValues", () => {
+describe("readingStreamValues", () => {
   const Set_ = Schema.ReadonlySet(Schema.String)
   const reader = (schema: Schema.Top) =>
-    Schema.decodeUnknownSync(readingAbsentValues(schema) as Schema.Codec<any, unknown>)
+    Schema.decodeUnknownSync(readingStreamValues(schema) as Schema.Codec<any, unknown>)
 
   it("a schema with nothing to read as absent is returned unchanged", () => {
     // Entity derivation would swap this date for a tolerant one. A schema it doesn't own stays.
-    const Dated = Schema.Struct({ at: Schema.DateTimeUtc, n: Schema.Number })
-    expect(readingAbsentValues(Dated)).toBe(Dated)
+    const Dated = Schema.Struct({ at: Schema.DateTimeUtcFromString, n: Schema.Number })
+    expect(readingStreamValues(Dated)).toBe(Dated)
   })
 
   it("finds a field through a list, an optional, a record and a union", () => {
@@ -256,7 +256,7 @@ describe("readingAbsentValues", () => {
 
   it("a union isn't judged as entity derivation judges one: a date beside a number is allowed", () => {
     expect(() =>
-      readingAbsentValues(
+      readingStreamValues(
         Schema.Union([
           Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
           Schema.Number,
@@ -273,12 +273,12 @@ describe("readingAbsentValues", () => {
       nested: Schema.Struct({ note: Schema.UndefinedOr(Schema.String) }),
     })
     const read = Schema.decodeUnknownSync(
-      readingAbsentValues(Holding) as Schema.Codec<any, unknown>,
+      readingStreamValues(Holding) as Schema.Codec<any, unknown>,
     )({ at: "2024-01-01T00:00:00.000Z", nested: {} })
     expect(read.tags).toEqual(new Set())
     expect("note" in read.nested).toBe(true)
     expect(() =>
-      Schema.decodeUnknownSync(readingAbsentValues(Holding) as Schema.Codec<any, unknown>)({
+      Schema.decodeUnknownSync(readingStreamValues(Holding) as Schema.Codec<any, unknown>)({
         at: new Date(0),
         nested: {},
       }),
@@ -290,7 +290,7 @@ describe("readingAbsentValues", () => {
       Schema.Struct({ tags: Schema.ReadonlySet(Schema.String) }),
       Schema.Struct({ other: Schema.Number }),
     ])
-    const read = Schema.decodeUnknownSync(readingAbsentValues(Union) as Schema.Codec<any, unknown>)
+    const read = Schema.decodeUnknownSync(readingStreamValues(Union) as Schema.Codec<any, unknown>)
     expect(read({ other: 1 })).toEqual({ other: 1 })
     expect(read({}).tags).toEqual(new Set())
   })
@@ -611,7 +611,7 @@ describe("a tuple position holding undefined", () => {
   })
 
   it("a read isn't refused, nor anything but the write schemas", () => {
-    const Read = readingAbsentValues(Schema.Tuple([U, Schema.Struct({ s: Schema.ReadonlySet(S) })]))
+    const Read = readingStreamValues(Schema.Tuple([U, Schema.Struct({ s: Schema.ReadonlySet(S) })]))
     expect(Exit.isSuccess(Schema.decodeUnknownExit(Read as never)([u, {}]))).toBe(true)
     const Plain = substituteSchemaDeep(Schema.Tuple([U, Schema.DateTimeUtc]))
     const at = DateTime.makeUnsafe("2026-01-02T03:04:05.000Z")

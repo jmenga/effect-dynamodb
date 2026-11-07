@@ -8,7 +8,7 @@ import { Effect, Option, Schema, type SchemaAST } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   optionalField,
-  readingAbsentValues,
+  readingStreamValues,
   substituteSchemaDeep,
   writingTuplePositions,
 } from "../src/internal/EntitySchemas.js"
@@ -561,7 +561,7 @@ describe("Schema.optionalKey over a union, its later members looked through", ()
     const schema = Schema.Struct({
       f: K(Schema.String, Schema.Struct({ b: Schema.UndefinedOr(Schema.String) })) as never,
     })
-    const read = readingAbsentValues(schema) as Schema.Codec<any>
+    const read = readingStreamValues(schema) as Schema.Codec<any>
     expect(Schema.decodeUnknownSync(read)({ f: {} })).toEqual({ f: { b: undefined } })
     expect(Schema.decodeUnknownSync(read)({ f: "x" })).toEqual({ f: "x" })
   })

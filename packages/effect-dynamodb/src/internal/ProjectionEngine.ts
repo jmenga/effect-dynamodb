@@ -26,7 +26,7 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
-  readingAbsentValues,
+  readingStreamValues,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
@@ -1200,7 +1200,7 @@ export const makeEngine = (config: EngineConfig) => {
   // -------------------------------------------------------------------------
 
   const decodeEffect = S.decodeUnknownEffect(
-    readingAbsentValues(config.outbox?.schema ?? S.Unknown) as S.Codec<unknown>,
+    readingStreamValues(config.outbox?.schema ?? S.Unknown) as S.Codec<unknown>,
   )
 
   /**

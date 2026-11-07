@@ -2903,7 +2903,7 @@ The names `.remove` refuses by configuration (immutable, sparse map) can't be de
 
 The write half is the marshaller (`Marshaller.toAttributeMap`), the single choke point every item passes. It marshals; only if that throws does it strip empty sets from maps and retry, which leaves `undefined` to `removeUndefinedValues` as before. A top-level operand (`toAttributeValue`) has no attribute to leave out, so it still throws, and the update path normalises operands first (`normalizeNoStoredForm`): `.set` of one is a clear, `.add` / `.deleteFromSet` / `pathAdd` / `pathDelete` of an empty set does nothing, and `pathSet` of one is a `pathRemove`.
 
-The read half is `substituteSchemaDeep` under `absentReads`, which wraps a struct field with `Schema.withDecodingDefaultKey`, at any depth, in the entity read schemas and the aggregate's `decodeSchema`. A default decodes through the field, so each read gets its own set, and a `.check()` refusing the value leaves the field required: `absentReading` is `undefined` for it, `rowCanLack` is false, and clearing it is refused. A lenient union member can't take a later member's row, because each member is tried strictly first; a `oneOf` union stays as declared, since a lenient copy would make two members match. An event, its metadata, a snapshot state and an outbox effect read through `readingAbsentValues`, the same walk with nothing else substituted: the marshaller would otherwise turn an empty set in an event from a failed write into a stream that can't be read. It follows the stored side: a set stored as a list stores its empty list, and a `Schema.HashSet` can't be stored at all, empty or not.
+The read half is `substituteSchemaDeep` under `absentReads`, which wraps a struct field with `Schema.withDecodingDefaultKey`, at any depth, in the entity read schemas and the aggregate's `decodeSchema`. A default decodes through the field, so each read gets its own set, and a `.check()` refusing the value leaves the field required: `absentReading` is `undefined` for it, `rowCanLack` is false, and clearing it is refused. A lenient union member can't take a later member's row, because each member is tried strictly first; a `oneOf` union stays as declared, since a lenient copy would make two members match. An event, its metadata, a snapshot state and an outbox effect read through `readingStreamValues`, the same walk with nothing else substituted except dates (see **Dates on a stream**): the marshaller would otherwise turn an empty set in an event from a failed write into a stream that can't be read. It follows the stored side: a set stored as a list stores its empty list, and a `Schema.HashSet` can't be stored at all, empty or not.
 
 The places the rule can't reach: a list element can't be absent without moving the elements after it, so an empty set in a list or a tuple is refused. A record entry holding an empty set loses its key. `UndefinedOr(ReadonlySet)`: absent can mean only one thing, `undefined`, so an empty set reads back `undefined`. A `.select()` is raw, so absent stays absent. `Schema.suspend`, opaque classes (`X.check()`, `X.annotate()`) and what's beneath a container's decoding default aren't walked, as for all nested substitution, so absent there stays a decode failure. In expressions, `eq` / `ne` with an empty set compile to `attribute_not_exists` / `attribute_exists`, and any other comparison with one is refused (`emptyPartProblem`).
 
@@ -3741,6 +3741,35 @@ instant is rejected rather than passed to the domain. There is no backfill: a
 legacy row is rewritten in wire form only when an `update` changes its
 decomposed group, because the diff compares decomposed (re-encoded) groups and a
 no-op update writes nothing.
+
+**Dates on a stream.** Nothing substitutes a date in an event, metadata, a
+snapshot state or an outbox effect, so it's stored as the map the marshaller makes
+of it (a class instance is marshalled with `for...in`, which skips functions), and
+Effect's guard (`DateTime.isDateTime`) looks only for the marker, so the plain map
+passed as a `DateTime` and threw once used. `readingStreamValues` adds a second
+pass after the absent-read one, `readingDates`, at the AST level so nothing about
+the write side or an entity path can change: each `Schema.DateTimeUtc` /
+`Schema.DateTimeZoned` declaration, kept through brand, check and annotate, in any
+struct, list, record, union, class, `Schema.suspend` (lazily, memoised, so
+recursion ends) or declaration's type parameters such as `Schema.Option`, becomes
+`Unknown` decoding through a rebuild into the declaration. The rebuild takes a
+plain object with the right `_tag` and the `~effect/DateTime` or
+`~effect/time/DateTime` marker, and hands anything else on unchanged, so the
+declaration's guard, checks and message still decide, and a union member that
+doesn't take the value still loses it to the next one. That also means a struct
+member listed first takes a date's fields, as it always did. `Schema.Unknown`
+isn't touched: nothing declares a date there.
+
+A real date then has to be accepted wherever a read date was. Under
+`DynamoModel.Packed`, `stringifyStrict` refused an instance and let the plain
+look-alike through, so a read date packed and a new one was refused; `JSON.stringify`
+would call its `toJSON` and store ISO text, which the declaration refuses on read.
+So `check` accepts a real `DateTime` and `storingDates` stores it as `storedDate`:
+the same keys, in the order DynamoDB Local hands the map back, so what's packed from
+a date a read returned doesn't move by a byte (`fixtures/stream-dates-1.39.0.json`,
+stored by the published 1.39.0, pins this). Real DynamoDB's map order isn't
+guaranteed, so that text was never fixed on that path. Anything else JSON can't
+represent is refused as before, beside a date too.
 
 **Stored-type change.** Because the gate now looks through `optional` /
 `NullOr` and into refs, some attributes that ≤1.22.0 stored in domain form are
