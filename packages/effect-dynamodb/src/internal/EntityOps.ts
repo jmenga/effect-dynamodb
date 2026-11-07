@@ -125,13 +125,16 @@ export interface SparseRemoveEntriesOp {
   readonly keys: ReadonlyArray<string>
 }
 
+/** What DynamoDB's `ADD` takes: a number adds, a set unions. */
+export type AddOperand = number | ReadonlySet<string> | ReadonlySet<number>
+
 /** @internal */
 export interface UpdateState {
   readonly updates: unknown
   readonly expectedVersion: number | undefined
   readonly condition: Expr | ConditionInput | undefined
   readonly remove: ReadonlyArray<string> | undefined
-  readonly add: globalThis.Record<string, number> | undefined
+  readonly add: globalThis.Record<string, AddOperand> | undefined
   readonly subtract: globalThis.Record<string, number> | undefined
   readonly append: globalThis.Record<string, ReadonlyArray<unknown>> | undefined
   readonly deleteFromSet: globalThis.Record<string, unknown> | undefined

@@ -1,10 +1,18 @@
-import { Schema } from "effect"
+import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { Cause, Effect, Schema } from "effect"
 import { describe, expect, it } from "vitest"
+import * as Expression from "../src/Expression.js"
+import { marshalOrFail } from "../src/internal/TransactableOps.js"
 import {
   fromAttributeMap,
   fromAttributeValue,
+  hasNoStoredForm,
+  isEmptySet,
+  isUnstorableValue,
   toAttributeMap,
   toAttributeValue,
+  type UnstorableValue,
+  unstorableIn,
 } from "../src/Marshaller.js"
 
 class Point extends Schema.Class<Point>("Point")({
@@ -16,6 +24,196 @@ class Location extends Schema.Class<Location>("Location")({
   timestamp: Schema.Number,
   geometry: Point,
 }) {}
+
+describe("values with no stored form", () => {
+  it("an empty set is an absent attribute, in a map at any depth", () => {
+    expect(
+      toAttributeMap({
+        id: "1",
+        tags: new Set(),
+        nested: { tags: new Set(), inner: { tags: new Set(), n: 1 } },
+        list: [{ tags: new Set(), n: 2 }],
+      }),
+    ).toEqual({
+      id: { S: "1" },
+      nested: { M: { inner: { M: { n: { N: "1" } } } } },
+      list: { L: [{ M: { n: { N: "2" } } }] },
+    })
+  })
+
+  it("so is one in a class instance, and in a Map", () => {
+    class Holder {
+      constructor(
+        readonly tags: ReadonlySet<string>,
+        readonly n: number,
+      ) {}
+    }
+    expect(toAttributeMap({ holder: new Holder(new Set(), 1) })).toEqual({
+      holder: { M: { n: { N: "1" } } },
+    })
+    expect(
+      toAttributeMap({
+        byName: new Map<string, unknown>([
+          ["a", new Set()],
+          ["b", { tags: new Set(), n: 1 }],
+          ["c", 2],
+        ]),
+      }),
+    ).toEqual({
+      byName: { M: { b: { M: { n: { N: "1" } } }, c: { N: "2" } } },
+    })
+  })
+
+  it("a Set of nothing but undefined has no stored form either", () => {
+    expect(toAttributeMap({ id: "1", tags: new Set([undefined]) })).toEqual({ id: { S: "1" } })
+    expect(isEmptySet(new Set([undefined]))).toBe(true)
+    expect(isEmptySet(new Set(["a"]))).toBe(false)
+    expect(isEmptySet([])).toBe(false)
+    expect(hasNoStoredForm(undefined)).toBe(true)
+    expect(hasNoStoredForm(null)).toBe(false)
+  })
+
+  it("everything else in the item is stored exactly as it would be", () => {
+    const rest = {
+      id: "1",
+      set: new Set(["a"]),
+      numbers: new Set([1, 2]),
+      bytes: new Uint8Array([1, 2]),
+      at: { nested: [1, "x", null, { y: true }] },
+      nothing: null,
+      gone: undefined,
+    }
+    expect(toAttributeMap({ ...rest, empty: new Set() })).toEqual(toAttributeMap(rest))
+    expect(toAttributeMap(rest).set).toEqual({ SS: ["a"] })
+    expect(toAttributeMap(rest).bytes).toEqual({ B: new Uint8Array([1, 2]) })
+  })
+
+  it("a list can't leave one out, so marshalling still refuses it", () => {
+    expect(() => toAttributeMap({ list: [new Set(["a"]), new Set()] })).toThrow(
+      /"list\[1\]": DynamoDB has no empty set/,
+    )
+  })
+
+  describe("what can't be stored is refused, saying where", () => {
+    const refusal = (marshal: () => unknown): UnstorableValue => {
+      try {
+        marshal()
+      } catch (error) {
+        expect(isUnstorableValue(error)).toBe(true)
+        return error as UnstorableValue
+      }
+      throw new Error("nothing was refused")
+    }
+
+    it("the deepest part refused, through lists, maps, Maps and classes", () => {
+      class Inner {
+        constructor(readonly at: unknown) {}
+      }
+      const CASES: ReadonlyArray<readonly [Record<string, unknown>, ReadonlyArray<unknown>]> = [
+        [{ a: [new Set()] }, ["a", 0]],
+        [{ a: ["x", new Set()] }, ["a", 1]],
+        [{ a: { b: [{ c: [1, new Set()] }] } }, ["a", "b", 0, "c", 1]],
+        [{ a: new Map([["k", [new Set()]]]) }, ["a", "k", 0]],
+        [{ a: new Inner([new Set()]) }, ["a", "at", 0]],
+        [{ a: Number.NaN }, ["a"]],
+        [{ a: { b: [Number.POSITIVE_INFINITY] } }, ["a", "b", 0]],
+        [{ a: { b: 2 ** 60 } }, ["a", "b"]],
+        [{ a: { b: new Set([{}]) } }, ["a", "b"]],
+      ]
+      for (const [item, path] of CASES) {
+        expect(refusal(() => toAttributeMap(item)).path).toEqual(path)
+        expect(unstorableIn(item)?.path).toEqual(path)
+      }
+    })
+
+    it("what isn't a refusal isn't dressed up as one", () => {
+      const cyclic: Record<string, unknown> = {}
+      cyclic.self = cyclic
+      expect(() => unstorableIn({ a: new Set(), cyclic })).toThrow(RangeError)
+      expect(() => toAttributeValue({ a: new Set(), cyclic })).toThrow(RangeError)
+    })
+
+    it("says why: an empty set as itself, anything else as marshalling did", () => {
+      expect(refusal(() => toAttributeMap({ a: [new Set()] })).reason).toMatch(/no empty set/)
+      expect(refusal(() => toAttributeMap({ a: Number.NaN })).reason).toMatch(/NaN/)
+      expect(refusal(() => toAttributeMap({ a: 2 ** 60 })).reason).toMatch(/MAX_SAFE_INTEGER/)
+    })
+
+    it("an item it can store has nothing in it, and one holding an empty set in a map", () => {
+      expect(unstorableIn({ a: 1, b: [1, "x"], c: { d: new Set(["e"]) } })).toBeUndefined()
+      expect(unstorableIn({ a: new Set(), b: { c: new Set() } })).toBeUndefined()
+    })
+
+    it("in words, a stored attribute by the field it holds", () => {
+      const error = refusal(() => toAttributeMap({ stored: { b: [new Set()] } }))
+      expect(error.describe()).toMatch(/^"stored\.b\[0\]": /)
+      expect(error.message).toMatch(/^"stored\.b\[0\]": /)
+      const field = (attribute: string) => (attribute === "stored" ? "field" : attribute)
+      expect(error.describe(field)).toMatch(/^"field\.b\[0\]": /)
+      // Only the attribute is renamed, not what it holds under the same name.
+      const same = refusal(() => toAttributeMap({ a: { stored: Number.NaN } }))
+      expect(same.describe(field)).toMatch(/^"a\.stored": /)
+    })
+
+    it("a value on its own: no attribute, unless it's given a name", () => {
+      const bare = refusal(() => toAttributeValue([new Set()]))
+      expect(bare.path).toEqual([0])
+      expect(refusal(() => toAttributeValue(new Set())).path).toEqual([])
+      expect(refusal(() => toAttributeValue(new Set())).describe()).toBe(
+        "DynamoDB has no empty set.",
+      )
+      expect(refusal(() => toAttributeValue(new Set(), "a")).path).toEqual(["a"])
+      expect(refusal(() => toAttributeValue({ b: [new Set()] }, "a")).path).toEqual(["a", "b", 0])
+      expect(refusal(() => toAttributeValue(Number.NaN, "a")).describe()).toMatch(/^"a": .*NaN/)
+    })
+
+    it("a limit: an Expression builder is a plain function, so it throws at the call", () => {
+      for (const value of [Number.NaN, new Set(), [new Set()]]) {
+        expect(refusal(() => Expression.condition({ gt: { a: value } }))._tag).toBe(
+          "UnstorableValue",
+        )
+      }
+    })
+
+    it("marshalOrFail: a ValidationError naming it, anything else a defect", async () => {
+      const failed = await Effect.runPromise(
+        Effect.flip(
+          marshalOrFail("Row", "put", () => toAttributeMap({ stored: [new Set()] }), {
+            fieldOf: () => "field",
+          }),
+        ),
+      )
+      expect(failed).toBeInstanceOf(ValidationError)
+      expect(failed.entityType).toBe("Row")
+      expect(failed.operation).toBe("put")
+      expect(String(failed.cause)).toMatch(/^"field\[0\]": .* Nothing was written\.$/)
+      const told = await Effect.runPromise(
+        Effect.flip(
+          marshalOrFail("Row", "search", () => toAttributeValue(Number.NaN), {
+            outcome: "Nothing was sent.",
+          }),
+        ),
+      )
+      expect(String(told.cause)).toMatch(/Nothing was sent\.$/)
+      const died = await Effect.runPromiseExit(
+        marshalOrFail("Row", "put", () => {
+          throw new Error("not the caller's value")
+        }),
+      )
+      expect(died._tag === "Failure" && Cause.hasDies(died.cause)).toBe(true)
+    })
+  })
+
+  it("a failure that isn't an empty set is still refused", () => {
+    expect(() => toAttributeMap({ n: Number.NaN })).toThrow(/"n": .*NaN/)
+  })
+
+  it("a value on its own has no attribute to leave out, so it's refused", () => {
+    expect(() => toAttributeValue(new Set())).toThrow(/DynamoDB has no empty set/)
+    expect(toAttributeValue({ tags: new Set(), n: 1 })).toEqual({ M: { n: { N: "1" } } })
+    expect(toAttributeValue(new Set(["a"]))).toEqual({ SS: ["a"] })
+  })
+})
 
 describe("Marshaller", () => {
   describe("toAttributeMap / fromAttributeMap", () => {

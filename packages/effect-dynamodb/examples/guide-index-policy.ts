@@ -114,9 +114,9 @@ const scenario1 = Effect.gen(function* () {
     timestamp: "2026-04-30T10:00:00Z",
   })
 
-  // "No alert this event" — alertState explicitly undefined. sk touched
-  // (alertState is in payload), can't compose (empty leading prefix) →
-  // sparse → REMOVE sk. pk untouched → preserved.
+  // "No alert this event" — alertState cleared, the same write as
+  // .remove(["alertState"]). sk can't compose without it → REMOVE sk.
+  // pk untouched → preserved.
   yield* db.entities.Devices.update({ channel: "c-1", deviceId: "d-1" }).set({
     alertState: undefined,
     timestamp: "2026-04-30T11:00:00Z",
@@ -195,7 +195,7 @@ const scenario2 = Effect.gen(function* () {
     timestamp: "2026-04-30T11:00:00Z",
   })
 
-  // Telemetry "no alert" event — sk touched, can't compose, sparse →
+  // Telemetry "no alert" event — alertState cleared, sk can't compose →
   // REMOVE sk. pk preserved. Item invisible in GSI but gsi1pk persists.
   yield* db.entities.Devices.update({ channel: "c-2", deviceId: "d-2" }).set({
     alertState: undefined,

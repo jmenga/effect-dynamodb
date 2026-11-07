@@ -986,18 +986,49 @@ is a text half like any other, and its sort half is rewritten only when a prefix
 differs: the address keeps its bytes. A run that moves an item reads the moved row and does
 the same (`rekeyAfterMove`). The move itself recomposes index keys as an update would.
 
-**The accepted limit.** An index key that isn't any form's text stays, as when a row cleared a
-composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
+**The accepted limit.** The text rewrite leaves an index key that isn't any form's text, as when a row
+cleared a composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
 broader query finds it where its old text sorts, and under a partition key half `get` still reads it.
-Writing the composites puts it back. Telling such text apart from current text would take parsing it,
-and a value can spell anything.
+Writing the composites puts it back, and so does `repairIndexKeys`, below. Telling such text apart from
+current text would take parsing it, and a value can spell anything.
+
+**Index keys that differ, and `repairIndexKeys` (`rekey-repair.md`).** Separately from the text rewrite, each
+half of each secondary index of a live item at its current table key is judged against what a `put` of the row's
+values writes (`KeyComposer.judgeIndexHalf`, through the key form, a ref's id read from the stored ref). Every
+run counts the result in `report.indexKeys` and per member, for no read: `missing`, `truncated`, `lagging`,
+`ambiguous`. `rekey({ repairIndexKeys: true })` writes it, off by default: one `UpdateItem` per row with work,
+conditioned on the row existing and on each key it writes and each composite those keys come from, as read or
+absent (`repairRequest`), so a writer changing any of them wins. On a failed condition it reads once
+consistently, judges again and tries once more, then counts the keys in `skipped`; `repaired` counts the keys
+written. A key DynamoDB refuses is a `failed` conflict. A dry run makes no write and counts `repaired` as what
+it would write, judging what the move would leave for a row that moves.
+
+| Composites on the row | Stored key | `sparse` | `preserve` |
+|---|---|---|---|
+| All | Equal | Nothing | Nothing |
+| All | Differs | SET (`truncated` when the stored key is a leading run of them under any form, else `lagging`) | SET |
+| All, and the other half's too | None | SET (`missing`), or `ambiguous` with 2+ composites outside the primary key | SET (`missing`) |
+| All, but not the other half's | None | Nothing: `put` wrote no entry | Nothing |
+| Trailing ones missing | None, or the truncated text | Nothing (shape 3) | Nothing |
+| Trailing ones missing | Anything else | SET the truncated text (`lagging`) | Nothing |
+| A hole, or none leading | None | Nothing | Nothing |
+| A hole, or none leading | Any | REMOVE (`lagging`) | Nothing |
+
+`ambiguous` is written by nothing: a `sparse` half with two or more composites outside the primary key and no
+key is byte for byte the documented drop (§7, "Telemetry (no alert)"), so a repair could re-admit an alert a
+writer ended. Not judged: a half in a table key attribute (no write names one); a half with a library-stamped
+composite (`put` composes before stamping, and `updatedAt` moves on every update), including as the other half of
+an index with no key; a half whose values compose no key; a sharded partition key already stored, or without its
+shard source (the text rewrite owns those). A Z-order half compares bytes and never truncates. For the same
+reason a move keeps a half absent that's `ambiguous` or holds a stamped composite (`keptAbsent` in `movedRowOf`).
+Aggregates compose their own rows and never called the gate; sentinels and history rows have no index keys.
 
 **A dry run agrees with the real run.** It judges the row the move would write (`movedRowOf`), and
 follows a chain: what holds a row's current key is judged by its own handler (`Rekey.displace`,
 counting nothing and claiming nothing, since the scan counts it when it reaches it), and what would
 stop it is reported, for it and for the row it holds up. Rootless aggregate rows are
 judged after the scan, so a dry run agrees with the real run whichever order the scan met them; a run
-stopped early by `maxPages` can count one whose root a later page brings in.
+that didn't read the whole table reports them as `rootNotSeen`, since a later page could bring the root in.
 
 **A row under both keys.** `clearTarget` reports `bothKeys` only if the row is still
 at its old key when it finds it at the new one. A page's rows run concurrently, and a
@@ -1016,7 +1047,7 @@ again or reports the row (`contended`).
 | Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); writes go in transactions of up to 100 items. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
 | Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
@@ -1063,12 +1094,16 @@ compose no such sentinel; an aggregate's rows below no root in their partition, 
 or 1.38.0 run cut short left (root at the current key, edges at the old partition); an aggregate root
 under no text; a projection tombstone or outbox item whose key reads as more than one set of values; a
 row holding `NaN` in a key under `escapeKeys: true`. `conflicts`, `failed`: a row whose Z-order value no
-longer places a key; a stream id whose rows read as two different ids.
+longer places a key; a stream id whose rows read as two different ids. `skipped.rootNotSeen`: an aggregate's
+rows below no root, met by a run that didn't read the whole table (`maxPages`, `resume`). Such a run can't
+say the root isn't there, since a root at its old key on a page it didn't read could claim them, so a run
+over the whole table judges them; only that run counts them `unrecognizedKey`.
 
 **Capacity.** The run is one `Table.rekey` operation measured whatever the
 `ConsumedCapacity` setting (`Capacity.measured`): every request asks for its
 capacity, and `report.capacity` carries the totals; the span and the observer
-follow the context's setting.
+follow the context's setting. Judging index keys adds no request: `repairIndexKeys` on a table with nothing to
+repair is the scan alone.
 
 **Dry run.** The same scan and consistent reads, no writes: an item's
 sentinels are read to count them, a stream's both partitions to judge it.
@@ -1300,12 +1335,13 @@ indexes: {
 - `indexPolicy: { pk: 'sparse' | 'preserve', sk: 'sparse' | 'preserve' }`. Both halves default to `'preserve'` if `indexPolicy` is omitted entirely or either half is unspecified.
 - The standard composition path has no per-composite information to discriminate within a half (it has only the merged payload, no read-before-write), so per-attribute policy callbacks were removed. A half is a single concatenated string; per-attribute mixing within a half has no coherent semantic.
 
-**Two-way payload classification.** v1.7.x collapses the v1.6 three-way classification (present / explicit-clear / omitted) to two states: **present** or **absent**. `attr: null`, `attr: undefined`, and "key omitted from payload" all mean "absent" for GSI-composition purposes.
+**Two-way payload classification.** v1.7.x collapses the v1.6 three-way classification (present / explicit-clear / omitted) to two states: **present** or **absent**. `attr: null`, an `append`'s `attr: undefined`, and "key omitted from payload" all mean "absent" for GSI-composition purposes. An update's `attr: undefined` never reaches the composer as a payload value: it is `.remove([attr])` (see "Clearing a field" below).
 
 | Payload state | What library does for GSI composition |
 |---|---|
 | `attr: <value>` | Use the value as a slot in the composed half |
-| `attr: null` *or* `attr: undefined` *or* (key omitted) | Treat as **absent** — the composition is built from the leading prefix of present values |
+| `attr: null` *or* an `append`'s `attr: undefined` *or* (key omitted) | Treat as **absent** — the composition is built from the leading prefix of present values |
+| An update's `attr: undefined` | In `removedSet`, not in the payload — the same as `.remove([attr])` |
 
 `set({ attr: null })` is no longer a separate "drop signal" — it still REMOVEs the attribute from the item (the data-attribute REMOVE clause), but it does not separately cascade-drop the GSI keys. Drop-via-cascade goes through `Entity.remove([attr])` instead.
 
@@ -1351,7 +1387,7 @@ if (shouldSkip) continue  // leave this half's key attribute alone
 - **v1.7.0** introduced the touched-predicate (`updatePayload`-only) to fix the v1.6 GSI-wide cascade. Closed the original GSI-blast bug but introduced the multi-writer leak.
 - **v1.7.1** added the `removedSet` arm to the touched-predicate (multi-writer leak fix — #41).
 - **v1.7.2** added the `keyRecord` arm to the touched-predicate (PK-composites-only fix — #43).
-- **1.39** (#183) narrowed the `keyRecord` arm to halves wholly known from the key record, closing shape 10. The skip-predicate's `every(absent in both)` clause had evaluated any half with one composite in the key record, which is what the #43 idempotence rationale never covered. No stored key text changes; a row an earlier release already damaged stays as it is until a write names the half's composites.
+- **1.39** (#183) narrowed the `keyRecord` arm to halves wholly known from the key record, closing shape 10. The skip-predicate's `every(absent in both)` clause had evaluated any half with one composite in the key record, which is what the #43 idempotence rationale never covered. No stored key text changes; a row an earlier release already damaged stays as it is until a write names the half's composites, or `rekey({ repairIndexKeys: true })` repairs it.
 - **v1.7.3** reframed the predicate from "list cases for which to evaluate" to "list the single condition for which it is safe to skip." Closes the empty-composite-half regression (#46) and any future degenerate-case gap of the same shape — the skip predicate's negation is the cumulative `||`-chain of all prior tactical fixes plus the structural `length === 0` short-circuit.
 
 End-to-end consequences for the canonical multi-writer scenarios:
@@ -1412,10 +1448,10 @@ If you want to demote (truncate) hierarchically, you must `set` the surviving co
 
 #### How to drop a half (call-site syntax)
 
-| Composite is... | Method 1: `Entity.remove` (always works) | Method 2: `set` with `undefined` |
+| Composite is... | `Entity.remove` | `set` with `undefined`, the same write |
 |---|---|---|
-| **Required** in model (e.g. `Schema.String`) | `update(key).remove(["composite"])` | not available — TS rejects `undefined` for non-optional fields under `exactOptionalPropertyTypes` (the v1.7.0 NullishOr revert ensures payload types match model declarations) |
-| **Optional** in model (`Schema.optional(...)`) | `update(key).remove(["composite"])` | `update(key).set({ composite: undefined })` |
+| **One a row can lack** (`Schema.optional`, `Schema.optionalKey`, the `OptionFromOptional` family; a decoding default stores the default instead of dropping the half) | `update(key).remove(["composite"])` | `update(key).set({ composite: undefined })` |
+| **One a row can't lack** (`Schema.String`, a primary-key composite) | Refused: a compile error, and a `ValidationError` before anything is sent | The same |
 
 Naming any one composite of a half is enough — `Entity.remove` doesn't require enumerating all of them. `null` is **never** valid for a composite (EDD-9025 rejects nullable composites at make-time).
 
@@ -1450,7 +1486,7 @@ For GSIs whose composites are entirely entity-PK composites (e.g. `byChannel: { 
 
 The semantic justification: composites participate in string composition (`acc#X#alert#Y`); null is not a meaningful slot value, only present-with-value or absent. Allowing `Schema.NullOr` on a composite would let `set({ composite: null })` typecheck and then immediately blow up at runtime (or worse, silently produce a key with the literal string `"null"` as a slot). EDD-9025 catches this at make-time.
 
-The sparse pattern is still expressible — use `Schema.optional(...)`, which produces `T | undefined` (without `null`). `undefined` is "absent" under the two-way classification.
+The sparse pattern is still expressible — use `Schema.optional(...)`, which produces `T | undefined` (without `null`). An update's `undefined` clears the composite; an `append`'s is "absent" under the two-way classification.
 
 **Footgun closed at the type level — `set({ composite: null })` no longer compiles.** Two changes work together (both shipped in v1.7.0, kept in v1.7.1):
 
@@ -1483,7 +1519,7 @@ entity.update(key).remove(['alertState']).asEffect()
 | Enrichment | `{ accountId: "newAcct" }` | touched, SET full → new `account#newAcct` | untouched, **noop** | Visible under new account, sk position unchanged |
 | Telemetry (active alert) | `{ alertState: "active", timestamp: T2 }` | untouched, **noop** | touched, SET full → fresh `alert#active#ts#T2` | Visible under last accountId, fresh sk |
 | Telemetry (no alert) | `{ timestamp: T2 }` (alertState omitted, optional) | untouched, **noop** | touched (timestamp), can't compose (hole) + sparse → REMOVE gsi1sk | Invisible (DDB needs both); gsi1pk preserved |
-| Telemetry (explicit clear) | `{ alertState: undefined, timestamp: T2 }` | untouched, **noop** | touched, can't compose + sparse → REMOVE gsi1sk | Same — invisible, gsi1pk preserved |
+| Telemetry (explicit clear) | `{ alertState: undefined, timestamp: T2 }` | untouched, **noop** | `alertState` in `removedSet`, can't compose → REMOVE gsi1sk, and the attribute | Same — invisible, gsi1pk preserved |
 | Stamp (unrelated write) | `{ published: {...} }` | untouched, **noop** | untouched, **noop** | Unchanged — both halves preserved (the v1.7.0 leak is closed) |
 | Telemetry (rejoin) | `{ alertState: "active", timestamp: T3 }` | untouched, **noop** | touched, SET full → `alert#active#ts#T3` | Re-visible under preserved gsi1pk + new gsi1sk; **no enrichment re-fire needed** |
 | Hierarchical demote (different entity, multi-composite SK) | `update(key).set({ region, country, city }).remove(["site"])` | n/a | touched (set + removedSet), trailing-absent → SET truncated to `region#APAC#country#AU#city#Sydney` | Re-indexed at city scope |
@@ -1500,7 +1536,7 @@ entity.update(key).remove(['alertState']).asEffect()
 
 `by` attributes are sort key composites, and the skip-predicate looks only at a half's own composites, so an update setting only `groupId` would leave the stored shard stale and pruned queries would miss the item. **`by` attributes are therefore dependencies of the PK half, but only when the writer touches them.** `keyRecord` membership doesn't count: the retain path's `keyRecord` holds the whole item, and a default source is immutable, so neither is evidence of a change.
 
-Over the `by` attributes only: **T** one has a value in the payload; **N** one is `null` / `undefined` in the payload; **R** one is in `removedSet`; **A** a source attribute is absent from the merged record; **PT** a PK composite has a value in the payload.
+Over the `by` attributes only: **T** one has a value in the payload; **N** one is `null` in the payload, or `undefined` in an `append`'s (an update's `undefined` is **R**); **R** one is in `removedSet`; **A** a source attribute is absent from the merged record; **PT** a PK composite has a value in the payload.
 
 **Gate.** The PK half is skipped iff the existing skip-predicate holds and not (T or N or R). An empty PK half with `by` is no longer a constant, so it is skipped when `by` is absent from payload and `keyRecord` and not T / N / R. An empty PK half without `by` is never skipped, as before.
 
@@ -1560,7 +1596,7 @@ The retain path holds the whole item in `keyRecord`, so a mixed half whose compo
 
 11. **A half stored in a table key attribute** (#183) — a local index's `pk`, an inverted index, or `sk: { field: "sk", composite: ["id"] }` shared with the table. DynamoDB refuses an update that writes a table key attribute, so the composer never returns one, in `sets` or `removes`: such a half holds what the table key does, out of composites an update can't change, and dropping the index entry takes the other half. Snapshots, tombstones and events keep the attribute too.
 
-12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. `.set({ note: undefined })` under `preserve` composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
+12. **A mutable half beside one that writes nothing, on the retain path** (#183) — `pk: [note]` with `sk: { field: "sk", composite: ["id"] }` shared with the table, a local index's `sk: [note]`, an inverted index's `sk: [note]`, or `pk: [note], sk: [group]` on a row that has cleared `group`. An update that names `note` with a leading composite missing under `preserve`, or one of a row an earlier release cleared with `.set({ note: undefined })` (which composed nothing, and left the attribute's key behind), composes nothing for such an index, as the kept half is a noop and the other half is the table's or has no value. That silence isn't a drop: the entry stays through it and through any later update, on the standard, retain and transaction paths alike, until an update clears `note`, which removes the half. **This is the regression scenario from shape 11**, where filtering a table key attribute out of the composer's result took away the only sign a retained update had that the index had been evaluated, and its Put-style fallback deleted the entry. The fallback only ever deleted (an index it reached always lacked a composite), so it's gone.
 
 13. **Two accessors storing their halves in one attribute** (#183) — `byRegion: { pk: [region], sk: [id] }` and `byGroup: { pk: [group], sk: [extra] }` on one physical index, or `byName: { pk: [name], sk: [id] }` with a sparse `byOther: { pk: [other], sk: [name] }` in one attribute. **Refused: `EDD-9106` at `Entity.make`, or at `Table.make` for a casing left to the schema.** A row can't show which accessor owns the attribute, so no composer can be right: an ordinary update replaces one half and leaves a mismatched pair, including on a row that only ever populated one accessor, and a table key move composes from the whole row with the later accessor winning. Fixing the writes would mean patching every path, which is how this kept regressing. The check runs per entity, so overloading one index across entity types is unaffected. To keep such access patterns, give each half its own attribute, which means a new index, and re-put existing rows.
 
@@ -2738,6 +2774,32 @@ immutable field; and a second operation on the same field. `.add()` /
 `.subtract()` / `.append()` / `.deleteFromSet()` on a GSI composite recompose
 the index key on every entity.
 
+**Clearing a field (#177, #178).** `.set({ f: undefined })` is `.remove(["f"])`, unless the field stores `undefined` as a value (`storesUndefined`), which is written like any other: `normalizeClears` moves it once, at the top of `runUpdate`, so the sentinel release, the composer's per-half gate and policy, the vector gate, the retain snapshot and the transactional planner (which runs this same op) see one form. A value that encodes to nothing (`Option.none()` on a `Schema.OptionFromOptional` field) clears the same way. Three names aren't clears: a library-generated `updatedAt` (`undefined` means generate it), a sparse map (`.set()` merges entries, and no entries merge nothing), and a name the model doesn't know, which the payload's schema drops.
+
+Clearing a field a row can't lack is refused with a `ValidationError` before anything is sent, for `.set({ f: undefined })`, `.remove(["f"])`, a top-level `pathRemove(["f"])` and an `append`'s `.remove`, because the write would land and the row could not then be read. A row can lack a field if it still decodes without it (`rowCanLack`: optional on its stored side, and a real decode of `{}` isn't refused), so a decoding default can be cleared and a `NullOr` can't. A ref can't, whatever its model field declares: its read schema points at the required target. `pathRemove` of a property below a field is judged by walking the stored side of the field's schema (`pathIsRequired`): structs, classes and recursive schemas are followed, a record's entry and a list's element are open (a list closes up, so which element went says nothing about the row), and a union requires a property only if every member declaring it does. A `.check()` that a removal would fail, such as a minimum length on a list, is not judged. `null` follows the same line: on a field a row can lack it clears, on one it can't (a required `NullOr`) it is stored.
+
+An update names model fields, never what the library stores. `refusedAttributeNames` refuses, in every record and path operation, another field's stored name (naming the field to use), a secondary index's key attribute, any `__edd_*` attribute, the version and timestamp attributes, `deletedAt` and the TTL attribute on an entity configured to use them, an immutable field and a sparse map; `.remove` and a single-segment `pathRemove` also refuse a sparse entry's stored name, naming `.removeEntries`, while the other path operations keep it, as that's how a counter entry is added to. A name the model simply doesn't know stays allowed, since it's the only way to clean up an attribute the model no longer declares.
+
+The types narrow to match. `.remove` takes `RemovableFields` (`AppendRemovableFields` on an `append`, which also needs the name in `appendInput` and excludes `orderBy`), on `BoundUpdate`, `BoundAppend` and `Entity.remove`, and the unbound update's payload carries the names as a phantom so `Entity.remove` works data-last in a `pipe`. `updateSchema` declares a field a row can't lack with `optionalKey`, not `optional`, so `.set({ required: undefined })` doesn't compile under `exactOptionalPropertyTypes`, and JSON `null` for it is a decode error for anyone serving the schema over HTTP. `.pathRemove` stays `ReadonlyArray<string | number>`.
+
+An `append`'s own `{ f: undefined }` is not a clear. The attribute stays, and it counts as naming the composite (**N**), so a half it feeds drops under `sparse` and stays under `preserve`. `.remove` clears. The exception is a field whose stored side includes `undefined`, below: there it is the value, and a REMOVE.
+
+The names `.remove` refuses by configuration (immutable, sparse map) can't be derived from what `Entity` and `BoundEntity` otherwise carry, because `make` unwraps `ConfiguredModel<TModel, TAttrs>` to `TModel`, so each has one more type parameter, last, defaulting to `never`. Every position the names reach is a method (`_unremovableFields`, `Removable`, `BoundUpdate.remove`, `BoundAppend.remove`), whose parameter is compared both ways, so a type written with the old argument count still fits an entity with such a field. Such an annotation forgets those names: `.remove` of one compiles, and is refused at run time.
+
+**Values with no stored form.** DynamoDB can't store `undefined` or an empty set, so on a field whose stored side includes one the value is an absent attribute, and an absent attribute reads back as that value (`absentReading`). It's one rule with a write half and a read half, and it costs nothing on any other value: no extra read, and the same bytes.
+
+The write half is the marshaller (`Marshaller.toAttributeMap`), the single choke point every item passes. It marshals; only if that throws does it strip empty sets from maps and retry, which leaves `undefined` to `removeUndefinedValues` as before. A top-level operand (`toAttributeValue`) has no attribute to leave out, so it still throws, and the update path normalises operands first (`normalizeNoStoredForm`): `.set` of one is a clear, `.add` / `.deleteFromSet` / `pathAdd` / `pathDelete` of an empty set does nothing, and `pathSet` of one is a `pathRemove`.
+
+The read half is `substituteSchemaDeep` under `absentReads`, which wraps a struct field with `Schema.withDecodingDefaultKey`, at any depth, in the entity read schemas and the aggregate's `decodeSchema`. A default decodes through the field, so each read gets its own set, and a `.check()` refusing the value leaves the field required: `absentReading` is `undefined` for it, `rowCanLack` is false, and clearing it is refused. A lenient union member can't take a later member's row, because each member is tried strictly first; a `oneOf` union stays as declared, since a lenient copy would make two members match. An event, its metadata, a snapshot state and an outbox effect read through `readingAbsentValues`, the same walk with nothing else substituted: the marshaller would otherwise turn an empty set in an event from a failed write into a stream that can't be read. It follows the stored side: a set stored as a list stores its empty list, and a `Schema.HashSet` can't be stored at all, empty or not.
+
+The places the rule can't reach: a list element can't be absent without moving the elements after it, so an empty set in a list or a tuple is refused. A record entry holding an empty set loses its key. `UndefinedOr(ReadonlySet)`: absent can mean only one thing, `undefined`, so an empty set reads back `undefined`. A `.select()` is raw, so absent stays absent. `Schema.suspend`, opaque classes (`X.check()`, `X.annotate()`) and what's beneath a container's decoding default aren't walked, as for all nested substitution, so absent there stays a decode failure. In expressions, `eq` / `ne` with an empty set compile to `attribute_not_exists` / `attribute_exists`, and any other comparison with one is refused (`emptyPartProblem`).
+
+**A caller's value is never a defect.** Whatever the marshaller still refuses (an empty set in a list, `NaN`, `Infinity`, past `MAX_SAFE_INTEGER`, a set it has no form for) throws `UnstorableValue`, with the path to the deepest part refused, and a write path turns that into a `ValidationError` naming the field (`marshalOrFail`, the counterpart of `composeKeysOrFail`), a stored attribute under its field's name. Anything else thrown stays a defect. It's found where it costs nothing: a plain `put` finds out at its one marshal, and only a path that sends something first looks ahead (`unstorableIn`, the marshaller on the values at hand): a `put` that reads, hydrates or embeds first, `upsert`, a time-series `append`, and every update operand including `.withVector` (`unstorableOperand`). That marshals an update's operands one more time. Comparison operands are judged with the rest of a condition (`emptyPartProblem`), and a vector `.filter` when it's compiled. A packed field has its own form and is left out. A `NaN` feeding a key is key composition's to refuse first, for `EDD-9096`; with `escapeKeys` off it has key text, or it may feed a half nothing composes, so what's left is refused once keys are composed (`refuseUncomposed`). The builders in `Expression.ts` are plain functions and throw it at the call. Event data, metadata, snapshot states and outbox effects pass the same marshal, as does a tombstone's kept fields.
+
+**`undefined` in a list.** `marshall` drops it, closing the list up. In a tuple that moves the values after it or empties a required position, so the row reads back wrong or not at all, and nobody can depend on it: the write schemas (`enforceChecks`) and `writingTuplePositions`, for what the library stores without deriving (events, metadata, snapshot states, outbox effects), refuse a position holding `undefined` unless no value follows it in an optional position, or its encoded side can't hold one (an `undefined` encoding to something else has a stored form). Reads don't, so stored rows read as they did. The check sits on the Type side, because `encodingChecks` has no public constructor, so a position only its encoding makes `undefined` isn't seen. A `Schema.Array` and the rest of a `TupleWithRest` are left closing up: a put and a read of them both work, so a caller can rely on it, and refusing would need a walk of every item on every write. Pinned by a test, documented, and the owner's call.
+
+**Relative updates aren't checked against the model.** `.set` is judged before it's sent. `.add`, `.subtract`, `.append`, `.deleteFromSet` and path operations compute from a value only DynamoDB holds, and reading it first would cost every update, so a `.check()` they break isn't seen until the row comes back. `appliedUpdate` wraps every decode after a landed write (`updateResult`, and the row a cascade reads), so the `ValidationError` says the update WAS applied, that the stored row no longer matches the model, and which field (`decodeProblem`). `allOld` / `updatedOld` report that the row it replaced doesn't match. Guard with `.condition()`. `.returnValues("none")` and a transaction return no row, so nothing reports it.
+
 **Guarded read-then-write (#133).** Updates that read first (a unique-field
 change, a computed change to an index composite, every retain update) write a
 guarded `Update` of only the attributes that changed, conditioned on what they
@@ -2967,13 +3029,14 @@ writes for a changed value carries its constraint's `ttl`, as a put's does.
 **`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
 sentinel, snapshot the replaced item, or tell whether to store a default or keep
 the stored value. So an entity with `unique` constraints or `versioned: { retain:
-true }`, or an input that omits a defaulted index composite, takes
+true }`, an input that omits a defaulted index composite, or an input clearing a
+secondary index composite, takes
 `guardedUpsert`: it validates the whole input (required fields included) and
 reads the item once. Missing: `create`, sentinels guarded by
 `attribute_not_exists`, the retain snapshot written, omitted defaults stored.
 Present: an update of the upserted fields (primary-key composites, immutable
 fields, `createdAt` and the version dropped, so they keep their stored values,
-as do fields the input omits) from that same read, with sentinels rotated for
+as do fields the input omits or leaves unset) from that same read, with sentinels rotated for
 changed values only and the replaced item snapshotted, under the update's
 version / incarnation guard (versioned) or attribute guard (unversioned). A
 concurrent create or delete between the read and the write is retried the other
@@ -2982,6 +3045,18 @@ way, and a sentinel release that raced is planned again from a fresh read
 `OptimisticLockError` / `ConcurrentModification`, never a
 `ConditionalCheckFailed` the caller didn't ask for, and every error names the
 `upsert`. Other entities keep the single `if_not_exists` `UpdateItem`.
+
+**An `undefined` in an upsert's input means the same on either path.** The answer goes by what the input encodes to:
+
+| The field, given `undefined` | What the upsert does | Read first? |
+|---|---|---|
+| Merely optional (`Schema.optional`): left unset | Keeps the attribute and any key holding it | Only if another reason says so |
+| `undefined` is a value with no stored form (`Schema.UndefinedOr`): a clear | Removes the attribute | Only if a secondary index holds it |
+| `undefined` is a value with a stored form (a transform writing `"none"`) | Writes that | Only if another reason says so |
+| A default no key holds | Writes the default | Only if another reason says so |
+| A defaulted index composite: omitted, as `omitsIndexedDefault` reads it | Keeps what the row holds; on a new row, the default | Yes |
+
+An empty set follows the second row. **Clearing a secondary index composite reads first**, because what's left of a half depends on the row, and the result is what `.set(...).remove([...])` leaves: `[owner, und]` given `und: undefined` truncates to `owner_o1`, and `[und]` loses the half under `'sparse'` and `'preserve'` alike, a clear being the cascade override. Without it the key would outlive its value. A primary composite, an immutable field, and a date the library stamps aren't cleared this way, so those stay one write. So does a clear no key holds. This read happens only when the input clears a composite: no other upsert pays for it.
 
 **Transaction puts.** `transactWrite` and `EventStore.append`'s
 `additionalItems` plan a put of a versioned or unique-constrained entity with
@@ -5315,8 +5390,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9108` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | One entity uses one physical index twice, even over the same fields |
 | `EDD-9109` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | A model attribute, a system timestamp or a version field is stored in a table key attribute, by rename or by name |
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
+| `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, without what its key needs beside it: the partition key's composites, the other `by` attributes, or (under `preserve`) a sort key composite before it. Every append carrying it would fail with `EDD-9100` |
 
-Next free code: **`EDD-9113`** (`9110` and `9111` are reserved for #189; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: **`EDD-9114`** (`9110` and `9111` are reserved for #189; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

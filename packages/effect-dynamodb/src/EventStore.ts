@@ -71,6 +71,10 @@ import {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  readingAbsentValues,
+  writingTuplePositions,
+} from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import {
   isDispatchEligible,
@@ -117,6 +121,7 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
+import { marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type AppendWriteOp,
   type BuiltStreamAppend,
@@ -2939,18 +2944,29 @@ export const makeStream = <
     return eventUnion
   }
 
+  const writableCodecs = new Map<Schema.Codec<any>, Schema.Codec<any>>()
+  /** A codec refusing a tuple position its stored list can't keep. Built once per schema. */
+  const writableCodec = (declared: Schema.Codec<any>): Schema.Codec<any> => {
+    const known = writableCodecs.get(declared)
+    if (known !== undefined) return known
+    const writable = writingTuplePositions(declared) as Schema.Codec<any>
+    writableCodecs.set(declared, writable)
+    return writable
+  }
+
   /**
    * Validate input and produce wire-form output: `Schema.encode` first, with a
    * `decode → encode` fallback for inputs already in encoded shape. Mirrors
    * the Entity write path (`encodeOrDecodeEncode` in `Entity.ts`).
    */
   const encodeToWire = (
-    codec: Schema.Codec<any>,
+    declared: Schema.Codec<any>,
     input: unknown,
     operation: string,
     errorEntityType: string = entityType,
-  ): Effect.Effect<unknown, ValidationError> =>
-    Schema.encodeUnknownEffect(codec)(input).pipe(
+  ): Effect.Effect<unknown, ValidationError> => {
+    const codec = writableCodec(declared)
+    return Schema.encodeUnknownEffect(codec)(input).pipe(
       Effect.catch((primaryCause) =>
         Schema.decodeUnknownEffect(codec)(input).pipe(
           Effect.flatMap((decoded) => Schema.encodeUnknownEffect(codec)(decoded)),
@@ -2964,12 +2980,24 @@ export const makeStream = <
         ),
       ),
     )
+  }
 
   // ---------------------------------------------------------------------------
   // Decode a raw DynamoDB item → StreamEvent<TEvent>
   // ---------------------------------------------------------------------------
 
   const decodeEnvelope = Schema.decodeUnknownEffect(EventEnvelope)
+  // `undefined` and an empty set are stored as absent attributes, in an event as
+  // anywhere else, and read back as those values.
+  const decodeEventData = Schema.decodeUnknownEffect(
+    readingAbsentValues(eventUnion) as Schema.Codec<unknown>,
+  )
+  const decodeMetadata = Schema.decodeUnknownEffect(
+    readingAbsentValues(metadataSchema ?? Schema.Unknown) as Schema.Codec<unknown>,
+  )
+  const decodeSnapshotState = Schema.decodeUnknownEffect(
+    readingAbsentValues(snapshot?.schema ?? Schema.Unknown) as Schema.Codec<unknown>,
+  )
 
   /**
    * An event's stored `data` → its wire form (plain JSON), by the stored
@@ -3021,8 +3049,7 @@ export const makeStream = <
       // JSON string (`S`) parsed, compressed binary (`B`) decompressed and
       // parsed — whatever the stream's current `storedAs` says.
       const wireData = yield* unpackData(raw.data, "EventStore.decode")
-      const decoder = Schema.decodeUnknownEffect(eventUnion as Schema.Schema<TEvent>)
-      const data = yield* (decoder(wireData) as Effect.Effect<TEvent, unknown>).pipe(
+      const data = yield* (decodeEventData(wireData) as Effect.Effect<TEvent, unknown>).pipe(
         Effect.mapError(toValidationError("EventStore.decode")),
       )
 
@@ -3032,9 +3059,9 @@ export const makeStream = <
       let metadata: unknown
       if (raw.metadata !== undefined) {
         metadata = metadataSchema
-          ? yield* Schema.decodeUnknownEffect(metadataSchema as Schema.Schema<unknown>)(
-              raw.metadata,
-            ).pipe(Effect.mapError(toValidationError("EventStore.decode.metadata")))
+          ? yield* decodeMetadata(raw.metadata).pipe(
+              Effect.mapError(toValidationError("EventStore.decode.metadata")),
+            )
           : raw.metadata
       }
 
@@ -3559,7 +3586,7 @@ export const makeStream = <
       }
       // Top-level and native, beside `state`, so packing never touches it.
       if (sealed) item[SEALED_ATTRIBUTE] = true
-      return toAttributeMap(item)
+      return yield* marshalOrFail(snapshotEntityType, operation, () => toAttributeMap(item))
     })
 
   /**
@@ -3905,7 +3932,9 @@ export const makeStream = <
             return {
               Put: {
                 TableName: tableName,
-                Item: toAttributeMap(item),
+                Item: yield* marshalOrFail(entityType, "EventStore.append", () =>
+                  toAttributeMap(item),
+                ),
                 ConditionExpression: "attribute_not_exists(pk)",
                 // The first put of a writer one version behind a seal lands on
                 // the sealing event: its item tells `StreamSealed` from a
@@ -4595,9 +4624,7 @@ export const makeStream = <
       : Effect.succeed(raw.state)
     ).pipe(
       Effect.flatMap((state) =>
-        Schema.decodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
-          state,
-        ).pipe(
+        decodeSnapshotState(state).pipe(
           Effect.mapError(
             (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
           ),

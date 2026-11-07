@@ -10,7 +10,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -18,6 +18,7 @@ import * as EventStore from "../src/EventStore.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import * as RekeyChains from "./helpers/RekeyChains.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 
 class Stop extends Schema.Class<Stop>("Stop")({
@@ -353,126 +354,30 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
   })
 })
 
-describe.each(SETTINGS)("a dry run follows the chain, %s", (_direction, escapeKeys) => {
-  const w = world(escapeKeys)
-  const other = world(!escapeKeys)
-  const { moving, holder } = chainOf(escapeKeys)
-  const logged = [new Logged({ note: "n" })]
-
-  it.effect("a sentinel's key held by one that can't move: neither moves", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.entities.Accounts.put({ id: "a", email: moving }).asEffect()
-        yield* db.entities.Accounts.put({ id: "b", email: holder }).asEffect()
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      // A duplicate of the holder's value, landed before `rekey`: its sentinel's current key is taken.
-      yield* db.entities.Accounts.put({ id: "c", email: holder }).asEffect()
-      const before = keysOf(table)
-      const { dry, real } = yield* dryThenReal(db)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(real.sentinelsMoved).toBe(0)
-      expect(real.conflicts.map((conflict) => conflict.reason)).toEqual(["taken", "taken"])
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
-
-  it.effect("a sentinel's key held by one that can move: both move", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.entities.Accounts.put({ id: "a", email: moving }).asEffect()
-        yield* db.entities.Accounts.put({ id: "b", email: holder }).asEffect()
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      const { dry, real } = yield* dryThenReal(db)
-      expect(real.conflicts).toEqual([])
-      expect(real.sentinelsMoved).toBe(2)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-    }).pipe(on(w, table))
-  })
-
-  it.effect("a stream's partition held by one that can't move: neither moves", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        yield* other.Logs.append({ id: moving }, logged, 0)
-        yield* other.Logs.append({ id: holder }, logged, 0)
-      }).pipe(on(other, table))
-      // Rows of no stream we know, where the holder belongs.
-      const known = new Set(table.items.keys())
-      yield* w.Logs.append({ id: holder }, logged, 0)
-      for (const [stored, item] of [...table.items.entries()]) {
-        if (!known.has(stored)) table.items.set(stored, { ...item, streamId: { S: "zzz" } })
-      }
-      const db = yield* w.client
-      const before = keysOf(table)
-      const { dry, real } = yield* dryThenReal(db, { streams: [w.Logs] })
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(real.moved.stream).toBe(0)
-      expect(real.conflicts.map((conflict) => conflict.reason).sort()).toEqual([
-        "bothKeys",
-        "taken",
-      ])
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
-
-  it.effect("a stream's partition held by one that can move: both move", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        yield* other.Logs.append({ id: moving }, logged, 0)
-        yield* other.Logs.append({ id: holder }, logged, 0)
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      const { dry, real } = yield* dryThenReal(db, { streams: [w.Logs] })
-      expect(real.conflicts).toEqual([])
-      expect(real.moved.stream).toBe(2)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-    }).pipe(on(w, table))
-  })
-
-  it.effect("an aggregate's partition held by one that can't move: neither moves", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.aggregates.Routes.create({ id: moving, name: "n", stops: [] })
-        yield* db.aggregates.Routes.create({ id: holder, name: "n", stops: [] })
-      }).pipe(on(other, table))
-      // It can't be assembled, so it can't be moved.
-      const held = [...table.items.entries()].find(([, item]) => item.id?.S === holder)!
-      const { name: _name, ...undecodable } = held[1]
-      table.items.set(held[0], undecodable)
-      const db = yield* w.client
-      const before = keysOf(table)
-      const { dry, real } = yield* dryThenReal(db)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(real.moved.aggregate).toBe(0)
-      expect(real.conflicts.map((conflict) => conflict.reason).sort()).toEqual(["failed", "taken"])
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
-
-  it.effect("an aggregate's partition held by one that can move: both move", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.aggregates.Routes.create({ id: moving, name: "n", stops: [] })
-        yield* db.aggregates.Routes.create({ id: holder, name: "n", stops: [] })
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      const { dry, real } = yield* dryThenReal(db)
-      expect(real.conflicts).toEqual([])
-      expect(real.moved.aggregate).toBe(2)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-    }).pipe(on(w, table))
-  })
+describe("a dry run follows the chain", () => {
+  // The same scenarios run on DynamoDB Local (`connected.rekey-chains.test.ts`), where both scan
+  // orders are met. A table here scans in key order.
+  const harness: RekeyChains.Harness = {
+    on: (chainWorld, body) => {
+      const table = tableOf()
+      const provideOn = (member: RekeyChains.ChainWorld) =>
+        Layer.merge(table.layer, member.MainTable.layer({ name: "t" }))
+      return body({
+        seed: (row) => Effect.sync(() => store(table, row)),
+        remove: (row) =>
+          Effect.sync(() => {
+            table.items.delete(`${row.pk!.S}|${row.sk!.S}`)
+          }),
+        rows: () => Effect.sync(() => [...table.items.values()]),
+        as: (member, effect) => effect.pipe(Effect.provide(provideOn(member))) as never,
+      }).pipe(Effect.provide(provideOn(chainWorld))) as never
+    },
+  }
+  for (const scenario of RekeyChains.chainScenarios) {
+    it.effect(scenario.name, () =>
+      Effect.asVoid(scenario.run(harness, RekeyChains.chainOf(scenario.escapeKeys), 1)),
+    )
+  }
 })
 
 describe.each(SETTINGS)("a value landing on another's old rows, %s", (_direction, escapeKeys) => {
@@ -679,6 +584,154 @@ describe.each(SETTINGS)("an aggregate's move, %s", (_direction, escapeKeys) => {
       }).pipe(on(w, table))
     },
   )
+
+  // A run cut short left the edges at the current key with the root still at the old one, and the
+  // scan meets the edges first. The value decides the order: a table scans in key order here.
+  const edgesFirst = escapeKeys ? "%z" : "r 1"
+  const bounded = {
+    ...route,
+    id: edgesFirst,
+  }
+  /** The bounded run's rows: edges where the move put them, root where it was. */
+  const halfMoved = (table: ReturnType<typeof tableOf>, id = edgesFirst) => {
+    const pkFor = (schema: DynamoSchema.DynamoSchema) =>
+      DynamoSchema.composeCollectionKey(schema, "routes", [
+        KeyComposer.keyText(schema, id, "lowercase"),
+      ])
+    const entry = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+    table.items.delete(entry[0])
+    store(table, { ...entry[1], pk: { S: pkFor(old) } })
+    const rows = [...table.items.values()].map((row) => row.pk?.S).sort()
+    expect(rows[0]).toBe(pkFor(id === edgesFirst ? w.schema : old))
+    expect(rows.at(-1)).toBe(pkFor(id === edgesFirst ? old : w.schema))
+  }
+
+  it.effect("a run that stopped before the root says nothing of the edges it met", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        maxPages: 1,
+      })
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        pageSize: 1,
+        maxPages: 1,
+      })
+      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+      expect(report.scanned).toBe(1)
+      expect(report.resume._tag).toBe("Some")
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(report.skipped.rootNotSeen).toBe(1)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run over the whole table judges them, with no read for a rooted edge", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+      })
+      expect(dry.skipped.unrecognizedKey).toBe(0)
+      expect(dry.skipped.rootNotSeen).toBe(0)
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({ pageSize: 1 })
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(report.skipped.rootNotSeen).toBe(0)
+      expect(report.moved.aggregate).toBe(1)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run resumed part way can't judge them either, whichever page held the root", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      // A dry run moves nothing, so what it learned of the root on an earlier page is gone.
+      const pages: Array<Table.RekeyReport> = []
+      let resume: string | undefined
+      do {
+        const page: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          dryRun: true,
+          pageSize: 1,
+          maxPages: 1,
+          ...(resume === undefined ? {} : { resume }),
+        })
+        pages.push(page)
+        resume = page.resume._tag === "Some" ? page.resume.value : undefined
+      } while (resume !== undefined)
+      expect(pages.length).toBeGreaterThan(1)
+      expect(pages.map((page) => page.skipped.unrecognizedKey)).toEqual(pages.map(() => 0))
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run resumed to the end of the table didn't read what came before its token", () => {
+    const table = tableOf()
+    // The other order: the root's old key sorts first, so an earlier page held it.
+    const rootFirst = escapeKeys ? "r 1" : "%z"
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create({ ...route, id: rootFirst })
+      halfMoved(table, rootFirst)
+      const first: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        maxPages: 1,
+      })
+      expect(first.scanned).toBe(1)
+      const rest: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        resume: Option.getOrThrow(first.resume),
+      })
+      expect(rest.resume._tag).toBe("None")
+      expect(rest.skipped.unrecognizedKey).toBe(0)
+      expect(rest.skipped.rootNotSeen).toBe(2)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a real orphan stays unjudged in a bounded run and is counted over the table", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      const root = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+      table.items.delete(root[0])
+      const part: Table.RekeyReport = yield* db.tables.MainTable.rekey({ pageSize: 1, maxPages: 1 })
+      expect(part.skipped.unrecognizedKey).toBe(0)
+      expect(part.skipped.rootNotSeen).toBe(1)
+      const whole: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      expect(whole.skipped.unrecognizedKey).toBe(2)
+      expect(whole.skipped.rootNotSeen).toBe(0)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("the fix adds no read to a run over the whole table", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      const root = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+      table.items.delete(root[0])
+      table.take()
+      yield* db.tables.MainTable.rekey()
+      // Two edges: the root's read for each as the scan meets it, and each edge read again after.
+      expect(table.take().map((request) => request.command)).toEqual([
+        "Scan",
+        "GetItem",
+        "GetItem",
+        "GetItem",
+        "GetItem",
+      ])
+    }).pipe(on(w, table))
+  })
 
   it.effect("segments meeting one aggregate move it once, and edges wait for the move", () => {
     const table = tableOf()

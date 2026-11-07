@@ -13,7 +13,7 @@
  * Not part of the public API.
  */
 
-import { type Schema, SchemaAST } from "effect"
+import { Exit, Schema, SchemaAST } from "effect"
 
 /**
  * Read `.fields` from a `Schema.Struct` or `Schema.Class`.
@@ -228,3 +228,180 @@ export const numericTypeWithStringEncoding = (schema: Schema.Top): boolean => {
     (SchemaAST.isNumber(typeAst) || SchemaAST.isBigInt(typeAst)) && SchemaAST.isString(encodedAst)
   )
 }
+
+/** The `representation` id Effect gives `Schema.ReadonlySet`, the one type stored as a set. */
+const READONLY_SET = "effect/schema/ReadonlySet"
+
+/**
+ * What an absent attribute reads back as, on a field whose stored side includes
+ * a value DynamoDB has no form for.
+ */
+export interface AbsentReading {
+  /** The value on the field's stored side: `undefined`, or an empty set. */
+  readonly stored: unknown
+  /** That value decoded through the field: what a reader gets. */
+  readonly value: unknown
+}
+
+/** Whether an AST is a `Schema.ReadonlySet`, by the id Effect gives its representation. */
+export const isSetDeclaration = (ast: SchemaAST.AST): boolean =>
+  ast._tag === "Declaration" &&
+  (
+    (ast.annotations as Record<string, unknown> | undefined)?.representation as
+      | { readonly id?: unknown }
+      | undefined
+  )?.id === READONLY_SET
+
+/**
+ * The value on a stored side that DynamoDB can't store, if there is one. With
+ * both in one union, `undefined` is what an absent attribute means.
+ */
+const valueWithNoStoredForm = (
+  ast: SchemaAST.AST,
+  seen: Set<SchemaAST.AST> = new Set(),
+): { readonly stored: unknown } | undefined => {
+  switch (ast._tag) {
+    case "Undefined":
+    case "Void":
+    case "Unknown":
+    case "Any":
+      return { stored: undefined }
+    case "Declaration":
+      return isSetDeclaration(ast) ? { stored: new Set() } : undefined
+    case "Suspend": {
+      if (seen.has(ast)) return undefined
+      seen.add(ast)
+      return valueWithNoStoredForm(ast.thunk(), seen)
+    }
+    case "Union": {
+      const found = ast.types.flatMap((member) => valueWithNoStoredForm(member, seen) ?? [])
+      return found.find((value) => value.stored === undefined) ?? found[0]
+    }
+    default:
+      return undefined
+  }
+}
+
+/**
+ * Whether a value of this type can be `undefined` and be stored as one: an `undefined` that
+ * encodes to something else has a stored form.
+ */
+export const holdsUndefined = (ast: SchemaAST.AST): boolean =>
+  [SchemaAST.toType(ast), SchemaAST.toEncoded(ast)].every((side) => {
+    const found = valueWithNoStoredForm(side)
+    return found !== undefined && found.stored === undefined
+  })
+
+/**
+ * The one rule for values with no stored form. DynamoDB can't store `undefined`
+ * or an empty set, so on a field whose stored side includes one the value is an
+ * absent attribute, and an absent attribute reads back as that value. Returns
+ * what it reads back as, or `undefined` when the rule doesn't apply: the field's
+ * key is optional, so absent reads as absent (or as its decoding default); or
+ * its schema refuses the value, as a `.check()` for a non-empty set does, so no
+ * row may be without it.
+ *
+ * The check decodes for real. A transformation that can't run synchronously is
+ * taken at its word, reading back as the stored value.
+ */
+export const absentReading = (field: Schema.Top): AbsentReading | undefined => {
+  const encoded = SchemaAST.toEncoded(field.ast)
+  if (SchemaAST.isOptional(encoded)) return undefined
+  const found = valueWithNoStoredForm(encoded)
+  if (found === undefined) return undefined
+  const decoded = Schema.decodeUnknownExit(field as unknown as Schema.Codec<unknown, unknown>)(
+    found.stored,
+  )
+  if (Exit.hasFails(decoded)) return undefined
+  return { stored: found.stored, value: Exit.isSuccess(decoded) ? decoded.value : found.stored }
+}
+
+/**
+ * Whether the field's key is one a stored row may leave out: optional fields
+ * (`Schema.optional`, `Schema.optionalKey`, the `OptionFromOptional` family) and
+ * a decoding default, whose value a read fills in.
+ *
+ * The stored side's optionality rules most fields out without running anything;
+ * what is left is decoded for real, because a transformation may still refuse
+ * the missing key. A default that cannot run synchronously is taken at its word.
+ */
+export const rowOmits = (field: Schema.Top): boolean => {
+  if (!SchemaAST.isOptional(SchemaAST.toEncoded(field.ast))) return false
+  const probe = Schema.Struct({ field }) as unknown as Schema.Codec<unknown, unknown>
+  return !Exit.hasFails(Schema.decodeUnknownExit(probe)({}))
+}
+
+/**
+ * Whether a stored row can be without this field and still be read: its key may
+ * be left out ({@link rowOmits}), or an absent attribute is one of its values
+ * ({@link absentReading}). A required field cannot, nor can a `NullOr`, whose key
+ * is required even though its value may be empty.
+ */
+export const rowCanLack = (field: Schema.Top): boolean =>
+  rowOmits(field) || absentReading(field) !== undefined
+
+/** The verdict on a path, as far as a schema can tell. */
+type PathVerdict = "required" | "open" | "absent"
+
+const pathVerdict = (ast: SchemaAST.AST, segments: ReadonlyArray<string | number>): PathVerdict => {
+  const head = segments[0]
+  if (head === undefined) return "open"
+  const rest = segments.slice(1)
+  const below = (member: SchemaAST.AST, optional: boolean): PathVerdict =>
+    rest.length > 0 ? pathVerdict(member, rest) : optional ? "open" : "required"
+  if (SchemaAST.isSuspend(ast)) return pathVerdict(ast.thunk(), segments)
+  if (SchemaAST.isUnion(ast)) {
+    const verdicts = ast.types
+      .map((member) => pathVerdict(member, segments))
+      .filter((verdict) => verdict !== "absent")
+    if (verdicts.length === 0) return "absent"
+    return verdicts.every((verdict) => verdict === "required") ? "required" : "open"
+  }
+  if (SchemaAST.isObjects(ast)) {
+    if (typeof head !== "string") return "absent"
+    const property = ast.propertySignatures.find((signature) => signature.name === head)
+    if (property !== undefined) {
+      const lackable =
+        SchemaAST.isOptional(property.type) ||
+        absentReading(Schema.make<Schema.Top>(property.type)) !== undefined
+      return below(property.type, lackable)
+    }
+    const index = ast.indexSignatures[0]
+    return index === undefined ? "absent" : rest.length > 0 ? pathVerdict(index.type, rest) : "open"
+  }
+  if (SchemaAST.isArrays(ast)) {
+    if (typeof head !== "number") return "absent"
+    const element = ast.elements[head]
+    if (element !== undefined && ast.rest.length === 0) {
+      return below(element, SchemaAST.isOptional(element))
+    }
+    // A list closes up when an element is removed, so which element is gone
+    // says nothing about the row; only what's below an element can be judged.
+    const repeated = element ?? ast.rest[0]
+    return repeated === undefined
+      ? "absent"
+      : rest.length > 0
+        ? pathVerdict(repeated, rest)
+        : "open"
+  }
+  return "absent"
+}
+
+/**
+ * Whether removing `segments`, a path inside this field, leaves a value the
+ * field's schema refuses: the last segment is a property (or a fixed tuple
+ * element) the stored side requires.
+ *
+ * It walks the stored side of the schema, so a `Schema.Class` and a `ref`
+ * field are seen through and a decoding default counts as optional. A union
+ * is judged by the members that declare the property: a value holding it is
+ * one of those. A property whose absent attribute is one of its values
+ * ({@link absentReading}) is not required. `false` means the schema can't say the
+ * row breaks: a record's keys, a list's elements, and anything opaque (a
+ * `Schema.declare`, a set, a `.check()` such as a minimum length, which is a
+ * verdict on the value and not its shape).
+ */
+export const pathIsRequired = (
+  field: Schema.Top,
+  segments: ReadonlyArray<string | number>,
+): boolean => pathVerdict(SchemaAST.toEncoded(field.ast), segments) === "required"

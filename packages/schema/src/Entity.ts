@@ -22,6 +22,7 @@ import {
   type DynamoEncoding,
   type ExtractIdentifier,
   type ExtractPackedFields,
+  type ExtractUnremovableFields,
   getIdentifierField,
   getPackedFields,
   getSparseFields,
@@ -34,7 +35,7 @@ import {
   type PackedConfig,
   type SparseConfig,
 } from "./DynamoModel.js"
-import type * as DynamoSchema from "./DynamoSchema.js"
+import * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
 import type {
@@ -71,6 +72,7 @@ import type {
   ModelFieldName,
   PrefixFieldNames,
 } from "./internal/EntityTypes.js"
+import { isShardSourceError } from "./internal/Shards.js"
 import {
   refuseRepeatedIndex,
   refuseSharedKeyAttributeOnEverySchema,
@@ -92,7 +94,11 @@ import type {
   ZOrderKeyPart,
   ZOrderSkPart,
 } from "./KeyComposer.js"
-import { isZOrderHalf, normalizeGsiConfig } from "./KeyComposer.js"
+import {
+  composeGsiKeysForUpdatePolicyAware,
+  isZOrderHalf,
+  normalizeGsiConfig,
+} from "./KeyComposer.js"
 import type { VectorIndexConfig, VectorIndexDefinition } from "./VectorIndex.js"
 import {
   deriveVectorFilterTypes,
@@ -441,6 +447,61 @@ export type AppendInputFields<TModel extends Schema.Top, TTimeSeries> = TTimeSer
         }
   : unknown
 
+/** The sort key composites an input lacks before one it carries: the hole a composer can't span. */
+type SortKeyHole<C, TCarried, TGap extends string = never> = C extends readonly [
+  infer H extends string,
+  ...infer T,
+]
+  ? H extends TCarried
+    ? TGap | SortKeyHole<T, TCarried>
+    : SortKeyHole<T, TCarried, TGap | H>
+  : never
+
+/**
+ * What an index's key lacks when an input carrying `TCarried` touches its `shards.by`.
+ * A sort key hole fails only under `preserve`; `sparse` takes the row out of the index.
+ */
+type AppendShardGap<TEntry, TCarried> = TEntry extends {
+  readonly pk: { readonly composite: infer PC extends ReadonlyArray<string> }
+  readonly sk: { readonly composite: infer SC extends ReadonlyArray<string> }
+  readonly shards: { readonly by: infer By extends ReadonlyArray<string> }
+}
+  ? [By[number] & TCarried] extends [never]
+    ? never
+    :
+        | Exclude<PC[number] | By[number], TCarried>
+        | (TEntry extends { readonly indexPolicy: infer P }
+            ? [P] extends [{ readonly pk?: unknown; readonly sk?: "preserve" }]
+              ? SortKeyHole<SC, TCarried>
+              : never
+            : SortKeyHole<SC, TCarried>)
+  : never
+
+/**
+ * @internal A `timeSeries.appendInput` carrying a `shards.by` attribute of an index,
+ * without what its key needs beside it: every append carrying it would fail with
+ * `EDD-9100`, so it's an error on `appendInput`. `Entity.make` checks again at run time
+ * (`EDD-9113`), which covers whatever the literals here don't show.
+ */
+export type AppendShardGuard<TIndexes, TTimeSeries> = TTimeSeries extends {
+  readonly appendInput: infer A extends Schema.Top
+}
+  ? string extends ModelFieldName<A>
+    ? unknown
+    : [
+          {
+            readonly [K in keyof TIndexes]: AppendShardGap<TIndexes[K], ModelFieldName<A>>
+          }[keyof TIndexes],
+        ] extends [never]
+      ? unknown
+      : {
+          readonly appendInput: `EDD-9113: appendInput carries a sharded index's \`by\` attribute but not ${{
+            readonly [K in keyof TIndexes]: AppendShardGap<TIndexes[K], ModelFieldName<A>>
+          }[keyof TIndexes] &
+            string}`
+        }
+  : unknown
+
 // ---------------------------------------------------------------------------
 // EntityDefinition — the pure half of an Entity (no AWS operations)
 // ---------------------------------------------------------------------------
@@ -551,6 +612,7 @@ export interface EntityDefinition<
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
   TPackedFields extends string = never,
+  TUnremovable extends string = never,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -579,6 +641,11 @@ export interface EntityDefinition<
    * a packed field can be tested only with `exists` / `notExists` as a whole.
    */
   readonly _packedFields: ReadonlyArray<TPackedFields>
+  /**
+   * @internal Phantom — never read at runtime. Carries the fields
+   * `.remove()` refuses by configuration (immutable, sparse map).
+   */
+  _unremovableFields?(field: TUnremovable): void
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -711,6 +778,58 @@ const bindShards = (
     )
   }
   return { ...shards, source: by }
+}
+
+/**
+ * An `appendInput` carrying a `shards.by` attribute of an index whose key can't be
+ * composed from what that input carries (`[EDD-9113]`): every append carrying it would
+ * fail with `[EDD-9100]`. Judged by composing one such append, through the composer every
+ * append goes through, so the policy decides as it would on the call: a sort key gap
+ * under `sparse` takes the row out of the index rather than failing.
+ */
+const refuseAppendThatCannotShard = (
+  entityType: string,
+  indexes: globalThis.Record<string, IndexDefinition>,
+  timeSeries: { readonly appendInput?: unknown } | undefined,
+): void => {
+  if (timeSeries?.appendInput === undefined || timeSeries.appendInput === null) return
+  const carried = Object.keys(getSchemaFields(timeSeries.appendInput as Schema.Top) ?? {})
+  const primary = indexes.primary
+  if (primary === undefined) return
+  const primaryComposites = [...primary.pk.composite, ...primary.sk.composite]
+  const appended = (fields: ReadonlyArray<string>) =>
+    Object.fromEntries(fields.map((field) => [field, "x"]))
+  for (const [indexName, index] of Object.entries(indexes)) {
+    const by = index.shards?.by
+    if (by === undefined || !by.some((attr) => carried.includes(attr))) continue
+    try {
+      composeGsiKeysForUpdatePolicyAware(
+        DynamoSchema.make({ name: "definition", version: 1 }),
+        entityType,
+        1,
+        { primary, [indexName]: index },
+        appended(carried.filter((field) => !primaryComposites.includes(field))),
+        appended(carried),
+      )
+    } catch (error) {
+      if (!isShardSourceError(error)) throw error
+      const lastCarried = index.sk.composite.reduce(
+        (last, attr, position) => (carried.includes(attr) ? position : last),
+        -1,
+      )
+      const missing = [
+        ...new Set([...index.pk.composite, ...by, ...index.sk.composite.slice(0, lastCarried)]),
+      ].filter((attr) => !carried.includes(attr))
+      const names = (attrs: ReadonlyArray<string>) => attrs.map((attr) => `"${attr}"`).join(", ")
+      throw new Error(
+        `[EDD-9113] Entity "${entityType}": timeSeries.appendInput carries ` +
+          `${names(by.filter((attr) => carried.includes(attr)))}, which index "${indexName}" is ` +
+          `sharded by, but not ${names(missing)}. Every append carrying it would fail with ` +
+          `EDD-9100, because the index's key can't be composed. Add ${names(missing)} to ` +
+          `appendInput, or take the sharded attribute out of it.`,
+      )
+    }
+  }
 }
 
 export const buildEntityDefinition = (config: {
@@ -1310,6 +1429,7 @@ export const buildEntityDefinition = (config: {
       shards: bindShards(config.entityType, indexName, indexDef, primaryIndex),
     }
   }
+  refuseAppendThatCannotShard(config.entityType, initialIndexes, config.timeSeries)
   refuseRepeatedIndex(config.entityType, initialIndexes)
   refuseSharedKeyAttributeOnEverySchema(config.entityType, initialIndexes)
 
@@ -1528,7 +1648,9 @@ export const make = <
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
   readonly refs?: TRefs & RefsKeyGuard<TModel, TRefs>
-  readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
+  readonly timeSeries?: TTimeSeries &
+    AppendInputFields<TModel, TTimeSeries> &
+    AppendShardGuard<TGsiIndexes, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
 }): EntityDefinition<
@@ -1544,7 +1666,8 @@ export const make = <
   TTimeSeries,
   TGeneratedId,
   TVectorIndexes,
-  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
+  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>,
+  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {

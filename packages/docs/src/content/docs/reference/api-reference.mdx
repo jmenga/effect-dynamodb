@@ -197,9 +197,10 @@ Both `make` and `definition` check the members against each other. Every member 
 | `Table` | Interface with `schema`, `entities`, `aggregates`, `layer()`, `layerConfig()`, and `Tag` for DI |
 | `TableConfig` | `{ name: string }` — runtime table configuration |
 | `TableDefinition` | `{ KeySchema, AttributeDefinitions, GlobalSecondaryIndexes? }` |
-| `RekeyOptions` | `rekey` options: `dryRun`, `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
-| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
+| `RekeyOptions` | `rekey` options: `dryRun`, `repairIndexKeys` (write the index keys `indexKeys` counts, default off), `segments` (default 1), `concurrency` (default 4), `pageSize`, `maxPages`, `resume`, `streams` (the table's event streams, bound or not), `onProgress(report)` |
+| `RekeyReport` | `{ dryRun, scanned, unchanged, moved: RekeyCounts, indexKeysRewritten, sentinelsMoved, indexKeys: RekeyIndexKeys, conflicts: RekeyConflict[], skipped: { notLibrary, unregistered, unrecognizedKey, rootNotSeen }, byMember, capacity, resume: Option<string> }` — `resume` is `None` when the run covered the whole table |
 | `RekeyCounts` | Rows moved by `RekeyRowKind`: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
+| `RekeyIndexKeys` | Index keys of items at their current table key that aren't what their values compose: `missing`, `truncated`, `lagging`, `ambiguous` (counted on every run); `repaired`, `skipped` (with `repairIndexKeys`) |
 | `RekeyConflict` | `{ member, kind, reason: "bothKeys" \| "taken" \| "contended" \| "failed" \| "uncomposable", key, target, message }` — a row `rekey` left as it is |
 | `RekeyMemberReport` | One entity type's, aggregate's or stream's share of a report |
 
@@ -215,7 +216,7 @@ The typed client's `db.tables.<Table>` binds the table's operations:
 | `enableTTL(attr)` / `disableTTL(attr)` / `describeTTL()` | Time to live |
 | `tag(tags)` / `untag(keys)` / `tags()` | Resource tags |
 | `addVectorIndex(name)` / `removeVectorIndex(name)` / `waitForVectorIndex(name, options?)` | Vector indexes ([Vector Search](/effect-dynamodb/guides/vector-search/)) |
-| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row under key text the schema's `escapeKeys` setting doesn't compose (1.36's, that of 1.37.0 and 1.38.0, or the other setting's) to the text it does, in either direction: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, nothing is overwritten or merged, and conflicts are reported and left; a row it can't place is counted in `skipped.unrecognizedKey`; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move. On a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) it also rewrites an index key stored under another layout (`indexKeysRewritten`), and reports a row that can't compose a current one as a conflict (`reason: "uncomposable"`). A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading](/effect-dynamodb/guides/upgrading/)) |
+| `rekey(options?)` | `Effect<RekeyReport, DynamoClientError \| ValidationError>` — move every row under key text the schema's `escapeKeys` setting doesn't compose (1.36's, that of 1.37.0 and 1.38.0, or the other setting's) to the text it does, in either direction: items with their index keys and unique sentinels, version snapshots, tombstones (with the sentinels `preserveUnique` kept), time-series events, aggregates, and the event streams in `options.streams`. Scans the table (`segments` in parallel), resumable (`maxPages`, `resume`, `onProgress`) and idempotent; every write is conditioned on what the move read, nothing is overwritten or merged, and conflicts are reported and left; a row it can't place is counted in `skipped.unrecognizedKey`; projection row tombstones and outbox items move to their row's current key (an outbox on a table of its own with that table's `rekey`; an item a drainer holds is left, `contended`); `dryRun` counts what would move; `indexKeys` counts index keys that aren't what their row's values compose, and [`repairIndexKeys`](/effect-dynamodb/guides/upgrading/#repairing-index-keys) writes them. On a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) it also rewrites an index key stored under another layout (`indexKeysRewritten`), and reports a row that can't compose a current one as a conflict (`reason: "uncomposable"`). A bad option or resume token fails with `ValidationError` (`EDD-9098`) before anything is read ([Upgrading](/effect-dynamodb/guides/upgrading/)) |
 
 ### Usage
 
@@ -362,7 +363,7 @@ These functions transform entity operations via pipe:
 | `expectedVersion(n)` | `EntityUpdate` | Optimistic lock — fail if version doesn't match. Requires a `versioned` entity: on any other it fails with a `ValidationError` before anything is sent |
 | `consistentRead` | `EntityGet` | Enable strongly consistent reads |
 | `condition(input)` | `EntityPut`, `EntityUpdate`, `EntityDelete` | Add a `ConditionExpression`. A later one replaces an earlier one. It is ANDed with the op's own guard (`create`'s not-exists, `patch`'s and `deleteIfExists`'s exists), never in its place. An empty condition (`{}`, `and()`) is no condition. An empty part under `or()` or `not()`, or an `or()` with no parts, fails with a `ValidationError` before anything is sent. An `isIn` with no values is sent, and DynamoDB's rejection of its `IN ()` is a `ValidationError` naming it |
-| `remove(fields)` | `EntityUpdate` | REMOVE attributes from the item |
+| `remove(fields)` | `EntityUpdate` | REMOVE model fields a row can lack; `set({ field: undefined })` is the same write. A required field, a stored attribute name or an attribute the library manages doesn't compile, and fails with a `ValidationError` before anything is sent. Use `pathRemove` for an attribute the model no longer declares |
 | `add(values)` | `EntityUpdate` | Atomically ADD to numeric attributes |
 | `subtract(values)` | `EntityUpdate` | Subtract from numeric attributes (SET `#f = #f - :v`) |
 | `append(values)` | `EntityUpdate` | Append to list attributes (`list_append`) |
@@ -942,7 +943,7 @@ import {
 | Combinator | Description |
 |------------|-------------|
 | `Entity.pathSet(op)` | SET nested path or attribute-to-attribute copy |
-| `Entity.pathRemove(segments)` | REMOVE nested path or array element |
+| `Entity.pathRemove(segments)` | REMOVE nested path or array element. A path the model requires, or a name that isn't the model's, fails with a `ValidationError`, as `remove` does. An attribute the model doesn't know is allowed |
 | `Entity.pathAdd(op)` | ADD to nested numeric/set |
 | `Entity.pathSubtract(op)` | Subtract from nested numeric |
 | `Entity.pathAppend(op)` | Append to nested list |

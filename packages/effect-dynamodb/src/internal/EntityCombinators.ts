@@ -12,6 +12,7 @@ import type {
 import { type Effect, Function as Fn } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import {
+  type AddOperand,
   type CascadeConfig,
   type CascadeTarget,
   type EntityDelete,
@@ -467,16 +468,38 @@ export const returnValues: {
 })
 
 /**
- * Remove one or more attributes from the item.
- * Produces a DynamoDB `REMOVE` clause.
+ * @internal The field names `.remove()` takes, carried on the (phantom) payload
+ * type `Entity.update()` returns, as {@link UpdateBase} carries its return types.
+ */
+declare const RemovableTypeId: unique symbol
+/** @internal */
+export interface Removable<N extends string> {
+  // A method: its parameter is compared both ways, so an update that takes fewer names
+  // still fits a type written without them.
+  [RemovableTypeId]?(_: N): void
+}
+/** @internal The names a payload type allows, `string` when it doesn't say. */
+export type RemovableOf<U> = typeof RemovableTypeId extends keyof U
+  ? U extends Removable<infer N>
+    ? N
+    : string
+  : string
+
+/**
+ * Clear model fields a row can lack, by their model names. Produces a DynamoDB
+ * `REMOVE` clause; `Entity.set({ field: undefined })` is the same operation.
+ *
+ * A field the model requires, a typo and a stored attribute name don't compile,
+ * and are refused at run time, before anything is sent. To clean up an attribute
+ * the model no longer declares, use `Entity.pathRemove(update, ["attribute"])`.
  */
 export const remove: {
-  (
-    fields: ReadonlyArray<string>,
-  ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
+  <A, Rec, U, E, R>(
+    fields: ReadonlyArray<RemovableOf<NoInfer<U>>>,
+  ): (self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
   <A, Rec, U, E, R>(
     self: EntityUpdate<A, Rec, U, E, R>,
-    fields: ReadonlyArray<string>,
+    fields: ReadonlyArray<RemovableOf<NoInfer<U>>>,
   ): EntityUpdate<A, Rec, U, E, R>
 } = Fn.dual(
   2,
@@ -501,17 +524,17 @@ export const remove: {
  */
 export const add: {
   (
-    values: globalThis.Record<string, number>,
+    values: globalThis.Record<string, AddOperand>,
   ): <A, Rec, U, E, R>(self: EntityUpdate<A, Rec, U, E, R>) => EntityUpdate<A, Rec, U, E, R>
   <A, Rec, U, E, R>(
     self: EntityUpdate<A, Rec, U, E, R>,
-    values: globalThis.Record<string, number>,
+    values: globalThis.Record<string, AddOperand>,
   ): EntityUpdate<A, Rec, U, E, R>
 } = Fn.dual(
   2,
   <A, Rec, U, E, R>(
     self: EntityUpdate<A, Rec, U, E, R>,
-    values: globalThis.Record<string, number>,
+    values: globalThis.Record<string, AddOperand>,
   ): EntityUpdate<A, Rec, U, E, R> => {
     const existing = self._updateState.add ?? {}
     return new EntityUpdateImpl<A, Rec, U, E, R>(

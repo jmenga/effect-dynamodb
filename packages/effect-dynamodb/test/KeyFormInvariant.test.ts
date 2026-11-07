@@ -66,6 +66,7 @@ const RECORD_TAKING = [
   "composeGsiKeysForUpdatePolicyAware",
   "composeVectorPartition",
   "tryComposeVectorPartition",
+  "judgeIndexHalf",
   "extractComposites",
   "tryExtractComposites",
 ] as const

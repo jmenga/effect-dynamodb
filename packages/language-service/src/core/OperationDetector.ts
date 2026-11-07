@@ -559,7 +559,12 @@ function parsePipeArgs(
             result.set = {}
             for (const p of setArg.properties) {
               if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) {
-                result.set[p.name.text] = extractArgValue(ts, p.initializer)
+                // `.set({ f: undefined })` is `.remove(["f"])`, and what's sent says so.
+                if (ts.isIdentifier(p.initializer) && p.initializer.text === "undefined") {
+                  result.remove = [...(result.remove ?? []), p.name.text]
+                } else {
+                  result.set[p.name.text] = extractArgValue(ts, p.initializer)
+                }
               }
             }
           }
@@ -570,7 +575,7 @@ function parsePipeArgs(
         if (arg.arguments.length > 0) {
           const removeArg = arg.arguments[0]!
           if (ts.isArrayLiteralExpression(removeArg)) {
-            result.remove = []
+            result.remove ??= []
             for (const el of removeArg.elements) {
               if (ts.isStringLiteral(el)) {
                 result.remove.push(el.text)

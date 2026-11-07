@@ -1,0 +1,738 @@
+{
+  "generated": "Stored by the published effect-dynamodb@1.38.0 and @effect-dynamodb/schema@1.38.0 (effect@4.1.0), on DynamoDB Local, by the writes each row names; each item as a consistent scan returned it. The entity is test/helpers/RekeyRepair.ts's Devices. Do not regenerate from this repo.",
+  "rows": {
+    "healthy": {
+      "writes": "put with every field",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "a": {
+          "S": "A"
+        },
+        "accountId": {
+          "S": "acme"
+        },
+        "alertState": {
+          "S": "active"
+        },
+        "b": {
+          "S": "B"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "city": {
+          "S": "berlin"
+        },
+        "country": {
+          "S": "de"
+        },
+        "deviceId": {
+          "S": "healthy"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_healthy"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi1sk": {
+          "S": "$damaged#v1#device#zone_north#deviceid_healthy"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_healthy#zone_north"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1#zone_north"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_healthy"
+        },
+        "gsi4pk": {
+          "S": "$damaged#v1#device#accountid_acme"
+        },
+        "gsi4sk": {
+          "S": "$damaged#v1#device#alertstate_active#timestamp_t1"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi5sk": {
+          "S": "$damaged#v1#device#a_a#b_b"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6sk": {
+          "S": "$damaged#v1#device#a_a#b_b"
+        },
+        "gsi7pk": {
+          "S": "$damaged#v1#device#region_emea"
+        },
+        "gsi7sk": {
+          "S": "$damaged#v1#device#country_de#city_berlin"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_healthy#level_0000000000000007"
+        },
+        "gsi9pk": {
+          "S": "$damaged#v1#device#zone_north"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "level": {
+          "N": "7"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_healthy"
+        },
+        "region": {
+          "S": "emea"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        },
+        "timestamp": {
+          "S": "t1"
+        },
+        "zone": {
+          "S": "north"
+        }
+      }
+    },
+    "bare": {
+      "writes": "put with only its key: no index but the one the primary key composes",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "bare"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_bare"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_bare"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        }
+      }
+    },
+    "damaged": {
+      "writes": "put, then .set({ status })",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "damaged"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_damaged"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_damaged"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_damaged"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_damaged"
+        },
+        "gsi9pk": {
+          "S": "$damaged#v1#device#zone_north"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_damaged"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        },
+        "status": {
+          "S": "seen"
+        },
+        "zone": {
+          "S": "north"
+        }
+      }
+    },
+    "damaged-number": {
+      "writes": "put, then .set({ status }): a number in the half",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "damaged-number"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_damaged-number"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_damaged-number"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_damaged-number"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_damaged-number"
+        },
+        "gsi9pk": {
+          "S": "$damaged#v1#device#zone_north"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "level": {
+          "N": "7"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_damaged-number"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        },
+        "status": {
+          "S": "seen"
+        },
+        "zone": {
+          "S": "north"
+        }
+      }
+    },
+    "a b": {
+      "writes": "put, then .set({ status }): values holding characters a key escapes, and upper case",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "channel": {
+          "S": "c 1"
+        },
+        "deviceId": {
+          "S": "a b"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c 1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_a%20b"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c 1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c 1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_a%20b"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c 1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_a%20b"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c 1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c 1"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c 1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_a%20b"
+        },
+        "gsi9pk": {
+          "S": "$damaged#v1#device#zone_north side#2"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c 1#deviceid_a b"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        },
+        "status": {
+          "S": "seen"
+        },
+        "zone": {
+          "S": "North Side#2"
+        }
+      }
+    },
+    "dropped": {
+      "writes": "put, then .set({ timestamp }): the documented drop",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "accountId": {
+          "S": "acme"
+        },
+        "alertState": {
+          "S": "active"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "dropped"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_dropped"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_dropped"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_dropped"
+        },
+        "gsi4pk": {
+          "S": "$damaged#v1#device#accountid_acme"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_dropped"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_dropped"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        },
+        "timestamp": {
+          "S": "t2"
+        }
+      }
+    },
+    "cleared": {
+      "writes": "put, then .set({ alertState: undefined })",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "accountId": {
+          "S": "acme"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "cleared"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_cleared"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_cleared"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_cleared"
+        },
+        "gsi4pk": {
+          "S": "$damaged#v1#device#accountid_acme"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_cleared"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_cleared"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        },
+        "timestamp": {
+          "S": "t1"
+        }
+      }
+    },
+    "writers": {
+      "writes": "put, then .set({ a }), then .set({ b }): two writers",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "a": {
+          "S": "A"
+        },
+        "b": {
+          "S": "B"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "writers"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_writers"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_writers"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_writers"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6sk": {
+          "S": "$damaged#v1#device#a_a"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_writers"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_writers"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        }
+      }
+    },
+    "lag": {
+      "writes": "put, then .set({ b }): the trailing composite changed",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "a": {
+          "S": "A"
+        },
+        "b": {
+          "S": "new"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "lag"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_lag"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_lag"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_lag"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6sk": {
+          "S": "$damaged#v1#device#a_a#b_old"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_lag"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_lag"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        }
+      }
+    },
+    "leading": {
+      "writes": "put, then .set({ a }): the leading composite changed",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "a": {
+          "S": "A2"
+        },
+        "b": {
+          "S": "B"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "deviceId": {
+          "S": "leading"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_leading"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_leading"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_leading"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi5sk": {
+          "S": "$damaged#v1#device#a_a2"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6sk": {
+          "S": "$damaged#v1#device#a_a2"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_leading"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_leading"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        }
+      }
+    },
+    "place": {
+      "writes": "put, then .set({ country }).remove([\"city\"]): a trailing composite absent, shape 3",
+      "item": {
+        "__edd_e__": {
+          "S": "Device"
+        },
+        "channel": {
+          "S": "c1"
+        },
+        "country": {
+          "S": "de"
+        },
+        "deviceId": {
+          "S": "place"
+        },
+        "gsi10pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi10sk": {
+          "S": "$damaged#v1#device#deviceid_place"
+        },
+        "gsi1pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi2sk": {
+          "S": "$damaged#v1#device#deviceid_place"
+        },
+        "gsi3pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi3sk": {
+          "S": "$damaged#v1#device#deviceid_place"
+        },
+        "gsi5pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi6pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi7pk": {
+          "S": "$damaged#v1#device#region_emea"
+        },
+        "gsi7sk": {
+          "S": "$damaged#v1#device#country_de"
+        },
+        "gsi8pk": {
+          "S": "$damaged#v1#device#channel_c1"
+        },
+        "gsi8sk": {
+          "S": "$damaged#v1#device#deviceid_place"
+        },
+        "gsi9sk": {
+          "S": "$damaged#v1#device"
+        },
+        "pk": {
+          "S": "$damaged#v1#device#channel_c1#deviceid_place"
+        },
+        "region": {
+          "S": "emea"
+        },
+        "sk": {
+          "S": "$damaged#v1#device"
+        }
+      }
+    }
+  }
+}

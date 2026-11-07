@@ -7,7 +7,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { ConditionInput } from "../Expression.js"
-import { toAttributeValue } from "../Marshaller.js"
+import { isEmptySet, toAttributeValue, unstorableIn } from "../Marshaller.js"
 import {
   compilePath,
   type PackedPath,
@@ -351,6 +351,13 @@ export const compileExpr = (
       case "gt":
       case "gte": {
         const ops = { eq: "=", ne: "<>", lt: "<", lte: "<=", gt: ">", gte: ">=" } as const
+        // DynamoDB has no empty set: a row holding one is a row without the attribute.
+        const emptySide = isEmptySetOperand(node.left) || isEmptySetOperand(node.right)
+        if (emptySide && (node._tag === "eq" || node._tag === "ne")) {
+          const other = isEmptySetOperand(node.left) ? node.right : node.left
+          const test = node._tag === "eq" ? "attribute_not_exists" : "attribute_exists"
+          return `${test}(${compileOperand(other)})`
+        }
         return `${compileOperand(node.left)} ${ops[node._tag]} ${compileOperand(node.right)}`
       }
       case "between":
@@ -456,9 +463,57 @@ export const emptyPartProblem = (expr: Expr): string | undefined => {
       }
       return emptyPartProblem(expr.expr)
     default:
-      return undefined
+      return emptySetOperands(expr).some(isEmptySetOperand)
+        ? "DynamoDB has no empty set, so a row holding one is a row without the attribute. " +
+            "Only eq() and ne() can compare with one, by whether the attribute exists."
+        : unstorableOperandProblem(expr)
   }
 }
+
+/** A value a comparison holds that DynamoDB can't store: compiling it would throw. */
+const unstorableOperandProblem = (expr: Expr): string | undefined => {
+  const operands = comparedOperands(expr)
+  for (const operand of operands) {
+    if (operand._tag !== "value") continue
+    const unstorable = unstorableIn({ value: operand.value })
+    if (unstorable === undefined) continue
+    const named = operands.find((other) => other._tag === "path")
+    const field = named === undefined ? "a value" : `"${named.segments.join(".")}"`
+    return `Comparing ${field} with a value DynamoDB can't store: ${unstorable.describe()}`
+  }
+  return undefined
+}
+
+/** Whether an operand is an empty set, which marshals to nothing. */
+const isEmptySetOperand = (operand: Operand): boolean =>
+  operand._tag === "value" && isEmptySet(operand.value)
+
+/** The operands of a comparison. */
+const comparedOperands = (expr: Expr): ReadonlyArray<Operand> => {
+  switch (expr._tag) {
+    case "eq":
+    case "ne":
+    case "lt":
+    case "lte":
+    case "gt":
+    case "gte":
+      return [expr.left, expr.right]
+    case "between":
+      return [expr.operand, expr.low, expr.high]
+    case "in":
+      return [expr.operand, ...expr.values]
+    case "beginsWith":
+      return [expr.operand, expr.prefix]
+    case "contains":
+      return [expr.operand, expr.value]
+    default:
+      return []
+  }
+}
+
+/** The operands that can't take an empty set: `eq` and `ne` compile it to an existence test. */
+const emptySetOperands = (expr: Expr): ReadonlyArray<Operand> =>
+  expr._tag === "eq" || expr._tag === "ne" ? [] : comparedOperands(expr)
 
 /** A condition or filter as an `Expr`: shorthand records are parsed. */
 export const toExpr = (cond: Expr | ConditionInput): Expr =>

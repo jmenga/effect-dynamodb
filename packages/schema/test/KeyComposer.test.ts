@@ -3127,3 +3127,293 @@ describe("index-level casing", () => {
     )
   })
 })
+
+// ---------------------------------------------------------------------------
+// A cleared composite (#177). `.set({ f: undefined })` and `.remove(["f"])` reach
+// the composer as one form: in `removedSet`, out of the payload. It's an explicit
+// removal, so a half it clears goes under `preserve` as under `sparse`.
+// ---------------------------------------------------------------------------
+
+describe("a cleared composite, by canonical GSI-composite shape", () => {
+  class Facets extends Schema.Class<Facets>("Facets")({
+    channel: Schema.String,
+    deviceId: Schema.String,
+    enrichment: Schema.optional(Schema.String),
+    alertState: Schema.optional(Schema.String),
+    region: Schema.optional(Schema.String),
+    country: Schema.optional(Schema.String),
+    city: Schema.optional(Schema.String),
+    site: Schema.optional(Schema.String),
+    a: Schema.optional(Schema.String),
+    b: Schema.optional(Schema.String),
+    binding: Schema.optional(Schema.String),
+    price: Schema.optional(Schema.Number),
+    bedrooms: Schema.optional(Schema.Number),
+    live: Schema.optional(Schema.Literals(["draft", "live"])),
+    agencyId: Schema.optional(Schema.String),
+    officeId: Schema.optional(Schema.String),
+    note: Schema.optional(Schema.String),
+  }) {}
+
+  const schema = DynamoSchema.make({ name: "clears", version: 1 })
+  const primaryKey = {
+    pk: { field: "pk", composite: ["channel"] },
+    sk: { field: "sk", composite: ["deviceId"] },
+  } as const
+  const keyRecord = { channel: "ch", deviceId: "d" }
+  const dimensions = [
+    { field: "price", min: 0, max: 1000 },
+    { field: "bedrooms", min: 0, max: 15 },
+  ] as const
+
+  const CASES: ReadonlyArray<{
+    readonly name: string
+    readonly index: { readonly pk: unknown; readonly sk: unknown }
+    readonly payload: Record<string, unknown>
+    readonly removed: ReadonlyArray<string>
+    readonly sets: ReadonlyArray<string>
+    readonly removes: ReadonlyArray<string>
+  }> = [
+    {
+      name: "shape 1, multi-writer: the other writer's half is skipped",
+      index: {
+        pk: { field: "gpk", composite: ["enrichment"] },
+        sk: { field: "gsk", composite: ["alertState"] },
+      },
+      payload: {},
+      removed: ["alertState"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 2, primary-key composites only (#43): SET on an unrelated clear",
+      index: {
+        pk: { field: "gpk", composite: ["channel"] },
+        sk: { field: "gsk", composite: ["deviceId"] },
+      },
+      payload: {},
+      removed: ["note"],
+      sets: ["gpk", "gsk"],
+      removes: [],
+    },
+    {
+      name: "shape 3, hierarchical: the parents given truncate it",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", composite: ["country", "city", "site"] },
+      },
+      payload: { country: "c", city: "t" },
+      removed: ["site"],
+      sets: ["gsk"],
+      removes: [],
+    },
+    {
+      name: "shape 3, hierarchical: no parents given, nothing to truncate to",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", composite: ["country", "city", "site"] },
+      },
+      payload: {},
+      removed: ["site"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 4, a hole",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", composite: ["country", "city"] },
+      },
+      payload: { city: "t" },
+      removed: ["country"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 5, all mutable",
+      index: {
+        pk: { field: "gpk", composite: ["a"] },
+        sk: { field: "gsk", composite: ["b"] },
+      },
+      payload: { a: "a2" },
+      removed: ["b"],
+      sets: ["gpk"],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 6, an empty half (#46): always evaluated",
+      index: {
+        pk: { field: "gpk", composite: ["binding"] },
+        sk: { field: "gsk", composite: [] },
+      },
+      payload: {},
+      removed: ["binding"],
+      sets: ["gsk"],
+      removes: ["gpk"],
+    },
+    {
+      name: "shape 7, a Z-order dimension: all or nothing, never truncated",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", zorder: dimensions },
+      },
+      payload: { price: 20 },
+      removed: ["bedrooms"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 7a, a single-bit dimension",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", zorder: ["live"] },
+      },
+      payload: {},
+      removed: ["live"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 7a′, mixed widths",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", zorder: ["live", { field: "price", min: 0, max: 8191 }] },
+      },
+      payload: { price: 20 },
+      removed: ["live"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 7b, an empty partition key half: SET, as the sort key goes",
+      index: {
+        pk: { field: "gpk", composite: [] },
+        sk: { field: "gsk", zorder: dimensions },
+      },
+      payload: { price: 20 },
+      removed: ["bedrooms"],
+      sets: ["gpk"],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8, the prefix cleared, the dimensions given",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId"], zorder: dimensions },
+      },
+      payload: { price: 20, bedrooms: 3 },
+      removed: ["agencyId"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8, a dimension cleared, the prefix given",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId"], zorder: dimensions },
+      },
+      payload: { agencyId: "ag" },
+      removed: ["price"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8a, every Z-order field a primary-key composite (#43): SET on an unrelated clear",
+      index: {
+        pk: { field: "gpk", composite: ["channel"] },
+        sk: { field: "gsk", prefix: ["channel"], zorder: [{ field: "deviceId", bytes: 4 }] },
+      },
+      payload: {},
+      removed: ["note"],
+      sets: ["gpk", "gsk"],
+      removes: [],
+    },
+    {
+      name: "shape 8b, the prefix's writer clears it, with no dimensions",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId"], zorder: dimensions },
+      },
+      payload: {},
+      removed: ["agencyId"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8c, a hierarchical prefix's leaf: never a truncated key",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId", "officeId"], zorder: dimensions },
+      },
+      payload: { agencyId: "ag", price: 20, bedrooms: 3 },
+      removed: ["officeId"],
+      sets: [],
+      removes: ["gsk"],
+    },
+  ]
+
+  const indexesOf = (index: { readonly pk: unknown; readonly sk: unknown }, policy: string) =>
+    (
+      Entity.make({
+        model: Facets,
+        entityType: "Facets",
+        primaryKey,
+        indexes: {
+          it: { name: "gsi", indexPolicy: { pk: policy, sk: policy }, ...index },
+        },
+      } as never) as unknown as { indexes: Record<string, KeyComposer.IndexDefinition> }
+    ).indexes
+
+  for (const policy of ["sparse", "preserve"] as const) {
+    for (const { name, index, payload, removed, sets, removes } of CASES) {
+      it(`${policy}, ${name}`, () => {
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Facets",
+          1,
+          indexesOf(index, policy),
+          payload,
+          keyRecord,
+          { removedSet: new Set(removed) },
+        )
+        expect(Object.keys(result.sets).sort()).toEqual(sets)
+        expect([...result.removes].sort()).toEqual(removes)
+      })
+    }
+  }
+
+  it("the truncated key of shape 3 holds the parents and stops", () => {
+    const { sets } = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+      schema,
+      "Facets",
+      1,
+      indexesOf(CASES[2]!.index, "preserve"),
+      { country: "c", city: "t" },
+      keyRecord,
+      { removedSet: new Set(["site"]) },
+    )
+    expect(sets.gsk).toBe("$clears#v1#facets#country_c#city_t")
+  })
+
+  it("leaving a composite out is not clearing it: the policy decides, then the clear overrides", () => {
+    const compose = (policy: string, removed: ReadonlyArray<string>) =>
+      KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "Facets",
+        1,
+        indexesOf(
+          {
+            pk: { field: "gpk", composite: ["region"] },
+            sk: { field: "gsk", zorder: dimensions },
+          },
+          policy,
+        ),
+        { price: 20 },
+        keyRecord,
+        { removedSet: new Set(removed) },
+      )
+    expect(compose("sparse", []).removes).toEqual(["gsk"])
+    expect(compose("preserve", []).removes).toEqual([])
+    expect(compose("preserve", ["bedrooms"]).removes).toEqual(["gsk"])
+  })
+})

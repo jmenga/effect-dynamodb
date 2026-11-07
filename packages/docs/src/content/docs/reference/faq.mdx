@@ -124,7 +124,7 @@ yield* users.update({ userId: "u-1" }).set({ region: "eu-west-1" })
 yield* users.update({ userId: "u-1" }).set({ region: "eu-west-1", office: "dublin" })
 ```
 
-**What about `Entity.remove()`?** Removing a GSI composite attribute recomposes the key half (pk or sk) that contains it without that attribute. If the half can no longer be composed (the removed attribute was a leading composite), the half is removed whatever its policy, and the item drops out of the index; if it was a trailing composite, the half is truncated. The other half is kept, so the item rejoins the index once a later write composes the removed half again. If SET and REMOVE target the same composite, removal wins.
+**What about `Entity.remove()`?** `.remove(["x"])` and `.set({ x: undefined })` are the same write. Removing a GSI composite attribute recomposes the key half (pk or sk) that contains it without that attribute. If the half can no longer be composed (the removed attribute was a leading composite), the half is removed whatever its policy, and the item drops out of the index; if it was a trailing composite, the half is truncated. The other half is kept, so the item rejoins the index once a later write composes the removed half again. If SET and REMOVE target the same composite, removal wins.
 
 See [Index Policy](/effect-dynamodb/guides/index-policy/) for the full rules.
 

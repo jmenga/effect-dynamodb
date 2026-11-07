@@ -22,10 +22,14 @@ import type {
   VersionedConfig,
 } from "./EntityConfig.js"
 import {
+  absentReading,
   firstTypeParameterAst,
   getSchemaFields,
+  holdsUndefined,
   isSchemaLike,
+  isSetDeclaration,
   numericTypeWithStringEncoding,
+  rowCanLack,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
 import { parseZonedIso } from "./ZonedIso.js"
@@ -1168,6 +1172,21 @@ export interface DeepSubstitutionOptions {
    * not enforced must stay readable. Propagated through the recursion.
    */
   readonly enforceChecks?: boolean | undefined
+  /**
+   * READ schemas: a struct field whose stored side includes a value with no
+   * stored form reads an absent attribute as that value (`absentReading`). `"only"`
+   * substitutes nothing else, for a schema the entity derivation doesn't own (an
+   * event, a snapshot state). Propagated through the recursion.
+   */
+  readonly absentReads?: boolean | "only" | undefined
+  /**
+   * An aggregate's mutated state only: a set also decodes from the list its plain state
+   * holds it as (`Schema.toIso` gives a set as an array), so a mutation can hand the state
+   * back. `create` input stays a set. Propagated through the recursion.
+   */
+  readonly listedSets?: boolean | undefined
+  /** See {@link writingTuplePositions}. Propagated through the recursion. */
+  readonly undefinedPositionsOnly?: boolean | undefined
 }
 
 /** The options a nested schema inherits: everything but the per-position ones. */
@@ -1177,7 +1196,10 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
   opts?.strictWireKind ||
   opts?.legacyReads ||
   opts?.path ||
-  opts?.enforceChecks
+  opts?.enforceChecks ||
+  opts?.absentReads ||
+  opts?.listedSets ||
+  opts?.undefinedPositionsOnly
     ? {
         ...(opts?.tolerantTransforms ? { tolerantTransforms: true } : {}),
         ...(opts?.resolveRef ? { resolveRef: opts.resolveRef } : {}),
@@ -1185,6 +1207,9 @@ const descend = (opts: DeepSubstitutionOptions | undefined): DeepSubstitutionOpt
         ...(opts?.legacyReads ? { legacyReads: true } : {}),
         ...(opts?.path ? { path: opts.path } : {}),
         ...(opts?.enforceChecks ? { enforceChecks: true } : {}),
+        ...(opts?.absentReads ? { absentReads: opts.absentReads } : {}),
+        ...(opts?.listedSets ? { listedSets: true } : {}),
+        ...(opts?.undefinedPositionsOnly ? { undefinedPositionsOnly: true } : {}),
       }
     : undefined
 
@@ -1509,6 +1534,98 @@ const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
   opts.strictWireKind !== true &&
   isSelfBigInt(schema)
 
+/** The field, reading an absent attribute as the value it stands for (`absentReading`). */
+const readingAbsent = (field: Schema.Top): Schema.Top => {
+  const reading = absentReading(field)
+  if (reading === undefined) return field
+  return field.pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
+      self: Schema.Top,
+    ) => Schema.Top,
+  )
+}
+
+/** Whether a struct field anywhere in the schema reads an absent attribute as a value. */
+const holdsAbsentRead = (schema: Schema.Top): boolean => {
+  const opt = optionalField(schema)
+  if (opt !== undefined) return holdsAbsentRead(opt.inner)
+  const defaulted = decodingDefaultField(schema)
+  if (defaulted !== undefined) return holdsAbsentRead(defaulted.inner)
+  const container = walkedContainer(schema)
+  if (container !== undefined) return container.children.some((child) => holdsAbsentRead(child))
+  if (isArraySchema(schema)) {
+    const element = arrayElementOf(schema)
+    return element !== undefined && holdsAbsentRead(element)
+  }
+  const fields = schemaFieldsOf(schema)
+  return (
+    fields !== undefined &&
+    Object.values(fields).some(
+      (field) => absentReading(field) !== undefined || holdsAbsentRead(field),
+    )
+  )
+}
+
+/** Whether a tuple has a fixed position that can hold `undefined`. */
+const hasUndefinedPosition = (schema: Schema.Top): boolean =>
+  SchemaAST.isArrays(schema.ast) && schema.ast.elements.some((element) => holdsUndefined(element))
+
+/** Whether a tuple with a position that can hold `undefined` is anywhere in the schema. */
+const holdsUndefinedPosition = (schema: Schema.Top): boolean => {
+  const inner = optionalField(schema)?.inner ?? decodingDefaultField(schema)?.inner
+  if (inner !== undefined) return holdsUndefinedPosition(inner)
+  if (hasUndefinedPosition(schema)) return true
+  const container = walkedContainer(schema)
+  if (container !== undefined) {
+    return container.children.some((child) => holdsUndefinedPosition(child))
+  }
+  if (isArraySchema(schema)) {
+    const element = arrayElementOf(schema)
+    return element !== undefined && holdsUndefinedPosition(element)
+  }
+  const fields = schemaFieldsOf(schema)
+  return (
+    fields !== undefined && Object.values(fields).some((field) => holdsUndefinedPosition(field))
+  )
+}
+
+/**
+ * Marshalling drops `undefined` from a list, closing it up. In a tuple that moves
+ * the values after it to other positions, or leaves a required position empty, so
+ * the row reads back wrong or not at all. Only a last optional position can go, and
+ * a position in a tuple's rest, which is a list.
+ */
+const refusingUndefinedPositions = (tuple: Schema.Top): Schema.Top => {
+  const optional = (tuple.ast as SchemaAST.Arrays).elements.map((element) =>
+    SchemaAST.isOptional(element),
+  )
+  return (
+    tuple as Schema.Top & { readonly check: (...checks: ReadonlyArray<unknown>) => Schema.Top }
+  ).check(
+    Schema.makeFilter((values: ReadonlyArray<unknown>) => {
+      const position = values.findIndex(
+        (value, index) =>
+          value === undefined &&
+          index < optional.length &&
+          (optional[index] !== true ||
+            values.slice(index + 1).some((later) => later !== undefined)),
+      )
+      return (
+        position === -1 ||
+        `Position ${position} holds undefined, and a list can't keep an empty position: ` +
+          "the values after it would move, or the row couldn't be read"
+      )
+    }),
+  )
+}
+
+/** Whether a substitution of this schema refuses what its tuple positions can't keep. */
+const refusesUndefinedPositions = (
+  schema: Schema.Top,
+  opts: DeepSubstitutionOptions | undefined,
+): boolean =>
+  opts?.enforceChecks === true && opts.absentReads !== "only" && hasUndefinedPosition(schema)
+
 /**
  * Recursively determine whether a schema contains — at any depth reachable
  * through nested `Schema.Struct` / `Schema.Class` / `Schema.Array` — a leaf that
@@ -1522,6 +1639,10 @@ const needsBigIntLift = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
  */
 const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOptions): boolean => {
   if (schema == null || (schema as { readonly ast?: unknown }).ast == null) return false
+  if (opts?.undefinedPositionsOnly) return holdsUndefinedPosition(schema)
+  if (opts?.absentReads === "only") return holdsAbsentRead(schema)
+  if (opts?.absentReads && holdsAbsentRead(schema)) return true
+  if (opts?.enforceChecks && hasUndefinedPosition(schema)) return true
   // `tolerantTransforms` AND `resolveRef` propagate through the recursion;
   // `skipTopLevel` names top-level fields only, so it is dropped below.
   //
@@ -1548,6 +1669,7 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   // case: after a mutation the field may hold either form (#116).
   if (opts?.tolerantTransforms && isLeafEncodingTransform(schema)) return true
   if (needsLegacyRead(schema, opts) || needsBigIntLift(schema, opts)) return true
+  if (opts?.listedSets && isSetDeclaration(schema.ast)) return true
   const container = walkedContainer(schema)
   if (container !== undefined) {
     return container.children.some((child, index) =>
@@ -1570,6 +1692,23 @@ const needsDeepSubstitution = (schema: Schema.Top, opts?: DeepSubstitutionOption
   }
   return false
 }
+
+/** A set, or the list an aggregate's plain state holds it as. See `listedSets`. */
+const acceptingListedSet = (set: Schema.Top): Schema.Top =>
+  Schema.Union([
+    set,
+    Schema.Array(Schema.make((set.ast as SchemaAST.Declaration).typeParameters[0]!)).pipe(
+      Schema.decodeTo(
+        set as Schema.Codec<unknown, unknown>,
+        {
+          decode: SchemaGetter.transform(
+            (list: unknown) => new Set(list as ReadonlyArray<unknown>),
+          ),
+          encode: SchemaGetter.transform((held: unknown) => [...(held as ReadonlySet<unknown>)]),
+        } as never,
+      ),
+    ),
+  ])
 
 /**
  * Recursively substitute self-date and `RedactedFromValue` leaves wherever they
@@ -1616,7 +1755,12 @@ export const substituteSchemaDeep = (
   // field beneath it and keep the step, so a missing key still defaults (#133).
   const defaulted = decodingDefaultField(schema)
   if (defaulted !== undefined) {
-    return defaulted.rewrap(substituteSchemaDeep(defaulted.inner, opts))
+    const beneath = substituteSchemaDeep(defaulted.inner, opts)
+    return defaulted.rewrap(
+      refusesUndefinedPositions(defaulted.inner, opts)
+        ? refusingUndefinedPositions(beneath)
+        : beneath,
+    )
   }
 
   // Leaf: self-date schema → tolerant bidirectional date transform.
@@ -1648,6 +1792,7 @@ export const substituteSchemaDeep = (
   // the plain-bigint lift (#133).
   if (needsLegacyRead(schema, opts)) return buildLegacyReadTransform(schema)
   if (needsBigIntLift(schema, opts)) return buildBigIntLift(schema)
+  if (opts?.listedSets && isSetDeclaration(schema.ast)) return acceptingListedSet(schema)
 
   // Union / Record / Tuple / *WithRest: substitute every child and rebuild the
   // same container kind, metadata included (#133). Without `tolerantTransforms`
@@ -1659,13 +1804,35 @@ export const substituteSchemaDeep = (
     const children = container.children.map((child, index) => {
       const childOpts = childOptions(container, deeper, index, opts)
       return {
+        child,
+        childOpts,
         substituted: substituteSchemaDeep(child, childOpts),
-        first: container.isUnion && isCanonicalDateMember(child, childOpts),
+        first:
+          container.isUnion &&
+          opts?.absentReads !== "only" &&
+          isCanonicalDateMember(child, childOpts),
       }
     })
+    const ordered = [...children.filter((c) => c.first), ...children.filter((c) => !c.first)]
+    const lenient = opts?.absentReads ? ordered.filter((c) => holdsAbsentRead(c.child)) : []
+    if (!container.isUnion || lenient.length === 0) {
+      const rebuilt = container.rebuild(ordered.map((c) => c.substituted))
+      return refusesUndefinedPositions(schema, opts) ? refusingUndefinedPositions(rebuilt) : rebuilt
+    }
+    // A member reading an absent attribute as a value accepts more than it
+    // declares, enough to claim a row of a later member. So every member gets
+    // its try as declared first, and only a row none of them takes reads absent.
+    // A `oneOf` union refuses a value two members accept: it stays as declared.
+    const declared = (c: (typeof ordered)[number]) =>
+      opts?.absentReads === "only"
+        ? c.child
+        : substituteSchemaDeep(c.child, { ...c.childOpts, absentReads: undefined })
+    if ((schema.ast as SchemaAST.Union).options?.mode === "oneOf") {
+      return container.rebuild(ordered.map((c) => declared(c)))
+    }
     return container.rebuild([
-      ...children.filter((c) => c.first).map((c) => c.substituted),
-      ...children.filter((c) => !c.first).map((c) => c.substituted),
+      ...ordered.map((c) => (lenient.includes(c) ? declared(c) : c.substituted)),
+      ...lenient.map((c) => c.substituted),
     ])
   }
 
@@ -1698,7 +1865,8 @@ export const substituteSchemaDeep = (
         const sub = substituteSchemaDeep(refTarget, atField(deeper, opts, name))
         subFields[name] = fieldOpt ? fieldOpt.rewrap(sub) : sub
       } else {
-        subFields[name] = substituteSchemaDeep(field, atField(deeper, opts, name))
+        const sub = substituteSchemaDeep(field, atField(deeper, opts, name))
+        subFields[name] = opts?.absentReads ? readingAbsent(sub) : sub
       }
     }
     const plainStruct = Schema.Struct(subFields as Schema.Struct.Fields) as unknown as Schema.Top
@@ -1729,6 +1897,27 @@ export const substituteSchemaDeep = (
 
   return schema
 }
+
+/**
+ * A schema the library stores but doesn't derive (an event, a snapshot state, an
+ * outbox effect), reading an absent attribute as the value it stands for
+ * (`absentReading`) and otherwise exactly as declared. Unchanged when no field
+ * of it does.
+ *
+ * @internal
+ */
+export const readingAbsentValues = (schema: Schema.Top): Schema.Top =>
+  substituteSchemaDeep(schema, { absentReads: "only", enforceChecks: true })
+
+/**
+ * A schema the library stores but doesn't derive, refusing a tuple position holding
+ * `undefined` that a stored list can't keep, and otherwise exactly as declared.
+ * Unchanged when no tuple of it can hold one.
+ *
+ * @internal
+ */
+export const writingTuplePositions = (schema: Schema.Top): Schema.Top =>
+  substituteSchemaDeep(schema, { undefinedPositionsOnly: true, enforceChecks: true })
 
 /**
  * Substitute model fields with bidirectional transforms where needed:
@@ -1763,12 +1952,15 @@ export const substituteSchemas = (
     readonly legacyReads?: boolean | undefined
     /** Build WRITE schemas: see `DeepSubstitutionOptions.enforceChecks`. */
     readonly enforceChecks?: boolean | undefined
+    /** Build READ schemas: see `DeepSubstitutionOptions.absentReads`. */
+    readonly absentReads?: boolean | undefined
   },
 ): SchemaFields => {
   const out: SchemaFields = {}
   const deep: DeepSubstitutionOptions = {
     ...(options?.legacyReads ? { legacyReads: true } : {}),
     ...(options?.enforceChecks ? { enforceChecks: true } : {}),
+    ...(options?.absentReads ? { absentReads: true } : {}),
   }
   for (const [name, schema] of Object.entries(modelFields)) {
     // 1. Self-date substitution. Pattern A: user declared `Schema.DateTimeUtc`
@@ -1814,6 +2006,9 @@ export const substituteSchemas = (
       path: [name],
       ...(unionOverride === undefined ? {} : { unionDateOverride: unionOverride }),
     })
+  }
+  if (options?.absentReads) {
+    for (const [name, field] of Object.entries(out)) out[name] = readingAbsent(field)
   }
   return out
 }
@@ -1994,10 +2189,14 @@ export const buildDerivedSchemas = (
   // the substitution rebuilds; the READ schemas below do not (#133).
   const fields = substituteSchemas(modelFields, fieldEncodings, { enforceChecks: true })
   // READ schemas (model / record / item / deleted / history decode) also take
-  // the domain-form values earlier releases left on transform fields (#133).
+  // the domain-form values earlier releases left on transform fields (#133),
+  // and read an absent attribute as the value it stands for (`absentReading`).
   // Their encode is the strict one, and keys are composed from `inputSchema`,
   // so neither writes nor keys see a difference.
-  const readFields = substituteSchemas(modelFields, fieldEncodings, { legacyReads: true })
+  const readFields = substituteSchemas(modelFields, fieldEncodings, {
+    legacyReads: true,
+    absentReads: true,
+  })
 
   // Ref fields carry the `DynamoModel.ref` annotation (an opaque Declaration that
   // hides the target's fields), so `substituteSchemaDeep` above can't see into
@@ -2012,7 +2211,10 @@ export const buildDerivedSchemas = (
       ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
       : targetModel
     fields[ref.fieldName] = substituteSchemaDeep(resolved, { enforceChecks: true })
-    readFields[ref.fieldName] = substituteSchemaDeep(resolved, { legacyReads: true })
+    readFields[ref.fieldName] = substituteSchemaDeep(resolved, {
+      legacyReads: true,
+      absentReads: true,
+    })
   }
 
   // --- Model Schema: pure model fields (decode of stored items in "model" mode) ---
@@ -2115,13 +2317,16 @@ export const buildDerivedSchemas = (
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
   // --- Update Schema: optional model fields minus key composites & immutable ---
-  // Each field is wrapped in `Schema.optional` so the key may be omitted
-  // entirely (the structural composer treats absent keys as absent for GSI
-  // composition under v3's two-way classification). The field's value type
-  // matches the model declaration exactly — there is no `null` widening,
-  // because EDD-9025 prevents composites from declaring `null` and the
-  // standard update payload follows the same shape. If the model declares a
-  // non-composite attribute as `Schema.NullOr(X)`, `set({ attr: null })`
+  // The key may always be omitted (the structural composer treats absent keys
+  // as absent for GSI composition under v3's two-way classification). Whether
+  // its value may be `undefined` follows the row: `undefined` clears the field,
+  // so a field a row can lack takes `Schema.optional` and one it can't takes
+  // `Schema.optionalKey`, as do ref ids. A library-generated value (a colliding
+  // `updatedAt`) stays `Schema.optional`: `undefined` there means generate it.
+  // The field's value type matches the model declaration exactly — there is
+  // no `null` widening, because EDD-9025 prevents composites from declaring
+  // `null` and the standard update payload follows the same shape. If the model
+  // declares a non-composite attribute as `Schema.NullOr(X)`, `set({ attr: null })`
   // still typechecks; the v1.6 `NullishOr` wrap that allowed null on
   // arbitrary fields (regardless of model declaration) is removed.
   const buildUpdateFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
@@ -2131,12 +2336,15 @@ export const buildDerivedSchemas = (
       if (immutableFields.has(key)) continue
       if (refFieldSet.has(key)) continue
       if (strippedFromUpdate.has(key)) continue
-      acc[key] = Schema.optional(field as Schema.Top)
+      const clearable = optionalOnCollide.has(key) || rowCanLack(field as Schema.Top)
+      acc[key] = clearable
+        ? Schema.optional(field as Schema.Top)
+        : Schema.optionalKey(field as Schema.Top)
     }
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optional(ref.identifierSchema as Schema.Top)
+      acc[ref.idFieldName] = Schema.optionalKey(ref.identifierSchema as Schema.Top)
     }
     return acc
   }

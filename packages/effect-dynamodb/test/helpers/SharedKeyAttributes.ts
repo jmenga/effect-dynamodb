@@ -6,10 +6,12 @@
  */
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Schema } from "effect"
 import { expect } from "vitest"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
+import { toAttributeMap } from "../../src/Marshaller.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 
@@ -333,6 +335,26 @@ const WRITE_PATHS: ReadonlyArray<{
   },
 ]
 
+/** What `.set({ attribute: undefined })` under `preserve` left before 1.40: the key, not the value. */
+const clearedByAnEarlierRelease = (
+  world: { readonly MainTable: any; readonly Rows: any },
+  attribute: string,
+) =>
+  Effect.gen(function* () {
+    const client = yield* DynamoClient
+    const table: { readonly name: string } = yield* world.MainTable.Tag
+    const primary = world.Rows.indexes.primary
+    yield* client.updateItem({
+      TableName: table.name,
+      Key: toAttributeMap({
+        pk: KeyComposer.composePk(schema, "Row", primary, key),
+        sk: KeyComposer.composeSk(schema, "Row", 1, primary, key),
+      }),
+      UpdateExpression: "REMOVE #a",
+      ExpressionAttributeNames: { "#a": attribute },
+    })
+  })
+
 export const keptEntryScenarios: ReadonlyArray<{
   readonly name: string
   readonly run: (h: Harness) => Effect.Effect<void, unknown>
@@ -353,15 +375,22 @@ export const keptEntryScenarios: ReadonlyArray<{
           expect(yield* found("old")).toBe(0)
           expect(yield* found("new")).toBe(1)
 
-          // Clearing keeps it, and so does whatever comes after.
-          yield* update({ group: undefined })
+          // A row whose composite an earlier release cleared under `preserve` kept its
+          // entry. It keeps it through whatever comes after.
+          yield* clearedByAnEarlierRelease(world, "note")
           expect(yield* found("new")).toBe(1)
-          yield* update({ note: undefined })
-          expect(yield* found("new")).toBe(1)
-          expect((yield* db.entities.Rows.get(key).asEffect()).note).toBeUndefined()
           yield* update({ extra: "x" })
           expect(yield* found("new")).toBe(1)
           expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ extra: "x" })
+          expect((yield* db.entities.Rows.get(key).asEffect()).note).toBeUndefined()
+
+          // Clearing it now is removing it, under `preserve` too: the entry goes, and
+          // what the index shares with the table stays.
+          yield* update({ note: undefined })
+          expect(yield* found("new")).toBe(0)
+          yield* update({ extra: "y" })
+          expect(yield* found("new")).toBe(0)
+          expect(yield* db.entities.Rows.get(key).asEffect()).toMatchObject({ extra: "y" })
         }),
       )
     },

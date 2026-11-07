@@ -2004,3 +2004,131 @@ describe("assertCollectionShardsAgreement", () => {
     ).toThrow("[EDD-9103]")
   })
 })
+
+describe("an appendInput that can't compose a sharded index's key (EDD-9113)", () => {
+  class Reading extends Schema.Class<Reading>("Reading9113")({
+    id: Schema.String,
+    at: Schema.Number,
+    tenant: Schema.String,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+    site: Schema.optional(Schema.String),
+  }) {}
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const index = (
+    policy: "sparse" | "preserve",
+    sk: ReadonlyArray<string>,
+    by: ReadonlyArray<string>,
+  ) =>
+    ({
+      byTenant: {
+        name: "gsi",
+        indexPolicy: { pk: policy, sk: policy },
+        pk: { field: "gpk", composite: ["tenant"] },
+        sk: { field: "gsk", composite: sk },
+        shards: { count: 4, by },
+      },
+    }) as const
+  const make = (indexes: unknown, appendInput: Record<string, Schema.Top>) =>
+    Entity.make({
+      model: Reading,
+      entityType: "Reading",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({ id: Schema.String, at: Schema.Number, ...appendInput }),
+      },
+    } as never)
+
+  it("carrying `by` without the composite before it, under preserve", () => {
+    expect(() =>
+      make(index("preserve", ["region", "group"], ["group"]), {
+        tenant: Schema.String,
+        group: Schema.String,
+      }),
+    ).toThrow(
+      '[EDD-9113] Entity "Reading": timeSeries.appendInput carries "group", which index "byTenant" is sharded by, but not "region".',
+    )
+  })
+
+  it("the message says what to do, and what would have happened", () => {
+    expect(() =>
+      make(index("preserve", ["region", "group"], ["group"]), {
+        tenant: Schema.String,
+        group: Schema.String,
+      }),
+    ).toThrow(
+      /would fail with EDD-9100.*Add "region" to appendInput, or take the sharded attribute out/,
+    )
+  })
+
+  it("the partition key's composite missing is the same failure", () => {
+    expect(() => make(index("sparse", ["group"], ["group"]), { group: Schema.String })).toThrow(
+      /\[EDD-9113\].*but not "tenant"/,
+    )
+  })
+
+  it("the whole key carried is fine", () => {
+    expect(() =>
+      make(index("preserve", ["region", "group"], ["group"]), {
+        tenant: Schema.String,
+        region: Schema.String,
+        group: Schema.String,
+      }),
+    ).not.toThrow()
+  })
+
+  it("an optional composite in appendInput counts as carried: it's a row's value, on the row", () => {
+    expect(() =>
+      make(index("preserve", ["region", "group"], ["group"]), {
+        tenant: Schema.String,
+        region: Schema.optional(Schema.String),
+        group: Schema.String,
+      }),
+    ).not.toThrow()
+  })
+
+  it("not carrying `by` leaves the index alone", () => {
+    expect(() =>
+      make(index("preserve", ["region", "group"], ["group"]), { tenant: Schema.String }),
+    ).not.toThrow()
+  })
+
+  it("under sparse, a sort key hole takes the row out of the index: nothing to refuse", () => {
+    expect(() =>
+      make(index("sparse", ["region", "group"], ["group"]), {
+        tenant: Schema.String,
+        group: Schema.String,
+      }),
+    ).not.toThrow()
+  })
+
+  it("a gap after `by` is a truncated key, not a hole", () => {
+    expect(() =>
+      make(index("preserve", ["group", "site"], ["group"]), {
+        tenant: Schema.String,
+        group: Schema.String,
+      }),
+    ).not.toThrow()
+  })
+
+  it("an unsharded index isn't this rule's business", () => {
+    expect(() =>
+      make(
+        {
+          byTenant: {
+            name: "gsi",
+            indexPolicy: { pk: "preserve", sk: "preserve" },
+            pk: { field: "gpk", composite: ["tenant"] },
+            sk: { field: "gsk", composite: ["region", "group"] },
+          },
+        },
+        { tenant: Schema.String, group: Schema.String },
+      ),
+    ).not.toThrow()
+  })
+})

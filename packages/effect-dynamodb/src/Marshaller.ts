@@ -11,18 +11,180 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
 import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
+import { Data } from "effect"
+
+const MARSHALL_OPTIONS = { removeUndefinedValues: true, convertClassInstanceToMap: true } as const
+
+/** A set DynamoDB can't store: nothing in it, once `undefined` values are removed. */
+export const isEmptySet = (value: unknown): boolean =>
+  value instanceof Set && [...value].every((element) => element === undefined)
+
+/** `undefined` or an empty set: stored as an absent attribute. */
+export const hasNoStoredForm = (value: unknown): boolean => value === undefined || isEmptySet(value)
+
+const renderPath = (
+  path: ReadonlyArray<string | number>,
+  fieldOf: (attribute: string) => string = (attribute) => attribute,
+): string =>
+  path.reduce<string>(
+    (text, segment, index) =>
+      typeof segment === "number"
+        ? `${text}[${segment}]`
+        : index === 0
+          ? fieldOf(segment)
+          : `${text}.${segment}`,
+    "",
+  )
+
+/**
+ * A value DynamoDB can't store, and where it is. Marshalling throws this, as key
+ * composition throws `KeyValueError`; what reaches it is the caller's value, so a
+ * write path turns it into a `ValidationError` (`marshalOrFail`).
+ */
+export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
+  readonly path: ReadonlyArray<string | number>
+  readonly reason: string
+}> {
+  override get message(): string {
+    return this.describe()
+  }
+
+  /** The refusal in words, naming a stored attribute by what `fieldOf` makes of it. */
+  describe(fieldOf?: (attribute: string) => string): string {
+    return this.path.length === 0
+      ? this.reason
+      : `"${renderPath(this.path, fieldOf)}": ${this.reason}`
+  }
+}
+
+export const isUnstorableValue = (value: unknown): value is UnstorableValue =>
+  value instanceof UnstorableValue
+
+/**
+ * The value without the empty sets in its maps, the same reference when it has
+ * none. A list keeps its elements: leaving one out would move those after it, so
+ * marshalling refuses an empty set there.
+ */
+const withoutEmptySets = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null) return value
+  if (Array.isArray(value)) {
+    const elements = value.map((element) => withoutEmptySets(element))
+    return elements.some((element, index) => element !== value[index]) ? elements : value
+  }
+  if (value instanceof Map) {
+    const entries = [...value].filter(([, entry]) => !isEmptySet(entry))
+    const next = entries.map(([key, entry]) => [key, withoutEmptySets(entry)] as const)
+    const same =
+      entries.length === value.size && next.every(([key, entry]) => entry === value.get(key))
+    return same ? value : new Map(next)
+  }
+  const entries = Object.entries(value)
+  const next = entries
+    .filter(([, entry]) => !isEmptySet(entry))
+    .map(([key, entry]) => [key, withoutEmptySets(entry)] as const)
+  const same =
+    next.length === entries.length &&
+    next.every(([key, entry]) => entry === (value as Record<string, unknown>)[key])
+  return same ? value : Object.fromEntries(next)
+}
+
+/** Whether marshalling refuses a value. */
+const isRefused = (value: unknown): boolean => {
+  try {
+    marshall({ v: value }, MARSHALL_OPTIONS)
+    return false
+  } catch {
+    return true
+  }
+}
+
+const partsOf = (value: unknown): ReadonlyArray<readonly [string | number, unknown]> => {
+  if (Array.isArray(value)) return value.map((element, index) => [index, element] as const)
+  if (value instanceof Map) return [...value]
+  if (typeof value !== "object" || value === null) return []
+  return Object.entries(value)
+}
+
+/**
+ * The deepest part of a value marshalling refuses, as the error saying so. Marshalling
+ * walks in this order and stops at the first it refuses, so `reason` is that part's.
+ */
+const unstorableAt = (
+  value: unknown,
+  path: ReadonlyArray<string | number>,
+  reason: string,
+): UnstorableValue => {
+  for (const [key, part] of partsOf(value)) {
+    if (isRefused(part)) return unstorableAt(part, [...path, key], reason)
+  }
+  return new UnstorableValue({
+    path,
+    reason: isEmptySet(value) ? NO_EMPTY_SET : reason,
+  })
+}
+
+const NO_EMPTY_SET =
+  "DynamoDB has no empty set, and a list element can't be left out without moving those after it."
+
+/**
+ * DynamoDB can't store an empty set, so one is an absent attribute. Marshalling
+ * refuses it, and only then are the item's empty sets looked for: an item without
+ * any costs nothing and marshals exactly as it did. Whatever is still refused has
+ * no attribute to leave out, and throws {@link UnstorableValue}.
+ */
+const marshallStorable = (item: Record<string, unknown>): Record<string, AttributeValue> => {
+  try {
+    return marshall(item, MARSHALL_OPTIONS)
+  } catch {
+    const storable = withoutEmptySets(item) as Record<string, unknown>
+    try {
+      return marshall(storable, MARSHALL_OPTIONS)
+    } catch (cause) {
+      throw unstorableAt(storable, [], cause instanceof Error ? cause.message : String(cause))
+    }
+  }
+}
+
+/**
+ * What in these attributes DynamoDB can't store, or `undefined`, for a path that
+ * has to know before it reads or sends anything. An attribute holding an empty set
+ * is left out, as when it's written.
+ */
+export const unstorableIn = (attributes: Record<string, unknown>): UnstorableValue | undefined => {
+  try {
+    marshallStorable(attributes)
+    return undefined
+  } catch (error) {
+    if (isUnstorableValue(error)) return error
+    throw error
+  }
+}
 
 /** Marshall a JS object to a DynamoDB attribute map */
 export const toAttributeMap = (item: Record<string, unknown>): Record<string, AttributeValue> =>
-  marshall(item, { removeUndefinedValues: true, convertClassInstanceToMap: true })
+  marshallStorable(item)
 
 /** Unmarshall a DynamoDB attribute map to a JS object */
 export const fromAttributeMap = (item: Record<string, AttributeValue>): Record<string, unknown> =>
   unmarshall(item)
 
-/** Marshall a single value to a DynamoDB attribute value */
-export const toAttributeValue = (value: unknown): AttributeValue =>
-  marshall({ v: value }, { removeUndefinedValues: true, convertClassInstanceToMap: true }).v!
+/**
+ * Marshall a single value to a DynamoDB attribute value. An empty set directly
+ * here is refused, as marshalling refuses it: a caller holding a value to send has
+ * no attribute to leave out, and has to decide what no value means. A refusal names
+ * the value's `name`, when it has one.
+ */
+export const toAttributeValue = (value: unknown, name?: string): AttributeValue => {
+  const at = name === undefined ? [] : [name]
+  if (isEmptySet(value))
+    throw new UnstorableValue({ path: at, reason: "DynamoDB has no empty set." })
+  try {
+    return marshallStorable({ v: value }).v!
+  } catch (error) {
+    if (!isUnstorableValue(error)) throw error
+    throw new UnstorableValue({ path: [...at, ...error.path.slice(1)], reason: error.reason })
+  }
+}
 
 /** Unmarshall a single DynamoDB attribute value */
 export const fromAttributeValue = (value: AttributeValue): unknown => unmarshall({ v: value }).v

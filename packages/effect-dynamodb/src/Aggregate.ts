@@ -85,7 +85,7 @@ import { asReadGuard } from "./internal/ExpressionLimits.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
-import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
+import { generateTimestampPrimitive, marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
   diagnosedValidationError,
@@ -1260,13 +1260,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
   //   - update re-decodes the mutated state, which carries domain `DateTime`
   //     values → accepted as-is (a strict `*FromString` decoder would reject
   //     them). It is decode-only, so making transforms tolerant is safe — the
-  //     stored wire format is still produced by the attribute encoders.
+  //     stored wire format is still produced by the attribute encoders;
+  //   - an absent attribute reads as the value it stands for: `undefined`, or an
+  //     empty set, neither of which DynamoDB can store (`absentReading`).
   // Nested edge / ref classes round-trip with their class instance identity
   // preserved (Option A). Returns the raw `schema` unchanged when it carries no
   // such leaf at all (zero overhead).
   const decodeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
     resolveRef,
+    absentReads: true,
   }) as unknown as Schema.Codec<any>
   // The same schema for WRITES — `create` input and `update`'s mutated state —
   // with the container `.check()` refinements the substitution rebuilds kept, so
@@ -1276,6 +1279,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
     tolerantTransforms: true,
     resolveRef,
     enforceChecks: true,
+  }) as unknown as Schema.Codec<any>
+
+  // `update`'s mutated state: the plain state a mutation is handed holds a set as a list
+  // (`Schema.toIso`), and it can hand that straight back.
+  const mutatedStateSchema = substituteSchemaDeep(schema, {
+    tolerantTransforms: true,
+    resolveRef,
+    enforceChecks: true,
+    listedSets: true,
   }) as unknown as Schema.Codec<any>
 
   // Validate the collection index against the table's primary key. Best effort: a
@@ -1653,7 +1665,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       //    for every date field (root + nested edges, Pattern A and Pattern B),
       //    so update no longer trips the "Expected string, got DateTime" decode
       //    that a strict `*FromString` schema would raise (#72 update path).
-      const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(updated).pipe(
+      const decoded = yield* Schema.decodeUnknownEffect(mutatedStateSchema)(updated).pipe(
         Effect.mapError(
           (cause) =>
             new ValidationError({
@@ -1734,18 +1746,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
       // Packed AFTER the group diff above compared the decomposed values, so
       // an unchanged packed value is never rewritten (#147).
-      const newDynamo = buildDynamoItems(
-        yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
-        config,
-        pkValue,
-        KeyComposer.extractKeyComposites(
-          config.schema,
-          {},
-          config.collection.sk?.composite ?? [],
-          keyRecord(assembledNew),
+      const newPacked = yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update")
+      const newDynamo = yield* marshalOrFail(aggregateName, "update", () =>
+        buildDynamoItems(
+          newPacked,
+          config,
+          pkValue,
+          KeyComposer.extractKeyComposites(
+            config.schema,
+            {},
+            config.collection.sk?.composite ?? [],
+            keyRecord(assembledNew),
+          ),
+          keyRecord,
+          stampFor(now, existingCreated),
         ),
-        keyRecord,
-        stampFor(now, existingCreated),
       )
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
@@ -2183,6 +2198,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * or be on its way to it (a run cut short moves the root last), in any order the scan met them,
    * and a dry run decides the same. Its values don't say whose it is unless the aggregate's context
    * holds them, so with no root at all there's no aggregate to move it with, and it's reported.
+   *
+   * A run that hasn't read the whole table can't say there's no root: a root at its old key, on a
+   * page this run didn't read, names this partition only when the scan reaches it. So it reports
+   * the row as unjudged, and a run over the whole table judges it.
    */
   const rekeyFinish = (
     ctx: Rekey.RekeyRowContext,
@@ -2200,7 +2219,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         })
         if (Item !== undefined) left++
       }
-      return left > 0 ? { skipped: { unrecognizedKey: left } } : {}
+      if (left === 0) return {}
+      return { skipped: ctx.sawWholeTable() ? { unrecognizedKey: left } : { rootNotSeen: left } }
     })
 
   const rekeyRow = (
@@ -2415,13 +2435,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // 6. Build DynamoDB items with composed keys (create only ever PUTs).
           //    Every row is new, so `created` has nothing to carry forward.
           const now = yield* DateTime.now
-          const dynamoGroups = buildDynamoItems(
-            yield* packAggregateGroups(groups, packedByType, aggregateName, "create"),
-            config,
-            pkValue,
-            collectionSkComposites,
-            keyRecord,
-            stampFor(now, EMPTY_CREATED),
+          const packedGroups = yield* packAggregateGroups(
+            groups,
+            packedByType,
+            aggregateName,
+            "create",
+          )
+          const dynamoGroups = yield* marshalOrFail(aggregateName, "create", () =>
+            buildDynamoItems(
+              packedGroups,
+              config,
+              pkValue,
+              collectionSkComposites,
+              keyRecord,
+              stampFor(now, EMPTY_CREATED),
+            ),
           )
 
           // 7. Write via sub-aggregate transactions. The root item goes first in
@@ -2733,6 +2761,16 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
     return a.every((item, i) => deepEqual(item, b[i]))
   }
   if (Array.isArray(a) || Array.isArray(b)) return false
+  // A set has no own keys: compared below, any two would be equal, and a change to one
+  // would never be written. Members are strings, numbers or binary values, by identity.
+  if (a instanceof Set || b instanceof Set) {
+    return (
+      a instanceof Set &&
+      b instanceof Set &&
+      a.size === b.size &&
+      [...a].every((member) => b.has(member))
+    )
+  }
 
   const aObj = a as Record<string, unknown>
   const bObj = b as Record<string, unknown>

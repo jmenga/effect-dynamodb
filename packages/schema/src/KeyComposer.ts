@@ -120,8 +120,9 @@ export type KeyValue = string | Uint8Array
  * - `"preserve"` — noop (leave the stored key for this half untouched). The
  *   stored value may go stale until either (a) the next write that touches
  *   this half supplies enough composites to recompose, or (b) a composite of
- *   this half is named in `Entity.remove([...])` — the cascade override
- *   then REMOVEs this half's key.
+ *   this half is named in `Entity.remove([...])` (`.set({ f: undefined })`
+ *   reaches this composer as the same thing) — the cascade override then
+ *   REMOVEs this half's key.
  *
  * Halves not declared in `indexPolicy` default to `"preserve"`. See
  * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision rules
@@ -1352,6 +1353,160 @@ const classifyZOrderHalf = (
 }
 
 const hasValue = (value: unknown): boolean => value !== undefined && value !== null
+
+/**
+ * How a stored index key differs from what its row's values compose (`rekey-repair.md`):
+ *
+ * - `missing` — every composite is on the row, and no key.
+ * - `truncated` — every composite is on the row, and the key stops at a leading run of them.
+ * - `lagging` — the key holds anything else: other values, or values the row no longer has.
+ */
+export type IndexKeyDrift = "missing" | "truncated" | "lagging"
+
+/**
+ * What {@link judgeIndexHalf} says of one half of a stored row:
+ *
+ * - `fine` — nothing to do, or nothing can be said.
+ * - `ambiguous` — a `sparse` half with no key and two or more composites outside the primary key
+ *   on the row. A writer naming only a later composite drops the row on purpose (`DESIGN.md` §7),
+ *   and that leaves exactly these bytes, so it can't be told from damage. Reported, never written.
+ * - `set` — the key to write. `remove` — a `sparse` half whose values compose no key, holding one.
+ */
+export type IndexKeyVerdict =
+  | { readonly kind: "fine" }
+  | { readonly kind: "ambiguous" }
+  | { readonly kind: "set"; readonly drift: IndexKeyDrift; readonly value: KeyValue }
+  | { readonly kind: "remove" }
+
+/** What judging a row's index keys needs of its entity. */
+export interface IndexKeyJudging {
+  readonly schema: DynamoSchema.DynamoSchema
+  readonly entityType: string
+  readonly entityVersion: number
+  /** Every text a key can be under, for telling a truncated key from any other. */
+  readonly forms: ReadonlyArray<{
+    readonly pk: DynamoSchema.DynamoSchema
+    readonly sk: DynamoSchema.DynamoSchema
+  }>
+  /** The primary key's composites. */
+  readonly primaryComposites: ReadonlySet<string>
+  /**
+   * Composites the library writes itself (`createdAt`, `updatedAt`, `version`). A `put` composes
+   * keys from its input, before stamping, and an update moves the value and not the key, so a
+   * healthy row's key says nothing about them, and a half holding one is never judged.
+   */
+  readonly stamped: ReadonlySet<string>
+}
+
+const FINE: IndexKeyVerdict = { kind: "fine" }
+
+const sameKeyValue = (a: KeyValue, b: KeyValue): boolean => {
+  if (typeof a === "string" || typeof b === "string") return a === b
+  return a.length === b.length && a.every((byte, i) => byte === b[i])
+}
+
+/** Is `stored` a leading run of `composites`' text, under any form? */
+const isLeadingRun = (
+  judging: IndexKeyJudging,
+  index: IndexDefinition,
+  half: "pk" | "sk",
+  composites: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+  stored: KeyValue,
+): boolean => {
+  if (typeof stored !== "string") return false
+  for (const form of judging.forms) {
+    for (let length = 0; length < composites.length; length++) {
+      try {
+        const text =
+          half === "pk"
+            ? composePkPrefixUpTo(form.pk, judging.entityType, index, record, length)
+            : composeSkPrefixUpTo(
+                form.sk,
+                judging.entityType,
+                judging.entityVersion,
+                index,
+                record,
+                length,
+              )
+        if (text === stored) return true
+      } catch {
+        // No text under this form: `NaN` under `escapeKeys: true`.
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * Judge one half of a stored row's index against what its values compose, for `rekey`'s report and
+ * `repairIndexKeys` (`rekey-repair.md`). Reads nothing and writes nothing. `stored` is what the
+ * half's attribute holds as read; `record` is the row's key form.
+ *
+ * A half with every composite on the row should hold what a `put` of them writes: the same
+ * composers, so a Z-order half is all or nothing and compares bytes, and a value within one
+ * quantization level is no difference. A half with one missing is the update path's business: under
+ * `preserve` it's left whatever it holds, which is what the policy promises; under `sparse` it holds
+ * what the structural rule composes (a trailing composite absent is a truncation, shape 3), or
+ * nothing. A half with no key whose index a `put` wouldn't have written whole has nothing missing.
+ *
+ * Not judged, so `fine`: a half holding a library-stamped composite; values that compose no key
+ * (`NaN`, a Z-order value a dimension can't place, a shard it can't compute), which a `put` refuses
+ * too; and a sharded partition key that's stored, since `rekey` already rewrites or reports those.
+ */
+export const judgeIndexHalf = (
+  judging: IndexKeyJudging,
+  index: IndexDefinition,
+  half: "pk" | "sk",
+  stored: KeyValue | undefined,
+  record: Record<string, unknown>,
+): IndexKeyVerdict => {
+  const { schema, entityType, entityVersion, primaryComposites, stamped } = judging
+  const composites = half === "pk" ? index.pk.composite : index.sk.composite
+  if (composites.some((attr) => stamped.has(attr))) return FINE
+  if (half === "pk" && index.shards !== undefined && stored !== undefined) return FINE
+  const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
+  const policy = resolveIndexPolicy(index.indexPolicy)[half]
+  try {
+    if (composites.every((attr) => hasValue(record[attr]))) {
+      const full =
+        half === "pk"
+          ? composePk(schema, entityType, index, record)
+          : composeSkValue(schema, entityType, entityVersion, index, record)
+      if (stored !== undefined) {
+        if (sameKeyValue(stored, full)) return FINE
+        return {
+          kind: "set",
+          drift: isLeadingRun(judging, index, half, composites, record, stored)
+            ? "truncated"
+            : "lagging",
+          value: full,
+        }
+      }
+      // `put` writes an index whole or not at all.
+      const wholeIndex = [...index.pk.composite, ...index.sk.composite, ...shardSource].every(
+        (attr) => hasValue(record[attr]) && !stamped.has(attr),
+      )
+      if (!wholeIndex) return FINE
+      const outsidePrimary = new Set(composites.filter((attr) => !primaryComposites.has(attr)))
+      if (policy === "sparse" && outsidePrimary.size >= 2) return { kind: "ambiguous" }
+      return { kind: "set", drift: "missing", value: full }
+    }
+    if (policy === "preserve" || stored === undefined) return FINE
+    if (half === "sk" && isZOrderHalf(index.sk)) return { kind: "remove" }
+    const outcome = classifyHalf(composites, record, "sparse", false)
+    if (outcome.kind !== "set") return { kind: "remove" }
+    const truncated =
+      half === "pk"
+        ? composePkPrefixUpTo(schema, entityType, index, record, outcome.length)
+        : composeSkPrefixUpTo(schema, entityType, entityVersion, index, record, outcome.length)
+    return sameKeyValue(stored, truncated)
+      ? FINE
+      : { kind: "set", drift: "lagging", value: truncated }
+  } catch {
+    return FINE
+  }
+}
 
 /**
  * The per-half gate's question for a half with composites: does this writer name
