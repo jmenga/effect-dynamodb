@@ -89,7 +89,7 @@ import { asReadGuard } from "./internal/ExpressionLimits.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
-import { notReadBack } from "./internal/RoundTrip.js"
+import { notReadBack, notStoredForm } from "./internal/RoundTrip.js"
 import { generateTimestampPrimitive, marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
@@ -227,7 +227,7 @@ interface ResolvedNode {
    * sub-aggregate's own schema. Undefined for the root, whose attributes are
    * encoded directly by `decomposeAggregate`.
    */
-  readonly attrEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  readonly attrEncoders?: AttrEncoders | undefined
   /**
    * `many` edges only: the encoders whose output the edge's sort-key composites
    * are read from. These are the pre-#133 encoders, kept separate from
@@ -841,7 +841,13 @@ const isMixedDateUnion = (ast: Schema.Top["ast"]): boolean => {
 /** Resolves a ref field (by schema identity) to the model it should be read as. */
 type RefResolver = (name: string, field: Schema.Top) => Schema.Top | undefined
 
-type AttrEncoders = Record<string, (value: unknown) => unknown>
+/**
+ * A field's attribute encoder. A value it can't put in its stored form is stored as given, and
+ * `asGiven` is told, so that the write can refuse it when it wouldn't read back (`EDD-9127`).
+ */
+type AttrEncoder = (value: unknown, asGiven?: () => void) => unknown
+
+type AttrEncoders = Record<string, AttrEncoder>
 
 /**
  * The date branch shared by both encoder builders: an explicit
@@ -879,24 +885,17 @@ const dateAttrEncoder = (
 /**
  * The field's own encode, with `decode -> encode` as the fallback so a caller
  * who already supplied wire form round-trips to itself (the same strategy
- * `Entity.put` uses). Neither working means the value is neither Type nor
- * Encoded for this field; it is stored unchanged rather than introducing a
- * write-time failure mode — that shape is already unreadable, and the tolerant
- * read path reports it.
+ * `Entity.put` uses). `None` when neither works: the value is neither Type nor
+ * Encoded for this field, and what's stored is the caller's to decide.
  */
-const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) => {
+const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => Option.Option<unknown>) => {
   const codec = fieldSchema as unknown as Schema.Codec<any>
   const encode = Schema.encodeUnknownOption(codec)
   const decode = Schema.decodeUnknownOption(codec)
   return (value) => {
     const direct = encode(value)
-    if (Option.isSome(direct)) return direct.value
-    const decoded = decode(value)
-    if (Option.isSome(decoded)) {
-      const reencoded = encode(decoded.value)
-      if (Option.isSome(reencoded)) return reencoded.value
-    }
-    return value
+    if (Option.isSome(direct)) return direct
+    return Option.flatMap(decode(value), encode)
   }
 }
 
@@ -922,7 +921,11 @@ const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) 
  *    `tolerantTransforms`, with the aggregate's ref resolver), so the stored
  *    form is exactly what assembly reads back — nested date leaves included —
  *    and a `DynamoModel.ref`-annotated field is encoded through the ref
- *    target's model. The field's own encode is the fallback.
+ *    target's model. The field's own encode is the fallback. A value none of
+ *    them takes is stored as given, and reported through `asGiven`: the write
+ *    then stores it only if its rows read back (`refuseNotReadBack`,
+ *    `EDD-9127`). A schema that can't encode a value it decodes to, such as a
+ *    transformation over itself, gets here with every value a caller holds.
  *
  *    Gating on the TOP-LEVEL node instead (as before #133) skipped every
  *    container, because an `Arrays` / `Objects` node carries no encoding of its
@@ -979,10 +982,14 @@ const buildAttrEncoders = (
     // is the first's; this only keeps such a value from being marshalled as it is.
     const encodeAsRead = encoderOver({ decodeOnly: true })
     const own = ownAttrEncoder(fieldSchema)
-    encoders[field] = (value) =>
+    encoders[field] = (value, asGiven) =>
       encodeSubstituted(value).pipe(
         Option.orElse(() => encodeAsRead(value)),
-        Option.getOrElse(() => own(value)),
+        Option.orElse(() => own(value)),
+        Option.getOrElse(() => {
+          asGiven?.()
+          return value
+        }),
       )
   }
   return encoders
@@ -1019,7 +1026,11 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
           return value
         }
       }
-    } else if (hasEncodingTransformation(fieldSchema)) encoders[field] = ownAttrEncoder(fieldSchema)
+    } else if (hasEncodingTransformation(fieldSchema)) {
+      // A key composed from a value no encoder takes is composed from the value as it is.
+      const own = ownAttrEncoder(fieldSchema)
+      encoders[field] = (value) => Option.getOrElse(own(value), () => value)
+    }
   }
   return encoders
 }
@@ -1205,16 +1216,21 @@ const collectRefTargets = (
  * Apply a node's attribute encoders in place — puts each attribute into its
  * stored form before the decomposed item is marshalled (#72, #133: without
  * this, a `DateTime` marshals to a `{ epochMilliseconds, … }` map that the
- * read path cannot decode as the wire form).
+ * read path cannot decode as the wire form). Returns the fields stored as
+ * given (see {@link AttrEncoder}).
  */
 const applyNodeAttrEncoders = (
   attrs: Record<string, unknown>,
-  encoders: Record<string, (value: unknown) => unknown> | undefined,
-): void => {
-  if (!encoders) return
+  encoders: AttrEncoders | undefined,
+): ReadonlyArray<string> => {
+  const asGiven: Array<string> = []
+  if (!encoders) return asGiven
   for (const [field, encode] of Object.entries(encoders)) {
-    if (field in attrs && attrs[field] != null) attrs[field] = encode(attrs[field])
+    if (field in attrs && attrs[field] != null) {
+      attrs[field] = encode(attrs[field], () => asGiven.push(field))
+    }
   }
+  return asGiven
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,16 +1631,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const holdsCustom = holdsCustomDeclaration(schema.ast)
 
   /**
-   * Refuses the rows of a write that wouldn't read back, for an aggregate holding a custom declaration
-   * (`EDD-9126`): the rows it's about to write, through the read path a `get` takes. An aggregate with
-   * none has nothing to do here.
+   * Refuses the rows of a write that wouldn't read back: the rows it's about to write, through the read
+   * path a `get` takes. Only two kinds of write pay for it: one of an aggregate holding a custom
+   * declaration (`EDD-9126`), and one that stored a value as given, which no encoder of its field
+   * takes (`asGiven`, `EDD-9127`). Every other write has nothing to do here.
    */
   const refuseNotReadBack = (
     groups: ReadonlyArray<{ readonly items: ReadonlyArray<Record<string, AttributeValue>> }>,
     key: Record<string, unknown>,
     operation: string,
+    asGiven: ReadonlyArray<string>,
   ): Effect.Effect<void, ValidationError> =>
-    !holdsCustom
+    !holdsCustom && asGiven.length === 0
       ? Effect.void
       : Effect.gen(function* () {
           const rows = groups.flatMap((group) =>
@@ -1645,7 +1663,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 new ValidationError({
                   entityType: aggregateName,
                   operation,
-                  cause: notReadBack("The aggregate", (error as ValidationError).cause ?? error),
+                  cause:
+                    asGiven.length > 0
+                      ? notStoredForm(asGiven, (error as ValidationError).cause ?? error)
+                      : notReadBack("The aggregate", (error as ValidationError).cause ?? error),
                 }),
             ),
           )
@@ -1903,7 +1924,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           stampFor(now, existingCreated, undefined, updatedBefore),
         ),
       )
-      yield* refuseNotReadBack(newDynamo, key, "aggregate.update")
+      yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
       const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
@@ -2602,7 +2623,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
               stampFor(now, EMPTY_CREATED),
             ),
           )
-          yield* refuseNotReadBack(dynamoGroups, assembled, "aggregate.create")
+          yield* refuseNotReadBack(
+            dynamoGroups,
+            assembled,
+            "aggregate.create",
+            storedAsGivenIn(groups),
+          )
 
           // 6. Write via sub-aggregate transactions. The root item goes first in
           //    the first transaction, guarded by `attribute_not_exists` (#134):
@@ -3919,6 +3945,8 @@ interface DecomposedItem {
   readonly member: string
   /** What the row does with each timestamp. */
   readonly rowStamps: RowStamps | undefined
+  /** The fields stored as given, which no encoder of theirs takes (see {@link AttrEncoder}). */
+  readonly storedAsGiven: ReadonlyArray<string>
 }
 
 /** A group of items to write in a single transaction */
@@ -3926,6 +3954,17 @@ interface TransactionGroup {
   readonly name: string
   readonly items: ReadonlyArray<DecomposedItem>
 }
+
+/** Each field a decomposition stored as given, once, as `"field" of "member"` (`EDD-9127`). */
+const storedAsGivenIn = (groups: ReadonlyArray<TransactionGroup>): ReadonlyArray<string> => [
+  ...new Set(
+    groups.flatMap((group) =>
+      group.items.flatMap((item) =>
+        item.storedAsGiven.map((field) => `"${field}" of "${item.member}"`),
+      ),
+    ),
+  ),
+]
 
 /**
  * A node's two encoder sets: `stored` puts every attribute into its stored
@@ -3956,9 +3995,14 @@ const decomposeAggregate = (
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
-    const encodeWith = (set: AttrEncoders, field: string, value: unknown): unknown => {
+    const encodeWith = (
+      set: AttrEncoders,
+      field: string,
+      value: unknown,
+      asGiven?: () => void,
+    ): unknown => {
       const encode = set[field]
-      return encode && value != null ? encode(value) : value
+      return encode && value != null ? encode(value, asGiven) : value
     }
 
     // Extract context values from the root, encoded for DynamoDB storage.
@@ -3975,9 +4019,11 @@ const decomposeAggregate = (
     const edgeFieldNames = new Set(rootNode.children.map((c) => c.fieldName).filter(Boolean))
     const rootAttrs: Record<string, unknown> = {}
     const rootKeyAttrs: Record<string, unknown> = {}
+    // A context field is a root field, so this names it too.
+    const rootAsGiven: Array<string> = []
     for (const [key, value] of Object.entries(assembled)) {
       if (edgeFieldNames.has(key)) continue
-      rootAttrs[key] = encodeWith(encoders.stored, key, value)
+      rootAttrs[key] = encodeWith(encoders.stored, key, value, () => rootAsGiven.push(key))
       rootKeyAttrs[key] = encodeWith(encoders.key, key, value)
     }
 
@@ -3990,6 +4036,7 @@ const decomposeAggregate = (
       skCompositesOther: () => [],
       member: rootNode.entityType,
       rowStamps: rootNode.rowStamps,
+      storedAsGiven: rootAsGiven,
     })
 
     // Decompose each edge
@@ -4147,7 +4194,7 @@ const decomposeNode = (
       }
 
       // Serialize this node's own date fields to their wire primitive (#72).
-      applyNodeAttrEncoders(subRootAttrs, node.attrEncoders)
+      const storedAsGiven = applyNodeAttrEncoders(subRootAttrs, node.attrEncoders)
 
       // Inject context and discriminator
       mergeContextValues(subRootAttrs, contextValues.stored)
@@ -4165,6 +4212,7 @@ const decomposeNode = (
         skCompositesOther: discValues.other,
         member: node.fieldName ?? node.entityType,
         rowStamps: node.rowStamps,
+        storedAsGiven,
       })
 
       // Decompose children within this sub-aggregate
@@ -4185,7 +4233,7 @@ const decomposeNode = (
       // Simple one-to-one edge (no children)
       const attrs = { ...(value as Record<string, unknown>) }
       // Serialize this edge entity's own date fields to their wire primitive (#72).
-      applyNodeAttrEncoders(attrs, node.attrEncoders)
+      const storedAsGiven = applyNodeAttrEncoders(attrs, node.attrEncoders)
       mergeContextValues(attrs, contextValues.stored)
       if (node.discriminator) {
         for (const [k, v] of Object.entries(node.discriminator)) {
@@ -4204,6 +4252,7 @@ const decomposeNode = (
         skCompositesOther: () => [...parentDiscriminators.other(), ...own.other()],
         member: node.fieldName ?? node.entityType,
         rowStamps: node.rowStamps,
+        storedAsGiven,
       })
     } else {
       // Many edge
@@ -4227,7 +4276,7 @@ const decomposeNode = (
         // The element's attributes in their STORED form — every nested date,
         // transformed scalar and hydrated ref encoded (#72, #133).
         const attrs = { ...(elem as Record<string, unknown>) }
-        applyNodeAttrEncoders(attrs, node.attrEncoders)
+        const storedAsGiven = applyNodeAttrEncoders(attrs, node.attrEncoders)
         withContext(attrs, contextValues.stored)
 
         // The sort key is read from the element as the pre-#133 encoders left
@@ -4254,6 +4303,7 @@ const decomposeNode = (
           ],
           member: node.fieldName ?? node.entityType,
           rowStamps: node.rowStamps,
+          storedAsGiven,
         })
       }
     }

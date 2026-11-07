@@ -43,6 +43,17 @@ export const readBackOf = (stored: Schema.Top, read: () => Schema.Top): ReadBack
 const issueOf = (issue: unknown): string =>
   Cause.isCause(issue) ? Cause.pretty(issue) : String((issue as Error)?.message ?? issue)
 
+/**
+ * The refusal of an aggregate write's value its field's schema can't put in its stored form (`EDD-9127`):
+ * stored as given, the rows wouldn't read back. `fields` names each such field as `"field" of "member"`,
+ * and `issue` is what the read made of the rows.
+ */
+export const notStoredForm = (fields: ReadonlyArray<string>, issue: unknown): string =>
+  `${fields.length === 1 ? "Field" : "Fields"} ${fields.join(", ")} can't be put in the stored form: ` +
+  "the schema can't encode the value, nor decode it and encode the result. Stored as given, the " +
+  `aggregate wouldn't read back: ${issueOf(issue)}. Nothing was written. A transformation that ` +
+  "encodes what it decodes to reads back. [EDD-9127]"
+
 /** The refusal in words: `what` is what the value is, and `issue` what a read made of it. */
 export const notReadBack = (what: string, issue: unknown): string =>
   `${what} wouldn't read back: a custom declaration's value is stored as the map the marshaller ` +
