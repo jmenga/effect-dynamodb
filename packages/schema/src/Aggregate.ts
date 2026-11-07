@@ -20,16 +20,24 @@ import type { Schema } from "effect"
 import type * as DynamoSchemaModule from "./DynamoSchema.js"
 import type { DiscriminatorConfig } from "./internal/AggregateCursor.js"
 import type { AggregateEdge } from "./internal/AggregateEdges.js"
-import { deriveAggregateSchemas } from "./internal/AggregateSchemas.js"
+import {
+  deriveAggregateSchemas,
+  getSchemaFields,
+  refuseAggregateKeyOverMovingValue,
+  refuseManySortKeysOverMovingValue,
+  unwrapModel,
+} from "./internal/AggregateSchemas.js"
 import type {
   AggregateEdgesConfig,
   AggregateEdgesGuard,
   AggregateInputType,
+  AggregateStampNames,
   BoundSubAggregate,
   SubAggregate,
 } from "./internal/AggregateTypes.js"
 import type { TimestampsConfig } from "./internal/EntityConfig.js"
 import type { ModelFieldName } from "./internal/EntityTypes.js"
+import { refuseReadonlyMaps } from "./internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "./internal/SharedKeyAttribute.js"
 
 export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
@@ -211,12 +219,22 @@ export function make<
   TSchema extends Schema.Top,
   const TEdges extends AggregateEdgesConfig<TSchema>,
   const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
+  const TTimestamps extends TimestampsConfig | undefined = undefined,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK> & {
     readonly edges: AggregateEdgesGuard<TSchema, TEdges>
+    readonly timestamps?: TTimestamps
   },
-): AggregateDefinition<TSchema, AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>>
+): AggregateDefinition<
+  TSchema,
+  AggregateInputType<
+    Schema.Schema.Type<TSchema>,
+    TEdges,
+    TPK,
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
+  >
+>
 export function make<
   TSchema extends Schema.Top,
   const TEdges extends AggregateEdgesConfig<TSchema>,
@@ -236,6 +254,7 @@ export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
 ): SubAggregate<TSchema> | AggregateDefinition<TSchema> {
+  refuseReadonlyMaps(`Aggregate "${config.root.entityType}"`, unwrapModel(schema))
   if (!("table" in config) || config.table === undefined) {
     return makeSubAggregate(schema, config as SubAggregateConfig)
   }
@@ -279,7 +298,24 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
           ]),
     ],
   )
-  const derivedSchemas = deriveAggregateSchemas(schema, config.edges, config.pk.composite)
+  refuseAggregateKeyOverMovingValue(
+    config.root.entityType,
+    config.timestamps,
+    getSchemaFields(schema),
+    config.pk.composite,
+  )
+  refuseManySortKeysOverMovingValue(
+    config.root.entityType,
+    config.timestamps,
+    getSchemaFields(schema),
+    config.edges,
+  )
+  const derivedSchemas = deriveAggregateSchemas(
+    schema,
+    config.edges,
+    config.pk.composite,
+    config.timestamps,
+  )
 
   return {
     [TypeId]: TypeId,

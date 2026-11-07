@@ -238,12 +238,21 @@ describe("what the flag changes", () => {
     expect(sk(on)).not.toBe(sk(flagOff))
   })
 
-  it("off, a number the numeric text refuses composes as 1.36 did; on it's refused", () => {
+  it("NaN has no key under either setting; only the text 1.36 stored still composes it", () => {
     const record = { tenant: Number.NaN, label: "x" }
-    expect(KeyComposer.composePk(flagOff, "E", index, record)).toBe(
+    expect(() => KeyComposer.composePk(flagOff, "E", index, record)).toThrow("[EDD-9096]")
+    expect(() => KeyComposer.composePk(on, "E", index, record)).toThrow("[EDD-9096]")
+    expect(KeyComposer.composePk(KeyText136.schema136(flagOff), "E", index, record)).toBe(
       "$app#v1#e#tenant_0000000000000nan",
     )
-    expect(() => KeyComposer.composePk(on, "E", index, record)).toThrow("[EDD-9096]")
+  })
+
+  it("off, ±Infinity and a bigint past the numeric text's limit keep 1.36's text", () => {
+    const text = (value: unknown) => KeyComposer.compositeText(flagOff, value)
+    expect(text(Number.POSITIVE_INFINITY)).toBe("00000000Infinity")
+    expect(text(Number.NEGATIVE_INFINITY)).toBe("0000000-Infinity")
+    expect(text(10n ** 1000n)).toBe(String(10n ** 1000n))
+    expect(() => KeyComposer.compositeText(on, 10n ** 1000n)).toThrow("[EDD-9096]")
   })
 
   it("keeps the shard marker before every value, and the shard the value hashes to", () => {

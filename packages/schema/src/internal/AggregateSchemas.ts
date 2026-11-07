@@ -4,15 +4,167 @@
  * Extracted from Aggregate.ts for decomposition. Not part of the public API.
  */
 
-import { Schema } from "effect"
+import { Schema, SchemaAST } from "effect"
 import { ConfiguredModelTag } from "../DynamoModel.js"
 import type { AggregateEdge, ManyEdge, RefEntity } from "./AggregateEdges.js"
-import type { AggregateInputType, BoundSubAggregate } from "./AggregateTypes.js"
+import type {
+  AggregateInputType,
+  AggregateStampNames,
+  BoundSubAggregate,
+} from "./AggregateTypes.js"
+import type { TimestampsConfig } from "./EntityConfig.js"
+import { optionalField, type ResolvedSystemFields, resolveSystemFields } from "./EntitySchemas.js"
 import {
   extractArrayElement as extractArrayElementImpl,
+  extractKeyedValue,
   getSchemaFields as getSchemaFieldsImpl,
   isFieldOptional as isFieldOptionalImpl,
 } from "./SchemaAccessors.js"
+
+// ---------------------------------------------------------------------------
+// Timestamps
+// ---------------------------------------------------------------------------
+
+/**
+ * `timestamps` resolved over a value's fields, by the entity's rules: `Schema.optional` wraps the
+ * value that's read, a date is the library's, and any other field of that name is the caller's.
+ */
+export const resolveAggregateStamps = (
+  timestamps: TimestampsConfig | undefined,
+  fields: Record<string, Schema.Top> | undefined,
+  owner: string,
+): ResolvedSystemFields =>
+  resolveSystemFields(
+    timestamps,
+    undefined,
+    undefined,
+    Object.fromEntries(
+      Object.entries(fields ?? {}).map(([name, field]) => [
+        name,
+        optionalField(field)?.inner ?? field,
+      ]),
+    ),
+    {},
+    owner,
+  )
+
+/**
+ * `[EDD-9121]`: a partition key the library would move on every write. An aggregate's rows all live
+ * under its partition key and a write only ever `Put`s rows under it, so the key would stop matching
+ * the value at the first update, and nothing could find the aggregate by what it holds.
+ */
+export const refuseAggregateKeyOverMovingValue = (
+  aggregate: string,
+  timestamps: TimestampsConfig | undefined,
+  fields: Record<string, Schema.Top> | undefined,
+  composite: ReadonlyArray<string>,
+): void => {
+  const { updatedAt } = resolveAggregateStamps(timestamps, fields, `Aggregate "${aggregate}"`)
+  if (updatedAt !== null && composite.includes(updatedAt)) {
+    throw new Error(
+      `[EDD-9121] Aggregate "${aggregate}": its partition key can't be composed from ` +
+        `"${updatedAt}". The library changes it on every write and a partition key never changes, ` +
+        `so the key would stop matching the value at the first update. Remove it from the ` +
+        `partition key, or use a field the library doesn't manage.`,
+    )
+  }
+}
+
+/**
+ * The fields of a `many` edge's ELEMENT, read off the parent model's field: the array's element
+ * (`players: Schema.Array(PlayerSheet)` → `PlayerSheet`'s), or a keyed collection's value, the
+ * elements of a custom `decompose` over it. `undefined` when the field says nothing about what its
+ * `decompose` returns, or the element exposes no fields (a scalar, or an opaque ref).
+ */
+export const manyElementFields = (
+  parentFields: Record<string, Schema.Top> | undefined,
+  edgeName: string,
+): Record<string, Schema.Top> | undefined => {
+  const field = parentFields?.[edgeName]
+  if (field === undefined) return undefined
+  const element = extractArrayElement(field) ?? extractKeyedValue(field)
+  return element === undefined ? undefined : getSchemaFields(element)
+}
+
+/**
+ * `[EDD-9121]`: a `many` edge's sort key the library would move on every write, on the root's edges
+ * and those of the sub-aggregates under it. Whose `updatedAt` it is, is the row's: a field of that
+ * name of another type is the caller's, and a root's turns the stamp off on every row.
+ */
+export const refuseManySortKeysOverMovingValue = (
+  aggregate: string,
+  timestamps: TimestampsConfig | undefined,
+  rootFields: Record<string, Schema.Top> | undefined,
+  rootEdges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+): void => {
+  const owner = `Aggregate "${aggregate}"`
+  if (resolveAggregateStamps(timestamps, rootFields, owner).updatedAt === null) return
+  const walk = (
+    fields: Record<string, Schema.Top> | undefined,
+    edges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+  ): void => {
+    for (const [name, edge] of Object.entries(edges)) {
+      if (!("_tag" in edge)) continue
+      if (edge._tag === "BoundSubAggregate") {
+        const sub = (edge as BoundSubAggregate<any>).aggregate
+        walk(getSchemaFields(sub.schema), sub.edges)
+      } else if (edge._tag === "ManyEdge") {
+        const entity = (edge as ManyEdge).entity
+        const element =
+          manyElementFields(fields, name) ??
+          (entity === undefined ? undefined : getSchemaFields(unwrapModel(entity.model)))
+        const { updatedAt } = resolveAggregateStamps(timestamps, element, owner)
+        if (updatedAt !== null && (edge as ManyEdge).sk?.composite.includes(updatedAt) === true) {
+          throw new Error(
+            `[EDD-9121] Aggregate "${aggregate}": edge "${name}"'s sort key can't be composed ` +
+              `from "${updatedAt}". The library changes it on every write and a sort key never ` +
+              `changes, so the key would stop matching the value at the first update.`,
+          )
+        }
+      }
+    }
+  }
+  walk(rootFields, rootEdges)
+}
+
+/** The dates the rows of a value with `fields` declare, of those `timestamps` stamps. */
+const managedDates = (
+  stamps: AggregateStamps,
+  fields: Record<string, Schema.Top>,
+): ReadonlySet<string> => {
+  const own = resolveAggregateStamps(stamps.config, fields, "Aggregate")
+  return new Set(
+    [own.createdAtCollision ? own.createdAt : null, own.updatedAtCollision ? own.updatedAt : null]
+      .filter((name): name is string => name !== null)
+      .filter((name) => stamps.names.has(name)),
+  )
+}
+
+/** `timestamps`, and the names it stamps on this aggregate's rows. */
+interface AggregateStamps {
+  readonly config: TimestampsConfig | undefined
+  readonly names: ReadonlySet<string>
+}
+
+/** A managed date's input field: optional, supplied or not. */
+const stampInput = (field: Schema.Top): Schema.Top =>
+  Schema.optionalKey((optionalField(field)?.inner ?? field) as Schema.Top) as unknown as Schema.Top
+
+/** A row's value on the input: as the model has it, but for the dates the library stamps. */
+const rowInput = (schema: Schema.Top, stamps: AggregateStamps): Schema.Top => {
+  const fields = getSchemaFields(schema)
+  if (fields === undefined) return schema
+  const managed = managedDates(stamps, fields)
+  if (managed.size === 0) return schema
+  return Schema.Struct(
+    Object.fromEntries(
+      Object.entries(fields).map(([name, field]) => [
+        name,
+        managed.has(name) ? stampInput(field) : field,
+      ]),
+    ) as any,
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Input schema derivation
@@ -22,10 +174,12 @@ import {
  * Derive an input schema from an aggregate definition.
  *
  * Edge-driven: walks edges to determine field transformations.
- * - OneEdge / RefEdge fields → `${field}Id: Schema.String`
+ * - RefEdge, and OneEdge with an entity, fields → `${field}Id: Schema.String`: `create` fetches it
+ * - OneEdge without one → the value itself, which is all `create` can take
  * - Sub-aggregate edges are recursed
  * - Many-edge array elements are recursed for ref replacement
  * - PK composite fields are omitted (auto-generated)
+ * - A date `timestamps` stamps is optional, at any level
  * - `Schema.toCodecJson` is applied at the end so Date fields accept ISO strings
  */
 /**
@@ -47,20 +201,41 @@ export const deriveAggregateSchemas = <
   TSchema extends Schema.Top,
   const TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
   const TPK extends ReadonlyArray<string>,
+  const TTimestamps extends TimestampsConfig | undefined = undefined,
 >(
   schema: TSchema,
   edges: TEdges,
   pkComposites: TPK,
-): DerivedAggregateSchemas<AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>> => {
-  type Result = DerivedAggregateSchemas<
-    AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>
+  timestamps?: TTimestamps,
+): DerivedAggregateSchemas<
+  AggregateInputType<
+    Schema.Schema.Type<TSchema>,
+    TEdges,
+    TPK,
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
   >
+> => {
+  const own = resolveAggregateStamps(timestamps, getSchemaFields(schema), "Aggregate")
+  return deriveWithStamps(schema, edges, pkComposites, {
+    config: timestamps,
+    names: new Set([own.createdAt, own.updatedAt].filter((name) => name !== null)),
+  }) as never
+}
+
+const deriveWithStamps = (
+  schema: Schema.Top,
+  edges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+  pkComposites: ReadonlyArray<string>,
+  stamps: AggregateStamps,
+): DerivedAggregateSchemas<unknown> => {
+  type Result = DerivedAggregateSchemas<unknown>
   const fields = getSchemaFields(schema)
   if (!fields) {
     return { inputSchema: schema, createSchema: schema, updateSchema: schema } as unknown as Result
   }
 
   const omit = new Set(pkComposites)
+  const managed = managedDates(stamps, fields)
   const newFields: Record<string, unknown> = {}
 
   for (const [name, fieldSchema] of Object.entries(fields)) {
@@ -70,32 +245,34 @@ export const deriveAggregateSchemas = <
     if (edge && "_tag" in edge) {
       const isOpt = isFieldOptional(fieldSchema)
 
-      if (edge._tag === "RefEdge" || edge._tag === "OneEdge") {
-        // RefEdge / OneEdge → ${name}Id: Schema.String
+      if (edge._tag === "OneEdge" && edge.entity === undefined) {
+        const value = rowInput(optionalField(fieldSchema)?.inner ?? fieldSchema, stamps)
+        newFields[name] = isOpt ? Schema.optionalKey(value) : value
+      } else if (edge._tag === "RefEdge" || edge._tag === "OneEdge") {
         newFields[`${name}Id`] = isOpt ? Schema.optionalKey(Schema.String) : Schema.String
       } else if (edge._tag === "BoundSubAggregate") {
         const sub = (edge as BoundSubAggregate<any>).aggregate
-        const subSchemas = deriveAggregateSchemas(sub.schema, sub.edges, [])
+        const subSchemas = deriveWithStamps(sub.schema, sub.edges, [], stamps)
         newFields[name] = isOpt
           ? Schema.optionalKey(subSchemas.inputSchema)
           : subSchemas.inputSchema
       } else if (edge._tag === "ManyEdge") {
         const manyEdge = edge as ManyEdge
         const fieldKey = manyEdge.inputField ?? name
-        const elemSchema = deriveElementInputSchema(fieldSchema, manyEdge.entity)
+        const elemSchema = deriveElementInputSchema(fieldSchema, manyEdge.entity, stamps)
         if (elemSchema) {
           newFields[fieldKey] = isOpt
             ? Schema.optionalKey(Schema.Array(elemSchema))
             : Schema.Array(elemSchema)
         } else {
-          newFields[fieldKey] = fieldSchema
+          newFields[fieldKey] = keyedInput(fieldSchema, stamps)
         }
       }
       continue
     }
 
     // Regular field → keep as-is (toCodecJson applied at the end handles Date)
-    newFields[name] = fieldSchema
+    newFields[name] = managed.has(name) ? stampInput(fieldSchema) : fieldSchema
   }
 
   const inputSchema = Schema.toCodecJson(Schema.Struct(newFields as any))
@@ -113,6 +290,18 @@ export const deriveAggregateSchemas = <
   // is a compile-time phantom (`AggregateInputType`) — same approach the
   // top-level `Aggregate.make` overload uses. `createSchema` aliases `inputSchema`.
   return { inputSchema, createSchema: inputSchema, updateSchema } as unknown as Result
+}
+
+/** A `Schema.Record` many edge's input (a custom `decompose`): its values' stamps are optional. */
+const keyedInput = (fieldSchema: Schema.Top, stamps: AggregateStamps): Schema.Top => {
+  const inner = optionalField(fieldSchema)?.inner ?? fieldSchema
+  if (!SchemaAST.isObjects(inner.ast)) return fieldSchema
+  const record = inner as unknown as { readonly key?: Schema.Top; readonly value?: Schema.Top }
+  if (record.key === undefined || record.value === undefined) return fieldSchema
+  const value = rowInput(record.value, stamps)
+  if (value === record.value) return fieldSchema
+  const input = Schema.Record(record.key as never, value)
+  return isFieldOptional(fieldSchema) ? Schema.optionalKey(input) : input
 }
 
 /**
@@ -146,6 +335,7 @@ export const deriveEntityFieldName = (entity: RefEntity): string => {
 export const deriveElementInputSchema = (
   arrayFieldSchema: Schema.Top,
   entity?: RefEntity,
+  stamps?: AggregateStamps,
 ): Schema.Top | undefined => {
   const elemSchema = extractArrayElement(arrayFieldSchema)
   if (!elemSchema) return undefined
@@ -161,25 +351,24 @@ export const deriveElementInputSchema = (
   if (!elemFields) return elemSchema
 
   // Element wraps entity + attributes — find the entity-derived field and transform it
-  if (entity) {
-    const entityFieldName = deriveEntityFieldName(entity)
-    let hasChanges = false
-    const newFields: Record<string, unknown> = {}
-    for (const [name, fSchema] of Object.entries(elemFields)) {
-      if (name === entityFieldName) {
-        // This field references the entity — transform to ${name}Id: Schema.String
-        const isOpt = isFieldOptional(fSchema)
-        newFields[`${name}Id`] = isOpt ? Schema.optionalKey(Schema.String) : Schema.String
-        hasChanges = true
-      } else {
-        newFields[name] = fSchema
-      }
+  const entityFieldName = entity ? deriveEntityFieldName(entity) : undefined
+  const managed = stamps === undefined ? undefined : managedDates(stamps, elemFields)
+  let hasChanges = false
+  const newFields: Record<string, unknown> = {}
+  for (const [name, fSchema] of Object.entries(elemFields)) {
+    if (name === entityFieldName) {
+      // This field references the entity — transform to ${name}Id: Schema.String
+      const isOpt = isFieldOptional(fSchema)
+      newFields[`${name}Id`] = isOpt ? Schema.optionalKey(Schema.String) : Schema.String
+      hasChanges = true
+    } else if (managed?.has(name) === true) {
+      newFields[name] = stampInput(fSchema)
+      hasChanges = true
+    } else {
+      newFields[name] = fSchema
     }
-    if (!hasChanges) return elemSchema
-    return Schema.Struct(newFields as any)
   }
-
-  return elemSchema
+  return hasChanges ? Schema.Struct(newFields as any) : elemSchema
 }
 
 /**

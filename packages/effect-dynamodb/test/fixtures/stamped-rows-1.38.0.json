@@ -1,0 +1,503 @@
+{
+  "generated": "Stored by the published effect-dynamodb@1.38.0 and @effect-dynamodb/schema@1.38.0 (effect@4.1.0), on DynamoDB Local, by the writes each row names; each item as a consistent scan returned it. The entity is test/helpers/RekeyRepair.ts's Stampeds. Do not regenerate from this repo.",
+  "rows": {
+    "bare": {
+      "writes": "put({ id, owner })",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "createdAt": {
+          "S": "2026-11-06T16:54:05.018Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "id": {
+          "S": "bare"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_bare"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.018Z"
+        }
+      }
+    },
+    "open": {
+      "writes": "put({ id, owner, status, region })",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "createdAt": {
+          "S": "2026-11-06T16:54:05.024Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "id": {
+          "S": "open"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_open"
+        },
+        "region": {
+          "S": "r"
+        },
+        "status": {
+          "S": "open"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.024Z"
+        }
+      }
+    },
+    "noted": {
+      "writes": "put({ id, owner, status, region }), then update.set({ note })",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "createdAt": {
+          "S": "2026-11-06T16:54:05.030Z"
+        },
+        "note": {
+          "S": "n"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "gsi7sk": {
+          "S": "$stamped#v1#stamped#id_noted"
+        },
+        "id": {
+          "S": "noted"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_noted"
+        },
+        "region": {
+          "S": "r"
+        },
+        "status": {
+          "S": "open"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.033Z"
+        }
+      }
+    },
+    "shut": {
+      "writes": "put({ id, owner, status, region }), then update.set({ status })",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "gsi3sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "gsi4sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "createdAt": {
+          "S": "2026-11-06T16:54:05.038Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "gsi5sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "gsi6sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "gsi7sk": {
+          "S": "$stamped#v1#stamped#id_shut"
+        },
+        "id": {
+          "S": "shut"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_shut"
+        },
+        "region": {
+          "S": "r"
+        },
+        "status": {
+          "S": "shut"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.040Z"
+        }
+      }
+    },
+    "given": {
+      "writes": "put supplying createdAt and updatedAt",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "gsi1sk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "gsi2sk": {
+          "S": "$stamped#v1#stamped#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi3sk": {
+          "S": "$stamped#v1#stamped#status_open#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi1pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi4sk": {
+          "S": "$stamped#v1#stamped#status_open#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "createdAt": {
+          "S": "2026-01-01T00:00:00.000Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "gsi2pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi5sk": {
+          "S": "$stamped#v1#stamped#status_open#createdat_2026-01-01t00:00:00.000z"
+        },
+        "gsi3pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi6sk": {
+          "S": "$stamped#v1#stamped#status_open#region_r#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi4pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi7sk": {
+          "S": "$stamped#v1#stamped#id_given"
+        },
+        "id": {
+          "S": "given"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_given"
+        },
+        "gsi5pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "region": {
+          "S": "r"
+        },
+        "gsi6pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi7pk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "status": {
+          "S": "open"
+        },
+        "updatedAt": {
+          "S": "2026-01-01T00:00:00.000Z"
+        }
+      }
+    },
+    "givenNoted": {
+      "writes": "put supplying createdAt and updatedAt, then update.set({ note })",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "note": {
+          "S": "n"
+        },
+        "gsi1sk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "gsi2sk": {
+          "S": "$stamped#v1#stamped#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi3sk": {
+          "S": "$stamped#v1#stamped#status_open#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi1pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi4sk": {
+          "S": "$stamped#v1#stamped#status_open#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "createdAt": {
+          "S": "2026-01-01T00:00:00.000Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "gsi2pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi5sk": {
+          "S": "$stamped#v1#stamped#status_open#createdat_2026-01-01t00:00:00.000z"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "gsi3pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi6sk": {
+          "S": "$stamped#v1#stamped#status_open#region_r#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi4pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi7sk": {
+          "S": "$stamped#v1#stamped#id_givennoted"
+        },
+        "gsi5pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "id": {
+          "S": "givenNoted"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_givennoted"
+        },
+        "gsi6pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "region": {
+          "S": "r"
+        },
+        "gsi7pk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "status": {
+          "S": "open"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.054Z"
+        }
+      }
+    },
+    "givenShut": {
+      "writes": "put supplying createdAt and updatedAt, then update.set({ status })",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "gsi1sk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "gsi2sk": {
+          "S": "$stamped#v1#stamped#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi3sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "gsi1pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi4sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "createdAt": {
+          "S": "2026-01-01T00:00:00.000Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "gsi2pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi5sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "gsi3pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi6sk": {
+          "S": "$stamped#v1#stamped#status_shut"
+        },
+        "gsi4pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi7sk": {
+          "S": "$stamped#v1#stamped#id_givenshut"
+        },
+        "gsi5pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "id": {
+          "S": "givenShut"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_givenshut"
+        },
+        "gsi6pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "region": {
+          "S": "r"
+        },
+        "gsi7pk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "status": {
+          "S": "shut"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.061Z"
+        }
+      }
+    },
+    "givenRemoved": {
+      "writes": "put supplying createdAt and updatedAt, then update.remove([\"status\"])",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "gsi1sk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "gsi2sk": {
+          "S": "$stamped#v1#stamped#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi1pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "createdAt": {
+          "S": "2026-01-01T00:00:00.000Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "gsi2pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "gsi3pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi4pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi7sk": {
+          "S": "$stamped#v1#stamped#id_givenremoved"
+        },
+        "gsi5pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "id": {
+          "S": "givenRemoved"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_givenremoved"
+        },
+        "gsi6pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "region": {
+          "S": "r"
+        },
+        "gsi7pk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.067Z"
+        }
+      }
+    },
+    "givenRegion": {
+      "writes": "put supplying createdAt and updatedAt, then update.set({ region })",
+      "item": {
+        "owner": {
+          "S": "o"
+        },
+        "gsi1sk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "gsi2sk": {
+          "S": "$stamped#v1#stamped#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi3sk": {
+          "S": "$stamped#v1#stamped#status_open#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "gsi1pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi4sk": {
+          "S": "$stamped#v1#stamped#status_open#updatedat_2026-01-01t00:00:00.000z"
+        },
+        "createdAt": {
+          "S": "2026-01-01T00:00:00.000Z"
+        },
+        "__edd_e__": {
+          "S": "Stamped"
+        },
+        "gsi2pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi5sk": {
+          "S": "$stamped#v1#stamped#status_open#createdat_2026-01-01t00:00:00.000z"
+        },
+        "sk": {
+          "S": "$stamped#v1#stamped"
+        },
+        "gsi3pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi4pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "gsi7sk": {
+          "S": "$stamped#v1#stamped#id_givenregion"
+        },
+        "gsi5pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "id": {
+          "S": "givenRegion"
+        },
+        "pk": {
+          "S": "$stamped#v1#stamped#id_givenregion"
+        },
+        "gsi6pk": {
+          "S": "$stamped#v1#stamped#owner_o"
+        },
+        "region": {
+          "S": "s"
+        },
+        "gsi7pk": {
+          "S": "$stamped#v1#stamped#createdat_2026-01-01t00:00:00.000z"
+        },
+        "status": {
+          "S": "open"
+        },
+        "updatedAt": {
+          "S": "2026-11-06T16:54:05.074Z"
+        }
+      }
+    }
+  }
+}

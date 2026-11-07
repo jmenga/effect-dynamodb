@@ -92,6 +92,27 @@ export const extractArrayElement = (fieldSchema: Schema.Top): Schema.Top | undef
   return undefined
 }
 
+/**
+ * The value schema of a keyed collection a custom `decompose` takes apart: `Schema.Record(K, T)`,
+ * under `optional` / `optionalKey` too. Returns `T`.
+ */
+export const extractKeyedValue = (fieldSchema: Schema.Top): Schema.Top | undefined => {
+  const keyed = (schema: Schema.Top): Schema.Top | undefined =>
+    getSchemaProp(schema, "key") === undefined ? undefined : getSchemaProp(schema, "value")
+  if (SchemaAST.isOptional(fieldSchema.ast)) {
+    const inner = getSchemaProp(fieldSchema, "schema")
+    if (inner === undefined) return undefined
+    const members = getSchemaMembers(inner)
+    if (members === undefined) return keyed(inner)
+    for (const member of members) {
+      const value = keyed(member)
+      if (value !== undefined) return value
+    }
+    return undefined
+  }
+  return keyed(fieldSchema)
+}
+
 /** Read the typed `.value` element schema off an `Array`/`NonEmptyArray` schema. */
 const arrayValue = (schema: Schema.Top): Schema.Top | undefined => getSchemaProp(schema, "value")
 
@@ -110,7 +131,10 @@ const getSchemaMembers = (schema: Schema.Top): ReadonlyArray<Schema.Top> | undef
  * a function (a `Schema.Class` is its constructor) — both carry `.ast`, so we
  * accept either `typeof`.
  */
-const getSchemaProp = (schema: Schema.Top, prop: "schema" | "value"): Schema.Top | undefined => {
+const getSchemaProp = (
+  schema: Schema.Top,
+  prop: "schema" | "key" | "value",
+): Schema.Top | undefined => {
   const value = (schema as unknown as Record<string, unknown>)[prop]
   if (isSchemaLike(value)) return value
   return undefined
@@ -231,6 +255,7 @@ export const numericTypeWithStringEncoding = (schema: Schema.Top): boolean => {
 
 /** The `representation` id Effect gives `Schema.ReadonlySet`, the one type stored as a set. */
 const READONLY_SET = "effect/schema/ReadonlySet"
+const READONLY_MAP = "effect/schema/ReadonlyMap"
 
 /**
  * What an absent attribute reads back as, on a field whose stored side includes
@@ -243,14 +268,81 @@ export interface AbsentReading {
   readonly value: unknown
 }
 
-/** Whether an AST is a `Schema.ReadonlySet`, by the id Effect gives its representation. */
-export const isSetDeclaration = (ast: SchemaAST.AST): boolean =>
+/** Whether an AST is the declaration Effect represents under this id. */
+const isDeclarationOf = (ast: SchemaAST.AST, id: string): boolean =>
   ast._tag === "Declaration" &&
   (
     (ast.annotations as Record<string, unknown> | undefined)?.representation as
       | { readonly id?: unknown }
       | undefined
-  )?.id === READONLY_SET
+  )?.id === id
+
+/** Whether an AST is a `Schema.ReadonlySet`, by the id Effect gives its representation. */
+export const isSetDeclaration = (ast: SchemaAST.AST): boolean => isDeclarationOf(ast, READONLY_SET)
+
+/**
+ * The path to a `Schema.ReadonlyMap` in this AST, if there's one. A cycle through `Schema.suspend`
+ * ends where it starts, and a path segment says what kind of value it went through.
+ */
+const readonlyMapPath = (
+  ast: SchemaAST.AST,
+  path: string,
+  seen: Set<SchemaAST.AST>,
+): string | undefined => {
+  const firstIn = (asts: ReadonlyArray<SchemaAST.AST>, at: string) => {
+    for (const part of asts) {
+      const found = readonlyMapPath(part, at, seen)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  switch (ast._tag) {
+    case "Declaration":
+      return isDeclarationOf(ast, READONLY_MAP) ? path : firstIn(ast.typeParameters, path)
+    case "Suspend": {
+      if (seen.has(ast)) return undefined
+      seen.add(ast)
+      return readonlyMapPath(ast.thunk(), path, seen)
+    }
+    case "Union":
+      return firstIn(ast.types, path)
+    case "Arrays":
+      return firstIn([...ast.elements, ...ast.rest], `${path}[]`)
+    case "Objects": {
+      for (const property of ast.propertySignatures) {
+        const name = String(property.name)
+        const found = firstIn([property.type], path === "" ? name : `${path}.${name}`)
+        if (found !== undefined) return found
+      }
+      return firstIn(
+        ast.indexSignatures.map((signature) => signature.type),
+        `${path}[key]`,
+      )
+    }
+    default:
+      return undefined
+  }
+}
+
+/**
+ * `[EDD-9125]`: a model whose stored side holds a `Schema.ReadonlyMap`, at any depth. It's stored as
+ * a DynamoDB map, a map reads back as a plain object, and the row no longer decodes, so a definition
+ * holding one can't work and fails at load. The stored side is what's read: a map decoded from a
+ * record, or under `Schema.toCodecJson`, is stored as that and reads back.
+ */
+export const refuseReadonlyMaps = (
+  owner: string,
+  model: Schema.Top,
+  whole: string = "the model",
+): void => {
+  const at = readonlyMapPath(SchemaAST.toEncoded(model.ast), "", new Set())
+  if (at === undefined) return
+  throw new Error(
+    `[EDD-9125] ${owner}: ${at === "" ? whole : `field "${at}"`} is a Schema.ReadonlyMap, ` +
+      "which can't be read back: it's stored as a map, a map reads back as a plain object, and the " +
+      "row no longer decodes. Use Schema.Record, which is stored the same way and reads back.",
+  )
+}
 
 /**
  * The value on a stored side that DynamoDB can't store, if there is one. With

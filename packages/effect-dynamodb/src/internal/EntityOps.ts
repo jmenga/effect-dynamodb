@@ -173,6 +173,12 @@ export interface UpdateState {
    * one as `ConditionalCheckFailed` (its documented contract).
    */
   readonly patch?: boolean | undefined
+  /**
+   * An upsert of an item it has read: the write merges the input over the stored item and composes
+   * every index key from the result. `fill` holds, in wire form, what the upsert sets only where
+   * nothing is stored (an immutable field, `createdAt`).
+   */
+  readonly upsertOver?: { readonly fill: globalThis.Record<string, unknown> } | undefined
 }
 
 /** @internal Path-based SET operation */

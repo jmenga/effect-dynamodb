@@ -22,6 +22,7 @@ import {
   StreamRecordIdentifierMissing,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { refuseReadonlyMaps } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   Duration,
   Effect,
@@ -893,19 +894,26 @@ export const refuseReadModel = (
   }
 }
 
-/** @internal An outbox config, resolved. */
-export const resolveOutbox = (outbox: ProjectionOutboxConfig<any, any, any> | undefined) =>
-  outbox === undefined
-    ? undefined
-    : {
-        schema: outbox.schema,
-        effects: outbox.effects,
-        table: outbox.table,
-        pk: outbox.keys?.pk ?? "pk",
-        sk: outbox.keys?.sk ?? "sk",
-        index: outbox.index,
-        claimFor: Duration.fromInputUnsafe(outbox.claimFor ?? "30 seconds"),
-      }
+/**
+ * @internal An outbox config, resolved. An effect holding a map would be committed with the row, then
+ * fail every drain from the head of the row's queue, so it's refused here with the other stored sides.
+ */
+export const resolveOutbox = (
+  label: string,
+  outbox: ProjectionOutboxConfig<any, any, any> | undefined,
+) => {
+  if (outbox === undefined) return undefined
+  refuseReadonlyMaps(`${label}, outbox schema`, outbox.schema, "the effect")
+  return {
+    schema: outbox.schema,
+    effects: outbox.effects,
+    table: outbox.table,
+    pk: outbox.keys?.pk ?? "pk",
+    sk: outbox.keys?.sk ?? "sk",
+    index: outbox.index,
+    claimFor: Duration.fromInputUnsafe(outbox.claimFor ?? "30 seconds"),
+  }
+}
 
 /**
  * Define a change-feed projection of `stream` into `readModel` — rows keyed by
@@ -1008,7 +1016,7 @@ export const projection = <
                 ? undefined
                 : Duration.fromInputUnsafe(config.removal.ttl),
           },
-    outbox: resolveOutbox(config.outbox),
+    outbox: resolveOutbox(label, config.outbox),
   })
 
   const keyOf = (streamId: Id, event: Ev): Effect.Effect<Option.Option<K>, ValidationError> =>

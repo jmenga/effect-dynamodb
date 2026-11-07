@@ -806,21 +806,19 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     ) as SkRemaining
     const { ops, targetField } = makeSkConditionOps()
     const condition = fn(skAccessor, ops as SkConditionOps<SkRemaining>)
-    const finalCondition = this._config.composeSkCondition
-      ? this._config.composeSkCondition(condition, targetField())
-      : serializeRawCondition(condition)
-    if (finalCondition === undefined) {
-      return new BoundQueryImpl<Model, never, A>(
-        Query.planEmpty(this._query),
-        this._config,
-        "where",
-      )
-    }
-    return new BoundQueryImpl<Model, never, A>(
-      Query.whereUnderPins(this._query, finalCondition),
-      this._config,
-      "where",
+    const query = Query.orRefusal(
+      this._config.operation,
+      () => {
+        const finalCondition = this._config.composeSkCondition
+          ? this._config.composeSkCondition(condition, targetField())
+          : serializeRawCondition(condition)
+        return finalCondition === undefined
+          ? Query.planEmpty(this._query)
+          : Query.whereUnderPins(this._query, finalCondition)
+      },
+      (refusal) => Query.refuse(this._query, refusal),
     )
+    return new BoundQueryImpl<Model, never, A>(query, this._config, "where")
   }
 
   // --- within ---
@@ -828,10 +826,13 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     bounds: Record<string, unknown>,
     options?: WithinOptions,
   ): BoundQueryImpl<Model, never, A> {
-    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._applied !== undefined) {
       refuseWithin(this._applied === "where" ? "within() after .where()" : "a second .within()")
     }
+    if (Query.isRefused(this._query)) {
+      return new BoundQueryImpl<Model, never, A>(this._query, this._config, "within")
+    }
+    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     const maxSkips = options?.maxSkips
     if (maxSkips !== undefined && !(Number.isInteger(maxSkips) && maxSkips >= 0)) {
       throw new Error(
@@ -842,7 +843,11 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     const plan = this._config.planWithin
     if (plan === undefined) refuseWithin("within() on a query without sort key composites to bound")
     return new BoundQueryImpl<Model, never, A>(
-      plan!(this._query, bounds, options),
+      Query.orRefusal(
+        this._config.operation,
+        () => plan!(this._query, bounds, options),
+        (refusal) => Query.refuse(this._query, refusal),
+      ),
       this._config,
       "within",
     )
@@ -850,6 +855,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   // --- zorder ---
   zorder(options: Query.ZOrderOptions): BoundQueryImpl<Model, SkRemaining, A> {
+    if (Query.isRefused(this._query)) return this
     Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._config.zorder !== true) {
       throw new Error(

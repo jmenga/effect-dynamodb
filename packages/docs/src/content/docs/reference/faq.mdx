@@ -156,6 +156,7 @@ const Orders = Entity.make({
   indexes: {
     byCustomer: { name: "gsi1", pk: { field: "gsi1pk", composite: ["customerId"] }, sk: { field: "gsi1sk", composite: ["createdAt"] } },
   },
+  timestamps: true,
 })
 ```
 

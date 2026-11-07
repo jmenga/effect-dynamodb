@@ -571,11 +571,19 @@ export const serializeValue136 = (value: unknown): string =>
     (n) => String(n).padStart(38, "0"),
   )
 
-/** A composite value's serialized text under the schema's setting, before casing and escaping. */
-export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string =>
-  schema.escapeKeys === true || schema.numericKeyText === true
-    ? serializeValue(value)
-    : serializeValue136(value)
+/**
+ * A composite value's serialized text under the schema's setting, before casing and escaping. `NaN`
+ * has no place in key order under any setting: `[EDD-9096]`. With `escapeKeys` off every other value
+ * keeps the text 1.36 gave it, and only {@link DynamoSchema.DynamoSchema.text136} composes 1.36's for
+ * `NaN` too, for `rekey` to find a row stored under it.
+ */
+export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string => {
+  if (schema.escapeKeys === true || schema.numericKeyText === true) return serializeValue(value)
+  if (schema.text136 !== true && typeof value === "number" && Number.isNaN(value)) {
+    return serializeValue(value)
+  }
+  return serializeValue136(value)
+}
 
 /** The highest code point a key composite's text escapes: `%`. */
 const ESCAPED_MAX = 0x25
@@ -1123,6 +1131,31 @@ export const tryComposeIndexKeys = (
 }
 
 /**
+ * The halves of a secondary index `record` holds every value of, for a write that leaves what it
+ * doesn't name as it's stored (an upsert). A half missing a value is left out, never truncated; a
+ * sharded index's partition half also needs what it hashes.
+ */
+export const composeKnownHalves = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): Record<string, KeyValue> => {
+  const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
+  const complete = (composite: ReadonlyArray<string>) =>
+    composite.every((attr) => hasValue(record[attr]))
+  return {
+    ...(complete([...index.pk.composite, ...shardSource])
+      ? { [index.pk.field]: composePk(schema, entityType, index, record) }
+      : {}),
+    ...(complete(index.sk.composite)
+      ? { [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record) }
+      : {}),
+  }
+}
+
+/**
  * Compose keys for all indexes of an entity.
  * Returns a flat record of all key field -> value mappings.
  */
@@ -1391,11 +1424,15 @@ export interface IndexKeyJudging {
   /** The primary key's composites. */
   readonly primaryComposites: ReadonlySet<string>
   /**
-   * Composites the library writes itself (`createdAt`, `updatedAt`, `version`). A `put` composes
-   * keys from its input, before stamping, and an update moves the value and not the key, so a
-   * healthy row's key says nothing about them, and a half holding one is never judged.
+   * Composites the library writes itself (`createdAt`, `updatedAt`, `version`). No writer leaves one
+   * out, so none makes a half with no key ambiguous.
    */
   readonly stamped: ReadonlySet<string>
+  /**
+   * `timestamps.updated`: a key holding it may lag the row's value, and that's no difference
+   * (`DESIGN.md` §7, "Composites the library stamps").
+   */
+  readonly lagTolerated: string | null
 }
 
 const FINE: IndexKeyVerdict = { kind: "fine" }
@@ -1439,6 +1476,42 @@ const isLeadingRun = (
 }
 
 /**
+ * Whether `stored` differs from what `record` composes only in the text of `attr`, the composite
+ * whose key may lag. An update that can't compose a half holding it leaves the key, so this is what
+ * a healthy row looks like, and comparing the whole key would rewrite it on every run after any
+ * write. Everything around the segment has to match exactly, and the segment has to be one segment.
+ * A Z-order address has no segments to read apart, so any address it holds will do.
+ */
+const differsOnlyInLaggingText = (
+  judging: IndexKeyJudging,
+  index: IndexDefinition,
+  half: "pk" | "sk",
+  composites: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+  stored: KeyValue,
+  attr: string,
+): boolean => {
+  if (half === "sk" && isZOrderHalf(index.sk)) return true
+  if (typeof stored !== "string") return false
+  const { schema, entityType, entityVersion } = judging
+  const blank = { ...record, [attr]: "" }
+  const position = composites.indexOf(attr) + 1
+  const head =
+    half === "pk"
+      ? composePkPrefixUpTo(schema, entityType, index, blank, position)
+      : composeSkPrefixUpTo(schema, entityType, entityVersion, index, blank, position)
+  const whole =
+    half === "pk"
+      ? composePk(schema, entityType, index, blank)
+      : composeSkValue(schema, entityType, entityVersion, index, blank)
+  if (typeof whole !== "string") return false
+  const tail = whole.slice(head.length)
+  if (stored.length <= head.length + tail.length) return false
+  if (!stored.startsWith(head) || !stored.endsWith(tail)) return false
+  return !stored.slice(head.length, stored.length - tail.length).includes("#")
+}
+
+/**
  * Judge one half of a stored row's index against what its values compose, for `rekey`'s report and
  * `repairIndexKeys` (`rekey-repair.md`). Reads nothing and writes nothing. `stored` is what the
  * half's attribute holds as read; `record` is the row's key form.
@@ -1450,9 +1523,13 @@ const isLeadingRun = (
  * what the structural rule composes (a trailing composite absent is a truncation, shape 3), or
  * nothing. A half with no key whose index a `put` wouldn't have written whole has nothing missing.
  *
- * Not judged, so `fine`: a half holding a library-stamped composite; values that compose no key
- * (`NaN`, a Z-order value a dimension can't place, a shard it can't compute), which a `put` refuses
- * too; and a sharded partition key that's stored, since `rekey` already rewrites or reports those.
+ * A half holding `updatedAt` is compared without that composite's text, so a key that only lags
+ * stays `fine` and a key that holds anything else is rewritten once, from the row's value, and is
+ * `fine` from then on, whatever later writes do to `updatedAt`.
+ *
+ * Not judged, so `fine`: values that compose no key (`NaN`, a Z-order value a dimension can't place,
+ * a shard it can't compute), which a `put` refuses too; and a sharded partition key that's stored,
+ * since `rekey` already rewrites or reports those.
  */
 export const judgeIndexHalf = (
   judging: IndexKeyJudging,
@@ -1461,9 +1538,8 @@ export const judgeIndexHalf = (
   stored: KeyValue | undefined,
   record: Record<string, unknown>,
 ): IndexKeyVerdict => {
-  const { schema, entityType, entityVersion, primaryComposites, stamped } = judging
+  const { schema, entityType, entityVersion, primaryComposites, stamped, lagTolerated } = judging
   const composites = half === "pk" ? index.pk.composite : index.sk.composite
-  if (composites.some((attr) => stamped.has(attr))) return FINE
   if (half === "pk" && index.shards !== undefined && stored !== undefined) return FINE
   const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
   const policy = resolveIndexPolicy(index.indexPolicy)[half]
@@ -1475,6 +1551,13 @@ export const judgeIndexHalf = (
           : composeSkValue(schema, entityType, entityVersion, index, record)
       if (stored !== undefined) {
         if (sameKeyValue(stored, full)) return FINE
+        if (
+          lagTolerated !== null &&
+          composites.includes(lagTolerated) &&
+          differsOnlyInLaggingText(judging, index, half, composites, record, stored, lagTolerated)
+        ) {
+          return FINE
+        }
         return {
           kind: "set",
           drift: isLeadingRun(judging, index, half, composites, record, stored)
@@ -1485,10 +1568,12 @@ export const judgeIndexHalf = (
       }
       // `put` writes an index whole or not at all.
       const wholeIndex = [...index.pk.composite, ...index.sk.composite, ...shardSource].every(
-        (attr) => hasValue(record[attr]) && !stamped.has(attr),
+        (attr) => hasValue(record[attr]),
       )
       if (!wholeIndex) return FINE
-      const outsidePrimary = new Set(composites.filter((attr) => !primaryComposites.has(attr)))
+      const outsidePrimary = new Set(
+        composites.filter((attr) => !primaryComposites.has(attr) && !stamped.has(attr)),
+      )
       if (policy === "sparse" && outsidePrimary.size >= 2) return { kind: "ambiguous" }
       return { kind: "set", drift: "missing", value: full }
     }
@@ -1520,6 +1605,27 @@ const writerLeavesHalf = (
 ): boolean =>
   composites.every((attr) => !(attr in updatePayload)) &&
   composites.some((attr) => !hasValue(keyRecord[attr]))
+
+/**
+ * Whether a write leaves a half holding a value it stamps itself (`DESIGN.md` §7, "Composites the
+ * library stamps"). Every update stamps it, so the stamp says nothing about who owns the half, and
+ * asking the skip-predicate would make every unrelated update "touch" it: under `sparse` that drops
+ * the row, the bug #183 stopped. Only the half's other composites count. All of them known: the
+ * half moves with the write. One unknown: the key lags until a write can compose it, under either
+ * policy. A composite the writer explicitly clears isn't left: that's the structural rule's.
+ */
+const writerLeavesStampedHalf = (
+  composites: ReadonlyArray<string>,
+  stamped: Record<string, unknown>,
+  updatePayload: Record<string, unknown>,
+  keyRecord: Record<string, unknown>,
+): boolean => {
+  const others = composites.filter((attr) => !(attr in stamped))
+  return (
+    others.some((attr) => !hasValue(updatePayload[attr]) && !hasValue(keyRecord[attr])) &&
+    others.every((attr) => !(attr in updatePayload) || hasValue(updatePayload[attr]))
+  )
+}
 
 /**
  * The PK half's outcome on a sharded index, from what {@link classifyHalf} says
@@ -1690,11 +1796,21 @@ export const composeGsiKeysForUpdatePolicyAware = (
      * write (see `docs/designs/gsi-write-sharding.md` §5).
      */
     readonly onMissingShardSource?: "fail" | "keep"
+    /**
+     * What this write stamps, in key form: `timestamps.updated` and, on a `retain` entity, the
+     * version. A half holding one follows {@link writerLeavesStampedHalf}, not the skip-predicate.
+     */
+    readonly stamped?: Record<string, unknown>
   },
 ): GsiUpdateResult => {
   const sets: Record<string, KeyValue> = {}
   const removes: Array<string> = []
   const removedSet = options?.removedSet
+  const stamped = options?.stamped
+  const leavesHalf = (composites: ReadonlyArray<string>): boolean =>
+    stamped !== undefined && composites.some((attr) => attr in stamped)
+      ? writerLeavesStampedHalf(composites, stamped, updatePayload, keyRecord)
+      : writerLeavesHalf(composites, updatePayload, keyRecord)
 
   for (const [indexName, index] of Object.entries(indexes)) {
     if (indexName === "primary") continue
@@ -1739,15 +1855,12 @@ export const composeGsiKeysForUpdatePolicyAware = (
     // An empty PK half is a constant prefix, unless `by` makes its marker vary.
     const skipPk =
       (pkComposites.length > 0
-        ? !pkHasRemoved && writerLeavesHalf(pkComposites, updatePayload, keyRecord)
+        ? !pkHasRemoved && leavesHalf(pkComposites)
         : by.length > 0 && by.some((attr) => !hasValue(keyRecord[attr]))) &&
       !byTouched &&
       !byCleared &&
       !byRemoved
-    const skipSk =
-      skComposites.length > 0 &&
-      !skHasRemoved &&
-      writerLeavesHalf(skComposites, updatePayload, keyRecord)
+    const skipSk = skComposites.length > 0 && !skHasRemoved && leavesHalf(skComposites)
 
     if (skipPk && skipSk) continue
 
@@ -1770,6 +1883,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
         delete merged[attr]
       }
     }
+    Object.assign(merged, stamped)
 
     const policy = resolveIndexPolicy(index.indexPolicy)
     // A Z-order half is never a `by` source, so only a text half can disagree.

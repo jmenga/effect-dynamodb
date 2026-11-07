@@ -719,7 +719,7 @@ describe("a value DynamoDB can't store", () => {
       const db = yield* DynamoClient.make({ entities: { Products }, tables: { MainTable } })
       for (const [value, says] of [
         [Number.NaN, /"category": .*NaN/],
-        [new Set(), /"category": DynamoDB has no empty set\. Nothing was sent\./],
+        [new Set(), /"category": DynamoDB has no empty set\. \[EDD-9124\] Nothing was sent\./],
         [[new Set()], /"category\[0\]": .*no empty set/],
       ] as const) {
         const error: any = yield* Effect.flip(
@@ -761,6 +761,24 @@ describe("vector search read path", () => {
       // …while similarity is normalized higher-is-more-similar.
       expect(hits[0]!.similarity).toBeCloseTo(1, 4)
       expect(hits[2]!.similarity).toBeCloseTo(0, 4)
+    }).pipe(Effect.provide(makeEmulatedLayer(capture)))
+  })
+
+  it.effect("a partition no key can hold fails with a ValidationError, nothing sent", () => {
+    const capture: Capture = { scanItems: [] }
+    setVector("boots", [1, 0, 0, 0])
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Products },
+        tables: { MainTable },
+      })
+      const error: any = yield* Effect.flip(
+        db.entities.Products.byDescription("boots")
+          .partition({ tenantId: Number.NaN as never })
+          .collect(),
+      )
+      expect(error._tag).toBe("ValidationError")
+      expect(error.cause.message).toContain("EDD-9096")
     }).pipe(Effect.provide(makeEmulatedLayer(capture)))
   })
 

@@ -7,6 +7,7 @@
 import { describe, expect, expectTypeOf, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
+import { KeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import {
   Cause,
   Deferred,
@@ -997,6 +998,55 @@ describe("nesting", () => {
         ["Entity.get", 1, []],
         ["Entity.query", 1, []],
       ])
+    }),
+  )
+
+  it.effect("an operation fails with what a refused value dies of, named for it", () =>
+    Effect.gen(function* () {
+      const defect = new KeyValueError({ value: 1, reason: "r", message: "m" })
+      const named: any = yield* Effect.flip(
+        Capacity.operation("Thing.do", { target: "Thing" }, Effect.die(defect)),
+      )
+      expect(named).toMatchObject({ _tag: "ValidationError", entityType: "Thing" })
+      expect(named.operation).toBe("Thing.do")
+      expect(named.cause).toBe(defect)
+      const untargeted: any = yield* Effect.flip(
+        Capacity.operation("Thing.do", undefined, Effect.die(defect)),
+      )
+      expect(untargeted.entityType).toBe("Thing.do")
+      const delegated: any = yield* Effect.flip(
+        Capacity.delegate("Thing.do", { target: "Thing" }, Effect.die(defect)),
+      )
+      expect(delegated.operation).toBe("Thing.do")
+    }),
+  )
+
+  it.effect("any other defect stays a defect", () =>
+    Effect.gen(function* () {
+      for (const run of [
+        Capacity.operation("Thing.do", undefined, Effect.die("boom")),
+        Capacity.delegate("Thing.do", undefined, Effect.die("boom")),
+        Stream.runDrain(
+          Stream.unwrap(Capacity.operationStream("Thing.do", undefined, Stream.die("boom"))),
+        ),
+      ]) {
+        const exit = yield* Effect.exit(run)
+        expect(Exit.isFailure(exit) && exit.cause.reasons[0]?._tag).toBe("Die")
+      }
+    }),
+  )
+
+  it.effect("withOperation leaves the caller's own effect failing and dying as it did", () =>
+    Effect.gen(function* () {
+      const defect = new KeyValueError({ value: 1, reason: "r", message: "m" })
+      const exit = yield* Effect.exit(
+        Effect.die(defect).pipe(ConsumedCapacity.withOperation("mine")),
+      )
+      expect(Exit.isFailure(exit) && exit.cause.reasons[0]?._tag).toBe("Die")
+      const streamed = yield* Effect.exit(
+        Stream.runDrain(Stream.die(defect).pipe(ConsumedCapacity.withOperationStream("mine"))),
+      )
+      expect(Exit.isFailure(streamed) && streamed.cause.reasons[0]?._tag).toBe("Die")
     }),
   )
 

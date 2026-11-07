@@ -511,6 +511,55 @@ describe("Entity type extractors", () => {
     expectTypeOf<BSelUpdate>().not.toHaveProperty("id")
   })
 
+  // ---------------------------------------------------------------------------
+  // A model field named like a timestamp: managed if it's a date, otherwise the caller's
+  // ---------------------------------------------------------------------------
+
+  it("put: a date `createdAt` is optional; a plain one stays as the model says", () => {
+    const primaryKey = {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    } as const
+    const Dated = Entity.make({
+      model: Schema.Struct({
+        id: Schema.String,
+        createdAt: Schema.DateTimeUtc,
+        updatedAt: Schema.optional(Schema.DateTimeUtc),
+      }),
+      entityType: "Dated",
+      primaryKey,
+      timestamps: true,
+    })
+    type DatedInput = Parameters<typeof Dated.put>[0]
+    expectTypeOf<{ readonly id: string }>().toExtend<DatedInput>()
+    expectTypeOf<NonNullable<DatedInput["createdAt"]>>().toEqualTypeOf<DateTime.Utc>()
+    expectTypeOf<NonNullable<DatedInput["updatedAt"]>>().toEqualTypeOf<DateTime.Utc>()
+
+    const Plain = Entity.make({
+      model: Schema.Struct({
+        id: Schema.String,
+        createdAt: Schema.String,
+        updatedAt: Schema.optional(Schema.String),
+      }),
+      entityType: "Plain",
+      primaryKey,
+      timestamps: true,
+    })
+    // At runtime the plain `createdAt` is required (`Missing key`) and stamped by nobody.
+    type PlainInput = Parameters<typeof Plain.put>[0]
+    expectTypeOf<{ readonly id: string }>().not.toExtend<PlainInput>()
+    expectTypeOf<{ readonly id: string; readonly createdAt: string }>().toExtend<PlainInput>()
+    expectTypeOf<PlainInput["createdAt"]>().toEqualTypeOf<string>()
+    expectTypeOf<NonNullable<PlainInput["updatedAt"]>>().toEqualTypeOf<string>()
+    // And an update may name it, since the writer owns it. A date `createdAt` it may not.
+    void (() => Plain.update({ id: "a" }).pipe(Entity.set({ createdAt: "2026" })))
+    void (() =>
+      Dated.update({ id: "a" }).pipe(
+        // @ts-expect-error the library keeps a date `createdAt`
+        Entity.set({ createdAt: DateTime.makeUnsafe(0) }),
+      ))
+  })
+
   // -------------------------------------------------------------------------
   // Entity.Create type tests
   // -------------------------------------------------------------------------

@@ -160,7 +160,7 @@ describe("values with no stored form", () => {
       expect(bare.path).toEqual([0])
       expect(refusal(() => toAttributeValue(new Set())).path).toEqual([])
       expect(refusal(() => toAttributeValue(new Set())).describe()).toBe(
-        "DynamoDB has no empty set.",
+        "DynamoDB has no empty set. [EDD-9124]",
       )
       expect(refusal(() => toAttributeValue(new Set(), "a")).path).toEqual(["a"])
       expect(refusal(() => toAttributeValue({ b: [new Set()] }, "a")).path).toEqual(["a", "b", 0])
@@ -216,6 +216,42 @@ describe("values with no stored form", () => {
 })
 
 describe("Marshaller", () => {
+  describe("[EDD-9124] a value with no DynamoDB form", () => {
+    const refused = [
+      ["NaN", Number.NaN],
+      ["Infinity", Number.POSITIVE_INFINITY],
+      ["-Infinity", Number.NEGATIVE_INFINITY],
+      ["a number past MAX_SAFE_INTEGER", 1e21],
+    ] as const
+
+    for (const [name, value] of refused) {
+      it(`${name}: both ways in, nested or not`, () => {
+        for (const attempt of [
+          () => toAttributeValue(value),
+          () => toAttributeMap({ a: value }),
+          () => toAttributeMap({ a: { b: [value] } }),
+        ]) {
+          let thrown: unknown
+          try {
+            attempt()
+          } catch (error) {
+            thrown = error
+          }
+          expect(isUnstorableValue(thrown)).toBe(true)
+          expect((thrown as UnstorableValue).message).toContain("[EDD-9124]")
+          expect((thrown as UnstorableValue).describe()).toContain("[EDD-9124]")
+        }
+      })
+    }
+
+    it("anything else isn't one", () => {
+      expect(isUnstorableValue(new Error("x"))).toBe(false)
+      expect(isUnstorableValue(undefined)).toBe(false)
+      expect(toAttributeValue(0)).toEqual({ N: "0" })
+      expect(toAttributeValue(10n ** 30n)).toEqual({ N: String(10n ** 30n) })
+    })
+  })
+
   describe("toAttributeMap / fromAttributeMap", () => {
     it("round-trips a simple object", () => {
       const obj = { name: "Alice", age: 30, active: true }

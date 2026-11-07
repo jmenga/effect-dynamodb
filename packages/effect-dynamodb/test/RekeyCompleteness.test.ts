@@ -9,6 +9,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Layer, Option, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
@@ -408,38 +409,110 @@ describe.each(SETTINGS)("a value landing on another's old rows, %s", (_direction
 })
 
 describe("a NaN in a key", () => {
-  // `NaN` has 1.36's text under off, as it always did, and no key text at all under on.
-  const values = { id: "a", level: Number.NaN }
-  const stored = (schema: DynamoSchema.DynamoSchema, index: KeyComposer.IndexDefinition) => ({
-    [index.pk.field]: KeyComposer.composePk(schema, "Reading", index, values),
-    [index.sk.field]: KeyComposer.composeSk(schema, "Reading", 1, index, values),
-  })
-
-  it.effect("off: the row is where off composes it, and nothing moves", () => {
-    const w = world(false)
-    const table = tableOf()
-    seed(table, {
-      id: "a",
-      level: "NaN",
-      ...stored(w.schema, w.Readings.indexes.primary),
-      ...stored(w.schema, w.Readings.indexes.byLevel),
-      __edd_e__: "Reading",
+  // `NaN` has no key text a write can compose, under either setting. Only a row 1.36 stored holds it,
+  // through a `NumberFromString` (a `Schema.Number` never reached the table), under 1.36's text,
+  // which isn't changed: there's no text to move it to.
+  const nanWorld = (escapeKeys: boolean) => {
+    const schema = DynamoSchema.make({ name: "nanrows", version: 1, escapeKeys })
+    const Keyed = Entity.make({
+      model: Schema.Struct({ id: Schema.String, level: Schema.NumberFromString }),
+      entityType: "Keyed",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: ["level"] },
+      },
     })
-    return Effect.gen(function* () {
-      const db = yield* w.client
-      const before = [...table.items.values()]
-      const report = yield* db.tables.MainTable.rekey()
-      expect(report.moved.item).toBe(0)
-      expect(report.indexKeysRewritten).toBe(0)
-      expect([...table.items.values()]).toEqual(before)
-    }).pipe(on(w, table))
-  })
+    const Indexed = Entity.make({
+      model: Schema.Struct({ id: Schema.String, level: Schema.NumberFromString }),
+      entityType: "Indexed",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byLevel: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["id"] },
+          sk: { field: "gsi1sk", composite: ["level"] },
+        },
+      },
+    })
+    const entities = { Keyed, Indexed }
+    const MainTable = Table.make({ schema, entities })
+    return {
+      schema,
+      Indexed,
+      MainTable,
+      client: DynamoClient.make({ entities, tables: { MainTable } }),
+    }
+  }
+  const values = { id: "a", level: Number.NaN }
 
-  it("on: its text is refused, so a write can't store one", () => {
-    const w = world(true)
-    expect(() =>
-      KeyComposer.composeSk(w.schema, "Reading", 1, w.Readings.indexes.byLevel, values),
-    ).toThrow(/EDD-9096/)
+  describe.each(SETTINGS)("%s", (_d, escapeKeys) => {
+    const seeded = (w: ReturnType<typeof nanWorld>) => {
+      const table = tableOf()
+      const old = KeyText136.schema136(w.schema)
+      seed(table, {
+        pk: "$nanrows#v1#keyed#id_a",
+        sk: "$nanrows#v1#keyed#level_0000000000000nan",
+        id: "a",
+        level: "NaN",
+        __edd_e__: "Keyed",
+      })
+      const index = w.Indexed.indexes.byLevel
+      seed(table, {
+        pk: "$nanrows#v1#indexed#id_b",
+        sk: "$nanrows#v1#indexed",
+        gsi1pk: KeyComposer.composePk(old, "Indexed", index, { ...values, id: "b" }),
+        gsi1sk: KeyComposer.composeSk(old, "Indexed", 1, index, { ...values, id: "b" }),
+        id: "b",
+        level: "NaN",
+        __edd_e__: "Indexed",
+      })
+      return table
+    }
+    const provide = <A, E>(
+      w: ReturnType<typeof nanWorld>,
+      table: ReturnType<typeof tableOf>,
+      effect: Effect.Effect<A, E, any>,
+    ) =>
+      effect.pipe(
+        Effect.provide(Layer.merge(table.layer, w.MainTable.layer({ name: "t" }))),
+      ) as Effect.Effect<A, E>
+
+    it.each([
+      ["a plain run", {}],
+      ["a repair", { repairIndexKeys: true }],
+    ])("%s reports what it can't place and leaves the rows", (_name, options) => {
+      const w = nanWorld(escapeKeys)
+      const table = seeded(w)
+      return Effect.runPromise(
+        provide(
+          w,
+          table,
+          Effect.gen(function* () {
+            const db: any = yield* w.client
+            const before = [...table.items.values()]
+            const report = yield* db.tables.MainTable.rekey(options)
+            // The row whose own key holds it; the row whose index key does has no difference to judge.
+            expect(report.skipped.unrecognizedKey).toBe(1)
+            expect(report.unchanged).toBe(1)
+            expect(report.moved.item).toBe(0)
+            expect(report.indexKeysRewritten).toBe(0)
+            expect(report.indexKeys.lagging).toBe(0)
+            expect(report.indexKeys.repaired).toBe(0)
+            expect([...table.items.values()]).toEqual(before)
+          }),
+        ),
+      )
+    })
+
+    it("a write can't compose it", () => {
+      const w = nanWorld(escapeKeys)
+      expect(() =>
+        KeyComposer.composeSk(w.schema, "Indexed", 1, w.Indexed.indexes.byLevel, values),
+      ).toThrow(/EDD-9096/)
+    })
   })
 })
 

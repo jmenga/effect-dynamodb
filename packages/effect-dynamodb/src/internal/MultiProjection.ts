@@ -509,7 +509,7 @@ export const multiProjection = <
                 ? undefined
                 : Duration.fromInputUnsafe(config.removal.ttl),
           },
-    outbox: resolveOutbox(config.outbox as never),
+    outbox: resolveOutbox(label, config.outbox as never),
   })
 
   const appliedOf = (result: RowResult): Applied => ({

@@ -33,6 +33,11 @@ export interface DynamoSchema {
    * and 1.38.0 composed. Nothing sets it but `rekey`, which composes that text to find rows there.
    */
   readonly numericKeyText?: true | undefined
+  /**
+   * @internal Exactly what 1.36 composed, `NaN` included, where `escapeKeys` off refuses it. Nothing
+   * sets it but `rekey`, which composes that text to find rows there.
+   */
+  readonly text136?: true | undefined
 }
 
 /**

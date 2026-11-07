@@ -1931,6 +1931,208 @@ describe("KeyComposer", () => {
     // Fixtures are bound through `Entity.make`: binding is what gives a
     // Z-order half its layout, and the composers only ever see bound halves.
 
+    describe("halves holding a value the write stamps (canonical shapes 16 to 18)", () => {
+      const NOW = "2026-02-02T00:00:00.000Z"
+      const at = (
+        name: string,
+        pk: ReadonlyArray<string>,
+        sk: ReadonlyArray<string>,
+        policy?: "sparse" | "preserve",
+      ) => ({
+        [name]: {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: [...pk] },
+          sk: { field: "gsi1sk", composite: [...sk] },
+          ...(policy === undefined ? {} : { indexPolicy: { pk: policy, sk: policy } }),
+        },
+      })
+      const compose = (
+        indexes: Record<string, KeyComposer.IndexDefinition>,
+        payload: Record<string, unknown>,
+        keyRecord: Record<string, unknown>,
+        options: { readonly removedSet?: ReadonlySet<string> } = {},
+      ) =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Ticket",
+          1,
+          indexes,
+          payload,
+          keyRecord,
+          { ...options, stamped: { updatedAt: NOW } },
+        )
+      const STAMP = `updatedat_${NOW.toLowerCase()}`
+      const SK = "$myapp#v1#ticket"
+
+      describe.each(["sparse", "preserve"] as const)("under %s", (policy) => {
+        it("shape 16: `sk: [updatedAt]` always moves, on a write naming nothing of it", () => {
+          const update = compose(
+            at("i", ["owner"], ["updatedAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#${STAMP}` })
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: `[status, updatedAt]`, status unknown: left, never dropped or truncated", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: status named: moves, with the new stamp", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { status: "open" },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_open#${STAMP}` })
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: status in the key record: moves on a write that doesn't name it", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { note: "n" },
+            { id: "1", status: "open" },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_open#${STAMP}` })
+        })
+
+        it("shape 17: a caller's `updatedAt` in the payload makes it no more this writer's", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { updatedAt: NOW },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: `.remove([status])` still follows the structural rule", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            {},
+            { id: "1" },
+            { removedSet: new Set(["status"]) },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual(["gsi1sk"])
+        })
+
+        it("shape 17: a named clear isn't left: the policy decides, as for any hole", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { status: null },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual(policy === "sparse" ? ["gsi1sk"] : [])
+        })
+
+        it("shape 17a: two others, one named: left whole, not truncated as without the stamp", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "region", "updatedAt"], policy),
+            { status: "open" },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+          const both = compose(
+            at("i", ["owner"], ["status", "region", "updatedAt"], policy),
+            { status: "open", region: "r" },
+            { id: "1" },
+          )
+          expect(both.sets).toEqual({ gsi1sk: `${SK}#status_open#region_r#${STAMP}` })
+        })
+
+        it("shape 2 analogue: the rest of the half is in the primary key, so it moves", () => {
+          const update = compose(
+            at("i", ["owner"], ["id", "updatedAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#id_1#${STAMP}` })
+        })
+
+        it("shape 6 analogue: an empty partition half is evaluated, a stamped sort half moves", () => {
+          const update = compose(at("i", [], ["updatedAt"], policy), { note: "n" }, { id: "1" })
+          expect(update.sets).toEqual({ gsi1pk: "$myapp#v1#ticket", gsi1sk: `${SK}#${STAMP}` })
+        })
+
+        it("shape 16 in a partition half: `pk: [updatedAt]` moves too", () => {
+          const update = compose(at("i", ["updatedAt"], ["id"], policy), { note: "n" }, { id: "1" })
+          expect(update.sets.gsi1pk).toBe(`$myapp#v1#ticket#${STAMP}`)
+        })
+
+        it("shape 18: `sk: [createdAt]` isn't stamped by an update: the writer leaves it", () => {
+          const update = compose(
+            at("i", ["owner"], ["createdAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 18: `pk: [createdAt]` is the same", () => {
+          const update = compose(at("i", ["createdAt"], ["id"], policy), { note: "n" }, { id: "1" })
+          expect(update.sets.gsi1pk).toBeUndefined()
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 18a: `[status, createdAt]` on `.set({ status })` follows the partial-payload rule", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "createdAt"], policy),
+            { status: "b" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_b` })
+          expect(update.removes).toEqual([])
+        })
+
+        it("with nothing stamped, the same half is the skip-predicate's, as ever", () => {
+          const update = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Ticket",
+            1,
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { status: "b" },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_b` })
+        })
+
+        it("a retain version is stamped the same way", () => {
+          const update = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Ticket",
+            1,
+            at("i", ["owner"], ["version"], policy),
+            { note: "n" },
+            { id: "1" },
+            { stamped: { version: 4 } },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#version_0000000000000004` })
+        })
+      })
+    })
+
     describe("Z-order halves (#171 — canonical shapes 7 and 8)", () => {
       const Listing = Schema.Struct({
         listingId: Schema.String,
@@ -3415,5 +3617,96 @@ describe("a cleared composite, by canonical GSI-composite shape", () => {
     expect(compose("sparse", []).removes).toEqual(["gsk"])
     expect(compose("preserve", []).removes).toEqual([])
     expect(compose("preserve", ["bedrooms"]).removes).toEqual(["gsk"])
+  })
+})
+
+describe("composeKnownHalves", () => {
+  const schema = DynamoSchema.make({ name: "myapp", version: 1 })
+  const Rows = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      owner: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+      region: Schema.optional(Schema.String),
+      score: Schema.optional(Schema.Number),
+      price: Schema.optional(Schema.Number),
+    }),
+    entityType: "Row",
+    primaryKey: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byOwner: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["owner"] },
+        sk: { field: "gsi1sk", composite: ["note", "score"] },
+      },
+      bySharded: {
+        name: "gsi2",
+        pk: { field: "gsi2pk", composite: [] },
+        sk: { field: "gsi2sk", composite: ["region", "note"] },
+        shards: { count: 8, by: ["region"] },
+      },
+      byConstant: {
+        name: "gsi3",
+        pk: { field: "gsi3pk", composite: ["owner"] },
+        sk: { field: "gsi3sk", composite: [] },
+      },
+      byPrice: {
+        name: "gsi4",
+        pk: { field: "gsi4pk", composite: ["owner"] },
+        sk: { field: "gsi4sk", zorder: [{ field: "price", min: 0, max: 100 }] },
+      },
+    },
+  })
+  const halves = (index: keyof typeof Rows.indexes, record: Record<string, unknown>) =>
+    KeyComposer.composeKnownHalves(schema, "Row", 1, Rows.indexes[index], record)
+
+  it("composes both halves when every composite has a value", () => {
+    const record = { owner: "o1", note: "n1", score: 2 }
+    expect(halves("byOwner", record)).toEqual({
+      gsi1pk: KeyComposer.composePk(schema, "Row", Rows.indexes.byOwner, record),
+      gsi1sk: KeyComposer.composeSk(schema, "Row", 1, Rows.indexes.byOwner, record),
+    })
+  })
+
+  it("composes the one half that has them, and only that one", () => {
+    expect(Object.keys(halves("byOwner", { owner: "o1", note: "n1" }))).toEqual(["gsi1pk"])
+    expect(Object.keys(halves("byOwner", { note: "n1", score: 2 }))).toEqual(["gsi1sk"])
+    expect(halves("byOwner", { note: "n1" })).toEqual({})
+  })
+
+  it("takes null and undefined for no value, and 0 and an empty string for values", () => {
+    expect(Object.keys(halves("byOwner", { owner: null, note: undefined, score: 2 }))).toEqual([])
+    expect(Object.keys(halves("byOwner", { owner: "", note: "", score: 0 }))).toEqual([
+      "gsi1pk",
+      "gsi1sk",
+    ])
+  })
+
+  it("a half with no composites always composes", () => {
+    expect(halves("byConstant", {})).toEqual({ gsi3sk: "$myapp#v1#row" })
+    expect(Object.keys(halves("byConstant", { owner: "o1" }))).toEqual(["gsi3pk", "gsi3sk"])
+  })
+
+  it("a sharded partition key needs what its shard is computed from", () => {
+    expect(Object.keys(halves("bySharded", { note: "n1" }))).toEqual([])
+    expect(Object.keys(halves("bySharded", { region: "eu" }))).toEqual(["gsi2pk"])
+    expect(Object.keys(halves("bySharded", { note: "n1", region: "eu" }))).toEqual([
+      "gsi2pk",
+      "gsi2sk",
+    ])
+  })
+
+  it("a Z-order half composes its bytes, or nothing", () => {
+    expect(Object.keys(halves("byPrice", { owner: "o1" }))).toEqual(["gsi4pk"])
+    expect(halves("byPrice", { owner: "o1", price: 7 }).gsi4sk).toBeInstanceOf(Uint8Array)
+  })
+
+  it("a value with no key text is refused, not left out", () => {
+    expect(() => halves("byOwner", { owner: "o1", note: "n1", score: Number.NaN })).toThrow(
+      "EDD-9096",
+    )
   })
 })

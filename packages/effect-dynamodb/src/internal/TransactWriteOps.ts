@@ -649,6 +649,7 @@ export const buildTransactWriteItems = (
             create: op.putKind === "create",
             operation,
             key: op.input!,
+            composeKeys: built.composeKeys,
           })
           guarded.push({ opIndex: op.opIndex, start: items.length, plan })
           for (const [i, item] of plan.items.entries()) {
