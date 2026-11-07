@@ -80,6 +80,8 @@ import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
 import * as Clears from "./helpers/ClearScenarios.js"
+import { harnessOn } from "./helpers/RekeyRepair.js"
+import * as StampedComposites from "./helpers/StampedComposites.js"
 
 // ---------------------------------------------------------------------------
 // Skip if DynamoDB Local is not available
@@ -23910,5 +23912,39 @@ describeConnected("a cleared composite, by canonical GSI-composite shape", () =>
   const harness = Clears.connectedHarness(ENDPOINT)
   for (const scenario of [...Clears.shapeScenarios, ...Clears.primaryCompositeShapeScenarios]) {
     it.effect(scenario.name, () => scenario.run(harness), { timeout: 20_000 })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Canonical shapes 16 to 18: values the library stamps
+// ---------------------------------------------------------------------------
+
+describeConnected("index keys over values the library stamps", () => {
+  let tables = 0
+  const harness = harnessOn((world) => {
+    const name = `stamped-${Date.now()}-${tables++}`
+    return {
+      tableName: name,
+      client: ClientLayer,
+      acquire: Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: name,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(world.MainTable),
+        })
+      }),
+      release: Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.deleteTable({ TableName: name })
+      }),
+    }
+  })
+  for (const [name, scenarios] of StampedComposites.ALL_SCENARIOS) {
+    describe(name, () => {
+      for (const scenario of scenarios) {
+        it.live(scenario.name, () => scenario.run(harness))
+      }
+    })
   }
 })

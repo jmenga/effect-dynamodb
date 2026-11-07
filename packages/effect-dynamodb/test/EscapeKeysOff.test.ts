@@ -115,11 +115,18 @@ describe("escapeKeys: false", () => {
       ),
     )
 
-    it.effect("a NaN composes 1.36's text, with no EDD-9096", () =>
+    it.effect("a NaN has no key here either: EDD-9096, and nothing is sent", () =>
       run((db, table) =>
         Effect.gen(function* () {
-          yield* db.entities.Places.byLevel({ store: "s", level: Number.NaN }).collect()
-          expect(skCondition(lastQuery(table))).toBe('#sk = "$off#v1#place#level_0000000000000nan"')
+          const before = table.requests.length
+          const error: any = yield* Effect.flip(
+            db.entities.Places.byLevel({ store: "s", level: Number.NaN }).collect(),
+          )
+          expect(error._tag).toBe("ValidationError")
+          expect(
+            String((error as { readonly cause?: { readonly message?: string } }).cause?.message),
+          ).toContain("[EDD-9096]")
+          expect(table.requests.length).toBe(before)
         }),
       ),
     )

@@ -465,7 +465,7 @@ export const emptyPartProblem = (expr: Expr): string | undefined => {
     default:
       return emptySetOperands(expr).some(isEmptySetOperand)
         ? "DynamoDB has no empty set, so a row holding one is a row without the attribute. " +
-            "Only eq() and ne() can compare with one, by whether the attribute exists."
+            "Only eq() and ne() can compare with one, by whether the attribute exists. [EDD-9124]"
         : unstorableOperandProblem(expr)
   }
 }

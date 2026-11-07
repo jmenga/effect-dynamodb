@@ -204,7 +204,7 @@ Going back gives up what the setting gave you, and a set of rows that were told 
 
 | Row | What `rekey` does |
 |-----|-------------------|
-| Item under other text | One transaction puts it at its current key, with every index key recomposed under its [index policy](/effect-dynamodb/guides/index-policy/) (a half that went without a key on purpose, or holds a value the library stamps, stays without one), and deletes the old row only if it is still as read. Its unique-constraint sentinels move with it. Another value's row stored at its current key is moved out of the way first. A truncated sort key the move can't recompose is rewritten in the same run, so a rerun has nothing left to do |
+| Item under other text | One transaction puts it at its current key, with every index key recomposed under its [index policy](/effect-dynamodb/guides/index-policy/) (a half that went without a key on purpose stays without one), and deletes the old row only if it is still as read. Its unique-constraint sentinels move with it. Another value's row stored at its current key is moved out of the way first. A truncated sort key the move can't recompose is rewritten in the same run, so a rerun has nothing left to do |
 | Item at its current key whose index keys hold other text | Rewrites those index keys and vector partitions in place with one `UpdateItem`, conditioned on each still holding that text. A sort key truncated under 1.36 (its trailing composites absent) is rewritten to the current text of the composites it holds. A half its index policy kept behind its values isn't touched here ([`repairIndexKeys`](#repairing-index-keys) is what writes it). A Z-order index's partition key is rewritten like any other, and its sort key where only a prefix value's text differs; the address keeps its bytes |
 | Unique-constraint sentinel under other text | Moved to its current key, still naming its item |
 | Version snapshot, soft-delete tombstone | Moved as a row: a Put at its current key and a Delete of the old row in one transaction. The version number and the timestamp keep their bytes. A history row an earlier release wrote without an item segment keeps that layout. A snapshot whose current key already holds the same snapshot (the same version, incarnation and `updatedAt`) is a copy: the old one is deleted, and counted as moved |
@@ -251,7 +251,7 @@ Every row is moved or counted. These are counted on every run, and left as they 
 | An aggregate's edge row with no root in its partition, including a 1.37.0 or 1.38.0 run cut short after moving the root and before the edges | `skipped.unrecognizedKey`; a run bounded by `maxPages` or started from `resume` says `skipped.rootNotSeen` instead, since the root could be on a page it didn't read |
 | An aggregate root under no text its values composed | `skipped.unrecognizedKey` |
 | A projection tombstone or outbox item whose key reads as more than one set of values | `skipped.unrecognizedKey` |
-| A row holding `NaN` in a key, under `escapeKeys: true` (it has no key text there) | `skipped.unrecognizedKey` |
+| A row holding `NaN` in its own key (it has no key text) | `skipped.unrecognizedKey` |
 | A row whose Z-order value no longer places a key | `conflicts`, `failed` |
 | A stream id whose rows read as two different ids | `conflicts`, `failed` |
 | A stream with another stream id's event right after its last, from a write that landed on it before `rekey` | `conflicts`, `contended` |
@@ -302,6 +302,8 @@ The correct key is what a `put` of the row's values writes now, composed the sam
 
 **A `sparse` row counted `ambiguous` may be that way on purpose.** A writer naming `timestamp` and not `alertState` on `sk: [alertState, timestamp]` takes the row out of the index and leaves both values on it: a current-alerts query shouldn't list it, whatever `alertState` still says. Two writers each naming one composite leave the same bytes. Nothing tells them apart, so they're counted and left. A write naming every composite of the half puts such a row back.
 
+**Keys over a value the library stamps are judged too.** An earlier release's `put` composed its keys before stamping, so a row with `sk: [createdAt]` or `[updatedAt]`, or a `retain` entity's `[version]`, went without a key unless the caller supplied the value: on any index holding one, the row was silently missing from every query. They're counted as `missing`, and repairing brings them in. Under `sparse`, `[status, region, updatedAt]` with both values on the row and no key is `ambiguous`, as for any half with two or more composites outside the primary key.
+
 **`lagging` is repaired under `preserve`.** A key behind its values isn't promised to stay there: it's stale until the next write that can compose it. If your application relies on a pin on the old value finding the row, that pin stops finding it: check the dry run's count first.
 
 These are left, and aren't counted:
@@ -309,7 +311,7 @@ These are left, and aren't counted:
 - A half missing a composite under `preserve`, whatever its key holds. That's what the policy promises.
 - A sort key cut before composites the row really doesn't have, on a hierarchy like `[country, city]`. It's what the update path writes.
 - A half with no key where the other half of its index can't compose: `put` writes no entry there.
-- A half holding a value the library stamps (`createdAt`, `updatedAt`, `version`). `put` composes keys before stamping, so a healthy row has the value and no key, and an `updatedAt` key is behind its value after every update.
+- A key holding `updatedAt` that's behind its value, with everything else in the key as the row says. An update that can't compose the half [leaves it](/effect-dynamodb/guides/index-policy/#keys-over-values-the-library-stamps), so that's a healthy row. A key under another status, say, is rewritten once from the row's `updatedAt`, and a later run has nothing to do.
 - A half stored in an attribute of the table's primary key: no write ever names one.
 - Values that compose no key (`NaN`, a Z-order value a dimension can't place). A `put` would refuse them too.
 

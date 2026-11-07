@@ -71,7 +71,9 @@ import type {
   KeyFields,
   ModelFieldName,
   PrefixFieldNames,
+  VersionFieldName,
 } from "./internal/EntityTypes.js"
+import { refuseReadonlyMaps } from "./internal/SchemaAccessors.js"
 import { isShardSourceError } from "./internal/Shards.js"
 import {
   refuseRepeatedIndex,
@@ -370,17 +372,69 @@ type ShardedPkFieldsGuard<TIndexes, TPrimaryKey> = {
     : unknown
 }
 
+/** The `versioned` attribute, when an index can't be composed from it: only `retain` reads the item. */
+type UnknownVersionField<TVersioned> = TVersioned extends { readonly retain: true }
+  ? never
+  : VersionFieldName<TVersioned>
+
+/** One half's composites without `V`: an error on the half that holds it, nothing on any other. */
+type CompositesWithout<THalf, V> = THalf extends {
+  readonly composite: infer C extends ReadonlyArray<string>
+}
+  ? [Extract<C[number], V>] extends [never]
+    ? unknown
+    : { readonly composite: ReadonlyArray<Exclude<C[number], V>> }
+  : unknown
+
+/** A Z-order half's dimensions and prefix without `V`, as {@link CompositesWithout}. */
+type ZOrderEntriesWithout<THalf, V> = (THalf extends { readonly zorder: infer Z }
+  ? { readonly zorder: { readonly [I in keyof Z]: EntryWithout<Z[I], V> } }
+  : unknown) &
+  (THalf extends { readonly prefix: infer P }
+    ? { readonly prefix: { readonly [I in keyof P]: EntryWithout<P[I], V> } }
+    : unknown)
+
+type EntryWithout<TEntry, V> = TEntry extends V
+  ? never
+  : TEntry extends { readonly field: V }
+    ? { readonly field: never }
+    : unknown
+
 /**
- * @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name, and
- * {@link ShardedPkFieldsGuard} over its primary key.
+ * @internal A secondary index over the `versioned` attribute is an error on that composite, unless
+ * `retain` makes the value known (`EDD-9121`). `Entity.make` checks again at runtime, and checks the
+ * primary key and `shards.by`. A half that doesn't hold it gets `unknown`, so it loses no completions.
+ */
+type VersionCompositesGuard<TIndexes, TVersioned> = [UnknownVersionField<TVersioned>] extends [
+  never,
+]
+  ? unknown
+  : {
+      readonly [K in keyof TIndexes]: (TIndexes[K] extends { readonly pk: infer P }
+        ? { readonly pk: CompositesWithout<P, UnknownVersionField<TVersioned>> }
+        : unknown) &
+        (TIndexes[K] extends { readonly sk: infer S }
+          ? {
+              readonly sk: CompositesWithout<S, UnknownVersionField<TVersioned>> &
+                ZOrderEntriesWithout<S, UnknownVersionField<TVersioned>>
+            }
+          : unknown)
+    }
+
+/**
+ * @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name,
+ * {@link ShardedPkFieldsGuard} over its primary key, and {@link VersionCompositesGuard} over its
+ * `versioned` config.
  */
 export type EntityIndexesGuard<
   TModel extends Schema.Top,
   TRefs,
   TIndexes,
   TPrimaryKey,
+  TVersioned = undefined,
 > = ZOrderEntriesGuard<TIndexes, KeyFields<TModel, RefsOrNone<TRefs>>> &
-  ShardedPkFieldsGuard<TIndexes, TPrimaryKey>
+  ShardedPkFieldsGuard<TIndexes, TPrimaryKey> &
+  VersionCompositesGuard<TIndexes, TVersioned>
 
 type ZOrderHalfGuard<SK, TFields> = (SK extends { readonly zorder: infer Z }
   ? {
@@ -850,6 +904,7 @@ export const buildEntityDefinition = (config: {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
   const rawModel = configured ? configured.model : (config.model as Schema.Top)
+  refuseReadonlyMaps(`Entity "${config.entityType}"`, rawModel)
   const configuredAttributes = configured?.attributes ?? {}
   // Schema.Class is a constructable function whose AST is a `Declaration`.
   // The `typeof` check alone is not enough: since Effect 4.0.0-rc,
@@ -861,11 +916,20 @@ export const buildEntityDefinition = (config: {
     (rawModel.ast as { readonly _tag?: string })._tag === "Declaration"
   const modelFields = getFields(rawModel)
   const hasHiddenFields = Object.values(modelFields).some(isHidden)
+  // `Schema.optional(X)` is a union with `Undefined`, which has no date representation of its own,
+  // so the value schema is what's read: an optional date is a date, as `Schema.optionalKey(X)`
+  // always was. An aggregate's stamp overwrites what a caller supplied, so its optional dates stay
+  // the caller's.
   const systemFields = resolveSystemFields(
     config.timestamps,
     config.versioned,
     config.timeSeries,
-    modelFields,
+    Object.fromEntries(
+      Object.entries(modelFields).map(([name, field]) => [
+        name,
+        optionalField(field as Schema.Top)?.inner ?? field,
+      ]),
+    ) as typeof modelFields,
     configuredAttributes,
     `Entity "${config.entityType}"`,
   )
@@ -919,6 +983,21 @@ export const buildEntityDefinition = (config: {
         )
       }
     }
+  }
+
+  refuseKeysOverMovingValues(config.entityType, config.indexes, systemFields, config.versioned)
+  if (
+    systemFields.version !== null &&
+    (configuredAttributes as globalThis.Record<string, { readonly field?: string } | undefined>)[
+      systemFields.version
+    ]?.field !== undefined
+  ) {
+    throw new Error(
+      `[EDD-9122] Entity "${config.entityType}": "${systemFields.version}" is where \`versioned\` ` +
+        `keeps the version, so \`configure\` can't store it under another name: the write would ` +
+        `succeed and every later read and write of the item would find no version. To name the ` +
+        `attribute, use \`versioned: { field: "..." }\` and give the model's field that name.`,
+    )
   }
 
   // ---------------------------------------------------------------------------
@@ -1527,6 +1606,65 @@ const optionalFieldEncoding = (schema: Schema.Top | undefined): DynamoEncoding |
   return inner === undefined ? undefined : (resolveFieldEncoding(inner, undefined) ?? undefined)
 }
 
+/**
+ * `[EDD-9121]`: a key over a value the library changes on every write, where the write can't know
+ * it or can't move the key (`DESIGN.md` §7, "Composites the library stamps").
+ *
+ * A plain `versioned` update adds one to the stored version without reading it, so a secondary index
+ * over it would never hold a key. `versioned: { retain: true }` reads the item on every write, so
+ * the value is known and the key moves with it. A primary key never changes, whatever is known, and
+ * a shard follows its source, which a query could then never pin.
+ */
+const refuseKeysOverMovingValues = (
+  entityType: string,
+  indexes: globalThis.Record<string, IndexDefinition>,
+  systemFields: ResolvedSystemFields,
+  versioned: VersionedConfig | undefined,
+): void => {
+  const { updatedAt, version } = systemFields
+  const retained = typeof versioned === "object" && versioned !== null && versioned.retain === true
+  const moving = [updatedAt, version].filter((field): field is string => field !== null)
+  const primary = indexes.primary
+  for (const field of moving) {
+    if (
+      primary !== undefined &&
+      [...primary.pk.composite, ...primary.sk.composite].includes(field)
+    ) {
+      throw new Error(
+        `[EDD-9121] Entity "${entityType}": the primary key can't be composed from "${field}". ` +
+          `The library changes it on every write and a primary key never changes, so the key ` +
+          `would stop matching the value at the first update. Remove it from the primary key, or ` +
+          `use a field the library doesn't manage.`,
+      )
+    }
+  }
+  for (const [indexName, index] of Object.entries(indexes)) {
+    if (indexName === "primary") continue
+    for (const field of moving) {
+      if (index.shards?.by?.includes(field) === true) {
+        throw new Error(
+          `[EDD-9121] Entity "${entityType}": index "${indexName}" shards.by can't name "${field}". ` +
+            `The library changes it on every write, so the shard would go stale on each one and ` +
+            `no pin could reach the item. Omit it to hash the primary key.`,
+        )
+      }
+    }
+    if (
+      version !== null &&
+      !retained &&
+      [...index.pk.composite, ...index.sk.composite].includes(version)
+    ) {
+      throw new Error(
+        `[EDD-9121] Entity "${entityType}": index "${indexName}" can't be composed from "${version}". ` +
+          `The library adds one to it on every write without reading the item, so the new value ` +
+          `isn't known when the key is written and no item would ever hold this key. Remove it ` +
+          `from the index, or use \`versioned: { retain: true }\`, which reads the item on every ` +
+          `write.`,
+      )
+    }
+  }
+}
+
 /** `[EDD-9090]`: a Z-order index is never a collection member. */
 export const zorderInCollection = (entityType: string, indexName: string): Error =>
   new Error(
@@ -1642,7 +1780,8 @@ export const make = <
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey>
+  readonly indexes?: TGsiIndexes &
+    EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey, TVersioned>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete

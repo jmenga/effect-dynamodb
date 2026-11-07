@@ -201,6 +201,44 @@ const seed = Effect.gen(function* () {
 })
 
 describe("multiProjection", () => {
+  it.effect("a key its row can't compose fails that row, not the batch", () =>
+    Effect.gen(function* () {
+      const projection = EventStore.multiProjection({
+        readModel: Shipments,
+        initial,
+        sources: (source) => ({
+          order: source(Orders, {
+            key: (_id, event) => ({
+              shipmentId: event.data.shipmentId === "bad" ? (Number.NaN as never) : "good",
+            }),
+            evolve: (state, event) =>
+              Effect.succeed({ ...state, lines: state.lines + event.data.lines }),
+          }),
+        }),
+        revision: "revision",
+        checkpoints: { field: "checkpoints" },
+      })
+      yield* Orders.append(
+        { orderId: "o" },
+        [
+          new ShipmentAdded({ shipmentId: "bad", lines: 1 }),
+          new ShipmentAdded({ shipmentId: "good", lines: 1 }),
+        ],
+        0,
+      )
+      const result = yield* projection.applyBatch(
+        tagged("order" as const, yield* Orders.read({ orderId: "o" })),
+      )
+      const failed = result.outcomes.find((outcome) => outcome._tag === "Failed")!
+      if (failed._tag !== "Failed") throw new Error("not failed")
+      const error: any = failed.error
+      expect(error._tag).toBe("ValidationError")
+      expect(error.cause.message).toContain("EDD-9096")
+      expect(result.outcomes.some((outcome) => outcome._tag === "Applied")).toBe(true)
+      expect(row("good")).toMatchObject({ lines: 1 })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect("folds every source's events into the row with one write per row", () =>
     Effect.gen(function* () {
       const { orders, scans, inspections } = yield* seed

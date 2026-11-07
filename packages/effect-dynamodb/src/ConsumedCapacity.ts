@@ -108,7 +108,7 @@ export const withOperation: {
     self: Effect.Effect<A, E, R>,
     name: string,
     options?: Capacity.OperationOptions,
-  ): Effect.Effect<A, E, R> => Capacity.operation(name, options, self),
+  ): Effect.Effect<A, E, R> => Capacity.scoped(name, options, self),
 )
 
 /**

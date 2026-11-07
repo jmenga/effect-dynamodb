@@ -37,8 +37,8 @@ const renderPath = (
   )
 
 /**
- * A value DynamoDB can't store, and where it is. Marshalling throws this, as key
- * composition throws `KeyValueError`; what reaches it is the caller's value, so a
+ * A value DynamoDB can't store, and where it is (`EDD-9124`). Marshalling throws this, as
+ * key composition throws `KeyValueError`; what reaches it is the caller's value, so a
  * write path turns it into a `ValidationError` (`marshalOrFail`).
  */
 export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
@@ -51,9 +51,9 @@ export class UnstorableValue extends Data.TaggedError("UnstorableValue")<{
 
   /** The refusal in words, naming a stored attribute by what `fieldOf` makes of it. */
   describe(fieldOf?: (attribute: string) => string): string {
-    return this.path.length === 0
-      ? this.reason
-      : `"${renderPath(this.path, fieldOf)}": ${this.reason}`
+    const refused =
+      this.path.length === 0 ? this.reason : `"${renderPath(this.path, fieldOf)}": ${this.reason}`
+    return `${refused.endsWith(".") ? refused : `${refused}.`} [EDD-9124]`
   }
 }
 

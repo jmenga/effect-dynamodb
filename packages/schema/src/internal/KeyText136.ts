@@ -29,20 +29,27 @@ import { composePk, composeSk, type IndexDefinition, unescapeKeyText } from "../
 import { decodeBigInt, decodeNumber } from "./NumericKey.js"
 
 /** The schema composing the key text 1.36 composed: what `escapeKeys` off composes. */
-export const schema136 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema =>
-  DynamoSchema.make({
+export const schema136 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema => ({
+  ...DynamoSchema.make({
     name: schema.name,
     version: schema.version,
     casing: schema.casing,
     escapeKeys: false,
-  })
+  }),
+  text136: true,
+})
 
 /**
  * The schema whose partition key text is what 1.37.0 and 1.38.0 stored: its numbers in numeric order, its
  * strings unescaped.
  */
 export const schema137 = (schema: DynamoSchema.DynamoSchema): DynamoSchema.DynamoSchema => ({
-  ...schema136(schema),
+  ...DynamoSchema.make({
+    name: schema.name,
+    version: schema.version,
+    casing: schema.casing,
+    escapeKeys: false,
+  }),
   numericKeyText: true,
 })
 

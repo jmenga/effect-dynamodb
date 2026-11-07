@@ -24,7 +24,7 @@ for (const [name, scenarios] of [
 ] as const) {
   describe(name, () => {
     for (const scenario of scenarios) {
-      it.effect(scenario.name, () => scenario.run(harness))
+      it.live(scenario.name, () => scenario.run(harness))
     }
   })
 }

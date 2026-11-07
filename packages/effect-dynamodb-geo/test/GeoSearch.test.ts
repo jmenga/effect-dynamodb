@@ -553,6 +553,68 @@ describe("GeoSearch", () => {
   // GeoIndex.bind tests
   // -------------------------------------------------------------------------
 
+  describe("a pkFilter no key can hold", () => {
+    const Fleet = Entity.make({
+      model: Schema.Struct({
+        vehicleId: Schema.String,
+        depot: Schema.Number,
+        latitude: Schema.Number,
+        longitude: Schema.Number,
+        timestamp: Schema.Number,
+        cell: Schema.optional(Schema.String),
+        parentCell: Schema.optional(Schema.String),
+        timePartition: Schema.optional(Schema.String),
+      }),
+      entityType: "FleetVehicle",
+      primaryKey: {
+        pk: { field: "pk", composite: ["vehicleId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byCell: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["depot", "parentCell", "timePartition"] },
+          sk: { field: "gsi1sk", composite: ["cell"] },
+        },
+      },
+    })
+    const FleetTable = Table.make({ schema: AppSchema, entities: { Fleet } })
+    const FleetGeo = GeoIndex.make({
+      entity: Fleet,
+      index: "byCell",
+      coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+      fields: {
+        cell: { field: "cell", resolution: 15 },
+        parentCell: { field: "parentCell", resolution: 3 },
+        timePartition: { field: "timePartition", source: "timestamp", bucket: "hourly" },
+      },
+    })
+    const nearby = (depot: number) =>
+      FleetGeo.nearby({
+        center: SF_CENTER,
+        radius: 1000,
+        unit: "m",
+        timeWindow: { start: NOW, end: NOW + 1000 },
+        pkFilter: { depot },
+      }).pipe(
+        Effect.provide(Layer.merge(TestDynamoClient, FleetTable.layer({ name: "geo-fleet" }))),
+      )
+
+    it("fails with a ValidationError (EDD-9096), nothing sent", async () => {
+      const error: any = await Effect.runPromise(Effect.flip(nearby(Number.NaN)))
+      expect(error._tag).toBe("ValidationError")
+      expect(error.operation).toBe("GeoIndex.nearby")
+      expect(error.cause._tag).toBe("KeyValueError")
+      expect(error.cause.message).toContain("EDD-9096")
+      expect(mockQuery).not.toHaveBeenCalled()
+    })
+
+    it("a value with key text queries", async () => {
+      expect(await Effect.runPromise(nearby(7))).toEqual([])
+      expect(mockQuery).toHaveBeenCalled()
+    })
+  })
+
   describe("GeoIndex.bind", () => {
     it("returns a BoundGeoIndex with put, nearby, enrich, and provide", async () => {
       await Effect.runPromise(

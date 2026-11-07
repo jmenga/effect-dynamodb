@@ -94,7 +94,8 @@ type StoredWithoutForm<S> = S extends { readonly Encoded: infer E }
 /**
  * The names `.remove()` takes: model fields a row can lack, less what no update
  * may clear: primary-key composites, refs, library-managed fields, and the
- * fields configured immutable or stored as a sparse map (`TUnremovable`).
+ * fields configured immutable or stored as a sparse map (`TUnremovable`). A
+ * timestamp is the library's when it's a date; one of another type is the caller's.
  */
 export type RemovableFields<
   TModel extends Schema.Top,
@@ -111,8 +112,10 @@ export type RemovableFields<
         | (string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>)
         | (keyof TRefs & string)
         | TUnremovable
-        | CreatedAtFieldName<TTimestamps>
-        | UpdatedAtFieldName<TTimestamps>
+        | ManagedDateField<
+            ModelType<TModel>,
+            CreatedAtFieldName<TTimestamps> | UpdatedAtFieldName<TTimestamps>
+          >
         | VersionFieldName<TVersioned>
       >
 
@@ -166,7 +169,8 @@ type TimestampFieldName<C, Default extends string> = [C] extends [undefined]
       ? F
       : Default
 
-type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
+/** @internal The attribute `timestamps` keeps `created` in. */
+export type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
   ? never
   : TTimestamps extends true
     ? "createdAt"
@@ -174,7 +178,8 @@ type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
       ? TimestampFieldName<C, "createdAt">
       : "createdAt"
 
-type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] extends [
+/** @internal The attribute `timestamps` keeps `updated` in. */
+export type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] extends [
   undefined | false,
 ]
   ? [TTimestamps] extends [undefined | false]
@@ -186,7 +191,8 @@ type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] ex
         : "updatedAt"
   : never // time-series entities auto-suppress updatedAt
 
-type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | false]
+/** @internal The attribute `versioned` keeps its version in. */
+export type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | false]
   ? never
   : TVersioned extends true
     ? "version"
@@ -195,9 +201,26 @@ type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | false]
       : "version"
 
 /**
+ * The fields of `K` the library manages: the dates, required or under `Schema.optional` /
+ * `Schema.optionalKey`. Any other model field of that name is the caller's, required or not as the
+ * model says (`resolveSystemFields`, rule b), and that includes `Schema.UndefinedOr` of a date: a
+ * required key whose value may be empty isn't a date to the run time, so nothing stamps it.
+ */
+export type ManagedDateField<T, K> = {
+  [P in K & keyof T]: [Exclude<T[P], undefined>] extends [DateTime.DateTime | Date]
+    ? undefined extends T[P]
+      ? T extends Record<P, unknown>
+        ? never
+        : P
+      : P
+    : never
+}[K & keyof T]
+
+/**
  * Apply system-field collision adjustments to an input/create type:
- *   - Colliding `createdAt`/`updatedAt` become optional (caller may supply or
- *     let the library auto-generate).
+ *   - A colliding date `createdAt`/`updatedAt` becomes optional (caller may
+ *     supply or let the library auto-generate). One of any other type is the
+ *     caller's own, unchanged.
  *   - Colliding `version` is stripped entirely (optimistic locking requires
  *     library-managed increment).
  */
@@ -211,15 +234,15 @@ export type WithSystemCollisions<T, TTimestamps, TVersioned, TTimeSeries = undef
         : Simplify<
             Omit<
               T,
-              | (CreatedAtFieldName<TTimestamps> & keyof T)
-              | (UpdatedAtFieldName<TTimestamps, TTimeSeries> & keyof T)
+              | ManagedDateField<T, CreatedAtFieldName<TTimestamps>>
+              | ManagedDateField<T, UpdatedAtFieldName<TTimestamps, TTimeSeries>>
               | (VersionFieldName<TVersioned> & keyof T)
             > &
               Partial<
                 Pick<
                   T,
-                  | (CreatedAtFieldName<TTimestamps> & keyof T)
-                  | (UpdatedAtFieldName<TTimestamps, TTimeSeries> & keyof T)
+                  | ManagedDateField<T, CreatedAtFieldName<TTimestamps>>
+                  | ManagedDateField<T, UpdatedAtFieldName<TTimestamps, TTimeSeries>>
                 >
               >
           >
@@ -239,7 +262,8 @@ export type WithSystemCollisionsForUpdate<T, TTimestamps, TVersioned> =
         : Simplify<
             Omit<
               T,
-              (CreatedAtFieldName<TTimestamps> & keyof T) | (VersionFieldName<TVersioned> & keyof T)
+              | ManagedDateField<T, CreatedAtFieldName<TTimestamps>>
+              | (VersionFieldName<TVersioned> & keyof T)
             >
           >
 

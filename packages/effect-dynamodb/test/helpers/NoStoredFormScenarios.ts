@@ -756,7 +756,7 @@ const refusalScenarios: ReadonlyArray<Scenario> = [
               db.entities.Rows.update(key)
                 .pathSet({ segments: ["lists", 0], value: empty(), isPath: false })
                 .asEffect(),
-            /a list element can't be left out/,
+            /a list element can't be left out.* \[EDD-9124\] Nothing was sent/,
           )
         }),
       ),
@@ -1281,7 +1281,7 @@ const expressionScenarios: ReadonlyArray<Scenario> = [
                 .add({ tags: new Set(["b"]) })
                 .condition(condition)
                 .asEffect(),
-            /Only eq\(\) and ne\(\) can compare/,
+            /Only eq\(\) and ne\(\) can compare with one, by whether the attribute exists\. \[EDD-9124\]/,
           )
         }),
       ),

@@ -73,7 +73,49 @@ const Readings = Entity.make({
   },
 })
 
-const MainTable = Table.make({ schema: AppSchema, entities: { Items, Readings } })
+class Stamped extends Schema.Class<Stamped>("ClearTypesStamped")({
+  id: Schema.String,
+  note: Schema.optional(Schema.String),
+  createdAt: Schema.optional(Schema.DateTimeUtc),
+  updatedAt: Schema.optionalKey(Schema.DateTimeUtc),
+}) {}
+
+const Stampeds = Entity.make({
+  model: Stamped,
+  entityType: "Stamped",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  timestamps: true,
+})
+
+class Labelled extends Schema.Class<Labelled>("ClearTypesLabelled")({
+  id: Schema.String,
+  createdAt: Schema.optional(Schema.String),
+  updatedAt: Schema.optionalKey(Schema.String),
+}) {}
+
+const Labelleds = Entity.make({
+  model: Labelled,
+  entityType: "Labelled",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  timestamps: true,
+})
+
+class MaybeDated extends Schema.Class<MaybeDated>("ClearTypesMaybeDated")({
+  id: Schema.String,
+  createdAt: Schema.UndefinedOr(Schema.DateTimeUtc),
+}) {}
+
+const MaybeDateds = Entity.make({
+  model: MaybeDated,
+  entityType: "MaybeDated",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  timestamps: true,
+})
+
+const MainTable = Table.make({
+  schema: AppSchema,
+  entities: { Items, Readings, Stampeds, Labelleds, MaybeDateds },
+})
 
 const key = { id: "1" }
 
@@ -84,7 +126,7 @@ describe("BoundUpdate", () => {
   const db = () =>
     Effect.gen(function* () {
       const client = yield* DynamoClient.make({
-        entities: { Items, Readings },
+        entities: { Items, Readings, Stampeds, Labelleds, MaybeDateds },
         tables: { MainTable },
       })
       return client.entities
@@ -148,6 +190,36 @@ describe("BoundUpdate", () => {
       const names: Array<string> = ["code"]
       // @ts-expect-error a `string[]` says nothing about what's in it
       u.remove(names)
+    })
+    expect(true).toBe(true)
+  })
+
+  it(".remove takes a timestamp of another type: it's the caller's field", () => {
+    compiles(() => {
+      bound.Labelleds.update(key).remove(["createdAt"])
+      bound.Labelleds.update(key).remove(["updatedAt"])
+      bound.Labelleds.update(key).remove(["createdAt", "updatedAt"])
+    })
+    expect(true).toBe(true)
+  })
+
+  it("`Schema.UndefinedOr` of a date is the caller's, as the run time has it: nothing stamps it", () => {
+    compiles(() => {
+      bound.MaybeDateds.update(key).remove(["createdAt"])
+      bound.MaybeDateds.put({ id: "1", createdAt: undefined })
+      // @ts-expect-error a required key: nothing fills it in
+      bound.MaybeDateds.put({ id: "1" })
+    })
+    expect(true).toBe(true)
+  })
+
+  it(".remove refuses a date the library stamps, however the model says it's optional", () => {
+    compiles(() => {
+      bound.Stampeds.update(key).remove(["note"])
+      // @ts-expect-error the library stamps it
+      bound.Stampeds.update(key).remove(["createdAt"])
+      // @ts-expect-error the library stamps it
+      bound.Stampeds.update(key).remove(["updatedAt"])
     })
     expect(true).toBe(true)
   })
