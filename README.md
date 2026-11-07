@@ -6,6 +6,7 @@ Schema-driven DynamoDB ORM for [Effect TS](https://effect.website). Single-table
 [![license](https://img.shields.io/npm/l/effect-dynamodb)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue)](https://www.typescriptlang.org/)
 [![Effect](https://img.shields.io/badge/Effect-4.x-purple)](https://effect.website)
+[![effect-dynamodb Geospatial on StartupScores](https://startupscores.com/badge/effect-dynamodb-geospatial.svg?style=shield&v=combo&theme=dark)](https://startupscores.com/open-source/effect-dynamodb-geospatial)
 
 **Documentation:** https://jmenga.github.io/effect-dynamodb
 
