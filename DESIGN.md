@@ -2282,9 +2282,32 @@ deleted, history) are built with `legacyReads`: a transform field also accepts
 the domain-form value older path updates wrote (a `number` on a
 `NumberFromString`, a safe-integer `number` or `bigint` on a `BigIntFromString`,
 a marshalled map on a date transform), and a plain `Schema.BigInt` lifts the
-unmarshalled `number` back to `bigint`. Never inside a union, where a lenient
-member could claim another member's value. Write schemas and keys use the
-strict schemas, so nothing written changes.
+unmarshalled `number` back to `bigint`. The transform forms are never taken
+inside a union, where a lenient member could claim another member's value. Write
+schemas and keys use the strict schemas, so nothing written changes.
+
+**A `Schema.BigInt` under a union.** The lift works there, on an entity's read
+schemas and an aggregate's tolerant ones. Every member gets its try as declared
+first (`exactBigInts`), and only a value none of them takes reaches the members
+holding a bigint, lifted, at any depth (`holdsBigInt`). A `oneOf` union refuses a
+value two members take, so it becomes `Union([exact oneOf, ...lifted members])`.
+Declared-first can only turn a failure into a success, so a row that read before
+reads the same: a member taking a number keeps it, and `Union([Number, BigInt])`
+reads `5n` as `5`, in either order. Nothing is judged from the members' kinds,
+which is why a number inside another member doesn't compete with a bigint in this
+one (`Union([Number, Struct({ b: BigInt })])`), and a member that takes only some
+numbers takes only those (`Union([Literal(5), BigInt])`, `6n` stays `6n`).
+
+**Beneath a decoding default.** A field with `withDecodingDefault` or
+`withDecodingDefaultKey` carries no runtime accessors below the step, so a
+substitution working from the node (`decodingDefaultField`'s `inner`) can't walk
+a struct, a record, a tuple or a union there. A read walks the declared schema
+(`.to`) instead: `legacyReads` on an entity, `decodeOnly` on an aggregate's read,
+write and state schemas. An encoder doesn't, so what's stored stays what it was,
+and it falls back to the read's reach only for a value the field's own schema
+refuses. That's why `Schema.Date` and `Schema.Redacted` in such a container are
+refused at load (`EDD-9125`): a read reaches them and a write doesn't. A check
+added after the step isn't on `.to`, so a schema enforcing checks keeps `inner`.
 
 **Zoned offsets.** A zoned date stored as `…+05:00` (an offset zone, no
 bracket) is rebuilt with that offset; before #133 it was rebuilt as UTC. One
@@ -5510,7 +5533,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
 | `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
-| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal, a transformation over `Schema.BigInt`. On a stream, a snapshot and an outbox, and under another declaration on an entity or an aggregate: `Schema.Date`, `Schema.Redacted`, `Schema.BigInt`. `Schema.BigInt` also under a union. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: a `Schema.BigInt` on a stream reads back past 2^53, and `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back. |
+| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal, a transformation over `Schema.BigInt`. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container: `Schema.Date`, `Schema.Redacted`, `Schema.BigInt`. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: a `Schema.BigInt` on a stream reads back past 2^53, and `Schema.Literals([1n, "a"])` reads back `"a"`. Members of a union aren't judged against each other, so a stream's `Union([Number, BigInt])`, whose values all read, is refused too. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back. |
 
 Next free code: **`EDD-9126`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
