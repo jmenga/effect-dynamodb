@@ -525,7 +525,7 @@ describe("EventStore packed storage — append (#147)", () => {
   it.effect("refuses non-JSON wire values, naming the path", () =>
     Effect.gen(function* () {
       class Stamped extends Schema.TaggedClass<Stamped>()("Stamped", {
-        at: Schema.Date,
+        at: Schema.instanceOf(Date),
       }) {}
       const Stamps = EventStore.makeStream({
         table: LedgerTable,

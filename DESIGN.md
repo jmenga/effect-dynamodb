@@ -2282,9 +2282,52 @@ deleted, history) are built with `legacyReads`: a transform field also accepts
 the domain-form value older path updates wrote (a `number` on a
 `NumberFromString`, a safe-integer `number` or `bigint` on a `BigIntFromString`,
 a marshalled map on a date transform), and a plain `Schema.BigInt` lifts the
-unmarshalled `number` back to `bigint`. Never inside a union, where a lenient
-member could claim another member's value. Write schemas and keys use the
-strict schemas, so nothing written changes.
+unmarshalled `number` back to `bigint`. The transform forms are never taken
+inside a union, where a lenient member could claim another member's value. Write
+schemas and keys use the strict schemas, so nothing written changes.
+
+**A `Schema.BigInt` under a union.** The lift works there, on an entity's read
+schemas and an aggregate's tolerant ones. Every member gets its try as declared
+first (`exactBigInts`), and only a value none of them takes reaches the members
+holding a bigint, lifted, at any depth (`holdsBigInt`). A `oneOf` union refuses a
+value two members take, so it becomes `Union([exact oneOf, ...lifted members])`.
+Declared-first can only turn a failure into a success, so a row that read before
+reads the same: a member taking a number keeps it, and `Union([Number, BigInt])`
+reads `5n` as `5`, in either order. Nothing is judged from the members' kinds,
+which is why a number inside another member doesn't compete with a bigint in this
+one (`Union([Number, Struct({ b: BigInt })])`), and a member that takes only some
+numbers takes only those (`Union([Literal(5), BigInt])`, `6n` stays `6n`).
+
+**Beneath a decoding default.** A field with `withDecodingDefault` or
+`withDecodingDefaultKey` carries no runtime accessors below the step, so a
+substitution working from the node (`decodingDefaultField`'s `inner`) can't walk
+a struct, a record, a tuple or a union there. A read walks the declared schema
+(`.to`) instead: `legacyReads` on an entity, `decodeOnly` on an aggregate's read,
+write and state schemas. An encoder doesn't, so what's stored stays what it was,
+and it falls back to the read's reach only for a value the field's own schema
+refuses. That's why `Schema.Date` and `Schema.Redacted` in such a container are
+refused at load (`EDD-9125`): a read reaches them and a write doesn't. A check
+added after the step isn't on `.to`, so a schema enforcing checks keeps `inner`.
+
+**`Schema.optionalKey` over a union.** `optionalField` gives the first member as
+`inner`, as it always has, and the whole union as `union`. A write substitutes
+`inner` only and writes the later members as declared, so what's stored for each
+member is what it has always been: `Union([DateTimeUtc, String])` stores a string
+for a date, `Union([String, DateTimeUtc])` stores Effect's internal form, and
+moving either would be a stored-format change. A path write follows the same line
+(`originalAt`'s `asDeclared`), and an `append` finds the first member holding a
+list. A value of a later member is written as that member, even one the first
+could read: until 1.40.0 the first member's decode took it, so `5` under
+`Union([DateTimeUtc, Number])` was stored as a date in 1970. A read tries each
+member in declared order with what it reads inside a union (`declaredOrder`:
+`strictWireKind`, and no canonical date moved ahead), and a first `Schema.BigInt`
+keeps its lift in place, since its row is a number. Whatever the first member read
+as the whole field comes last, so a row it took still reads. An aggregate stores a
+first date transform in its date encoding, not its wire form, so that's read in
+its place too, and the same for a date in a union of nothing else but `Schema.Null`
+or another date, whatever it declares (`holdsOnlyDates`). A later `Schema.Date` or `Schema.Redacted` is refused at load
+(`EDD-9125`): written as declared, its value is lost. `Schema.optional(Union)` is
+one member, the union, and every member of it is substituted.
 
 **Zoned offsets.** A zoned date stored as `…+05:00` (an offset zone, no
 bracket) is rebuilt with that offset; before #133 it was rebuilt as UTC. One
@@ -2860,7 +2903,7 @@ The names `.remove` refuses by configuration (immutable, sparse map) can't be de
 
 The write half is the marshaller (`Marshaller.toAttributeMap`), the single choke point every item passes. It marshals; only if that throws does it strip empty sets from maps and retry, which leaves `undefined` to `removeUndefinedValues` as before. A top-level operand (`toAttributeValue`) has no attribute to leave out, so it still throws, and the update path normalises operands first (`normalizeNoStoredForm`): `.set` of one is a clear, `.add` / `.deleteFromSet` / `pathAdd` / `pathDelete` of an empty set does nothing, and `pathSet` of one is a `pathRemove`.
 
-The read half is `substituteSchemaDeep` under `absentReads`, which wraps a struct field with `Schema.withDecodingDefaultKey`, at any depth, in the entity read schemas and the aggregate's `decodeSchema`. A default decodes through the field, so each read gets its own set, and a `.check()` refusing the value leaves the field required: `absentReading` is `undefined` for it, `rowCanLack` is false, and clearing it is refused. A lenient union member can't take a later member's row, because each member is tried strictly first; a `oneOf` union stays as declared, since a lenient copy would make two members match. An event, its metadata, a snapshot state and an outbox effect read through `readingAbsentValues`, the same walk with nothing else substituted: the marshaller would otherwise turn an empty set in an event from a failed write into a stream that can't be read. It follows the stored side: a set stored as a list stores its empty list, and a `Schema.HashSet` can't be stored at all, empty or not.
+The read half is `substituteSchemaDeep` under `absentReads`, which wraps a struct field with `Schema.withDecodingDefaultKey`, at any depth, in the entity read schemas and the aggregate's `decodeSchema`. A default decodes through the field, so each read gets its own set, and a `.check()` refusing the value leaves the field required: `absentReading` is `undefined` for it, `rowCanLack` is false, and clearing it is refused. A lenient union member can't take a later member's row, because each member is tried strictly first; a `oneOf` union stays as declared, since a lenient copy would make two members match. An event, its metadata, a snapshot state and an outbox effect read through `readingStreamValues`, the same walk with nothing else substituted except dates (see **Dates on a stream**): the marshaller would otherwise turn an empty set in an event from a failed write into a stream that can't be read. It follows the stored side: a set stored as a list stores its empty list, and a `Schema.HashSet` can't be stored at all, empty or not.
 
 The places the rule can't reach: a list element can't be absent without moving the elements after it, so an empty set in a list or a tuple is refused. A record entry holding an empty set loses its key. `UndefinedOr(ReadonlySet)`: absent can mean only one thing, `undefined`, so an empty set reads back `undefined`. A `.select()` is raw, so absent stays absent. `Schema.suspend`, opaque classes (`X.check()`, `X.annotate()`) and what's beneath a container's decoding default aren't walked, as for all nested substitution, so absent there stays a decode failure. In expressions, `eq` / `ne` with an empty set compile to `attribute_not_exists` / `attribute_exists`, and any other comparison with one is refused (`emptyPartProblem`).
 
@@ -3699,6 +3742,72 @@ legacy row is rewritten in wire form only when an `update` changes its
 decomposed group, because the diff compares decomposed (re-encoded) groups and a
 no-op update writes nothing.
 
+**Dates on a stream.** Nothing substitutes a date in an event, metadata, a
+snapshot state or an outbox effect, so it's stored as the map the marshaller makes
+of it (a class instance is marshalled with `for...in`, which skips functions), and
+Effect's guard (`DateTime.isDateTime`) looks only for the marker, so the plain map
+passed as a `DateTime` and threw once used. `readingStreamValues` adds a second
+pass after the absent-read one, `readingMarshalled`, at the AST level so nothing about
+the write side or an entity path can change: each `Schema.DateTimeUtc` /
+`Schema.DateTimeZoned` declaration, kept through brand, check and annotate, in any
+struct, list, record, union, class, `Schema.suspend` (lazily, memoised, so
+recursion ends) or declaration's type parameters such as `Schema.Option`, becomes
+`Unknown` decoding through a rebuild into the declaration. The rebuild takes a
+plain object with the right `_tag` and the `~effect/DateTime` or
+`~effect/time/DateTime` marker, and hands anything else on unchanged, so the
+declaration's guard, checks and message still decide, and a union member that
+doesn't take the value still loses it to the next one. That also means a struct
+member listed first takes a date's fields, as it always did. `Schema.Unknown`
+isn't touched: nothing declares a date there.
+
+A real date then has to be accepted wherever a read date was. Under
+`DynamoModel.Packed`, `stringifyStrict` refused an instance and let the plain
+look-alike through, so a read date packed and a new one was refused; `JSON.stringify`
+would call its `toJSON` and store ISO text, which the declaration refuses on read.
+So `check` accepts a real `DateTime` and `storingDates` stores it as `storedDate`:
+the same keys, in the order DynamoDB Local hands the map back, so what's packed from
+a date a read returned doesn't move by a byte (`fixtures/stream-dates-1.39.0.json`,
+stored by the published 1.39.0, pins this). Real DynamoDB's map order isn't
+guaranteed, so that text was never fixed on that path. Anything else JSON can't
+represent is refused as before, beside a date too.
+
+**BigInts on a stream.** `Schema.BigInt` goes through the same pass: a number
+becomes a `bigint` before the node (`liftingMarshalledBigInt`, using the entity rule
+`legacyBigInt`), and anything else, a fraction included, is handed on for the guard
+to refuse. It's stored as a number, as it was, so nothing moves and rows already
+stored read. A union member that takes the number keeps it, since each member gets
+its own try, so a union in which something else is stored as a number can't be
+told apart: `5n` and `5` are the same row. `hasBigintBesideANumber` refuses those at
+load (`EDD-9125`, `BIGINT_BESIDE_A_NUMBER`), for every ordered pair of members and
+for a stream's events as one union, looking through the encoded side and forcing
+what's suspended. It's cautious where it can't see in: a struct holding a bigint
+beside one of Effect's other declarations, or `Schema.Option(Schema.BigInt)` beside a
+struct, is refused too. Packed storage doesn't change: `stringifyStrict` refuses a
+`bigint`, so a packed stream's append fails with nothing written, as it did, and a
+number already packed reads lifted.
+
+**Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
+`Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
+can. `holdsCustomDeclaration` finds a declaration with no `representation` id (and
+not a `Schema.Class`, which has an encoding) on the stored side when a member is
+built, and `internal/RoundTrip.ts` holds the check: the real marshaller and
+unmarshaller, then the read schema. The test is whether it decodes, never whether
+it's an instance, since `Schema.Cause`, `Schema.Graph`, `Schema.TimeZone` and an
+empty `Schema.HashSet` all are instances and read back, and a duck-typed declaration
+that takes the map keeps writing. A value the marshaller refuses is left to
+`marshalOrFail` (`EDD-9124`). The choke points are `encodeForWrite` and
+`_refuseNotReadBack` on an entity (`validateAndBuildPutItem` for Batch and
+`TransactWriteOps`), `notReadBackOperand` for an update's stored operands
+(`.append`, `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists`; `.add`,
+`.subtract` and `.deleteFromSet` apply a value, they don't store it),
+`refuseNotReadBack` on an aggregate, which runs the real `assembleAggregate` over the
+marshalled groups so a custom `decompose` and packed edges are covered,
+`encodeToWire` on a stream and `outboxItems` for an outbox. A member holding no custom
+declaration has no check object at all, so its requests don't change and it pays
+for the scan alone. `CustomDeclarationWrites.test.ts` fails on a write path that isn't
+in `test/helpers/CustomDeclarationPaths.ts`, and on a new `Schema.encode` call
+anywhere that writes. Rows already stored aren't touched and still fail on read.
+
 **Stored-type change.** Because the gate now looks through `optional` /
 `NullOr` and into refs, some attributes that ≤1.22.0 stored in domain form are
 now encoded: a top-level `optional` / `NullOr` around a non-date transform, and
@@ -3811,7 +3920,7 @@ configuration that could add one (#98).
    rewritten row is stamped, and a row the diff left keeps its value. When a node
    declares a stamp, the result is assembled from the rows written, with no I/O. When
    none does, it's the decoded value, and nothing extra runs.
-7. **A `many` edge with a custom `decompose`.** `fillStamps` works on the value as the model has it, before it's decoded (`fillRows`). With `decompose` and `assemble` it takes the value apart, fills each row and puts it back, so a `Schema.Record` of rows is stamped like an array, and its rows' fields are read from the record's value schema (`manyElementFields`, `extractKeyedValue`), so a date in one is stored in its own form. A value they can't take apart or put back is left for the schema to report. Two can't be filled: a value with `decompose` and no `assemble` that isn't an array (there's no way to put its rows back, nor does it read back), and an opaque field (`Schema.Unknown`) with no `entity`, where nothing says what its rows hold, so they're stamped and it's stripped on read, as a row that doesn't declare the date. A `Schema.ReadonlyMap` doesn't get this far: it's refused at load (`EDD-9125`).
+7. **A `many` edge with a custom `decompose`.** `fillStamps` works on the value as the model has it, before it's decoded (`fillRows`). With `decompose` and `assemble` it takes the value apart, fills each row and puts it back, so a `Schema.Record` of rows is stamped like an array, and its rows' fields are read from the record's value schema (`manyElementFields`, `extractKeyedValue`), so a date in one is stored in its own form. A value they can't take apart or put back is left for the schema to report. Two can't be filled: a value with `decompose` and no `assemble` that isn't an array (there's no way to put its rows back, nor does it read back), and an opaque field (`Schema.Unknown`) with no `entity`, where nothing says what its rows hold, so they're stamped and it's stripped on read, as a row that doesn't declare the date. A `Schema.ReadonlyMap`, `Schema.HashMap` or `Schema.Chunk` field works here, as it doesn't anywhere else (`EDD-9125`), because its collection is rows and is never stored itself.
 8. **The input matches what `create` takes, at every row.** A `one` edge with an `entity` takes an id (`venueId`), which `create` fetches and denormalises. One with no `entity` has nothing to fetch by, so it takes the value under its field name, with its stamps optional: the derived `inputSchema` (`deriveWithStamps`, `rowInput`) and the type (`AggregateInputType`, `_IsValueEdge`) agree. A `Schema.Record` `many` edge's values have optional stamps too (`keyedInput`, `_TransformManyEdge`), and its `sk.composite` names are checked against them (`ManyEdgeSkPaths`). Any other object field takes any name there: its rows are whatever its `decompose` makes, and a scalar field has no rows and takes none.
 
 **A key with no value.** A composite of an aggregate key can be optional. What happens without a value depends on what the key does:
@@ -5510,9 +5619,10 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |
 | `EDD-9124` | `Marshaller.ts` (`UnstorableValue`), through `marshalOrFail` and `unstorableIn`; `internal/Expr.ts` | A value has no DynamoDB form: a number that's `NaN`, `±Infinity` or past `Number.MAX_SAFE_INTEGER`, an unsupported type, an empty set in a list or tuple, or one a comparison other than `eq` / `ne` holds. A `ValidationError`, on any write, condition or filter, with nothing sent. Was a defect. An empty set on a field that can read as one isn't refused: it's stored absent (§7). |
-| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseReadonlyMaps`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds a `Schema.ReadonlyMap`, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. It's stored as a DynamoDB map, which reads back as a plain object, so the row doesn't decode. Refused at load, naming the path and pointing to `Schema.Record`. A map whose stored side is something else (a transform from a record, `Schema.toCodecJson`) isn't refused. |
+| `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal, a transformation over `Schema.BigInt`. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container: `Schema.Date`, `Schema.Redacted`. `Schema.BigInt` on an entity or an aggregate under those, and on a stream, a snapshot and an outbox a union in which something else is stored as a number (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field, or another event), since `5n` and `5` are stored the same. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
+| `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 
-Next free code: **`EDD-9126`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: **`EDD-9127`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

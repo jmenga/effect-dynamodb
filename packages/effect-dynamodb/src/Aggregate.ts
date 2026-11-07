@@ -41,6 +41,7 @@ import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityCo
 import {
   buildDateTransform,
   containsWireTransform,
+  type DeepSubstitutionOptions,
   matchDateRepresentation,
   optionalField,
   substituteSchemaDeep,
@@ -53,7 +54,8 @@ import {
   extractArrayElement,
   getSchemaFields,
   hasEncodingTransformation,
-  refuseReadonlyMaps,
+  holdsCustomDeclaration,
+  refuseUnreadable,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -87,6 +89,7 @@ import { asReadGuard } from "./internal/ExpressionLimits.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
+import { notReadBack } from "./internal/RoundTrip.js"
 import { generateTimestampPrimitive, marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
@@ -153,6 +156,7 @@ import {
   deriveAggregateSchemas,
   deriveEntityFieldName,
   isFieldOptional,
+  manyEdgePaths,
   manyElementFields,
   refuseAggregateKeyOverMovingValue,
   refuseManySortKeysOverMovingValue,
@@ -742,7 +746,9 @@ export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
 ): SubAggregate<TSchema> | Aggregate<TSchema, Record<string, unknown>> {
-  refuseReadonlyMaps(`Aggregate "${config.root.entityType}"`, unwrapModel(schema))
+  refuseUnreadable(`Aggregate "${config.root.entityType}"`, "aggregate", unwrapModel(schema), {
+    manyEdges: manyEdgePaths(config.edges),
+  })
   if (!("table" in config) || config.table === undefined) {
     // Sub-aggregate form
     return makeSubAggregate(schema, config as SubAggregateConfig)
@@ -784,42 +790,39 @@ type ASTNode = Record<string, unknown> & {
 }
 
 /**
- * Infer date encoding from a schema AST, handling Schema.optional() wrappers.
+ * The date encodings a schema AST holds, handling Schema.optional() wrappers: one, or one per date
+ * member of a union, in the order they're declared.
  * Optional fields have Union AST with [InnerType, Undefined] — unwrap to find dates.
  */
-const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined => {
+const inferDateEncodings = (ast: Schema.Top["ast"]): ReadonlyArray<DynamoEncoding> => {
   // Try SchemaAST.resolve first (works for non-optional date fields)
   const resolved = SchemaAST.resolve(ast) as ASTNode | undefined
   if (resolved) {
     const direct = matchDateRepresentation(resolved)
-    if (direct) return direct
+    if (direct) return [direct]
   }
   // Handle optional wrapper: Union with Undefined + inner type.
   // SchemaAST.resolve returns undefined for Union ASTs, so check the raw AST.
   const rawAst = ast as unknown as ASTNode
-  if (rawAst._tag === "Union" && rawAst.types) {
-    for (const member of rawAst.types) {
-      if (member._tag === "Undefined") continue
-      // Try SchemaAST.resolve on the inner member (e.g., Declaration for Schema.Date)
-      const memberResolved = SchemaAST.resolve(member as unknown as Schema.Top["ast"]) as
-        | ASTNode
-        | undefined
-      if (memberResolved) {
-        const enc = matchDateRepresentation(memberResolved)
-        if (enc) return enc
-      }
-      // Fallback: check raw member annotations (same record shape, nested under .annotations)
-      const enc = matchDateRepresentation(member.annotations)
-      if (enc) return enc
-    }
-  }
-  return undefined
+  if (rawAst._tag !== "Union" || !rawAst.types) return []
+  return rawAst.types.flatMap((member) => {
+    if (member._tag === "Undefined") return []
+    // Try SchemaAST.resolve on the inner member (e.g., Declaration for Schema.Date)
+    const memberResolved = SchemaAST.resolve(member as unknown as Schema.Top["ast"]) as
+      | ASTNode
+      | undefined
+    // Fallback: check raw member annotations (same record shape, nested under .annotations)
+    const encoding =
+      (memberResolved ? matchDateRepresentation(memberResolved) : undefined) ??
+      matchDateRepresentation(member.annotations)
+    return encoding ? [encoding] : []
+  })
 }
 
 /**
  * A union that holds a date member alongside a member that is neither a date
  * nor `Undefined` / `Null` — `Union([DateTimeUtcFromString, Number])`.
- * `inferDateEncoding` looks through unions to find the date in `optional(date)`,
+ * `inferDateEncodings` looks through unions to find the date in `optional(date)`,
  * so it reports such a field as a date, and encoding a `5` through a date
  * transform throws. Its stored form is the union's own business: it is encoded
  * member by member through the substituted union instead.
@@ -853,10 +856,24 @@ const dateAttrEncoder = (
   options?: { readonly mixedUnions?: boolean },
 ): ((value: unknown) => unknown) | undefined => {
   if (options?.mixedUnions !== true && isMixedDateUnion(fieldSchema.ast)) return undefined
-  const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
-  if (!encoding) return undefined
-  const encode = Schema.encodeUnknownSync(buildDateTransform(encoding) as Schema.Codec<any>)
-  return (value) => encode(value)
+  const explicit = DynamoModel.getEncoding(fieldSchema)
+  const encodings = explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)
+  const last = encodings.at(-1)
+  if (!last) return undefined
+  // A union of dates of different kinds: a value is stored in the form of the kind it is.
+  const earlier = encodings
+    .slice(0, -1)
+    .map((encoding) =>
+      Schema.encodeUnknownOption(buildDateTransform(encoding) as Schema.Codec<any>),
+    )
+  const encode = Schema.encodeUnknownSync(buildDateTransform(last) as Schema.Codec<any>)
+  return (value) => {
+    for (const encodeEarlier of earlier) {
+      const encoded = encodeEarlier(value)
+      if (Option.isSome(encoded)) return encoded.value
+    }
+    return encode(value)
+  }
 }
 
 /**
@@ -941,17 +958,32 @@ const buildAttrEncoders = (
     // 2. Encode through the read path's own (substituted, tolerant) schema. A
     //    one-field struct carries the field's optionality and lets `resolveRef`
     //    re-point the field itself, exactly as it does inside `decodeSchema`.
-    const substituted = substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
-      tolerantTransforms: true,
-      resolveRef,
-    }) as unknown as Schema.Codec<any>
-    const encodeSubstituted = Schema.encodeUnknownOption(substituted)
-    const own = ownAttrEncoder(fieldSchema)
-    encoders[field] = (value) => {
-      const encoded = encodeSubstituted({ [field]: value })
-      if (Option.isSome(encoded)) return (encoded.value as Record<string, unknown>)[field]
-      return own(value)
+    const encoderOver = (options: DeepSubstitutionOptions) => {
+      const encode = Schema.encodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+          ...options,
+          tolerantTransforms: true,
+          resolveRef,
+        }) as unknown as Schema.Codec<any>,
+      )
+      return (value: unknown) => {
+        const encoded = encode({ [field]: value })
+        return Option.isSome(encoded)
+          ? Option.some((encoded.value as Record<string, unknown>)[field])
+          : Option.none()
+      }
     }
+    const encodeSubstituted = encoderOver({})
+    // A read reaches beneath a decoding default and this doesn't, and what it takes there isn't
+    // always what the field's own schema takes: a redacted value of another label. What's stored
+    // is the first's; this only keeps such a value from being marshalled as it is.
+    const encodeAsRead = encoderOver({ decodeOnly: true })
+    const own = ownAttrEncoder(fieldSchema)
+    encoders[field] = (value) =>
+      encodeSubstituted(value).pipe(
+        Option.orElse(() => encodeAsRead(value)),
+        Option.getOrElse(() => own(value)),
+      )
   }
   return encoders
 }
@@ -1350,6 +1382,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // such leaf at all (zero overhead).
   const decodeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
     absentReads: true,
   }) as unknown as Schema.Codec<any>
@@ -1359,17 +1392,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // a row written while those checks were not enforced must stay readable.
   const writeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
     enforceChecks: true,
   }) as unknown as Schema.Codec<any>
 
-  // `update`'s mutated state: the plain state a mutation is handed holds a set as a list
-  // (`Schema.toIso`), and it can hand that straight back.
+  // `update`'s mutated state: the plain state a mutation is handed holds a set as a list and
+  // an `Option` as a tagged object (`Schema.toIso`), and it can hand that straight back.
   const mutatedStateSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
     enforceChecks: true,
-    listedSets: true,
+    plainStateForms: true,
   }) as unknown as Schema.Codec<any>
 
   // Validate the collection index against the table's primary key. Best effort: a
@@ -1573,6 +1608,45 @@ const makeAggregate = <TSchema extends Schema.Top>(
           : [...(yield* read(from)), ...(rekeyRead?.fromOnly === true ? [] : yield* read(pkValue))]
       return { client, tableConfig, pkValue, allItems }
     })
+
+  const holdsCustom = holdsCustomDeclaration(schema.ast)
+
+  /**
+   * Refuses the rows of a write that wouldn't read back, for an aggregate holding a custom declaration
+   * (`EDD-9126`): the rows it's about to write, through the read path a `get` takes. An aggregate with
+   * none has nothing to do here.
+   */
+  const refuseNotReadBack = (
+    groups: ReadonlyArray<{ readonly items: ReadonlyArray<Record<string, AttributeValue>> }>,
+    key: Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> =>
+    !holdsCustom
+      ? Effect.void
+      : Effect.gen(function* () {
+          const rows = groups.flatMap((group) =>
+            group.items.map((item) => fromAttributeMap(item) as Record<string, unknown>),
+          )
+          yield* unpackAggregateItems(rows, dispatchByType, aggregateName)
+          yield* assembleAggregate(
+            decodeSchema,
+            rootNode,
+            rows,
+            contextFields,
+            key,
+            aggregateName,
+            systemAttrs,
+          ).pipe(
+            Effect.mapError(
+              (error) =>
+                new ValidationError({
+                  entityType: aggregateName,
+                  operation,
+                  cause: notReadBack("The aggregate", (error as ValidationError).cause ?? error),
+                }),
+            ),
+          )
+        })
 
   /** Shared: compose PK and query all items, a rejected read a `ValidationError`. */
   const fetchPartition = (key: Record<string, unknown>, operation: string, rekeyRead?: RekeyRead) =>
@@ -1825,6 +1899,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           stampFor(now, existingCreated, undefined, updatedBefore),
         ),
       )
+      yield* refuseNotReadBack(newDynamo, key, "aggregate.update")
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
       const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
@@ -2523,6 +2598,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               stampFor(now, EMPTY_CREATED),
             ),
           )
+          yield* refuseNotReadBack(dynamoGroups, assembled, "aggregate.create")
 
           // 6. Write via sub-aggregate transactions. The root item goes first in
           //    the first transaction, guarded by `attribute_not_exists` (#134):

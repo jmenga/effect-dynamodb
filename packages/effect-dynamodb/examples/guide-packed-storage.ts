@@ -22,7 +22,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Config, Console, DateTime, Effect, Layer, Option, Schema } from "effect"
+import { Config, Console, DateTime, Effect, Equal, Layer, Option, Schema } from "effect"
 import { Base64 } from "effect/encoding"
 
 // Import from source (use "effect-dynamodb" and "effect-dynamodb/compression/zlib" when published)
@@ -163,6 +163,20 @@ const Ledger = EventStore.makeStream({
     // Snapshot state as JSON, zstd-compressed from 1 KB (the default threshold)
     storedAs: DynamoModel.Packed({ format: "json", compression: { codec: "zstd" } }),
   },
+})
+// #endregion
+
+// #region stream-date
+class Scheduled extends Schema.TaggedClass<Scheduled>()("Scheduled", {
+  at: Schema.DateTimeUtc,
+}) {}
+
+const Schedule = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Schedule",
+  events: [Scheduled],
+  streamId: { composite: ["scheduleId"] },
+  storedAs: { data: DynamoModel.Packed({ format: "json" }) },
 })
 // #endregion
 
@@ -423,6 +437,24 @@ const program = Effect.gen(function* () {
     `snapshot state: ${formOf(snapshotItem.state)} ${snapshotItem.state?.B?.length} bytes ` +
       `(JSON ${JSON.stringify(latest).length} bytes)`,
   )
+
+  // #region stream-date-append
+  const at = DateTime.makeUnsafe("2025-01-01T00:00:00.000Z")
+  const scheduleId = { scheduleId: "S-1" }
+  yield* Schedule.append(scheduleId, [new Scheduled({ at })], 0)
+
+  // A date a read returned can be written back as it is
+  const scheduled = yield* Schedule.read(scheduleId)
+  yield* Schedule.append(
+    scheduleId,
+    scheduled.map((event) => new Scheduled({ at: event.data.at })),
+    1,
+  )
+  // #endregion
+  for (const event of yield* Schedule.read(scheduleId)) {
+    assertEq(Equal.equals(event.data.at, at), true, "a date comes back real")
+    assertEq(DateTime.getPart(event.data.at, "year"), 2025, "a real date's functions work")
+  }
 
   // #region missing-codec
   // A reader that registered only gzip meets the zstd-compressed snapshot state.

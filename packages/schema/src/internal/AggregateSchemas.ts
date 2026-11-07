@@ -372,6 +372,29 @@ export const deriveElementInputSchema = (
 }
 
 /**
+ * The paths of an aggregate's `many` edges, sub-aggregates included. The collection such a field is
+ * declared as is taken apart by `decompose` and put back by `assemble`, so it's never stored itself.
+ */
+export const manyEdgePaths = (
+  edges: Readonly<Record<string, unknown>> | undefined,
+  at = "",
+): ReadonlySet<string> => {
+  const paths = new Set<string>()
+  for (const [name, edge] of Object.entries(edges ?? {})) {
+    const path = at === "" ? name : `${at}.${name}`
+    const tagged = edge as {
+      readonly _tag?: string
+      readonly aggregate?: { readonly edges?: Readonly<Record<string, unknown>> }
+    }
+    if (tagged._tag === "ManyEdge") paths.add(path)
+    if (tagged._tag === "BoundSubAggregate") {
+      for (const nested of manyEdgePaths(tagged.aggregate?.edges, path)) paths.add(nested)
+    }
+  }
+  return paths
+}
+
+/**
  * Unwrap a ConfiguredModel to get the raw Schema.Class model.
  * ConfiguredModel wraps the original model with DynamoDB-specific overrides
  * (field renaming, storage encoding) and has shape { model: M, attributes: ... }.

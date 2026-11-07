@@ -575,6 +575,7 @@ export const validateAndBuildPutItem = (
           }),
       ),
     )
+    yield* entity._refuseNotReadBack(encoded, operation)
 
     const item: Record<string, unknown> = { ...(encoded as Record<string, unknown>) }
     item.__edd_e__ = entity.entityType

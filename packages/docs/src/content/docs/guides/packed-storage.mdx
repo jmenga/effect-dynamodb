@@ -355,6 +355,8 @@ Native, JSON and compressed values of the same field therefore decode through th
 
 **JSON only.** A value that isn't JSON is refused when it's written, with a `ValidationError` that names the field, the path inside it and the type. That covers `bigint`, `Uint8Array` and other binary, `Set`, `Map`, a `Date` or other class instance, non-finite numbers, `undefined` inside an array, symbols and functions. An `undefined` property is omitted, as it is from a map. A field that needs one of these should stay native, or use a JSON-shaped schema such as `Schema.BigIntFromString`, `Schema.Uint8ArrayFromBase64` or an array instead of a set.
 
+A `DateTime` is the one instance a packed value takes. Where a schema has already encoded it, as an entity field does, there's nothing to take: it's text by then. Where nothing has, it's stored as the JSON of the map a native field holds, so one value reads back the same from every form. That's event data and snapshot state on a stream, which comes back as a real `DateTime` wherever the schema declares one, and a `Schema.Unknown` field, which comes back as the map.
+
 ## EventStore streams
 
 ```typescript region="stream" example="guide-packed-storage.ts"
@@ -414,6 +416,38 @@ const { snapshot, version } = yield* Ledger.readLatest(id)
 ```
 
 `append` and `commandHandler` encode each event, and compress it when that's configured. Every read path decodes by stored form: `read`, `readFrom`, `currentVersion`, `readLatest` (including snapshot replay), `readSnapshot`, `readIndex`, `query.events` and `query.index`. In this example the 2,967-byte JSON of the inline snapshot's state is stored as 213 bytes.
+
+### Dates in event data and snapshot state
+
+A date in event data or a snapshot state can be new, or one a read returned. They're stored the same way, and every read gives back a real `DateTime`, including from rows an earlier release packed.
+
+```typescript region="stream-date" example="guide-packed-storage.ts"
+class Scheduled extends Schema.TaggedClass<Scheduled>()("Scheduled", {
+  at: Schema.DateTimeUtc,
+}) {}
+
+const Schedule = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Schedule",
+  events: [Scheduled],
+  streamId: { composite: ["scheduleId"] },
+  storedAs: { data: DynamoModel.Packed({ format: "json" }) },
+})
+```
+
+```typescript region="stream-date-append" example="guide-packed-storage.ts"
+const at = DateTime.makeUnsafe("2025-01-01T00:00:00.000Z")
+const scheduleId = { scheduleId: "S-1" }
+yield* Schedule.append(scheduleId, [new Scheduled({ at })], 0)
+
+// A date a read returned can be written back as it is
+const scheduled = yield* Schedule.read(scheduleId)
+yield* Schedule.append(
+  scheduleId,
+  scheduled.map((event) => new Scheduled({ at: event.data.at })),
+  1,
+)
+```
 
 ### Raw rows and filters
 
