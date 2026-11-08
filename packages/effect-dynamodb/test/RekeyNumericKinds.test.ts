@@ -48,10 +48,40 @@ const on = <A, E>(
   >
 }
 
+const N = (m: number) => String(m).padStart(16, "0")
+
 describe("rekey moves rows under the other numeric kind's text (EDD-9128)", () => {
   for (const scenario of scenarios) {
     it.effect(scenario.name, () => on(scenario.Kind, (db, keys) => scenario.check(db, keys)))
   }
+
+  it.effect("rows under their current keys cost no read of the other kind's keys", () => {
+    const { Counters, Main } = definitions(Schema.Number)
+    const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Counters },
+        tables: { Main },
+      } as never) as Effect.Effect<any, never, any>
+      for (const n of [1, 2, 3]) {
+        yield* db.entities.Counters.put({ id: `i${n}`, n, m: n, note: "x" }).asEffect()
+      }
+      table.take()
+      const report = yield* db.tables.Main.rekey()
+      // The items; a sentinel is its item's.
+      expect(report.unchanged).toBe(3)
+      const sentinelReads = table
+        .take()
+        .filter((request) => request.command === "GetItem")
+        .map((request) => request.input.Key.pk.S as string)
+        .filter((pk) => pk.startsWith("$kin#v1#counters.bym#"))
+      // Each item's sentinel, under its current key, and no key under the other kind's text.
+      expect(sentinelReads.sort()).toEqual([1, 2, 3].map((m) => `$kin#v1#counters.bym#${N(m)}`))
+    }).pipe(
+      Effect.provide(Main.layer({ name: "t" })),
+      Effect.provide(table.layer),
+    ) as Effect.Effect<void, unknown>
+  })
 
   it.effect("a dry run counts the same moves and writes nothing", () =>
     on(Schema.Number, (db, keys) =>

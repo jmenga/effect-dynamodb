@@ -1005,8 +1005,10 @@ its values as read back: an item, its index keys and vector partitions, its uniq
 its key is read with a numeric composite as the other kind when the declared reading fits nothing
 (`readAsOtherNumericKind`). Two items whose values read back as one item (`3` and `3n`) are the
 conflict `bothKeys`, and both are left. A key with no numeric composite has one variant, and nothing
-changes for it. A unique constraint over one has more candidate keys, and each costs `rekey` a
-consistent read.
+changes for it. An item or tombstone under its current key doesn't read its sentinels' keys under
+the other kind's text, which would cost a read per item on every run: the scan reaches such a
+sentinel, and its own handler moves it (`sentinelsUnderOtherKind`). A row that moves looks there,
+since its sentinels name its old key.
 
 An event's sort key is composed from the `orderBy` value `append` stored, the Encoded value: a
 `Schema.BigInt` is read back below 2^53 as a number and lifted (`storedNumericForm`). Through 1.39.0

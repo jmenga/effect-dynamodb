@@ -12531,7 +12531,16 @@ const makeImpl = <
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
         const sentinels =
           kind === "tombstone"
-            ? yield* sentinelRekeys(ctx, kind, values, read!, targets.lives, targets.live, depth)
+            ? yield* sentinelRekeys(
+                ctx,
+                kind,
+                values,
+                read!,
+                targets.lives,
+                targets.live,
+                depth,
+                true,
+              )
             : NO_SENTINEL_REKEYS
         if (ctx.dryRun) {
           return Rekey.mergeTallies(countMove(ctx, kind, to, tally), sentinels.tally, {
@@ -12926,7 +12935,7 @@ const makeImpl = <
         tally = Rekey.mergeTallies(tally, room.tally)
         if (!room.cleared) return tally
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
-        const sentinels = yield* sentinelRekeys(ctx, "item", values, read!, [from], to, depth)
+        const sentinels = yield* sentinelRekeys(ctx, "item", values, read!, [from], to, depth, true)
         tally = Rekey.mergeTallies(tally, sentinels.tally)
         if ((sentinels.tally.conflicts ?? []).length > 0) return tally
         const failed = (error: ValidationError) =>
@@ -13246,7 +13255,7 @@ const makeImpl = <
         row = fresh
       }
       const repair = yield* repairIndexKeys(ctx, left, at)
-      const sentinels = yield* rekeySentinels(ctx, "item", row, [at], at, depth)
+      const sentinels = yield* rekeySentinels(ctx, "item", row, [at], at, depth, false)
       const refused = heldBackIndexKeys(at, uncomposable)
       return Rekey.mergeTallies(
         rewritten ||
@@ -13332,7 +13341,7 @@ const makeImpl = <
   }
   /**
    * The keys a unique sentinel of `source`'s values, read from `row`, can be stored under, other
-   * than `current`: under each text, and with a numeric value as the other kind.
+   * than `current`: under each text, and with `otherKinds`, with a numeric value as the other kind.
    */
   const otherSentinelKeys = (
     constraintName: string,
@@ -13340,6 +13349,7 @@ const makeImpl = <
     source: globalThis.Record<string, unknown>,
     row: StoredRow,
     current: { readonly pk: string; readonly sk: string } | undefined,
+    otherKinds: boolean,
   ) => {
     // Each value as its field's kind, which the other kind is then the other of.
     const lifted = { ...source }
@@ -13347,7 +13357,9 @@ const makeImpl = <
       const value = storedSentinelValue(field, source[field])
       if (value !== undefined) lifted[field] = value
     }
-    const variants = numericKindVariants(row, lifted)
+    const variants = otherKinds
+      ? numericKindVariants(row, lifted)
+      : [{ record: lifted, asOther: new Set<string>() as ReadonlySet<string> }]
     const others: Array<{ readonly pk: string; readonly sk: string }> = []
     for (const under of [
       KeyText136.schema136(schema),
@@ -13405,6 +13417,13 @@ const makeImpl = <
     owners: ReadonlyArray<StoredKey>,
     to: StoredKey,
     depth: number,
+    /**
+     * Look under the other numeric kind's text too (`numericKindVariants`). A moving row's
+     * sentinels are looked for there, since they name its old key. One under its current key
+     * leaves it to the scan to find one there ({@link rekeySentinelRow}): each read it costs is a
+     * read of every item, on every run.
+     */
+    otherKinds: boolean,
   ) =>
     Effect.gen(function* () {
       if (config.unique === undefined) return NO_SENTINEL_REKEYS
@@ -13489,7 +13508,14 @@ const makeImpl = <
               readonly owner: StoredKey
             }
           | undefined
-        for (const key of otherSentinelKeys(constraintName, constraintDef, values, row, current)) {
+        for (const key of otherSentinelKeys(
+          constraintName,
+          constraintDef,
+          values,
+          row,
+          current,
+          otherKinds,
+        )) {
           const held = yield* readAt(key)
           const owner = ownerIn(held)
           if (held !== undefined && owner !== undefined) {
@@ -13618,13 +13644,14 @@ const makeImpl = <
     owners: ReadonlyArray<StoredKey>,
     to: StoredKey,
     depth: number,
+    otherKinds: boolean,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       if (config.unique === undefined) return {}
       const client = yield* Capacity.client
       const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
-        const planned = yield* sentinelRekeys(ctx, kind, values, row, owners, to, depth)
+        const planned = yield* sentinelRekeys(ctx, kind, values, row, owners, to, depth, otherKinds)
         const moved = planned.count > 0 ? { sentinelsMoved: planned.count } : {}
         if (planned.items.length === 0 || ctx.dryRun) {
           return Rekey.mergeTallies(planned.tally, moved)
@@ -13664,18 +13691,28 @@ const makeImpl = <
       )?.[constraintName]
       const at = storedKeyOf(row)
       if (at === undefined) return { skipped: { unrecognizedKey: 1 } }
-      const named = (sentinel: StoredRow, owner: StoredRow) => {
+      const named = (sentinel: StoredRow, owner: StoredRow, otherKinds: boolean) => {
         if (constraintDef === undefined) return false
         const values = toDomainView(fromAttributeMap(owner) as globalThis.Record<string, unknown>)
         const current = sentinelKeyUnder(schema, constraintName, constraintDef, values)
         const stored = storedKeyOf(sentinel)!
         return [
           ...(current === undefined ? [] : [current]),
-          ...otherSentinelKeys(constraintName, constraintDef, values, owner, current),
+          ...otherSentinelKeys(constraintName, constraintDef, values, owner, current, otherKinds),
         ].some((key) => key.pk === stored[rekeyPk] && key.sk === stored[rekeySk])
       }
-      const owner = yield* sentinelOwnerRow(ctx.tableName, row)
-      if (owner !== undefined && named(row, owner)) return {}
+      // Its owner's own pass moves it, except from under the other numeric kind's text, which an
+      // owner under its current key doesn't look under: this one moves it from there.
+      const judge = (sentinel: StoredRow, owner: StoredRow | undefined) =>
+        owner === undefined
+          ? Effect.succeed(undefined)
+          : named(sentinel, owner, false)
+            ? Effect.succeed({})
+            : named(sentinel, owner, true)
+              ? sentinelsUnderOtherKind(ctx, owner)
+              : Effect.succeed(undefined)
+      const judged = yield* judge(row, yield* sentinelOwnerRow(ctx.tableName, row))
+      if (judged !== undefined) return judged
       const client = yield* Capacity.client
       const { Item: fresh } = yield* client.getItem({
         TableName: ctx.tableName,
@@ -13683,10 +13720,29 @@ const makeImpl = <
         ConsistentRead: true,
       })
       if (fresh === undefined) return {}
-      const freshOwner = yield* sentinelOwnerRow(ctx.tableName, fresh)
-      return freshOwner !== undefined && named(fresh, freshOwner)
-        ? {}
-        : { skipped: { unrecognizedKey: 1 } }
+      return (
+        (yield* judge(fresh, yield* sentinelOwnerRow(ctx.tableName, fresh))) ?? {
+          skipped: { unrecognizedKey: 1 },
+        }
+      )
+    })
+
+  /**
+   * The sentinels of `owner`, a row under its current key, brought from under the other numeric
+   * kind's text (`numericKindVariants`). A row under an old key moves them itself when it moves.
+   */
+  const sentinelsUnderOtherKind = (
+    ctx: Rekey.RekeyRowContext,
+    owner: StoredRow,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const targets = rowTargets(owner)
+      const ownerAt = storedKeyOf(owner)
+      if (targets === undefined || ownerAt === undefined) return {}
+      if (!sameStoredKey(ownerAt, targets.current)) return {}
+      return targets.kind === "tombstone"
+        ? yield* rekeySentinels(ctx, "tombstone", owner, targets.lives, targets.live, 0, true)
+        : yield* rekeySentinels(ctx, "item", owner, [ownerAt], ownerAt, 0, true)
     })
 
   /** The entity's `rekey` handler: one scanned row — or one displaced by a move. */
@@ -13733,6 +13789,7 @@ const makeImpl = <
             targets.lives,
             targets.live,
             depth,
+            false,
           )
           return (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
             ? sentinels
