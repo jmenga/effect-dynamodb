@@ -23,6 +23,13 @@
  *   sort key, so B's row belongs where A's is. Both scan orders.
  * - `mixed edges`: a transformed custom `many` edge whose key as written is a `one` edge's.
  *
+ * And against `fixtures/aggregate-decompose-rename-1.39.0.json`, generated the same way, a custom
+ * `decompose` renaming a transformed field (`{ lid, f, note }` stored as `{ lid, g: f, note }`), keyed
+ * by `lid`: `g` is no field of the element, so it's stored as given, and neither reading recomposes
+ * the row stored. As read, the reading 1.39.0 took, a row is the edge's by its key, so `update`
+ * deletes it and `rekey` moves it, as 1.39.0 did. Kinds `x10`, `nested`, `text`; an edge, one with an
+ * `entity`, one of a sub-aggregate.
+ *
  * The other owner's rows are compared byte for byte after every step: no write of one owner may
  * delete, move or rewrite them.
  */
@@ -66,6 +73,14 @@ const ownership = JSON.parse(
 ) as { readonly scenarios: Record<string, Record<string, any>> }
 const atOwnership = (scenario: string, step: string): Step & Record<string, any> =>
   ownership.scenarios[scenario]![step]!
+const renamed = JSON.parse(
+  readFileSync(
+    new URL("../fixtures/aggregate-decompose-rename-1.39.0.json", import.meta.url),
+    "utf8",
+  ),
+) as { readonly scenarios: Record<string, Record<string, any>> }
+const atRenamed = (scenario: string, step: string): Step & Record<string, any> =>
+  renamed.scenarios[scenario]![step]!
 
 /** A table for one world: a client over it, its rows, and a write as another writer's. */
 export interface Opened {
@@ -607,6 +622,74 @@ const mixedDefine = (schema: DynamoSchema.DynamoSchema): Defined => {
   )
   return { table, aggregates: { Agg } }
 }
+
+/** A string prefixed with "x" as it reads. */
+const XText = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.transform((text: string) => `x${text}`),
+    encode: SchemaGetter.transform((text: string) => text.slice(1)),
+  }),
+)
+const renameKinds = {
+  x10: [X10, 50],
+  nested: [Schema.Struct({ n: X10 }), { n: 50 }],
+  text: [XText, "xabc"],
+} as const
+type RenameShape = "plain" | "entity" | "sub"
+const renameDefine =
+  (kind: keyof typeof renameKinds, shape: RenameShape) =>
+  (schema: DynamoSchema.DynamoSchema): Defined => {
+    const line = Schema.Struct({
+      lid: Schema.String,
+      f: renameKinds[kind][0] as typeof Schema.Number,
+      note: Schema.String,
+    })
+    const entity = Entity.make({
+      model: line,
+      entityType: "Line",
+      primaryKey: {
+        pk: { field: "pk", composite: ["lid"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const table = Table.make({ schema, entities: shape === "entity" ? { entity } : {} })
+    const edge = Aggregate.many({
+      entityType: "Line",
+      ...(shape === "entity" ? { entity } : {}),
+      sk: { composite: ["lid"] },
+      decompose: (lines: unknown) =>
+        (lines as ReadonlyArray<{ lid: string; f: unknown; note: string }>).map((l) => ({
+          lid: l.lid,
+          g: l.f,
+          note: l.note,
+        })),
+      assemble: (items: unknown) =>
+        (items as ReadonlyArray<{ lid: string; g: unknown; note: string }>).map((l) => ({
+          lid: l.lid,
+          f: l.g,
+          note: l.note,
+        })),
+    } as any)
+    const nested = Schema.Struct({ lines: Schema.Array(line) })
+    const model = Schema.Struct({
+      id: Schema.String,
+      note: Schema.String,
+      ...(shape === "sub" ? { sub: nested } : { lines: Schema.Array(line) }),
+    })
+    const sub = Aggregate.make(nested, {
+      root: { entityType: "Sub" },
+      edges: { lines: edge },
+    } as any)
+    const Orders = Aggregate.make(model, {
+      schema,
+      table,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "root" },
+      root: { entityType: "Root" },
+      edges: shape === "sub" ? { sub: (sub as any).with({}) } : { lines: edge },
+    } as any)
+    return { table, entities: shape === "entity" ? { entity } : {}, aggregates: { Orders } }
+  }
 
 /** The keys a transaction writes, as `pk|sk`. */
 const transactionKeys = (request: Request): ReadonlyArray<string> =>
@@ -1218,6 +1301,128 @@ export const sharedPartitionSuite = (backend: Backend) => {
           yield* w.opened.close
         }),
       )
+    }
+  })
+
+  describe("a custom decompose renaming a transformed field", () => {
+    type Lines = ReadonlyArray<{ readonly lid: string }>
+    const linesOf = (state: any, shape: RenameShape): Lines =>
+      shape === "sub" ? state.sub.lines : state.lines
+    const withLines = (state: any, shape: RenameShape, lines: Lines) =>
+      shape === "sub" ? { ...state, sub: { ...state.sub, lines } } : { ...state, lines }
+    for (const kind of Object.keys(renameKinds) as Array<keyof typeof renameKinds>) {
+      for (const shape of ["plain", "entity", "sub"] as const) {
+        const scenario = `${kind} ${shape}`
+        const created = atRenamed(scenario, "create").rows
+        const read = (w: {
+          readonly run: <A>(
+            body: (db: any) => Effect.Effect<A, unknown, never>,
+          ) => Effect.Effect<Exit.Exit<A, unknown>>
+        }) =>
+          Effect.map(
+            w.run((db) => db.aggregates.Orders.get({ id: "p q" })),
+            (exit) => resultOf(exit),
+          )
+
+        it.effect(`${scenario}: create stores the rows 1.39.0 stored`, () =>
+          Effect.gen(function* () {
+            const w = yield* world(backend, renameDefine(kind, shape), { name: "rename" })
+            const [value] = [renameKinds[kind][1]]
+            const lines = ["a", "b"].map((lid) => ({ lid, f: value, note: "initial" }))
+            const done = yield* w.step((db) =>
+              db.aggregates.Orders.create({
+                id: "p q",
+                note: "initial",
+                ...(shape === "sub" ? { sub: { lines } } : { lines }),
+              }),
+            )
+            expect(done.rows).toEqual(byKey(created))
+            expect(yield* read(w)).toEqual(atRenamed(scenario, "create get"))
+            yield* w.opened.close
+          }),
+        )
+
+        it.effect(
+          `${scenario}: changing a line, then removing it, leaves the rows 1.39.0 left`,
+          () =>
+            Effect.gen(function* () {
+              const w = yield* world(backend, renameDefine(kind, shape), {
+                name: "rename",
+                seed: created,
+              })
+              for (const [name, mutate] of [
+                [
+                  "change",
+                  (state: any) =>
+                    withLines(
+                      state,
+                      shape,
+                      linesOf(state, shape).map((l) =>
+                        l.lid === "a" ? { ...l, note: "changed" } : l,
+                      ),
+                    ),
+                ],
+                [
+                  "remove",
+                  (state: any) =>
+                    withLines(
+                      state,
+                      shape,
+                      linesOf(state, shape).filter((l) => l.lid !== "a"),
+                    ),
+                ],
+              ] as const) {
+                const done = yield* w.step((db) =>
+                  db.aggregates.Orders.update({ id: "p q" }, ({ state }: any) => mutate(state)),
+                )
+                const expected = atRenamed(scenario, name)
+                expect(done.exit._tag).toBe("Success")
+                expect(done.requests).toEqual(named(expected.requests))
+                expect(done.rows).toEqual(byKey(expected.rows))
+                expect(yield* read(w)).toEqual(atRenamed(scenario, `${name} get`))
+              }
+              yield* w.opened.close
+            }),
+        )
+
+        for (const dryRun of [true, false]) {
+          const name = `rekey${dryRun ? " dry run" : ""}`
+          it.effect(`${scenario}: ${name} moves every row, as stored`, () =>
+            Effect.gen(function* () {
+              const w = yield* world(backend, renameDefine(kind, shape), {
+                name: "rename",
+                escapeKeys: true,
+                seed: created,
+              })
+              const done = yield* w.step((db) =>
+                db.tables.Main.rekey({ repairIndexKeys: true, dryRun }),
+              )
+              const expected = atRenamed(scenario, name)
+              // The rows 1.39.0 moved, counted as it counted them.
+              expect(reportOf(done.exit)).toEqual(expected.report)
+              if (backend.local)
+                expect(unordered(done.commands)).toEqual(unordered(expected.commands))
+              // Each row as it was stored, under the new partition key. 1.39.0 wrote the edge's rows
+              // from their value decoded once more (`g` 500 became 5000), so they read otherwise.
+              expect(done.rows).toEqual(
+                byKey(
+                  dryRun
+                    ? created
+                    : created.map((row) => ({
+                        ...row,
+                        pk: { S: row.pk!.S!.replace("#p q", "#p%20q") },
+                      })),
+                ),
+              )
+              expect(byKey(expected.rows).map((row) => [row.pk, row.sk])).toEqual(
+                done.rows.map((row) => [row.pk, row.sk]),
+              )
+              if (!dryRun) expect(yield* read(w)).toEqual(atRenamed(scenario, "create get"))
+              yield* w.opened.close
+            }),
+          )
+        }
+      }
     }
   })
 }

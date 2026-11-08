@@ -1,0 +1,5915 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "scenarios": {
+  "x10 plain": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": 500,
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": 500,
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": 5000,
+       "note": "initial"
+      },
+      {
+       "lid": "b",
+       "f": 5000,
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": 50000,
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": 50000,
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100353-1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100353-1",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100353-1",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "N": "50000"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100353-1",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "N": "50000"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "50000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "50000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": 500000,
+       "note": "changed"
+      },
+      {
+       "lid": "b",
+       "f": 500000,
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "b",
+        "f": 5000000,
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100353-1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100353-1",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100353-1",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "N": "5000000"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155100353-1",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "5000000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "b",
+       "f": 50000000,
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": 50000,
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": 50000,
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "x10 entity": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": 500,
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": 500,
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": 5000,
+       "note": "initial"
+      },
+      {
+       "lid": "b",
+       "f": 5000,
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": 50000,
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": 50000,
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100484-5",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100484-5",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100484-5",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "N": "50000"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100484-5",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "N": "50000"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "50000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "50000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": 500000,
+       "note": "changed"
+      },
+      {
+       "lid": "b",
+       "f": 500000,
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "b",
+        "f": 5000000,
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100484-5",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100484-5",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100484-5",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "N": "5000000"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155100484-5",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "5000000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "b",
+       "f": 50000000,
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": 50000,
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": 50000,
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "x10 sub": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": 500,
+         "note": "initial"
+        },
+        {
+         "lid": "b",
+         "f": 500,
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "a",
+        "f": 5000,
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": 5000,
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": 50000,
+         "note": "changed"
+        },
+        {
+         "lid": "b",
+         "f": 50000,
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100601-9",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100601-9",
+          "Item": {
+           "__edd_e__": {
+            "S": "Sub"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#sub"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100601-9",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "N": "50000"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100601-9",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "N": "50000"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "50000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "50000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "a",
+        "f": 500000,
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": 500000,
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "b",
+         "f": 5000000,
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100601-9",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100601-9",
+          "Item": {
+           "__edd_e__": {
+            "S": "Sub"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#sub"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100601-9",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "N": "5000000"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155100601-9",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "5000000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "b",
+        "f": 50000000,
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": 50000,
+         "note": "initial"
+        },
+        {
+         "lid": "b",
+         "f": 50000,
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  "nested plain": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 500
+        },
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 500
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": {
+        "n": 5000
+       },
+       "note": "initial"
+      },
+      {
+       "lid": "b",
+       "f": {
+        "n": 5000
+       },
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 50000
+        },
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 50000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100722-13",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100722-13",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100722-13",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "50000"
+             }
+            }
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100722-13",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "50000"
+             }
+            }
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "50000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "50000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": {
+        "n": 500000
+       },
+       "note": "changed"
+      },
+      {
+       "lid": "b",
+       "f": {
+        "n": 500000
+       },
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "b",
+        "f": {
+         "n": 5000000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100722-13",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100722-13",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100722-13",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "5000000"
+             }
+            }
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155100722-13",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "b",
+       "f": {
+        "n": 50000000
+       },
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 50000
+        },
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 50000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "nested entity": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 500
+        },
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 500
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": {
+        "n": 5000
+       },
+       "note": "initial"
+      },
+      {
+       "lid": "b",
+       "f": {
+        "n": 5000
+       },
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 50000
+        },
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 50000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100837-17",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100837-17",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100837-17",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "50000"
+             }
+            }
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100837-17",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "50000"
+             }
+            }
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "50000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "50000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": {
+        "n": 500000
+       },
+       "note": "changed"
+      },
+      {
+       "lid": "b",
+       "f": {
+        "n": 500000
+       },
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "b",
+        "f": {
+         "n": 5000000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100837-17",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100837-17",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100837-17",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "5000000"
+             }
+            }
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155100837-17",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "b",
+       "f": {
+        "n": 50000000
+       },
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 50000
+        },
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 50000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "nested sub": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": {
+          "n": 500
+         },
+         "note": "initial"
+        },
+        {
+         "lid": "b",
+         "f": {
+          "n": 500
+         },
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 5000
+        },
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 5000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": {
+          "n": 50000
+         },
+         "note": "changed"
+        },
+        {
+         "lid": "b",
+         "f": {
+          "n": 50000
+         },
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100951-21",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100951-21",
+          "Item": {
+           "__edd_e__": {
+            "S": "Sub"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#sub"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100951-21",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "50000"
+             }
+            }
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100951-21",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "50000"
+             }
+            }
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "50000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "50000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "a",
+        "f": {
+         "n": 500000
+        },
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": {
+         "n": 500000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "b",
+         "f": {
+          "n": 5000000
+         },
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155100951-21",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155100951-21",
+          "Item": {
+           "__edd_e__": {
+            "S": "Sub"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#sub"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155100951-21",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "M": {
+             "n": {
+              "N": "5000000"
+             }
+            }
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155100951-21",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "b",
+        "f": {
+         "n": 50000000
+        },
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "500"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "M": {
+        "n": {
+         "N": "5000"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": {
+          "n": 50000
+         },
+         "note": "initial"
+        },
+        {
+         "lid": "b",
+         "f": {
+          "n": 50000
+         },
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  "text plain": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxabc",
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": "xxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": "xxxabc",
+       "note": "initial"
+      },
+      {
+       "lid": "b",
+       "f": "xxxabc",
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxxxabc",
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": "xxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155101072-25",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155101072-25",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101072-25",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "S": "xxxxabc"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101072-25",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "S": "xxxxabc"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": "xxxxxabc",
+       "note": "changed"
+      },
+      {
+       "lid": "b",
+       "f": "xxxxxabc",
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "b",
+        "f": "xxxxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155101072-25",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155101072-25",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101072-25",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "S": "xxxxxxabc"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155101072-25",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "b",
+       "f": "xxxxxxxabc",
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxxxabc",
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": "xxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "text entity": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxabc",
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": "xxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": "xxxabc",
+       "note": "initial"
+      },
+      {
+       "lid": "b",
+       "f": "xxxabc",
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxxxabc",
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": "xxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155101191-29",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155101191-29",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101191-29",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "S": "xxxxabc"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101191-29",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "S": "xxxxabc"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "a",
+       "f": "xxxxxabc",
+       "note": "changed"
+      },
+      {
+       "lid": "b",
+       "f": "xxxxxabc",
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "b",
+        "f": "xxxxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155101191-29",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155101191-29",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101191-29",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "S": "xxxxxxabc"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155101191-29",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "lines": [
+      {
+       "lid": "b",
+       "f": "xxxxxxxabc",
+       "note": "initial"
+      }
+     ]
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxxxabc",
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": "xxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "text sub": {
+   "create": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": "xxabc",
+         "note": "initial"
+        },
+        {
+         "lid": "b",
+         "f": "xxabc",
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "create get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxxabc",
+        "note": "initial"
+       },
+       {
+        "lid": "b",
+        "f": "xxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "change": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": "xxxxabc",
+         "note": "changed"
+        },
+        {
+         "lid": "b",
+         "f": "xxxxabc",
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155101307-33",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155101307-33",
+          "Item": {
+           "__edd_e__": {
+            "S": "Sub"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#sub"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101307-33",
+          "Item": {
+           "lid": {
+            "S": "a"
+           },
+           "g": {
+            "S": "xxxxabc"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101307-33",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "S": "xxxxabc"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "change get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "a",
+        "f": "xxxxxabc",
+        "note": "changed"
+       },
+       {
+        "lid": "b",
+        "f": "xxxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "remove": {
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "b",
+         "f": "xxxxxxabc",
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    },
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "ownership-1794155101307-33",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$rename#v1#root#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "ownership-1794155101307-33",
+          "Item": {
+           "__edd_e__": {
+            "S": "Sub"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#sub"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "ownership-1794155101307-33",
+          "Item": {
+           "lid": {
+            "S": "b"
+           },
+           "g": {
+            "S": "xxxxxxabc"
+           },
+           "note": {
+            "S": "initial"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#b"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "ownership-1794155101307-33",
+          "Key": {
+           "pk": {
+            "S": "$rename#v1#root#p q"
+           },
+           "sk": {
+            "S": "$rename#v1#line#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxxxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "remove get": {
+    "ok": {
+     "id": "p q",
+     "note": "initial",
+     "sub": {
+      "lines": [
+       {
+        "lid": "b",
+        "f": "xxxxxxxabc",
+        "note": "initial"
+       }
+      ]
+     }
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p q"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$rename#v1#line#a"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "a"
+      },
+      "g": {
+       "S": "xxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#line#b"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "lid": {
+       "S": "b"
+      },
+      "g": {
+       "S": "xxxabc"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#root"
+      },
+      "note": {
+       "S": "initial"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     },
+     {
+      "sk": {
+       "S": "$rename#v1#sub"
+      },
+      "__edd_e__": {
+       "S": "Sub"
+      },
+      "pk": {
+       "S": "$rename#v1#root#p%20q"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "note": "initial",
+      "sub": {
+       "lines": [
+        {
+         "lid": "a",
+         "f": "xxxxabc",
+         "note": "initial"
+        },
+        {
+         "lid": "b",
+         "f": "xxxxabc",
+         "note": "initial"
+        }
+       ]
+      }
+     }
+    }
+   }
+  }
+ }
+}

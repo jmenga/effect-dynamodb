@@ -2097,10 +2097,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   /**
    * Whether the row read as `stored` is the row `composed` writes for `item` of an edge with a
-   * custom `decompose`: a key that edge's decomposition gives is its row's only if the row holds
-   * what it would write there. Under a `decompose` that reads values back otherwise than it wrote
-   * them, a reading's key can be another owner's row (another aggregate's, an entity's), and a row
-   * of this edge's can change under a concurrent write; neither holds what the reading writes.
+   * custom `decompose`: a key that edge's decomposition gives as a write's value is
+   * ({@link decomposedAsWritten}) is its row's only if the row holds what it would write there.
+   * (As read, the reading 1.39.0 took, the key is enough, as it was on 1.39.0.) Under a `decompose`
+   * that reads values back otherwise than it wrote them, a key only the second reading gives can
+   * be another owner's row (another aggregate's, an entity's), and a row of this edge's can change
+   * under a concurrent write; neither holds what the reading writes.
    * Every attribute but those the library manages compares exactly. A value 1.39.0 stored as
    * given, before a keyed edge's values were put in their stored form, compares as that form.
    * Only the rows read are compared: nothing is read for it.
@@ -2250,9 +2252,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * ({@link placeRows}).
    *
    * An edge with a custom `decompose` is decomposed both as read and as a write's value is
-   * ({@link decomposedAsWritten}), and holds a row stored under a key either gives only if the row
-   * holds what that reading writes there ({@link holdsItem}): the keys 1.39.0 wrote are found under
-   * either convention, and a key that holds another owner's row isn't this aggregate's. Such a row
+   * ({@link decomposedAsWritten}): the keys 1.39.0 wrote are found under either convention. As
+   * read, the reading 1.39.0 took, it holds a row stored under a key it gives, as 1.39.0 did. As a
+   * write's value is, only if the row also holds what that reading writes there
+   * ({@link holdsItem}): a key only the second reading gives can be another owner's row. Such a row
    * is moved as stored: decomposing the value read back needn't give the attributes it holds. A
    * row no reading keys isn't the aggregate's, and is left where it is.
    *
@@ -2324,7 +2327,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
           const atCurrent = positionOf(current.pk, current.sk)
           const atOld = positionOf(old.pk, old.sk)
-          // A row an earlier reading or edge holds is placed by it, and isn't compared again.
+          if (reading === 0) {
+            // As read, the reading 1.39.0 took: a row stored under its key is the edge's, by its
+            // key, and is placed by where it is, as any edge's row is.
+            const keyed = [...new Set([atCurrent, atOld])].filter((position) =>
+              storedAt.has(position),
+            )
+            if (keyed.length === 0) return
+            for (const position of keyed) held.add(position)
+            found.push({ group: group.name, source: "stored", current, old })
+            return
+          }
+          // As a write's value is: only a row holding what the reading writes there. A row an
+          // earlier reading or edge holds is placed by it, and isn't compared again.
           const holds = [...new Set([atCurrent, atOld])].filter(
             (position) =>
               !held.has(position) && holdsItem(item, () => row(g, i), storedAt.get(position)),
@@ -2534,11 +2549,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
       }
 
       // An edge with a custom `decompose` holds a row stored under a key its old value decomposes
-      // to, as read or as a write's value is (`decomposedAsWritten`), only if the row holds what
-      // that reading writes there (`holdsItem`): the keys 1.39.0 wrote are found under either
-      // convention, and a row another owner wrote at such a key isn't the aggregate's, whatever its
-      // entity type. Only a row read is deleted, once, in the transaction of the group the edge is
-      // written in. Nothing more is read, and no condition is added.
+      // to as read, the reading 1.39.0 took, by that key, and one stored under a key it decomposes
+      // to as a write's value is (`decomposedAsWritten`) only if the row holds what that reading
+      // writes there (`holdsItem`): the keys 1.39.0 wrote are found under either convention, and a
+      // row another owner wrote at a key only the second reading gives isn't the aggregate's,
+      // whatever its entity type. Only a row read is deleted, once, in the transaction of the group
+      // the edge is written in. Nothing more is read, and no condition is added.
       const storedAtSk = !customDecompose
         ? undefined
         : new Map(
@@ -2571,18 +2587,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // others aren't compared with it.
         const taken = new Set<string>()
         const held: Array<Record<string, AttributeValue>> = []
-        const take = (
-          item: DecomposedItem | undefined,
-          sk: string,
-          row: () => Record<string, AttributeValue>,
-        ) => {
-          if (taken.has(sk)) return
-          if (item?.custom !== undefined && !holdsItem(item, row, storedAtSk.get(sk))) return
+        const take = (sk: string, row: () => Record<string, AttributeValue>) => {
           taken.add(sk)
           held.push(row())
         }
-        for (const [i, row] of items.entries()) take(decomposed[i], skOf(row), () => row)
-        for (const { item, sk, row } of asWrittenByGroup.get(name) ?? []) take(item, sk, row)
+        for (const [i, row] of items.entries()) {
+          const sk = skOf(row)
+          if (taken.has(sk)) continue
+          if (decomposed[i]?.custom !== undefined && !storedAtSk.has(sk)) continue
+          take(sk, () => row)
+        }
+        for (const { item, sk, row } of asWrittenByGroup.get(name) ?? []) {
+          if (taken.has(sk) || !holdsItem(item, row, storedAtSk.get(sk))) continue
+          take(sk, row)
+        }
         return held
       }
 
