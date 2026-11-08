@@ -435,6 +435,85 @@ describe("a custom decompose over a class with no transformation costs no schema
   )
 })
 
+describe("a transformed field under a custom decompose", () => {
+  it.effect("a row the reading as written gives isn't put in its stored form unless compared", () =>
+    Effect.gen(function* () {
+      let checks = 0
+      const counted = Schema.Number.check(
+        Schema.makeFilter(() => {
+          checks++
+          return true
+        }),
+      ).pipe(
+        Schema.decodeTo(Schema.Number, {
+          decode: SchemaGetter.transform((n: number) => n * 10),
+          encode: SchemaGetter.transform((n: number) => n / 10),
+        }),
+      )
+      const schema = DynamoSchema.make({ name: "dc", version: 1 })
+      const Main = Table.make({ schema, entities: {} })
+      const Orders = Aggregate.make(
+        Schema.Struct({
+          id: Schema.String,
+          lines: Schema.Array(Schema.Struct({ lineId: Schema.String, f: counted })),
+        }),
+        {
+          table: Main,
+          schema,
+          pk: { field: "pk", composite: ["id"] },
+          collection: { name: "order" },
+          root: { entityType: "Order" },
+          edges: {
+            lines: Aggregate.many({
+              entityType: "OrderLine",
+              sk: { composite: ["lineId"] },
+              decompose: (lines: unknown) => lines as ReadonlyArray<unknown>,
+            }),
+          },
+        },
+      )
+      const table = makeRecordingTable()
+      const run = <A, E>(body: (db: any) => Effect.Effect<A, E, never>) =>
+        Effect.gen(function* () {
+          checks = 0
+          const db: any = yield* DynamoClient.make({
+            entities: {},
+            aggregates: { Orders },
+            tables: { Main },
+          } as never)
+          succeed(yield* Effect.exit(body(db)))
+          return checks
+        }).pipe(
+          Effect.provide(Layer.merge(table.layer, Main.layer({ name: "dc" })) as never),
+        ) as Effect.Effect<number>
+      // The input read as the domain value it is (3), then as 1.39.0 read it for `decompose` (1),
+      // and the row's stored form (1).
+      expect(
+        yield* run((db) =>
+          db.aggregates.Orders.create({ id: "a", lines: [{ lineId: "l", f: 5 }] }),
+        ),
+      ).toBe(5)
+      // The rows read (1); the value read, as a write's value is (1); the new state, read as the
+      // domain value it is (3); the old rows' stored form (1); the new value, as 1.39.0 read it (1);
+      // the new rows' stored form (1). The reading as written keys its row where the reading as
+      // read does, so that row is never compared, and never put in its stored form.
+      for (const note of ["unchanged", "changed"]) {
+        expect(
+          yield* run((db) =>
+            db.aggregates.Orders.update({ id: "a" }, ({ state }: any) =>
+              note === "unchanged"
+                ? state
+                : { ...state, lines: state.lines.map((line: any) => ({ ...line, f: 6 })) },
+            ),
+          ),
+        ).toBe(8)
+      }
+      // The rows read (1), their stored form (1), and the value read as a write's value is (1).
+      expect(yield* run((db) => db.tables.Main.rekey())).toBe(3)
+    }),
+  )
+})
+
 /**
  * Keyed (`Schema.Record`) edges, whose `decompose` returns a date field's stored form. 1.39.0 stored a
  * keyed edge's attributes as `decompose` returned them; they now go through the element's encoders,

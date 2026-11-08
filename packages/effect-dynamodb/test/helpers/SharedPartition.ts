@@ -13,6 +13,16 @@
  * - `graph`: nested sub-aggregates under static discriminators, a `one` and a `many` edge sharing an
  *   entity type, with and without a custom `decompose`.
  *
+ * And against `fixtures/aggregate-ownership-1.39.0.json`, generated the same way, a custom `decompose`
+ * whose keys, read as a write's value is, can name a row it doesn't hold:
+ *
+ * - `second reading`: A's field multiplies by 10 as it reads, so its 50, stored at key 500, decomposes
+ *   as written to 5000, where B's row is.
+ * - `entity second reading`: the same key holding an entity's row.
+ * - `claimed destination`: A stored under escaped keys and B under the old ones, a `Line` each at one
+ *   sort key, so B's row belongs where A's is. Both scan orders.
+ * - `mixed edges`: a transformed custom `many` edge whose key as written is a `one` edge's.
+ *
  * The other owner's rows are compared byte for byte after every step: no write of one owner may
  * delete, move or rewrite them.
  */
@@ -22,7 +32,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Exit, Layer, Schema } from "effect"
+import { Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
@@ -51,6 +61,11 @@ const fixture = JSON.parse(
   ),
 ) as { readonly scenarios: Record<string, Record<string, any>> }
 const at = (scenario: string, step: string): Step => fixture.scenarios[scenario]![step]!
+const ownership = JSON.parse(
+  readFileSync(new URL("../fixtures/aggregate-ownership-1.39.0.json", import.meta.url), "utf8"),
+) as { readonly scenarios: Record<string, Record<string, any>> }
+const atOwnership = (scenario: string, step: string): Step & Record<string, any> =>
+  ownership.scenarios[scenario]![step]!
 
 /** A table for one world: a client over it, its rows, and a write as another writer's. */
 export interface Opened {
@@ -439,6 +454,168 @@ const overlapDefine = (schema: DynamoSchema.DynamoSchema): Defined => {
   return { table, aggregates: { A: make("a"), B: make("b") } }
 }
 
+// --- A key read as written that names a row the reading doesn't hold ------------------------------
+
+/** A field multiplying by 10 as it reads. */
+const X10 = Schema.Number.pipe(
+  Schema.decodeTo(Schema.Number, {
+    decode: SchemaGetter.transform((n: number) => n * 10),
+    encode: SchemaGetter.transform((n: number) => n / 10),
+  }),
+)
+const ownerLine = (field: Schema.Top) =>
+  Schema.Struct({ f: field as typeof Schema.Number, owner: Schema.String, note: Schema.String })
+const secondDefine =
+  (owners: ReadonlyArray<"a" | "b">) =>
+  (schema: DynamoSchema.DynamoSchema): Defined => {
+    const table = Table.make({ schema, entities: {} })
+    const make = (owner: string, field: Schema.Top) =>
+      Aggregate.make(
+        Schema.Struct({
+          id: Schema.String,
+          note: Schema.String,
+          lines: Schema.Array(ownerLine(field)),
+        }),
+        {
+          schema,
+          table,
+          pk: { field: "pk", composite: ["id"] },
+          collection: { name: "shared" },
+          root: { entityType: `Root${owner}` },
+          edges: {
+            lines: Aggregate.many({
+              entityType: "Line",
+              sk: { composite: ["f"] },
+              assemble: (lines) =>
+                (lines as ReadonlyArray<{ owner: string }>).filter((l) => l.owner === owner),
+              decompose: (lines) => lines as ReadonlyArray<unknown>,
+            }),
+          },
+        } as any,
+      )
+    const all = { a: () => make("a", X10), b: () => make("b", Schema.Number) }
+    return {
+      table,
+      aggregates: Object.fromEntries(owners.map((owner) => [owner.toUpperCase(), all[owner]()])),
+    }
+  }
+
+const entityDefine = (schema: DynamoSchema.DynamoSchema): Defined => {
+  const Lines = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      f: Schema.Number,
+      owner: Schema.String,
+      note: Schema.String,
+    }),
+    entityType: "Line",
+    primaryKey: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: ["f"] },
+    },
+  })
+  const table = Table.make({ schema, entities: { Lines } })
+  const Agg = Aggregate.make(
+    Schema.Struct({
+      id: Schema.String,
+      lines: Schema.Array(Schema.Struct({ f: X10, owner: Schema.String, note: Schema.String })),
+    }),
+    {
+      schema,
+      table,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "line" },
+      root: { entityType: "Root" },
+      edges: {
+        lines: Aggregate.many({
+          entityType: "Line",
+          sk: { composite: ["k"] },
+          assemble: (lines) =>
+            (lines as ReadonlyArray<{ owner: string }>).filter((l) => l.owner === "aggregate"),
+          decompose: (lines) =>
+            (lines as ReadonlyArray<{ f: number }>).map((line) => ({
+              ...line,
+              k: `f_${String(line.f).padStart(16, "0")}`,
+            })),
+        }),
+      },
+    } as any,
+  )
+  return { table, entities: { Lines }, aggregates: { Agg } }
+}
+
+const ClaimedLine = Schema.Struct({ lid: Schema.String, owner: Schema.String, note: Schema.String })
+const claimedDefine =
+  (owners: ReadonlyArray<string>) =>
+  (schema: DynamoSchema.DynamoSchema): Defined => {
+    const table = Table.make({ schema, entities: {} })
+    const make = (owner: string) =>
+      Aggregate.make(
+        Schema.Struct({ id: Schema.String, note: Schema.String, lines: Schema.Array(ClaimedLine) }),
+        {
+          schema,
+          table,
+          pk: { field: "pk", composite: ["id"] },
+          collection: { name: "shared" },
+          root: { entityType: `Root${owner}` },
+          edges: {
+            lines: Aggregate.many({
+              entityType: "Line",
+              sk: { composite: ["lid"] },
+              assemble: (lines) =>
+                (lines as ReadonlyArray<{ owner: string }>).filter((l) => l.owner === owner),
+              decompose: (lines) => lines as ReadonlyArray<unknown>,
+            }),
+          },
+        } as any,
+      )
+    return {
+      table,
+      aggregates: Object.fromEntries(owners.map((owner) => [owner.toUpperCase(), make(owner)])),
+    }
+  }
+
+const mixedDefine = (schema: DynamoSchema.DynamoSchema): Defined => {
+  const table = Table.make({ schema, entities: {} })
+  const Agg = Aggregate.make(
+    Schema.Struct({
+      id: Schema.String,
+      lines: Schema.Array(Schema.Struct({ f: X10, note: Schema.String })),
+      single: Schema.Struct({ note: Schema.String }),
+    }),
+    {
+      schema,
+      table,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "shared" },
+      root: { entityType: "Root" },
+      edges: {
+        lines: Aggregate.many({
+          entityType: "Line",
+          sk: { composite: ["k"] },
+          assemble: (lines) =>
+            (lines as ReadonlyArray<{ note: string }>).filter((l) => l.note === "many"),
+          decompose: (lines) =>
+            (lines as ReadonlyArray<{ f: number }>).map((line) => ({
+              ...line,
+              k: `slot#${line.f}`,
+            })),
+        }),
+        single: Aggregate.one({ entityType: "Line", discriminator: { slot: "5000" } }),
+      },
+    } as any,
+  )
+  return { table, aggregates: { Agg } }
+}
+
+/** The keys a transaction writes, as `pk|sk`. */
+const transactionKeys = (request: Request): ReadonlyArray<string> =>
+  (request.input.TransactItems as ReadonlyArray<any>).map((op) => {
+    const write = op.Put ?? op.Delete ?? op.Update ?? op.ConditionCheck
+    const row = write.Item ?? write.Key
+    return `${row.pk.S}|${row.sk.S}`
+  })
+
 // --- The suite --------------------------------------------------------------------------------------
 
 export const sharedPartitionSuite = (backend: Backend) => {
@@ -814,4 +991,233 @@ export const sharedPartitionSuite = (backend: Backend) => {
       )
     })
   }
+
+  describe("a custom decompose whose key read as written is another aggregate's row", () => {
+    const scenario = "second reading"
+    const created = atOwnership(scenario, "created").rows
+    const lineOf = (owner: string) => (row: Row) =>
+      row.__edd_e__?.S === "Line" && row.owner?.S === owner
+
+    it.effect("each reads its own row, as 1.39.0 did", () =>
+      Effect.gen(function* () {
+        const w = yield* world(backend, secondDefine(["a", "b"]), {
+          name: "collision",
+          seed: created,
+        })
+        for (const owner of ["a", "b"]) {
+          expect(
+            resultOf(yield* w.run((db) => db.aggregates[owner.toUpperCase()].get({ id: "p q" }))),
+          ).toEqual(atOwnership(scenario, `created ${owner} get`))
+        }
+        yield* w.opened.close
+      }),
+    )
+
+    it.effect("removing A's element deletes A's row alone, as 1.39.0 did", () =>
+      Effect.gen(function* () {
+        const w = yield* world(backend, secondDefine(["a", "b"]), {
+          name: "collision",
+          seed: created,
+        })
+        const done = yield* w.step((db) =>
+          db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
+        )
+        const expected = atOwnership(scenario, "remove a")
+        expect(done.result).toEqual(expected.result)
+        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.rows).toEqual(byKey(expected.rows))
+        expect(byKey(done.rows.filter(lineOf("b")))).toEqual(byKey(created.filter(lineOf("b"))))
+        expect(resultOf(yield* w.run((db) => db.aggregates.B.get({ id: "p q" })))).toEqual(
+          atOwnership(scenario, "remove a get b"),
+        )
+        yield* w.opened.close
+      }),
+    )
+
+    it.effect("B's row, edited after A's update read it, keeps the edit, as on 1.39.0", () =>
+      Effect.gen(function* () {
+        const w = yield* world(backend, secondDefine(["a", "b"]), {
+          name: "collision",
+          seed: created,
+        })
+        const foreign = created.find(lineOf("b"))!
+        w.hooks.before = (command) => {
+          if (command !== "TransactWriteItems") return undefined
+          w.hooks.before = undefined
+          return w.opened.put({ ...foreign, note: { S: "concurrent b edit" } })
+        }
+        const done = yield* w.step((db) =>
+          db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
+        )
+        const expected = atOwnership(scenario, "race remove a")
+        expect(done.result).toEqual(expected.result)
+        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.rows).toEqual(byKey(expected.rows))
+        expect(done.rows).toContainEqual({ ...foreign, note: { S: "concurrent b edit" } })
+        yield* w.opened.close
+      }),
+    )
+
+    for (const [label, owners] of [
+      ["both", ["a", "b"]],
+      ["a only", ["a"]],
+    ] as const) {
+      for (const dryRun of [true, false]) {
+        const name = `rekey ${label}${dryRun ? " dry run" : ""}`
+        it.effect(`${name}: each moves its own rows, and leaves the other's, as 1.39.0 did`, () =>
+          Effect.gen(function* () {
+            const w = yield* world(backend, secondDefine(owners), {
+              name: "collision",
+              escapeKeys: true,
+              seed: created,
+            })
+            const done = yield* w.step((db) =>
+              db.tables.Main.rekey({ repairIndexKeys: true, dryRun }),
+            )
+            const expected = atOwnership(scenario, name)
+            expect(reportOf(done.exit)).toEqual(expected.report)
+            if (backend.local)
+              expect(unordered(done.commands)).toEqual(unordered(expected.commands))
+            expect(done.rows).toEqual(byKey(expected.rows))
+            if (owners.length === 1) {
+              // B isn't registered: its rows stay where they are.
+              expect(byKey(done.rows.filter(lineOf("b")))).toEqual(
+                byKey(created.filter(lineOf("b"))),
+              )
+            }
+            for (const [owner, read] of Object.entries(expected.gets ?? {})) {
+              expect(
+                resultOf(
+                  yield* w.run((db) => db.aggregates[owner.toUpperCase()].get({ id: "p q" })),
+                ),
+              ).toEqual(read)
+            }
+            if (!dryRun) {
+              const again = yield* w.step((db) => db.tables.Main.rekey({ repairIndexKeys: true }))
+              expect(reportOf(again.exit)).toEqual(expected.again)
+            }
+            yield* w.opened.close
+          }),
+        )
+      }
+    }
+  })
+
+  describe("a custom decompose whose key read as written is an entity's row", () => {
+    it.effect("removing the aggregate's element leaves the entity's row, as 1.39.0 did", () =>
+      Effect.gen(function* () {
+        const scenario = "entity second reading"
+        const seeded = atOwnership(scenario, "seeded").rows
+        const w = yield* world(backend, entityDefine, { name: "entitycollision", seed: seeded })
+        const done = yield* w.step((db) =>
+          db.aggregates.Agg.update({ id: "id_a" }, ({ state }: any) => ({ ...state, lines: [] })),
+        )
+        const expected = atOwnership(scenario, "remove")
+        expect(done.result).toEqual(expected.result)
+        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.rows).toEqual(byKey(expected.rows))
+        const entityRows = (rows: ReadonlyArray<Row>) =>
+          byKey(rows.filter((row) => row.owner?.S === "entity"))
+        expect(entityRows(done.rows)).toEqual(entityRows(seeded))
+        expect(resultOf(yield* w.run((db) => db.entities.Lines.get({ id: "a", f: 5000 })))).toEqual(
+          atOwnership(scenario, "remove entity get"),
+        )
+        yield* w.opened.close
+      }),
+    )
+  })
+
+  describe("an aggregate whose row belongs where another aggregate's row is", () => {
+    const scenario = "claimed destination"
+    for (const id of ["p%z", "p q"]) {
+      const created = atOwnership(scenario, `created ${id}`).rows
+      // The scan meets one aggregate's rows first: on the in-memory table, the order they're stored
+      // in, and each order is run; on DynamoDB Local, its own. Either way the outcome is the same.
+      const ofA = (row: Row) => row.__edd_e__?.S === "Roota" || row.owner?.S === "a"
+      const aRows = byKey(created.filter(ofA))
+      const bRows = byKey(created.filter((row) => !ofA(row)))
+      const orders = backend.local
+        ? [{ order: "", seed: created, aFirst: true }]
+        : [
+            { order: ", A's rows scanned first", seed: [...aRows, ...bRows], aFirst: true },
+            { order: ", B's rows scanned first", seed: [...bRows, ...aRows], aFirst: false },
+          ]
+      for (const [label, owners] of [
+        ["both", ["a", "b"]],
+        ["b only", ["b"]],
+      ] as const) {
+        for (const dryRun of [true, false]) {
+          const name = `rekey ${id} ${label}${dryRun ? " dry run" : ""}`
+          for (const { order, seed, aFirst } of orders) {
+            it.effect(`${name}${order}: B's move is refused whole, as 1.39.0 did`, () =>
+              Effect.gen(function* () {
+                const w = yield* world(
+                  backend,
+                  claimedDefine(aFirst || owners.length === 1 ? owners : [...owners].reverse()),
+                  { name: "claimed", escapeKeys: true, seed },
+                )
+                const done = yield* w.step((db) =>
+                  db.tables.Main.rekey({ repairIndexKeys: true, dryRun }),
+                )
+                const expected = atOwnership(scenario, name)
+                expect(reportOf(done.exit)).toEqual(expected.report)
+                if (backend.local)
+                  expect(unordered(done.commands)).toEqual(unordered(expected.commands))
+                // Nothing of B's moved, its root included, and A's rows are as they were.
+                expect(done.rows).toEqual(byKey(created))
+                expect(done.rows).toEqual(byKey(expected.rows))
+                for (const [owner, read] of Object.entries(expected.gets ?? {})) {
+                  expect(
+                    resultOf(yield* w.run((db) => db.aggregates[owner.toUpperCase()].get({ id }))),
+                  ).toEqual(read)
+                }
+                if (!dryRun) {
+                  const again = yield* w.step((db) =>
+                    db.tables.Main.rekey({ repairIndexKeys: true }),
+                  )
+                  expect(reportOf(again.exit)).toEqual(expected.again)
+                  expect(again.rows).toEqual(byKey(created))
+                }
+                yield* w.opened.close
+              }),
+            )
+          }
+        }
+      }
+    }
+  })
+
+  describe("a transformed custom `many` edge whose key as written is a `one` edge's", () => {
+    const scenario = "mixed edges"
+    const created = atOwnership(scenario, "created").rows
+    for (const dryRun of [true, false]) {
+      const name = `rekey${dryRun ? " dry run" : ""}`
+      it.effect(`${name} moves each row once, as 1.39.0 did`, () =>
+        Effect.gen(function* () {
+          const w = yield* world(backend, mixedDefine, {
+            name: "mixed",
+            escapeKeys: true,
+            seed: created,
+          })
+          const done = yield* w.step((db) =>
+            db.tables.Main.rekey({ repairIndexKeys: true, dryRun }),
+          )
+          const expected = atOwnership(scenario, name)
+          expect(reportOf(done.exit)).toEqual(expected.report)
+          if (backend.local) expect(unordered(done.commands)).toEqual(unordered(expected.commands))
+          expect(done.rows).toEqual(byKey(expected.rows))
+          for (const request of done.requests.filter((r) => r.command === "TransactWriteItems")) {
+            const keys = transactionKeys(request)
+            expect(new Set(keys).size).toBe(keys.length)
+          }
+          if (!dryRun) {
+            expect(resultOf(yield* w.run((db) => db.aggregates.Agg.get({ id: "p q" })))).toEqual(
+              expected.get,
+            )
+          }
+          yield* w.opened.close
+        }),
+      )
+    }
+  })
 }
