@@ -244,4 +244,91 @@ describeConnected("a custom decompose is handed a write's value as 1.39.0 handed
       }),
     ),
   )
+
+  it.effect("an update deletes a removed element's row, and a changed key's old row", () =>
+    onTable((tableName) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        for (const row of fixture.rows) yield* client.putItem({ TableName: tableName, Item: row })
+        const db = yield* bind
+        const lines = (rows: ReadonlyArray<Row>) =>
+          rows
+            .filter((row) => (row.__edd_e__ as { S: string }).S === "DcLine")
+            .map((row) => [(row.sk as { S: string }).S, row.f])
+        // 1.39.0 sent a Delete for the key decomposing 50 again gives (5), and left this row.
+        yield* db.aggregates.Orders.update({ id: "created" }, ({ state }) => ({
+          ...state,
+          lines: state.lines.map((line) => ({ ...line, f: 60 })),
+        }))
+        expect(lines(yield* rowsOf(tableName, "created"))).toEqual([
+          ["$dc#v1#dcline#0000000000000060", { N: "6" }],
+        ])
+        yield* db.aggregates.Orders.update({ id: "created" }, ({ state }) => ({
+          ...state,
+          lines: [],
+        }))
+        expect(lines(yield* rowsOf(tableName, "created"))).toEqual([])
+        expect((yield* db.aggregates.Orders.get({ id: "created" })).lines).toEqual([])
+      }),
+    ),
+  )
+
+  it.effect("rekey moves the edge's rows with the root, under escaped keys", () =>
+    onTable((tableName) =>
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        // The fixture's rows as those of an aggregate whose id holds a space.
+        const seeded = renamed(fixtureRows("created"), "created", "a b")
+        for (const row of seeded) yield* client.putItem({ TableName: tableName, Item: row })
+        const escaped = DynamoSchema.make({ name: "dc", version: 1, escapeKeys: true })
+        const Escaped = Table.make({ schema: escaped, entities: { Anchors } })
+        const Moved = Aggregate.make(Order, {
+          table: Escaped,
+          schema: escaped,
+          pk: { field: "pk", composite: ["id"] },
+          collection: { name: "dcorder" },
+          root: { entityType: "DcOrder" },
+          edges: {
+            lines: Aggregate.many({
+              entityType: "DcLine",
+              sk: { composite: ["f"] },
+              decompose: (lines) =>
+                (lines as ReadonlyArray<Line>).map((line) => ({ ...line, f: line.f / 10 })),
+            }),
+            kept: Aggregate.many({
+              entityType: "DcKept",
+              sk: { composite: ["f"] },
+              decompose: (lines) => (lines as ReadonlyArray<Line>).map((line) => ({ ...line })),
+            }),
+          },
+        })
+        const report = yield* Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Anchors },
+            aggregates: { Moved },
+            tables: { Escaped },
+          })
+          return yield* db.tables.Escaped.rekey()
+        }).pipe(Effect.provide(Escaped.layer({ name: tableName })))
+        expect(report.conflicts).toEqual([])
+        expect(report.moved.aggregate).toBe(3)
+        expect(yield* rowsOf(tableName, "a b")).toEqual([])
+        expect(yield* rowsOf(tableName, "a%20b")).toEqual(
+          renamed(seeded, "a b", "a%20b").map((row) => ({
+            ...row,
+            ...(row.id !== undefined && { id: { S: "a b" } }),
+          })),
+        )
+        const got = yield* Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Anchors },
+            aggregates: { Moved },
+            tables: { Escaped },
+          })
+          return yield* db.aggregates.Moved.get({ id: "a b" })
+        }).pipe(Effect.provide(Escaped.layer({ name: tableName })))
+        expect(got).toEqual({ ...fixture.read.created, id: "a b" })
+      }),
+    ),
+  )
 })

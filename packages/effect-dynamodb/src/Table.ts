@@ -939,7 +939,9 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" 
  * - `taken` — another row holds its current key
  * - `contended` — concurrent writes changed it on every attempt
  * - `failed` — it could not be moved as stored (its values no longer decode,
- *   a stream id reads as more than one id, or a write was refused);
+ *   a stream id reads as more than one id, or a write was refused; an
+ *   aggregate that doesn't assemble or decompose, or a row of its types that
+ *   no row of its value places, which moving it would leave behind);
  *   `message` says why
  * - `uncomposable` — its values can't compose a current key: a composite holds a
  *   value with no key text (`NaN`) or one no form of its schema takes

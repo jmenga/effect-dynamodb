@@ -68,10 +68,12 @@ import {
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
+  Cause,
   type Context,
   DateTime,
   Effect,
   Equal,
+  Exit,
   type Optic,
   Option,
   Schema,
@@ -230,9 +232,10 @@ interface ResolvedNode {
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   /**
    * `many` edges with a custom `decompose` only: the value that `decompose` is handed on a write,
-   * read as 1.39.0 read it (see {@link storedFormFirst}). Undefined where that's the value itself.
+   * the caller's own value read as 1.39.0 read it (see {@link storedFormFirst}). Undefined where
+   * that's the value itself.
    */
-  readonly decomposeInput?: ((value: unknown) => unknown) | undefined
+  readonly decomposeInput?: ((written: Written) => Option.Option<unknown>) | undefined
   /**
    * Per-attribute encoders for this node's items, applied on the WRITE path
    * (decompose) so every value with a wire form — a date, a transformed scalar,
@@ -897,6 +900,15 @@ const dateAttrEncoder = (
   }
 }
 
+/** Whether a value is a date field's stored form: one its date encodings decode. */
+const storedDateForm = (fieldSchema: Schema.Top): ((value: unknown) => boolean) => {
+  const explicit = DynamoModel.getEncoding(fieldSchema)
+  const decoders = (explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)).map((encoding) =>
+    Schema.decodeUnknownOption(buildDateTransform(encoding) as Schema.Codec<any>),
+  )
+  return (value) => decoders.some((decode) => Option.isSome(decode(value)))
+}
+
 /**
  * The field's own encode, with `decode -> encode` as the fallback so a caller
  * who already supplied wire form round-trips to itself (the same strategy
@@ -915,35 +927,75 @@ const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => Option.Op
 }
 
 /**
- * What a `many` edge's custom `decompose` is handed on a write: the edge's value read stored form
- * first, as 1.39.0 read every write's input. A write's value is otherwise taken as the domain value
- * a caller holds, but a `decompose` written for 1.39.0 was handed this, and what it returns is
- * stored and keyed as it is: handed the domain value instead, a `decompose` that returns a field's
- * stored form (`f / 10` on a field that multiplies by 10) has that encoded once more, its sort key
- * moves, and every `update` compounds the value and adds a row. Handed this, its rows store, key and
- * read exactly as on 1.39.0, and an `update` of a row 1.39.0 wrote finds it. A `decompose` that hands
- * such a field back unchanged stores it decoded once more, as on 1.39.0.
+ * A write's own value at one place in the aggregate, as the caller gave it: `create`'s input, or the
+ * state `update`'s mutation returned, before either is decoded. `present` is false where the
+ * caller left the field out.
+ */
+interface Written {
+  readonly present: boolean
+  readonly value: unknown
+  /** `update`'s new state, which holds what a mutation's plain state holds. */
+  readonly update: boolean
+}
+
+/** The caller's own value of `field`, under `written`. */
+const writtenField = (written: Written | undefined, field: string): Written | undefined => {
+  if (written === undefined) return undefined
+  const holder = written.present ? written.value : undefined
+  const present = holder !== null && typeof holder === "object" && field in holder
+  return {
+    present,
+    value: present ? (holder as Record<string, unknown>)[field] : undefined,
+    update: written.update,
+  }
+}
+
+/**
+ * What a `many` edge's custom `decompose` is handed on a write: the caller's own value of the edge
+ * read stored form first, once, as 1.39.0 read every write's input. A write's value is otherwise
+ * taken as the domain value a caller holds, but a `decompose` written for 1.39.0 was handed this,
+ * and what it returns is stored and keyed as it is: handed the domain value instead, a `decompose`
+ * that returns a field's stored form (`f / 10` on a field that multiplies by 10) has that encoded
+ * once more, its sort key moves, and every `update` compounds the value and adds a row. Handed
+ * this, its rows store, key and read exactly as on 1.39.0, and an `update` of a row 1.39.0 wrote
+ * finds it. A `decompose` that hands such a field back unchanged stores it decoded once more, as
+ * on 1.39.0.
  *
- * Only a transformation with one type on both sides reads differently: anything else reads as it
- * is. Undefined when the field holds no transformation, so nothing is read again. What was read
- * (update's old state, `rekey`) is handed to `decompose` as it was read, as 1.39.0 did.
+ * It reads what the caller gave, never the value the write already decoded: read again, a decoding
+ * default (`5`, read as 50) or a stored form the domain side refuses (`"5"`, read as 50) would be
+ * decoded twice, to 500. Only a transformation with one type on both sides reads differently, and
+ * a class whose fields hold none reads as given, so undefined when the field holds no
+ * transformation beneath its classes: nothing is read again. What was read (update's old state,
+ * `rekey`) is handed to `decompose` as it was read, as 1.39.0 did. None where the caller's value
+ * doesn't read, and `decompose` is handed the decoded value.
  */
 const storedFormFirst = (
   field: string,
   fieldSchema: Schema.Top | undefined,
   resolveRef: RefResolver | undefined,
-): ((value: unknown) => unknown) | undefined => {
-  if (fieldSchema === undefined || !containsWireTransform(fieldSchema)) return undefined
-  const read = Schema.decodeUnknownOption(
-    substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
-      tolerantTransforms: true,
-      decodeOnly: true,
-      resolveRef,
-    }) as unknown as Schema.Codec<any>,
-  )
-  return (value) => {
-    const asRead = read({ [field]: value })
-    return Option.isSome(asRead) ? (asRead.value as Record<string, unknown>)[field] : value
+): ((written: Written) => Option.Option<unknown>) | undefined => {
+  if (fieldSchema === undefined || !containsWireTransform(fieldSchema, { throughClasses: true })) {
+    return undefined
+  }
+  const reader = (update: boolean) =>
+    Schema.decodeUnknownOption(
+      substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+        tolerantTransforms: true,
+        decodeOnly: true,
+        resolveRef,
+        // A mutation's plain state holds a set as a list and an `Option` as a tagged object.
+        ...(update && { plainStateForms: true }),
+      }) as unknown as Schema.Codec<any>,
+    )
+  const readers: { create?: ReturnType<typeof reader>; update?: ReturnType<typeof reader> } = {}
+  return (written) => {
+    const which = written.update ? "update" : "create"
+    const read = readers[which] ?? reader(written.update)
+    readers[which] = read
+    return Option.map(
+      read(written.present ? { [field]: written.value } : {}),
+      (asRead) => (asRead as Record<string, unknown>)[field],
+    )
   }
 }
 
@@ -996,10 +1048,20 @@ const buildAttrEncoders = (
   for (const field of Object.keys(fields)) {
     const fieldSchema = fields[field]!
 
-    // 1. Date encoding.
+    // 1. Date encoding. A value already in the field's stored form (a custom `decompose` that
+    //    returns the ISO text of a `DateTimeUtcFromString`) is stored as it is, as 1.39.0 stored it
+    //    on a keyed edge; anything else is stored as given, and the write refuses it unless it reads back.
     const date = dateAttrEncoder(fieldSchema)
     if (date) {
-      encoders[field] = date
+      const stored = storedDateForm(fieldSchema)
+      encoders[field] = (value, asGiven) => {
+        try {
+          return date(value)
+        } catch {
+          if (!stored(value)) asGiven?.()
+          return value
+        }
+      }
       continue
     }
 
@@ -1416,6 +1478,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
     node.rowStamps?.updatedDeclared === true ||
     node.children.some(declaresStamp)
   const returnsStamps = declaresStamp(rootNode)
+  // A `many` edge with a custom `decompose`: `update` and `rekey` read its rows off the partition
+  // (`customEdgeRows`). Without one, both work from the decomposition alone, as they always have.
+  const holdsCustomDecompose = (node: ResolvedNode): boolean =>
+    node.decompose !== undefined || node.children.some(holdsCustomDecompose)
+  const customDecompose = holdsCustomDecompose(rootNode)
 
   // Packed edge attributes, and those read by stored form, by item entity type (#147).
   const packedByType = collectPackedByType(rootNode)
@@ -2005,6 +2072,149 @@ const makeAggregate = <TSchema extends Schema.Top>(
       return text !== undefined && text !== stored[field]
     })
 
+  /** The rows read, by position. */
+  const storedPositions = (
+    allItems: ReadonlyArray<Record<string, unknown>>,
+  ): ReadonlyMap<string, Record<string, unknown>> =>
+    new Map(
+      allItems.map((item) => [positionOf(String(item[config.pk.field]), String(item.sk)), item]),
+    )
+
+  /** A custom `decompose`'s row with each attribute its encoder stored read back as it was given. */
+  const storedDecoders = new WeakMap<
+    ResolvedNode,
+    (row: Record<string, unknown>) => Record<string, unknown>
+  >()
+  const decodeStored = (node: ResolvedNode, row: Record<string, unknown>) => {
+    let decode = storedDecoders.get(node)
+    if (decode === undefined) {
+      const fields = node.ownFields ?? {}
+      const readers = Object.keys(node.attrEncoders ?? {}).flatMap((field) => {
+        const fieldSchema = fields[field]
+        if (fieldSchema === undefined) return []
+        const read = Schema.decodeUnknownOption(
+          substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+            tolerantTransforms: true,
+            decodeOnly: true,
+            resolveRef,
+            absentReads: true,
+          }) as unknown as Schema.Codec<any>,
+        )
+        return [[field, read] as const]
+      })
+      decode = (stored) => {
+        const given = { ...stored }
+        for (const [field, read] of readers) {
+          if (given[field] == null) continue
+          const decoded = read({ [field]: given[field] })
+          if (Option.isSome(decoded))
+            given[field] = (decoded.value as Record<string, unknown>)[field]
+        }
+        return given
+      }
+      storedDecoders.set(node, decode)
+    }
+    return decode(row)
+  }
+
+  /**
+   * `rekey`'s placing of the rows read for each edge with a custom `decompose` (`customEdgeRows`):
+   * each row's key composed from its own attributes, read back as `decompose` returned them, or else
+   * as stored. A key composed so is taken only where the row is stored under it, in either text;
+   * else the key decomposing the value read back gives, if the row is under that. A row neither
+   * places is `unplaced`, with what refused it: moving the aggregate would leave it behind.
+   */
+  const customEdgeSlots = (
+    groups: ReadonlyArray<TransactionGroup>,
+    composed: ReadonlyArray<{
+      readonly group: string
+      readonly items: ReadonlyArray<Record<string, AttributeValue>>
+    }>,
+    allItems: ReadonlyArray<Record<string, unknown>>,
+    assembled: Record<string, unknown>,
+    pkValue: string,
+    from: string | undefined,
+  ): Effect.Effect<{
+    readonly slots: ReadonlyArray<CustomSlot>
+    readonly unplaced: ReadonlyMap<string, string | undefined>
+  }> =>
+    Effect.gen(function* () {
+      const storedAt = storedPositions(allItems)
+      const placedAt = (item: DecomposedItem, sk: string) => ({
+        current: { pk: pkValue, sk },
+        old: oldPosition(
+          from ?? pkValue,
+          pkValue,
+          otherSortKey(config.schema, item, sk),
+          sk,
+          storedAt,
+          () => undefined,
+        ),
+      })
+      const decomposed = new Map<ResolvedNode, Array<{ current: Position; old: Position }>>()
+      groups.forEach((group, g) => {
+        group.items.forEach((item, i) => {
+          if (item.custom === undefined) return
+          const sk = (composed[g]!.items[i]!.sk as { S?: string } | undefined)?.S ?? ""
+          decomposed.set(item.custom, [...(decomposed.get(item.custom) ?? []), placedAt(item, sk)])
+        })
+      })
+      const context = contextValuesOf(assembled, contextFields, rootEncoders)
+      const slots: Array<CustomSlot> = []
+      const unplaced = new Map<string, string | undefined>()
+      for (const { node, group, parentDiscriminators, rows } of customEdgeRows(
+        rootNode,
+        allItems,
+        config.schema,
+      )) {
+        for (const row of rows) {
+          const stored = { pk: String(row[config.pk.field]), sk: String(row.sk) }
+          const here = positionOf(stored.pk, stored.sk)
+          const holds = (at: { readonly current: Position; readonly old: Position }) =>
+            positionOf(at.current.pk, at.current.sk) === here ||
+            positionOf(at.old.pk, at.old.sk) === here
+          const given = stripMetadata(row, stampsToStrip(node, systemAttrs))
+          let refused: string | undefined
+          let found: { readonly current: Position; readonly old: Position } | undefined
+          for (const attrs of [decodeStored(node, given), given]) {
+            const exit = yield* Effect.exit(
+              Effect.flatMap(
+                manyElementItem(
+                  node,
+                  attrs,
+                  context,
+                  group,
+                  parentDiscriminators,
+                  aggregateName,
+                  config.schema,
+                ),
+                (item) =>
+                  Effect.sync(() =>
+                    placedAt(
+                      item,
+                      composeKey(config.schema, item.entityType, [...item.skComposites]),
+                    ),
+                  ),
+              ),
+            )
+            if (Exit.isSuccess(exit)) {
+              if (holds(exit.value)) {
+                found = exit.value
+                break
+              }
+            } else {
+              const error = Cause.squash(exit.cause) as { reason?: unknown; message?: unknown }
+              refused ??= String(error.reason ?? error.message ?? error)
+            }
+          }
+          found ??= (decomposed.get(node) ?? []).find(holds)
+          if (found === undefined) unplaced.set(here, refused)
+          else slots.push({ group, stored, current: found.current, old: found.old })
+        }
+      }
+      return { slots, unplaced }
+    })
+
   /**
    * Where a row may be under the partition's old text: at the sort key the other setting composes,
    * or the current one, where 1.37.0 and 1.38.0 wrote it (its partition key unescaped, its sort key escaped).
@@ -2041,11 +2251,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
     allItems: ReadonlyArray<Record<string, unknown>>,
     pkValue: string,
     from: string | undefined,
+    /** The rows of edges with a custom `decompose`, as {@link customEdgeSlots} placed them. */
+    custom: ReadonlyArray<CustomSlot>,
   ) => {
-    const storedAt = new Map<string, Record<string, unknown>>()
-    for (const item of allItems) {
-      storedAt.set(positionOf(String(item[config.pk.field]), String(item.sk)), item)
-    }
+    const storedAt = storedPositions(allItems)
     /** The sort keys stored in a partition, other than `sk` ({@link oldPosition}). */
     const partitions = new Map<string, KindTargets>()
     const sortKeysIn = (pk: string, sk: string): KindTargets => {
@@ -2064,26 +2273,48 @@ const makeAggregate = <TSchema extends Schema.Top>(
         hasPrefix: inPartition.hasPrefix,
       }
     }
-    const rows = groups.flatMap((group, g) =>
-      group.items.map((item, i) => {
-        const built = composed[g]!.items[i]!
-        const sk = (built.sk as { S?: string } | undefined)?.S ?? ""
-        return {
-          group: group.name,
-          item,
-          built,
-          current: { pk: pkValue, sk },
-          old: oldPosition(
-            from ?? pkValue,
-            pkValue,
-            otherSortKey(config.schema, item, sk),
-            sk,
-            storedAt,
-            (pk) => item.otherKindSortKey?.(sortKeysIn(pk, sk)),
-          ),
-        }
-      }),
-    )
+    // `source`: the decomposed item's index, its row written as decomposed; or, for a custom
+    // `decompose`'s row, where it's stored, moved as stored.
+    let index = 0
+    const rows: ReadonlyArray<{
+      readonly group: string
+      readonly source: number | Position
+      readonly current: Position
+      readonly old: Position
+      /** The decomposed item, for a row written as decomposed. */
+      readonly item?: DecomposedItem | undefined
+    }> = [
+      ...groups.flatMap((group, g) =>
+        group.items.flatMap((item, i) => {
+          const source = index++
+          if (item.custom !== undefined) return []
+          const built = composed[g]!.items[i]!
+          const sk = (built.sk as { S?: string } | undefined)?.S ?? ""
+          return [
+            {
+              group: group.name,
+              source,
+              item,
+              current: { pk: pkValue, sk },
+              old: oldPosition(
+                from ?? pkValue,
+                pkValue,
+                otherSortKey(config.schema, item, sk),
+                sk,
+                storedAt,
+                (pk) => item.otherKindSortKey?.(sortKeysIn(pk, sk)),
+              ),
+            },
+          ]
+        }),
+      ),
+      ...custom.map((slot) => ({
+        group: slot.group,
+        source: slot.stored,
+        current: slot.current,
+        old: slot.old,
+      })),
+    ]
     const placements = placeRows(
       rows.map((row) => ({
         current: positionOf(row.current.pk, row.current.sk),
@@ -2145,9 +2376,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
       //    update path), and a transformation with one type on both sides isn't
       //    applied again to a value it already made.
       //    A row the mutation added doesn't need the dates the library stamps.
-      const decoded = yield* Schema.decodeUnknownEffect(mutatedStateSchema)(
-        fillStamps(rootNode, updated, now, "required"),
-      ).pipe(
+      const written = fillStamps(rootNode, updated, now, "required")
+      const decoded = yield* Schema.decodeUnknownEffect(mutatedStateSchema)(written).pipe(
         Effect.mapError(
           (cause) =>
             new ValidationError({
@@ -2169,7 +2399,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         rootEncoders,
         aggregateName,
         config.schema,
-        false,
+        undefined,
       )
       const newGroups = yield* decomposeAggregate(
         assembledNew,
@@ -2178,7 +2408,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         rootEncoders,
         aggregateName,
         config.schema,
-        true,
+        { present: true, value: written, update: true },
       )
 
       // 5. Diff at the ITEM (primary-key) level, not just the group level.
@@ -2252,6 +2482,46 @@ const makeAggregate = <TSchema extends Schema.Top>(
         for (const item of g.items) survivingSks.add(skOf(item))
       }
 
+      // An edge with a custom `decompose` holds the rows read for it, at the keys they're stored
+      // under: decomposing the value read back needn't key them there (`customEdgeRows`). The
+      // partition is read already, so this reads nothing more.
+      const customRows = customDecompose ? customEdgeRows(rootNode, allItems, config.schema) : []
+      const storedSks = new Map(
+        customRows.map(({ node, rows }) => [node, new Set(rows.map((row) => String(row.sk)))]),
+      )
+      /** The rows of `name` that `update` would delete if the new state doesn't hold their keys. */
+      const heldRows = (name: string): ReadonlyArray<Record<string, AttributeValue>> => {
+        const items = oldItemsByGroup.get(name) ?? []
+        if (customRows.length === 0) return items
+        const decomposed = oldGroupMap.get(name)?.items ?? []
+        const customOf = (i: number) => decomposed[i]?.custom
+        const once = new Set<string>()
+        return [
+          ...items.filter((item, i) => {
+            const node = customOf(i)
+            return node === undefined || storedSks.get(node)?.has(skOf(item)) === true
+          }),
+          ...customRows
+            .filter((entry) => entry.group === name)
+            .flatMap(({ node, rows }) => {
+              const keyed = new Set(
+                items.flatMap((item, i) => (customOf(i) === node ? [skOf(item)] : [])),
+              )
+              return rows
+                .filter((row) => !keyed.has(String(row.sk)))
+                .map((row) =>
+                  toAttributeMap({ [config.pk.field]: row[config.pk.field], sk: row.sk }),
+                )
+            }),
+          // Two edges of one entity type take the same rows.
+        ].filter((item) => {
+          const sk = skOf(item)
+          if (once.has(sk)) return false
+          once.add(sk)
+          return true
+        })
+      }
+
       // 7. Per group (union of old + new names), collect PUTs + orphan DELETEs.
       const groupWrites: Array<{
         group: string
@@ -2270,7 +2540,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         if (!changed) continue
 
         const puts = newItemsByGroup.get(name) ?? []
-        const deletes = (oldItemsByGroup.get(name) ?? [])
+        const deletes = heldRows(name)
           .filter((item) => !survivingSks.has(skOf(item)))
           .map((item) => ({
             [config.pk.field]: item[config.pk.field]!,
@@ -2392,15 +2662,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootEncoders,
           aggregateName,
           config.schema,
-          false,
+          undefined,
         )
-        const rows = locateRows(
-          groups,
-          buildDynamoItems(groups, config, pkValue, undefined, keyRecord),
-          allItems,
-          pkValue,
-          from,
-        )
+        const identities = buildDynamoItems(groups, config, pkValue, undefined, keyRecord)
+        const custom = customDecompose
+          ? yield* customEdgeSlots(groups, identities, allItems, assembled, pkValue, from)
+          : { slots: [], unplaced: new Map<string, string | undefined>() }
+        const rows = locateRows(groups, identities, allItems, pkValue, from, custom.slots)
         const doubled = rows.filter(
           (row) => row.placement === "both" || row.placement === "ambiguous",
         )
@@ -2430,6 +2698,42 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   : "Its rows' keys overlap across key text, and which row is stored under which " +
                     "key can't be told from the keys held: the aggregate is left as it is.",
             })),
+          }
+        }
+
+        // A row of the aggregate's types that no row of its value places would be left behind,
+        // under a key nothing composes: the aggregate is left as it is, and each such row reported.
+        const placed = new Set(
+          rows.flatMap((row) =>
+            row.placement === "current"
+              ? [positionOf(row.current.pk, row.current.sk)]
+              : row.placement === "old"
+                ? [positionOf(row.old.pk, row.old.sk)]
+                : [],
+          ),
+        )
+        const left = allItems.filter(
+          (item) =>
+            rekeyTypes.includes(String(item.__edd_e__)) &&
+            !placed.has(positionOf(String(item[config.pk.field]), String(item.sk))),
+        )
+        if (left.length > 0) {
+          return {
+            conflicts: left.map((item) => {
+              const at = positionOf(String(item[config.pk.field]), String(item.sk))
+              const refused = custom.unplaced.get(at)
+              return {
+                member: aggregateName,
+                kind: "aggregate" as const,
+                reason: "failed" as const,
+                key: { [config.pk.field]: item[config.pk.field], sk: item.sk },
+                target: undefined,
+                message:
+                  "No row of the aggregate's value is stored under this row's key, in either " +
+                  "key text, so moving the aggregate would leave it behind: the aggregate is " +
+                  `left as it is.${refused === undefined ? "" : ` Its key composites: ${refused}`}`,
+              }
+            }),
           }
         }
 
@@ -2477,6 +2781,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
           ])
         const keyOf = (at: { readonly pk: string; readonly sk: string }) =>
           toAttributeMap({ [config.pk.field]: at.pk, sk: at.sk })
+        // A custom `decompose`'s row is written as stored, under its current key: decomposing the
+        // value read back needn't give the attributes it holds (`customEdgeSlots`).
+        const mirror =
+          config.collection.index !== undefined && config.collection.sk !== undefined
+            ? config.collection.sk.field
+            : undefined
+        const itemOf = (row: (typeof rows)[number]): Record<string, AttributeValue> =>
+          typeof row.source === "number"
+            ? built[row.source]!
+            : {
+                ...storedAt.get(positionOf(row.source.pk, row.source.sk)),
+                [config.pk.field]: { S: row.current.pk },
+                sk: { S: row.current.sk },
+                ...(mirror !== undefined && { [mirror]: { S: row.current.sk } }),
+              }
 
         type Move = {
           readonly from: { readonly pk: string; readonly sk: string }
@@ -2485,7 +2804,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
         const moves: Array<Move> = []
         const rewrites: Array<ReadonlyArray<TransactWriteItem>> = []
-        for (const [r, row] of rows.entries()) {
+        for (const row of rows) {
           if (row.placement === "old") {
             moves.push({
               from: row.old,
@@ -2494,7 +2813,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 {
                   Put: {
                     TableName: tableConfig.name,
-                    Item: built[r]!,
+                    Item: itemOf(row),
                     ConditionExpression: "attribute_not_exists(#pk)",
                     ExpressionAttributeNames: { "#pk": config.pk.field },
                   },
@@ -2507,14 +2826,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
             continue
           }
           if (row.placement !== "current" || row.atCurrent === undefined) continue
-          const stale = staleIndexFields(built[r]!, row.atCurrent)
+          const item = itemOf(row)
+          const stale = staleIndexFields(item, row.atCurrent)
           if (stale.length === 0) continue
           const guard = guardOf(row.current)
           const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
           const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
           const sets = stale.map((field, i) => {
             names[`#x${i}`] = field
-            values[`:x${i}`] = built[r]![field]!
+            values[`:x${i}`] = item[field]!
             return `#x${i} = :x${i}`
           })
           rewrites.push([
@@ -2929,9 +3249,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
           //    when no edge needs it). A date the library stamps is stamped now
           //    unless supplied, so what's composed and returned is what's stored.
           const now = yield* DateTime.now
-          const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(
-            fillStamps(rootNode, hydrated, now, "declared"),
-          ).pipe(
+          const written = fillStamps(rootNode, hydrated, now, "declared")
+          const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(written).pipe(
             Effect.mapError(
               (cause) =>
                 new ValidationError({
@@ -2955,7 +3274,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             rootEncoders,
             aggregateName,
             config.schema,
-            true,
+            { present: true, value: written, update: false },
           )
 
           // 5. Build DynamoDB items with composed keys (create only ever PUTs).
@@ -3373,7 +3692,7 @@ interface ResolveNodeArgs {
   readonly discriminator?: Record<string, unknown> | undefined
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
-  readonly decomposeInput?: ((value: unknown) => unknown) | undefined
+  readonly decomposeInput?: ((written: Written) => Option.Option<unknown>) | undefined
   readonly ownDiscriminator?: Record<string, unknown> | undefined
   readonly attrEncoders?: AttrEncoders | undefined
   readonly keyAttrEncoders?: AttrEncoders | undefined
@@ -4349,6 +4668,28 @@ interface DecomposedItem {
   readonly rowStamps: RowStamps | undefined
   /** The fields stored as given, which no encoder of theirs takes (see {@link AttrEncoder}). */
   readonly storedAsGiven: ReadonlyArray<string>
+  /**
+   * The `many` edge with a custom `decompose` this row is an element of. Its key, decomposed from
+   * a value read back, needn't be the key it's stored under (see {@link customEdgeRows}).
+   */
+  readonly custom?: ResolvedNode | undefined
+}
+
+/** Where a row is stored: its partition and sort key. */
+interface Position {
+  readonly pk: string
+  readonly sk: string
+}
+
+/**
+ * A row of an edge with a custom `decompose`, as `rekey` placed it: where it's stored, its current
+ * key, and its old one (see `customEdgeSlots`).
+ */
+interface CustomSlot {
+  readonly group: string
+  readonly stored: Position
+  readonly current: Position
+  readonly old: Position
 }
 
 /** A group of items to write in a single transaction */
@@ -4383,6 +4724,36 @@ interface ContextValues {
   readonly key: Record<string, unknown>
 }
 
+/** An attribute through its encoder, if it has one and a value. */
+const encodeWith = (
+  set: AttrEncoders,
+  field: string,
+  value: unknown,
+  asGiven?: () => void,
+): unknown => {
+  const encode = set[field]
+  return encode && value != null ? encode(value, asGiven) : value
+}
+
+/**
+ * The root's context values, as stored on member items and as their keys read them. Domain
+ * Date/DateTime objects must be encoded before toAttributeMap() marshalling, otherwise Date objects
+ * become { M: {} } (no enumerable properties).
+ */
+const contextValuesOf = (
+  assembled: Record<string, unknown>,
+  contextFields: ReadonlyArray<string>,
+  encoders: NodeEncoders,
+): ContextValues => {
+  const contextValues: ContextValues = { stored: {}, key: {} }
+  for (const field of contextFields) {
+    const value = assembled[field]
+    contextValues.stored[field] = encodeWith(encoders.stored, field, value)
+    contextValues.key[field] = encodeWith(encoders.key, field, value)
+  }
+  return contextValues
+}
+
 /**
  * Decompose an assembled domain object into DynamoDB items grouped by
  * sub-aggregate transaction boundaries.
@@ -4394,30 +4765,15 @@ const decomposeAggregate = (
   encoders: NodeEncoders,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
-  /** A write's value (`create`, update's new state): a custom `decompose` is handed it read as on 1.39.0. */
-  written: boolean,
+  /**
+   * A write's own value (`create`'s input, the state `update`'s mutation returned), before it was
+   * decoded: a custom `decompose` is handed it read as on 1.39.0. Undefined for what was read.
+   */
+  written: Written | undefined,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
-    const encodeWith = (
-      set: AttrEncoders,
-      field: string,
-      value: unknown,
-      asGiven?: () => void,
-    ): unknown => {
-      const encode = set[field]
-      return encode && value != null ? encode(value, asGiven) : value
-    }
-
-    // Extract context values from the root, encoded for DynamoDB storage.
-    // Domain Date/DateTime objects must be encoded before toAttributeMap() marshalling,
-    // otherwise Date objects become { M: {} } (no enumerable properties).
-    const contextValues: ContextValues = { stored: {}, key: {} }
-    for (const field of contextFields) {
-      const value = assembled[field]
-      contextValues.stored[field] = encodeWith(encoders.stored, field, value)
-      contextValues.key[field] = encodeWith(encoders.key, field, value)
-    }
+    const contextValues = contextValuesOf(assembled, contextFields, encoders)
 
     // Root item: fields not claimed by edges
     const edgeFieldNames = new Set(rootNode.children.map((c) => c.fieldName).filter(Boolean))
@@ -4455,7 +4811,7 @@ const decomposeAggregate = (
         { current: [], other: () => [] },
         aggregateName,
         schema,
-        written,
+        writtenField(written, child.fieldName!),
       )
     }
 
@@ -4568,7 +4924,8 @@ const decomposeNode = (
   parentDiscriminators: DiscriminatorValues,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
-  written: boolean,
+  /** The caller's own value here, on a write (see {@link Written}). */
+  written: Written | undefined,
 ): Effect.Effect<void, AggregateDecompositionError> =>
   Effect.gen(function* () {
     // Optional edges may have null/undefined values — skip decomposition
@@ -4633,7 +4990,7 @@ const decomposeNode = (
           discValues,
           aggregateName,
           schema,
-          written,
+          writtenField(written, child.fieldName!),
         )
       }
     } else if (node.cardinality === "one") {
@@ -4663,103 +5020,204 @@ const decomposeNode = (
       })
     } else {
       // Many edge
+      const handed =
+        written === undefined || node.decomposeInput === undefined
+          ? value
+          : Option.getOrElse(node.decomposeInput(written), () => value)
       const arrayItems = node.decompose
-        ? node.decompose(written && node.decomposeInput ? node.decomposeInput(value) : value)
+        ? node.decompose(handed)
         : Array.isArray(value)
           ? (value as ReadonlyArray<unknown>)
           : []
 
-      const withContext = (attrs: Record<string, unknown>, context: Record<string, unknown>) => {
-        mergeContextValues(attrs, context)
-        if (node.discriminator) {
-          for (const [k, v] of Object.entries(node.discriminator)) {
-            if (typeof v !== "function") attrs[k] = v
-          }
-        }
-        return attrs
-      }
-
       for (const elem of arrayItems) {
-        // The element's attributes in their STORED form — every nested date,
-        // transformed scalar and hydrated ref encoded (#72, #133).
-        const attrs = { ...(elem as Record<string, unknown>) }
-        const storedAsGiven = applyNodeAttrEncoders(attrs, node.attrEncoders)
-        withContext(attrs, contextValues.stored)
-
-        // The sort key is read from the element as the pre-#133 encoders left
-        // it, NOT from `attrs`: encoding a ref's nested `NumberFromString` turns
-        // a padded `0000000000000005` key segment into `5`, so composing from
-        // the stored form would re-spell (and orphan) existing rows.
-        const keyAttrs = { ...(elem as Record<string, unknown>) }
-        applyNodeAttrEncoders(keyAttrs, node.keyAttrEncoders)
-        withContext(keyAttrs, contextValues.key)
-
-        const values = yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)
-
-        items.push({
-          entityType: node.entityType,
-          attributes: attrs,
-          transactionGroup: parentGroup,
-          skComposites: [
-            ...parentDiscriminators.current,
-            ...values.map((value) => KeyComposer.keyValueText(schema, value, schema.casing)),
-          ],
-          skCompositesOther: () => [
-            ...parentDiscriminators.other(),
-            ...values.map((value) => otherKeyText(schema, value)),
-          ],
-          otherKindSortKey: (targets) => {
-            const slots = values.map((_, i) => String(i))
-            const settings: ReadonlyArray<
-              readonly [() => ReadonlyArray<string>, (value: unknown) => string]
-            > = [
-              [
-                () => parentDiscriminators.current,
-                (value) => KeyComposer.keyValueText(schema, value, schema.casing),
-              ],
-              [() => parentDiscriminators.other(), (value) => otherKeyText(schema, value)],
-            ]
-            for (const [parents, text] of settings) {
-              const sortKey = (record: Record<string, unknown>) =>
-                composeKey(schema, node.entityType, [
-                  ...parents(),
-                  ...slots.map((slot) => text(record[slot])),
-                ])
-              const reading = kindReadingOf(
-                { ...values },
-                slots,
-                () => undefined,
-                ({ record }) => sortKey(record),
-                targets,
-              )
-              if (reading !== undefined && reading.asOther.size > 0) return sortKey(reading.record)
-            }
-            return undefined
-          },
-          skTextFor: (taker, path) => {
-            try {
-              let from = keyAttrs
-              if (taker !== node) {
-                from = { ...(elem as Record<string, unknown>) }
-                applyNodeAttrEncoders(from, taker.keyAttrEncoders)
-                mergeContextValues(from, contextValues.key)
-              }
-              const value = readCompositePath(from, path)
-              return value == null || !isScalarComposite(value)
-                ? undefined
-                : KeyComposer.keyValueText(schema, value, schema.casing)
-            } catch {
-              // What `taker` can't compose a key from isn't a key it writes.
-              return undefined
-            }
-          },
-          member: node.fieldName ?? node.entityType,
-          rowStamps: node.rowStamps,
-          storedAsGiven,
-        })
+        items.push(
+          yield* manyElementItem(
+            node,
+            elem,
+            contextValues,
+            parentGroup,
+            parentDiscriminators,
+            aggregateName,
+            schema,
+          ),
+        )
       }
     }
   })
+
+/** One element of a `many` edge as its row: its stored attributes and its sort key composites. */
+const manyElementItem = (
+  node: ResolvedNode,
+  elem: unknown,
+  contextValues: ContextValues,
+  parentGroup: string,
+  parentDiscriminators: DiscriminatorValues,
+  aggregateName: string,
+  schema: DynamoSchemaModule.DynamoSchema,
+): Effect.Effect<DecomposedItem, AggregateDecompositionError> =>
+  Effect.gen(function* () {
+    const withContext = (attrs: Record<string, unknown>, context: Record<string, unknown>) => {
+      mergeContextValues(attrs, context)
+      if (node.discriminator) {
+        for (const [k, v] of Object.entries(node.discriminator)) {
+          if (typeof v !== "function") attrs[k] = v
+        }
+      }
+      return attrs
+    }
+
+    // The element's attributes in their STORED form — every nested date,
+    // transformed scalar and hydrated ref encoded (#72, #133).
+    const attrs = { ...(elem as Record<string, unknown>) }
+    const storedAsGiven = applyNodeAttrEncoders(attrs, node.attrEncoders)
+    withContext(attrs, contextValues.stored)
+
+    // The sort key is read from the element as the pre-#133 encoders left
+    // it, NOT from `attrs`: encoding a ref's nested `NumberFromString` turns
+    // a padded `0000000000000005` key segment into `5`, so composing from
+    // the stored form would re-spell (and orphan) existing rows.
+    const keyAttrs = { ...(elem as Record<string, unknown>) }
+    applyNodeAttrEncoders(keyAttrs, node.keyAttrEncoders)
+    withContext(keyAttrs, contextValues.key)
+
+    const values = yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)
+
+    return {
+      entityType: node.entityType,
+      attributes: attrs,
+      transactionGroup: parentGroup,
+      skComposites: [
+        ...parentDiscriminators.current,
+        ...values.map((value) => KeyComposer.keyValueText(schema, value, schema.casing)),
+      ],
+      skCompositesOther: () => [
+        ...parentDiscriminators.other(),
+        ...values.map((value) => otherKeyText(schema, value)),
+      ],
+      otherKindSortKey: (targets: KindTargets) => {
+        const slots = values.map((_, i) => String(i))
+        const settings: ReadonlyArray<
+          readonly [() => ReadonlyArray<string>, (value: unknown) => string]
+        > = [
+          [
+            () => parentDiscriminators.current,
+            (value) => KeyComposer.keyValueText(schema, value, schema.casing),
+          ],
+          [() => parentDiscriminators.other(), (value) => otherKeyText(schema, value)],
+        ]
+        for (const [parents, text] of settings) {
+          const sortKey = (record: Record<string, unknown>) =>
+            composeKey(schema, node.entityType, [
+              ...parents(),
+              ...slots.map((slot) => text(record[slot])),
+            ])
+          const reading = kindReadingOf(
+            { ...values },
+            slots,
+            () => undefined,
+            ({ record }) => sortKey(record),
+            targets,
+          )
+          if (reading !== undefined && reading.asOther.size > 0) return sortKey(reading.record)
+        }
+        return undefined
+      },
+      skTextFor: (taker: ResolvedNode, path: string) => {
+        try {
+          let from = keyAttrs
+          if (taker !== node) {
+            from = { ...(elem as Record<string, unknown>) }
+            applyNodeAttrEncoders(from, taker.keyAttrEncoders)
+            mergeContextValues(from, contextValues.key)
+          }
+          const value = readCompositePath(from, path)
+          return value == null || !isScalarComposite(value)
+            ? undefined
+            : KeyComposer.keyValueText(schema, value, schema.casing)
+        } catch {
+          // What `taker` can't compose a key from isn't a key it writes.
+          return undefined
+        }
+      },
+      member: node.fieldName ?? node.entityType,
+      rowStamps: node.rowStamps,
+      storedAsGiven,
+      ...(node.decompose !== undefined && { custom: node }),
+    }
+  })
+
+/**
+ * The rows read that assembly took for each `many` edge with a custom `decompose`, as it took them:
+ * of the edge's entity type, holding every static discriminator value of the bindings above it, below
+ * a sub-aggregate whose root was read. Each with the transaction group its rows are written in and
+ * the discriminator values its sort keys start with. A custom `decompose` handed the value read back
+ * needn't return what was stored (one that returns a field's stored form, `f / 10`, does so again), so
+ * which rows an edge holds, and where, is read off these rows, never off decomposing it again.
+ */
+const customEdgeRows = (
+  rootNode: ResolvedNode,
+  allItems: ReadonlyArray<Record<string, unknown>>,
+  schema: DynamoSchemaModule.DynamoSchema,
+): ReadonlyArray<{
+  readonly node: ResolvedNode
+  readonly group: string
+  readonly parentDiscriminators: DiscriminatorValues
+  readonly rows: ReadonlyArray<Record<string, unknown>>
+}> => {
+  const found: Array<{
+    readonly node: ResolvedNode
+    readonly group: string
+    readonly parentDiscriminators: DiscriminatorValues
+    readonly rows: ReadonlyArray<Record<string, unknown>>
+  }> = []
+  const rowsOf = (node: ResolvedNode) =>
+    allItems.filter(
+      (item) =>
+        item.__edd_e__ === node.entityType &&
+        Object.entries(node.discriminator ?? {}).every(
+          ([attr, value]) => typeof value === "function" || item[attr] === value,
+        ),
+    )
+  // As `assembleNode` walks: a sub-aggregate's children match on its discriminator merged with theirs.
+  const walk = (
+    node: ResolvedNode,
+    group: string,
+    discriminators: DiscriminatorValues,
+    root: boolean,
+  ): void => {
+    for (const child of node.children) {
+      const matched =
+        !root && node.discriminator
+          ? { ...child, discriminator: { ...node.discriminator, ...child.discriminator } }
+          : child
+      if (child.cardinality === "many") {
+        if (child.decompose !== undefined) {
+          found.push({
+            node: child,
+            group,
+            parentDiscriminators: discriminators,
+            rows: rowsOf(matched),
+          })
+        }
+      } else if (child.children.length > 0 && rowsOf(matched).length === 1) {
+        const ownName = child.fieldName ?? child.entityType
+        const own = ownDiscriminatorValues(child, schema)
+        walk(
+          matched,
+          group === "root" ? ownName : `${group}.${ownName}`,
+          {
+            current: [...discriminators.current, ...own.current],
+            other: () => [...discriminators.other(), ...own.other()],
+          },
+          false,
+        )
+      }
+    }
+  }
+  walk(rootNode, "root", { current: [], other: () => [] }, true)
+  return found
+}
 
 /**
  * Read one declared sk composite off a decomposed element.

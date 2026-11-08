@@ -1,0 +1,633 @@
+/**
+ * Rows published 1.39.0 wrote through `many` edges with a custom `decompose`, read, updated and
+ * moved by `rekey`.
+ *
+ * Each edge is keyed by a field whose transformation has one type on both sides (it multiplies by
+ * 10 on decode). `pass` hands each element back unchanged; `enc` returns the field's stored form
+ * (`f / 10`), so its rows are keyed by the value they read as, while decomposing that value again
+ * keys them elsewhere (`f / 10` once more). `fixtures/aggregate-decompose-reads-1.39.0.json` holds
+ * what 1.39.0 stored and read: generated once from the published package, don't regenerate or "fix"
+ * it.
+ *
+ * - `Defaults`: the field has a decoding default of 5, and `create` leaves it out. 1.39.0 hands
+ *   `decompose` 50, the default decoded once.
+ * - `Overlaps`: the field's encoded side takes a number or a string, and `create` gives it "5".
+ *   1.39.0 hands `decompose` 50.
+ * - `Moves`: two lines on each edge, under an id holding a space.
+ */
+
+import { readFileSync } from "node:fs"
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { describe, expect, it } from "@effect/vitest"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { Cause, DateTime, Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
+import * as Aggregate from "../src/Aggregate.js"
+import { DynamoClient } from "../src/DynamoClient.js"
+import * as Table from "../src/Table.js"
+import { makeRecordingTable } from "./helpers/RecordingTable.js"
+
+type Row = Record<string, AttributeValue>
+
+const fixture = JSON.parse(
+  readFileSync(
+    new URL("./fixtures/aggregate-decompose-reads-1.39.0.json", import.meta.url),
+    "utf8",
+  ),
+) as {
+  readonly cases: Record<
+    string,
+    { readonly rows: ReadonlyArray<Row>; readonly read: Record<string, unknown> }
+  >
+}
+const at = (name: string) => fixture.cases[name]!
+
+// The fixture's models: they must stay what the generator declared.
+const times10 = {
+  decode: SchemaGetter.transform((value: unknown) => Number(value) * 10),
+  encode: SchemaGetter.transform((value: number) => value / 10),
+}
+const X10 = Schema.Number.pipe(Schema.decodeTo(Schema.Number, times10))
+const Defaulted = X10.pipe(Schema.withDecodingDefault(Effect.succeed(5)))
+const Overlap = Schema.Union([Schema.Number, Schema.String]).pipe(
+  Schema.decodeTo(Schema.Number, times10),
+)
+
+/** What each `decompose` was handed. */
+const handed: Array<unknown> = []
+
+const world = (escapeKeys: boolean) => {
+  const schema = DynamoSchema.make({ name: "dr", version: 1, escapeKeys })
+  const Main = Table.make({ schema, entities: {} })
+  const make = (name: string, field: Schema.Top) => {
+    const Line = Schema.Struct({
+      lineId: Schema.String,
+      f: field as typeof X10,
+      note: Schema.optional(Schema.String),
+    })
+    const Model = Schema.Struct({
+      id: Schema.String,
+      pass: Schema.Array(Line),
+      enc: Schema.Array(Line),
+    })
+    return Aggregate.make(Model, {
+      table: Main,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: name.toLowerCase() },
+      root: { entityType: name },
+      edges: {
+        pass: Aggregate.many({
+          entityType: `${name}Pass`,
+          sk: { composite: ["f"] },
+          decompose: (lines) => {
+            handed.push(lines)
+            return (lines as ReadonlyArray<typeof Line.Type>).map((line) => ({ ...line }))
+          },
+        }),
+        enc: Aggregate.many({
+          entityType: `${name}Enc`,
+          sk: { composite: ["f"] },
+          decompose: (lines) =>
+            (lines as ReadonlyArray<typeof Line.Type>).map((line) => ({ ...line, f: line.f / 10 })),
+        }),
+      },
+    })
+  }
+  const aggregates = {
+    Defaults: make("Defaults", Defaulted),
+    Overlaps: make("Overlaps", Overlap),
+    Moves: make("Moves", X10),
+  }
+  const table = makeRecordingTable()
+  const run = <A, E>(body: (db: any) => Effect.Effect<A, E, never>) =>
+    Effect.gen(function* () {
+      const db: any = yield* DynamoClient.make({
+        entities: {},
+        aggregates,
+        tables: { Main },
+      } as never)
+      return yield* body(db)
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, Main.layer({ name: "dr" })) as never),
+      Effect.exit,
+    ) as Effect.Effect<Exit.Exit<A, E>>
+  const seed = (rows: ReadonlyArray<Row>) => {
+    for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, structuredClone(row))
+  }
+  /** One partition's rows, in key order. */
+  const rowsOf = (pk: string) =>
+    [...table.items.values()]
+      .filter((row) => row.pk?.S === pk)
+      .sort((a, b) => a.sk!.S!.localeCompare(b.sk!.S!))
+  return { table, run, seed, rowsOf }
+}
+
+const succeed = (exit: Exit.Exit<unknown, unknown>): any => {
+  if (Exit.isFailure(exit)) throw new Error(String(exit.cause))
+  return exit.value
+}
+
+/** An edge's rows as their sort keys and stored `f`. */
+const edgeRows = (rows: ReadonlyArray<Row>, entityType: string) =>
+  rows.filter((row) => row.__edd_e__?.S === entityType).map((row) => [row.sk?.S, row.f])
+
+describe("a write hands a custom decompose the caller's value, read once", () => {
+  it.effect("a decoding default left out is read once: stored and keyed as on 1.39.0", () =>
+    Effect.gen(function* () {
+      const { run, rowsOf } = world(false)
+      handed.length = 0
+      succeed(
+        yield* run((db) =>
+          db.aggregates.Defaults.create({
+            id: "created",
+            pass: [{ lineId: "p1" }],
+            enc: [{ lineId: "e1" }],
+          }),
+        ),
+      )
+      expect(handed).toEqual([[{ lineId: "p1", f: 50 }]])
+      expect(rowsOf("$dr#v1#defaults#created")).toEqual(at("defaults created").rows)
+      expect(succeed(yield* run((db) => db.aggregates.Defaults.get({ id: "created" })))).toEqual(
+        at("defaults created").read,
+      )
+    }),
+  )
+
+  it.effect(
+    "a stored form the domain side refuses is read once: stored and keyed as on 1.39.0",
+    () =>
+      Effect.gen(function* () {
+        const { run, rowsOf } = world(false)
+        handed.length = 0
+        succeed(
+          yield* run((db) =>
+            db.aggregates.Overlaps.create({
+              id: "created",
+              pass: [{ lineId: "p1", f: "5" }],
+              enc: [{ lineId: "e1", f: "5" }],
+            }),
+          ),
+        )
+        expect(handed).toEqual([[{ lineId: "p1", f: 50 }]])
+        expect(rowsOf("$dr#v1#overlaps#created")).toEqual(at("overlaps created").rows)
+        expect(succeed(yield* run((db) => db.aggregates.Overlaps.get({ id: "created" })))).toEqual(
+          at("overlaps created").read,
+        )
+      }),
+  )
+
+  for (const [name, aggregate, added] of [
+    ["defaults", "Defaults", { lineId: "e2", note: "new line" }],
+    ["overlaps", "Overlaps", { lineId: "e2", f: "5", note: "new line" }],
+  ] as const) {
+    it.effect(`${name}: an element added to rows 1.39.0 wrote is stored as 1.39.0 stored it`, () =>
+      Effect.gen(function* () {
+        const { run, seed, rowsOf } = world(false)
+        seed(at(`${name} added before`).rows)
+        const updated = yield* run((db) =>
+          db.aggregates[aggregate].update({ id: "added" }, ({ state }: any) => ({
+            ...state,
+            enc: [...state.enc, added],
+          })),
+        )
+        succeed(updated)
+        expect(rowsOf(`$dr#v1#${name}#added`)).toEqual(at(`${name} added after`).rows)
+        expect(succeed(yield* run((db) => db.aggregates[aggregate].get({ id: "added" })))).toEqual(
+          at(`${name} added after`).read,
+        )
+      }),
+    )
+  }
+})
+
+describe("update deletes the rows read, at the keys they're stored under", () => {
+  const pk = "$dr#v1#moves#a b"
+
+  it.effect("removing an element deletes its row, whichever convention decompose follows", () =>
+    Effect.gen(function* () {
+      const { run, seed, rowsOf } = world(false)
+      seed(at("moves created").rows)
+      succeed(
+        yield* run((db) =>
+          db.aggregates.Moves.update({ id: "a b" }, ({ state }: any) => ({
+            ...state,
+            pass: state.pass.filter((line: any) => line.lineId !== "p1"),
+            enc: state.enc.filter((line: any) => line.lineId !== "e1"),
+          })),
+        ),
+      )
+      const rows = rowsOf(pk)
+      expect(edgeRows(rows, "MovesEnc")).toEqual([["$dr#v1#movesenc#0000000000000060", { N: "6" }]])
+      // A value handed back unchanged is decoded once more on every update, as on 1.39.0.
+      expect(edgeRows(rows, "MovesPass")).toEqual([
+        ["$dr#v1#movespass#0000000000006000", { N: "600" }],
+      ])
+      const got = succeed(yield* run((db) => db.aggregates.Moves.get({ id: "a b" })))
+      expect(got.enc).toEqual([{ lineId: "e2", f: 60 }])
+      expect(got.pass).toEqual([{ lineId: "p2", f: 6000 }])
+    }),
+  )
+
+  it.effect("changing a keyed value leaves one row, under the new key", () =>
+    Effect.gen(function* () {
+      const { run, seed, rowsOf } = world(false)
+      seed(at("moves created").rows)
+      succeed(
+        yield* run((db) =>
+          db.aggregates.Moves.update({ id: "a b" }, ({ state }: any) => ({
+            ...state,
+            enc: state.enc.map((line: any) => (line.lineId === "e1" ? { ...line, f: 70 } : line)),
+          })),
+        ),
+      )
+      expect(edgeRows(rowsOf(pk), "MovesEnc")).toEqual([
+        ["$dr#v1#movesenc#0000000000000060", { N: "6" }],
+        ["$dr#v1#movesenc#0000000000000070", { N: "7" }],
+      ])
+      const got = succeed(yield* run((db) => db.aggregates.Moves.get({ id: "a b" })))
+      expect(got.enc).toEqual([
+        { lineId: "e2", f: 60 },
+        { lineId: "e1", f: 70 },
+      ])
+    }),
+  )
+})
+
+describe("rekey moves a custom decompose's rows by the keys their own values compose", () => {
+  const before = "$dr#v1#moves#a b"
+  const after = "$dr#v1#moves#a%20b"
+  const rekey = (run: ReturnType<typeof world>["run"]) =>
+    run((db) => db.tables.Main.rekey({ repairIndexKeys: true }))
+
+  it.effect("every row moves with the root, as stored, and reads as it did", () =>
+    Effect.gen(function* () {
+      const { run, seed, rowsOf } = world(true)
+      seed(at("moves created").rows)
+      const report = succeed(yield* rekey(run))
+      expect(report.conflicts).toEqual([])
+      expect(report.moved.aggregate).toBe(5)
+      expect(rowsOf(before)).toEqual([])
+      expect(rowsOf(after)).toEqual(
+        at("moves created").rows.map((row) => ({ ...row, pk: { S: after } })),
+      )
+      expect(succeed(yield* run((db) => db.aggregates.Moves.get({ id: "a b" })))).toEqual(
+        at("moves created").read,
+      )
+      // Nothing is left to move.
+      const again = succeed(yield* rekey(run))
+      expect(again.conflicts).toEqual([])
+      expect(again.moved.aggregate).toBe(0)
+    }),
+  )
+
+  it.effect("a row no value of the aggregate places is reported, and nothing moves", () =>
+    Effect.gen(function* () {
+      const { run, seed, rowsOf } = world(true)
+      seed(at("moves created").rows)
+      // A row of the edge under a key its own value doesn't compose: 7 reads as 70, keyed 80.
+      const stray = {
+        ...at("moves created").rows.find((row) => row.__edd_e__?.S === "MovesEnc")!,
+        sk: { S: "$dr#v1#movesenc#0000000000000080" },
+        lineId: { S: "e3" },
+        f: { N: "7" },
+      }
+      seed([stray])
+      const seeded = rowsOf(before)
+      const report = succeed(yield* rekey(run))
+      expect(report.conflicts).toEqual([
+        expect.objectContaining({
+          member: "Moves",
+          reason: "failed",
+          key: { pk: before, sk: "$dr#v1#movesenc#0000000000000080" },
+        }),
+      ])
+      expect(report.moved.aggregate).toBe(0)
+      expect(rowsOf(before)).toEqual(seeded)
+      expect(rowsOf(after)).toEqual([])
+    }),
+  )
+})
+
+describe("rekey never leaves an aggregate's row behind unreported", () => {
+  it.effect("a second row of a `one` edge, which assembly doesn't take, holds the move", () =>
+    Effect.gen(function* () {
+      const schema = DynamoSchema.make({ name: "dr", version: 1, escapeKeys: true })
+      const Main = Table.make({ schema, entities: {} })
+      const Note = Schema.Struct({ text: Schema.String })
+      const Doc = Aggregate.make(Schema.Struct({ id: Schema.String, note: Note }), {
+        table: Main,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "doc" },
+        root: { entityType: "Doc" },
+        edges: { note: Aggregate.one({ entityType: "DocNote" }) },
+      })
+      const table = makeRecordingTable()
+      const pk = "$dr#v1#doc#a b"
+      const rows: ReadonlyArray<Row> = [
+        { pk: { S: pk }, sk: { S: "$dr#v1#doc" }, __edd_e__: { S: "Doc" }, id: { S: "a b" } },
+        {
+          pk: { S: pk },
+          sk: { S: "$dr#v1#docnote" },
+          __edd_e__: { S: "DocNote" },
+          text: { S: "x" },
+        },
+        // The same edge's row again, under a key nothing composes.
+        {
+          pk: { S: pk },
+          sk: { S: "$dr#v1#docnote#old" },
+          __edd_e__: { S: "DocNote" },
+          text: { S: "y" },
+        },
+      ]
+      for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, structuredClone(row))
+      const report: any = succeed(
+        yield* Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: {},
+            aggregates: { Doc },
+            tables: { Main },
+          } as never)
+          return yield* db.tables.Main.rekey()
+        }).pipe(
+          Effect.provide(Layer.merge(table.layer, Main.layer({ name: "dr" })) as never),
+          Effect.exit,
+        ) as Effect.Effect<Exit.Exit<unknown, unknown>>,
+      )
+      expect(report.conflicts).toEqual([
+        expect.objectContaining({
+          member: "Doc",
+          reason: "failed",
+          key: { pk, sk: "$dr#v1#docnote#old" },
+        }),
+      ])
+      expect([...table.items.values()]).toEqual(rows)
+    }),
+  )
+})
+
+describe("a custom decompose over a class with no transformation costs no schema check", () => {
+  it.effect("create and update check each value as often as without the custom decompose", () =>
+    Effect.gen(function* () {
+      const counts = (custom: boolean) =>
+        Effect.gen(function* () {
+          let checks = 0
+          const counted = Schema.Number.check(
+            Schema.makeFilter(() => {
+              checks++
+              return true
+            }),
+          )
+          class Line extends Schema.Class<Line>("DecomposeRowsLine")({
+            lineId: Schema.String,
+            f: counted,
+          }) {}
+          const schema = DynamoSchema.make({ name: "dr", version: 1 })
+          const Main = Table.make({ schema, entities: {} })
+          const Orders = Aggregate.make(
+            Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) }),
+            {
+              table: Main,
+              schema,
+              pk: { field: "pk", composite: ["id"] },
+              collection: { name: "order" },
+              root: { entityType: "Order" },
+              edges: {
+                lines: Aggregate.many({
+                  entityType: "OrderLine",
+                  sk: { composite: ["lineId"] },
+                  ...(custom && { decompose: (lines: unknown) => lines as ReadonlyArray<unknown> }),
+                }),
+              },
+            },
+          )
+          const table = makeRecordingTable()
+          const run = <A, E>(body: (db: any) => Effect.Effect<A, E, never>) =>
+            Effect.gen(function* () {
+              const db: any = yield* DynamoClient.make({
+                entities: {},
+                aggregates: { Orders },
+                tables: { Main },
+              } as never)
+              return yield* body(db)
+            }).pipe(
+              Effect.provide(Layer.merge(table.layer, Main.layer({ name: "dr" })) as never),
+              Effect.exit,
+            ) as Effect.Effect<Exit.Exit<A, E>>
+          const seen: Record<string, number> = {}
+          checks = 0
+          succeed(
+            yield* run((db) =>
+              db.aggregates.Orders.create({ id: "a", lines: [new Line({ lineId: "l", f: 5 })] }),
+            ),
+          )
+          seen.create = checks
+          checks = 0
+          succeed(
+            yield* run((db) =>
+              db.aggregates.Orders.update({ id: "a" }, ({ state }: any) => ({
+                ...state,
+                lines: state.lines.map((line: any) => ({ ...line, f: 6 })),
+              })),
+            ),
+          )
+          seen.update = checks
+          return seen
+        })
+      expect(yield* counts(true)).toEqual(yield* counts(false))
+    }),
+  )
+})
+
+/**
+ * Keyed (`Schema.Record`) edges, whose `decompose` returns a date field's stored form. 1.39.0 stored a
+ * keyed edge's attributes as `decompose` returned them; they now go through the element's encoders,
+ * as an array edge's always did. `fixtures/aggregate-decompose-keyed-1.39.0.json` holds what 1.39.0
+ * stored and read: generated once from the published package, don't regenerate or "fix" it.
+ */
+describe("a keyed edge whose decompose returns a field's stored form", () => {
+  const keyedFixture = JSON.parse(
+    readFileSync(
+      new URL("./fixtures/aggregate-decompose-keyed-1.39.0.json", import.meta.url),
+      "utf8",
+    ),
+  ) as {
+    readonly cases: Record<
+      string,
+      { readonly rows: ReadonlyArray<Row>; readonly read: Record<string, unknown> }
+    >
+  }
+  const keyedAt = (name: string) => keyedFixture.cases[name]!
+
+  const NumberToDate = Schema.Number.pipe(
+    Schema.decodeTo(Schema.Date, {
+      decode: SchemaGetter.transform((n: number) => new Date(n)),
+      encode: SchemaGetter.transform((d: Date) => d.getTime()),
+    }),
+  )
+  const line = <S extends Schema.Top>(at: S) =>
+    Schema.Struct({ lineId: Schema.String, at, note: Schema.optional(Schema.String) })
+  const Iso = line(Schema.DateTimeUtcFromString)
+  const Millis = line(NumberToDate)
+  const Nums = line(Schema.NumberFromString)
+  type Lines = Record<string, { readonly lineId: string; readonly at: any; readonly note?: string }>
+  const keyed = (lines: ReadonlyArray<unknown>) =>
+    Object.fromEntries((lines as ReadonlyArray<{ lineId: string }>).map((l) => [l.lineId, l]))
+
+  const keyedWorld = (options: {
+    readonly array?: boolean
+    readonly isoOf?: (at: any) => unknown
+  }) => {
+    const schema = DynamoSchema.make({ name: "dk", version: 1 })
+    const Main = Table.make({ schema, entities: {} })
+    const holder = <S extends Schema.Top>(element: S) =>
+      options.array ? Schema.Array(element) : Schema.Record(Schema.String, element)
+    const Model = Schema.Struct({
+      id: Schema.String,
+      iso: holder(Iso),
+      millis: holder(Millis),
+      nums: holder(Nums),
+    })
+    const elements = (lines: unknown) => Object.values(lines as Lines)
+    const isoOf = options.isoOf ?? ((at: any) => DateTime.formatIso(at))
+    const Dates = Aggregate.make(
+      Model as any,
+      {
+        table: Main,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "dates" },
+        root: { entityType: "Dates" },
+        edges: {
+          iso: Aggregate.many({
+            entityType: "DatesIso",
+            sk: { composite: ["at"] },
+            decompose: (lines) => elements(lines).map((l) => ({ ...l, at: isoOf(l.at) })),
+            ...(!options.array && { assemble: keyed }),
+          }),
+          millis: Aggregate.many({
+            entityType: "DatesMillis",
+            sk: { composite: ["at"] },
+            decompose: (lines) => elements(lines).map((l) => ({ ...l, at: l.at.getTime() })),
+            ...(!options.array && { assemble: keyed }),
+          }),
+          nums: Aggregate.many({
+            entityType: "DatesNums",
+            sk: { composite: ["at"] },
+            decompose: (lines) => elements(lines).map((l) => ({ ...l })),
+            ...(!options.array && { assemble: keyed }),
+          }),
+        },
+      } as any,
+    )
+    const table = makeRecordingTable()
+    const run = <A, E>(body: (db: any) => Effect.Effect<A, E, never>) =>
+      Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: {},
+          aggregates: { Dates },
+          tables: { Main },
+        } as never)
+        return yield* body(db)
+      }).pipe(
+        Effect.provide(Layer.merge(table.layer, Main.layer({ name: "dk" })) as never),
+        Effect.exit,
+      ) as Effect.Effect<Exit.Exit<A, E>>
+    const rows = () =>
+      [...table.items.values()]
+        .filter((row) => row.pk?.S === "$dk#v1#dates#a")
+        .sort((a, b) => a.sk!.S!.localeCompare(b.sk!.S!))
+    const seed = (seeded: ReadonlyArray<Row>) => {
+      for (const row of seeded) table.items.set(`${row.pk?.S}|${row.sk?.S}`, structuredClone(row))
+    }
+    return { run, rows, seed }
+  }
+
+  const input = (array: boolean) => {
+    const of = <A extends { lineId: string }>(l: A) => (array ? [l] : { [l.lineId]: l })
+    return {
+      id: "a",
+      iso: of({ lineId: "l1", at: DateTime.makeUnsafe(0) }),
+      millis: of({ lineId: "m1", at: new Date(5) }),
+      nums: of({ lineId: "n1", at: 5 }),
+    }
+  }
+  /** What `get` returned, each value in its stored form, as the fixture holds it. */
+  const plain = (read: any) => ({
+    id: read.id,
+    iso: Object.values(read.iso as Lines).map((l) => [
+      l.lineId,
+      DateTime.formatIso(l.at),
+      l.note ?? null,
+    ]),
+    millis: Object.values(read.millis as Lines).map((l) => [
+      l.lineId,
+      l.at.getTime(),
+      l.note ?? null,
+    ]),
+    nums: Object.values(read.nums as Lines).map((l) => [l.lineId, l.at, l.note ?? null]),
+  })
+  /** 1.39.0's rows, but a `nums` row's `at` as its stored form, the text. */
+  const asEncoded = (rows: ReadonlyArray<Row>) =>
+    rows.map((row) => (row.__edd_e__?.S === "DatesNums" ? { ...row, at: { S: "5" } } : row))
+  const noted = (lines: Lines) =>
+    Object.fromEntries(Object.entries(lines).map(([k, l]) => [k, { ...l, note: "n" }]))
+
+  it.effect("create stores the dates as 1.39.0 did, and the text field as its stored form", () =>
+    Effect.gen(function* () {
+      const { run, rows } = keyedWorld({})
+      succeed(yield* run((db) => db.aggregates.Dates.create(input(false))))
+      expect(rows()).toEqual(asEncoded(keyedAt("created").rows))
+      expect(plain(succeed(yield* run((db) => db.aggregates.Dates.get({ id: "a" }))))).toEqual(
+        keyedAt("created").read,
+      )
+    }),
+  )
+
+  it.effect("an update of 1.39.0's rows lands, in place", () =>
+    Effect.gen(function* () {
+      const { run, rows, seed } = keyedWorld({})
+      seed(keyedAt("created").rows)
+      expect(plain(succeed(yield* run((db) => db.aggregates.Dates.get({ id: "a" }))))).toEqual(
+        keyedAt("created").read,
+      )
+      succeed(
+        yield* run((db) =>
+          db.aggregates.Dates.update({ id: "a" }, ({ state }: any) => ({
+            ...state,
+            iso: noted(state.iso),
+            millis: noted(state.millis),
+            nums: noted(state.nums),
+          })),
+        ),
+      )
+      expect(rows()).toEqual(asEncoded(keyedAt("noted").rows))
+      expect(plain(succeed(yield* run((db) => db.aggregates.Dates.get({ id: "a" }))))).toEqual(
+        keyedAt("noted").read,
+      )
+    }),
+  )
+
+  it.effect("an array edge stores them the same way (1.39.0 failed the create with a defect)", () =>
+    Effect.gen(function* () {
+      const { run, rows } = keyedWorld({ array: true })
+      succeed(yield* run((db) => db.aggregates.Dates.create(input(true))))
+      expect(rows()).toEqual(asEncoded(keyedAt("created").rows))
+      expect(plain(succeed(yield* run((db) => db.aggregates.Dates.get({ id: "a" }))))).toEqual(
+        keyedAt("created").read,
+      )
+    }),
+  )
+
+  it.effect("a value in neither form is refused with EDD-9127, and nothing is written", () =>
+    Effect.gen(function* () {
+      const { run, rows } = keyedWorld({ isoOf: () => "not a date" })
+      const exit = yield* run((db) => db.aggregates.Dates.create(input(false)))
+      expect(Exit.isFailure(exit) && !Exit.hasDies(exit)).toBe(true)
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+      expect((error as { _tag?: string })._tag).toBe("ValidationError")
+      expect(String((error as { cause?: unknown }).cause)).toContain("EDD-9127")
+      expect(rows()).toEqual([])
+    }),
+  )
+})
