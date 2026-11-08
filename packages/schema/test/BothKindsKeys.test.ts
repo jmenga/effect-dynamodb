@@ -10,6 +10,7 @@
 import { Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
+import * as DynamoModel from "../src/DynamoModel.js"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as Entity from "../src/Entity.js"
 
@@ -153,6 +154,45 @@ describe("EDD-9128 on an entity, a key composed from a field storing both numeri
         entity(n, { unique: { byOther: ["other"] }, ...index(["id"], { composite: ["other"] }) }),
       ).not.toThrow()
     }
+  })
+
+  it("a ref's identifier, composed into a key as `<ref>Id`", () => {
+    const Team = (teamId: Schema.Top) =>
+      Schema.Struct({ teamId, name: Schema.String }).annotate({ identifier: "Team" })
+    const player = (teamId: Schema.Top) => () => {
+      const model = Team(teamId)
+      const Teams = Entity.make({
+        model: DynamoModel.configure(model, { teamId: { identifier: true } }),
+        entityType: "Team",
+        primaryKey: {
+          pk: { field: "pk", composite: ["name"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as never)
+      return Entity.make({
+        model: DynamoModel.configure(Schema.Struct({ playerId: Schema.String, team: model }), {
+          playerId: { identifier: true },
+          team: { ref: true },
+        }),
+        entityType: "Player",
+        primaryKey: {
+          pk: { field: "pk", composite: ["playerId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byTeam: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["teamId"] },
+            sk: { field: "gsi1sk", composite: [] },
+          },
+        },
+        refs: { team: { entity: Teams } },
+      } as never)
+    }
+    expect(player(Schema.Union([Schema.Number, Schema.BigInt]))).toThrow(
+      /\[EDD-9128\] Entity "Player": index "byTeam" can't be composed from "teamId"/,
+    )
+    expect(player(Schema.BigInt)).not.toThrow()
   })
 
   it("a Z-order dimension keeps its own refusal (EDD-9088)", () => {
