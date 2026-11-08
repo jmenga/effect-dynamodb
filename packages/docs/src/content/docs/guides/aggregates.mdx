@@ -485,6 +485,19 @@ Container `.check()` refinements are enforced on `create` and `update`, as they 
 A `many` edge with a custom `decompose` that **renames** element fields (`{ noteId, at }` → `{ nid, when }`) is the one exception. Encoders are matched to the element's own field names, so a renamed field is stored as its domain value, and a `DateTime` there is still written as a map. It reads back as a real `DateTime`. To store it in wire form, keep the element's field names in `decompose`, or encode the value yourself before returning it.
 :::
 
+#### What a custom `decompose` is handed
+
+A `many` edge's custom `decompose` is handed a write's value as 1.39.0 handed it, so its rows store, key and read exactly as they did on 1.39.0. The edge's value is read stored form first. Where a transformation has one type on both sides, that decodes a value once more: on a field that multiplies by 10 on decode, `create(50)` hands `decompose` 500. Anything else is handed as it is, such as a `Schema.NumberFromString` or a field with no transformation. `update` hands it the state it read as it was read, and the new state as a write's value.
+
+What `decompose` returns is stored as on 1.39.0. Its fields are encoded as every other edge's are, and a sort key composite is read from what it returns. So a `decompose` that encodes such a field itself (`f / 10`) keeps working:
+
+| `decompose` returns | Stored | Sort key text | `get` | After an `update` |
+|---|---|---|---|---|
+| `f / 10`, the field encoded | 5 | 50 | 50 | the same row, unchanged |
+| `f`, the field unchanged | 50 | 500 | 500 | 500 stored under 5000, reads 5000 |
+
+One that hands such a field back unchanged has it decoded once more on every write, as on 1.39.0. Encode the field in `decompose`, as `f / 10` does. Because `update` hands it the state it read as it was read, each `update` rewrites the edge's rows, even one that changes nothing, as on 1.39.0.
+
 #### What `create` and `update` take
 
 A value you hand to `create` or `update` is a domain value, as it is on an entity: in the input, in `state`, `cursor` and `current`, and in what a mutation returns. It's stored in its wire form and reads back as you gave it. An `update` leaves a field it doesn't change, and one that changes nothing writes nothing. A value that can't be a domain value but is the wire form, such as `"5"` for a `Schema.NumberFromString`, is still taken. Anything else is refused with a `ValidationError`.

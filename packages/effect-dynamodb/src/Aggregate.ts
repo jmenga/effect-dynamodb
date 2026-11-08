@@ -229,6 +229,11 @@ interface ResolvedNode {
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   /**
+   * `many` edges with a custom `decompose` only: the value that `decompose` is handed on a write,
+   * read as 1.39.0 read it (see {@link storedFormFirst}). Undefined where that's the value itself.
+   */
+  readonly decomposeInput?: ((value: unknown) => unknown) | undefined
+  /**
    * Per-attribute encoders for this node's items, applied on the WRITE path
    * (decompose) so every value with a wire form — a date, a transformed scalar,
    * or a container or hydrated ref holding one — is put into it before
@@ -906,6 +911,39 @@ const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => Option.Op
     const direct = encode(value)
     if (Option.isSome(direct)) return direct
     return Option.flatMap(decode(value), encode)
+  }
+}
+
+/**
+ * What a `many` edge's custom `decompose` is handed on a write: the edge's value read stored form
+ * first, as 1.39.0 read every write's input. A write's value is otherwise taken as the domain value
+ * a caller holds, but a `decompose` written for 1.39.0 was handed this, and what it returns is
+ * stored and keyed as it is: handed the domain value instead, a `decompose` that returns a field's
+ * stored form (`f / 10` on a field that multiplies by 10) has that encoded once more, its sort key
+ * moves, and every `update` compounds the value and adds a row. Handed this, its rows store, key and
+ * read exactly as on 1.39.0, and an `update` of a row 1.39.0 wrote finds it. A `decompose` that hands
+ * such a field back unchanged stores it decoded once more, as on 1.39.0.
+ *
+ * Only a transformation with one type on both sides reads differently: anything else reads as it
+ * is. Undefined when the field holds no transformation, so nothing is read again. What was read
+ * (update's old state, `rekey`) is handed to `decompose` as it was read, as 1.39.0 did.
+ */
+const storedFormFirst = (
+  field: string,
+  fieldSchema: Schema.Top | undefined,
+  resolveRef: RefResolver | undefined,
+): ((value: unknown) => unknown) | undefined => {
+  if (fieldSchema === undefined || !containsWireTransform(fieldSchema)) return undefined
+  const read = Schema.decodeUnknownOption(
+    substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+      tolerantTransforms: true,
+      decodeOnly: true,
+      resolveRef,
+    }) as unknown as Schema.Codec<any>,
+  )
+  return (value) => {
+    const asRead = read({ [field]: value })
+    return Option.isSome(asRead) ? (asRead.value as Record<string, unknown>)[field] : value
   }
 }
 
@@ -2131,6 +2169,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         rootEncoders,
         aggregateName,
         config.schema,
+        false,
       )
       const newGroups = yield* decomposeAggregate(
         assembledNew,
@@ -2139,6 +2178,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         rootEncoders,
         aggregateName,
         config.schema,
+        true,
       )
 
       // 5. Diff at the ITEM (primary-key) level, not just the group level.
@@ -2352,6 +2392,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootEncoders,
           aggregateName,
           config.schema,
+          false,
         )
         const rows = locateRows(
           groups,
@@ -2914,6 +2955,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             rootEncoders,
             aggregateName,
             config.schema,
+            true,
           )
 
           // 5. Build DynamoDB items with composed keys (create only ever PUTs).
@@ -3331,6 +3373,7 @@ interface ResolveNodeArgs {
   readonly discriminator?: Record<string, unknown> | undefined
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
+  readonly decomposeInput?: ((value: unknown) => unknown) | undefined
   readonly ownDiscriminator?: Record<string, unknown> | undefined
   readonly attrEncoders?: AttrEncoders | undefined
   readonly keyAttrEncoders?: AttrEncoders | undefined
@@ -3485,6 +3528,10 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator,
             assemble: edge.assemble,
             decompose: edge.decompose,
+            decomposeInput:
+              edge.decompose === undefined
+                ? undefined
+                : storedFormFirst(field, parentFields?.[field], resolveRef),
             ownFields: elementFields,
             attrEncoders: buildAttrEncoders(elementFields, resolveRef),
             // Sort-key composites keep reading the pre-#133 encoding (the entity
@@ -3552,6 +3599,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     children,
     ...(assemble !== undefined && { assemble }),
     ...(decompose !== undefined && { decompose }),
+    ...(args.decomposeInput !== undefined && { decomposeInput: args.decomposeInput }),
     ...(skComposite !== undefined && { skComposite }),
     ...(refIdentifierField !== undefined && { refIdentifierField }),
     ...(args.packed !== undefined && { packed: args.packed }),
@@ -4346,6 +4394,8 @@ const decomposeAggregate = (
   encoders: NodeEncoders,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
+  /** A write's value (`create`, update's new state): a custom `decompose` is handed it read as on 1.39.0. */
+  written: boolean,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
@@ -4405,6 +4455,7 @@ const decomposeAggregate = (
         { current: [], other: () => [] },
         aggregateName,
         schema,
+        written,
       )
     }
 
@@ -4517,6 +4568,7 @@ const decomposeNode = (
   parentDiscriminators: DiscriminatorValues,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
+  written: boolean,
 ): Effect.Effect<void, AggregateDecompositionError> =>
   Effect.gen(function* () {
     // Optional edges may have null/undefined values — skip decomposition
@@ -4581,6 +4633,7 @@ const decomposeNode = (
           discValues,
           aggregateName,
           schema,
+          written,
         )
       }
     } else if (node.cardinality === "one") {
@@ -4611,7 +4664,7 @@ const decomposeNode = (
     } else {
       // Many edge
       const arrayItems = node.decompose
-        ? node.decompose(value)
+        ? node.decompose(written && node.decomposeInput ? node.decomposeInput(value) : value)
         : Array.isArray(value)
           ? (value as ReadonlyArray<unknown>)
           : []

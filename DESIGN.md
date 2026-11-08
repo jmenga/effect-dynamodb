@@ -4177,6 +4177,23 @@ one-type composite keys on its encoded form and `get` finds it.
 decodes to. That's asked after the domain value and before the stored side (`plainForm`), so a set held as a
 list isn't taken for a stored list and transformed again.
 
+**A custom `decompose` is handed a write's value as 1.39.0 handed it.** What a `many` edge's
+`decompose` returns is stored and keyed as given: its fields go through the element's attribute
+encoders, and its `sk.composite` is read off it (through `buildKeyAttrEncoders`, which an edge with no
+entity doesn't have). On 1.39.0 a write's value reached `decompose` read stored form first, so one
+written for it encodes a one-type field itself from a value decoded once more: on a field multiplying by
+10, `f / 10` was handed 500 for `create(50)`, returned 50, which was encoded to 5 and keyed as 50.
+Handed the domain value, the same function returns 5, encoded again to 0.5 and keyed as 5, and every
+`update` compounded it and added a row; an `update` of a 1.39.0 row left it and wrote a second. So on a
+write (`create`, update's new state) `decompose` is handed the edge's value read stored form first
+(`storedFormFirst`: the field's tolerant `decodeOnly` substitution, without `domainValues`, only where the
+field `containsWireTransform`), and what was read (update's old state, `rekey`) is handed as it was
+read, as on 1.39.0. Its rows store, key and read exactly as on 1.39.0. A field with two types
+(`NumberFromString`) or none reads the same either way. Two things stay as on 1.39.0: a `decompose` that
+hands a one-type field back unchanged stores it decoded once more on every write (`create(50)` stores 50
+under 500 and reads 500), and since the old state composes other keys than the new, every `update` of an
+edge whose `decompose` encodes the field rewrites its rows, even one that changes nothing.
+
 A caller who passed the stored form on 1.39.0 had the only input that read back as meant (`create(5)` on
 that field read 50). It's a valid domain value too, so it can't be told apart or warned about: it now
 stores 0.5 and reads 5, and the guide and the changeset say what such a caller changes.
