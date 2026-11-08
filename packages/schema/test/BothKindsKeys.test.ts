@@ -302,3 +302,114 @@ describe("EDD-9128 on an aggregate, a key composed from a field storing both num
     for (const [, n] of BOTH) expect(aggregate(n, {})).not.toThrow()
   })
 })
+
+describe("EDD-9128 on a dotted composite, through what holds each segment", () => {
+  const Both = Schema.Union([Schema.Number, Schema.BigInt])
+  class Holder extends Schema.Class<Holder>("Holder")({ n: Both }) {}
+  class OneKind extends Schema.Class<OneKind>("OneKind")({ n: Schema.Number }) {}
+  const nested = (holder: Schema.Top) => () =>
+    Aggregate.make(
+      Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Array(Schema.Struct({ nested: holder, note: Schema.String })),
+      }),
+      {
+        table: { Tag: Symbol.for("test/table") },
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { index: "gsi1", name: "c", sk: { field: "gsi1sk", composite: [] } },
+        root: { entityType: "Root" },
+        edges: { lines: Aggregate.many({ entityType: "Line", sk: { composite: ["nested.n"] } }) },
+      } as never,
+    )
+  const struct = Schema.Struct({ n: Both })
+  const HOLDERS: ReadonlyArray<readonly [string, Schema.Top]> = [
+    ["a struct", struct],
+    ["Schema.optional", Schema.optional(struct)],
+    ["Schema.optionalKey", Schema.optionalKey(struct)],
+    ["Schema.NullOr", Schema.NullOr(struct)],
+    ["a union with null and undefined", Schema.Union([struct, Schema.Null, Schema.Undefined])],
+    ["a Schema.Class", Holder],
+    ["Schema.NullOr of a Schema.Class", Schema.NullOr(Holder)],
+  ]
+  for (const [name, holder] of HOLDERS) {
+    it(`is refused below ${name}`, () => {
+      expect(nested(holder)).toThrow(/\[EDD-9128\] Aggregate "Root": edge "lines"'s sort key/)
+      expect(nested(holder)).toThrow(/"nested\.n"/)
+    })
+  }
+  it("is refused below Schema.suspend, by the unreadable-union rule first (EDD-9125)", () => {
+    expect(nested(Schema.suspend(() => struct))).toThrow(/\[EDD-9125\]/)
+  })
+  it("isn't, holding one kind", () => {
+    expect(nested(Schema.optional(Schema.Struct({ n: Schema.Number })))).not.toThrow()
+    expect(nested(Schema.NullOr(OneKind))).not.toThrow()
+  })
+})
+
+describe("EDD-9128 through timeSeries.appendInput, which append composes keys from", () => {
+  const Both = Schema.Union([Schema.Number, Schema.BigInt])
+  const readings =
+    (at: Schema.Top, appendAt: Schema.Top, sk: ReadonlyArray<string> = []) =>
+    () =>
+      Entity.make({
+        model: Schema.Struct({ id: Schema.String, at, seq: at, v: Schema.String }),
+        entityType: "Reading",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: sk } },
+        timeSeries: {
+          orderBy: "at",
+          appendInput: Schema.Struct({
+            id: Schema.String,
+            at: appendAt,
+            seq: appendAt,
+            v: Schema.String,
+          }),
+        },
+      } as never)
+  it("refuses an orderBy appendInput declares storing both kinds, whatever the model declares", () => {
+    expect(readings(Schema.Number, Both)).toThrow(
+      /\[EDD-9128\] Entity "Reading": an event's sort key \(timeSeries\.orderBy\), through timeSeries\.appendInput, can't be composed from "at", which stores both/,
+    )
+  })
+  it("refuses an orderBy appendInput declares the other kind", () => {
+    expect(readings(Schema.Number, Schema.BigInt)).toThrow(
+      /"at", which timeSeries\.appendInput holds as a bigint and the model as a number/,
+    )
+    expect(readings(Schema.BigInt, Schema.Number)).toThrow(
+      /holds as a number and the model as a bigint/,
+    )
+  })
+  it("refuses a key composite appendInput carries", () => {
+    expect(readings(Schema.Number, Schema.Number, ["seq"])).not.toThrow()
+    const model = () =>
+      Entity.make({
+        model: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          seq: Schema.Number,
+          v: Schema.String,
+        }),
+        entityType: "Reading",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: ["seq"] },
+        },
+        timeSeries: {
+          orderBy: "at",
+          appendInput: Schema.Struct({
+            id: Schema.String,
+            at: Schema.Number,
+            seq: Both,
+            v: Schema.String,
+          }),
+        },
+      } as never)
+    expect(model).toThrow(
+      /the primary key, through timeSeries\.appendInput, can't be composed from "seq"/,
+    )
+  })
+  it("isn't, declaring one kind in both", () => {
+    expect(readings(Schema.Number, Schema.Number)).not.toThrow()
+    expect(readings(Schema.BigInt, Schema.BigInt)).not.toThrow()
+  })
+})

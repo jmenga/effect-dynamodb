@@ -12,10 +12,13 @@ import { describe, expect, it } from "vitest"
 import { DateEpochMs } from "../src/DynamoModel.js"
 import {
   bothKindsKeyRefusal,
+  fieldAtPath,
   keyFormValueKind,
+  kindReadingOf,
+  kindTargets,
   makeCompositeKeyForm,
-  numericKindVariants,
-  readsBackAsOtherKind,
+  otherNumericKind,
+  readsBackOtherwise,
   storedNumericForm,
   storedNumericKinds,
   toCompositeKeyRecord,
@@ -201,39 +204,182 @@ describe("CompositeCodec", () => {
       expect(storedNumericForm(Schema.Union([Schema.String, Schema.BigInt]))?.(5)).toBe(5n)
     })
 
-    it("judges a value of a field taking both kinds undeclared by its kind read back", () => {
-      const readsOther = readsBackAsOtherKind(Schema.Unknown)!
-      expect(readsOther(5n)).toBe(true)
-      expect(readsOther(-5n)).toBe(true)
-      expect(readsOther(2n ** 60n + 1n)).toBe(false)
-      expect(readsOther(5)).toBe(false)
-      expect(readsOther(1.5)).toBe(false)
-      expect(readsOther(2 ** 60)).toBe(true)
-      expect(readsOther("5")).toBe(false)
-      expect(readsBackAsOtherKind(Schema.Any)).toBeDefined()
-      expect(readsBackAsOtherKind(Schema.BigInt)).toBeUndefined()
-      expect(readsBackAsOtherKind(Schema.String)).toBeUndefined()
+    it("judges a value of a field whose kinds can't be read by the value DynamoDB returns", () => {
+      const readsOther = readsBackOtherwise(Schema.Unknown)!
+      expect(readsOther(5n)).toBe("a number")
+      expect(readsOther(-5n)).toBe("a number")
+      expect(readsOther(2n ** 60n + 1n)).toBeUndefined()
+      expect(readsOther(5)).toBeUndefined()
+      expect(readsOther(1.5)).toBeUndefined()
+      expect(readsOther(2 ** 60)).toBe("a bigint")
+      expect(readsOther("5")).toBeUndefined()
+      expect(readsBackOtherwise(Schema.Any)).toBeDefined()
+      // A transform whose stored side can't be read is judged through its decode: a bigint that
+      // decodes the number DynamoDB returns to the same bigint is read back as written.
+      const toBigInt = Schema.Unknown.pipe(
+        Schema.decodeTo(Schema.BigInt, {
+          decode: SchemaGetter.transform((n) => BigInt(n as number)),
+          encode: SchemaGetter.transform((n) => n),
+        }),
+      )
+      expect(readsBackOtherwise(toBigInt)?.(5n)).toBeUndefined()
+      const declared = Schema.declare(
+        (v): v is number | bigint => typeof v === "number" || typeof v === "bigint",
+      )
+      expect(readsBackOtherwise(declared)?.(5n)).toBe("a number")
+      expect(readsBackOtherwise(declared)?.(5)).toBeUndefined()
+      // Kinds known at load are never judged at write.
+      expect(readsBackOtherwise(Schema.BigInt)).toBeUndefined()
+      expect(readsBackOtherwise(Schema.String)).toBeUndefined()
+      expect(readsBackOtherwise(Schema.Union([Schema.Number, Schema.BigInt]))).toBeUndefined()
     })
 
-    it("gives a record's numeric fields as each kind, for rekey to find a row under the other's text", () => {
-      const variants = (record: Record<string, unknown>, digits: Record<string, string> = {}) =>
-        numericKindVariants(record, ["a", "b", "s"], (field) => digits[field]).map((variant) => [
-          variant.record,
-          [...variant.asOther],
-        ])
-      expect(variants({ a: 5, b: 7n, s: "x" })).toEqual([
-        [{ a: 5, b: 7n, s: "x" }, []],
-        [{ a: 5n, b: 7n, s: "x" }, ["a"]],
-        [{ a: 5, b: 7, s: "x" }, ["b"]],
-        [{ a: 5n, b: 7, s: "x" }, ["a", "b"]],
+    it("follows a dotted composite through what holds each segment", () => {
+      class Holder extends Schema.Class<Holder>("Holder")({ n: Schema.BigInt }) {}
+      const inner = Schema.Struct({ n: Schema.BigInt })
+      const kindsAt = (holder: Schema.Top) => {
+        const field = fieldAtPath({ nested: holder }, "nested.n")
+        return field === undefined ? undefined : [...storedNumericKinds(field)].sort()
+      }
+      for (const holder of [
+        inner,
+        Schema.optional(inner),
+        Schema.optionalKey(inner),
+        Schema.NullOr(inner),
+        Schema.Union([inner, Schema.Null, Schema.Undefined]),
+        Schema.suspend(() => inner),
+        Holder,
+        Schema.NullOr(Holder),
+      ]) {
+        expect(kindsAt(holder)).toEqual(["bigint"])
+      }
+      // A union of structs naming the segment in two members gives both their fields.
+      expect(kindsAt(Schema.Union([inner, Schema.Struct({ n: Schema.Number })]))).toEqual([
+        "bigint",
+        "number",
       ])
-      // A number that isn't an integer has no bigint; a field not named is left.
-      expect(variants({ a: 1.5, c: 5 })).toEqual([[{ a: 1.5, c: 5 }, []]])
+      expect(fieldAtPath({ nested: inner }, "nested.m")).toBeUndefined()
+      expect(fieldAtPath({ nested: Schema.String }, "nested.n")).toBeUndefined()
+      expect(fieldAtPath({ n: Schema.Number }, "n")).toBeDefined()
+    })
+
+    it("gives a numeric value as the other kind, from the digits stored", () => {
+      expect(otherNumericKind(5, undefined)).toBe(5n)
+      expect(otherNumericKind(7n, undefined)).toBe(7)
+      expect(otherNumericKind(1.5, undefined)).toBeUndefined()
+      expect(otherNumericKind("5", undefined)).toBeUndefined()
       // The digits stored, not the number they read back as.
-      expect(variants({ a: Number(2n ** 60n + 1n) }, { a: String(2n ** 60n + 1n) })[1]![0]).toEqual(
-        { a: 2n ** 60n + 1n },
-      )
-      expect(variants({ a: 1.5 }, { a: "1.5" })).toHaveLength(1)
+      expect(otherNumericKind(Number(2n ** 60n + 1n), String(2n ** 60n + 1n))).toBe(2n ** 60n + 1n)
+      expect(otherNumericKind(1.5, "1.5")).toBeUndefined()
+    })
+
+    describe("the reading a key was composed from", () => {
+      // A key of `width` numeric composites, each as its own kind's text.
+      const composite = (value: unknown) =>
+        typeof value === "bigint" ? `b${String(value).padStart(6, "0")}` : `n${value}`
+      const fields = (width: number) => Array.from({ length: width }, (_, i) => `f${i}`)
+      const counting = (width: number, values: (i: number) => unknown) => {
+        let compositions = 0
+        const record = Object.fromEntries(fields(width).map((field, i) => [field, values(i)]))
+        const compose = ({ record: given }: { record: Record<string, unknown> }) => {
+          compositions++
+          return `$app#v1#e#${fields(width)
+            .map((field) => composite(given[field]))
+            .join("#")}`
+        }
+        return { record, compose, count: () => compositions }
+      }
+
+      it("composes the values once when that is the key", () => {
+        const { record, compose, count } = counting(18, () => 5)
+        const reading = kindReadingOf(
+          record,
+          fields(18),
+          () => undefined,
+          compose,
+          compose({ record }),
+        )
+        expect(reading?.asOther.size).toBe(0)
+        // One composition here, one for the key the test built.
+        expect(count()).toBe(2)
+      })
+
+      it("finds a mix of kinds composing once per field, not once per combination", () => {
+        const width = 18
+        const { record, compose, count } = counting(width, () => 5)
+        const mixed = Object.fromEntries(
+          fields(width).map((field, i) => [field, i % 3 === 0 ? 5n : 5]),
+        )
+        const stored = compose({ record: mixed })
+        const before = count()
+        const reading = kindReadingOf(record, fields(width), () => undefined, compose, stored)
+        expect([...(reading?.asOther ?? [])].sort()).toEqual(
+          fields(width)
+            .filter((_, i) => i % 3 === 0)
+            .sort(),
+        )
+        expect(reading?.record).toEqual(mixed)
+        // The values, each field alone as the other kind, and the reading found.
+        expect(count() - before).toBe(1 + width + 1)
+      })
+
+      it("finds one field alone as soon as it is composed", () => {
+        const { record, compose, count } = counting(4, () => 5)
+        const stored = compose({ record: { ...record, f2: 5n } })
+        const before = count()
+        expect([
+          ...(kindReadingOf(record, fields(4), () => undefined, compose, stored)?.asOther ?? []),
+        ]).toEqual(["f2"])
+        expect(count() - before).toBe(1 + 3)
+      })
+
+      it("finds none for a key no reading composes", () => {
+        const { record, compose } = counting(4, () => 5)
+        expect(
+          kindReadingOf(record, fields(4), () => undefined, compose, "$app#v1#e#n5#n6#n5#n5"),
+        ).toBeUndefined()
+        expect(
+          kindReadingOf(
+            record,
+            fields(4),
+            () => undefined,
+            () => undefined,
+            "x",
+          ),
+        ).toBeUndefined()
+      })
+
+      it("looks for a reading among several texts", () => {
+        const { record, compose } = counting(3, () => 5)
+        const texts = kindTargets([
+          compose({ record: { ...record, f0: 5n, f2: 5n } }),
+          "$app#v1#e#n5#n5#n5",
+          "$app#v1#f",
+        ])
+        expect(texts.has("$app#v1#f")).toBe(true)
+        expect(texts.hasPrefix("$app#v1#e#b")).toBe(true)
+        expect(texts.hasPrefix("$app#v1#g")).toBe(false)
+        const others = {
+          has: (text: string) => text !== compose({ record }) && texts.has(text),
+          hasPrefix: texts.hasPrefix,
+        }
+        expect(
+          [
+            ...(kindReadingOf(record, fields(3), () => undefined, compose, others)?.asOther ?? []),
+          ].sort(),
+        ).toEqual(["f0", "f2"])
+      })
+
+      it("reads each field alone as the other kind when a composer doesn't keep values apart", () => {
+        // Every value's kind shows in one character at the end: no field has a stretch of its own.
+        const record = { a: 5, b: 5 }
+        const compose = ({ record: given }: { record: Record<string, unknown> }) =>
+          `k${Object.values(given).filter((value) => typeof value === "bigint").length}`
+        expect([
+          ...(kindReadingOf(record, ["a", "b"], () => undefined, compose, "k1")?.asOther ?? []),
+        ]).toEqual(["a"])
+        expect(kindReadingOf(record, ["a", "b"], () => undefined, compose, "k2")).toBeUndefined()
+      })
     })
 
     it("refuses a key over a field storing both, and only that (EDD-9128)", () => {

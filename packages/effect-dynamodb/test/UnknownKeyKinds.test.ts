@@ -11,7 +11,7 @@ import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Exit, Schema } from "effect"
+import { Effect, Exit, Schema, SchemaGetter } from "effect"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -273,6 +273,149 @@ describe("a key over Schema.Unknown or Schema.Any, judged by value (EDD-9128)", 
         expect(rows()).toEqual([])
         yield* db.entities.Readings.append({ id: "r", at: 5, v: "a" }).asEffect()
         expect(rows()).toHaveLength(2)
+      }),
+    ),
+  )
+
+  it.effect("a value reached by a dotted composite is judged, through what holds it", () => {
+    const Dotted = (Aggregate.make as any)(
+      Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Array(
+          Schema.Struct({
+            nested: Schema.optional(Schema.Struct({ n: Schema.Unknown })),
+            note: Schema.String,
+          }),
+        ),
+      }),
+      {
+        table: Main,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "dotted" },
+        root: { entityType: "Dotted" },
+        edges: {
+          lines: Aggregate.many({ entityType: "DottedLine", sk: { composite: ["nested.n"] } }),
+        },
+      },
+    )
+    const table = makeRecordingTable()
+    const rows = () => [...table.items.values()] as unknown as ReadonlyArray<Row>
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Dotted },
+        tables: { Main },
+      } as never) as Effect.Effect<any, never, any>
+      refused(
+        yield* Effect.exit(
+          db.aggregates.Dotted.create({ id: "d", lines: [{ nested: { n: 5n }, note: "x" }] }),
+        ),
+        "nested.n",
+        /edge \\"lines\\"'s sort key, and the bigint 5n would read back as a number/,
+      )
+      expect(rows()).toEqual([])
+      yield* db.aggregates.Dotted.create({ id: "d", lines: [{ nested: { n: 5 }, note: "x" }] })
+      yield* db.aggregates.Dotted.update({ id: "d" }, ({ state }: any) => ({
+        ...state,
+        lines: state.lines.map((line: any) => ({ ...line, note: "y" })),
+      }))
+      const read = yield* db.aggregates.Dotted.get({ id: "d" })
+      expect(read.lines).toEqual([{ nested: { n: 5 }, note: "y" }])
+      expect(rows()).toHaveLength(2)
+    }).pipe(
+      Effect.provide(Main.layer({ name: "t" })),
+      Effect.provide(table.layer),
+    ) as Effect.Effect<void, unknown>
+  })
+})
+
+describe("a key over a field whose numeric kinds can't be read at load, judged at write (EDD-9128)", () => {
+  const keyed = (n: Schema.Top) => {
+    const Items = Entity.make({
+      model: Schema.Struct({ id: Schema.String, n, open: Schema.Unknown, note: Schema.String }),
+      entityType: "Items",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: ["n"] } },
+      softDelete: true,
+    } as never) as any
+    const Items_ = Table.make({ schema, entities: { Items } } as never) as any
+    return { Items, Items_ }
+  }
+  const run = <A>(
+    n: Schema.Top,
+    body: (db: any, rows: () => ReadonlyArray<Row>) => Effect.Effect<A, unknown, any>,
+  ) => {
+    const { Items, Items_ } = keyed(n)
+    const table = makeRecordingTable()
+    const rows = () => [...table.items.values()] as unknown as ReadonlyArray<Row>
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Items },
+        tables: { Items_ },
+      } as never) as Effect.Effect<any, never, any>
+      return yield* body(db, rows)
+    }).pipe(
+      Effect.provide(Items_.layer({ name: "t" })),
+      Effect.provide(table.layer),
+    ) as Effect.Effect<A, unknown>
+  }
+
+  it.effect("a declaration taking both kinds refuses a bigint that reads back as a number", () =>
+    run(
+      Schema.declare(
+        (value: unknown): value is number | bigint =>
+          typeof value === "number" || typeof value === "bigint",
+      ),
+      (db, rows) =>
+        Effect.gen(function* () {
+          refused(
+            yield* Effect.exit(
+              db.entities.Items.put({ id: "a", n: 5n, open: 1, note: "x" }).asEffect(),
+            ),
+            "n",
+            /the primary key, and the bigint 5n would read back as a number/,
+          )
+          expect(rows()).toEqual([])
+          yield* db.entities.Items.put({ id: "a", n: 5, open: 1, note: "x" }).asEffect()
+          expect((yield* db.entities.Items.get({ id: "a", n: 5 })).note).toBe("x")
+        }),
+    ),
+  )
+
+  it.effect(
+    "a transform that decodes the number DynamoDB returns to the bigint written is stored",
+    () =>
+      run(
+        Schema.Unknown.pipe(
+          Schema.decodeTo(Schema.BigInt, {
+            decode: SchemaGetter.transform((n: unknown) => BigInt(n as number)),
+            encode: SchemaGetter.transform((n: bigint) => n),
+          }),
+        ),
+        (db, rows) =>
+          Effect.gen(function* () {
+            const key = { id: "a", n: 5n }
+            yield* db.entities.Items.put({ ...key, open: 1, note: "x" }).asEffect()
+            expect(rows().map((row) => row.sk?.S)).toEqual([
+              `$unk#v1#items#n_${"5".padStart(38, "0")}`,
+            ])
+            const got = yield* db.entities.Items.get(key)
+            expect(got.n).toBe(5n)
+            yield* db.entities.Items.delete(key).asEffect()
+            yield* db.entities.Items.restore(key)
+            expect(yield* db.entities.Items.get(key)).toEqual(got)
+            expect(rows().map((row) => row.sk?.S)).toEqual([
+              `$unk#v1#items#n_${"5".padStart(38, "0")}`,
+            ])
+          }),
+      ),
+  )
+
+  it.effect("a field no key reads is never judged", () =>
+    run(Schema.Number, (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Items.put({ id: "a", n: 5, open: 5n, note: "x" }).asEffect()
+        expect((yield* db.entities.Items.get({ id: "a", n: 5 })).open).toBe(5)
       }),
     ),
   )

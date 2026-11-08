@@ -12,7 +12,7 @@ import type {
   AggregateStampNames,
   BoundSubAggregate,
 } from "./AggregateTypes.js"
-import { bothKindsKeyRefusal } from "./CompositeCodec.js"
+import { bothKindsKeyRefusal, fieldAtPath } from "./CompositeCodec.js"
 import type { TimestampsConfig } from "./EntityConfig.js"
 import { optionalField, type ResolvedSystemFields, resolveSystemFields } from "./EntitySchemas.js"
 import {
@@ -132,7 +132,8 @@ export const refuseManySortKeysOverMovingValue = (
  * `[EDD-9128]`: a key an aggregate composes from a field storing both numeric kinds
  * (`bothKindsKeyRefusal`): its partition key, its collection and list keys, and a `many` edge's sort
  * key, on the root's edges and those of the sub-aggregates under it. A sort-key composite that's a
- * path into a value (`player.id`) is followed to the field it names.
+ * path into a value (`player.id`) is followed to the field it names, through an optional, nullable,
+ * suspended or class value on the way (`fieldAtPath`).
  */
 export const refuseAggregateKeysOverBothKinds = (
   aggregate: string,
@@ -148,24 +149,13 @@ export const refuseAggregateKeysOverBothKinds = (
   rootEdges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
 ): void => {
   const owner = `Aggregate "${aggregate}"`
-  const fieldAt = (
-    fields: Record<string, Schema.Top> | undefined,
-    path: string,
-  ): Schema.Top | undefined => {
-    const [first, ...rest] = path.split(".")
-    let field = fields?.[first!]
-    for (const segment of rest) {
-      field = field === undefined ? undefined : getSchemaFields(field)?.[segment]
-    }
-    return field
-  }
   const refuse = (
     where: string,
     fields: Record<string, Schema.Top> | undefined,
     composites: ReadonlyArray<string>,
   ): void => {
     for (const attr of composites) {
-      const field = fieldAt(fields, attr)
+      const field = fieldAtPath(fields, attr)
       if (field === undefined) continue
       const refused = bothKindsKeyRefusal(owner, where, attr, field)
       if (refused !== undefined) throw refused

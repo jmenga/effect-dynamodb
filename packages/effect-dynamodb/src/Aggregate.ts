@@ -34,9 +34,12 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
+  fieldAtPath,
+  type KindTargets,
+  kindReadingOf,
+  kindTargets,
   makeCompositeKeyForm,
-  numericKindVariants as numericKindVariantsOf,
-  readsBackAsOtherKind,
+  readsBackOtherwise,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
@@ -1677,91 +1680,90 @@ const makeAggregate = <TSchema extends Schema.Top>(
         })
 
   /**
-   * `[EDD-9128]`, by value: each key composite whose field takes both numeric kinds without declaring
-   * either (`Schema.Unknown`, `Schema.Any`), with what composes it and the test of a value that reads
-   * back as the other kind. A declared one is refused at load. Empty for an aggregate with none, which
-   * pays nothing more on a write.
+   * `[EDD-9128]`, by value: each key composite whose numeric kinds can't be read at load
+   * (`Schema.Unknown`, `Schema.Any`, a declaration, or a transformation from one), with what composes
+   * it and the test of a stored value that reads back otherwise (`readsBackOtherwise`). A composite
+   * that's a path into a value (`nested.n`) is followed to the field it names (`fieldAtPath`). A
+   * declared one is refused at load. Empty for an aggregate with none, which pays nothing more on a
+   * write.
    */
   const otherKindKeys = (() => {
-    type Check = { readonly into: string; readonly readsOther: (value: unknown) => boolean }
-    const root = new Map<string, Check>()
-    const addRoot = (into: string, composites: ReadonlyArray<string>) => {
-      for (const field of composites) {
-        const fieldSchema = schemaFields?.[field]
-        const readsOther = fieldSchema === undefined ? undefined : readsBackAsOtherKind(fieldSchema)
-        if (readsOther !== undefined && !root.has(field)) root.set(field, { into, readsOther })
-      }
+    type Check = {
+      readonly path: string
+      readonly into: string
+      readonly readsOther: (value: unknown) => string | undefined
     }
-    addRoot("its partition key", config.pk.composite)
-    addRoot("its collection sort key", config.collection.sk?.composite ?? [])
-    if (config.list !== undefined) {
-      addRoot("its list partition key", config.list.pk.composite)
-      addRoot("its list sort key", config.list.sk.composite)
+    const checksOf = (
+      fields: Record<string, Schema.Top> | undefined,
+      into: string,
+      composites: ReadonlyArray<string>,
+    ): ReadonlyArray<Check> =>
+      composites.flatMap((path) => {
+        const fieldSchema = fieldAtPath(fields, path)
+        const readsOther = fieldSchema === undefined ? undefined : readsBackOtherwise(fieldSchema)
+        return readsOther === undefined ? [] : [{ path, into, readsOther }]
+      })
+    const byType = new Map<string, ReadonlyArray<Check>>()
+    const add = (entityType: string, checks: ReadonlyArray<Check>) => {
+      if (checks.length > 0) byType.set(entityType, [...(byType.get(entityType) ?? []), ...checks])
     }
-    const edges = new Map<string, Map<string, Check>>()
+    add(config.root.entityType, [
+      ...checksOf(schemaFields, "its partition key", config.pk.composite),
+      ...checksOf(schemaFields, "its collection sort key", config.collection.sk?.composite ?? []),
+      ...(config.list === undefined
+        ? []
+        : [
+            ...checksOf(schemaFields, "its list partition key", config.list.pk.composite),
+            ...checksOf(schemaFields, "its list sort key", config.list.sk.composite),
+          ]),
+    ])
     const walk = (node: ResolvedNode): void => {
       if (node.cardinality === "many" && node.skComposite !== undefined) {
-        const checks = new Map<string, Check>()
-        for (const field of node.skComposite) {
-          const fieldSchema = node.ownFields?.[field]
-          const readsOther =
-            fieldSchema === undefined ? undefined : readsBackAsOtherKind(fieldSchema)
-          if (readsOther !== undefined) {
-            checks.set(field, { into: `edge "${node.fieldName}"'s sort key`, readsOther })
-          }
-        }
-        if (checks.size > 0) edges.set(node.entityType, checks)
+        add(
+          node.entityType,
+          checksOf(node.ownFields, `edge "${node.fieldName}"'s sort key`, node.skComposite),
+        )
       }
       for (const child of node.children) walk(child)
     }
     walk(rootNode)
-    return { root, edges }
+    return byType
   })()
 
   /**
-   * Refuses a write giving a key composite of a field that takes both numeric kinds a value that
-   * reads back as the other kind: a stored row would compose other key text (`EDD-9128`).
+   * Refuses a write storing, for a key composite whose numeric kinds can't be read at load, a value
+   * that reads back otherwise: a stored row would compose other key text (`EDD-9128`). Each row's
+   * composites are read off its stored attributes, a path into a value followed.
    */
   const refuseOtherKindKeys = (
     groups: ReadonlyArray<TransactionGroup>,
-    value: Record<string, unknown>,
     operation: string,
   ): Effect.Effect<void, ValidationError> => {
-    if (otherKindKeys.root.size === 0 && otherKindKeys.edges.size === 0) return Effect.void
-    const found: Array<readonly [string, string, string, unknown]> = []
-    for (const [field, { into, readsOther }] of otherKindKeys.root) {
-      if (value[field] != null && readsOther(value[field])) {
-        found.push([field, config.root.entityType, into, value[field]])
-      }
-    }
+    if (otherKindKeys.size === 0) return Effect.void
     for (const group of groups) {
       for (const item of group.items) {
-        for (const [field, { into, readsOther }] of otherKindKeys.edges.get(item.entityType) ??
-          []) {
-          const held = item.attributes[field]
-          if (held != null && readsOther(held)) found.push([field, item.member, into, held])
+        for (const { path, into, readsOther } of otherKindKeys.get(item.entityType) ?? []) {
+          const held = readCompositePath(item.attributes, path)
+          const readsAs = held == null ? undefined : readsOther(held)
+          if (readsAs === undefined) continue
+          const given =
+            typeof held === "bigint" ? `the bigint ${held}n` : `the number ${String(held)}`
+          return Effect.fail(
+            new ValidationError({
+              entityType: aggregateName,
+              operation,
+              cause:
+                `Field "${path}" of "${item.member}" is composed into ${into}, and ${given} ` +
+                `would read back as ${readsAs}, whose key text isn't the one written: ` +
+                "DynamoDB stores a number and a bigint alike. A key composed again from the " +
+                "stored rows wouldn't be this one. Nothing was written. Declare the field's kind, " +
+                "such as Schema.Number or Schema.BigInt. [EDD-9128]",
+            }),
+          )
         }
       }
     }
-    const [first] = found
-    if (first === undefined) return Effect.void
-    const [field, member, into, held] = first
-    const [given, read] =
-      typeof held === "bigint"
-        ? [`the bigint ${held}n`, "a number"]
-        : [`the number ${String(held)}`, "a bigint"]
-    return Effect.fail(
-      new ValidationError({
-        entityType: aggregateName,
-        operation,
-        cause:
-          `Field "${field}" of "${member}" is composed into ${into}, and ${given} would read back ` +
-          `as ${read}, whose key text isn't the one written: DynamoDB stores a number and a ` +
-          "bigint alike. A key composed again from the stored rows wouldn't be this one. Nothing " +
-          "was written. Declare the field's kind, such as Schema.Number or Schema.BigInt. " +
-          "[EDD-9128]",
-      }),
-    )
+    return Effect.void
   }
 
   /** Shared: compose PK and query all items, a rejected read a `ValidationError`. */
@@ -1819,15 +1821,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
     skOther: string,
     sk: string,
     storedAt: ReadonlyMap<string, Record<string, unknown>>,
-    otherKinds: () => ReadonlyArray<string>,
+    otherKind: (pk: string) => string | undefined,
   ): { readonly pk: string; readonly sk: string } => {
     if (storedAt.has(positionOf(pk, skOther))) return { pk, sk: skOther }
-    if (pk !== pkNow && storedAt.has(positionOf(pk, sk))) return { pk, sk }
-    // A sort key holding a numeric composite's other kind's text.
-    const otherKind = otherKinds().find(
-      (other) => other !== sk && storedAt.has(positionOf(pk, other)),
-    )
-    return { pk, sk: otherKind ?? skOther }
+    if (storedAt.has(positionOf(pk, sk))) return { pk, sk: pk === pkNow ? skOther : sk }
+    // A sort key holding a numeric composite's other kind's text. Looked for only for a row at
+    // neither key: one at its current key under the other kind's text too would have been read
+    // back as a second element, which `rekey` reports before placing anything (`bothKeys`).
+    return { pk, sk: otherKind(pk) ?? skOther }
   }
 
   /**
@@ -1850,12 +1851,31 @@ const makeAggregate = <TSchema extends Schema.Top>(
     for (const item of allItems) {
       storedAt.set(positionOf(String(item[config.pk.field]), String(item.sk)), item)
     }
+    /** The sort keys stored in a partition, other than `sk` ({@link oldPosition}). */
+    const partitions = new Map<string, KindTargets>()
+    const sortKeysIn = (pk: string, sk: string): KindTargets => {
+      let held = partitions.get(pk)
+      if (held === undefined) {
+        held = kindTargets(
+          allItems
+            .filter((item) => String(item[config.pk.field]) === pk)
+            .map((item) => String(item.sk)),
+        )
+        partitions.set(pk, held)
+      }
+      const inPartition = held
+      return {
+        has: (text) => text !== sk && inPartition.has(text),
+        hasPrefix: inPartition.hasPrefix,
+      }
+    }
     const rows = groups.flatMap((group, g) =>
       group.items.map((item, i) => {
         const built = composed[g]!.items[i]!
         const sk = (built.sk as { S?: string } | undefined)?.S ?? ""
         return {
           group: group.name,
+          item,
           built,
           current: { pk: pkValue, sk },
           old: oldPosition(
@@ -1864,7 +1884,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             otherSortKey(config.schema, item, sk),
             sk,
             storedAt,
-            () => otherKindSortKeys(config.schema, item),
+            (pk) => item.otherKindSortKey?.(sortKeysIn(pk, sk)),
           ),
         }
       }),
@@ -1876,12 +1896,37 @@ const makeAggregate = <TSchema extends Schema.Top>(
       })),
       (position) => storedAt.has(position),
     )
-    return rows.map((row, r) => ({
-      ...row,
-      placement: placements[r]!,
-      atCurrent: storedAt.get(positionOf(row.current.pk, row.current.sk)),
-      atOld: storedAt.get(positionOf(row.old.pk, row.old.sk)),
-    }))
+    // Elements composing one sort key: rows of one element stored under two keys, each read back
+    // as an element of its own (a field that stored both numeric kinds, now one). Each is reported
+    // once, at the other row's key, and nothing is placed.
+    const seen = new Set<string>()
+    return rows.flatMap((row, r) => {
+      const at = positionOf(row.current.pk, row.current.sk)
+      const collided = rows.some(
+        (other, o) => o !== r && positionOf(other.current.pk, other.current.sk) === at,
+      )
+      if (collided && seen.has(at)) return []
+      seen.add(at)
+      const old =
+        collided &&
+        (positionOf(row.old.pk, row.old.sk) === at ||
+          !storedAt.has(positionOf(row.old.pk, row.old.sk)))
+          ? {
+              pk: row.old.pk,
+              sk: row.item.otherKindSortKey?.(sortKeysIn(row.old.pk, row.current.sk)) ?? row.old.sk,
+            }
+          : row.old
+      return [
+        {
+          ...row,
+          old,
+          collided,
+          placement: placements[r]!,
+          atCurrent: storedAt.get(at),
+          atOld: storedAt.get(positionOf(old.pk, old.sk)),
+        },
+      ]
+    })
   }
 
   const updateCore = (
@@ -2023,7 +2068,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           stampFor(now, existingCreated, undefined, updatedBefore),
         ),
       )
-      yield* refuseOtherKindKeys(newGroups, assembledNew, "aggregate.update")
+      yield* refuseOtherKindKeys(newGroups, "aggregate.update")
       yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
@@ -2175,6 +2220,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootEncoders,
           aggregateName,
           config.schema,
+          "keep",
         )
         const rows = locateRows(
           groups,
@@ -2184,7 +2230,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           from,
         )
         const doubled = rows.filter(
-          (row) => row.placement === "both" || row.placement === "ambiguous",
+          (row) => row.collided || row.placement === "both" || row.placement === "ambiguous",
         )
         if (doubled.length > 0) {
           // In one partition, a move during the read shows a row at both keys too: it's
@@ -2206,8 +2252,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
               reason: "bothKeys" as const,
               key: { [config.pk.field]: row.old.pk, sk: row.old.sk },
               target: { [config.pk.field]: row.current.pk, sk: row.current.sk },
-              message:
-                row.placement === "both"
+              message: row.collided
+                ? "Rows stored under two keys read back as one element, each key its text under " +
+                  "one numeric kind or setting: the aggregate is left as it is."
+                : row.placement === "both"
                   ? "The row is also stored under its current key: the aggregate is left as it is."
                   : "Its rows' keys overlap across key text, and which row is stored under which " +
                     "key can't be told from the keys held: the aggregate is left as it is.",
@@ -2435,40 +2483,36 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
-   * Every partition key a root row's values have composed: under each setting's text, and with a
-   * numeric composite as the other kind (`numericKindVariants`), the other kind read from the
-   * digits the row stored.
+   * Is `pk` a partition key a root row's values have composed: under each setting's text, and with
+   * a numeric composite as either kind (`CompositeCodec.kindReadingOf`), the other kind read from
+   * the digits the row stored. The current text comes first, and a root under it composes nothing
+   * more.
    */
-  const storedPartitionsOf = (
+  const holdsPartition = (
     row: Record<string, AttributeValue>,
     key: Record<string, unknown>,
-  ): ReadonlyArray<string> => {
-    const variants = numericKindVariantsOf(
-      keyRecord(key),
-      config.pk.composite,
-      (field) => row[field]?.N,
-    )
-    return [
+    pk: string,
+  ): boolean =>
+    [
       config.schema,
       KeyText136.schema136(config.schema),
       KeyText136.schema137(config.schema),
       KeyText136.schemaEscaped(config.schema),
-    ].flatMap((under) =>
-      variants.flatMap(({ record: kindKeyForm }) => {
-        try {
-          return [
+    ].some(
+      (under) =>
+        kindReadingOf(
+          keyRecord(key),
+          config.pk.composite,
+          (field) => row[field]?.N,
+          ({ record }) =>
             composeCollectionKey(
               config.schema,
               config.collection.name,
-              KeyComposer.extractKeyComposites(under, {}, config.pk.composite, kindKeyForm),
+              KeyComposer.extractKeyComposites(under, {}, config.pk.composite, record),
             ),
-          ]
-        } catch {
-          return []
-        }
-      }),
+          pk,
+        ) !== undefined,
     )
-  }
 
   /**
    * The root of another aggregate at `pk`, stored there under text its values no longer compose:
@@ -2561,7 +2605,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const key = fromAttributeMap(row) as Record<string, unknown>
       const current = partitionUnder(config.schema, key)
       // Under none of the keys its values have had: nothing here can place it.
-      if (current === undefined || !storedPartitionsOf(row, key).includes(pk)) {
+      if (current === undefined || !holdsPartition(row, key, pk)) {
         return { skipped: { unrecognizedKey: 1 } }
       }
       const { rooted } = rekeyRunOf(ctx)
@@ -2759,7 +2803,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               stampFor(now, EMPTY_CREATED),
             ),
           )
-          yield* refuseOtherKindKeys(groups, assembled, "aggregate.create")
+          yield* refuseOtherKindKeys(groups, "aggregate.create")
           yield* refuseNotReadBack(
             dynamoGroups,
             assembled,
@@ -4079,11 +4123,13 @@ interface DecomposedItem {
    */
   readonly skCompositesOther: () => ReadonlyArray<string>
   /**
-   * A `many` element's sort key composites with a numeric value as the other kind, in either
-   * setting's text: a field that stored both composed each value's own kind's text (`EDD-9128`),
-   * and `rekey` looks for a row there too. A value a setting refuses (`NaN`) gives none.
+   * A `many` element's sort key with some numeric values as the other kind, in either setting's
+   * text, that is one of `targets`: a field that stored both composed each value's own kind's text
+   * (`EDD-9128`), and `rekey` looks for a row there too. Found value by value
+   * (`CompositeCodec.kindReadingOf`), never by composing each combination; `undefined` when none
+   * is. A value a setting refuses (`NaN`) gives none there.
    */
-  readonly skCompositesOtherKinds?: (() => ReadonlyArray<ReadonlyArray<string>>) | undefined
+  readonly otherKindSortKey?: ((targets: KindTargets) => string | undefined) | undefined
   /** Edge field name (entity type for the root) — used to name the culprit in errors. */
   readonly member: string
   /** What the row does with each timestamp. */
@@ -4135,6 +4181,11 @@ const decomposeAggregate = (
   encoders: NodeEncoders,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
+  /**
+   * `"keep"` returns items that compose one sort key, for `rekey` to report: rows of one element
+   * stored under two keys read back as two elements (`locateRows`).
+   */
+  collisions: "refuse" | "keep" = "refuse",
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
@@ -4204,7 +4255,7 @@ const decomposeAggregate = (
     // decode it and the collision reaches the caller as an opaque client error.
     // Catch it here, where the edge that produced it is still known (#103).
     const seen = new Map<string, DecomposedItem>()
-    for (const item of items) {
+    for (const item of collisions === "keep" ? [] : items) {
       const sk = composeKey(schema, item.entityType, [...item.skComposites])
       const prior = seen.get(sk)
       if (prior !== undefined) {
@@ -4275,19 +4326,6 @@ const otherSortKey = (
     return sk
   }
 }
-
-/** A decomposed row's sort keys with a numeric composite as the other kind, in either setting. */
-const otherKindSortKeys = (
-  schema: DynamoSchemaModule.DynamoSchema,
-  item: DecomposedItem,
-): ReadonlyArray<string> =>
-  (item.skCompositesOtherKinds?.() ?? []).flatMap((composites) => {
-    try {
-      return [composeKey(schema, item.entityType, [...composites])]
-    } catch {
-      return []
-    }
-  })
 
 /** A node's own static discriminator values as {@link DiscriminatorValues}. */
 const ownDiscriminatorValues = (
@@ -4457,33 +4495,33 @@ const decomposeNode = (
             ...parentDiscriminators.other(),
             ...values.map((value) => otherKeyText(schema, value)),
           ],
-          skCompositesOtherKinds: () => {
+          otherKindSortKey: (targets) => {
             const slots = values.map((_, i) => String(i))
-            return numericKindVariantsOf({ ...values }, slots, () => undefined)
-              .slice(1)
-              .flatMap(({ record }) => {
-                const flipped = slots.map((slot) => record[slot])
-                const texts: Array<ReadonlyArray<string>> = []
-                try {
-                  texts.push([
-                    ...parentDiscriminators.current,
-                    ...flipped.map((value) =>
-                      KeyComposer.keyValueText(schema, value, schema.casing),
-                    ),
-                  ])
-                } catch {
-                  // No text under this setting.
-                }
-                try {
-                  texts.push([
-                    ...parentDiscriminators.other(),
-                    ...flipped.map((value) => otherKeyText(schema, value)),
-                  ])
-                } catch {
-                  // No text under the other setting.
-                }
-                return texts
-              })
+            const settings: ReadonlyArray<
+              readonly [() => ReadonlyArray<string>, (value: unknown) => string]
+            > = [
+              [
+                () => parentDiscriminators.current,
+                (value) => KeyComposer.keyValueText(schema, value, schema.casing),
+              ],
+              [() => parentDiscriminators.other(), (value) => otherKeyText(schema, value)],
+            ]
+            for (const [parents, text] of settings) {
+              const sortKey = (record: Record<string, unknown>) =>
+                composeKey(schema, node.entityType, [
+                  ...parents(),
+                  ...slots.map((slot) => text(record[slot])),
+                ])
+              const reading = kindReadingOf(
+                { ...values },
+                slots,
+                () => undefined,
+                ({ record }) => sortKey(record),
+                targets,
+              )
+              if (reading !== undefined && reading.asOther.size > 0) return sortKey(reading.record)
+            }
+            return undefined
           },
           member: node.fieldName ?? node.entityType,
           rowStamps: node.rowStamps,

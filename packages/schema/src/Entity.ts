@@ -38,7 +38,7 @@ import {
 import * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
-import { bothKindsKeyRefusal } from "./internal/CompositeCodec.js"
+import { bothKindsKeyRefusal, keyFormValueKind } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -1098,8 +1098,11 @@ export const buildEntityDefinition = (config: {
 
   // EDD-9128: no value is composed into key text from a field storing both numeric kinds. A
   // Z-order dimension is quantized, not composed, and its own check refuses a union (EDD-9088).
+  // What composes each key composite, in words, for `appendInput`'s check below.
+  const composedInto = new Map<string, string>()
   const refuseBothKinds = (where: string, attrs: ReadonlyArray<string>): void => {
     for (const attr of attrs) {
+      if (!composedInto.has(attr)) composedInto.set(attr, where)
       const resolved = resolveCompositeSchemaForNullCheck(attr)
       if (resolved === undefined) continue
       const refused = bothKindsKeyRefusal(
@@ -1201,6 +1204,36 @@ export const buildEntityDefinition = (config: {
         throw new Error(
           `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput missing primary-key composite "${composite}". ` +
             `Every PK/SK composite must appear in appendInput so the event can be addressed.`,
+        )
+      }
+    }
+
+    // EDD-9128: `.append()` takes its input through `appendInput`, and composes the event's sort key
+    // and the current item's keys from it, so `appendInput`'s own fields are refused as the model's
+    // are: `orderBy` and every key composite it carries. One composing the other numeric kind's key
+    // text than its model field is refused too: the event is keyed by one kind's text and every read
+    // composes the other's.
+    const appendFields = getSchemaFields(ts.appendInput as Schema.Top) ?? {}
+    for (const [attr, where] of composedInto) {
+      const field = appendFields[attr]
+      if (field === undefined) continue
+      const owner = `Entity "${config.entityType}"`
+      const at = `${where}, through timeSeries.appendInput,`
+      const refused = bothKindsKeyRefusal(owner, at, attr, field)
+      if (refused !== undefined) throw refused
+      const model = modelFields[attr] as Schema.Top | undefined
+      const given = keyFormValueKind(field)
+      const read = model === undefined ? undefined : keyFormValueKind(model)
+      if (
+        (given === "number" || given === "bigint") &&
+        (read === "number" || read === "bigint") &&
+        given !== read
+      ) {
+        throw new Error(
+          `[EDD-9128] ${owner}: ${at} can't be composed from "${attr}", which timeSeries.appendInput ` +
+            `holds as a ${given} and the model as a ${read}. The two compose different key text, so ` +
+            `an event appended under one would never be found by a read composing the other. ` +
+            `Declare the same kind in both.`,
         )
       }
     }

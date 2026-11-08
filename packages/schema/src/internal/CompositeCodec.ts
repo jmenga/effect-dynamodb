@@ -33,7 +33,7 @@
  * Not part of the public API.
  */
 
-import { Option, Schema, SchemaAST } from "effect"
+import { Equal, Option, Schema, SchemaAST } from "effect"
 import {
   getSchemaFields,
   hasEncodingTransformation,
@@ -215,8 +215,8 @@ export type NumericKind = "number" | "bigint"
  * `Schema.Union([Schema.Number, Schema.BigInt])` stores both, and so does an unknown value. Read back,
  * a field storing one kind is that kind ({@link storedNumericForm}); a field storing both can't say
  * which from the value alone, so no key is composed from one: declared, it's refused at load
- * ({@link bothKindsKeyRefusal}), and a `Schema.Unknown` or `Schema.Any` key refuses a value that
- * reads back as the other kind at write ({@link readsBackAsOtherKind}).
+ * ({@link bothKindsKeyRefusal}), and a key whose kinds can't be read (`Schema.Unknown`, a declaration)
+ * refuses a value that reads back otherwise at write ({@link readsBackOtherwise}).
  */
 export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> =>
   numericKinds(field, true)
@@ -262,7 +262,8 @@ const numericKinds = (field: Schema.Top, open: boolean): ReadonlySet<NumericKind
  * and the value can't say which kind it was. Refused at load wherever a value is composed into key
  * text: a key, a unique constraint, a vector partition, a time-series `orderBy`. A field no key reads
  * may store both. `Schema.Unknown` and `Schema.Any` declare no kind, and a key over one that holds
- * strings works, so they're judged by value at write instead ({@link readsBackAsOtherKind}).
+ * strings works, so they're judged by value at write instead ({@link readsBackOtherwise}), as is a
+ * declaration and a transformation whose Encoded side is one of these.
  */
 export const bothKindsKeyRefusal = (
   owner: string,
@@ -281,65 +282,293 @@ export const bothKindsKeyRefusal = (
 }
 
 /**
- * For a key composite whose field takes both numeric kinds without declaring them
- * (`Schema.Unknown`, `Schema.Any`): whether a value a write stores reads back as the other kind,
- * and so composes other key text from a stored row. A `bigint` that's a safe integer reads back as
- * a `number`, and an integer `number` past 2^53 as a `bigint`. `undefined` for a field that can't
- * hold both, which never needs asking.
+ * Whether the numeric kinds a field stores can't be read off its schema: its Encoded side holds a
+ * `Schema.Unknown`, a `Schema.Any` or a declaration (`Schema.declare`), alone, in a union or behind a
+ * `Schema.suspend`. A transformation is judged by its Encoded side, so `Schema.Unknown` decoded to a
+ * `Schema.BigInt` is one.
  */
-export const readsBackAsOtherKind = (
-  field: Schema.Top,
-): ((value: unknown) => boolean) | undefined => {
-  if (storedNumericKinds(field).size < 2) return undefined
-  return (value) =>
-    typeof value === "bigint"
-      ? Number.isSafeInteger(Number(value)) && BigInt(Number(value)) === value
-      : typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)
+const kindsUnreadable = (field: Schema.Top): boolean => {
+  const seen = new Set<SchemaAST.AST>()
+  const walk = (ast: SchemaAST.AST): boolean => {
+    if (SchemaAST.isSuspend(ast)) {
+      if (seen.has(ast)) return false
+      seen.add(ast)
+      return walk(ast.thunk())
+    }
+    if (SchemaAST.isUnknown(ast) || SchemaAST.isAny(ast) || SchemaAST.isDeclaration(ast))
+      return true
+    return SchemaAST.isUnion(ast) && ast.types.some(walk)
+  }
+  return walk(SchemaAST.toEncoded(field.ast))
 }
 
 /**
- * `record` with its `fields` that hold a number or a bigint as each numeric kind: `record` first,
- * then with each set of them as the other kind, naming the fields given as the other kind. A field
- * that stored both (`Schema.Union([Schema.Number, Schema.BigInt])` before {@link
- * bothKindsKeyRefusal}, or a `Schema.Unknown`) composed each value's own kind's text, so `rekey`
- * looks for a row now one kind under the other's. The other kind is read from `digits`, the `N`
- * a field stored, when there is one: a bigint past 2^53 keeps its digits, and a number that isn't
- * an integer has no bigint.
+ * What DynamoDB hands back for a stored numeric value, where it's the other kind: a `bigint` that's a
+ * safe integer comes back as a `number`, and an integer `number` past 2^53 as a `bigint`. `undefined`
+ * for any other value, which comes back as it went.
  */
-export const numericKindVariants = (
+const readBackKind = (stored: unknown): number | bigint | undefined => {
+  if (typeof stored === "bigint") {
+    const asNumber = Number(stored)
+    return Number.isSafeInteger(asNumber) && BigInt(asNumber) === stored ? asNumber : undefined
+  }
+  return typeof stored === "number" && Number.isInteger(stored) && !Number.isSafeInteger(stored)
+    ? BigInt(stored)
+    : undefined
+}
+
+const sameValue = (a: unknown, b: unknown): boolean =>
+  typeof a === typeof b && (Object.is(a, b) || Equal.equals(a, b))
+
+/**
+ * For a key composite whose numeric kinds can't be read at load ({@link kindsUnreadable}): what a
+ * value a write stores reads back as, when that is something other than what was written, so a
+ * stored row composes other key text: `"a number"`, `"a bigint"`, or `"a value the field refuses"`.
+ * `undefined` for a value that reads back as written. DynamoDB returns a safe-integer `bigint` as
+ * a `number` and an integer `number` past 2^53 as a `bigint` ({@link readBackKind}); that value is
+ * decoded through the field and compared with the stored value decoded. `Schema.Unknown` reads
+ * `5n` back as `5`, and a declaration of either kind does the same, so both are refused;
+ * `Schema.Unknown` decoded to a `Schema.BigInt` with `BigInt(n)` reads it back as `5n`, and is
+ * stored. Only a value of the other kind on the way back is decoded, twice, synchronously. The
+ * judge itself is `undefined` for a field whose kinds can be read, which never needs asking: one
+ * declaring both is refused at load ({@link bothKindsKeyRefusal}).
+ */
+export const readsBackOtherwise = (
+  field: Schema.Top,
+): ((stored: unknown) => string | undefined) | undefined => {
+  if (!kindsUnreadable(field)) return undefined
+  const decode = Schema.decodeUnknownOption(field as unknown as Schema.Codec<unknown, unknown>)
+  return (stored) => {
+    const returned = readBackKind(stored)
+    if (returned === undefined) return undefined
+    const read = decode(returned)
+    const written = decode(stored)
+    if (Option.isSome(read) && Option.isSome(written) && sameValue(read.value, written.value)) {
+      return undefined
+    }
+    if (Option.isNone(read)) return "a value the field refuses"
+    return typeof read.value === "bigint"
+      ? "a bigint"
+      : typeof read.value === "number"
+        ? "a number"
+        : "something else"
+  }
+}
+
+/**
+ * The field a composite names by its dotted path (`nested.n`): the first segment a field of
+ * `fields`, each further one looked up through what holds it on the way — `Schema.optional`,
+ * `Schema.optionalKey`, `Schema.NullOr` or another union with `null` or `undefined`,
+ * `Schema.suspend`, and a `Schema.Class` — as the value holds it. A union of structs naming the
+ * segment in several members gives the union of their fields. `undefined` where a segment names
+ * nothing.
+ */
+export const fieldAtPath = (
+  fields: Record<string, Schema.Top> | undefined,
+  path: string,
+): Schema.Top | undefined => {
+  const [first, ...rest] = path.split(".")
+  const top = fields?.[first!]
+  if (top === undefined || rest.length === 0) return top
+  let at: ReadonlyArray<SchemaAST.AST> = [top.ast]
+  for (const segment of rest) {
+    at = at.flatMap((ast) => propertyAt(ast, segment, new Set()))
+    if (at.length === 0) return undefined
+  }
+  return at.length === 1
+    ? Schema.make<Schema.Top>(at[0]!)
+    : Schema.Union(at.map((ast) => Schema.make<Schema.Top>(ast)))
+}
+
+const propertyAt = (
+  ast: SchemaAST.AST,
+  name: string,
+  seen: Set<SchemaAST.AST>,
+): ReadonlyArray<SchemaAST.AST> => {
+  if (SchemaAST.isSuspend(ast)) {
+    if (seen.has(ast)) return []
+    seen.add(ast)
+    return propertyAt(ast.thunk(), name, seen)
+  }
+  if (SchemaAST.isUnion(ast)) {
+    return ast.types.flatMap((member) =>
+      SchemaAST.isUndefined(member) || SchemaAST.isNull(member)
+        ? []
+        : propertyAt(member, name, seen),
+    )
+  }
+  if (SchemaAST.isObjects(ast)) {
+    const property = ast.propertySignatures.find((signature) => signature.name === name)
+    return property === undefined ? [] : [property.type]
+  }
+  // A class: a declaration of its struct, which is what it's stored as.
+  if (
+    SchemaAST.isDeclaration(ast) &&
+    ast.typeParameters.length === 1 &&
+    SchemaAST.isObjects(SchemaAST.toEncoded(ast))
+  ) {
+    return propertyAt(ast.typeParameters[0]!, name, seen)
+  }
+  return []
+}
+
+/** A record with the fields in `asOther` given as the other numeric kind ({@link kindReadingOf}). */
+export interface KindReading {
+  readonly record: Record<string, unknown>
+  readonly asOther: ReadonlySet<string>
+}
+
+/**
+ * A number or bigint as the other kind, read from `stored`, the `N` its field stored, when there
+ * is one: a bigint past 2^53 keeps its digits, and a number that isn't an integer has no bigint.
+ * `undefined` for anything else.
+ */
+export const otherNumericKind = (
+  value: unknown,
+  stored: string | undefined,
+): number | bigint | undefined => {
+  if (typeof value === "bigint") return Number(stored ?? value)
+  if (typeof value !== "number") return undefined
+  const integer = stored !== undefined ? /^-?\d+$/.test(stored) : Number.isInteger(value)
+  return integer ? BigInt(stored ?? value) : undefined
+}
+
+/** The texts a reading is looked for among ({@link kindReadingOf}). */
+export interface KindTargets {
+  readonly has: (text: string) => boolean
+  /** Whether some text looked for begins with `prefix`. */
+  readonly hasPrefix: (prefix: string) => boolean
+}
+
+/** {@link KindTargets} over `texts`: sorted once, then each question is a binary search. */
+export const kindTargets = (texts: Iterable<string>): KindTargets => {
+  // Compared by UTF-16 code unit, as `<` and `startsWith` compare: the texts beginning with a
+  // prefix sort together, from the first one not below it.
+  const sorted = [...new Set(texts)].sort()
+  const from = (text: string) => {
+    let low = 0
+    let high = sorted.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if (sorted[middle]! < text) low = middle + 1
+      else high = middle
+    }
+    return sorted[low]
+  }
+  return {
+    has: (text) => from(text) === text,
+    hasPrefix: (prefix) => from(prefix)?.startsWith(prefix) ?? false,
+  }
+}
+
+/** The stretch of a reading's text where one field as the other kind differs from `record`'s. */
+interface KindEdit {
+  readonly field: string
+  readonly other: number | bigint
+  readonly start: number
+  readonly end: number
+  readonly text: string
+}
+
+/**
+ * The reading of `record` whose `compose` is `stored`, or one of the texts in `stored`: each of
+ * `fields` that holds a number or a bigint given as its own kind or as the other one ({@link
+ * otherNumericKind}, the other read from `digits`, the `N` the field stored). A field that stored
+ * both kinds (`Schema.Union([Schema.Number, Schema.BigInt])` before {@link bothKindsKeyRefusal},
+ * or a `Schema.Unknown`) composed each value's own kind's text, so `rekey` looks for a row stored
+ * under the other kind's. `compose` gives `undefined` for values with no text there.
+ *
+ * `record` as it is comes first, and when its text is looked for nothing else is composed: that is
+ * a row under its current key, every row of a clean run. Otherwise each field is composed once as
+ * the other kind by itself, which shows where its value lies in the text: the stretch where that
+ * text and `record`'s differ. The readings are then walked field by field from the left, keeping
+ * those whose text so far begins a text looked for, and one left whole at the end is composed to
+ * confirm it. That is one composition per field and one or two more, never one per combination,
+ * and no text is split on its delimiters. When two fields' stretches overlap, a composer that
+ * doesn't keep each value in a stretch of its own, each field is read as the other kind only alone.
+ */
+export const kindReadingOf = (
   record: Record<string, unknown>,
   fields: ReadonlyArray<string>,
   digits: (field: string) => string | undefined,
-): ReadonlyArray<{
-  readonly record: Record<string, unknown>
-  readonly asOther: ReadonlySet<string>
-}> => {
-  const others: Array<readonly [string, number | bigint]> = []
-  for (const field of fields) {
-    const value = record[field]
-    if (typeof value !== "number" && typeof value !== "bigint") continue
-    const stored = digits(field)
-    if (typeof value === "bigint") {
-      others.push([field, Number(stored ?? value)])
-    } else if (stored !== undefined ? /^-?\d+$/.test(stored) : Number.isInteger(value)) {
-      others.push([field, BigInt(stored ?? value)])
+  compose: (reading: KindReading) => string | undefined,
+  stored: string | KindTargets,
+): KindReading | undefined => {
+  const targets: KindTargets =
+    typeof stored === "string"
+      ? { has: (text) => text === stored, hasPrefix: (prefix) => stored.startsWith(prefix) }
+      : stored
+  const composed = (reading: KindReading) => {
+    try {
+      return compose(reading)
+    } catch {
+      return undefined
     }
   }
-  const variants: Array<{
-    readonly record: Record<string, unknown>
-    readonly asOther: ReadonlySet<string>
-  }> = [{ record, asOther: new Set() }]
-  for (let set = 1; set < 2 ** others.length; set++) {
+  const given: KindReading = { record, asOther: new Set() }
+  const base = composed(given)
+  if (base === undefined) return undefined
+  if (targets.has(base)) return given
+  const edits: Array<KindEdit> = []
+  for (const field of new Set(fields)) {
+    const other = otherNumericKind(record[field], digits(field))
+    if (other === undefined) continue
+    const alone: KindReading = { record: { ...record, [field]: other }, asOther: new Set([field]) }
+    const text = composed(alone)
+    if (text === undefined || text === base) continue
+    if (targets.has(text)) return alone
+    let start = 0
+    while (start < base.length && start < text.length && base[start] === text[start]) start++
+    let tail = 0
+    while (
+      tail < base.length - start &&
+      tail < text.length - start &&
+      base[base.length - 1 - tail] === text[text.length - 1 - tail]
+    ) {
+      tail++
+    }
+    edits.push({
+      field,
+      other,
+      start,
+      end: base.length - tail,
+      text: text.slice(start, -tail || undefined),
+    })
+  }
+  // Each field alone has been tried.
+  if (edits.length < 2) return undefined
+  edits.sort((a, b) => a.start - b.start || a.end - b.end)
+  if (edits.some((edit, i) => i > 0 && edit.start <= edits[i - 1]!.start)) return undefined
+  if (edits.some((edit, i) => i > 0 && edit.start < edits[i - 1]!.end)) return undefined
+  // The readings' texts so far, each with the fields it gives as the other kind.
+  let walked = new Map<string, ReadonlyArray<KindEdit>>([["", []]])
+  let at = 0
+  for (const edit of edits) {
+    const next = new Map<string, ReadonlyArray<KindEdit>>()
+    const between = base.slice(at, edit.start)
+    for (const [text, taken] of walked) {
+      const kept = `${text}${between}${base.slice(edit.start, edit.end)}`
+      if (!next.has(kept) && targets.hasPrefix(kept)) next.set(kept, taken)
+      const flipped = `${text}${between}${edit.text}`
+      if (!next.has(flipped) && targets.hasPrefix(flipped)) next.set(flipped, [...taken, edit])
+    }
+    if (next.size === 0) return undefined
+    walked = next
+    at = edit.end
+  }
+  const rest = base.slice(at)
+  for (const [text, taken] of walked) {
+    if (taken.length < 2 || !targets.has(`${text}${rest}`)) continue
     const flipped = { ...record }
-    const asOther = new Set<string>()
-    for (const [i, [field, other]] of others.entries()) {
-      if ((set & (2 ** i)) === 0) continue
-      flipped[field] = other
-      asOther.add(field)
+    for (const edit of taken) flipped[edit.field] = edit.other
+    const reading: KindReading = {
+      record: flipped,
+      asOther: new Set(taken.map((edit) => edit.field)),
     }
-    variants.push({ record: flipped, asOther })
+    const confirmed = composed(reading)
+    if (confirmed !== undefined && targets.has(confirmed)) return reading
   }
-  return variants
+  return undefined
 }
 
 /**
