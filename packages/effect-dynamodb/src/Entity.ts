@@ -52,7 +52,6 @@ import {
   keyFormValueKind,
   makeCompositeKeyForm,
   storedNumericForm,
-  storedNumericKinds,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
@@ -4631,15 +4630,11 @@ const makeImpl = <
           withVectors?.[logicalName] === undefined &&
           definition.sourceFields.some((field) => !(field in merged)),
       )
-      // A two-kind value of the stored row no key on it proves, and the update doesn't give.
-      let unproven: ReadonlyArray<UnprovenKind> = []
       if (needsFullSource) {
         const client = yield* Capacity.client
         const current = yield* client.getItem({ TableName: tableName, Key: marshalledKey })
         if (current.Item) {
-          const reading = readStored(current.Item)
-          unproven = reading.unproven.filter((kind) => !(kind.field in merged))
-          const currentDomain = reading.raw
+          const currentDomain = fromAttributeMap(current.Item) as globalThis.Record<string, unknown>
           // Packed fields are read by their stored form: the source text is
           // derived from the value, not its JSON string or compressed bytes.
           yield* unpackFields(currentDomain, "update.vector")
@@ -4655,9 +4650,6 @@ const makeImpl = <
       const removes: Array<string> = []
       for (const [logicalName, definition] of vectorIndexEntries) {
         const isNeeded = needing.some(([name]) => name === logicalName)
-        // No partition is composed from a two-kind value the row's keys don't prove.
-        const hung = unproven.find((kind) => definition.partition.includes(kind.field))
-        if (hung !== undefined) return yield* unprovenRefusal("update", hung)
         // Partition value: idempotent and cheap, so recompose whenever the
         // merged record can supply it (same reasoning as the PK-composites-only
         // GSI shape in §7).
@@ -5730,8 +5722,10 @@ const makeImpl = <
             ConsistentRead: true,
           })).Item
       yield* checkVersion(current, args.operation)
-      const currentRead = current !== undefined ? readStored(current) : undefined
-      const currentRaw = currentRead?.raw
+      const currentRaw =
+        current !== undefined
+          ? (fromAttributeMap(current) as globalThis.Record<string, unknown>)
+          : undefined
       const storedVersion = storedVersionOf(current)
       if (currentRaw !== undefined) {
         // The same item, continued: its next version, its incarnation, its
@@ -5823,13 +5817,12 @@ const makeImpl = <
                 readonly fieldsRecord: globalThis.Record<string, string>
               }
             | undefined
-          /** Where the stored value's sentinel may be: one key per kind of an unproven value. */
-          readonly priors: ReadonlyArray<{ readonly pk: string; readonly sk: string }>
+          readonly prior: { readonly pk: string; readonly sk: string } | undefined
         }> = []
         const sameKey = (
           a: { readonly pk: string; readonly sk: string },
-          b: { readonly pk: string; readonly sk: string } | undefined,
-        ) => b !== undefined && a.pk === b.pk && a.sk === b.sk
+          b: { readonly pk: string; readonly sk: string },
+        ) => a.pk === b.pk && a.sk === b.sk
         for (const [constraintName, constraintDef] of Object.entries(
           config.unique as globalThis.Record<string, UniqueConstraintDef>,
         )) {
@@ -5841,30 +5834,33 @@ const makeImpl = <
             newSource,
             storedSentinelValue,
           )
-          const priors =
+          const prior =
             oldSource !== undefined
-              ? heldSentinelKeys(constraintName, constraintDef, oldSource, currentRead!.unproven)
-              : []
-          if (next !== undefined && priors.length === 1 && sameKey(priors[0]!, next.key)) continue
-          changes.push({ constraintName, constraintDef, next, priors })
+              ? composeUniqueSentinel(
+                  schema,
+                  entityType,
+                  constraintName,
+                  constraintDef,
+                  oldSource,
+                  storedSentinelValue,
+                )
+              : undefined
+          if (next !== undefined && prior !== undefined && sameKey(next.key, prior.key)) continue
+          changes.push({ constraintName, constraintDef, next, prior: prior?.key })
         }
         const owned = new Set(
           yield* ownedSentinels(
             args.tableName,
-            changes.flatMap((change) => change.priors),
+            changes.flatMap((change) => (change.prior === undefined ? [] : [change.prior])),
             owner,
           ),
         )
         for (const change of changes) {
-          for (const prior of change.priors) {
-            if (!owned.has(prior) || sameKey(prior, change.next?.key)) continue
-            items.push(sentinelRelease(args.tableName, prior, owner))
+          if (change.prior !== undefined && owned.has(change.prior)) {
+            items.push(sentinelRelease(args.tableName, change.prior, owner))
             roles.push({ kind: "release", constraintName: change.constraintName })
           }
           if (change.next === undefined) continue
-          if (change.priors.some((prior) => owned.has(prior) && sameKey(prior, change.next?.key))) {
-            continue
-          }
           items.push({
             Put: {
               TableName: args.tableName,
@@ -7045,8 +7041,7 @@ const makeImpl = <
           return yield* missingItem()
         }
 
-        // A two-kind value read as the kind the row's keys prove (`readStored`).
-        const { raw: currentRaw, unproven } = readStored(currentResult.Item)
+        const currentRaw = fromAttributeMap(currentResult.Item)
         // 0: written before the entity was `versioned` (#133).
         const currentVersion = systemFields.version
           ? (((currentRaw as globalThis.Record<string, unknown>)[systemFields.version] as
@@ -7244,41 +7239,20 @@ const makeImpl = <
         // Z-order value the composer can't place (EDD-9092, #171) fails the
         // update with a `ValidationError`.
         const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
-        const gsiKeysOf = (record: globalThis.Record<string, unknown>) =>
+        const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
           KeyComposer.composeGsiKeysForUpdatePolicyAware(
             schema,
             entityType,
             entityVersion,
             allIndexes,
             keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
-            keyForm(record),
+            keyForm(newItem),
             {
               ...(retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet }),
               stamped: keyForm(writeStamps(newItem[systemFields.updatedAt ?? ""], newVersion)),
             },
-          )
-        const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () => gsiKeysOf(newItem))
-        // No key is written from a two-kind value the row's keys don't prove (a value the update
-        // gives is the caller's). Unique sentinels are found by their owner read below.
-        const hung = hangsOnUnproven(
-          unproven.filter(
-            (kind) => !(kind.field in (hydratedUpdates as globalThis.Record<string, unknown>)),
           ),
-          newItem,
-          (record) => [
-            composePrimaryKey(record),
-            gsiKeysOf(record),
-            vectorIndexEntries.map(([, definition]) =>
-              KeyComposer.tryComposeVectorPartition(
-                schema,
-                entityType,
-                definition,
-                keyForm(record),
-              ),
-            ),
-          ],
         )
-        if (hung !== undefined) return yield* unprovenRefusal("update", hung)
         for (const [field, value] of Object.entries(gsiUpdate.sets)) {
           newItem[field] = value
         }
@@ -7291,76 +7265,49 @@ const makeImpl = <
         // Sparse-aware rotation: each constraint may transition through one of four
         // states between old and new — both-missing (no-op), missing→present (Put only),
         // present→missing (Delete only), present→present (Delete + Put if changed).
-        //
-        // The old value's sentinel may be under more than one key: a two-kind value the row's keys
-        // don't prove composes one per kind, and the owner read says which. Each reading pairs the
-        // old key with the new one, the value read the same way where the update leaves it.
-        type SentinelReading = {
-          readonly old: { readonly pk: string; readonly sk: string } | undefined
-          readonly next:
-            | {
-                readonly key: { readonly pk: string; readonly sk: string }
-                readonly fieldsRecord: globalThis.Record<string, string>
-              }
-            | undefined
-        }
         type SentinelRotation = {
           constraintName: string
-          readings: ReadonlyArray<SentinelReading>
-          /** The unproven value a new key depends on, when the readings' new keys differ. */
-          hangs: UnprovenKind | undefined
+          oldUniqueKey: { readonly pk: string; readonly sk: string } | undefined
+          newUniqueKey: { readonly pk: string; readonly sk: string } | undefined
+          newFieldsRecord: globalThis.Record<string, string> | undefined
         }
         const sentinelRotations: Array<SentinelRotation> = []
         if (touchesUniqueFields) {
           const currentRawDomain = toDomainView(currentRaw as globalThis.Record<string, unknown>)
           for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-            const fields = resolveUniqueFields(constraintDef)
-            let pairs: ReadonlyArray<{
-              readonly old: globalThis.Record<string, unknown>
-              readonly next: globalThis.Record<string, unknown>
-            }> = [{ old: currentRawDomain, next: newItem }]
-            let hangs: UnprovenKind | undefined
-            for (const kind of unproven) {
-              if (!fields.includes(kind.field) || currentRawDomain[kind.field] !== kind.asRead) {
-                continue
-              }
-              const kept = newItem[kind.field] === kind.asRead
-              if (kept) hangs ??= kind
-              pairs = [
-                ...pairs,
-                ...pairs.map((pair) => ({
-                  old: { ...pair.old, [kind.field]: kind.other },
-                  next: kept ? { ...pair.next, [kind.field]: kind.other } : pair.next,
-                })),
-              ]
-            }
-            const sentinelOf = (values: globalThis.Record<string, unknown>) =>
-              composeUniqueSentinel(
-                schema,
-                entityType,
-                constraintName,
-                constraintDef,
-                values,
-                storedSentinelValue,
-              )
-            const readings = pairs.map(
-              (pair): SentinelReading => ({
-                old: sentinelOf(pair.old)?.key,
-                next: sentinelOf(pair.next),
-              }),
+            const oldSentinel = composeUniqueSentinel(
+              schema,
+              entityType,
+              constraintName,
+              constraintDef,
+              currentRawDomain,
+              storedSentinelValue,
             )
-            if (readings.every(({ old, next }) => old === undefined && next === undefined)) continue
+            const newSentinel = composeUniqueSentinel(
+              schema,
+              entityType,
+              constraintName,
+              constraintDef,
+              newItem,
+              storedSentinelValue,
+            )
+
+            if (!oldSentinel && !newSentinel) continue
             if (
-              readings.length === 1 &&
-              readings[0]!.old !== undefined &&
-              readings[0]!.next !== undefined &&
-              readings[0]!.old.pk === readings[0]!.next.key.pk &&
-              readings[0]!.old.sk === readings[0]!.next.key.sk
+              oldSentinel &&
+              newSentinel &&
+              oldSentinel.key.pk === newSentinel.key.pk &&
+              oldSentinel.key.sk === newSentinel.key.sk
             ) {
               continue
             }
 
-            sentinelRotations.push({ constraintName, readings, hangs })
+            sentinelRotations.push({
+              constraintName,
+              oldUniqueKey: oldSentinel?.key,
+              newUniqueKey: newSentinel?.key,
+              newFieldsRecord: newSentinel?.fieldsRecord,
+            })
           }
         }
 
@@ -7734,23 +7681,15 @@ const makeImpl = <
           // sentinel this item owns (#133): the item may hold the old value
           // without its reservation, which another item may hold.
           const owner = { pk: primaryKey[pkField], sk: primaryKey[skField] }
-          const olds = new Map<string, { readonly pk: string; readonly sk: string }>()
-          for (const rotation of sentinelRotations) {
-            for (const { old } of rotation.readings) {
-              if (old !== undefined) olds.set(`${old.pk}\u0000${old.sk}`, old)
-            }
-          }
           const owned = new Set(
-            (yield* ownedSentinels(tableName, [...olds.values()], owner)).map(
-              (key) => `${key.pk}\u0000${key.sk}`,
+            yield* ownedSentinels(
+              tableName,
+              sentinelRotations.flatMap((rotation) =>
+                rotation.oldUniqueKey === undefined ? [] : [rotation.oldUniqueKey],
+              ),
+              owner,
             ),
           )
-          const isOwned = (key: { readonly pk: string; readonly sk: string } | undefined) =>
-            key !== undefined && owned.has(`${key.pk}\u0000${key.sk}`)
-          const sameSentinel = (
-            a: { readonly pk: string; readonly sk: string } | undefined,
-            b: { readonly pk: string; readonly sk: string } | undefined,
-          ) => a !== undefined && b !== undefined && a.pk === b.pk && a.sk === b.sk
           const sentinelPutIndices: Array<{
             index: number
             constraintName: string
@@ -7758,39 +7697,20 @@ const makeImpl = <
           }> = []
           const releaseIndices: Array<{ index: number; constraintName: string }> = []
           for (const rotation of sentinelRotations) {
-            // The reading whose old sentinel this item holds. Holding none, only a new key every
-            // reading agrees on is written: one composed from a value no key proves isn't.
-            const held = rotation.readings.find(({ old }) => isOwned(old))
-            const first = rotation.readings[0]!
-            const agreed = rotation.readings.every(({ next }) =>
-              next === undefined
-                ? first.next === undefined
-                : sameSentinel(next.key, first.next?.key),
-            )
-            const chosen = held ?? (agreed ? first : undefined)
-            if (chosen === undefined) {
-              return yield* unprovenRefusal("update", rotation.hangs!)
-            }
-            // Each key this item holds the old value under, unless the new value is there too.
-            const released = new Set<string>()
-            for (const { old } of rotation.readings) {
-              if (!isOwned(old) || sameSentinel(old, chosen.next?.key)) continue
-              if (released.has(`${old!.pk}\u0000${old!.sk}`)) continue
-              released.add(`${old!.pk}\u0000${old!.sk}`)
+            const held = rotation.oldUniqueKey
+            if (held !== undefined && owned.has(held)) {
               releaseIndices.push({
                 index: transactItems.length,
                 constraintName: rotation.constraintName,
               })
-              transactItems.push(sentinelRelease(tableName, old!, owner))
+              transactItems.push(sentinelRelease(tableName, held, owner))
             }
 
-            const keeps = held !== undefined && sameSentinel(held.old, chosen.next?.key)
-            const next = chosen.next
-            if (next !== undefined && !keeps) {
+            if (rotation.newUniqueKey && rotation.newFieldsRecord) {
               sentinelPutIndices.push({
                 index: transactItems.length,
                 constraintName: rotation.constraintName,
-                newFieldsRecord: next.fieldsRecord,
+                newFieldsRecord: rotation.newFieldsRecord,
               })
               transactItems.push({
                 Put: {
@@ -7799,7 +7719,7 @@ const makeImpl = <
                     sentinelItemFor(
                       rotation.constraintName,
                       config.unique![rotation.constraintName]!,
-                      next.key,
+                      rotation.newUniqueKey,
                       owner,
                       now,
                       ttlAttrName,
@@ -8922,18 +8842,11 @@ const makeImpl = <
       // Put's item when the op writes the whole row, else the row it read
       // overlaid with the payload.
       const mainPut = items.find((i) => i.Put !== undefined && isOwn(i.Put.Item))?.Put?.Item
-      const ownReading = ownRow === undefined ? undefined : readStored(ownRow)
-      const read = ownReading === undefined ? {} : toDomainView(ownReading.raw)
+      const read = ownRow === undefined ? {} : toDomainView(fromAttributeMap(ownRow))
       const after: globalThis.Record<string, unknown> =
         mainPut !== undefined
           ? toDomainView(fromAttributeMap(mainPut))
           : { ...read, ...request.payload }
-      // A two-kind value read back that the write leaves: a sentinel it reserves is under one
-      // kind's key, whichever the item held.
-      const afterUnproven =
-        mainPut !== undefined
-          ? []
-          : (ownReading?.unproven ?? []).filter((kind) => after[kind.field] === kind.asRead)
       if (mainPut === undefined) {
         for (const [field, delta] of Object.entries(request.deltas ?? {})) {
           if (typeof delta !== "number") continue
@@ -8974,29 +8887,25 @@ const makeImpl = <
         }
         const constraintName = tag.slice(sentinelPrefix.length)
         const constraintDef = config.unique?.[constraintName]
-        const putKey = fromAttributeMap(item.Put.Item ?? {})
-        // Only values that recompose THIS sentinel are reported — never a guess.
         const reserved =
           constraintDef === undefined
             ? undefined
-            : readingViews(after, afterUnproven, resolveUniqueFields(constraintDef))
-                .map((values) =>
-                  composeUniqueSentinel(
-                    schema,
-                    entityType,
-                    constraintName,
-                    constraintDef,
-                    values,
-                    storedSentinelValue,
-                  ),
-                )
-                .find(
-                  (sentinel) =>
-                    sentinel !== undefined &&
-                    sentinel.key.pk === putKey[pkField] &&
-                    sentinel.key.sk === putKey[skField],
-                )
-        const fields = reserved?.fieldsRecord ?? {}
+            : composeUniqueSentinel(
+                schema,
+                entityType,
+                constraintName,
+                constraintDef,
+                after,
+                storedSentinelValue,
+              )
+        const putKey = fromAttributeMap(item.Put.Item ?? {})
+        // Only values that recompose THIS sentinel are reported — never a guess.
+        const fields =
+          reserved !== undefined &&
+          reserved.key.pk === putKey[pkField] &&
+          reserved.key.sk === putKey[skField]
+            ? reserved.fieldsRecord
+            : {}
         return {
           _tag: "reserve",
           error: new UniqueConstraintViolation({ entityType, constraint: constraintName, fields }),
@@ -9298,7 +9207,6 @@ const makeImpl = <
             table: string,
             raw: globalThis.Record<string, unknown>,
             into: Array<unknown>,
-            unproven: ReadonlyArray<UnprovenKind>,
           ) =>
             Effect.gen(function* () {
               const rawDomain = toDomainView(raw)
@@ -9307,17 +9215,17 @@ const makeImpl = <
                 readonly sk: string
                 readonly constraintName: string
               }> = []
-              // A two-kind value its row's keys don't prove names a key per kind: the owner read
-              // below says which this item holds.
               for (const [constraintName, constraintDef] of Object.entries(config.unique!)) {
-                for (const key of heldSentinelKeys(
+                const sentinel = composeUniqueSentinel(
+                  schema,
+                  entityType,
                   constraintName,
                   constraintDef,
                   rawDomain,
-                  unproven,
-                )) {
-                  held.push({ ...key, constraintName })
-                }
+                  storedSentinelValue,
+                )
+                if (!sentinel) continue
+                held.push({ ...sentinel.key, constraintName })
               }
               const owner = { pk: primaryKey[primary.pk.field], sk: primaryKey[primary.sk.field] }
               const releases: Array<{ index: number; constraintName: string }> = []
@@ -9344,7 +9252,7 @@ const makeImpl = <
                 yield* checkVersion(result.Item, "delete")
                 const softGuard = deleteGuard(result.Item, "item", userCondition?.expression)
 
-                const { raw, unproven } = readStored(result.Item)
+                const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
                 // Clock-backed time source; `now` is the ISO timestamp used for the
                 // deleted SK + deletedAt, `dtNow` drives the optional TTL + snapshot.
                 const dtNow = yield* DateTime.now
@@ -9444,7 +9352,7 @@ const makeImpl = <
                 // never had a sentinel, so nothing to release.
                 const releases =
                   hasUniqueConstraints && !preserveUnique()
-                    ? yield* ownedReleases(tableName, raw, transactItems, unproven)
+                    ? yield* ownedReleases(tableName, raw, transactItems)
                     : []
 
                 yield* guardedDelete(
@@ -9524,7 +9432,7 @@ const makeImpl = <
                   userCondition?.expression,
                 )
 
-                const { raw, unproven } = readStored(result.Item)
+                const raw = fromAttributeMap(result.Item) as globalThis.Record<string, unknown>
 
                 const transactItems: Array<TransactWriteItem> = []
 
@@ -9565,7 +9473,7 @@ const makeImpl = <
                 // Release sentinels — only those this item owns (#133). Sparse: no
                 // sentinel was ever written for a constraint whose fields are unset.
                 const releases = hasUniqueConstraints
-                  ? yield* ownedReleases(tableName, raw, transactItems, unproven)
+                  ? yield* ownedReleases(tableName, raw, transactItems)
                   : []
 
                 yield* guardedDelete(
@@ -11562,9 +11470,7 @@ const makeImpl = <
           }
 
           yield* checkVersion(tombstone, "restore")
-          // A two-kind value read as the kind the tombstone's keys prove (`readStored`): its
-          // partition key, and the item segment of its sort key.
-          const { raw: deletedRaw, unproven } = readStored(tombstone)
+          const deletedRaw = fromAttributeMap(tombstone)
           const deletedMarshalledKey = toAttributeMap({
             [primary.pk.field]: (deletedRaw as globalThis.Record<string, unknown>)[
               primary.pk.field
@@ -11600,40 +11506,6 @@ const makeImpl = <
           // stays attribute-keyed — it is the row being written back, and
           // `decodeAs` renames it in place at the end (#127).
           const restoredDomain = toDomainView(restoredItem)
-
-          // A tombstone holds no index key, vector partition or sentinel: a key restore composes
-          // from a two-kind value its own keys don't prove isn't written, and the tombstone stays.
-          const hung = hangsOnUnproven(unproven, restoredDomain, (record) => [
-            KeyComposer.composeAllKeys(
-              schema,
-              entityType,
-              entityVersion,
-              allIndexes,
-              keyForm(record),
-            ),
-            vectorIndexEntries.map(([, definition]) =>
-              KeyComposer.tryComposeVectorPartition(
-                schema,
-                entityType,
-                definition,
-                keyForm(record),
-              ),
-            ),
-            Object.entries(
-              (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
-            ).map(
-              ([constraintName, constraintDef]) =>
-                composeUniqueSentinel(
-                  schema,
-                  entityType,
-                  constraintName,
-                  constraintDef,
-                  record,
-                  storedSentinelValue,
-                )?.key,
-            ),
-          ])
-          if (hung !== undefined) return yield* unprovenRefusal("restore", hung)
 
           // Recompose all keys (original SK, GSI keys)
           const restoredKeys = yield* composeAllKeys(restoredDomain, "restore")
@@ -11903,15 +11775,8 @@ const makeImpl = <
               // off a value holding `#` is keyed under the text of another —
               // `a b#c`'s under `a b`'s live key — and is that value's, not
               // this item's.
-              // The stored sort key names the item: a two-kind value its keys don't prove (the
-              // projection carries no partition composite) is the item's under either reading.
               try {
-                const read = readStored(row)
-                return readingViews(
-                  toDomainView(read.raw),
-                  read.unproven,
-                  primary.sk.composite,
-                ).some((values) => liveSkOf(values) === liveSk)
+                return liveSkOf(toDomainView(fromAttributeMap(row))) === liveSk
               } catch {
                 return true
               }
@@ -11995,19 +11860,18 @@ const makeImpl = <
             // row is attribute-keyed, the constraint is not (#127).
             const held = new Map<string, { readonly pk: string; readonly sk: string }>()
             for (const holder of holders) {
-              const { raw: holderRaw, unproven } = readStored(holder)
-              const holderDomain = toDomainView(holderRaw)
+              const holderDomain = toDomainView(fromAttributeMap(holder))
               for (const [constraintName, constraintDef] of Object.entries(config.unique)) {
-                // A key per kind of a two-kind value the row's keys don't prove: the owner read
-                // below says which this item holds.
-                for (const key of heldSentinelKeys(
+                const sentinel = composeUniqueSentinel(
+                  schema,
+                  entityType,
                   constraintName,
                   constraintDef,
                   holderDomain,
-                  unproven,
-                )) {
-                  held.set(`${key.pk}\u0000${key.sk}`, key)
-                }
+                  storedSentinelValue,
+                )
+                if (!sentinel) continue
+                held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
               }
             }
             // Released one by one, each only while still this item's: a batch
@@ -12205,18 +12069,17 @@ const makeImpl = <
    * row holding a composite whose value has no key text (`NaN`) or that no form of its schema takes
    * (`EDD-9050`), and `undefined` for a row missing one, or of no layout the entity writes. A
    * history row keeps its layout: one an earlier release wrote without an item segment (#133)
-   * moves only its partition key. Its values are as {@link readStored} reads them, unless `given`.
+   * moves only its partition key.
    */
   const rowPlaces = (
     row: StoredRow,
-    given?: globalThis.Record<string, unknown>,
   ): RowTargets | { readonly uncomposable: string } | undefined => {
     if (row.__edd_e__?.S !== entityType) return undefined
     const stored = storedKeyOf(row)
     if (stored === undefined) return undefined
     try {
       const primary = config.indexes.primary
-      const values = given ?? toDomainView(readStored(row).raw)
+      const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
       const rowKeyForm = keyForm(values)
       const live = composePrimaryKey(values) as StoredKey
       const places = keyFormsOf().flatMap((form) => {
@@ -12313,316 +12176,6 @@ const makeImpl = <
   const rowTargets = (row: StoredRow): RowTargets | undefined => {
     const places = rowPlaces(row)
     return places === undefined || "uncomposable" in places ? undefined : places
-  }
-
-  // -------------------------------------------------------------------------
-  // Two-kind values read back
-  //
-  // A field whose schema stores both a `number` and a `bigint`
-  // (`Schema.Union([Schema.Number, Schema.BigInt])`) is stored as `N` either way, and the
-  // unmarshaller hands a safe integer back as a number. Their key texts differ (16 digits, 38), so a
-  // key composed from the value read back isn't the key `put` composed from a `bigint`. A path
-  // composing keys from a stored row reads such a value as the kind the row's own keys prove
-  // (`readStored`), and writes no key composed from one they don't (`hangsOnUnproven`).
-  // -------------------------------------------------------------------------
-
-  /**
-   * The fields a key, sentinel or partition is composed from whose schema stores both numeric kinds
-   * (`storedNumericKinds`), with what tells a value of each. `allIndexes` grows after `make()`.
-   */
-  let twoKinds:
-    | readonly [
-        globalThis.Record<string, IndexDefinition>,
-        ReadonlyArray<readonly [string, (value: unknown) => boolean]>,
-      ]
-    | undefined
-  const twoKindFields = () => {
-    if (twoKinds === undefined || twoKinds[0] !== allIndexes) {
-      const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top) ?? {}
-      twoKinds = [
-        allIndexes,
-        Object.entries(fields)
-          .filter(
-            ([field, fieldSchema]) => readsKey(field) && storedNumericKinds(fieldSchema).size === 2,
-          )
-          .map(([field, fieldSchema]) => [
-            field,
-            Schema.is(Schema.toEncoded(fieldSchema as Schema.Top) as Schema.Top) as (
-              value: unknown,
-            ) => boolean,
-          ]),
-      ]
-    }
-    return twoKinds[1]
-  }
-
-  /** The other numeric kind a stored `N` read back as `value` may have been written from. */
-  const otherKindOf = (value: unknown): number | bigint | undefined => {
-    if (typeof value === "number") return Number.isSafeInteger(value) ? BigInt(value) : undefined
-    if (typeof value !== "bigint") return undefined
-    const asNumber = Number(value)
-    return Number.isFinite(asNumber) && BigInt(asNumber) === value ? asNumber : undefined
-  }
-
-  const sameKeyBytes = (a: unknown, b: unknown): boolean => {
-    if (typeof a === "string" || typeof b === "string") return a === b
-    if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array) || a.length !== b.length) {
-      return false
-    }
-    return a.every((byte, i) => byte === b[i])
-  }
-
-  /** A two-kind field no key on a row proves: as read, and its other kind. */
-  type UnprovenKind = {
-    readonly field: string
-    readonly asRead: unknown
-    readonly other: unknown
-  }
-  type StoredReading = {
-    /** The row, unmarshalled and attribute-keyed, each two-kind value read as its keys prove. */
-    readonly raw: globalThis.Record<string, unknown>
-    /** The two-kind values no key on the row proves, read as the unmarshaller handed them back. */
-    readonly unproven: ReadonlyArray<UnprovenKind>
-  }
-
-  /**
-   * A row read back, unmarshalled, with each two-kind value (`twoKindFields`) read as the kind its
-   * keys prove: the primary key (a live row's, or the partition key and item segment of a history
-   * row), each index half and vector partition the row holds. A value of only one of the kinds the
-   * field takes is that kind. One that no key on the row reads, or whose keys disagree, is
-   * `unproven`. Reads nothing; an entity with no two-kind field pays nothing.
-   */
-  const readStored = (row: StoredRow): StoredReading => {
-    const raw = fromAttributeMap(row) as globalThis.Record<string, unknown>
-    const fields = twoKindFields()
-    if (fields.length === 0) return { raw, unproven: [] }
-    const open: Array<{
-      readonly field: string
-      readonly attribute: string
-      readonly readings: readonly [unknown, unknown]
-    }> = []
-    for (const [field, isValue] of fields) {
-      const attribute = resolveDbName(field)
-      const value = raw[attribute]
-      const other = otherKindOf(value)
-      if (other === undefined || !isValue(other)) continue
-      if (!isValue(value)) {
-        raw[attribute] = other
-        continue
-      }
-      if (KeyComposer.compositeText(schema, value) === KeyComposer.compositeText(schema, other)) {
-        continue
-      }
-      open.push({ field, attribute, readings: [value, other] })
-    }
-    if (open.length === 0) return { raw, unproven: [] }
-    const unprovenAll = (): StoredReading => ({
-      raw,
-      unproven: open.map(({ field, readings }) => ({
-        field,
-        asRead: readings[0],
-        other: readings[1],
-      })),
-    })
-    // Every combination of readings, as read first. Past 64 nothing is judged.
-    if (open.length > 6) return unprovenAll()
-    const combos: Array<ReadonlyArray<unknown>> = [[]]
-    for (const { readings } of open) {
-      combos.splice(
-        0,
-        combos.length,
-        ...combos.flatMap((combo) => readings.map((r) => [...combo, r])),
-      )
-    }
-    const views = combos.map((combo) => {
-      const read = { ...raw }
-      open.forEach(({ attribute }, i) => {
-        read[attribute] = combo[i]
-      })
-      return toDomainView(read)
-    })
-    const readsOpen = (composites: ReadonlyArray<string>) =>
-      open.some(({ field }) => composites.includes(field))
-    const stored = storedKeyOf(row)
-    // Each key the row holds that some open value is composed into: which readings reproduce it.
-    // The primary key always says; an index or partition key no reading reproduces says nothing.
-    const verdicts: Array<ReadonlyArray<boolean>> = []
-    const primary = config.indexes.primary
-    if (stored !== undefined && readsOpen([...primary.pk.composite, ...primary.sk.composite])) {
-      verdicts.push(
-        views.map((view) => {
-          const places = rowPlaces(row, view)
-          return (
-            places !== undefined &&
-            !("uncomposable" in places) &&
-            (sameStoredKey(stored, places.current) || places.old !== undefined)
-          )
-        }),
-      )
-    }
-    const judged: Array<ReadonlyArray<boolean>> = []
-    for (const [name, index] of Object.entries(allIndexes)) {
-      if (name === "primary") continue
-      for (const half of ["pk", "sk"] as const) {
-        const { field, composite } = index[half]
-        const attribute = row[field]
-        const held = attribute?.S ?? attribute?.B
-        if (held === undefined || isTableKeyField(field) || !readsOpen(composite)) continue
-        if (half === "pk" && index.shards !== undefined) continue
-        // Under the current text or any text `rekey` moves from.
-        judged.push(
-          views.map((view) =>
-            [{ pk: schema, sk: schema }, ...KeyText136.forms(schema)].some((under) => {
-              try {
-                return sameKeyBytes(
-                  held,
-                  half === "pk"
-                    ? KeyComposer.composePk(under.pk, entityType, index, keyForm(view))
-                    : KeyComposer.composeSkValue(
-                        under.sk,
-                        entityType,
-                        entityVersion,
-                        index,
-                        keyForm(view),
-                      ),
-                )
-              } catch {
-                return false
-              }
-            }),
-          ),
-        )
-      }
-    }
-    for (const [, definition] of vectorIndexEntries) {
-      const held = row[definition.partitionField]?.S
-      if (held === undefined || !readsOpen(definition.partition)) continue
-      judged.push(
-        views.map((view) => {
-          try {
-            return (
-              KeyComposer.tryComposeVectorPartition(
-                schema,
-                entityType,
-                definition,
-                keyForm(view),
-              ) === held
-            )
-          } catch {
-            return false
-          }
-        }),
-      )
-    }
-    for (const verdict of judged) if (verdict.some(Boolean)) verdicts.push(verdict)
-    const kept = combos.filter((_, i) => verdicts.every((verdict) => verdict[i]))
-    // No reading reproduces the keys the row holds: none is proven.
-    if (kept.length === 0) return unprovenAll()
-    const read = { ...raw }
-    const unproven: Array<UnprovenKind> = []
-    open.forEach(({ field, attribute, readings }, i) => {
-      const chosen = kept[0]![i]
-      if (kept.every((combo) => combo[i] === chosen)) read[attribute] = chosen
-      else unproven.push({ field, asRead: readings[0], other: readings[1] })
-    })
-    return { raw: read, unproven }
-  }
-
-  /**
-   * Whether a key `compose` makes from `record` (domain-keyed) is composed from an unproven value:
-   * read as its other kind, the value composes another key. A value the write replaced isn't the
-   * row's. Composes only when something is unproven.
-   */
-  const hangsOnUnproven = (
-    unproven: ReadonlyArray<UnprovenKind>,
-    record: globalThis.Record<string, unknown>,
-    compose: (record: globalThis.Record<string, unknown>) => unknown,
-  ): UnprovenKind | undefined => {
-    if (unproven.length === 0) return undefined
-    const text = (value: unknown) =>
-      JSON.stringify(value, (_, inner) =>
-        typeof inner === "bigint" ? `${inner}n` : inner instanceof Uint8Array ? [...inner] : inner,
-      )
-    const attempt = (from: globalThis.Record<string, unknown>) => {
-      try {
-        return text(compose(from))
-      } catch (error) {
-        return `threw ${error instanceof Error ? error.message : String(error)}`
-      }
-    }
-    const base = attempt(record)
-    return unproven.find(
-      (kind) =>
-        record[kind.field] === kind.asRead &&
-        attempt({ ...record, [kind.field]: kind.other }) !== base,
-    )
-  }
-
-  /** Whether an index half is composed from a two-kind value no key on its row proves. */
-  const hangsOnUnprovenHalf = (
-    unproven: ReadonlyArray<UnprovenKind>,
-    index: IndexDefinition,
-    half: "pk" | "sk",
-  ): boolean =>
-    unproven.some(
-      ({ field }) =>
-        index[half].composite.includes(field) ||
-        (half === "pk" && (index.shards?.source ?? []).includes(field)),
-    )
-
-  /** The refusal of a write whose key `kind` would be composed from a value its row doesn't prove. */
-  const unprovenRefusal = (operation: string, kind: UnprovenKind) =>
-    new ValidationError({
-      entityType,
-      operation,
-      cause:
-        `[EDD-9128] "${kind.field}" holds ${String(kind.asRead)}, stored as a number, and its ` +
-        `schema stores both a number and a bigint, whose keys differ. No key on the row this ` +
-        `${operation} reads says which it was put as, and a key it writes is composed from it, so ` +
-        `nothing was written. Write the item again with its value, or keep the field to one kind.`,
-    })
-
-  /**
-   * `view`, a stored row's values, under each reading of the unproven values of `fields`: as read
-   * first.
-   */
-  const readingViews = (
-    view: globalThis.Record<string, unknown>,
-    unproven: ReadonlyArray<UnprovenKind>,
-    fields: ReadonlyArray<string>,
-  ): ReadonlyArray<globalThis.Record<string, unknown>> => {
-    const views = [view]
-    for (const kind of unproven) {
-      if (!fields.includes(kind.field) || view[kind.field] !== kind.asRead) continue
-      views.push(...views.map((each) => ({ ...each, [kind.field]: kind.other })))
-    }
-    return views
-  }
-
-  /**
-   * The keys a sentinel of `constraint` may be stored under for `view`, a stored row's values: the
-   * one they compose, and for an unproven value the one it composes as its other kind. Its owner read
-   * (`ownedSentinels`) says which this row holds.
-   */
-  const heldSentinelKeys = (
-    constraintName: string,
-    constraintDef: UniqueConstraintDef,
-    view: globalThis.Record<string, unknown>,
-    unproven: ReadonlyArray<UnprovenKind>,
-  ): ReadonlyArray<{ readonly pk: string; readonly sk: string }> => {
-    const keys: Array<{ readonly pk: string; readonly sk: string }> = []
-    for (const each of readingViews(view, unproven, resolveUniqueFields(constraintDef))) {
-      const key = composeUniqueSentinel(
-        schema,
-        entityType,
-        constraintName,
-        constraintDef,
-        each,
-        storedSentinelValue,
-      )?.key
-      if (key !== undefined && !keys.some((k) => k.pk === key.pk && k.sk === key.sk)) keys.push(key)
-    }
-    return keys
   }
 
   /**
@@ -12853,19 +12406,10 @@ const makeImpl = <
           continue
         }
         if (!room.cleared) return tally
-        const reading = readStored(read!)
-        const values = toDomainView(reading.raw)
+        const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
         const sentinels =
           kind === "tombstone"
-            ? yield* sentinelRekeys(
-                ctx,
-                kind,
-                values,
-                reading.unproven,
-                targets.lives,
-                targets.live,
-                depth,
-              )
+            ? yield* sentinelRekeys(ctx, kind, values, targets.lives, targets.live, depth)
             : NO_SENTINEL_REKEYS
         if (ctx.dryRun) {
           return Rekey.mergeTallies(countMove(ctx, kind, to, tally), sentinels.tally, {
@@ -12948,11 +12492,8 @@ const makeImpl = <
    * A stored row's values as a `put` composed from them. A `put` is given a ref's id and stores the
    * ref (`team: { id, ... }`, no `teamId`), so it's read back from there, as `.within()` does.
    */
-  const putValuesOf = (
-    row: StoredRow,
-    reading: StoredReading = readStored(row),
-  ): globalThis.Record<string, unknown> => {
-    const values = toDomainView(reading.raw)
+  const putValuesOf = (row: StoredRow): globalThis.Record<string, unknown> => {
+    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
     if (resolvedRefs.length === 0) return values
     const withIds = { ...values }
     for (const ref of resolvedRefs) {
@@ -12993,9 +12534,8 @@ const makeImpl = <
    */
   const judgeIndexKeys = (row: StoredRow): IndexKeyWork => {
     let rowKeyForm: globalThis.Record<string, unknown>
-    const reading = readStored(row)
     try {
-      rowKeyForm = keyForm(putValuesOf(row, reading))
+      rowKeyForm = keyForm(putValuesOf(row))
     } catch {
       return NO_INDEX_KEY_WORK
     }
@@ -13020,12 +12560,6 @@ const makeImpl = <
         if (verdict.kind === "ambiguous") {
           found.ambiguous++
           keptAbsent.push(field)
-          continue
-        }
-        // Composed from a two-kind value no key on the row proves: which kind `put` wrote can't be
-        // told, so it isn't written.
-        if (hangsOnUnprovenHalf(reading.unproven, index, half)) {
-          found.ambiguous++
           continue
         }
         if (verdict.kind === "remove") {
@@ -13199,8 +12733,9 @@ const makeImpl = <
     operation: string,
   ): Effect.Effect<StoredRow, ValidationError> =>
     Effect.gen(function* () {
-      const reading = readStored(read)
-      const rowKeyForm = keyForm(toDomainView(reading.raw))
+      const rowKeyForm = keyForm(
+        toDomainView(fromAttributeMap(read) as globalThis.Record<string, unknown>),
+      )
       const gsi = yield* composeKeysOrFail(entityType, operation, () =>
         KeyComposer.composeGsiKeysForUpdatePolicyAware(
           schema,
@@ -13223,20 +12758,8 @@ const makeImpl = <
       // A move recomposes as an update naming everything would, which writes a key the row went
       // without on purpose: it isn't damage (`rekey-repair.md`), so it stays that way.
       for (const field of judgeIndexKeys(read).keptAbsent) delete moved[field]
-      // A half composed from a two-kind value no key on the row proves keeps what it holds.
-      for (const [name, index] of Object.entries(allIndexes)) {
-        if (name === "primary") continue
-        for (const half of ["pk", "sk"] as const) {
-          const { field } = index[half]
-          if (isTableKeyField(field) || !hangsOnUnprovenHalf(reading.unproven, index, half))
-            continue
-          if (read[field] === undefined) delete moved[field]
-          else moved[field] = read[field]
-        }
-      }
       for (const [, definition] of vectorIndexEntries) {
         if (read[definition.vectorField] === undefined) continue
-        if (reading.unproven.some(({ field }) => definition.partition.includes(field))) continue
         const partition = KeyComposer.tryComposeVectorPartition(
           schema,
           entityType,
@@ -13280,17 +12803,8 @@ const makeImpl = <
         const room = yield* clearTarget(ctx, "item", from, to, depth)
         tally = Rekey.mergeTallies(tally, room.tally)
         if (!room.cleared) return tally
-        const reading = readStored(read!)
-        const values = toDomainView(reading.raw)
-        const sentinels = yield* sentinelRekeys(
-          ctx,
-          "item",
-          values,
-          reading.unproven,
-          [from],
-          to,
-          depth,
-        )
+        const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
+        const sentinels = yield* sentinelRekeys(ctx, "item", values, [from], to, depth)
         tally = Rekey.mergeTallies(tally, sentinels.tally)
         if ((sentinels.tally.conflicts ?? []).length > 0) return tally
         const failed = (error: ValidationError) =>
@@ -13398,7 +12912,9 @@ const makeImpl = <
    * unless it is already in the current layout.
    */
   const staleIndexKeys = (row: StoredRow) => {
-    const rowKeyForm = keyForm(toDomainView(readStored(row).raw))
+    const rowKeyForm = keyForm(
+      toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>),
+    )
     const composing = <A>(compose: () => A | undefined): A | undefined => {
       try {
         return compose()
@@ -13736,7 +13252,6 @@ const makeImpl = <
     ctx: Rekey.RekeyRowContext,
     kind: RowKind,
     values: globalThis.Record<string, unknown>,
-    unproven: ReadonlyArray<UnprovenKind>,
     owners: ReadonlyArray<StoredKey>,
     to: StoredKey,
     depth: number,
@@ -13785,7 +13300,7 @@ const makeImpl = <
       for (const [constraintName, constraintDef] of Object.entries(
         config.unique as globalThis.Record<string, UniqueConstraintDef>,
       )) {
-        const sentinelOf = (view: globalThis.Record<string, unknown>) => {
+        const now = (() => {
           try {
             return {
               key: composeUniqueSentinel(
@@ -13793,34 +13308,14 @@ const makeImpl = <
                 entityType,
                 constraintName,
                 constraintDef,
-                view,
+                values,
                 storedSentinelValue,
               )?.key,
             }
           } catch {
             return undefined
           }
-        }
-        // A two-kind value no key on the row proves: the reading whose sentinel the item holds,
-        // under its current text or another, is the one brought to its current key.
-        const views = readingViews(values, unproven, resolveUniqueFields(constraintDef))
-        let readAs = views[0]!
-        for (const view of views.length > 1 ? views : []) {
-          const key = sentinelOf(view)?.key
-          if (key === undefined) continue
-          let holds = false
-          for (const at of [key, ...otherSentinelKeys(constraintName, constraintDef, view, key)]) {
-            if (ownerIn(yield* readAt(at)) !== undefined) {
-              holds = true
-              break
-            }
-          }
-          if (holds) {
-            readAs = view
-            break
-          }
-        }
-        const now = sentinelOf(readAs)
+        })()
         if (now === undefined) {
           tally = Rekey.mergeTallies(
             tally,
@@ -13844,7 +13339,7 @@ const makeImpl = <
               readonly owner: StoredKey
             }
           | undefined
-        for (const key of otherSentinelKeys(constraintName, constraintDef, readAs, current)) {
+        for (const key of otherSentinelKeys(constraintName, constraintDef, values, current)) {
           const held = yield* readAt(key)
           const owner = ownerIn(held)
           if (held !== undefined && owner !== undefined) {
@@ -13873,7 +13368,7 @@ const makeImpl = <
                     schema,
                     constraintName,
                     constraintDef,
-                    toDomainView(readStored(holder).raw),
+                    toDomainView(fromAttributeMap(holder) as globalThis.Record<string, unknown>),
                   )
             const stale =
               holderNow !== undefined &&
@@ -13977,18 +13472,9 @@ const makeImpl = <
     Effect.gen(function* () {
       if (config.unique === undefined) return {}
       const client = yield* Capacity.client
-      const reading = readStored(row)
-      const values = toDomainView(reading.raw)
+      const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
-        const planned = yield* sentinelRekeys(
-          ctx,
-          kind,
-          values,
-          reading.unproven,
-          owners,
-          to,
-          depth,
-        )
+        const planned = yield* sentinelRekeys(ctx, kind, values, owners, to, depth)
         const moved = planned.count > 0 ? { sentinelsMoved: planned.count } : {}
         if (planned.items.length === 0 || ctx.dryRun) {
           return Rekey.mergeTallies(planned.tally, moved)
@@ -14030,20 +13516,13 @@ const makeImpl = <
       if (at === undefined) return { skipped: { unrecognizedKey: 1 } }
       const named = (sentinel: StoredRow, owner: StoredRow) => {
         if (constraintDef === undefined) return false
-        const read = readStored(owner)
+        const values = toDomainView(fromAttributeMap(owner) as globalThis.Record<string, unknown>)
+        const current = sentinelKeyUnder(schema, constraintName, constraintDef, values)
         const stored = storedKeyOf(sentinel)!
-        // A two-kind value the owner's keys don't prove names a sentinel under either kind.
-        return readingViews(
-          toDomainView(read.raw),
-          read.unproven,
-          resolveUniqueFields(constraintDef),
-        ).some((values) => {
-          const current = sentinelKeyUnder(schema, constraintName, constraintDef, values)
-          return [
-            ...(current === undefined ? [] : [current]),
-            ...otherSentinelKeys(constraintName, constraintDef, values, current),
-          ].some((key) => key.pk === stored[rekeyPk] && key.sk === stored[rekeySk])
-        })
+        return [
+          ...(current === undefined ? [] : [current]),
+          ...otherSentinelKeys(constraintName, constraintDef, values, current),
+        ].some((key) => key.pk === stored[rekeyPk] && key.sk === stored[rekeySk])
       }
       const owner = yield* sentinelOwnerRow(ctx.tableName, row)
       if (owner !== undefined && named(row, owner)) return {}

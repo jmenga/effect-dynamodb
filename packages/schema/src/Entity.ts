@@ -38,6 +38,7 @@ import {
 import * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
+import { bothKindsKeyRefusal } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -1093,6 +1094,40 @@ export const buildEntityDefinition = (config: {
         checkCompositeForNull(`unique:${constraintName}`, f)
       }
     }
+  }
+
+  // EDD-9128: no value is composed into key text from a field storing both numeric kinds. A
+  // Z-order dimension is quantized, not composed, and its own check refuses a union (EDD-9088).
+  const refuseBothKinds = (where: string, attrs: ReadonlyArray<string>): void => {
+    for (const attr of attrs) {
+      const resolved = resolveCompositeSchemaForNullCheck(attr)
+      if (resolved === undefined) continue
+      const refused = bothKindsKeyRefusal(
+        `Entity "${config.entityType}"`,
+        where,
+        attr,
+        resolved.schema,
+      )
+      if (refused !== undefined) throw refused
+    }
+  }
+  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
+    const dimensions = isZOrderHalf(indexDef.sk)
+      ? new Set(indexDef.sk.zorderHalf.dimensions.map((dimension) => dimension.field))
+      : new Set<string>()
+    refuseBothKinds(indexName === "primary" ? "the primary key" : `index "${indexName}"`, [
+      ...indexDef.pk.composite,
+      ...indexDef.sk.composite.filter((attr) => !dimensions.has(attr)),
+    ])
+  }
+  for (const [constraintName, constraintDef] of Object.entries(config.unique ?? {})) {
+    refuseBothKinds(`unique constraint "${constraintName}"`, resolveUniqueFields(constraintDef))
+  }
+  for (const [logicalName, vectorConfig] of Object.entries(config.vectorIndexes ?? {})) {
+    refuseBothKinds(`vector index "${logicalName}"'s partition`, vectorConfig.partition ?? [])
+  }
+  if (config.timeSeries !== undefined && config.timeSeries !== null) {
+    refuseBothKinds("an event's sort key (timeSeries.orderBy)", [config.timeSeries.orderBy])
   }
 
   // ---------------------------------------------------------------------------

@@ -159,6 +159,7 @@ import {
   manyEdgePaths,
   manyElementFields,
   refuseAggregateKeyOverMovingValue,
+  refuseAggregateKeysOverBothKinds,
   refuseManySortKeysOverMovingValue,
   resolveAggregateStamps,
   unwrapModel,
@@ -1342,6 +1343,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     }
   }
   refuseManySortKeysOverMovingValue(aggregateName, config.timestamps, schemaFields, config.edges)
+  refuseAggregateKeysOverBothKinds(aggregateName, schemaFields, config, config.edges)
   const withRowStamps = (node: ResolvedNode): ResolvedNode => ({
     ...node,
     rowStamps: rowStampsOf(node.ownFields),
@@ -1566,102 +1568,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
-   * Each key a row of a type holds, and the composites it's composed from, last first after
-   * `trailing` segments of its own (a list shard). A `many` edge's declared sort-key composites
-   * that are paths into a hydrated ref aren't read here.
-   */
-  const keyLayouts = (() => {
-    type Layout = {
-      readonly attribute: string
-      readonly composites: ReadonlyArray<string>
-      readonly trailing: number
-    }
-    const layouts = new Map<string, Array<Layout>>()
-    const add = (type: string, layout: Layout) => {
-      if (layout.composites.length === 0) return
-      layouts.set(type, [...(layouts.get(type) ?? []), layout])
-    }
-    const root = config.root.entityType
-    add(root, { attribute: config.pk.field, composites: config.pk.composite, trailing: 0 })
-    if (config.collection.index !== undefined && config.collection.sk !== undefined) {
-      add(root, {
-        attribute: config.collection.sk.field,
-        composites: config.collection.sk.composite,
-        trailing: 0,
-      })
-    }
-    if (config.list !== undefined) {
-      add(root, {
-        attribute: config.list.pk.field,
-        composites: config.list.pk.composite,
-        trailing: config.list.cardinality ? 1 : 0,
-      })
-      add(root, {
-        attribute: config.list.sk.field,
-        composites: config.list.sk.composite,
-        trailing: 0,
-      })
-    }
-    const walk = (node: ResolvedNode): void => {
-      if (node.cardinality === "many" && node.skComposite !== undefined) {
-        if (node.skComposite.every((path) => !path.includes("."))) {
-          add(node.entityType, { attribute: "sk", composites: node.skComposite, trailing: 0 })
-        }
-      }
-      for (const child of node.children) walk(child)
-    }
-    walk(rootNode)
-    return layouts
-  })()
-
-  /**
-   * A row read back, its numeric key composites read as the kind its keys show (in place). A
-   * stored `N` comes back as a number while it's a safe integer and as a `bigint` past 2^53,
-   * whichever it was written from, and the two compose different key text (16 digits, 38): read as
-   * the other kind, a key composed from the value wouldn't be the row's, and an `update` would write
-   * the row again under it. A value is changed only when its own segment of a key the row holds is
-   * the other kind's text, and isn't its own. Reads nothing; the row's own keys are what says.
-   */
-  const readKeysKind = (row: Record<string, unknown>): Record<string, unknown> => {
-    const layouts = keyLayouts.get(String(row.__edd_e__))
-    if (layouts === undefined) return row
-    const texts = (value: unknown) =>
-      [config.schema, KeyText136.schema136(config.schema), KeyText136.schemaEscaped(config.schema)]
-        .map((under) => {
-          try {
-            return KeyComposer.keyValueText(under, value, config.schema.casing)
-          } catch {
-            return undefined
-          }
-        })
-        .filter((text): text is string => text !== undefined)
-    for (const { attribute, composites, trailing } of layouts) {
-      const held = row[attribute]
-      if (typeof held !== "string") continue
-      const segments = held.split("#")
-      const first = segments.length - trailing - composites.length
-      if (first < 0) continue
-      composites.forEach((composite, i) => {
-        const value = row[composite]
-        const other =
-          typeof value === "number" && Number.isSafeInteger(value)
-            ? BigInt(value)
-            : typeof value === "bigint" &&
-                Number.isFinite(Number(value)) &&
-                BigInt(Number(value)) === value
-              ? Number(value)
-              : undefined
-        if (other === undefined) return
-        const segment = segments[first + i]
-        if (!texts(value).includes(segment!) && texts(other).includes(segment!)) {
-          row[composite] = other
-        }
-      })
-    }
-    return row
-  }
-
-  /**
    * DynamoDB's rejection of an assembly read (#144) — a consistent read of a
    * GSI collection index — explained for the aggregate and its index.
    */
@@ -1721,7 +1627,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
         from === undefined
           ? yield* read(pkValue)
           : [...(yield* read(from)), ...(rekeyRead?.fromOnly === true ? [] : yield* read(pkValue))]
-      for (const item of allItems) readKeysKind(item)
       return { client, tableConfig, pkValue, allItems }
     })
 
@@ -2437,8 +2342,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
    */
   const staleRootAt = (tableName: string, pk: string) =>
     Effect.map(rootItemAt(tableName, pk), ({ Item }) =>
-      Item === undefined ||
-      partitionUnder(config.schema, readKeysKind(fromAttributeMap(Item))) === pk
+      Item === undefined || partitionUnder(config.schema, fromAttributeMap(Item)) === pk
         ? undefined
         : Item,
     )
@@ -2520,7 +2424,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (row.sk?.S !== rekeyRootSk || row.__edd_e__?.S !== config.root.entityType) {
         return yield* rekeyRowBelowRoot(row, pk, ctx)
       }
-      const key = readKeysKind(fromAttributeMap(row) as Record<string, unknown>)
+      const key = fromAttributeMap(row) as Record<string, unknown>
       const current = partitionUnder(config.schema, key)
       // Under none of the keys its values have had: nothing here can place it.
       if (
@@ -2966,9 +2870,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // Extract PK composite values from each root item and assemble
           const aggregates: Array<Schema.Schema.Type<TSchema>> = []
           for (const rootItem of rootItems) {
-            // Its partition key composed as `create` composed it: a numeric composite read as the
-            // kind the root's own keys show.
-            readKeysKind(rootItem)
             const key: Record<string, unknown> = {}
             for (const composite of config.pk.composite) {
               key[composite] = rootItem[composite]

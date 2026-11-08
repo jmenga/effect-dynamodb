@@ -214,7 +214,7 @@ export type NumericKind = "number" | "bigint"
  * `Schema.BigInt` and `Schema.Union([Schema.String, Schema.BigInt])` store only a `bigint`;
  * `Schema.Union([Schema.Number, Schema.BigInt])` stores both, and so does an unknown value. Read back,
  * a field storing one kind is that kind ({@link storedNumericForm}); a field storing both can't say
- * which from the value alone, and a path composing keys from a row asks the row's keys.
+ * which from the value alone, so no key is composed from one ({@link bothKindsKeyRefusal}).
  */
 export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> => {
   const kinds = new Set<NumericKind>()
@@ -235,6 +235,32 @@ export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> 
   }
   walk(SchemaAST.toEncoded(field.ast))
   return kinds
+}
+
+/**
+ * `[EDD-9128]`: a key composite storing both numeric kinds ({@link storedNumericKinds}), or
+ * `undefined` for one that doesn't. DynamoDB stores `5` and `5n` alike, as `{N:"5"}`, and a safe
+ * integer reads back as a `number` whichever was written, while the two compose different key text
+ * (16 digits, 38). So a key composed again from a row read back (`restore`, an update reading the
+ * item first, a delete releasing a unique constraint, `rekey`, an aggregate's `update` and `list`)
+ * wouldn't be the key `put` wrote, and the value can't say which kind it was. Refused at load
+ * wherever a value is composed into key text: a key, a unique constraint, a vector partition, a
+ * time-series `orderBy`. A field no key reads may store both.
+ */
+export const bothKindsKeyRefusal = (
+  owner: string,
+  where: string,
+  attr: string,
+  field: Schema.Top,
+): Error | undefined => {
+  if (storedNumericKinds(field).size < 2) return undefined
+  return new Error(
+    `[EDD-9128] ${owner}: ${where} can't be composed from "${attr}", which stores both a number ` +
+      `and a bigint. DynamoDB stores 5 and 5n alike and reads a safe integer back as a number, ` +
+      `and the two compose different key text, so a key composed again from a stored row ` +
+      `wouldn't be the key the write composed. Declare the one kind it holds, such as ` +
+      `Schema.Number or Schema.BigInt.`,
+  )
 }
 
 /**

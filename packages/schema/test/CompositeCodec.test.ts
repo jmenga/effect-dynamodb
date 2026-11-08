@@ -11,6 +11,7 @@ import { DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import { DateEpochMs } from "../src/DynamoModel.js"
 import {
+  bothKindsKeyRefusal,
   makeCompositeKeyForm,
   storedNumericForm,
   storedNumericKinds,
@@ -164,9 +165,34 @@ describe("CompositeCodec", () => {
       expect(kinds(Schema.Union([Schema.Number, Schema.BigInt]))).toEqual(["bigint", "number"])
       expect(kinds(Schema.Unknown)).toEqual(["bigint", "number"])
       expect(kinds(Schema.Literals([1, 2]))).toEqual(["number"])
+      expect(kinds(Schema.Literal(2n))).toEqual(["bigint"])
+      expect(kinds(Schema.Union([Schema.Literal(1), Schema.Literal(2n)]))).toEqual([
+        "bigint",
+        "number",
+      ])
+      expect(kinds(Schema.Enum({ A: 1, B: "b" }))).toEqual(["number"])
+      expect(kinds(Schema.Enum({ A: "a" }))).toEqual([])
+      expect(kinds(Schema.Union([Schema.Enum({ A: 1 }), Schema.BigInt]))).toEqual([
+        "bigint",
+        "number",
+      ])
+      expect(kinds(Schema.Any)).toEqual(["bigint", "number"])
       expect(kinds(Schema.String)).toEqual([])
       expect(storedNumericForm(Schema.Union([Schema.Number, Schema.BigInt]))).toBeUndefined()
       expect(storedNumericForm(Schema.Union([Schema.String, Schema.BigInt]))?.(5)).toBe(5n)
+    })
+
+    it("refuses a key over a field storing both, and only that (EDD-9128)", () => {
+      const refusal = (field: Schema.Top) =>
+        bothKindsKeyRefusal('Entity "E"', "the primary key", "n", field)?.message
+      expect(refusal(Schema.Union([Schema.Number, Schema.BigInt]))).toMatch(
+        /^\[EDD-9128\] Entity "E": the primary key can't be composed from "n", which stores both/,
+      )
+      expect(refusal(Schema.Unknown)).toMatch(/EDD-9128/)
+      expect(refusal(Schema.BigInt)).toBeUndefined()
+      expect(refusal(Schema.Number)).toBeUndefined()
+      expect(refusal(Schema.Union([Schema.String, Schema.BigInt]))).toBeUndefined()
+      expect(refusal(Schema.BigIntFromString)).toBeUndefined()
     })
   })
 

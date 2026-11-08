@@ -12,6 +12,7 @@ import type {
   AggregateStampNames,
   BoundSubAggregate,
 } from "./AggregateTypes.js"
+import { bothKindsKeyRefusal } from "./CompositeCodec.js"
 import type { TimestampsConfig } from "./EntityConfig.js"
 import { optionalField, type ResolvedSystemFields, resolveSystemFields } from "./EntitySchemas.js"
 import {
@@ -121,6 +122,76 @@ export const refuseManySortKeysOverMovingValue = (
               `changes, so the key would stop matching the value at the first update.`,
           )
         }
+      }
+    }
+  }
+  walk(rootFields, rootEdges)
+}
+
+/**
+ * `[EDD-9128]`: a key an aggregate composes from a field storing both numeric kinds
+ * (`bothKindsKeyRefusal`): its partition key, its collection and list keys, and a `many` edge's sort
+ * key, on the root's edges and those of the sub-aggregates under it. A sort-key composite that's a
+ * path into a value (`player.id`) is followed to the field it names.
+ */
+export const refuseAggregateKeysOverBothKinds = (
+  aggregate: string,
+  rootFields: Record<string, Schema.Top> | undefined,
+  config: {
+    readonly pk: { readonly composite: ReadonlyArray<string> }
+    readonly collection?: { readonly sk?: { readonly composite?: ReadonlyArray<string> } }
+    readonly list?: {
+      readonly pk: { readonly composite: ReadonlyArray<string> }
+      readonly sk: { readonly composite: ReadonlyArray<string> }
+    }
+  },
+  rootEdges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+): void => {
+  const owner = `Aggregate "${aggregate}"`
+  const fieldAt = (
+    fields: Record<string, Schema.Top> | undefined,
+    path: string,
+  ): Schema.Top | undefined => {
+    const [first, ...rest] = path.split(".")
+    let field = fields?.[first!]
+    for (const segment of rest) {
+      field = field === undefined ? undefined : getSchemaFields(field)?.[segment]
+    }
+    return field
+  }
+  const refuse = (
+    where: string,
+    fields: Record<string, Schema.Top> | undefined,
+    composites: ReadonlyArray<string>,
+  ): void => {
+    for (const attr of composites) {
+      const field = fieldAt(fields, attr)
+      if (field === undefined) continue
+      const refused = bothKindsKeyRefusal(owner, where, attr, field)
+      if (refused !== undefined) throw refused
+    }
+  }
+  refuse("its partition key", rootFields, config.pk.composite)
+  refuse("its collection sort key", rootFields, config.collection?.sk?.composite ?? [])
+  if (config.list !== undefined) {
+    refuse("its list partition key", rootFields, config.list.pk.composite)
+    refuse("its list sort key", rootFields, config.list.sk.composite)
+  }
+  const walk = (
+    fields: Record<string, Schema.Top> | undefined,
+    edges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+  ): void => {
+    for (const [name, edge] of Object.entries(edges)) {
+      if (!("_tag" in edge)) continue
+      if (edge._tag === "BoundSubAggregate") {
+        const sub = (edge as BoundSubAggregate<any>).aggregate
+        walk(getSchemaFields(sub.schema), sub.edges)
+      } else if (edge._tag === "ManyEdge") {
+        const entity = (edge as ManyEdge).entity
+        const element =
+          manyElementFields(fields, name) ??
+          (entity === undefined ? undefined : getSchemaFields(unwrapModel(entity.model)))
+        refuse(`edge "${name}"'s sort key`, element, (edge as ManyEdge).sk?.composite ?? [])
       }
     }
   }
