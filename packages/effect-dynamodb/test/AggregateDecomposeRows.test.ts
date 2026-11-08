@@ -18,6 +18,7 @@
 
 import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { NumberValueImpl } from "@aws-sdk/util-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Cause, DateTime, Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
@@ -879,4 +880,318 @@ describe("a Delete only the content decided is on condition the row is still as 
         ])
       }),
   )
+})
+
+describe("an element of a custom decompose holds one row at most", () => {
+  // Two aggregates sharing a partition and the `Line` entity type, each `assemble` taking its own
+  // lines. `A`'s element is read from the row its key as read gives, so the key it gives as a
+  // write's value is (ten times larger) is never its row, whatever that row holds.
+  const owners = (options: {
+    readonly escapeKeys?: boolean
+    readonly line: Schema.Top
+    readonly mine: (owner: "a" | "b", line: any) => boolean
+    readonly decompose: (owner: "a" | "b", lines: ReadonlyArray<any>) => ReadonlyArray<unknown>
+    readonly bound?: ReadonlyArray<"a" | "b">
+  }) => {
+    const schema = DynamoSchema.make({
+      name: "eo",
+      version: 1,
+      escapeKeys: options.escapeKeys ?? false,
+    })
+    const Main = Table.make({ schema, entities: {} })
+    const make = (owner: "a" | "b") =>
+      Aggregate.make(Schema.Struct({ id: Schema.String, lines: Schema.Array(options.line) }), {
+        table: Main,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "shared" },
+        root: { entityType: `Root${owner}` },
+        edges: {
+          lines: Aggregate.many({
+            entityType: "Line",
+            sk: { composite: ["f"] },
+            assemble: (lines) =>
+              (lines as ReadonlyArray<any>).filter((line) => options.mine(owner, line)),
+            decompose: (lines) => options.decompose(owner, lines as ReadonlyArray<any>),
+          }),
+        },
+      } as any)
+    const all = { A: make("a"), B: make("b") }
+    const table = makeRecordingTable()
+    const run = <A, E>(body: (db: any) => Effect.Effect<A, E, never>, bound = options.bound) =>
+      Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: {},
+          aggregates: Object.fromEntries(
+            (bound ?? ["a", "b"]).map((owner) => [
+              owner.toUpperCase(),
+              all[owner === "a" ? "A" : "B"],
+            ]),
+          ),
+          tables: { Main },
+        } as never)
+        return yield* body(db)
+      }).pipe(
+        Effect.provide(Layer.merge(table.layer, Main.layer({ name: "eo" })) as never),
+        Effect.exit,
+      ) as Effect.Effect<Exit.Exit<A, E>>
+    const rows = () =>
+      [...table.items.values()].sort((a, b) =>
+        `${a.pk?.S}|${a.sk?.S}`.localeCompare(`${b.pk?.S}|${b.sk?.S}`),
+      )
+    const seed = (items: ReadonlyArray<Row>) => {
+      table.items.clear()
+      for (const row of items) table.items.set(`${row.pk?.S}|${row.sk?.S}`, structuredClone(row))
+    }
+    const deletedKeys = () =>
+      table.requests.flatMap((request) =>
+        ((request.input.TransactItems ?? []) as ReadonlyArray<any>).flatMap((item) =>
+          item.Delete === undefined ? [] : [item.Delete.Key.sk.S as string],
+        ),
+      )
+    return { table, run, rows, seed, deletedKeys }
+  }
+
+  const x10Line = Schema.Struct({ f: X10, note: Schema.String })
+  const below100 = (owner: "a" | "b", line: any) => (owner === "a" ? line.f < 100 : line.f >= 100)
+
+  describe("a row holding exactly what the element's key as written would hold is another's", () => {
+    // 1.39.0 stores A's 50 at key 500 holding `f: 50`, and B's 500 at key 5000 holding `f: 500`:
+    // A's key as written is 5000, and the row there is byte for byte the row A would write.
+    const created = Effect.gen(function* () {
+      const world = owners({ line: x10Line, mine: below100, decompose: (_, lines) => lines })
+      succeed(
+        yield* world.run((db) =>
+          db.aggregates.A.create({ id: "p q", lines: [{ f: 50, note: "same" }] }),
+        ),
+      )
+      succeed(
+        yield* world.run((db) =>
+          db.aggregates.B.create({ id: "p q", lines: [{ f: 500, note: "same" }] }),
+        ),
+      )
+      return world.rows()
+    })
+    const bRow = (rows: ReadonlyArray<Row>) => rows.filter((row) => row.f?.N === "500")
+
+    it.effect("removing A's element deletes A's row, and B's stays", () =>
+      Effect.gen(function* () {
+        const initial = yield* created
+        expect(bRow(initial)).toMatchObject([{ sk: { S: "$eo#v1#line#0000000000005000" } }])
+        const world = owners({ line: x10Line, mine: below100, decompose: (_, lines) => lines })
+        world.seed(initial)
+        expect(succeed(yield* world.run((db) => db.aggregates.A.get({ id: "p q" }))).lines).toEqual(
+          [{ f: 500, note: "same" }],
+        )
+        world.table.requests.length = 0
+        succeed(
+          yield* world.run((db) =>
+            db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
+          ),
+        )
+        expect(world.deletedKeys()).toEqual(["$eo#v1#line#0000000000000500"])
+        expect(bRow(world.rows())).toEqual(bRow(initial))
+        expect(succeed(yield* world.run((db) => db.aggregates.B.get({ id: "p q" }))).lines).toEqual(
+          [{ f: 5000, note: "same" }],
+        )
+      }),
+    )
+
+    it.effect("rekey of A alone moves A's two rows, and leaves B's where it is", () =>
+      Effect.gen(function* () {
+        const initial = yield* created
+        for (const dryRun of [true, false]) {
+          const world = owners({
+            escapeKeys: true,
+            line: x10Line,
+            mine: below100,
+            decompose: (_, lines) => lines,
+            bound: ["a"],
+          })
+          world.seed(initial)
+          const report = succeed(yield* world.run((db) => db.tables.Main.rekey({ dryRun })))
+          expect([dryRun, report.moved.aggregate, report.conflicts]).toEqual([dryRun, 2, []])
+          expect(bRow(world.rows())).toEqual(bRow(initial))
+        }
+      }),
+    )
+  })
+
+  describe("a number compares as the exact decimal stored", () => {
+    // B's decompose stores `payload` spelled its own way. A's row as written holds `0.1`.
+    const spelled = (spelling: string) =>
+      owners({
+        escapeKeys: false,
+        line: Schema.Struct({ f: X10, note: Schema.String, payload: Schema.Number }),
+        mine: below100,
+        decompose: (owner, lines) =>
+          owner === "b"
+            ? lines.map((line) => ({ ...line, payload: NumberValueImpl.from(spelling) }))
+            : lines,
+      })
+    for (const spelling of ["0.100", "0.10000000000000001"]) {
+      it.effect(`B's payload ${spelling}: removing A's element and rekey leave B's row`, () =>
+        Effect.gen(function* () {
+          const writer = spelled(spelling)
+          succeed(
+            yield* writer.run((db) =>
+              db.aggregates.A.create({ id: "p q", lines: [{ f: 50, note: "same", payload: 0.1 }] }),
+            ),
+          )
+          succeed(
+            yield* writer.run((db) =>
+              db.aggregates.B.create({
+                id: "p q",
+                lines: [{ f: 500, note: "same", payload: 0.1 }],
+              }),
+            ),
+          )
+          const initial = writer.rows()
+          const foreign = initial.filter((row) => row.f?.N === "500")
+          expect(foreign).toMatchObject([{ payload: { N: spelling } }])
+          const remove = spelled(spelling)
+          remove.seed(initial)
+          succeed(
+            yield* remove.run((db) =>
+              db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
+            ),
+          )
+          expect(remove.rows().filter((row) => row.f?.N === "500")).toEqual(foreign)
+          const moved = owners({
+            escapeKeys: true,
+            line: Schema.Struct({ f: X10, note: Schema.String, payload: Schema.Number }),
+            mine: below100,
+            decompose: (_, lines) => lines,
+            bound: ["a"],
+          })
+          moved.seed(initial)
+          succeed(yield* moved.run((db) => db.tables.Main.rekey({})))
+          expect(moved.rows().filter((row) => row.f?.N === "500")).toEqual(foreign)
+        }),
+      )
+    }
+  })
+
+  describe("a row only its content made the aggregate's is written to only while it's whole as read", () => {
+    // A's decompose divides by 10, so A's row, at key 50, is held only by its content. `z_owner` is
+    // an optional field of the line A's model declares; B's lines are those holding "b".
+    const fillers = (n: number) =>
+      Object.fromEntries(
+        Array.from({ length: n }, (_, i) => [`a${String(i).padStart(3, "0")}`, Schema.String]),
+      )
+    const guardedOwners = (wide: number, escapeKeys = false, bound?: ReadonlyArray<"a" | "b">) =>
+      owners({
+        escapeKeys,
+        line: Schema.Struct({
+          f: X10,
+          note: Schema.String,
+          z_owner: Schema.optional(Schema.String),
+          ...fillers(wide),
+        }),
+        mine: (owner, line) => (owner === "a" ? line.z_owner !== "b" : line.z_owner === "b"),
+        decompose: (_, lines) => lines.map((line) => ({ ...line, f: line.f / 10 })),
+        ...(bound !== undefined && { bound }),
+      })
+    const lineOf = (wide: number) => ({
+      f: 50,
+      note: "same",
+      ...Object.fromEntries(Object.keys(fillers(wide)).map((name) => [name, "value"])),
+    })
+    const lineKey = "$eo#v1#line#0000000000000050"
+    const seeded = (wide: number) =>
+      Effect.gen(function* () {
+        const world = guardedOwners(wide)
+        succeed(
+          yield* world.run((db) => db.aggregates.A.create({ id: "p q", lines: [lineOf(wide)] })),
+        )
+        succeed(yield* world.run((db) => db.aggregates.B.create({ id: "p q", lines: [] })))
+        return world.rows()
+      })
+
+    it.effect(
+      "B's line replaces A's after A's read, adding an attribute A's model has: kept, and the update reads again",
+      () =>
+        Effect.gen(function* () {
+          const initial = yield* seeded(0)
+          const world = guardedOwners(0)
+          world.seed(initial)
+          const mine = initial.find((row) => row.sk?.S === lineKey)!
+          world.table.hooks.onRequest = (request) => {
+            if (request.command !== "TransactWriteItems") return
+            world.table.hooks.onRequest = undefined
+            world.table.items.set(`${mine.pk!.S}|${lineKey}`, { ...mine, z_owner: { S: "b" } })
+          }
+          world.table.requests.length = 0
+          succeed(
+            yield* world.run((db) =>
+              db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
+            ),
+          )
+          expect(world.rows().find((row) => row.sk?.S === lineKey)?.z_owner).toEqual({ S: "b" })
+          expect(world.table.requests.map((request) => request.command)).toEqual([
+            "Query",
+            "TransactWriteItems",
+            "Query",
+          ])
+          const [guard] = (
+            world.table.requests[1]!.input.TransactItems as ReadonlyArray<any>
+          ).flatMap((item) => (item.Delete === undefined ? [] : [item.Delete]))
+          expect(Object.values(guard.ExpressionAttributeNames)).toContain("z_owner")
+          expect(guard.ConditionExpression).toContain("attribute_not_exists(")
+        }),
+    )
+
+    it.effect(
+      "a row too wide to prove unchanged in one condition isn't the update's to delete",
+      () =>
+        Effect.gen(function* () {
+          const initial = yield* seeded(160)
+          const world = guardedOwners(160)
+          world.seed(initial)
+          world.table.requests.length = 0
+          const done = succeed(
+            yield* world.run((db) =>
+              db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
+            ),
+          )
+          expect(done.lines).toEqual([])
+          // As on 1.39.0, which never deleted it: the row stays, and reads back.
+          expect(world.deletedKeys()).toEqual([])
+          expect(world.rows().find((row) => row.sk?.S === lineKey)).toEqual(
+            initial.find((row) => row.sk?.S === lineKey),
+          )
+        }),
+    )
+
+    it.effect(
+      "rekey reports a row too wide to prove unchanged, and moves none of the aggregate",
+      () =>
+        Effect.gen(function* () {
+          const initial = yield* seeded(160)
+          const narrow = yield* seeded(0)
+          for (const dryRun of [true, false]) {
+            const world = guardedOwners(160, true, ["a"])
+            world.seed(initial)
+            const report = succeed(yield* world.run((db) => db.tables.Main.rekey({ dryRun })))
+            expect([dryRun, report.moved.aggregate, report.conflicts]).toEqual([
+              dryRun,
+              0,
+              [
+                expect.objectContaining({
+                  member: "Roota",
+                  reason: "failed",
+                  key: { pk: "$eo#v1#shared#p q", sk: lineKey },
+                }),
+              ],
+            ])
+            expect(world.rows()).toEqual(initial)
+            // The same row, narrow, moves with its aggregate.
+            const moves = guardedOwners(0, true, ["a"])
+            moves.seed(narrow)
+            const moved = succeed(yield* moves.run((db) => db.tables.Main.rekey({ dryRun })))
+            expect([dryRun, moved.moved.aggregate, moved.conflicts]).toEqual([dryRun, 2, []])
+          }
+        }),
+    )
+  })
 })
