@@ -3360,7 +3360,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const tableConfig: TableConfig = yield* config.table.Tag
 
           // 1. Hydrate refs from edges
-          const hydrated = yield* hydrateAggregateRefs(input, config.edges, aggregateName)
+          const hydrated = yield* hydrateAggregateRefs(
+            input,
+            config.edges,
+            schemaFields,
+            aggregateName,
+          )
 
           // 2. Validate via schema decode (decodeSchema substitutes nested edge
           //    self-date/Redacted leaves — Option A — and is identical to `schema`
@@ -4473,12 +4478,39 @@ interface RefRequest {
 }
 
 /**
+ * The attribute an entity is fetched by from one id: its primary key's only composite. The id an
+ * edge is given is typed as that composite's value (`RefEntityIdentifierValue`), whatever the
+ * entity's `DynamoModel.identifier` names, so it's the key it's fetched under. `undefined` for a
+ * primary key composed from more than one attribute, or none: no one id names one item there.
+ */
+const refFetchKey = (entity: RefEntity): string | undefined => {
+  const composites = primaryCompositesOf(entity)
+  return composites.length === 1 ? composites[0] : undefined
+}
+
+/** An entity's primary key composites, its partition key's then its sort key's. */
+const primaryCompositesOf = (entity: RefEntity): ReadonlyArray<string> => {
+  const primary = (
+    entity.indexes as
+      | {
+          readonly primary?: {
+            readonly pk?: { readonly composite?: ReadonlyArray<string> }
+            readonly sk?: { readonly composite?: ReadonlyArray<string> }
+          }
+        }
+      | undefined
+  )?.primary
+  return [...(primary?.pk?.composite ?? []), ...(primary?.sk?.composite ?? [])]
+}
+
+/**
  * Walk the input recursively following graph edges, collect ref IDs,
  * fetch referenced entities, and replace IDs with hydrated domain data.
  */
 const hydrateAggregateRefs = (
   input: Record<string, unknown>,
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+  fields: Record<string, Schema.Top> | undefined,
   aggregateName: string,
 ): Effect.Effect<
   Record<string, unknown>,
@@ -4488,7 +4520,7 @@ const hydrateAggregateRefs = (
   Effect.gen(function* () {
     // Collect all ref IDs from the entire input hierarchy
     const refRequests: RefRequest[] = []
-    collectRefIdsFromEdges(refRequests, input, edges, [])
+    collectRefIdsFromEdges(refRequests, input, edges, fields, [])
 
     if (refRequests.length === 0) return input
 
@@ -4508,8 +4540,27 @@ const hydrateAggregateRefs = (
     const hydratedLookup = new Map<string, Record<string, unknown>>()
 
     for (const [entityType, { entity, reqs }] of byEntityType) {
-      const idField = DynamoModel.getIdentifierField(entity.model)
-      const identifierName = idField?.name ?? "id"
+      const identifierName = refFetchKey(entity)
+      if (identifierName === undefined) {
+        // Nothing to fetch it by: 1.39.0 fetched under its identifier (or `id`), which no key
+        // composes from alone, and died composing it.
+        const composites = primaryCompositesOf(entity)
+        const fields = [...new Set(reqs.map((req) => req.fieldName))]
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.create",
+          cause: new Error(
+            `[EDD-9129] Aggregate "${aggregateName}": ${fields.map((name) => `"${name}"`).join(", ")} ` +
+              `${fields.length === 1 ? "is" : "are"} given an id of entity "${entityType}", whose ` +
+              `primary key is composed from ${
+                composites.length === 0
+                  ? "no attribute"
+                  : composites.map((name) => `"${name}"`).join(", ")
+              }, so no one id names one item to fetch. Key that entity by one attribute to ` +
+              `fetch it by id.`,
+          ),
+        })
+      }
 
       // Deduplicate IDs for this entity type
       const uniqueIds = [...new Set(reqs.map((r) => r.id))]
@@ -4598,6 +4649,8 @@ const collectRefIdsFromEdges = (
   result: RefRequest[],
   input: Record<string, unknown>,
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+  /** The fields of the schema `input` is a value of: a `many` element's are read off it. */
+  fields: Record<string, Schema.Top> | undefined,
   path: ReadonlyArray<string>,
 ): void => {
   for (const [edgeName, edge] of Object.entries(edges)) {
@@ -4633,10 +4686,13 @@ const collectRefIdsFromEdges = (
       const bound = edge as BoundSubAggregate<any>
       const subInput = input[edgeName]
       if (subInput != null && typeof subInput === "object") {
-        collectRefIdsFromEdges(result, subInput as Record<string, unknown>, bound.aggregate.edges, [
-          ...path,
-          edgeName,
-        ])
+        collectRefIdsFromEdges(
+          result,
+          subInput as Record<string, unknown>,
+          bound.aggregate.edges,
+          fieldsOf(bound.aggregate.schema),
+          [...path, edgeName],
+        )
       }
     } else if (edge._tag === "ManyEdge" && edge.entity) {
       // ManyEdge with entity → walk array elements for ref IDs
@@ -4644,6 +4700,11 @@ const collectRefIdsFromEdges = (
       const arr = input[inputKey]
       if (Array.isArray(arr)) {
         const entityFieldName = deriveEntityFieldName(edge.entity)
+        // An element wrapping the entity names it by a field of its own, which its input takes as
+        // `${field}Id` (`deriveElementInputSchema`). An element declaring no such field holds no
+        // ref, whatever it holds: an element that is the entity's own model has its key field
+        // (`lineId` of a `Line`) as a value of its own, and 1.39.0 took it for a ref.
+        const wraps = manyElementFields(fields, edgeName)?.[entityFieldName] !== undefined
         for (let i = 0; i < arr.length; i++) {
           const elem = arr[i]
           if (typeof elem === "string") {
@@ -4655,7 +4716,7 @@ const collectRefIdsFromEdges = (
               fieldName: edgeName,
               idFieldName: String(i),
             })
-          } else if (elem != null && typeof elem === "object") {
+          } else if (wraps && elem != null && typeof elem === "object") {
             // Element wraps entity + attributes — find the entityFieldName + "Id"
             const elemObj = elem as Record<string, unknown>
             const idFieldName = `${entityFieldName}Id`

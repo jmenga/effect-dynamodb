@@ -1,0 +1,892 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "shapes": {
+  "many, element the entity's struct, given whole": {
+   "make": "ok",
+   "seeded": [],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element the entity's struct, given ids": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element wraps the entity, without an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element the entity's class, given ids, without an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, without an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "ref, without an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element wraps the entity, with an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "2"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}"
+  },
+  "many, element the entity's class, given ids, with an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"lineId\":\"l\",\"f\":5}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline#l"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"lineId\":\"l\",\"f\":5}]}"
+  },
+  "one, with an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}"
+  },
+  "ref, with an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}"
+  },
+  "many, element wraps an entity with a code, with an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"line\":{\"lineId\":\"l\",\"code\":\"c\",\"f\":5},\"qty\":2}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       },
+       "code": {
+        "S": "c"
+       }
+      }
+     },
+     "qty": {
+      "N": "2"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"line\":{\"lineId\":\"l\",\"code\":\"c\",\"f\":5},\"qty\":2}]}"
+  },
+  "one, an entity with a code, with an identifier": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"code\":\"c\",\"f\":5}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"code\":\"c\",\"f\":5}}"
+  },
+  "many, element wraps an entity with a code, its identifier another field": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity with a code, its identifier another field": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "code": {
+      "S": "c"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element wraps an entity keyed by two composites": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#tenant_t"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"tenant\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#tenant_t"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by two composites": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#tenant_t"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"tenant\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#tenant_t"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  }
+ }
+}
