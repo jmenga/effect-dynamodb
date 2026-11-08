@@ -487,7 +487,7 @@ A `many` edge with a custom `decompose` that **renames** element fields (`{ note
 
 #### What a custom `decompose` is handed
 
-A `many` edge's custom `decompose` is handed a write's value as 1.39.0 handed it, so its rows store, key and read exactly as they did on 1.39.0. The edge's value is read stored form first. Where a transformation has one type on both sides, that decodes a value once more: on a field that multiplies by 10 on decode, `create(50)` hands `decompose` 500. Anything else is handed as it is, such as a `Schema.NumberFromString` or a field with no transformation. `update` hands it the state it read as it was read, and the new state as a write's value.
+A `many` edge's custom `decompose` is handed a write's value as 1.39.0 handed it, so its rows store, key and read exactly as they did on 1.39.0. The value you gave is read stored form first, once. Where a transformation has one type on both sides, that decodes a value once more: on a field that multiplies by 10 on decode, `create(50)` hands `decompose` 500. Anything else is handed as it is, such as a `Schema.NumberFromString` or a field with no transformation. `update` hands it the state it read as it was read, and the new state as a write's value.
 
 What `decompose` returns is stored as on 1.39.0. Its fields are encoded as every other edge's are, and a sort key composite is read from what it returns. So a `decompose` that encodes such a field itself (`f / 10`) keeps working:
 
@@ -497,6 +497,12 @@ What `decompose` returns is stored as on 1.39.0. Its fields are encoded as every
 | `f`, the field unchanged | 50 | 500 | 500 | 500 stored under 5000, reads 5000 |
 
 One that hands such a field back unchanged has it decoded once more on every write, as on 1.39.0. Encode the field in `decompose`, as `f / 10` does. Because `update` hands it the state it read as it was read, each `update` rewrites the edge's rows, even one that changes nothing, as on 1.39.0.
+
+A date field that `decompose` returns in its stored form, such as the ISO text of a `Schema.DateTimeUtcFromString` or the epoch milliseconds of a number decoded to a `Date`, is stored as it is and keyed by it. A value in neither form is refused with a `ValidationError` (`EDD-9127`), and nothing is written.
+
+On 1.39.0 a `many` edge held as a `Schema.Record` stored what `decompose` returned without encoding it. Its fields are now encoded as an array edge's are. A `Schema.NumberFromString` there is stored as its text where 1.39.0 stored the number, under the same key, and reads the same value. A field that multiplies by 10 on decode, returned as `f / 10`, now reads back the value you gave instead of ten times it, and a row 1.39.0 wrote reads as it did.
+
+Which rows the edge holds is read off the rows themselves, never off handing `decompose` the value it read. So `update` deletes the row of an element you remove, and the old row of an element whose keyed value you change, where 1.39.0 left both when `decompose` encoded the field. `rekey` moves each of the edge's rows with the aggregate, by the key its own values compose, and reports a row it can't place rather than leaving it behind.
 
 #### What `create` and `update` take
 

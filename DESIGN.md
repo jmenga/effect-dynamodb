@@ -1129,7 +1129,7 @@ again or reports the row (`contended`).
 | Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row of the aggregate's entity types that no row of its value places, under either key text, is `failed`, and the aggregate is left as it is: moving the root would leave the row behind, under a key nothing reads (a second row of a `one` edge, which assembly doesn't take, or a custom `decompose`'s row whose own values compose another key). A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
 | Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
@@ -1163,8 +1163,9 @@ down, the other rows, event 1 last. A delete that loses to a write reads again.
 `bothKeys` (the row is also under its current key; for a snapshot, a
 different snapshot of the version), `taken` (another row
 holds the target), `contended` (concurrent writes on every attempt, or the attempts exhausted),
-`failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, or an
-aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
+`failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, an
+aggregate that doesn't assemble or decompose, `message` naming why, or a row of an aggregate's types no
+row of its value places), `uncomposable` (a sharded key from another layout whose values can't
 compose a current one; a row whose own key holds a value with no key text, `NaN`, or one of whose key
 composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or
@@ -4185,14 +4186,40 @@ written for it encodes a one-type field itself from a value decoded once more: o
 10, `f / 10` was handed 500 for `create(50)`, returned 50, which was encoded to 5 and keyed as 50.
 Handed the domain value, the same function returns 5, encoded again to 0.5 and keyed as 5, and every
 `update` compounded it and added a row; an `update` of a 1.39.0 row left it and wrote a second. So on a
-write (`create`, update's new state) `decompose` is handed the edge's value read stored form first
-(`storedFormFirst`: the field's tolerant `decodeOnly` substitution, without `domainValues`, only where the
-field `containsWireTransform`), and what was read (update's old state, `rekey`) is handed as it was
-read, as on 1.39.0. Its rows store, key and read exactly as on 1.39.0. A field with two types
-(`NumberFromString`) or none reads the same either way. Two things stay as on 1.39.0: a `decompose` that
-hands a one-type field back unchanged stores it decoded once more on every write (`create(50)` stores 50
-under 500 and reads 500), and since the old state composes other keys than the new, every `update` of an
-edge whose `decompose` encodes the field rewrites its rows, even one that changes nothing.
+write (`create`, update's new state) `decompose` is handed the caller's own value of the edge, as given
+and before the write decodes it, read stored form first once (`storedFormFirst`: the field's tolerant
+`decodeOnly` substitution, without `domainValues`, only where the field `containsWireTransform` beneath
+its classes, `throughClasses`), and what was read (update's old state, `rekey`) is handed as it was
+read, as on 1.39.0. Never the value the write already decoded: read again, a decoding default (5, read
+as 50) or a stored form the domain side refuses (`"5"` on a union of a number and a string, read as 50)
+is decoded twice, to 500, and a row 1.39.0 wrote collides with the one an update adds. Its rows store,
+key and read exactly as on 1.39.0. A field with two types (`NumberFromString`) or none reads the same
+either way. Two things stay as on 1.39.0: a `decompose` that hands a one-type field back unchanged
+stores it decoded once more on every write (`create(50)` stores 50 under 500 and reads 500), and since
+the old state composes other keys than the new, every `update` of an edge whose `decompose` encodes the
+field rewrites its rows, even one that changes nothing.
+
+**Which rows such an edge holds is read off the rows, never off decomposing them again**
+(`customEdgeRows`: the rows assembly took for the edge, of its entity type, holding the static
+discriminator values above it). Decomposing the value read back keys an encoding `decompose`'s rows
+elsewhere (`f / 10` once more: 50 is keyed 5), so on 1.39.0 an `update` that removed an element sent a
+`Delete` for a key no row held and left the row, which `get` still returned, and one that changed the
+keyed value left both rows. `update` now deletes, from a changed group, each of those rows whose key the
+new state doesn't hold (a decomposed key no row holds is no longer deleted), from the partition it has
+read: no read is added. `rekey` composes each such row's key from the row's own attributes, each read
+back through its field (what an attribute encoder stored is the encoded `decompose` output, so decoding
+it gives the value the key was composed from), or else as stored, and takes the key only where the row
+is stored under it in either text; else the key decomposing gives, if the row is under that. The row is
+moved as stored, with its partition key, sort key and collection sort key mirror replaced. An aggregate
+without a custom `decompose` sends exactly the requests it did.
+
+A date field's attribute encoder stores a value already in the field's stored form as it is: one its
+date encodings decode (`storedDateForm`), such as the ISO text a `decompose` returns for a
+`DateTimeUtcFromString`. Its key encoder already composed from such a value as given. 1.39.0 stored
+a `Schema.Record` edge's attributes as `decompose` returned them, so such a `decompose` worked there and
+failed `create` with a defect on an array edge; once keyed edges took their element's encoders (#201)
+it failed on both. A value in neither form is stored as given and reported (`asGiven`), so the write
+refuses it unless it reads back (`EDD-9127`).
 
 A caller who passed the stored form on 1.39.0 had the only input that read back as meant (`create(5)` on
 that field read 50). It's a valid domain value too, so it can't be told apart or warned about: it now
