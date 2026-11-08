@@ -253,7 +253,7 @@ describe("update deletes the rows read, at the keys they're stored under", () =>
   )
 })
 
-describe("rekey moves a custom decompose's rows by the keys their own values compose", () => {
+describe("rekey moves a custom decompose's rows by the keys its value decomposes to", () => {
   const before = "$dr#v1#moves#a b"
   const after = "$dr#v1#moves#a%20b"
   const rekey = (run: ReturnType<typeof world>["run"]) =>
@@ -280,11 +280,12 @@ describe("rekey moves a custom decompose's rows by the keys their own values com
     }),
   )
 
-  it.effect("a row no value of the aggregate places is reported, and nothing moves", () =>
+  it.effect("a row no value of the aggregate keys is left where it is, and the rest move", () =>
     Effect.gen(function* () {
       const { run, seed, rowsOf } = world(true)
       seed(at("moves created").rows)
-      // A row of the edge under a key its own value doesn't compose: 7 reads as 70, keyed 80.
+      // A row of the edge under a key its value doesn't decompose to, either way: 7 reads as 70,
+      // keyed 7 as read and 70 as a write's value, and it's stored under 80.
       const stray = {
         ...at("moves created").rows.find((row) => row.__edd_e__?.S === "MovesEnc")!,
         sk: { S: "$dr#v1#movesenc#0000000000000080" },
@@ -292,24 +293,19 @@ describe("rekey moves a custom decompose's rows by the keys their own values com
         f: { N: "7" },
       }
       seed([stray])
-      const seeded = rowsOf(before)
       const report = succeed(yield* rekey(run))
-      expect(report.conflicts).toEqual([
-        expect.objectContaining({
-          member: "Moves",
-          reason: "failed",
-          key: { pk: before, sk: "$dr#v1#movesenc#0000000000000080" },
-        }),
-      ])
-      expect(report.moved.aggregate).toBe(0)
-      expect(rowsOf(before)).toEqual(seeded)
-      expect(rowsOf(after)).toEqual([])
+      expect(report.conflicts).toEqual([])
+      expect(report.moved.aggregate).toBe(5)
+      expect(rowsOf(before)).toEqual([stray])
+      expect(rowsOf(after)).toEqual(
+        at("moves created").rows.map((row) => ({ ...row, pk: { S: after } })),
+      )
     }),
   )
 })
 
-describe("rekey never leaves an aggregate's row behind unreported", () => {
-  it.effect("a second row of a `one` edge, which assembly doesn't take, holds the move", () =>
+describe("rekey moves the rows the aggregate's value keys, as c32e2bb did", () => {
+  it.effect("a second row of a `one` edge, which assembly doesn't take, is left where it is", () =>
     Effect.gen(function* () {
       const schema = DynamoSchema.make({ name: "dr", version: 1, escapeKeys: true })
       const Main = Table.make({ schema, entities: {} })
@@ -324,6 +320,7 @@ describe("rekey never leaves an aggregate's row behind unreported", () => {
       })
       const table = makeRecordingTable()
       const pk = "$dr#v1#doc#a b"
+      const moved = "$dr#v1#doc#a%20b"
       const rows: ReadonlyArray<Row> = [
         { pk: { S: pk }, sk: { S: "$dr#v1#doc" }, __edd_e__: { S: "Doc" }, id: { S: "a b" } },
         {
@@ -354,14 +351,13 @@ describe("rekey never leaves an aggregate's row behind unreported", () => {
           Effect.exit,
         ) as Effect.Effect<Exit.Exit<unknown, unknown>>,
       )
-      expect(report.conflicts).toEqual([
-        expect.objectContaining({
-          member: "Doc",
-          reason: "failed",
-          key: { pk, sk: "$dr#v1#docnote#old" },
-        }),
-      ])
-      expect([...table.items.values()]).toEqual(rows)
+      expect(report.conflicts).toEqual([])
+      expect(report.moved.aggregate).toBe(2)
+      const byKey = (list: ReadonlyArray<Row>) =>
+        [...list].sort((x, y) => `${x.pk?.S}|${x.sk?.S}`.localeCompare(`${y.pk?.S}|${y.sk?.S}`))
+      expect(byKey([...table.items.values()])).toEqual(
+        byKey([{ ...rows[0]!, pk: { S: moved } }, { ...rows[1]!, pk: { S: moved } }, rows[2]!]),
+      )
     }),
   )
 })

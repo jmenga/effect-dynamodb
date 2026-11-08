@@ -72,6 +72,11 @@ export interface RekeyRowContext {
     unit: string,
     work: Effect.Effect<RekeyTally, E, R>,
   ) => Effect.Effect<RekeyTally, E, R>
+  /**
+   * The rows units of this run took, by position, with the name of the member that took them: a
+   * row two aggregates both hold moves, and a dry run counts it, once.
+   */
+  readonly rowOwners?: Map<string, string> | undefined
 }
 
 /**
@@ -407,6 +412,7 @@ export const run = (args: {
       const claimed = new Set<string>()
       const running = new Map<string, Deferred.Deferred<void>>()
       const ctx: RekeyRowContext = {
+        rowOwners: new Map(),
         tableName,
         dryRun,
         repairIndexKeys: options.repairIndexKeys === true,

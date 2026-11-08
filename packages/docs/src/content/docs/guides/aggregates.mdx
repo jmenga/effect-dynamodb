@@ -502,7 +502,7 @@ A date field that `decompose` returns in its stored form, such as the ISO text o
 
 On 1.39.0 a `many` edge held as a `Schema.Record` stored what `decompose` returned without encoding it. Its fields are now encoded as an array edge's are. A `Schema.NumberFromString` there is stored as its text where 1.39.0 stored the number, under the same key, and reads the same value. A field that multiplies by 10 on decode, returned as `f / 10`, now reads back the value you gave instead of ten times it, and a row 1.39.0 wrote reads as it did.
 
-Which rows the edge holds is read off the rows themselves, never off handing `decompose` the value it read. So `update` deletes the row of an element you remove, and the old row of an element whose keyed value you change, where 1.39.0 left both when `decompose` encoded the field. `rekey` moves each of the edge's rows with the aggregate, by the key its own values compose, and reports a row it can't place rather than leaving it behind.
+Which rows the edge holds comes from decomposing the value read, both as it was read and as a write's value is, so the keys 1.39.0 wrote are found either way. So `update` deletes the row of an element you remove, and the old row of an element whose keyed value you change, where 1.39.0 left both when `decompose` encoded the field; it deletes only a key one of the rows it read holds. `rekey` moves each of the edge's rows with the aggregate, as stored. Rows are told apart by key, never by entity type, so rows of the same entity type that another aggregate or the entity itself writes in the partition are left alone.
 
 #### What `create` and `update` take
 

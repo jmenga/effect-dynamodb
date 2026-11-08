@@ -1,0 +1,10815 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "scenarios": {
+  "many": {
+   "created": {
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138003480-0",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$ownership#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138003480-0",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138003480-0",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "owner": {
+            "S": "a"
+           },
+           "note": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#line#a#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "changed",
+      "lines": [
+       {
+        "lid": "x y",
+        "owner": "a",
+        "note": "a"
+       }
+      ]
+     }
+    }
+   },
+   "update a get": {
+    "ok": {
+     "id": "p q",
+     "note": "changed",
+     "lines": [
+      {
+       "lid": "x y",
+       "owner": "a",
+       "note": "a"
+      }
+     ]
+    }
+   },
+   "update b get": {
+    "ok": {
+     "id": "p q",
+     "note": "root",
+     "lines": [
+      {
+       "lid": "x y",
+       "owner": "b",
+       "note": "b"
+      }
+     ]
+    }
+   },
+   "noop update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138003594-1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$ownership#v1#shared#p q"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "race update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138003649-2",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$ownership#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138003649-2",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "A edit"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138003649-2",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "owner": {
+            "S": "a"
+           },
+           "note": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#line#a#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x y"
+      },
+      "note": {
+       "S": "concurrent B edit"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "A edit"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "A edit",
+      "lines": [
+       {
+        "lid": "x y",
+        "owner": "a",
+        "note": "a"
+       }
+      ]
+     }
+    }
+   },
+   "rekey both dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey both": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x%20y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "gets": {
+     "a": {
+      "ok": {
+       "id": "p q",
+       "note": "root",
+       "lines": [
+        {
+         "lid": "x y",
+         "owner": "a",
+         "note": "a"
+        }
+       ]
+      }
+     },
+     "b": {
+      "ok": {
+       "id": "p q",
+       "note": "root",
+       "lines": [
+        {
+         "lid": "x y",
+         "owner": "b",
+         "note": "b"
+        }
+       ]
+      }
+     }
+    }
+   },
+   "rekey a only dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a only": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#a#x%20y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ],
+    "gets": {
+     "a": {
+      "ok": {
+       "id": "p q",
+       "note": "root",
+       "lines": [
+        {
+         "lid": "x y",
+         "owner": "a",
+         "note": "a"
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  "one": {
+   "created": {
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138003951-7",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$ownership#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138003951-7",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138003951-7",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "owner": {
+            "S": "a"
+           },
+           "note": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#line#owner#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "changed"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "changed",
+      "lines": {
+       "lid": "x y",
+       "owner": "a",
+       "note": "a"
+      }
+     }
+    }
+   },
+   "update a get": {
+    "ok": {
+     "id": "p q",
+     "note": "changed",
+     "lines": {
+      "lid": "x y",
+      "owner": "a",
+      "note": "a"
+     }
+    }
+   },
+   "update b get": {
+    "ok": {
+     "id": "p q",
+     "note": "root",
+     "lines": {
+      "lid": "x y",
+      "owner": "b",
+      "note": "b"
+     }
+    }
+   },
+   "noop update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004022-8",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$ownership#v1#shared#p q"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "race update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004077-9",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$ownership#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004077-9",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "note": {
+            "S": "A edit"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004077-9",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "owner": {
+            "S": "a"
+           },
+           "note": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$ownership#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$ownership#v1#line#owner#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "concurrent B edit"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "A edit"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "note": "A edit",
+      "lines": {
+       "lid": "x y",
+       "owner": "a",
+       "note": "a"
+      }
+     }
+    }
+   },
+   "rekey both dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey both": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 4,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "gets": {
+     "a": {
+      "ok": {
+       "id": "p q",
+       "note": "root",
+       "lines": {
+        "lid": "x y",
+        "owner": "a",
+        "note": "a"
+       }
+      }
+     },
+     "b": {
+      "ok": {
+       "id": "p q",
+       "note": "root",
+       "lines": {
+        "lid": "x y",
+        "owner": "b",
+        "note": "b"
+       }
+      }
+     }
+    }
+   },
+   "rekey a only dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a only": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#b"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#rootb"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$ownership#v1#line#owner#a"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$ownership#v1#roota"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$ownership#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ],
+    "gets": {
+     "a": {
+      "ok": {
+       "id": "p q",
+       "note": "root",
+       "lines": {
+        "lid": "x y",
+        "owner": "a",
+        "note": "a"
+       }
+      }
+     }
+    }
+   }
+  },
+  "version": {
+   "seeded": {
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#lid_item"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "2"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#v#lid_item#0000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "1"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004400-14",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$history#v1#line#id_a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004400-14",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "note": {
+            "S": "edited"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#root"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#lid_item"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "2"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#v#lid_item#0000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "1"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "edited"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "id_a",
+      "note": "edited",
+      "lines": []
+     }
+    }
+   },
+   "update add": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004400-14",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$history#v1#line#id_a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004400-14",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "note": {
+            "S": "edited"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004400-14",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "lid": {
+            "S": "own"
+           },
+           "owner": {
+            "S": "aggregate"
+           },
+           "note": {
+            "S": "aggregate-owned"
+           },
+           "at": {
+            "N": "0"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#line#own"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#lid_item"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "2"
+      }
+     },
+     {
+      "owner": {
+       "S": "aggregate"
+      },
+      "note": {
+       "S": "aggregate-owned"
+      },
+      "at": {
+       "N": "0"
+      },
+      "lid": {
+       "S": "own"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#own"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#v#lid_item#0000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "1"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "edited"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "id_a",
+      "note": "edited",
+      "lines": [
+       {
+        "id": "id_a",
+        "lid": "own",
+        "owner": "aggregate",
+        "note": "aggregate-owned",
+        "at": 0
+       }
+      ]
+     }
+    }
+   },
+   "update remove": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004400-14",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$history#v1#line#id_a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004400-14",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "note": {
+            "S": "edited"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "shared-1794138004400-14",
+          "Key": {
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#line#own"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#lid_item"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "2"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "__edd_i__": {
+       "S": "e6759c6b-9830-414d-892b-42f04d44c112"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#v#lid_item#0000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "version": {
+       "N": "1"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "edited"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "id_a",
+      "note": "edited",
+      "lines": []
+     }
+    }
+   },
+   "entity get": {
+    "ok": {
+     "id": "a",
+     "lid": "item",
+     "owner": "entity",
+     "note": "entity-owned 2",
+     "at": 1,
+     "version": 2
+    }
+   }
+  },
+  "timeSeries": {
+   "seeded": {
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000002"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "root"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004494-15",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$history#v1#line#id_a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004494-15",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "note": {
+            "S": "edited"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#root"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000002"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "edited"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "id_a",
+      "note": "edited",
+      "lines": []
+     }
+    }
+   },
+   "update add": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004494-15",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$history#v1#line#id_a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004494-15",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "note": {
+            "S": "edited"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004494-15",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "lid": {
+            "S": "own"
+           },
+           "owner": {
+            "S": "aggregate"
+           },
+           "note": {
+            "S": "aggregate-owned"
+           },
+           "at": {
+            "N": "0"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#line#own"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000002"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "aggregate"
+      },
+      "note": {
+       "S": "aggregate-owned"
+      },
+      "at": {
+       "N": "0"
+      },
+      "lid": {
+       "S": "own"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#own"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "edited"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "id_a",
+      "note": "edited",
+      "lines": [
+       {
+        "id": "id_a",
+        "lid": "own",
+        "owner": "aggregate",
+        "note": "aggregate-owned",
+        "at": 0
+       }
+      ]
+     }
+    }
+   },
+   "update remove": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004494-15",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$history#v1#line#id_a"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004494-15",
+          "Item": {
+           "id": {
+            "S": "id_a"
+           },
+           "note": {
+            "S": "edited"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "shared-1794138004494-15",
+          "Key": {
+           "pk": {
+            "S": "$history#v1#line#id_a"
+           },
+           "sk": {
+            "S": "$history#v1#line#own"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned"
+      },
+      "at": {
+       "N": "1"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000001"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "owner": {
+       "S": "entity"
+      },
+      "note": {
+       "S": "entity-owned 2"
+      },
+      "at": {
+       "N": "2"
+      },
+      "lid": {
+       "S": "item"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$history#v1#line#e#0000000000000002"
+      },
+      "id": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      }
+     },
+     {
+      "sk": {
+       "S": "$history#v1#root"
+      },
+      "note": {
+       "S": "edited"
+      },
+      "id": {
+       "S": "id_a"
+      },
+      "pk": {
+       "S": "$history#v1#line#id_a"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "id_a",
+      "note": "edited",
+      "lines": []
+     }
+    }
+   },
+   "entity get": {
+    "ok": {
+     "id": "a",
+     "lid": "item",
+     "owner": "entity",
+     "note": "entity-owned 2",
+     "at": 2
+    }
+   }
+  },
+  "two edges": {
+   "created": {
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$two#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$two#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$two#v1#root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004573-16",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$two#v1#two#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004573-16",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$two#v1#two#p q"
+           },
+           "sk": {
+            "S": "$two#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004573-16",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "owner": {
+            "S": "a"
+           },
+           "note": {
+            "S": "a changed"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$two#v1#two#p q"
+           },
+           "sk": {
+            "S": "$two#v1#line#a#x y"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004573-16",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "owner": {
+            "S": "b"
+           },
+           "note": {
+            "S": "b"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$two#v1#two#p q"
+           },
+           "sk": {
+            "S": "$two#v1#line#b#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$two#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a changed"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$two#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$two#v1#root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "a": [
+       {
+        "lid": "x y",
+        "owner": "a",
+        "note": "a changed"
+       }
+      ],
+      "b": [
+       {
+        "lid": "x y",
+        "owner": "b",
+        "note": "b"
+       }
+      ]
+     }
+    }
+   },
+   "update remove": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004573-16",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$two#v1#two#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004573-16",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$two#v1#two#p q"
+           },
+           "sk": {
+            "S": "$two#v1#root"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004573-16",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "owner": {
+            "S": "b"
+           },
+           "note": {
+            "S": "b"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$two#v1#two#p q"
+           },
+           "sk": {
+            "S": "$two#v1#line#b#x y"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "shared-1794138004573-16",
+          "Key": {
+           "pk": {
+            "S": "$two#v1#two#p q"
+           },
+           "sk": {
+            "S": "$two#v1#line#a#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$two#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$two#v1#root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "a": [],
+      "b": [
+       {
+        "lid": "x y",
+        "owner": "b",
+        "note": "b"
+       }
+      ]
+     }
+    }
+   },
+   "rekey dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$two#v1#line#a#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$two#v1#line#b#x y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$two#v1#root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$two#v1#two#p q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ]
+   },
+   "rekey": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 0,
+     "moved": 3,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$two#v1#line#a#x%20y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$two#v1#two#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$two#v1#line#b#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$two#v1#two#p%20q"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$two#v1#root"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$two#v1#two#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "p q",
+      "a": [
+       {
+        "lid": "x y",
+        "owner": "a",
+        "note": "a"
+       }
+      ],
+      "b": [
+       {
+        "lid": "x y",
+        "owner": "b",
+        "note": "b"
+       }
+      ]
+     }
+    }
+   }
+  },
+  "graph": {
+   "create": {
+    "requests": [
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "id": {
+            "S": "a b"
+           },
+           "note": {
+            "S": "root"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#root"
+           },
+           "gsi1pk": {
+            "S": "$graph#v1#roots"
+           },
+           "gsi1sk": {
+            "S": "$graph#v1#roots#a b"
+           }
+          },
+          "ConditionExpression": "attribute_not_exists(#pk)",
+          "ExpressionAttributeNames": {
+           "#pk": "pk"
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "lid": {
+            "S": "r s"
+           },
+           "kind": {
+            "S": "root"
+           },
+           "note": {
+            "S": "r"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#r s"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "kind": {
+            "S": "one"
+           },
+           "note": {
+            "S": "one"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#kind#one"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "note": {
+            "S": "branch"
+           },
+           "team": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Branch"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#branch#team#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "note": {
+            "S": "left"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "l"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "note": {
+            "S": "right"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#right"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "lid": {
+            "S": "x%20y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "r"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#right#x%20y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "note": {
+            "S": "branch"
+           },
+           "team": {
+            "S": "b"
+           },
+           "__edd_e__": {
+            "S": "Branch"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#branch#team#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "note": {
+            "S": "left"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#b#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "l"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#b#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "note": {
+            "S": "right"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#b#section#right"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "lid": {
+            "S": "x%20y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "r"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#b#section#right#x%20y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "root",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "get": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004759-19",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "root",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "list": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004759-19",
+       "IndexName": "gsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "gsi1pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#roots"
+        }
+       }
+      }
+     },
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004759-19",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "data": [
+       {
+        "id": "a b",
+        "note": "root",
+        "lines": [
+         {
+          "lid": "r s",
+          "kind": "root",
+          "note": "r"
+         }
+        ],
+        "single": {
+         "kind": "one",
+         "note": "one"
+        },
+        "a": {
+         "note": "branch",
+         "left": {
+          "note": "left",
+          "lines": [
+           {
+            "lid": "x y",
+            "kind": "nested",
+            "note": "l"
+           }
+          ]
+         },
+         "right": {
+          "note": "right",
+          "lines": [
+           {
+            "lid": "x%20y",
+            "kind": "nested",
+            "note": "r"
+           }
+          ]
+         }
+        },
+        "b": {
+         "note": "branch",
+         "left": {
+          "note": "left",
+          "lines": [
+           {
+            "lid": "x y",
+            "kind": "nested",
+            "note": "l"
+           }
+          ]
+         },
+         "right": {
+          "note": "right",
+          "lines": [
+           {
+            "lid": "x%20y",
+            "kind": "nested",
+            "note": "r"
+           }
+          ]
+         }
+        }
+       }
+      ],
+      "cursor": {
+       "_id": "Option",
+       "_tag": "None"
+      }
+     }
+    }
+   },
+   "update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004759-19",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "id": {
+            "S": "a b"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#root"
+           },
+           "gsi1pk": {
+            "S": "$graph#v1#roots"
+           },
+           "gsi1sk": {
+            "S": "$graph#v1#roots#a b"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "lid": {
+            "S": "r s"
+           },
+           "kind": {
+            "S": "root"
+           },
+           "note": {
+            "S": "r"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#r s"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "kind": {
+            "S": "one"
+           },
+           "note": {
+            "S": "one"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#kind#one"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138004759-19",
+          "Item": {
+           "note": {
+            "S": "left"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "shared-1794138004759-19",
+          "Key": {
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "changed",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": []
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "noop": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004759-19",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "changed",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": []
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "get2": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004759-19",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "changed",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": []
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138004759-19",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     },
+     {
+      "command": "BatchWriteItem",
+      "input": {
+       "RequestItems": {
+        "shared-1794138004759-19": [
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#branch#team#a"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#branch#team#b"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#a#section#left"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#a#section#right"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#b#section#left"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#b#section#right"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#kind#one"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#r s"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#team#a#section#right#x%20y"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#team#b#section#left#x y"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#team#b#section#right#x%20y"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#root"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     }
+    ],
+    "rows": [],
+    "result": {
+     "ok": null
+    }
+   },
+   "rekey": {
+    "report": {
+     "scanned": 13,
+     "unchanged": 0,
+     "moved": 13,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r%20s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x%20y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%2520y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x%20y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%2520y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "a b",
+      "note": "root",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "sub failure": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005029-21",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005029-21",
+          "Item": {
+           "id": {
+            "S": "a b"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#root"
+           },
+           "gsi1pk": {
+            "S": "$graph#v1#roots"
+           },
+           "gsi1sk": {
+            "S": "$graph#v1#roots#a b"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005029-21",
+          "Item": {
+           "lid": {
+            "S": "r s"
+           },
+           "kind": {
+            "S": "root"
+           },
+           "note": {
+            "S": "r"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#r s"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005029-21",
+          "Item": {
+           "kind": {
+            "S": "one"
+           },
+           "note": {
+            "S": "one"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#kind#one"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005029-21",
+          "Item": {
+           "note": {
+            "S": "changed sub"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "shared-1794138005029-21",
+          "Key": {
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "failed": "Cause([Fail(DynamoError (cause: Error: injected sub-aggregate request failure))])"
+    }
+   }
+  },
+  "graph custom": {
+   "create": {
+    "requests": [
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "id": {
+            "S": "a b"
+           },
+           "note": {
+            "S": "root"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#root"
+           },
+           "gsi1pk": {
+            "S": "$graph#v1#roots"
+           },
+           "gsi1sk": {
+            "S": "$graph#v1#roots#a b"
+           }
+          },
+          "ConditionExpression": "attribute_not_exists(#pk)",
+          "ExpressionAttributeNames": {
+           "#pk": "pk"
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "lid": {
+            "S": "r s"
+           },
+           "kind": {
+            "S": "root"
+           },
+           "note": {
+            "S": "r"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#r s"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "kind": {
+            "S": "one"
+           },
+           "note": {
+            "S": "one"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#kind#one"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "note": {
+            "S": "branch"
+           },
+           "team": {
+            "S": "a"
+           },
+           "__edd_e__": {
+            "S": "Branch"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#branch#team#a"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "note": {
+            "S": "left"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "l"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "note": {
+            "S": "right"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#right"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "lid": {
+            "S": "x%20y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "r"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#right#x%20y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "note": {
+            "S": "branch"
+           },
+           "team": {
+            "S": "b"
+           },
+           "__edd_e__": {
+            "S": "Branch"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#branch#team#b"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "note": {
+            "S": "left"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#b#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "lid": {
+            "S": "x y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "l"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#b#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "note": {
+            "S": "right"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#b#section#right"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "lid": {
+            "S": "x%20y"
+           },
+           "kind": {
+            "S": "nested"
+           },
+           "note": {
+            "S": "r"
+           },
+           "team": {
+            "S": "b"
+           },
+           "section": {
+            "S": "right"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#b#section#right#x%20y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "root",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "get": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005137-22",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "root",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "list": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005137-22",
+       "IndexName": "gsi1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "gsi1pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#roots"
+        }
+       }
+      }
+     },
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005137-22",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "data": [
+       {
+        "id": "a b",
+        "note": "root",
+        "lines": [
+         {
+          "lid": "r s",
+          "kind": "root",
+          "note": "r"
+         }
+        ],
+        "single": {
+         "kind": "one",
+         "note": "one"
+        },
+        "a": {
+         "note": "branch",
+         "left": {
+          "note": "left",
+          "lines": [
+           {
+            "lid": "x y",
+            "kind": "nested",
+            "note": "l"
+           }
+          ]
+         },
+         "right": {
+          "note": "right",
+          "lines": [
+           {
+            "lid": "x%20y",
+            "kind": "nested",
+            "note": "r"
+           }
+          ]
+         }
+        },
+        "b": {
+         "note": "branch",
+         "left": {
+          "note": "left",
+          "lines": [
+           {
+            "lid": "x y",
+            "kind": "nested",
+            "note": "l"
+           }
+          ]
+         },
+         "right": {
+          "note": "right",
+          "lines": [
+           {
+            "lid": "x%20y",
+            "kind": "nested",
+            "note": "r"
+           }
+          ]
+         }
+        }
+       }
+      ],
+      "cursor": {
+       "_id": "Option",
+       "_tag": "None"
+      }
+     }
+    }
+   },
+   "update": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005137-22",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "id": {
+            "S": "a b"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#root"
+           },
+           "gsi1pk": {
+            "S": "$graph#v1#roots"
+           },
+           "gsi1sk": {
+            "S": "$graph#v1#roots#a b"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "lid": {
+            "S": "r s"
+           },
+           "kind": {
+            "S": "root"
+           },
+           "note": {
+            "S": "r"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#r s"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "kind": {
+            "S": "one"
+           },
+           "note": {
+            "S": "one"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#kind#one"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005137-22",
+          "Item": {
+           "note": {
+            "S": "left"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "shared-1794138005137-22",
+          "Key": {
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "changed",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": []
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "noop": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005137-22",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "changed",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": []
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "get2": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005137-22",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "a b",
+      "note": "changed",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": []
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005137-22",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     },
+     {
+      "command": "BatchWriteItem",
+      "input": {
+       "RequestItems": {
+        "shared-1794138005137-22": [
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#branch#team#a"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#branch#team#b"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#a#section#left"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#a#section#right"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#b#section#left"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#leaf#team#b#section#right"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#kind#one"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#r s"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#team#a#section#right#x%20y"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#team#b#section#left#x y"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#line#team#b#section#right#x%20y"
+            }
+           }
+          }
+         },
+         {
+          "DeleteRequest": {
+           "Key": {
+            "pk": {
+             "S": "$graph#v1#root#a b"
+            },
+            "sk": {
+             "S": "$graph#v1#root"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     }
+    ],
+    "rows": [],
+    "result": {
+     "ok": null
+    }
+   },
+   "rekey": {
+    "report": {
+     "scanned": 13,
+     "unchanged": 0,
+     "moved": 13,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r%20s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x%20y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%2520y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x%20y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%2520y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     },
+     {
+      "note": {
+       "S": "root"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a%20b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a%20b"
+      }
+     }
+    ],
+    "get": {
+     "ok": {
+      "id": "a b",
+      "note": "root",
+      "lines": [
+       {
+        "lid": "r s",
+        "kind": "root",
+        "note": "r"
+       }
+      ],
+      "single": {
+       "kind": "one",
+       "note": "one"
+      },
+      "a": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      },
+      "b": {
+       "note": "branch",
+       "left": {
+        "note": "left",
+        "lines": [
+         {
+          "lid": "x y",
+          "kind": "nested",
+          "note": "l"
+         }
+        ]
+       },
+       "right": {
+        "note": "right",
+        "lines": [
+         {
+          "lid": "x%20y",
+          "kind": "nested",
+          "note": "r"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "sub failure": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "shared-1794138005398-24",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$graph#v1#root#a b"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005398-24",
+          "Item": {
+           "id": {
+            "S": "a b"
+           },
+           "note": {
+            "S": "changed"
+           },
+           "__edd_e__": {
+            "S": "Root"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#root"
+           },
+           "gsi1pk": {
+            "S": "$graph#v1#roots"
+           },
+           "gsi1sk": {
+            "S": "$graph#v1#roots#a b"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005398-24",
+          "Item": {
+           "lid": {
+            "S": "r s"
+           },
+           "kind": {
+            "S": "root"
+           },
+           "note": {
+            "S": "r"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#r s"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "shared-1794138005398-24",
+          "Item": {
+           "kind": {
+            "S": "one"
+           },
+           "note": {
+            "S": "one"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#kind#one"
+           }
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "shared-1794138005398-24",
+          "Item": {
+           "note": {
+            "S": "changed sub"
+           },
+           "team": {
+            "S": "a"
+           },
+           "section": {
+            "S": "left"
+           },
+           "__edd_e__": {
+            "S": "Leaf"
+           },
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#leaf#team#a#section#left"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "shared-1794138005398-24",
+          "Key": {
+           "pk": {
+            "S": "$graph#v1#root#a b"
+           },
+           "sk": {
+            "S": "$graph#v1#line#team#a#section#left#x y"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#a"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#branch#team#b"
+      },
+      "note": {
+       "S": "branch"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Branch"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#a#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#left"
+      },
+      "note": {
+       "S": "left"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#leaf#team#b#section#right"
+      },
+      "note": {
+       "S": "right"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "__edd_e__": {
+       "S": "Leaf"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#kind#one"
+      },
+      "note": {
+       "S": "one"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "kind": {
+       "S": "one"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$graph#v1#line#r s"
+      },
+      "note": {
+       "S": "r"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      },
+      "lid": {
+       "S": "r s"
+      },
+      "kind": {
+       "S": "root"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#a#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "l"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#left#x y"
+      },
+      "section": {
+       "S": "left"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "r"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "kind": {
+       "S": "nested"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "sk": {
+       "S": "$graph#v1#line#team#b#section#right#x%20y"
+      },
+      "section": {
+       "S": "right"
+      },
+      "team": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     },
+     {
+      "note": {
+       "S": "changed"
+      },
+      "gsi1sk": {
+       "S": "$graph#v1#roots#a b"
+      },
+      "__edd_e__": {
+       "S": "Root"
+      },
+      "gsi1pk": {
+       "S": "$graph#v1#roots"
+      },
+      "sk": {
+       "S": "$graph#v1#root"
+      },
+      "id": {
+       "S": "a b"
+      },
+      "pk": {
+       "S": "$graph#v1#root#a b"
+      }
+     }
+    ],
+    "result": {
+     "failed": "Cause([Fail(DynamoError (cause: Error: injected sub-aggregate request failure))])"
+    }
+   }
+  }
+ }
+}
