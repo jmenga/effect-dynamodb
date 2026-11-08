@@ -336,55 +336,118 @@ export const readBackUnsure = (field: Schema.Top): boolean =>
   kindsUnreadable(field) || transformsAnywhere(field.ast)
 
 /**
- * What DynamoDB hands back for a stored numeric value, where it's the other kind: a `bigint` that's a
- * safe integer comes back as a `number`, and an integer `number` past 2^53 as a `bigint`. `undefined`
- * for any other value, which comes back as it went.
+ * The value a field stored, from what a read of it hands back, for composing a key from a row read
+ * back: `undefined` when it's that already. A field storing one numeric kind takes it
+ * ({@link storedNumericForm}). A field whose kinds can't be read off its schema ({@link
+ * kindsUnreadable}) is decoded through the field, as a read decodes it, and encoded again, as a write
+ * encodes it: `Schema.Unknown` decoded to a `Schema.BigInt` with `BigInt(n)` stored `5n`, which reads
+ * back as `5`, and decoding `5` gives `5n` again. Only a number or a bigint is taken this way, the
+ * only values DynamoDB hands back otherwise, and for any other field nothing is.
  */
-const readBackKind = (stored: unknown): number | bigint | undefined => {
-  if (typeof stored === "bigint") {
-    const asNumber = Number(stored)
-    return Number.isSafeInteger(asNumber) && BigInt(asNumber) === stored ? asNumber : undefined
+export const storedFormOfRead = (field: Schema.Top): ((value: unknown) => unknown) | undefined => {
+  const lift = storedNumericForm(field)
+  if (lift !== undefined || !kindsUnreadable(field)) return lift
+  const codec = field as unknown as Schema.Codec<unknown, unknown>
+  const decode = Schema.decodeUnknownOption(codec)
+  const encode = Schema.encodeUnknownOption(codec)
+  return (value) => {
+    if (typeof value !== "number" && typeof value !== "bigint") return undefined
+    const stored = Option.flatMap(decode(value), (decoded) => encode(decoded))
+    return Option.isSome(stored) && !Object.is(stored.value, value) ? stored.value : undefined
   }
-  return typeof stored === "number" && Number.isInteger(stored) && !Number.isSafeInteger(stored)
-    ? BigInt(stored)
-    : undefined
 }
 
-const sameValue = (a: unknown, b: unknown): boolean =>
-  typeof a === typeof b && (Object.is(a, b) || Equal.equals(a, b))
+/**
+ * Whether two decoded values compose the same key text: the same value, or the same number (`-0` and
+ * `0` compose the same text).
+ */
+const sameKeyValue = (a: unknown, b: unknown): boolean =>
+  typeof a === typeof b &&
+  (Object.is(a, b) || (typeof a === "number" && a === b) || Equal.equals(a, b))
+
+/** The texts a key composite's value is composed into: as written, and from what's read back. */
+export interface ReadBackText {
+  /** The text a write composes from the value it stores, `undefined` when it composes none. */
+  readonly written: (stored: unknown) => string | undefined
+  /** The text composed again from the value read back, `undefined` when none can be. */
+  readonly read: (returned: unknown) => string | undefined
+}
 
 /**
- * For a key composite whose numeric kinds can't be read at load ({@link kindsUnreadable}): what a
- * value a write stores reads back as, when that is something other than what was written, so a
- * stored row composes other key text: `"a number"`, `"a bigint"`, or `"a value the field refuses"`.
- * `undefined` for a value that reads back as written. DynamoDB returns a safe-integer `bigint` as
- * a `number` and an integer `number` past 2^53 as a `bigint` ({@link readBackKind}); that value is
- * decoded through the field and compared with the stored value decoded. `Schema.Unknown` reads
- * `5n` back as `5`, and a declaration of either kind does the same, so both are refused;
- * `Schema.Unknown` decoded to a `Schema.BigInt` with `BigInt(n)` reads it back as `5n`, and is
- * stored. Only a value of the other kind on the way back is decoded, twice, synchronously. The
- * judge itself is `undefined` for a field whose kinds can be read, which never needs asking: one
- * declaring both is refused at load ({@link bothKindsKeyRefusal}).
+ * For a key composite whose read-back can't be guaranteed at load ({@link readBackUnsure}, of the
+ * field that reads it back or of the one a write encodes it with): what a value a write stores reads
+ * back as, when a key composed again from the row read back wouldn't be the key written. `"a
+ * number"` or `"a bigint"` for a value read back as the other kind, `"a value the field refuses"`,
+ * or the value it reads back as. `undefined` for a value that reads back as written.
+ *
+ * `asRead` is what DynamoDB hands back for a stored value, the marshaller and the unmarshaller run
+ * for real: a safe-integer `bigint` comes back as a `number`, an integer `number` past 2^53 as a
+ * `bigint`, and `-0` as `0`. A value that comes back as it went is never judged. One that doesn't is
+ * judged twice: each of `texts` composed from the value written and from the value read back must be
+ * the same text, and the value read back, decoded through `field`, must be the value written
+ * decoded (when that decodes). `Schema.Unknown` reads `5n` back as `5`, and a declaration of either
+ * kind does the same, so both are refused; `Schema.Unknown` decoded to a `Schema.BigInt` with
+ * `BigInt(n)` reads it back as `5n`, and is stored. A codec decoding `-0` and `0` to different values
+ * refuses `-0`. The judge itself is `undefined` for a field that reads back as itself by
+ * construction, which never needs asking.
  */
 export const readsBackOtherwise = (
   field: Schema.Top,
+  options: {
+    readonly asRead: (stored: unknown) => unknown
+    /** The field a write encodes the value with, when it isn't `field` (`timeSeries.appendInput`). */
+    readonly written?: Schema.Top | undefined
+    readonly texts?: ReadonlyArray<ReadBackText> | undefined
+  },
 ): ((stored: unknown) => string | undefined) | undefined => {
-  if (!kindsUnreadable(field)) return undefined
+  if (
+    !readBackUnsure(field) &&
+    (options.written === undefined || !readBackUnsure(options.written))
+  ) {
+    return undefined
+  }
   const decode = Schema.decodeUnknownOption(field as unknown as Schema.Codec<unknown, unknown>)
+  const texts = options.texts ?? []
   return (stored) => {
-    const returned = readBackKind(stored)
-    if (returned === undefined) return undefined
-    const read = decode(returned)
-    const written = decode(stored)
-    if (Option.isSome(read) && Option.isSome(written) && sameValue(read.value, written.value)) {
+    // A string or a boolean comes back as it went.
+    if (typeof stored === "string" || typeof stored === "boolean") return undefined
+    let returned: unknown
+    try {
+      returned = options.asRead(stored)
+    } catch {
+      // A value the marshaller refuses is the write's own marshalling's to report.
       return undefined
     }
+    if (Object.is(returned, stored)) return undefined
+    const read = decode(returned)
+    const written = decode(stored)
+    const textMoved = texts.some((text) => {
+      const at = text.written(stored)
+      return at !== undefined && text.read(returned) !== at
+    })
+    const valueMoved =
+      Option.isSome(written) &&
+      (Option.isNone(read) ||
+        (typeof written.value !== "object" &&
+          typeof written.value !== "function" &&
+          !sameKeyValue(read.value, written.value)))
+    if (!textMoved && !valueMoved) return undefined
     if (Option.isNone(read)) return "a value the field refuses"
+    const was = Option.isSome(written) ? written.value : stored
+    if (typeof read.value !== typeof was) {
+      return typeof read.value === "bigint"
+        ? "a bigint"
+        : typeof read.value === "number"
+          ? "a number"
+          : "something else"
+    }
     return typeof read.value === "bigint"
-      ? "a bigint"
-      : typeof read.value === "number"
-        ? "a number"
-        : "something else"
+      ? `${read.value}n`
+      : typeof read.value === "number" || typeof read.value === "boolean"
+        ? String(read.value)
+        : typeof read.value === "string"
+          ? JSON.stringify(read.value)
+          : "something else"
   }
 }
 

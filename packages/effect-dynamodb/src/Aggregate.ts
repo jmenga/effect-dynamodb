@@ -94,7 +94,7 @@ import { asReadGuard } from "./internal/ExpressionLimits.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
-import { notReadBack, notStoredForm } from "./internal/RoundTrip.js"
+import { asRead, notReadBack, notStoredForm, readBackRefusal } from "./internal/RoundTrip.js"
 import { generateTimestampPrimitive, marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
@@ -1700,7 +1700,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
     ): ReadonlyArray<Check> =>
       composites.flatMap((path) => {
         const fieldSchema = fieldAtPath(fields, path)
-        const readsOther = fieldSchema === undefined ? undefined : readsBackOtherwise(fieldSchema)
+        const readsOther =
+          fieldSchema === undefined ? undefined : readsBackOtherwise(fieldSchema, { asRead })
         return readsOther === undefined ? [] : [{ path, into, readsOther }]
       })
     const byType = new Map<string, ReadonlyArray<Check>>()
@@ -1746,18 +1747,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const held = readCompositePath(item.attributes, path)
           const readsAs = held == null ? undefined : readsOther(held)
           if (readsAs === undefined) continue
-          const given =
-            typeof held === "bigint" ? `the bigint ${held}n` : `the number ${String(held)}`
           return Effect.fail(
             new ValidationError({
               entityType: aggregateName,
               operation,
-              cause:
-                `Field "${path}" of "${item.member}" is composed into ${into}, and ${given} ` +
-                `would read back as ${readsAs}, whose key text isn't the one written: ` +
-                "DynamoDB stores a number and a bigint alike. A key composed again from the " +
-                "stored rows wouldn't be this one. Nothing was written. Declare the field's kind, " +
-                "such as Schema.Number or Schema.BigInt. [EDD-9128]",
+              cause: readBackRefusal(
+                `Field "${path}" of "${item.member}" is composed into ${into}`,
+                held,
+                readsAs,
+              ),
             }),
           )
         }

@@ -53,7 +53,9 @@ import {
   kindReadingOf,
   makeCompositeKeyForm,
   otherNumericKind,
+  type ReadBackText,
   readsBackOtherwise,
+  storedFormOfRead,
   storedNumericForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -136,7 +138,13 @@ import {
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
-import { asRead, notReadBack, type ReadBack, readBackOf } from "./internal/RoundTrip.js"
+import {
+  asRead,
+  notReadBack,
+  type ReadBack,
+  readBackOf,
+  readBackRefusal,
+} from "./internal/RoundTrip.js"
 import {
   composeKeysOrFail,
   freshIncarnationToken,
@@ -3031,15 +3039,72 @@ const makeImpl = <
     return timeSeries?.orderBy === field ? "an event's sort key (timeSeries.orderBy)" : undefined
   }
 
+  /** A composite value's text, as `KeyComposer` composes it; `undefined` when it composes none. */
+  const compositeTextOf = (value: unknown): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    try {
+      return KeyComposer.compositeText(schema, value)
+    } catch {
+      return undefined
+    }
+  }
+
   /**
-   * The key composites of `fields` whose numeric kinds can't be read at load (`Schema.Unknown`,
-   * `Schema.Any`, a declaration, or a transformation from one), each with what composes it and the
-   * test of a stored value that reads back otherwise (`readsBackOtherwise`). A write giving one such
-   * a value is refused (`EDD-9128`); a declared one is refused at load. A field no key composes isn't
-   * asked. Empty for a model with none, which pays nothing more on a write.
+   * The texts a key composite's value is composed into, written and composed again from a row read
+   * back, by what composes it: a key or a vector partition through the key form; a unique sentinel
+   * from the value as stored (`storedSentinelValue`, `readSentinelValue`); and `append`'s event sort
+   * key, with `escapeKeys` and `numericKeyText` off, from the value as given.
+   */
+  const readBackTexts = (field: string, append: boolean): ReadonlyArray<ReadBackText> => {
+    const timeSeries = config.timeSeries as TimeSeriesConfig<any> | undefined
+    const numericOrderBy = schema.escapeKeys === true || schema.numericKeyText === true
+    const inKey =
+      Object.values(allIndexes).some(
+        (def) => def.pk.composite.includes(field) || def.sk.composite.includes(field),
+      ) ||
+      Object.values(data.vectorIndexes).some((def) => def.partition.includes(field)) ||
+      (append && timeSeries?.orderBy === field && numericOrderBy)
+    const inSentinel =
+      !append &&
+      Object.values((config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>).some(
+        (def) => resolveUniqueFields(def).includes(field),
+      )
+    const inEvent = append && timeSeries?.orderBy === field && !numericOrderBy
+    const keyText = (value: unknown) => {
+      try {
+        return compositeTextOf(compositeKeyForm(field, value))
+      } catch {
+        return undefined
+      }
+    }
+    const readText = (value: unknown) => compositeTextOf(readSentinelValue(field, value) ?? value)
+    return [
+      ...(inKey ? [{ written: keyText, read: keyText }] : []),
+      ...(inSentinel
+        ? [
+            {
+              written: (value: unknown) =>
+                compositeTextOf(storedSentinelValue(field, value) ?? value),
+              read: readText,
+            },
+          ]
+        : []),
+      ...(inEvent ? [{ written: compositeTextOf, read: readText }] : []),
+    ]
+  }
+
+  /**
+   * The key composites of `fields` (the model's, or `appendInput`'s for `append`) whose read-back
+   * can't be guaranteed at load (`readBackUnsure`: a transformation, or numeric kinds that can't be
+   * read off the schema), each with what composes it and the test of a stored value that reads back
+   * otherwise (`readsBackOtherwise`): read back by the model's field, as every read and every key
+   * composed again from a row reads it. A write giving one such a value is refused (`EDD-9128`). A
+   * field no key composes isn't asked. Empty for a model with none, which pays nothing more on a
+   * write.
    */
   const otherKindReadsOf = (
     fields: globalThis.Record<string, Schema.Top>,
+    append: boolean,
   ): ReadonlyMap<
     string,
     { readonly into: string; readonly readsOther: (value: unknown) => string | undefined }
@@ -3047,8 +3112,14 @@ const makeImpl = <
     new Map(
       Object.entries(fields).flatMap(([field, schema]) => {
         const into = composedInto(field)
-        const readsOther = into === undefined ? undefined : readsBackOtherwise(schema)
-        return readsOther === undefined ? [] : [[field, { into: into!, readsOther }] as const]
+        if (into === undefined) return []
+        const reading = modelFieldSchemas[field] ?? schema
+        const readsOther = readsBackOtherwise(reading, {
+          asRead,
+          written: schema === reading ? undefined : schema,
+          texts: readBackTexts(field, append),
+        })
+        return readsOther === undefined ? [] : [[field, { into, readsOther }] as const]
       }),
     )
   type KindReads = ReturnType<typeof otherKindReadsOf>
@@ -3066,15 +3137,15 @@ const makeImpl = <
       appendInput === undefined ? undefined : getSchemaFields(appendInput as Schema.Top)
     kindReadsFor = {
       indexes: allIndexes,
-      model: otherKindReadsOf(data.modelFields as globalThis.Record<string, Schema.Top>),
-      append: appendFields === undefined ? new Map() : otherKindReadsOf(appendFields),
+      model: otherKindReadsOf(data.modelFields as globalThis.Record<string, Schema.Top>, false),
+      append: appendFields === undefined ? new Map() : otherKindReadsOf(appendFields, true),
     }
     return kindReadsFor
   }
 
   /**
-   * Refuses a payload storing, for a key composite whose numeric kinds can't be read at load, a value
-   * that reads back otherwise: a stored row would compose other key text (`EDD-9128`).
+   * Refuses a payload storing, for a key composite whose read-back can't be guaranteed at load, a
+   * value that reads back otherwise: a stored row would compose other key text (`EDD-9128`).
    */
   const refuseOtherKindRead = (
     encoded: unknown,
@@ -3085,17 +3156,11 @@ const makeImpl = <
       const value = (encoded as globalThis.Record<string, unknown>)[field]
       const readsAs = value == null ? undefined : readsOther(value)
       if (readsAs === undefined) continue
-      const given = typeof value === "bigint" ? `the bigint ${value}n` : `the number ${value}`
       return Effect.fail(
         new ValidationError({
           entityType,
           operation,
-          cause:
-            `Field "${field}" is composed into ${into}, and ${given} would read back as ` +
-            `${readsAs}, whose key text isn't the one written: DynamoDB stores a number and a ` +
-            "bigint alike. A key composed again from the stored row wouldn't be this one. " +
-            "Nothing was written. Declare the field's kind, such as Schema.Number or " +
-            "Schema.BigInt. [EDD-9128]",
+          cause: readBackRefusal(`Field "${field}" is composed into ${into}`, value, readsAs),
         }),
       )
     }
@@ -3760,6 +3825,25 @@ const makeImpl = <
       if (!forms.has(field)) {
         const fieldSchema = fields?.[field]
         forms.set(field, fieldSchema === undefined ? undefined : storedNumericForm(fieldSchema))
+      }
+      return forms.get(field)?.(value)
+    }
+  })()
+
+  /**
+   * A unique field's value, or a time-series `orderBy`, as `put` or `append` stored it, from a row
+   * read back: {@link storedSentinelValue}, and for a field whose numeric kinds can't be read off its
+   * schema, the value decoded through the field, as a read decodes it, and encoded again
+   * (`storedFormOfRead`). `Schema.Unknown` decoded to a `Schema.BigInt` stored `5n`, which reads back
+   * as `5`. Only a value read from a row is taken this way: a write's own value is the one it stores.
+   */
+  const readSentinelValue = (() => {
+    const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
+    const forms = new Map<string, ((value: unknown) => unknown) | undefined>()
+    return (field: string, value: unknown): unknown => {
+      if (!forms.has(field)) {
+        const fieldSchema = fields?.[field]
+        forms.set(field, fieldSchema === undefined ? undefined : storedFormOfRead(fieldSchema))
       }
       return forms.get(field)?.(value)
     }
@@ -5941,7 +6025,7 @@ const makeImpl = <
                   constraintName,
                   constraintDef,
                   oldSource,
-                  storedSentinelValue,
+                  readSentinelValue,
                 )
               : undefined
           if (next !== undefined && prior !== undefined && sameKey(next.key, prior.key)) continue
@@ -7380,7 +7464,7 @@ const makeImpl = <
               constraintName,
               constraintDef,
               currentRawDomain,
-              storedSentinelValue,
+              readSentinelValue,
             )
             const newSentinel = composeUniqueSentinel(
               schema,
@@ -7388,7 +7472,10 @@ const makeImpl = <
               constraintName,
               constraintDef,
               newItem,
-              storedSentinelValue,
+              (field, value) =>
+                Object.is(value, currentDomainItem[field])
+                  ? readSentinelValue(field, value)
+                  : storedSentinelValue(field, value),
             )
 
             if (!oldSentinel && !newSentinel) continue
@@ -9321,7 +9408,7 @@ const makeImpl = <
                   constraintName,
                   constraintDef,
                   rawDomain,
-                  storedSentinelValue,
+                  readSentinelValue,
                 )
                 if (!sentinel) continue
                 held.push({ ...sentinel.key, constraintName })
@@ -11710,7 +11797,7 @@ const makeImpl = <
                 constraintName,
                 constraintDef,
                 restoredDomain,
-                storedSentinelValue,
+                readSentinelValue,
               )
               if (!sentinel) continue
               sentinelConstraints.push(constraintName)
@@ -11967,7 +12054,7 @@ const makeImpl = <
                   constraintName,
                   constraintDef,
                   holderDomain,
-                  storedSentinelValue,
+                  readSentinelValue,
                 )
                 if (!sentinel) continue
                 held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
@@ -12374,7 +12461,7 @@ const makeImpl = <
     if (values[orderBy] === undefined || values[orderBy] === null) return undefined
     // What `append` composed the key from: the Encoded value it stored, which a `bigint`
     // reads back from as a number while it's a safe integer.
-    const appended = storedSentinelValue(orderBy, values[orderBy]) ?? values[orderBy]
+    const appended = readSentinelValue(orderBy, values[orderBy]) ?? values[orderBy]
     return {
       kind: "event",
       at: (form, key, record) =>
@@ -13462,7 +13549,7 @@ const makeImpl = <
         constraintName,
         constraintDef,
         source,
-        (field, value) => (asOther.has(field) ? undefined : storedSentinelValue(field, value)),
+        (field, value) => (asOther.has(field) ? undefined : readSentinelValue(field, value)),
       )?.key
     } catch {
       return undefined
@@ -13475,7 +13562,7 @@ const makeImpl = <
   ) => {
     const lifted = { ...source }
     for (const field of resolveUniqueFields(constraintDef)) {
-      const value = storedSentinelValue(field, source[field])
+      const value = readSentinelValue(field, source[field])
       if (value !== undefined) lifted[field] = value
     }
     return lifted
@@ -13716,7 +13803,7 @@ const makeImpl = <
                 constraintName,
                 constraintDef,
                 values,
-                storedSentinelValue,
+                readSentinelValue,
               )?.key,
             }
           } catch {

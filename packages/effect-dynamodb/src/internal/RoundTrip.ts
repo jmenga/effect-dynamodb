@@ -54,6 +54,37 @@ export const notStoredForm = (fields: ReadonlyArray<string>, issue: unknown): st
   `aggregate wouldn't read back: ${issueOf(issue)}. Nothing was written. A transformation that ` +
   "encodes what it decodes to reads back. [EDD-9127]"
 
+/**
+ * The refusal of a key composite's value that reads back otherwise (`EDD-9128`): `what` names the
+ * field and what composes it, and `readsAs` is what the value reads back as.
+ */
+export const readBackRefusal = (what: string, value: unknown, readsAs: string): string => {
+  const given =
+    typeof value === "bigint"
+      ? `the bigint ${value}n`
+      : typeof value === "number"
+        ? `the number ${Object.is(value, -0) ? "-0" : String(value)}`
+        : "the value given"
+  let returned: unknown = value
+  try {
+    returned = asRead(value)
+  } catch {
+    // Described as given.
+  }
+  const because =
+    (typeof value === "bigint" || typeof value === "number") && typeof returned !== typeof value
+      ? "DynamoDB stores a number and a bigint alike"
+      : Object.is(value, -0)
+        ? "DynamoDB stores -0 as 0"
+        : "DynamoDB doesn't hand it back as it was written"
+  return (
+    `${what}, and ${given} would read back as ${readsAs}, whose key text isn't the one ` +
+    `written: ${because}. A key composed again from the stored row wouldn't be this one. ` +
+    "Nothing was written. Declare the field's kind, such as Schema.Number or Schema.BigInt, " +
+    "or store a value that reads back as written. [EDD-9128]"
+  )
+}
+
 /** The refusal in words: `what` is what the value is, and `issue` what a read made of it. */
 export const notReadBack = (what: string, issue: unknown): string =>
   `${what} wouldn't read back: a custom declaration's value is stored as the map the marshaller ` +

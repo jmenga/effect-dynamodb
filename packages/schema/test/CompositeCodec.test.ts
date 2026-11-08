@@ -207,7 +207,20 @@ describe("CompositeCodec", () => {
     })
 
     it("judges a value of a field whose kinds can't be read by the value DynamoDB returns", () => {
-      const readsOther = readsBackOtherwise(Schema.Unknown)!
+      // What DynamoDB hands back, as the marshaller and the unmarshaller do: a safe-integer bigint
+      // as a number, an integer number past 2^53 as a bigint, and -0 as 0.
+      const asRead = (stored: unknown): unknown => {
+        if (typeof stored === "bigint") {
+          return Number.isSafeInteger(Number(stored)) ? Number(stored) : stored
+        }
+        if (typeof stored === "number") {
+          if (Object.is(stored, -0)) return 0
+          return Number.isInteger(stored) && !Number.isSafeInteger(stored) ? BigInt(stored) : stored
+        }
+        return stored
+      }
+      const judge = (field: Schema.Top) => readsBackOtherwise(field, { asRead })
+      const readsOther = judge(Schema.Unknown)!
       expect(readsOther(5n)).toBe("a number")
       expect(readsOther(-5n)).toBe("a number")
       expect(readsOther(2n ** 60n + 1n)).toBeUndefined()
@@ -215,7 +228,7 @@ describe("CompositeCodec", () => {
       expect(readsOther(1.5)).toBeUndefined()
       expect(readsOther(2 ** 60)).toBe("a bigint")
       expect(readsOther("5")).toBeUndefined()
-      expect(readsBackOtherwise(Schema.Any)).toBeDefined()
+      expect(judge(Schema.Any)).toBeDefined()
       // A transform whose stored side can't be read is judged through its decode: a bigint that
       // decodes the number DynamoDB returns to the same bigint is read back as written.
       const toBigInt = Schema.Unknown.pipe(
@@ -224,16 +237,27 @@ describe("CompositeCodec", () => {
           encode: SchemaGetter.transform((n) => n),
         }),
       )
-      expect(readsBackOtherwise(toBigInt)?.(5n)).toBeUndefined()
+      expect(judge(toBigInt)?.(5n)).toBeUndefined()
       const declared = Schema.declare(
         (v): v is number | bigint => typeof v === "number" || typeof v === "bigint",
       )
-      expect(readsBackOtherwise(declared)?.(5n)).toBe("a number")
-      expect(readsBackOtherwise(declared)?.(5)).toBeUndefined()
+      expect(judge(declared)?.(5n)).toBe("a number")
+      expect(judge(declared)?.(5)).toBeUndefined()
       // Kinds known at load are never judged at write.
-      expect(readsBackOtherwise(Schema.BigInt)).toBeUndefined()
-      expect(readsBackOtherwise(Schema.String)).toBeUndefined()
-      expect(readsBackOtherwise(Schema.Union([Schema.Number, Schema.BigInt]))).toBeUndefined()
+      expect(judge(Schema.BigInt)).toBeUndefined()
+      expect(judge(Schema.String)).toBeUndefined()
+      expect(judge(Schema.Union([Schema.Number, Schema.BigInt]))).toBeUndefined()
+      // -0 reads back as 0: the same key text for a field reading both alike, and refused by one that
+      // decodes them to different values.
+      expect(readsOther(-0)).toBeUndefined()
+      const zero = Schema.Unknown.pipe(
+        Schema.decodeTo(Schema.Literals([1n, 2n]), {
+          decode: SchemaGetter.transform((x) => (Object.is(x, -0) ? 1n : 2n)),
+          encode: SchemaGetter.transform((x) => (x === 1n ? -0 : 1)),
+        }),
+      )
+      expect(judge(zero)?.(-0)).toBe("2n")
+      expect(judge(zero)?.(1)).toBeUndefined()
     })
 
     it("follows a dotted composite through what holds each segment", () => {
