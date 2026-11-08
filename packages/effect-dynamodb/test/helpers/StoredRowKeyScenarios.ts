@@ -10,6 +10,7 @@
  * (`connected.stored-row-keys.test.ts`), through a {@link Harness}.
  */
 
+import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
@@ -115,7 +116,17 @@ interface Shape {
   readonly name: string
   readonly schema: Schema.Top
   readonly given: (value: bigint) => unknown
+  /** The values it's run with, when not {@link VALUES}. */
+  readonly values?: ReadonlyArray<readonly [string, bigint]>
+  /**
+   * What's compared of a value read back. A union storing both numeric kinds reads a safe integer
+   * back as a number from a plain read, whichever kind was put.
+   */
+  readonly text?: (value: unknown) => string
 }
+
+/** Both numeric kinds, stored as `N` either way, whose key texts differ (16 digits, 38). */
+export const NumericUnion = Schema.Union([Schema.Number, Schema.BigInt])
 
 const SHAPES: ReadonlyArray<Shape> = [
   { name: "Schema.BigInt", schema: Schema.BigInt, given: (value) => value },
@@ -128,6 +139,19 @@ const SHAPES: ReadonlyArray<Shape> = [
     name: "a BigInt under a decoding default",
     schema: Schema.BigInt.pipe(Schema.withDecodingDefault(Effect.succeed(7n))),
     given: (value) => value,
+  },
+  {
+    name: "Union([Number, BigInt]) holding a bigint",
+    schema: NumericUnion,
+    given: (value) => value,
+    text: String,
+  },
+  {
+    name: "Union([Number, BigInt]) holding a number",
+    schema: NumericUnion,
+    given: (value) => Number(value),
+    values: [["5", 5n]],
+    text: String,
   },
 ]
 
@@ -338,8 +362,9 @@ const shapeScenarios = (shape: Shape, label: string, value: bigint): ReadonlyArr
     >
 
   /** Every field reads back as it was put. */
+  const text = shape.text ?? show
   const readsBack = (got: any) => {
-    expect(show(got.n)).toBe(show(n))
+    expect(text(got.n)).toBe(text(n))
     expect(show(got.o)).toBe(show(item.o))
     expect(show(got.ok)).toBe(show(item.ok))
     expect(show(got.f)).toBe(show(item.f))
@@ -464,11 +489,11 @@ const shapeScenarios = (shape: Shape, label: string, value: bigint): ReadonlyArr
           }))
           expect(teamKeys(yield* rows())).toEqual(written)
           const got = yield* db.aggregates.Teams.get({ id: "a", n })
-          expect(show(got.n)).toBe(show(n))
-          expect(show(got.lines[0].k)).toBe(show(n))
+          expect(text(got.n)).toBe(text(n))
+          expect(text(got.lines[0].k)).toBe(text(n))
           const listed = yield* db.aggregates.Teams.list({ cust: "c" })
           expect(listed.data).toHaveLength(1)
-          expect(show(listed.data[0].n)).toBe(show(n))
+          expect(text(listed.data[0].n)).toBe(text(n))
           yield* db.aggregates.Teams.delete({ id: "a", n })
           expect(teamKeys(yield* rows())).toEqual([])
         }),
@@ -516,7 +541,7 @@ const shapeScenarios = (shape: Shape, label: string, value: bigint): ReadonlyArr
 }
 
 const shapes: ReadonlyArray<Scenario> = SHAPES.flatMap((shape) =>
-  VALUES.flatMap(([label, value]) => shapeScenarios(shape, label, value)),
+  (shape.values ?? VALUES).flatMap(([label, value]) => shapeScenarios(shape, label, value)),
 )
 
 /** A row holding a composite no form of its schema takes: rekey reports it and leaves it. */
@@ -827,8 +852,573 @@ const injectedIndex: Scenario = {
   },
 }
 
+/** The write failed with EDD-9128: a key would be composed from a value its row doesn't prove. */
+const unproven = (exit: Exit.Exit<unknown, unknown>, field: string) => {
+  expect(Exit.isFailure(exit)).toBe(true)
+  if (Exit.isFailure(exit)) {
+    const error = Cause.squash(exit.cause) as { readonly _tag?: string }
+    expect(error._tag).toBe("ValidationError")
+    expect(String((error as { readonly cause?: unknown }).cause)).toContain(`[EDD-9128] "${field}"`)
+  }
+}
+
+/**
+ * A key composite storing both numeric kinds, where no key of the stored row holds it: in an index
+ * only, and in a unique constraint only. A live row's index key says which kind `put` wrote; a
+ * tombstone holds no index key, and no row holds a sentinel's. A path composing a key from such a
+ * value writes the key the row proves, finds a sentinel by its owner, and otherwise writes nothing.
+ */
+const unionPlacements: ReadonlyArray<Scenario> = (() => {
+  const Model = Schema.Struct({
+    id: Schema.String,
+    n: NumericUnion,
+    m: Schema.optional(Schema.String),
+    note: Schema.optional(Schema.String),
+    line: Schema.optional(Schema.String),
+  })
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const UG = Entity.make({
+    model: Model,
+    entityType: "UG",
+    primaryKey,
+    indexes: {
+      byN: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["id"] },
+        sk: { field: "gsi1sk", composite: ["n"] },
+      },
+    },
+    versioned: { retain: true },
+    softDelete: true,
+  } as never) as any
+  const UU = Entity.make({
+    model: Model,
+    entityType: "UU",
+    primaryKey,
+    unique: { byN: ["n"] },
+    softDelete: true,
+  } as never) as any
+  // In the primary key and a unique constraint: the tombstone's item segment says which.
+  const UP = Entity.make({
+    model: Model,
+    entityType: "UP",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: ["n"] } },
+    unique: { byN: ["n"] },
+    softDelete: true,
+  } as never) as any
+  // In a unique constraint with another field: an update of the other keeps the value's kind.
+  const UC = Entity.make({
+    model: Model,
+    entityType: "UC",
+    primaryKey,
+    unique: { byNM: ["n", "m"] },
+  } as never) as any
+  // In a vector partition only: the stored partition says which.
+  const UV = Entity.make({
+    model: Model,
+    entityType: "UV",
+    primaryKey,
+    vectorIndexes: {
+      byNote: {
+        name: "vec1",
+        dimensions: 2,
+        distance: "cosine",
+        source: { fields: ["note", "line"] },
+        partition: ["n"],
+      },
+    },
+  } as never) as any
+  const members = { UG, UU, UP, UC, UV }
+  const Main = Table.make({
+    schema: DynamoSchema.make({ name: "srk", version: 1, escapeKeys: false }),
+    entities: members,
+  } as never) as Table.Table
+  const embedder = Layer.succeed(Embedder, {
+    dimensions: 2,
+    embed: () => Effect.succeed([1, 0]),
+  } as never)
+  const on = (
+    h: Harness,
+    body: (
+      db: any,
+      rows: () => Effect.Effect<ReadonlyArray<StoredRow>, unknown>,
+      name: string,
+    ) => Effect.Effect<void, unknown, any>,
+  ) =>
+    h.on(
+      Main,
+      (name, rows) =>
+        Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: members,
+            tables: { Main },
+          } as never) as Effect.Effect<any, never, any>
+          return yield* body(db, rows, name)
+        }).pipe(Effect.provide(Layer.merge(Main.layer({ name }), embedder))) as Effect.Effect<
+          void,
+          unknown,
+          DynamoClient
+        >,
+    )
+  // A safe integer of either kind can't be told from what's stored; 2.5 and 2^60+1 can.
+  const ambiguous: ReadonlyArray<readonly [string, number | bigint, number | bigint]> = [
+    ["5n", 5n, 6n],
+    ["5", 5, 6],
+  ]
+  const told: ReadonlyArray<readonly [string, number | bigint]> = [
+    ["2.5", 2.5],
+    ["2^60+1", BIG],
+  ]
+  const typeRows = (rows: ReadonlyArray<StoredRow>, type: string) =>
+    rows.filter(
+      (row) => row.__edd_e__?.S === type || row.__edd_e__?.S?.startsWith(`${type}._unique.`),
+    )
+  return [
+    ...[...ambiguous, ...told].map(
+      ([label, n]): Scenario => ({
+        name: `in an index only, holding ${label}: a retained update, patch and transactional update keep the index key put wrote`,
+        run: (h) =>
+          on(h, (db, rows) =>
+            Effect.gen(function* () {
+              yield* db.entities.UG.put({ id: "a", n }).asEffect()
+              const written = keysOf(yield* rows(), "UG")
+              for (const write of [
+                () => db.entities.UG.update({ id: "a" }).set({ note: "u" }).asEffect(),
+                () => db.entities.UG.patch({ id: "a" }).set({ note: "p" }).asEffect(),
+                () =>
+                  Transaction.transactWrite([
+                    db.entities.UG.update({ id: "a" }).set({ note: "t" }),
+                  ]),
+              ]) {
+                yield* write()
+                expect(keysOf(yield* rows(), "UG")).toEqual(written)
+              }
+              const found = yield* db.entities.UG.byN({ id: "a" })
+                .where((t: any, { eq }: any) => eq(t.n, n))
+                .collect()
+              expect(found).toHaveLength(1)
+            }),
+          ),
+      }),
+    ),
+    ...ambiguous.map(
+      ([label, n]): Scenario => ({
+        name: `in an index only, holding ${label}: restore refuses (EDD-9128), and the tombstone stays`,
+        run: (h) =>
+          on(h, (db, rows) =>
+            Effect.gen(function* () {
+              yield* db.entities.UG.put({ id: "a", n }).asEffect()
+              yield* db.entities.UG.delete({ id: "a" }).asEffect()
+              const before = yield* rows()
+              unproven(yield* Effect.exit(run(db.entities.UG.restore({ id: "a" }))), "n")
+              expect(yield* rows()).toEqual(before)
+              const got = yield* Effect.exit(db.entities.UG.get({ id: "a" }))
+              expect(Exit.isFailure(got)).toBe(true)
+            }),
+          ),
+      }),
+    ),
+    ...told.map(
+      ([label, n]): Scenario => ({
+        name: `in an index only, holding ${label}: restore puts back the keys put wrote`,
+        run: (h) =>
+          on(h, (db, rows) =>
+            Effect.gen(function* () {
+              yield* db.entities.UG.put({ id: "a", n }).asEffect()
+              const written = keysOf(yield* rows(), "UG")
+              yield* db.entities.UG.delete({ id: "a" }).asEffect()
+              yield* run(db.entities.UG.restore({ id: "a" }))
+              expect(keysOf(yield* rows(), "UG")).toEqual(written)
+            }),
+          ),
+      }),
+    ),
+    ...ambiguous.map(
+      ([label, n, changed]): Scenario => ({
+        name: `in a unique constraint only, holding ${label}: the sentinel put reserved stays through an update, is released by a delete and moved by a change of value`,
+        run: (h) =>
+          on(h, (db, rows) =>
+            Effect.gen(function* () {
+              yield* db.entities.UU.put({ id: "a", n }).asEffect()
+              const written = keysOf(yield* rows(), "UU")
+              yield* db.entities.UU.update({ id: "a" }).set({ note: "u" }).asEffect()
+              expect(keysOf(yield* rows(), "UU")).toEqual(written)
+              yield* Transaction.transactWrite([
+                db.entities.UU.update({ id: "a" }).set({ note: "t" }),
+              ])
+              expect(keysOf(yield* rows(), "UU")).toEqual(written)
+              yield* db.entities.UU.delete({ id: "a" }).asEffect()
+              // Released: no sentinel holds the value.
+              expect(keysOf(yield* rows(), "UU")).toEqual({})
+              // A tombstone holds no sentinel's key: restore can't say which to reserve.
+              const before = yield* rows()
+              unproven(yield* Effect.exit(run(db.entities.UU.restore({ id: "a" }))), "n")
+              expect(yield* rows()).toEqual(before)
+              yield* db.entities.UU.put({ id: "a", n }).asEffect()
+              expect(keysOf(yield* rows(), "UU")).toEqual(written)
+              yield* db.entities.UU.update({ id: "a" }).set({ n: changed }).asEffect()
+              // The old value is free again.
+              yield* db.entities.UU.put({ id: "b", n }).asEffect()
+              const sentinels = typeRows(yield* rows(), "UU").filter(
+                (row) => row.__edd_e__?.S !== "UU",
+              )
+              expect(sentinels).toHaveLength(2)
+            }),
+          ),
+      }),
+    ),
+    ...ambiguous.map(
+      ([label, n]): Scenario => ({
+        name: `in a unique constraint with another field, holding ${label}: an update of the other moves the sentinel under the kind put reserved`,
+        run: (h) =>
+          on(h, (db, rows) =>
+            Effect.gen(function* () {
+              const sentinels = (found: ReadonlyArray<StoredRow>) =>
+                typeRows(found, "UC")
+                  .filter((row) => row.__edd_e__?.S !== "UC")
+                  .map((row) => row.pk!.S)
+              yield* db.entities.UC.put({ id: "a", n, m: "x" }).asEffect()
+              yield* db.entities.UC.update({ id: "a" }).set({ m: "y" }).asEffect()
+              yield* Transaction.transactWrite([db.entities.UC.update({ id: "a" }).set({ m: "z" })])
+              // Where a put of the same values reserves it: the other item is refused.
+              const taken = yield* Effect.exit(
+                db.entities.UC.put({ id: "b", n, m: "z" }).asEffect(),
+              )
+              expect(Exit.isFailure(taken)).toBe(true)
+              if (Exit.isFailure(taken)) {
+                expect((Cause.squash(taken.cause) as { readonly _tag?: string })._tag).toBe(
+                  "UniqueConstraintViolation",
+                )
+              }
+              expect(sentinels(yield* rows())).toHaveLength(1)
+              yield* db.entities.UC.delete({ id: "a" }).asEffect()
+              expect(sentinels(yield* rows())).toEqual([])
+            }),
+          ),
+      }),
+    ),
+    ...ambiguous.map(
+      ([label, n]): Scenario => ({
+        name: `in a vector partition only, holding ${label}: an update reading the item keeps the partition put wrote, and refuses (EDD-9128) when the row holds none`,
+        run: (h) =>
+          on(h, (db, rows, name) =>
+            Effect.gen(function* () {
+              yield* db.entities.UV.put({ id: "a", n, note: "x", line: "l" }).asEffect()
+              const written = keysOf(yield* rows(), "UV")
+              expect(Object.keys(written).some((k) => k.startsWith("__edd_vp_"))).toBe(true)
+              // A partial source: the item is read for the rest.
+              yield* db.entities.UV.update({ id: "a" }).set({ note: "y" }).asEffect()
+              expect(keysOf(yield* rows(), "UV")).toEqual(written)
+              // Without its partition (and vector), nothing on the row says which kind it was.
+              const row = (yield* rows()).find((r) => r.__edd_e__?.S === "UV")!
+              const bare = Object.fromEntries(
+                Object.entries(row).filter(([attribute]) => !attribute.startsWith("__edd_v")),
+              )
+              const raw = yield* DynamoClient
+              yield* raw.putItem({ TableName: name, Item: bare })
+              const before = yield* rows()
+              unproven(
+                yield* Effect.exit(
+                  db.entities.UV.update({ id: "a" }).set({ note: "z" }).asEffect(),
+                ),
+                "n",
+              )
+              expect(yield* rows()).toEqual(before)
+            }),
+          ),
+      }),
+    ),
+    ...[
+      ["-5n", -5n],
+      ["-5", -5],
+    ].map(
+      ([label, n]): Scenario => ({
+        // A negative composes other text under `escapeKeys: true`, and each kind its own.
+        name: `in a unique constraint only, holding ${label}: rekey moves the sentinel put reserved, and a delete releases it`,
+        run: (h) => {
+          const Escaped = Table.make({
+            schema: DynamoSchema.make({ name: "srk", version: 1, escapeKeys: true }),
+            entities: {
+              UU: Entity.make({
+                model: Model,
+                entityType: "UU",
+                primaryKey,
+                unique: { byN: ["n"] },
+                softDelete: true,
+              } as never),
+            },
+          } as never) as Table.Table
+          return h.on(Main, (name, rows) =>
+            Effect.gen(function* () {
+              const sentinels = (found: ReadonlyArray<StoredRow>) =>
+                typeRows(found, "UU")
+                  .filter((row) => row.__edd_e__?.S !== "UU")
+                  .map((row) => row.pk!.S)
+              yield* Effect.gen(function* () {
+                const db = yield* DynamoClient.make({
+                  entities: { UU },
+                  tables: { Main },
+                } as never) as Effect.Effect<any, never, any>
+                yield* db.entities.UU.put({ id: "a", n }).asEffect()
+              }).pipe(Effect.provide(Main.layer({ name }))) as Effect.Effect<void, unknown, never>
+              const before = sentinels(yield* rows())
+              yield* Effect.gen(function* () {
+                const db = yield* DynamoClient.make({
+                  entities: (Escaped as any).entities,
+                  tables: { Main: Escaped },
+                } as never) as Effect.Effect<any, never, any>
+                const report = yield* db.tables.Main.rekey()
+                expect(report.conflicts).toEqual([])
+                expect(report.sentinelsMoved).toBe(1)
+                const after = sentinels(yield* rows())
+                expect(after).toHaveLength(1)
+                expect(after).not.toEqual(before)
+                yield* db.entities.UU.delete({ id: "a" }).asEffect()
+              }).pipe(Effect.provide(Escaped.layer({ name }))) as Effect.Effect<
+                void,
+                unknown,
+                never
+              >
+              expect(sentinels(yield* rows())).toEqual([])
+            }),
+          )
+        },
+      }),
+    ),
+    ...ambiguous.map(
+      ([label, n]): Scenario => ({
+        name: `in the primary key and a unique constraint, holding ${label}: restore puts back the keys put wrote, and purge leaves nothing`,
+        run: (h) =>
+          on(h, (db, rows) =>
+            Effect.gen(function* () {
+              yield* db.entities.UP.put({ id: "a", n }).asEffect()
+              const written = keysOf(yield* rows(), "UP")
+              yield* db.entities.UP.delete({ id: "a", n }).asEffect()
+              yield* run(db.entities.UP.restore({ id: "a", n }))
+              expect(keysOf(yield* rows(), "UP")).toEqual(written)
+              yield* db.entities.UP.delete({ id: "a", n }).asEffect()
+              yield* run(db.entities.UP.purge({ id: "a", n }))
+              expect(typeRows(yield* rows(), "UP")).toEqual([])
+            }),
+          ),
+      }),
+    ),
+  ]
+})()
+
+/**
+ * Rows published 1.39.0 stored (`fixtures/stored-row-kinds-1.39.0.json`, from its own `create`,
+ * `put` and `delete`, on DynamoDB Local).
+ */
+const kinds139 = JSON.parse(
+  readFileSync(new URL("../fixtures/stored-row-kinds-1.39.0.json", import.meta.url), "utf8"),
+)
+
+/** The fixture's definitions: they must stay what its generator declared. */
+const fixtureMembers = (() => {
+  const schema = DynamoSchema.make({ name: "kinds", version: 1, escapeKeys: false })
+  const Line = Schema.Struct({ n: Schema.NumberFromString, note: Schema.String })
+  const Root = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+  const Lines = Entity.make({
+    model: Line,
+    entityType: "Line",
+    primaryKey: { pk: { field: "pk", composite: ["n"] }, sk: { field: "sk", composite: [] } },
+  } as never) as any
+  const Model = Schema.Struct({
+    id: Schema.String,
+    n: NumericUnion,
+    note: Schema.String,
+    other: Schema.BigInt.pipe(Schema.withDecodingDefault(Effect.succeed(7n))),
+  })
+  const InPrimary = Entity.make({
+    model: Model,
+    entityType: "InPrimary",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: ["n"] } },
+    softDelete: true,
+  } as never) as any
+  const InIndex = Entity.make({
+    model: Model,
+    entityType: "InIndex",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    indexes: {
+      byN: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["id"] },
+        sk: { field: "gsi1sk", composite: ["n"] },
+      },
+    },
+    softDelete: true,
+  } as never) as any
+  const InUnique = Entity.make({
+    model: Model,
+    entityType: "InUnique",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    unique: { byN: ["n"] },
+  } as never) as any
+  const entities = { Lines, InPrimary, InIndex, InUnique }
+  const Main = Table.make({ schema, entities } as never) as Table.Table
+  // A custom `decompose` handing back the wire form of a sort-key composite, padded.
+  const roots = (withEntity: boolean) =>
+    (Aggregate.make as any)(Root, {
+      table: Main,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "root" },
+      root: { entityType: "Root" },
+      edges: {
+        lines: Aggregate.many({
+          entityType: "Line",
+          ...(withEntity ? { entity: Lines } : {}),
+          sk: { composite: ["n"] },
+          decompose: (lines: ReadonlyArray<{ readonly n: number }>) =>
+            lines.map((line) => ({ ...line, n: String(line.n).padStart(2, "0") })),
+        } as never),
+      },
+    })
+  return { Main, entities, roots }
+})()
+
+/** On the fixture's table, with `rows` stored first as they are. */
+const onFixture = (
+  h: Harness,
+  seed: ReadonlyArray<StoredRow>,
+  aggregates: Record<string, unknown>,
+  body: (
+    db: any,
+    rows: () => Effect.Effect<ReadonlyArray<StoredRow>, unknown>,
+  ) => Effect.Effect<void, unknown, any>,
+) =>
+  h.on(
+    fixtureMembers.Main,
+    (name, rows) =>
+      Effect.gen(function* () {
+        const raw = yield* DynamoClient
+        for (const row of seed) yield* raw.putItem({ TableName: name, Item: row })
+        const db = yield* DynamoClient.make({
+          entities: fixtureMembers.entities,
+          aggregates,
+          tables: { Main: fixtureMembers.Main },
+        } as never) as Effect.Effect<any, never, any>
+        return yield* body(db, rows)
+      }).pipe(Effect.provide(fixtureMembers.Main.layer({ name }))) as Effect.Effect<
+        void,
+        unknown,
+        DynamoClient
+      >,
+  )
+
+const byKey = (rows: ReadonlyArray<StoredRow>) =>
+  [...rows].sort((a, b) => `${a.pk!.S}|${a.sk!.S}`.localeCompare(`${b.pk!.S}|${b.sk!.S}`))
+
+/** A row without what a write stamps on it. */
+const unstamped = (row: StoredRow) => {
+  const { createdAt: _c, updatedAt: _u, ...rest } = row
+  return rest
+}
+
+const fixtureScenarios: ReadonlyArray<Scenario> = [
+  ...[true, false].map(
+    (withEntity): Scenario => ({
+      name: `an aggregate's custom decompose handing back a wire value (${withEntity ? "with" : "without"} an edge entity): create stores what 1.39.0 stored, and get reads it`,
+      run: (h) =>
+        onFixture(h, [], { Roots: fixtureMembers.roots(withEntity) }, (db, rows) =>
+          Effect.gen(function* () {
+            yield* db.aggregates.Roots.create({ id: "a", lines: [{ n: 5, note: "a" }] })
+            const stored = kinds139.aggregate[withEntity ? "withEntity" : "withoutEntity"]
+            expect(byKey(yield* rows())).toEqual(byKey(stored.rows))
+            expect(yield* db.aggregates.Roots.get({ id: "a" })).toEqual(stored.read)
+          }),
+        ),
+    }),
+  ),
+  ...[true, false].map(
+    (withEntity): Scenario => ({
+      name: `an aggregate's custom decompose handing back a wire value (${withEntity ? "with" : "without"} an edge entity): an update of the rows 1.39.0 stored changes its edge in place`,
+      run: (h) => {
+        const stored = kinds139.aggregate[withEntity ? "withEntity" : "withoutEntity"]
+        return onFixture(h, stored.rows, { Roots: fixtureMembers.roots(withEntity) }, (db, rows) =>
+          Effect.gen(function* () {
+            yield* db.aggregates.Roots.update({ id: "a" }, ({ state }: any) => ({
+              ...state,
+              lines: state.lines.map((line: any) => ({ ...line, note: "changed" })),
+            }))
+            expect(yield* db.aggregates.Roots.get({ id: "a" })).toEqual({
+              id: "a",
+              lines: [{ n: 5, note: "changed" }],
+            })
+            const after = byKey(yield* rows())
+            expect(after.map((row) => `${row.pk!.S}|${row.sk!.S}`)).toEqual(
+              byKey(stored.rows).map((row: StoredRow) => `${row.pk!.S}|${row.sk!.S}`),
+            )
+          }),
+        )
+      },
+    }),
+  ),
+  {
+    name: "a numeric union in the primary key, beside a field no key reads: restore puts back the row put wrote, as 1.39.0 put it",
+    run: (h) =>
+      onFixture(h, [], {}, (db, rows) =>
+        Effect.gen(function* () {
+          const item = { id: "Ab C", n: 5n, note: "before", other: 5n }
+          yield* db.entities.InPrimary.put(item).asEffect()
+          const written = (yield* rows()).map(unstamped)
+          expect(written).toEqual(kinds139.union.inPrimary.put.map(unstamped))
+          yield* db.entities.InPrimary.delete({ id: "Ab C", n: 5n }).asEffect()
+          yield* run(db.entities.InPrimary.restore({ id: "Ab C", n: 5n }))
+          expect((yield* rows()).map(unstamped)).toEqual(written)
+          yield* db.entities.InPrimary.get({ id: "Ab C", n: 5n })
+        }),
+      ),
+  },
+  {
+    name: "a numeric union in the primary key: the tombstone 1.39.0 left restores under its live key",
+    run: (h) =>
+      onFixture(h, kinds139.union.inPrimary.rows, {}, (db, rows) =>
+        Effect.gen(function* () {
+          yield* run(db.entities.InPrimary.restore({ id: "Ab C", n: 5n }))
+          expect(keysOf(yield* rows(), "InPrimary")).toEqual(
+            keysOf(kinds139.union.inPrimary.put, "InPrimary"),
+          )
+          yield* db.entities.InPrimary.get({ id: "Ab C", n: 5n })
+        }),
+      ),
+  },
+  {
+    name: "a numeric union in an index only: restore of the tombstone 1.39.0 left refuses (EDD-9128), and it stays",
+    run: (h) =>
+      onFixture(h, kinds139.union.inIndex.rows, {}, (db, rows) =>
+        Effect.gen(function* () {
+          const before = yield* rows()
+          unproven(yield* Effect.exit(run(db.entities.InIndex.restore({ id: "Ab C" }))), "n")
+          expect(yield* rows()).toEqual(before)
+        }),
+      ),
+  },
+  {
+    name: "a numeric union in a unique constraint only: a delete of the row 1.39.0 stored releases its sentinel",
+    run: (h) =>
+      onFixture(h, kinds139.union.inUnique.rows, {}, (db, rows) =>
+        Effect.gen(function* () {
+          yield* db.entities.InUnique.update({ id: "Ab C" }).set({ note: "u" }).asEffect()
+          expect(keysOf(yield* rows(), "InUnique")).toEqual(
+            keysOf(kinds139.union.inUnique.rows, "InUnique"),
+          )
+          yield* db.entities.InUnique.delete({ id: "Ab C" }).asEffect()
+          expect(yield* rows()).toEqual([])
+          yield* db.entities.InUnique.put({ id: "b", n: 5n, note: "x", other: 1n }).asEffect()
+        }),
+      ),
+  },
+]
+
 export const allScenarios: Readonly<Record<string, ReadonlyArray<Scenario>>> = {
   "a key composed from a row read back is the key put composed": shapes,
   "a row rekey can't compose a key for": [uncomposable],
   "an attribute a key is composed from is refused like a composite": [...readers, injectedIndex],
+  "a numeric union no key of its row holds": unionPlacements,
+  "rows 1.39.0 stored": fixtureScenarios,
 }

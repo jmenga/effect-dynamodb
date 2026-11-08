@@ -1191,6 +1191,35 @@ sources, unique fields, vector partitions and the time-series `orderBy`): a
 value of any other attribute that reaches neither form is left as it is rather
 than refused, since it is never key text.
 
+**Both numeric kinds.** A field whose Encoded side admits a `number` and a
+`bigint` (`Schema.Union([Schema.Number, Schema.BigInt])`, `storedNumericKinds`)
+stores either as `N`, and a safe integer reads back as a `number` whichever was
+put, so its value alone can't say which key `put` composed (16 digits, or 38). A
+field admitting one kind is lifted to it (`Union([String, BigInt])` reads `5` as
+`5n`); one admitting both is left to the row. A path composing keys from a stored
+row never writes under a key the row doesn't prove (`readStored`, `Entity.ts`):
+it reads the value as the kind that reproduces the keys the row holds (the
+primary key, a history row's partition key and item segment, each index half and
+vector partition present), and a value no key on the row holds, or that no
+reading reproduces, is unproven. A key composed from an unproven value isn't
+written: the write fails with a `ValidationError` (**EDD-9128**) and changes
+nothing (`hangsOnUnproven`). That is `restore` of a value in an index only or a
+unique constraint only (a tombstone holds neither key), and an update that reads
+the item first and would compose an index key or vector partition the row doesn't
+hold from one; a value the update sets is the caller's. A sentinel is found by its owner instead: a key per reading,
+and the owner read the write already makes (`ownedSentinels`) says which this
+item holds, one more key in that read only for an unproven value. A new
+sentinel of a constraint over it and a field the update changes is composed with
+the kind of the old sentinel the item holds; holding none, a new key the readings
+disagree on is refused (EDD-9128). `rekey` moves a sentinel under the reading the
+item holds, and counts an index half composed from an unproven value as
+`ambiguous` and leaves it. Aggregates read a
+numeric composite as the kind its own segment of a key the row holds is the text
+of (`readKeysKind`, `Aggregate.ts`). Reads nothing more: only the row already read
+says. Since 1.40.0; 1.39.0 composed from the value as read, so a `bigint` safe
+integer was restored, updated and listed under the `number`'s key, its sentinel
+left behind by a delete.
+
 ### Isolated vs Clustered Key Prefixes
 
 **Isolated:**
@@ -3782,7 +3811,7 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 | Rule | Behaviour |
 |------|-----------|
 | **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` / `Record` / `Tuple` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` / `Union` node carries no encoding of its own; that included `Schema.optional(X)` and `NullOr(X)` around a transform. Fields with nothing to encode get no encoder and their bytes are unchanged. |
-| **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), then through it as a read reaches beneath a decoding default (`decodeOnly`); a value neither takes is stored as given and reported (`EDD-9127`, below). A `many` edge's sort-key composites and a root list index's are composed from the field's own `encode` (`buildKeyAttrEncoders`). |
+| **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
 | **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
 | **Union members** | `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` in every mode (`walkedContainer`), rebuilding each container kind around substituted children with the original node's annotations and `.check()` refinements (`withMetadataOf`). Under `tolerantTransforms` (aggregates) every transformed leaf is substituted; for entity derivation only self-date and `Redacted` leaves are. Union members follow the union rules in §8 (Self dates nested in containers): a self date accepts only its own wire kind, its domain or a legacy map; on a storage-kind collision only its exact canonical form, decoded first; an epoch date next to a numeric member is rejected (**EDD-9058**). The collision set propagates into nested unions. A transform date member keeps its own decode, so a stored `5` in `Union([DateTimeUtcFromString, Number])` stays a number. |
@@ -3940,8 +3969,9 @@ package.
 side, without encoding it, since the attribute encoders encode it next anyway and an encode here would be
 paid on every write. A schema that can't encode a value it decodes to, such as a transformation over
 itself (`s.pipe(Schema.decodeTo(s, passthrough))` where `s` holds a transformation), passes that check and
-reaches an encoder that can't put it in its stored form: neither the substituted schema nor the same
-beneath a decoding default takes it. Up to 1.39.0 the wire side was asked first and refused it. That value is stored as given, and the encoder reports it (`asGiven`, the item's
+reaches an encoder that can't put it in its stored form, neither the substituted schema nor the field's
+own encode nor decode then encode (`ownAttrEncoder`). Up to 1.39.0 the wire side was asked first and
+refused it. That value is stored as given, and the encoder reports it (`asGiven`, the item's
 `storedAsGiven`), so the write runs `refuseNotReadBack` over its rows: the real marshaller, unmarshaller
 and `assembleAggregate`, as a `get` reads them. Rows that don't read back are refused with a
 `ValidationError` naming each field as `"field" of "member"`, on `create` and `update`, and nothing is
@@ -5750,8 +5780,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container, other than one between lists holding the same type: `Schema.Date`, `Schema.Redacted`. `Schema.Redacted` beneath a transformation onto another type, such as `Schema.OptionFromOptional`, on every owner. A union a read can't tell a bigint from something else stored as a number in (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field that a read would try first, or another event), since `5n` and `5` are stored the same: on a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
+| `EDD-9128` | `Entity.ts` (`unprovenRefusal`), through `restore` and the update paths that read the item first (`update`, `patch`, in a `transactWrite` too, and a vector update reading the item for its source) | A key the write composes from a field storing both numeric kinds (`Schema.Union([Schema.Number, Schema.BigInt])`) whose stored row holds no key saying which kind `put` wrote: a safe integer reads back as a `number` either way, and the two kinds compose different key text. A `ValidationError` naming the field, with nothing written (a tombstone stays). `restore` of such a value in an index only or a unique constraint only, since a tombstone holds neither key; an update composing an index key or vector partition the row doesn't hold from it, or a new sentinel of a constraint whose old sentinel the item doesn't hold (§7 "Both numeric kinds"). |
 
-Next free code: **`EDD-9128`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: **`EDD-9129`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

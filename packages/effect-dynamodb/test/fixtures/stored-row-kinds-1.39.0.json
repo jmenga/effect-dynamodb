@@ -1,0 +1,255 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "aggregate": {
+  "withEntity": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$kinds#v1#line#5"
+     },
+     "note": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "n": {
+      "S": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kinds#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "read": {
+    "id": "a",
+    "lines": [
+     {
+      "n": 5,
+      "note": "a"
+     }
+    ]
+   }
+  },
+  "withoutEntity": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$kinds#v1#line#05"
+     },
+     "note": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "n": {
+      "S": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kinds#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "read": {
+    "id": "a",
+    "lines": [
+     {
+      "n": 5,
+      "note": "a"
+     }
+    ]
+   }
+  }
+ },
+ "union": {
+  "inPrimary": {
+   "put": [
+    {
+     "note": {
+      "S": "before"
+     },
+     "other": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "InPrimary"
+     },
+     "sk": {
+      "S": "$kinds#v1#inprimary#n_00000000000000000000000000000000000005"
+     },
+     "id": {
+      "S": "Ab C"
+     },
+     "pk": {
+      "S": "$kinds#v1#inprimary#id_ab c"
+     },
+     "n": {
+      "N": "5"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "note": {
+      "S": "before"
+     },
+     "other": {
+      "N": "5"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T00:52:30.774Z"
+     },
+     "__edd_e__": {
+      "S": "InPrimary"
+     },
+     "sk": {
+      "S": "$kinds#v1#inprimary#deleted#n_00000000000000000000000000000000000005#2026-11-08T00:52:30.774Z"
+     },
+     "id": {
+      "S": "Ab C"
+     },
+     "pk": {
+      "S": "$kinds#v1#inprimary#id_ab c"
+     },
+     "n": {
+      "N": "5"
+     }
+    }
+   ]
+  },
+  "inIndex": {
+   "put": [
+    {
+     "note": {
+      "S": "before"
+     },
+     "other": {
+      "N": "5"
+     },
+     "gsi1sk": {
+      "S": "$kinds#v1#inindex#n_00000000000000000000000000000000000005"
+     },
+     "__edd_e__": {
+      "S": "InIndex"
+     },
+     "gsi1pk": {
+      "S": "$kinds#v1#inindex#id_ab c"
+     },
+     "sk": {
+      "S": "$kinds#v1#inindex"
+     },
+     "id": {
+      "S": "Ab C"
+     },
+     "pk": {
+      "S": "$kinds#v1#inindex#id_ab c"
+     },
+     "n": {
+      "N": "5"
+     }
+    }
+   ],
+   "rows": [
+    {
+     "note": {
+      "S": "before"
+     },
+     "other": {
+      "N": "5"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T00:52:30.779Z"
+     },
+     "__edd_e__": {
+      "S": "InIndex"
+     },
+     "sk": {
+      "S": "$kinds#v1#inindex#deleted#2026-11-08T00:52:30.779Z"
+     },
+     "id": {
+      "S": "Ab C"
+     },
+     "pk": {
+      "S": "$kinds#v1#inindex#id_ab c"
+     },
+     "n": {
+      "N": "5"
+     }
+    }
+   ]
+  },
+  "inUnique": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$kinds#v1#inunique.byn"
+     },
+     "_entity_sk": {
+      "S": "$kinds#v1#inunique"
+     },
+     "pk": {
+      "S": "$kinds#v1#inunique.byn#00000000000000000000000000000000000005"
+     },
+     "_entity_pk": {
+      "S": "$kinds#v1#inunique#id_ab c"
+     },
+     "__edd_e__": {
+      "S": "InUnique._unique.byN"
+     }
+    },
+    {
+     "note": {
+      "S": "before"
+     },
+     "other": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "InUnique"
+     },
+     "sk": {
+      "S": "$kinds#v1#inunique"
+     },
+     "id": {
+      "S": "Ab C"
+     },
+     "pk": {
+      "S": "$kinds#v1#inunique#id_ab c"
+     },
+     "n": {
+      "N": "5"
+     }
+    }
+   ]
+  }
+ }
+}

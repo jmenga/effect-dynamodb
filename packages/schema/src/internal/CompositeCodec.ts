@@ -133,15 +133,20 @@ export const makeCompositeKeyForm = (
     // value unmarshalls as a number (and a `Schema.Number` past 2^53 as a
     // bigint), so a key re-derived from a stored row would compose at the
     // other kind's width.
+    // A union of kinds storing one numeric kind (`Union([String, BigInt])`) takes it the same way: a
+    // stored `N` can only have been that kind. One storing both is left: its value alone can't say.
     if (!hasEncodingTransformation(field)) {
       const kind = keyFormValueKind(field)
+      const lift = kind === undefined ? liftToKind(storedNumericKinds(field)) : undefined
       const fn =
         kind === "bigint"
           ? (value: unknown): unknown =>
               typeof value === "number" && Number.isInteger(value) ? BigInt(value) : value
           : kind === "number"
             ? (value: unknown): unknown => (typeof value === "bigint" ? Number(value) : value)
-            : null
+            : lift !== undefined
+              ? (value: unknown): unknown => lift(value) ?? value
+              : null
       cache.set(attr, fn)
       return fn
     }
@@ -188,16 +193,48 @@ export const makeCompositeKeyForm = (
  * Encoded side isn't one numeric kind, and from the function returned for a
  * value already of that kind (or not a number at all).
  */
-export const storedNumericForm = (field: Schema.Top): ((value: unknown) => unknown) | undefined => {
-  const kind = astKeyFormValueKind(SchemaAST.toEncoded(field.ast))
-  if (kind === "bigint") {
+export const storedNumericForm = (field: Schema.Top): ((value: unknown) => unknown) | undefined =>
+  liftToKind(storedNumericKinds(field))
+
+/** {@link storedNumericForm}, from the kinds a field stores. */
+const liftToKind = (kinds: ReadonlySet<NumericKind>): ((value: unknown) => unknown) | undefined => {
+  if (kinds.size !== 1) return undefined
+  if (kinds.has("bigint")) {
     return (value) =>
       typeof value === "number" && Number.isSafeInteger(value) ? BigInt(value) : undefined
   }
-  if (kind === "number") {
-    return (value) => (typeof value === "bigint" ? Number(value) : undefined)
+  return (value) => (typeof value === "bigint" ? Number(value) : undefined)
+}
+
+/** A JavaScript numeric kind a stored `N` may have been written from. */
+export type NumericKind = "number" | "bigint"
+
+/**
+ * The numeric kinds a field's stored `N` can have been written from: those its Encoded side admits.
+ * `Schema.BigInt` and `Schema.Union([Schema.String, Schema.BigInt])` store only a `bigint`;
+ * `Schema.Union([Schema.Number, Schema.BigInt])` stores both, and so does an unknown value. Read back,
+ * a field storing one kind is that kind ({@link storedNumericForm}); a field storing both can't say
+ * which from the value alone, and a path composing keys from a row asks the row's keys.
+ */
+export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> => {
+  const kinds = new Set<NumericKind>()
+  const walk = (ast: SchemaAST.AST): void => {
+    if (SchemaAST.isNumber(ast)) kinds.add("number")
+    else if (SchemaAST.isBigInt(ast)) kinds.add("bigint")
+    else if (SchemaAST.isUnknown(ast) || SchemaAST.isAny(ast)) {
+      kinds.add("number")
+      kinds.add("bigint")
+    } else if (SchemaAST.isLiteral(ast)) {
+      if (typeof ast.literal === "number") kinds.add("number")
+      if (typeof ast.literal === "bigint") kinds.add("bigint")
+    } else if (SchemaAST.isEnum(ast)) {
+      for (const [, value] of ast.enums) if (typeof value === "number") kinds.add("number")
+    } else if (SchemaAST.isUnion(ast)) {
+      for (const member of ast.types) walk(member)
+    }
   }
-  return undefined
+  walk(SchemaAST.toEncoded(field.ast))
+  return kinds
 }
 
 /**

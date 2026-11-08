@@ -10,7 +10,12 @@
 import { DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import { DateEpochMs } from "../src/DynamoModel.js"
-import { makeCompositeKeyForm, toCompositeKeyRecord } from "../src/internal/CompositeCodec.js"
+import {
+  makeCompositeKeyForm,
+  storedNumericForm,
+  storedNumericKinds,
+  toCompositeKeyRecord,
+} from "../src/internal/CompositeCodec.js"
 import { serializeValue } from "../src/KeyComposer.js"
 
 const Model = Schema.Struct({
@@ -124,6 +129,44 @@ describe("CompositeCodec", () => {
 
     it("a non-numeric field is untouched", () => {
       expect(fromRow("label", 5)).toBe(5)
+    })
+  })
+
+  describe("the numeric kinds a field stores", () => {
+    it("a union storing one numeric kind is that kind read back", () => {
+      // A stored `N` of `Union([String, BigInt])` can only have been a bigint.
+      const Mixed = Schema.Struct({
+        sb: Schema.Union([Schema.String, Schema.BigInt]),
+        sn: Schema.Union([Schema.String, Schema.Number]),
+      })
+      const fromRow = makeCompositeKeyForm(Mixed, refuse)
+      expect(fromRow("sb", 5)).toBe(5n)
+      expect(serializeValue(fromRow("sb", 5))).toBe(serializeValue(5n))
+      expect(fromRow("sb", "a")).toBe("a")
+      expect(fromRow("sn", 12n)).toBe(12)
+      expect(fromRow("sn", "a")).toBe("a")
+    })
+
+    it("a union storing both kinds is left: its value alone can't say", () => {
+      const Both = Schema.Struct({ n: Schema.Union([Schema.Number, Schema.BigInt]) })
+      const fromRow = makeCompositeKeyForm(Both, refuse)
+      expect(fromRow("n", 5)).toBe(5)
+      expect(fromRow("n", 5n)).toBe(5n)
+    })
+
+    it("names the kinds of each Encoded side", () => {
+      const kinds = (field: Schema.Top) => [...storedNumericKinds(field)].sort()
+      expect(kinds(Schema.BigInt)).toEqual(["bigint"])
+      expect(kinds(Schema.Number)).toEqual(["number"])
+      expect(kinds(Schema.BigIntFromString)).toEqual([])
+      expect(kinds(Schema.OptionFromNullOr(Schema.BigInt))).toEqual(["bigint"])
+      expect(kinds(Schema.Union([Schema.String, Schema.BigInt]))).toEqual(["bigint"])
+      expect(kinds(Schema.Union([Schema.Number, Schema.BigInt]))).toEqual(["bigint", "number"])
+      expect(kinds(Schema.Unknown)).toEqual(["bigint", "number"])
+      expect(kinds(Schema.Literals([1, 2]))).toEqual(["number"])
+      expect(kinds(Schema.String)).toEqual([])
+      expect(storedNumericForm(Schema.Union([Schema.Number, Schema.BigInt]))).toBeUndefined()
+      expect(storedNumericForm(Schema.Union([Schema.String, Schema.BigInt]))?.(5)).toBe(5n)
     })
   })
 

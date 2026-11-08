@@ -883,14 +883,20 @@ const dateAttrEncoder = (
 }
 
 /**
- * The field's own encode, for a sort-key composite read off an item
- * (`buildKeyAttrEncoders`). Decomposition hands it the domain value, so there
- * is no stored form to take back: a value the encode refuses is composed from
- * as it is.
+ * The field's own encode, with `decode -> encode` as the fallback so a caller
+ * who already supplied wire form round-trips to itself (the same strategy
+ * `Entity.put` uses). `None` when neither works: the value is neither Type nor
+ * Encoded for this field, and what's stored is the caller's to decide.
  */
-const ownKeyEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) => {
-  const encode = Schema.encodeUnknownOption(fieldSchema as unknown as Schema.Codec<any>)
-  return (value) => Option.getOrElse(encode(value), () => value)
+const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => Option.Option<unknown>) => {
+  const codec = fieldSchema as unknown as Schema.Codec<any>
+  const encode = Schema.encodeUnknownOption(codec)
+  const decode = Schema.decodeUnknownOption(codec)
+  return (value) => {
+    const direct = encode(value)
+    if (Option.isSome(direct)) return direct
+    return Option.flatMap(decode(value), encode)
+  }
 }
 
 /**
@@ -915,11 +921,11 @@ const ownKeyEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) =
  *    `tolerantTransforms`, with the aggregate's ref resolver), so the stored
  *    form is exactly what assembly reads back — nested date leaves included —
  *    and a `DynamoModel.ref`-annotated field is encoded through the ref
- *    target's model. A value it can't encode is stored as given, and reported
- *    through `asGiven`: the write then stores it only if its rows read back
- *    (`refuseNotReadBack`, `EDD-9127`). A schema that can't encode a value it
- *    decodes to, such as a transformation over itself, gets here with every
- *    value a caller holds.
+ *    target's model. The field's own encode is the fallback. A value none of
+ *    them takes is stored as given, and reported through `asGiven`: the write
+ *    then stores it only if its rows read back (`refuseNotReadBack`,
+ *    `EDD-9127`). A schema that can't encode a value it decodes to, such as a
+ *    transformation over itself, gets here with every value a caller holds.
  *
  *    Gating on the TOP-LEVEL node instead (as before #133) skipped every
  *    container, because an `Arrays` / `Objects` node carries no encoding of its
@@ -975,10 +981,11 @@ const buildAttrEncoders = (
     // always what the field's own schema takes: a redacted value of another label. What's stored
     // is the first's; this only keeps such a value from being marshalled as it is.
     const encodeAsRead = encoderOver({ decodeOnly: true })
-    // A value neither takes is stored as given.
+    const own = ownAttrEncoder(fieldSchema)
     encoders[field] = (value, asGiven) =>
       encodeSubstituted(value).pipe(
         Option.orElse(() => encodeAsRead(value)),
+        Option.orElse(() => own(value)),
         Option.getOrElse(() => {
           asGiven?.()
           return value
@@ -1019,7 +1026,11 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
           return value
         }
       }
-    } else if (hasEncodingTransformation(fieldSchema)) encoders[field] = ownKeyEncoder(fieldSchema)
+    } else if (hasEncodingTransformation(fieldSchema)) {
+      // A key composed from a value no encoder takes is composed from the value as it is.
+      const own = ownAttrEncoder(fieldSchema)
+      encoders[field] = (value) => Option.getOrElse(own(value), () => value)
+    }
   }
   return encoders
 }
@@ -1555,6 +1566,102 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
+   * Each key a row of a type holds, and the composites it's composed from, last first after
+   * `trailing` segments of its own (a list shard). A `many` edge's declared sort-key composites
+   * that are paths into a hydrated ref aren't read here.
+   */
+  const keyLayouts = (() => {
+    type Layout = {
+      readonly attribute: string
+      readonly composites: ReadonlyArray<string>
+      readonly trailing: number
+    }
+    const layouts = new Map<string, Array<Layout>>()
+    const add = (type: string, layout: Layout) => {
+      if (layout.composites.length === 0) return
+      layouts.set(type, [...(layouts.get(type) ?? []), layout])
+    }
+    const root = config.root.entityType
+    add(root, { attribute: config.pk.field, composites: config.pk.composite, trailing: 0 })
+    if (config.collection.index !== undefined && config.collection.sk !== undefined) {
+      add(root, {
+        attribute: config.collection.sk.field,
+        composites: config.collection.sk.composite,
+        trailing: 0,
+      })
+    }
+    if (config.list !== undefined) {
+      add(root, {
+        attribute: config.list.pk.field,
+        composites: config.list.pk.composite,
+        trailing: config.list.cardinality ? 1 : 0,
+      })
+      add(root, {
+        attribute: config.list.sk.field,
+        composites: config.list.sk.composite,
+        trailing: 0,
+      })
+    }
+    const walk = (node: ResolvedNode): void => {
+      if (node.cardinality === "many" && node.skComposite !== undefined) {
+        if (node.skComposite.every((path) => !path.includes("."))) {
+          add(node.entityType, { attribute: "sk", composites: node.skComposite, trailing: 0 })
+        }
+      }
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return layouts
+  })()
+
+  /**
+   * A row read back, its numeric key composites read as the kind its keys show (in place). A
+   * stored `N` comes back as a number while it's a safe integer and as a `bigint` past 2^53,
+   * whichever it was written from, and the two compose different key text (16 digits, 38): read as
+   * the other kind, a key composed from the value wouldn't be the row's, and an `update` would write
+   * the row again under it. A value is changed only when its own segment of a key the row holds is
+   * the other kind's text, and isn't its own. Reads nothing; the row's own keys are what says.
+   */
+  const readKeysKind = (row: Record<string, unknown>): Record<string, unknown> => {
+    const layouts = keyLayouts.get(String(row.__edd_e__))
+    if (layouts === undefined) return row
+    const texts = (value: unknown) =>
+      [config.schema, KeyText136.schema136(config.schema), KeyText136.schemaEscaped(config.schema)]
+        .map((under) => {
+          try {
+            return KeyComposer.keyValueText(under, value, config.schema.casing)
+          } catch {
+            return undefined
+          }
+        })
+        .filter((text): text is string => text !== undefined)
+    for (const { attribute, composites, trailing } of layouts) {
+      const held = row[attribute]
+      if (typeof held !== "string") continue
+      const segments = held.split("#")
+      const first = segments.length - trailing - composites.length
+      if (first < 0) continue
+      composites.forEach((composite, i) => {
+        const value = row[composite]
+        const other =
+          typeof value === "number" && Number.isSafeInteger(value)
+            ? BigInt(value)
+            : typeof value === "bigint" &&
+                Number.isFinite(Number(value)) &&
+                BigInt(Number(value)) === value
+              ? Number(value)
+              : undefined
+        if (other === undefined) return
+        const segment = segments[first + i]
+        if (!texts(value).includes(segment!) && texts(other).includes(segment!)) {
+          row[composite] = other
+        }
+      })
+    }
+    return row
+  }
+
+  /**
    * DynamoDB's rejection of an assembly read (#144) — a consistent read of a
    * GSI collection index — explained for the aggregate and its index.
    */
@@ -1614,6 +1721,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         from === undefined
           ? yield* read(pkValue)
           : [...(yield* read(from)), ...(rekeyRead?.fromOnly === true ? [] : yield* read(pkValue))]
+      for (const item of allItems) readKeysKind(item)
       return { client, tableConfig, pkValue, allItems }
     })
 
@@ -2329,7 +2437,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
    */
   const staleRootAt = (tableName: string, pk: string) =>
     Effect.map(rootItemAt(tableName, pk), ({ Item }) =>
-      Item === undefined || partitionUnder(config.schema, fromAttributeMap(Item)) === pk
+      Item === undefined ||
+      partitionUnder(config.schema, readKeysKind(fromAttributeMap(Item))) === pk
         ? undefined
         : Item,
     )
@@ -2411,7 +2520,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (row.sk?.S !== rekeyRootSk || row.__edd_e__?.S !== config.root.entityType) {
         return yield* rekeyRowBelowRoot(row, pk, ctx)
       }
-      const key = fromAttributeMap(row) as Record<string, unknown>
+      const key = readKeysKind(fromAttributeMap(row) as Record<string, unknown>)
       const current = partitionUnder(config.schema, key)
       // Under none of the keys its values have had: nothing here can place it.
       if (
@@ -2857,6 +2966,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // Extract PK composite values from each root item and assemble
           const aggregates: Array<Schema.Schema.Type<TSchema>> = []
           for (const rootItem of rootItems) {
+            // Its partition key composed as `create` composed it: a numeric composite read as the
+            // kind the root's own keys show.
+            readKeysKind(rootItem)
             const key: Record<string, unknown> = {}
             for (const composite of config.pk.composite) {
               key[composite] = rootItem[composite]
