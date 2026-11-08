@@ -4,7 +4,7 @@
  * Extracted from Aggregate.ts for decomposition. Not part of the public API.
  */
 
-import { Schema, SchemaAST } from "effect"
+import { Option, Schema, SchemaAST } from "effect"
 import { ConfiguredModelTag } from "../DynamoModel.js"
 import type { AggregateEdge, ManyEdge, RefEntity } from "./AggregateEdges.js"
 import type {
@@ -81,9 +81,7 @@ export const manyElementFields = (
   parentFields: Record<string, Schema.Top> | undefined,
   edgeName: string,
 ): Record<string, Schema.Top> | undefined => {
-  const field = parentFields?.[edgeName]
-  if (field === undefined) return undefined
-  const element = extractArrayElement(field) ?? extractKeyedValue(field)
+  const element = manyElementSchema(parentFields, edgeName)
   return element === undefined ? undefined : getSchemaFields(element)
 }
 
@@ -237,8 +235,10 @@ const rowInput = (schema: Schema.Top, stamps: AggregateStamps): Schema.Top => {
  * Derive an input schema from an aggregate definition.
  *
  * Edge-driven: walks edges to determine field transformations.
- * - RefEdge, and OneEdge with an entity, fields → `${field}Id: Schema.String`: `create` fetches it
- * - OneEdge without one → the value itself, which is all `create` can take
+ * - RefEdge, and OneEdge with an entity, fields → `${field}Id`, a value of the entity's key
+ *   composite (`refIdInput`): `create` fetches it
+ * - OneEdge without one, or with an entity no single id names → the value itself, which is all
+ *   `create` can take
  * - Sub-aggregate edges are recursed
  * - Many-edge array elements are recursed for ref replacement
  * - PK composite fields are omitted (auto-generated)
@@ -308,11 +308,17 @@ const deriveWithStamps = (
     if (edge && "_tag" in edge) {
       const isOpt = isFieldOptional(fieldSchema)
 
-      if (edge._tag === "OneEdge" && edge.entity === undefined) {
+      if (
+        (edge._tag === "OneEdge" || edge._tag === "RefEdge") &&
+        (edge.entity === undefined || refKeyComposite(edge.entity) === undefined)
+      ) {
+        // Nothing to fetch by: no entity, or one no single id names (its key has two composites,
+        // or none). `create` takes the value, and refuses an id for it (`EDD-9129`).
         const value = rowInput(optionalField(fieldSchema)?.inner ?? fieldSchema, stamps)
         newFields[name] = isOpt ? Schema.optionalKey(value) : value
       } else if (edge._tag === "RefEdge" || edge._tag === "OneEdge") {
-        newFields[`${name}Id`] = isOpt ? Schema.optionalKey(Schema.String) : Schema.String
+        const id = refIdInput(edge.entity!)
+        newFields[`${name}Id`] = isOpt ? Schema.optionalKey(id) : id
       } else if (edge._tag === "BoundSubAggregate") {
         const sub = (edge as BoundSubAggregate<any>).aggregate
         const subSchemas = deriveWithStamps(sub.schema, sub.edges, [], stamps)
@@ -388,12 +394,219 @@ export const deriveEntityFieldName = (entity: RefEntity): string => {
   return identifier.charAt(0).toLowerCase() + identifier.slice(1)
 }
 
+// ---------------------------------------------------------------------------
+// Ref ids: what one id of an edge's entity names, and which values hold one
+// ---------------------------------------------------------------------------
+
+/**
+ * The distinct attributes an entity's primary key is composed from, its partition key's first. An
+ * attribute in both halves (`pk: ["lineId"]`, `sk: ["lineId"]`) is one attribute: one value of it
+ * names one item.
+ */
+export const refKeyComposites = (entity: RefEntity): ReadonlyArray<string> => {
+  const primary = (
+    entity.indexes as
+      | {
+          readonly primary?: {
+            readonly pk?: { readonly composite?: ReadonlyArray<string> }
+            readonly sk?: { readonly composite?: ReadonlyArray<string> }
+          }
+        }
+      | undefined
+  )?.primary
+  return [...new Set([...(primary?.pk?.composite ?? []), ...(primary?.sk?.composite ?? [])])]
+}
+
+/**
+ * The one attribute an id of `entity` is a value of: its primary key's only distinct composite.
+ * `undefined` for a key composed from more than one attribute, or none: no one id names one item.
+ */
+export const refKeyComposite = (entity: RefEntity): string | undefined => {
+  const composites = refKeyComposites(entity)
+  return composites.length === 1 ? composites[0] : undefined
+}
+
+/**
+ * The model field an id of `entity` is a value of (its {@link refKeyComposite}), `undefined` when
+ * its key has no one composite or its model's fields can't be read.
+ */
+export const refIdField = (entity: RefEntity): Schema.Top | undefined => {
+  const name = refKeyComposite(entity)
+  return name === undefined ? undefined : getSchemaFields(unwrapModel(entity.model))?.[name]
+}
+
+/**
+ * The schema `create` takes an id of `entity` as: its key composite's own field, so a number keyed
+ * entity takes a number. `Schema.String` when the field can't be read, as before.
+ */
+const refIdInput = (entity: RefEntity): Schema.Top => refIdField(entity) ?? Schema.String
+
+const jsonCodecs = new WeakMap<Schema.Top, Schema.Top | null>()
+
+/** A field's JSON codec (`Schema.toCodecJson`), once per field; `null` where it has none. */
+const jsonCodecOf = (field: Schema.Top): Schema.Top | null => {
+  const cached = jsonCodecs.get(field)
+  if (cached !== undefined) return cached
+  let codec: Schema.Top | null
+  try {
+    codec = Schema.toCodecJson(field as Schema.Codec<unknown>) as unknown as Schema.Top
+  } catch {
+    codec = null
+  }
+  jsonCodecs.set(field, codec)
+  return codec
+}
+
+/**
+ * An id given for `entity`, as a value of its key composite ({@link refIdField}): the value itself
+ * when it is one (`5` of a number, `5n` of a bigint, a `Date`), or what it decodes to from its JSON
+ * or stored form (`"5"` of a `NumberFromString` or a bigint, an ISO string of a date). `None` when it
+ * is neither: it names no item. Without a key field to read, a string is taken as given and nothing
+ * else, as it always was.
+ */
+export const refIdValue = (entity: RefEntity, value: unknown): Option.Option<unknown> => {
+  const field = refIdField(entity)
+  if (field === undefined) return typeof value === "string" ? Option.some(value) : Option.none()
+  const codec = field as Schema.Codec<unknown>
+  if (Schema.is(codec)(value)) return Option.some(value)
+  const json = jsonCodecOf(field)
+  const fromJson =
+    json === null
+      ? Option.none<unknown>()
+      : Schema.decodeUnknownOption(json as Schema.Codec<unknown>)(value)
+  return Option.isSome(fromJson) ? fromJson : Schema.decodeUnknownOption(codec)(value)
+}
+
+/** A type AST's members, `undefined` and `null` left out: a union's, flattened, or the type itself. */
+const astMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> => {
+  if (SchemaAST.isUnion(ast)) return ast.types.flatMap((member) => astMembers(member))
+  if (SchemaAST.isUndefined(ast) || SchemaAST.isNull(ast)) return []
+  return [ast]
+}
+
+/** A value with no fields of its own: a scalar, a literal, or a list. */
+const isScalarOrList = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isString(ast) ||
+  SchemaAST.isNumber(ast) ||
+  SchemaAST.isBigInt(ast) ||
+  SchemaAST.isBoolean(ast) ||
+  SchemaAST.isLiteral(ast) ||
+  SchemaAST.isEnum(ast) ||
+  SchemaAST.isTemplateLiteral(ast) ||
+  SchemaAST.isSymbol(ast) ||
+  SchemaAST.isUniqueSymbol(ast) ||
+  SchemaAST.isArrays(ast) ||
+  SchemaAST.isNever(ast) ||
+  SchemaAST.isVoid(ast)
+
+/**
+ * The properties of an object type: a struct's, or a class's (read off its declaration, so a class
+ * an annotation has taken `.fields` from, `Line.pipe(DynamoModel.ref)`, still has them).
+ * `undefined` for anything else.
+ */
+const astProperties = (
+  ast: SchemaAST.AST,
+): ReadonlyArray<SchemaAST.PropertySignature> | undefined => {
+  if (SchemaAST.isObjects(ast)) return ast.propertySignatures
+  if (SchemaAST.isDeclaration(ast)) {
+    const [struct] = ast.typeParameters
+    if (struct !== undefined && SchemaAST.isObjects(struct)) return struct.propertySignatures
+  }
+  return undefined
+}
+
+/**
+ * Whether a field can hold the entity's record, so the field is the entity's: some member of it,
+ * `optional` and unions unwrapped, is an object, a class, or something that says nothing of what it
+ * holds. A scalar or list field (`line: Schema.String`) never wraps the entity, whatever its name.
+ */
+const holdsRecordAst = (ast: SchemaAST.AST): boolean =>
+  astMembers(ast).some((member) => !isScalarOrList(member))
+
+/** {@link holdsRecordAst} of a field's schema. */
+export const holdsRecord = (field: Schema.Top): boolean => holdsRecordAst(field.ast)
+
+/** The literals a property is limited to, or `undefined`: a discriminator of a union's members. */
+const propertyLiterals = (ast: SchemaAST.AST): ReadonlyArray<unknown> | undefined => {
+  const members = astMembers(ast)
+  if (members.length === 0) return undefined
+  const found: Array<unknown> = []
+  for (const member of members) {
+    if (SchemaAST.isLiteral(member)) found.push(member.literal)
+    else if (SchemaAST.isEnum(member)) found.push(...member.enums.map(([, value]) => value))
+    else return undefined
+  }
+  return found
+}
+
+/** Whether `value` can be a value of an object member: each literal property it has, matched. */
+const matchesLiterals = (
+  properties: ReadonlyArray<SchemaAST.PropertySignature>,
+  value: Record<string, unknown>,
+): boolean =>
+  properties.every((property) => {
+    const literals = propertyLiterals(property.type)
+    if (literals === undefined) return true
+    const given = value[String(property.name)]
+    if (given === undefined) return SchemaAST.isOptional(property.type)
+    return literals.includes(given)
+  })
+
+/**
+ * Whether a `many` element value holds a ref of `entity`, under the `${field}Id` its input takes
+ * (`deriveElementInputSchema`): decided per member of the element's schema, the members its literal
+ * properties (a union's discriminator) leave it. A member holds one when its property named for the
+ * entity (`deriveEntityFieldName`) can hold the entity's record ({@link holdsRecord}). One that
+ * declares no such property, the entity's own model among them (`lineId` of a `Line` is its own
+ * value), or declares it a scalar, holds none. What the schema says nothing of (no element schema,
+ * a member that isn't an object) is taken to hold one, as it always was.
+ */
+export const elementHoldsRef = (
+  element: Schema.Top | undefined,
+  entity: RefEntity,
+  value: Record<string, unknown>,
+): boolean => {
+  if (element === undefined) return true
+  const name = deriveEntityFieldName(entity)
+  const members = astMembers(element.ast)
+  const judged = members.map((member) => ({ member, properties: astProperties(member) }))
+  const candidates = judged.filter(
+    ({ properties }) => properties === undefined || matchesLiterals(properties, value),
+  )
+  return (candidates.length > 0 ? candidates : judged).some(({ member, properties }) => {
+    // Not an object: a scalar or a declaration (a date) is a value, not a wrapper, and anything
+    // else (`Schema.Unknown`, a `suspend`) says nothing of what it holds.
+    if (properties === undefined) return !isScalarOrList(member) && !SchemaAST.isDeclaration(member)
+    const property = properties.find((candidate) => candidate.name === name)
+    if (property === undefined) {
+      // A record (`Schema.Record`) holds whatever keys it's given.
+      return SchemaAST.isObjects(member) && member.indexSignatures.length > 0
+    }
+    return holdsRecordAst(property.type)
+  })
+}
+
+/**
+ * The element schema of a `many` edge, read off the parent model's field: the array's element, or a
+ * keyed collection's value. `undefined` when the field says nothing of it.
+ */
+export const manyElementSchema = (
+  parentFields: Record<string, Schema.Top> | undefined,
+  edgeName: string,
+): Schema.Top | undefined => {
+  const field = parentFields?.[edgeName]
+  if (field === undefined) return undefined
+  return extractArrayElement(field) ?? extractKeyedValue(field)
+}
+
 /**
  * Derive input schema for a many-edge array element.
  * Extracts the element type from the field schema (which may be an Array
- * or optional(Array)). If the element IS the entity (matches the entity model),
- * transforms to Schema.String. Otherwise, finds the entity-derived field within
- * the element and transforms it.
+ * or optional(Array)). If the element IS the entity (its model, or a class of the same
+ * identifier), transforms to an id, a value of the entity's key composite. Otherwise, finds the
+ * entity-derived field within the element, when it can hold the entity's record, and transforms
+ * it to `${field}Id`; in a union of members, in each member. An entity no single id names is left
+ * as is.
  */
 export const deriveElementInputSchema = (
   arrayFieldSchema: Schema.Top,
@@ -404,25 +617,56 @@ export const deriveElementInputSchema = (
   if (!elemSchema) return undefined
 
   const elemFields = getSchemaFields(elemSchema)
+  // An entity no single id names is given whole, never by id (`EDD-9129`).
+  const fetched = entity !== undefined && refKeyComposite(entity) !== undefined ? entity : undefined
 
   // Check if the element itself IS the entity model (e.g., Array<Umpire>)
-  if (entity && elemFields && isSchemaMatchingEntity(elemSchema, entity)) {
-    // Element IS the entity → array of IDs (Schema.String)
-    return Schema.String
+  if (
+    fetched &&
+    elemFields &&
+    (isSchemaMatchingEntity(elemSchema, fetched) ||
+      elemSchema.ast === unwrapModel(fetched.model).ast)
+  ) {
+    // Element IS the entity → array of ids, each a value of its key composite
+    return refIdInput(fetched)
   }
 
-  if (!elemFields) return elemSchema
+  if (elemFields) return deriveElementMember(elemSchema, elemFields, fetched, stamps)
 
-  // Element wraps entity + attributes — find the entity-derived field and transform it
-  const entityFieldName = entity ? deriveEntityFieldName(entity) : undefined
+  // A union of members: each member holding the entity takes its id, as `create` decides per
+  // member (`elementHoldsRef`).
+  const members = (elemSchema as { readonly members?: unknown }).members
+  if (!Array.isArray(members)) return elemSchema
+  const derived = (members as ReadonlyArray<Schema.Top>).map((member) => {
+    const fields = getSchemaFields(member)
+    return fields === undefined ? member : deriveElementMember(member, fields, fetched, stamps)
+  })
+  return derived.some((member, i) => member !== members[i])
+    ? Schema.Union(derived as never)
+    : elemSchema
+}
+
+/**
+ * An element (or a union member of one) with fields, as its input takes it: the entity-derived
+ * field, when it can hold the entity's record, as `${field}Id`, as `create` takes it
+ * (`elementHoldsRef`); a date the library stamps optional. The element itself when nothing changes.
+ */
+const deriveElementMember = (
+  elemSchema: Schema.Top,
+  elemFields: Record<string, Schema.Top>,
+  fetched: RefEntity | undefined,
+  stamps: AggregateStamps | undefined,
+): Schema.Top => {
+  const entityFieldName = fetched ? deriveEntityFieldName(fetched) : undefined
   const managed = stamps === undefined ? undefined : managedDates(stamps, elemFields)
   let hasChanges = false
   const newFields: Record<string, unknown> = {}
   for (const [name, fSchema] of Object.entries(elemFields)) {
-    if (name === entityFieldName) {
-      // This field references the entity — transform to ${name}Id: Schema.String
+    if (name === entityFieldName && holdsRecord(fSchema)) {
+      // This field references the entity — transform to ${name}Id: <its key composite>
       const isOpt = isFieldOptional(fSchema)
-      newFields[`${name}Id`] = isOpt ? Schema.optionalKey(Schema.String) : Schema.String
+      const id = refIdInput(fetched!)
+      newFields[`${name}Id`] = isOpt ? Schema.optionalKey(id) : id
       hasChanges = true
     } else if (managed?.has(name) === true) {
       newFields[name] = stampInput(fSchema)

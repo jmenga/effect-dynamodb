@@ -887,6 +887,1026 @@
     }
    ],
    "get": "failed: AggregateAssemblyError"
+  },
+  "many, element a union of structs wrapping the entity": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000002"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "2"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}"
+  },
+  "many, element a union whose members may hold the entity": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000002"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "2"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}"
+  },
+  "sub-aggregate, many, element a union of structs wrapping the entity": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "side": {
+      "N": "1"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "2"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     },
+     "sk": {
+      "S": "$hydrate#v1#sheetline#side#0000000000000001#0000000000000002"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":2}]}}"
+  },
+  "one, an entity whose key composite is in its pk and its sk": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}"
+  },
+  "one, an entity keyed by a Date, given its ISO string": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "2024-01-02T03:04:05.000Z"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_2024-01-02t03:04:05.000z"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"2024-01-02T03:04:05.000Z\",\"f\":5}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline"
+     },
+     "lineId": {
+      "S": "2024-01-02T03:04:05.000Z"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "2024-01-02T03:04:05.000Z"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_2024-01-02t03:04:05.000z"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"2024-01-02T03:04:05.000Z\",\"f\":5}}"
+  },
+  "one, an entity keyed by a NumberFromString, given its encoded string": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":5,\"f\":5}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline"
+     },
+     "lineId": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":5,\"f\":5}}"
+  },
+  "one, an entity keyed by a number, given a number": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by a number, given a numeric string": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: RefNotFound",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by a bigint, given a bigint": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_00000000000000000000000000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_00000000000000000000000000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by a number, the edge optional": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\"}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\"}"
+  },
+  "one, an entity keyed by a bigint, the edge optional": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_00000000000000000000000000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\"}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_00000000000000000000000000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\"}"
+  },
+  "one, an entity keyed by a string codec": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "x:MiX"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_x:x:mix"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: RefNotFound",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "x:MiX"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_x:x:mix"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, ids of an entity keyed by a NumberFromString, given encoded strings": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"lineId\":5,\"f\":5}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline#5"
+     },
+     "lineId": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"lineId\":5,\"f\":5}]}"
+  },
+  "many, ids of an entity keyed by a number, given numbers": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_0000000000000005"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element declares the entity's field a string, given it and a lineId": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one and one, the second an entity keyed by two composites": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#pair#lineid_p"
+     },
+     "lineId": {
+      "S": "p"
+     },
+     "pk": {
+      "S": "$hydrate#v1#pair#tenant_t"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "f": {
+      "N": "6"
+     },
+     "__edd_e__": {
+      "S": "Pair"
+     }
+    }
+   ],
+   "create": "died: Missing composite attribute \"tenant\" in record",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#pair#lineid_p"
+     },
+     "lineId": {
+      "S": "p"
+     },
+     "pk": {
+      "S": "$hydrate#v1#pair#tenant_t"
+     },
+     "tenant": {
+      "S": "t"
+     },
+     "f": {
+      "N": "6"
+     },
+     "__edd_e__": {
+      "S": "Pair"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
   }
  }
 }

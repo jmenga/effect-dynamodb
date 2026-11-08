@@ -4,7 +4,11 @@
  * entity's own model, given whole, is stored as given; an entity without a `DynamoModel.identifier`,
  * or whose identifier is another field, is fetched by its key's only composite, and writes the rows
  * 1.39.0 wrote for the same shape with its identifier on the key; an entity no one id keys fails with
- * `EDD-9129`, nothing written. 1.39.0 died on each of these.
+ * `EDD-9129`, nothing written. 1.39.0 died on each of these. Shapes 1.39.0 hydrated as it should
+ * (union elements, a key composite in both halves, `Date` and `NumberFromString` keys) write and read
+ * what it did; an id of the key composite's own type 1.39.0 dropped, or fetched under a key `put`
+ * never wrote (a string codec), is fetched by the key `put` wrote; an id of no type of it fails with
+ * `EDD-9131`, nothing written.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -22,6 +26,7 @@ import {
   byKey,
   CONTROLS,
   fixture,
+  NOW_FETCHED,
   SHAPES,
   type Shape,
   schema,
@@ -79,7 +84,7 @@ const run = (shape: Shape) => {
           entities: shape.entities,
           tables: { Base },
         } as never) as Effect.Effect<any>
-        for (const item of shape.seed) yield* edb.entities.Lines.put(item).asEffect()
+        for (const [member, item] of shape.seed) yield* edb.entities[member].put(item).asEffect()
         const db: any = yield* DynamoClient.make({
           entities: {},
           aggregates: { A },
@@ -171,5 +176,52 @@ describeConnected(
         }),
       )
     }
+
+    for (const label of NOW_FETCHED) {
+      it.effect(`${label}: fetched by the key Entity.put wrote`, () =>
+        Effect.gen(function* () {
+          const { create, rows, get } = yield* run(SHAPES[label]!())
+          expect(Exit.isSuccess(create)).toBe(true)
+          const seeded = fixture.shapes[label]!.seeded
+          expect(byKey(rows.filter((row) => row.__edd_e__?.S === "Line"))).toEqual(byKey(seeded))
+          const edge = rows.find((row) => row.__edd_e__?.S === "AggLine")!
+          expect({ lineId: edge.lineId, f: edge.f }).toEqual({
+            lineId: seeded[0]!.lineId,
+            f: seeded[0]!.f,
+          })
+          expect(Exit.isSuccess(get) && get.value).toEqual(Exit.isSuccess(create) && create.value)
+        }),
+      )
+    }
+
+    for (const [label, code] of [
+      ["one, an entity keyed by a number, given a numeric string", "[EDD-9131]"],
+      ["one and one, the second an entity keyed by two composites", "[EDD-9129]"],
+    ] as const) {
+      it.effect(`${label}: create fails with ${code}, nothing written`, () =>
+        Effect.gen(function* () {
+          const { create, rows } = yield* run(SHAPES[label]!())
+          expect(Exit.isFailure(create)).toBe(true)
+          const error = Cause.squash((create as Exit.Failure<unknown, unknown>).cause)
+          expect(error).toBeInstanceOf(ValidationError)
+          expect(String((error as ValidationError).cause)).toContain(code)
+          expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.seeded))
+        }),
+      )
+    }
+
+    it.effect("an element declaring the entity's field a string is stored as given", () =>
+      Effect.gen(function* () {
+        const { create, rows, get } = yield* run(
+          SHAPES["many, element declares the entity's field a string, given it and a lineId"]!(),
+        )
+        const expected = { id: "a", lines: [{ line: "label", qty: 2 }] }
+        expect(Exit.isSuccess(create) && create.value).toEqual(expected)
+        const sheet = rows.find((row) => row.__edd_e__?.S === "SheetLine")!
+        expect(sheet.line).toEqual({ S: "label" })
+        expect(sheet.lineId).toBeUndefined()
+        expect(Exit.isSuccess(get) && get.value).toEqual(expected)
+      }),
+    )
   },
 )

@@ -8,8 +8,8 @@
  * (`EntityRefInputType`, exercised in `Entity.types.test.ts`).
  *
  * Uses vitest's `expectTypeOf` to verify compile-time type relationships.
- * These assertions are compile-time only; the runtime schema deliberately
- * builds `Schema.String` for id fields (brands are compile-time phantoms).
+ * These assertions are compile-time only; the runtime schema takes each id field
+ * as the entity's key composite's own schema (`refIdInput`), the brand included.
  */
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
