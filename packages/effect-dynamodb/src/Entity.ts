@@ -126,7 +126,13 @@ import {
   parseSimpleShorthand,
   toExpr,
 } from "./internal/Expr.js"
-import { asReadGuard, countOperators, expressionFits } from "./internal/ExpressionLimits.js"
+import {
+  asReadGuard,
+  countOperators,
+  expressionFits,
+  unprovableRow,
+  wholeRowGuard,
+} from "./internal/ExpressionLimits.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
 import {
   decodeImage,
@@ -5461,33 +5467,41 @@ const makeImpl = <
     // `updatedAt`, so with timestamps it alone detects any library update;
     // then as many attributes as fit, those the sentinels derive from first,
     // then the model's own fields, then the rest.
-    for (const key of Object.keys(names)) if (key.startsWith("#dg")) delete names[key]
-    for (const key of Object.keys(values)) if (key.startsWith(":dg")) delete values[key]
-    const uniqueAttrs = Object.values(config.unique ?? {}).flatMap((def) =>
-      resolveUniqueFields(def as UniqueConstraintDef).map(resolveDbName),
-    )
-    const modelAttrs = Object.keys(data.modelFields as object).map(resolveDbName)
-    const ordered = [
-      ...new Set([
-        ...(systemFields.updatedAt ? [systemFields.updatedAt] : []),
-        ...uniqueAttrs,
-        ...modelAttrs,
-        ...attrs.slice().sort(),
-      ]),
-    ].filter((attr) => attrs.includes(attr))
-    const inputs: Array<string> = []
-    let expression = parts.join(" AND ")
-    for (const attr of ordered) {
-      const clause = guardOf(attr, inputs.length)
-      if (!fits(`${expression} AND ${clause}`)) {
-        delete names[`#dg${inputs.length}`]
-        delete values[`:dg${inputs.length}`]
-        continue
+    const strongest = () => {
+      for (const key of Object.keys(names)) if (key.startsWith("#dg")) delete names[key]
+      for (const key of Object.keys(values)) if (key.startsWith(":dg")) delete values[key]
+      const uniqueAttrs = Object.values(config.unique ?? {}).flatMap((def) =>
+        resolveUniqueFields(def as UniqueConstraintDef).map(resolveDbName),
+      )
+      const modelAttrs = Object.keys(data.modelFields as object).map(resolveDbName)
+      const ordered = [
+        ...new Set([
+          ...(systemFields.updatedAt ? [systemFields.updatedAt] : []),
+          ...uniqueAttrs,
+          ...modelAttrs,
+          ...attrs.slice().sort(),
+        ]),
+      ].filter((attr) => attrs.includes(attr))
+      const inputs: Array<string> = []
+      let expression = parts.join(" AND ")
+      for (const attr of ordered) {
+        const clause = guardOf(attr, inputs.length)
+        if (!fits(`${expression} AND ${clause}`)) {
+          delete names[`#dg${inputs.length}`]
+          delete values[`:dg${inputs.length}`]
+          continue
+        }
+        expression = `${expression} AND ${clause}`
+        inputs.push(attr)
       }
-      expression = `${expression} AND ${clause}`
-      inputs.push(attr)
+      return { expression, names, values, inputs }
     }
-    return { expression, names, values, inputs }
+    if (systemFields.updatedAt && attrs.includes(systemFields.updatedAt)) return strongest()
+    // Nothing guarded that every write changes: the switch point decides.
+    switch (unprovableRow()) {
+      case "strongest":
+        return strongest()
+    }
   }
 
   /** Which predicate rejected a guarded delete — from the stored item (ALL_OLD). */
@@ -15112,6 +15126,20 @@ const makeImpl = <
   }
 
   /**
+   * A projection's row tombstone or outbox item as read, whole, and unclaimed by a drainer since (a
+   * row too wide for that, as `unprovableRow` decides).
+   */
+  const valuelessGuard = (read: StoredRow, pkField: string) => {
+    const claims = [OUTBOX_CLAIM, OUTBOX_CLAIMED_UNTIL]
+    const whole = wholeRowGuard(read, pkField, claims)
+    if (whole !== undefined) return whole
+    switch (unprovableRow()) {
+      case "strongest":
+        return asReadGuard(read, pkField, [], claims)
+    }
+  }
+
+  /**
    * Move a projection's row tombstone or outbox item as a row: one transaction puts `item` at
    * `to`, where nothing may be, and deletes it at `from` while it is as `read`, unclaimed by a
    * drainer since. `false` when either condition failed.
@@ -15140,7 +15168,7 @@ const makeImpl = <
               Delete: {
                 TableName: tableName,
                 Key: toAttributeMap(from),
-                ...asReadGuard(read, pkField, [], [OUTBOX_CLAIM, OUTBOX_CLAIMED_UNTIL]),
+                ...valuelessGuard(read, pkField),
               },
             },
           ],

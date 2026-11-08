@@ -39,6 +39,10 @@ export interface RepairTable {
   readonly beforeUpdate: (
     hook: (input: Record<string, any>) => Effect.Effect<void, unknown>,
   ) => void
+  /** Run before each `TransactWriteItems` is sent: another writer landing just before it. */
+  readonly beforeTransact: (
+    hook: (input: Record<string, any>) => Effect.Effect<void, unknown>,
+  ) => void
 }
 
 export interface Harness {
@@ -62,7 +66,8 @@ export const harnessOn = (setup: (world: { readonly MainTable: any }) => TableSe
   on: (world, body) => {
     const { tableName, client, acquire, release } = setup(world)
     const requests: Array<RecordedRequest> = []
-    let hook: ((input: Record<string, any>) => Effect.Effect<void, unknown>) | undefined
+    type Hook = (input: Record<string, any>) => Effect.Effect<void, unknown>
+    const hooks: { updateItem?: Hook; transactWriteItems?: Hook } = {}
     let raw: any
     const recording = Layer.effect(
       DynamoClient,
@@ -76,7 +81,11 @@ export const harnessOn = (setup: (world: { readonly MainTable: any }) => TableSe
             return (input: Record<string, any>) =>
               Effect.suspend(() => {
                 requests.push({ command: property, input })
-                return property === "updateItem" && hook !== undefined
+                const hook =
+                  property === "updateItem" || property === "transactWriteItems"
+                    ? hooks[property]
+                    : undefined
+                return hook !== undefined
                   ? Effect.flatMap(hook(input), () => method.call(target, input))
                   : method.call(target, input)
               })
@@ -108,7 +117,10 @@ export const harnessOn = (setup: (world: { readonly MainTable: any }) => TableSe
         requests.length = 0
       },
       beforeUpdate: (next) => {
-        hook = next
+        hooks.updateItem = next
+      },
+      beforeTransact: (next) => {
+        hooks.transactWriteItems = next
       },
     }
     return Effect.acquireUseRelease(

@@ -6,7 +6,8 @@
  *
  * - by strategies that pick a request that fits — `Entity`'s wide-update split
  *   and its strongest-guard fallback ({@link expressionFits}), the guard on a
- *   1.36 row's move ({@link asReadGuard}) — refusing nothing;
+ *   1.36 row's move ({@link asReadGuard}), the whole-row guard that proves a
+ *   row unchanged or isn't sent ({@link wholeRowGuard}) — refusing nothing;
  * - by `WriteDiagnosis.ts`, to confirm DynamoDB's rejection of an expression
  *   against the request that was sent and name it.
  *
@@ -140,3 +141,119 @@ export const asReadGuard = (
     ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
   }
 }
+
+/**
+ * The condition that a stored row is still exactly the row read: it exists, every attribute but its
+ * table key (`pkField`, `sk`) holds the value read, and each of `absent` the read didn't have is
+ * still absent. Never weakened to fit: undefined when the whole condition doesn't fit DynamoDB's
+ * limits on one expression, so a caller that can't prove the row unchanged leaves it alone.
+ */
+export const wholeRowGuard = (
+  stored: Record<string, AttributeValue>,
+  pkField: string,
+  absent: ReadonlyArray<string>,
+):
+  | {
+      readonly ConditionExpression: string
+      readonly ExpressionAttributeNames: Record<string, string>
+      readonly ExpressionAttributeValues?: Record<string, AttributeValue>
+    }
+  | undefined => {
+  const names: Record<string, string> = { "#gpk": pkField }
+  const values: Record<string, AttributeValue> = {}
+  const clauses = ["attribute_exists(#gpk)"]
+  const missing = [...new Set(absent)].filter(
+    (attr) => attr !== pkField && attr !== "sk" && stored[attr] === undefined,
+  )
+  for (const [i, attr] of missing.entries()) {
+    names[`#ga${i}`] = attr
+    clauses.push(`attribute_not_exists(#ga${i})`)
+  }
+  const attrs = Object.keys(stored)
+    .sort()
+    .filter((attr) => attr !== pkField && attr !== "sk" && stored[attr] !== undefined)
+  for (const [i, attr] of attrs.entries()) {
+    names[`#g${i}`] = attr
+    values[`:g${i}`] = stored[attr]!
+    clauses.push(`#g${i} = :g${i}`)
+  }
+  const expression = clauses.join(" AND ")
+  if (!expressionFits(expression)) return undefined
+  return {
+    ConditionExpression: expression,
+    ExpressionAttributeNames: names,
+    ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+  }
+}
+
+/**
+ * The guard on a row too wide to guard whole ({@link wholeRowGuard}) that holds a value every
+ * library write changes (`prefer`: an `updatedAt`): it exists, each of `prefer` holds the value read
+ * (or is still absent, when the read didn't have it), and then, as many as fit DynamoDB's limits on
+ * one expression, each of `absent` the read didn't have is still absent and every other attribute
+ * but the table key holds the value read. A library write is always seen; a write that changes only
+ * what's left out, and not `prefer`, isn't.
+ */
+export const preferredGuard = (
+  stored: Record<string, AttributeValue>,
+  pkField: string,
+  prefer: ReadonlyArray<string>,
+  absent: ReadonlyArray<string>,
+): {
+  readonly ConditionExpression: string
+  readonly ExpressionAttributeNames: Record<string, string>
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue>
+} => {
+  const names: Record<string, string> = { "#gpk": pkField }
+  const values: Record<string, AttributeValue> = {}
+  let expression = "attribute_exists(#gpk)"
+  const keyed = (attr: string) => attr !== pkField && attr !== "sk"
+  const preferred = [...new Set(prefer)].filter(keyed)
+  for (const [i, attr] of preferred.entries()) {
+    names[`#gp${i}`] = attr
+    if (stored[attr] === undefined) {
+      expression = `${expression} AND attribute_not_exists(#gp${i})`
+    } else {
+      values[`:gp${i}`] = stored[attr]!
+      expression = `${expression} AND #gp${i} = :gp${i}`
+    }
+  }
+  const missing = [...new Set(absent)].filter(
+    (attr) => keyed(attr) && !preferred.includes(attr) && stored[attr] === undefined,
+  )
+  for (const [i, attr] of missing.entries()) {
+    const clause = `attribute_not_exists(#ga${i})`
+    if (!expressionFits(`${expression} AND ${clause}`)) continue
+    names[`#ga${i}`] = attr
+    expression = `${expression} AND ${clause}`
+  }
+  const attrs = Object.keys(stored)
+    .sort()
+    .filter((attr) => keyed(attr) && !preferred.includes(attr) && stored[attr] !== undefined)
+  for (const [i, attr] of attrs.entries()) {
+    const clause = `#g${i} = :g${i}`
+    if (!expressionFits(`${expression} AND ${clause}`)) continue
+    names[`#g${i}`] = attr
+    values[`:g${i}`] = stored[attr]!
+    expression = `${expression} AND ${clause}`
+  }
+  return {
+    ConditionExpression: expression,
+    ExpressionAttributeNames: names,
+    ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+  }
+}
+
+/**
+ * What a write does with a row it can't prove unchanged: one whose whole guard ({@link
+ * wholeRowGuard}) doesn't fit DynamoDB's limits on one expression and that holds nothing every
+ * library write changes (a version, an `updatedAt`). The one place that decides it, for `rekey`'s
+ * moves (an entity's item, history row and value-less row, an aggregate's row, an event stream's
+ * row) and a soft, retain or unique delete, each of which switches on it. `"strongest"`, for now: as
+ * 1.39.0, the strongest guard that fits is sent, so a concurrent write changing only what it leaves
+ * out lands unseen, and the move or delete loses it.
+ */
+export type UnprovableRow = "strongest"
+
+/** What a write does with a row it can't prove unchanged ({@link UnprovableRow}). */
+export const unprovableRow = (): UnprovableRow => "strongest"

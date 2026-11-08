@@ -104,7 +104,7 @@ import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
-import { asReadGuard } from "./internal/ExpressionLimits.js"
+import { asReadGuard, unprovableRow, wholeRowGuard } from "./internal/ExpressionLimits.js"
 import {
   itemBytes,
   jsonBytes,
@@ -5501,13 +5501,22 @@ export const makeStream = <
                 }),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
-      /** Delete `row` at `from` while it is as read. `false` when a write changed it. */
+      /** `row` as read, whole (a row too wide for that, as `unprovableRow` decides). */
+      const guardOfRow = (row: Record<string, AttributeValue>) => {
+        const whole = wholeRowGuard(row, "pk", [])
+        if (whole !== undefined) return whole
+        switch (unprovableRow()) {
+          case "strongest":
+            return asReadGuard(row, "pk", [])
+        }
+      }
+      /** Delete `row` at `from` while it is as read (`guardOfRow`). `false` when a write changed it. */
       const remove = (row: Record<string, AttributeValue>) =>
         client
           .deleteItem({
             TableName: ctx.tableName,
             Key: toAttributeMap({ pk: from, sk: skOf(row) }),
-            ...asReadGuard(row, "pk", []),
+            ...guardOfRow(row),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
 

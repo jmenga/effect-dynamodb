@@ -101,7 +101,12 @@ import {
   isEmptyExpr,
   parseSimpleShorthand,
 } from "./internal/Expr.js"
-import { asReadGuard } from "./internal/ExpressionLimits.js"
+import {
+  asReadGuard,
+  preferredGuard,
+  unprovableRow,
+  wholeRowGuard,
+} from "./internal/ExpressionLimits.js"
 import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
@@ -2834,13 +2839,49 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const REKEY_ATTEMPTS = 3
 
   /**
+   * Every attribute a row of each entity type can hold, the table key aside: its node's own fields
+   * (an edge field is its own rows'), the context fields and discriminators a row beneath the root
+   * carries, the index keys, the timestamps and `__edd_e__`. A row `rekey` moves is guarded on each
+   * one it didn't have still being absent, so a write that adds one cancels the move.
+   */
+  const writableAttributes: ReadonlyMap<string, ReadonlyArray<string>> = (() => {
+    const shared = [
+      "__edd_e__",
+      ...indexFields,
+      ...[timestampFields.createdAt, timestampFields.updatedAt].filter(
+        (name): name is string => name !== null,
+      ),
+    ]
+    const byType = new Map<string, Set<string>>()
+    const walk = (node: ResolvedNode): void => {
+      const names = byType.get(node.entityType) ?? new Set(shared)
+      const edges = new Set(node.children.map((child) => child.fieldName))
+      for (const field of Object.keys(node.ownFields ?? {})) {
+        if (!edges.has(field)) names.add(field)
+      }
+      if (node.cardinality !== "root") {
+        for (const field of contextFields) names.add(field)
+        for (const [field, value] of Object.entries(node.discriminator ?? {})) {
+          if (typeof value !== "function") names.add(field)
+        }
+      }
+      byType.set(node.entityType, names)
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return new Map([...byType].map(([entityType, names]) => [entityType, [...names].sort()]))
+  })()
+
+  /**
    * `rekey`'s move of the aggregate at `key` (#183, DESIGN.md §7 "`rekey`"): read from the
    * partition its root was found in and its current one, and placed ({@link locateRows}). Each row
    * under its old key moves — a Put of the row `update` would write at its current key, keeping
    * its `created` and `updated`, beside a Delete of the old row — and a row at its current key
    * whose list or collection index key holds other text has those keys rewritten. Nothing else is
    * written, and every write is conditional: the Put only where nothing is, the Delete and the
-   * rewrite only while the row is as read (`asReadGuard`). Rows whose keys chain move in order, the
+   * rewrite only while the row is as read, whole, with each attribute its entity type can hold and
+   * it didn't still absent (`wholeRowGuard`; a row too wide for that, on its `updatedAt` first, or
+   * as `unprovableRow` decides). Rows whose keys chain move in order, the
    * one whose current key is free first, so no write lands on a row still to move, and the root
    * moves last, so a move cut short is found by the next run. A write that loses to a concurrent
    * one reads the aggregate again; a row stored under both keys leaves the aggregate as it is,
@@ -3026,10 +3067,22 @@ const makeAggregate = <TSchema extends Schema.Top>(
             item,
           ]),
         )
-        const guardOf = (at: { readonly pk: string; readonly sk: string }) =>
-          asReadGuard(storedAt.get(positionOf(at.pk, at.sk)) ?? {}, config.pk.field, [
-            ...(updatedField === null ? [] : [updatedField]),
-          ])
+        // The row as read, whole, with every attribute its entity type can hold and it didn't
+        // still absent. A row too wide for that is guarded on its `updatedAt` first, which every
+        // write changes; one without is the switch point's (`unprovableRow`).
+        const guardOf = (at: { readonly pk: string; readonly sk: string }, r: number) => {
+          const read = storedAt.get(positionOf(at.pk, at.sk)) ?? {}
+          const absent = writableAttributes.get(built[r]!.__edd_e__?.S ?? "") ?? []
+          const whole = wholeRowGuard(read, config.pk.field, absent)
+          if (whole !== undefined) return whole
+          if (updatedField !== null) {
+            return preferredGuard(read, config.pk.field, [updatedField], absent)
+          }
+          switch (unprovableRow()) {
+            case "strongest":
+              return asReadGuard(read, config.pk.field, [])
+          }
+        }
         const keyOf = (at: { readonly pk: string; readonly sk: string }) =>
           toAttributeMap({ [config.pk.field]: at.pk, sk: at.sk })
         // A custom `decompose`'s row is written as stored, its keys and its collection sort key
@@ -3073,7 +3126,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   },
                 },
                 {
-                  Delete: { TableName: tableConfig.name, Key: keyOf(row.old), ...guardOf(row.old) },
+                  Delete: {
+                    TableName: tableConfig.name,
+                    Key: keyOf(row.old),
+                    ...guardOf(row.old, r),
+                  },
                 },
               ],
             })
@@ -3083,7 +3140,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const item = itemOf(r)
           const stale = staleIndexFields(item, row.atCurrent)
           if (stale.length === 0) continue
-          const guard = guardOf(row.current)
+          const guard = guardOf(row.current, r)
           const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
           const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
           const sets = stale.map((field, i) => {
