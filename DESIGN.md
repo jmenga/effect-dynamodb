@@ -996,24 +996,44 @@ the same (`rekeyAfterMove`). The move itself recomposes index keys as an update 
 numeric kinds composed each value's own kind's text: 16 digits for `5`, 38 for `5n`. That's a
 `Schema.Union([Schema.Number, Schema.BigInt])` before 1.40.0 refused it, or a `Schema.Unknown` given
 a `bigint` safe integer. Declared one kind now, a row written with the other is under text its
-values, as read back, don't compose. Each form is also composed with the row's numeric key
-composites as the other kind (`CompositeCodec.numericKindVariants`: every set of them, the other
-kind read from the digits of the stored `N`). So such a row is recognised and moved to the text of
-its values as read back: an item, its index keys and vector partitions, its unique sentinels
-(`otherSentinelKeys`), a snapshot or tombstone, a time-series event, an aggregate's partition and a
-`many` edge's rows (`oldPosition`). A projection's row tombstone or outbox item holds no values, so
-its key is read with a numeric composite as the other kind when the declared reading fits nothing
-(`readAsOtherNumericKind`). Two items whose values read back as one item (`3` and `3n`) are the
-conflict `bothKeys`, and both are left. A key with no numeric composite has one variant, and nothing
-changes for it. An item or tombstone under its current key doesn't read its sentinels' keys under
-the other kind's text, which would cost a read per item on every run: the scan reaches such a
-sentinel, and its own handler moves it (`sentinelsUnderOtherKind`). A row that moves looks there,
-since its sentinels name its old key.
+values, as read back, don't compose. A stored key that isn't its current text is also looked for
+with the row's numeric composites as the other kind (`CompositeCodec.kindReadingOf`, the other kind
+read from the digits of the stored `N`). So such a row is recognised and moved to the text of its
+values as read back: an item, its index keys and vector partitions, its unique sentinels
+(`otherSentinelKeys`, `sentinelHeldAt`), a snapshot or tombstone, a time-series event, an
+aggregate's partition (`holdsPartition`) and a `many` edge's rows (`oldPosition`). A projection's
+row tombstone or outbox item holds no values, so its key is read with each numeric composite as
+either kind when the declared reading fits nothing: each composite takes the kind whose value
+composes its own text again (`readAsOtherNumericKind`, `KeyText136.readIndexKeys`). Two items whose
+values read back as one item (`3` and `3n`) are the conflict `bothKeys`, and both are left; so are
+two rows of an aggregate's `many` edge that read back as one element, reported before anything is
+placed (`locateRows`). A key with no numeric composite has one reading, and nothing changes for it.
+
+The search costs nothing on a clean run, and never one composition per combination of kinds. A
+stored key that is its current text is never looked for under another: one composition, as before.
+Otherwise each field is composed once as the other kind by itself, which shows the stretch of the
+text its value lies in, and the readings are walked field by field from the left, keeping those
+whose text so far begins the stored key, or one of a partition's stored sort keys; the one left is
+composed to confirm it. That is one composition per field, plus two, under each form, and no key
+is split on its delimiters. Where two fields' stretches overlap, each is read as the other kind
+only alone. A moving row's unique sentinel is looked for before there is a stored key to compare,
+so it is read at the keys of a few readings: the values as they are, as the row's own key gives
+them, each alone as the other kind, and all of them, which is every reading of a constraint over
+one or two numeric fields. A sentinel under another mix is found from its own row, whose stored
+key is compared like any other, when the scan reaches it. `test/RekeyNumericKinds.test.ts` pins a
+clean run of an 18-composite index key to its one `Scan`, and a third of them under the bigint's
+text to one rewrite, each well under a quarter of a second (`f4ecbf7` took about half a second for
+the clean run alone); `test/CompositeCodec.test.ts` pins the count of compositions.
+
+An item or tombstone under its current key doesn't read its sentinels' keys under the other kind's
+text, which would cost a read per item on every run: the scan reaches such a sentinel, and its own
+handler moves it (`sentinelsUnderOtherKind`). A row that moves looks there, since its sentinels
+name its old key.
 
 An event's sort key is composed from the `orderBy` value `append` stored, the Encoded value: a
 `Schema.BigInt` is read back below 2^53 as a number and lifted (`storedNumericForm`). Through 1.39.0
 `rekey` composed it from the number under `escapeKeys: false` and moved the event to the number's
-text. The other-kind variants find such an event and move it back.
+text. The other-kind reading finds such an event and moves it back.
 
 **The accepted limit.** The text rewrite leaves an index key that isn't any form's text, as when a row
 cleared a composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
@@ -1226,14 +1246,29 @@ composed into key text: `Entity.make` refuses it at load (**EDD-9128**,
 prefix included; a dimension is refused by EDD-9088), a unique constraint, a
 vector partition and a time-series `orderBy`, and `Aggregate.make` in its
 partition key, its collection and list keys and a `many` edge's sort key.
-`Schema.Unknown` and `Schema.Any` declare no kind, and a key over one holding
-strings or numbers works, so they're judged by value at write instead
-(`readsBackAsOtherKind`): a value that reads back as the other kind (a `bigint`
-safe integer, an integer `number` past 2^53) in one of those places is refused
-with a `ValidationError` (EDD-9128) and nothing written, on every entity write
+A dotted composite (`nested.n`) is the field it names, followed through
+whatever holds each segment: `Schema.optional`, `Schema.optionalKey`,
+`Schema.NullOr` or another union with `null` or `undefined`, `Schema.suspend`,
+and a `Schema.Class` (`fieldAtPath`), at load and at write alike. A time-series
+entity's `appendInput` is what `append` encodes and composes keys from, so its
+own fields are refused too: `orderBy` and every key composite it carries, and
+one declaring the other kind than the model's field, whose events would be keyed
+by text no read composes. A field whose kinds can't be read at load,
+`Schema.Unknown`, `Schema.Any`, an opaque `Schema.declare`, or a transform whose
+stored side is one of those, is judged by value at write instead
+(`readsBackOtherwise`): the value DynamoDB returns for it (a `number` for a
+`bigint` safe integer, a `bigint` for an integer `number` past 2^53) is decoded
+through the field and compared with the value written, decoded. One that reads
+back as something else is refused with a `ValidationError` (EDD-9128) naming
+what it reads back as, and nothing written, on every entity write
 (`encodeForWrite`, and `_refuseNotReadBack` for transactions and batches) and
-on an aggregate's `create` and `update` (`refuseOtherKindKeys`). A field no key
-reads may store both, and is read as it comes back. Since 1.40.0; 1.39.0 loaded
+on an aggregate's `create` and `update` (`refuseOtherKindKeys`).
+`Schema.Unknown` reads `5n` back as `5`, so it is refused; a `Schema.Unknown`
+decoded to `Schema.BigInt` by `BigInt(n)` reads it back as `5n`, so it is
+stored, under the bigint's text, as on 1.39.0. That costs two synchronous
+decodes of such a value, only for a key composite whose kinds can't be read at
+load, and never for a field no key reads. A field no key reads may store both,
+and is read as it comes back. Since 1.40.0; 1.39.0 loaded
 such a model and composed its keys from the value as read, so a `bigint` safe
 integer was restored, updated and listed under the `number`'s key, and a delete
 left its sentinel behind. A field once declared both and now one kind keeps rows
@@ -5800,7 +5835,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container, other than one between lists holding the same type: `Schema.Date`, `Schema.Redacted`. `Schema.Redacted` beneath a transformation onto another type, such as `Schema.OptionFromOptional`, on every owner. A union a read can't tell a bigint from something else stored as a number in (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field that a read would try first, or another event), since `5n` and `5` are stored the same: on a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
-| `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackAsOtherKind`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. In the same places, a `Schema.Unknown` or `Schema.Any` field's value that reads back as the other kind (a `bigint` safe integer, an integer `number` past 2^53) is refused at write with a `ValidationError` naming the field, with nothing written. A field no key reads may store both (§7 "Both numeric kinds"). |
+| `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackOtherwise`, `fieldAtPath`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. A dotted composite is followed through what holds each segment, and a time-series `appendInput`'s own fields are refused as the model's are, as is one declaring the other kind than the model. In the same places, the value of a field whose kinds can't be read at load (`Schema.Unknown`, `Schema.Any`, an opaque declaration, a transform whose stored side is one) that reads back as something else is refused at write with a `ValidationError` naming the field, with nothing written. A field no key reads may store both (§7 "Both numeric kinds"). |
 
 Next free code: **`EDD-9129`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
