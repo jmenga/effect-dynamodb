@@ -13625,52 +13625,72 @@ const makeImpl = <
     return undefined
   }
 
+  /** A unique sentinel's key, as `composeUniqueSentinel` gives it. */
+  type SentinelKey = { readonly pk: string; readonly sk: string }
+  const sameSentinelKey = (a: SentinelKey, b: SentinelKey) => a.pk === b.pk && a.sk === b.sk
+
   /**
    * The keys a unique sentinel of `source`'s values, read from `row`, can be stored under, other
    * than `current`: under each text, and with `otherKinds`, with some numeric values as the other
-   * kind. A moving row's sentinel is looked for there, before anything has a key to compare: with
-   * the values as `row`'s own key gives them, each value alone as the other kind, and every one
-   * of them, which is every reading of a constraint over one or two numeric fields. A sentinel
-   * under another mix is moved from its own row, which the scan reaches ({@link sentinelHeldAt}).
+   * kind. A moving row's sentinel is looked for there, before anything has a key to compare.
+   * `first` reads the values as they are, as `row`'s own key gives them, each alone as the other
+   * kind, and all of them, which is every reading of a constraint over one or two numeric fields.
+   * `mixes` gives every other reading, fewest values as the other kind first: looked at only when
+   * no key of `first`, and not the current key, holds a sentinel, since a moving row's sentinel
+   * names its old key and is moved by nothing else.
    */
   const otherSentinelKeys = (
     constraintName: string,
     constraintDef: UniqueConstraintDef,
     source: globalThis.Record<string, unknown>,
     row: StoredRow,
-    current: { readonly pk: string; readonly sk: string } | undefined,
+    current: SentinelKey | undefined,
     otherKinds: boolean,
-  ) => {
+  ): {
+    readonly first: ReadonlyArray<SentinelKey>
+    readonly mixes: () => ReadonlyArray<SentinelKey>
+  } => {
     const lifted = liftedSentinelValues(constraintDef, source)
+    const digits = (field: string) => row[resolveDbName(field)]?.N
+    const fields = otherKinds
+      ? resolveUniqueFields(constraintDef).filter(
+          (field) => otherNumericKind(lifted[field], digits(field)) !== undefined,
+        )
+      : []
     const readings: Array<ReadonlySet<string>> = [new Set()]
     if (otherKinds) {
-      const digits = (field: string) => row[resolveDbName(field)]?.N
-      const fields = resolveUniqueFields(constraintDef).filter(
-        (field) => otherNumericKind(lifted[field], digits(field)) !== undefined,
-      )
       const keyed = storedKeyReading(row)?.asOther
       if (keyed !== undefined) readings.push(new Set(fields.filter((field) => keyed.has(field))))
       for (const field of fields) readings.push(new Set([field]))
       readings.push(new Set(fields))
     }
-    const others: Array<{ readonly pk: string; readonly sk: string }> = []
-    for (const under of sentinelTexts()) {
-      for (const asOther of readings) {
-        const record = { ...lifted }
-        for (const field of asOther) {
-          record[field] = otherNumericKind(lifted[field], row[resolveDbName(field)]?.N)
-        }
-        const key = sentinelKeyUnder(under, constraintName, constraintDef, record, asOther)
-        if (
-          key !== undefined &&
-          !(key.pk === current?.pk && key.sk === current?.sk) &&
-          !others.some((other) => other.pk === key.pk && other.sk === key.sk)
-        ) {
-          others.push(key)
+    const seen = new Set<string>(current === undefined ? [] : [`${current.pk}\u0000${current.sk}`])
+    const keysOf = (mixes: ReadonlyArray<ReadonlySet<string>>) => {
+      const keys: Array<SentinelKey> = []
+      for (const under of sentinelTexts()) {
+        for (const asOther of mixes) {
+          const record = { ...lifted }
+          for (const field of asOther)
+            record[field] = otherNumericKind(lifted[field], digits(field))
+          const key = sentinelKeyUnder(under, constraintName, constraintDef, record, asOther)
+          if (key === undefined || seen.has(`${key.pk}\u0000${key.sk}`)) continue
+          seen.add(`${key.pk}\u0000${key.sk}`)
+          keys.push(key)
         }
       }
+      return keys
     }
-    return others
+    const first = keysOf(readings)
+    const mixes = () => {
+      const named = new Set(readings.map((asOther) => [...asOther].sort().join("\u0000")))
+      const others: Array<ReadonlySet<string>> = []
+      for (let mask = 1; mask < 2 ** fields.length; mask++) {
+        const asOther = new Set(fields.filter((_, i) => (mask & (1 << i)) !== 0))
+        if (!named.has([...asOther].sort().join("\u0000"))) others.push(asOther)
+      }
+      return keysOf(others.sort((a, b) => a.size - b.size))
+    }
+    return { first, mixes }
   }
 
   /**
@@ -13744,11 +13764,14 @@ const makeImpl = <
     depth: number,
     /**
      * Look under the other numeric kind's text too ({@link otherSentinelKeys}). A moving row's
-     * sentinels are looked for there, since they name its old key. One under its current key
-     * leaves it to the scan to find one there ({@link rekeySentinelRow}): each read it costs is a
-     * read of every item, on every run.
+     * sentinels are looked for there, since they name its old key: under the first readings, then,
+     * when none of them nor the current key holds one, under every other mix. One under its current
+     * key leaves it to the scan to find one there ({@link rekeySentinelRow}): each read it costs is
+     * a read of every item, on every run.
      */
     otherKinds: boolean,
+    /** A sentinel the scan reached, which names the row: looked at first, for its constraint. */
+    scanned?: { readonly constraintName: string; readonly key: SentinelKey } | undefined,
   ) =>
     Effect.gen(function* () {
       if (config.unique === undefined) return NO_SENTINEL_REKEYS
@@ -13833,20 +13856,39 @@ const makeImpl = <
               readonly owner: StoredKey
             }
           | undefined
-        for (const key of otherSentinelKeys(
+        const keys = otherSentinelKeys(
           constraintName,
           constraintDef,
           values,
           row,
           current,
           otherKinds,
-        )) {
-          const held = yield* readAt(key)
-          const owner = ownerIn(held)
-          if (held !== undefined && owner !== undefined) {
-            found = { key, held, owner }
-            break
-          }
+        )
+        const at =
+          scanned?.constraintName === constraintName && !sameSentinelKey(scanned.key, current)
+            ? [scanned.key]
+            : []
+        const lookAt = (
+          among: ReadonlyArray<SentinelKey>,
+        ): Effect.Effect<typeof found, DynamoClientError> =>
+          Effect.gen(function* () {
+            for (const key of among) {
+              const held = yield* readAt(key)
+              const owner = ownerIn(held)
+              if (held !== undefined && owner !== undefined) return { key, held, owner }
+            }
+            return undefined
+          })
+        found = yield* lookAt([
+          ...at,
+          ...keys.first.filter((key) => !at.some((one) => sameSentinelKey(one, key))),
+        ])
+        // Under no reading looked at, and none under its current key: the sentinel of a moving row
+        // is moved by nothing else, so every mix of kinds is looked at.
+        if (found === undefined && heldNow === undefined && otherKinds) {
+          found = yield* lookAt(
+            keys.mixes().filter((key) => !at.some((one) => sameSentinelKey(one, key))),
+          )
         }
         if (found !== undefined) {
           if (heldNow !== undefined) {
@@ -13970,13 +14012,24 @@ const makeImpl = <
     to: StoredKey,
     depth: number,
     otherKinds: boolean,
+    scanned?: { readonly constraintName: string; readonly key: SentinelKey } | undefined,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       if (config.unique === undefined) return {}
       const client = yield* Capacity.client
       const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
-        const planned = yield* sentinelRekeys(ctx, kind, values, row, owns, to, depth, otherKinds)
+        const planned = yield* sentinelRekeys(
+          ctx,
+          kind,
+          values,
+          row,
+          owns,
+          to,
+          depth,
+          otherKinds,
+          scanned,
+        )
         const moved = planned.count > 0 ? { sentinelsMoved: planned.count } : {}
         if (planned.items.length === 0 || ctx.dryRun) {
           return Rekey.mergeTallies(planned.tally, moved)
@@ -14016,28 +14069,32 @@ const makeImpl = <
       )?.[constraintName]
       const at = storedKeyOf(row)
       if (at === undefined) return { skipped: { unrecognizedKey: 1 } }
+      const keyOf = (sentinel: StoredRow): SentinelKey => {
+        const stored = storedKeyOf(sentinel)!
+        return { pk: stored[rekeyPk]!, sk: stored[rekeySk]! }
+      }
       const named = (sentinel: StoredRow, owner: StoredRow, otherKinds: boolean) => {
         if (constraintDef === undefined) return false
         const values = toDomainView(fromAttributeMap(owner) as globalThis.Record<string, unknown>)
-        const stored = storedKeyOf(sentinel)!
         return sentinelHeldAt(
           constraintName,
           constraintDef,
           values,
           owner,
-          { pk: stored[rekeyPk]!, sk: stored[rekeySk]! },
+          keyOf(sentinel),
           otherKinds,
         )
       }
       // Its owner's own pass moves it, except from under the other numeric kind's text, which an
-      // owner under its current key doesn't look under: this one moves it from there.
+      // owner under its current key doesn't look under: this one moves it from there, from the key
+      // the scan found it at, whatever mix of kinds that is.
       const judge = (sentinel: StoredRow, owner: StoredRow | undefined) =>
         owner === undefined
           ? Effect.succeed(undefined)
           : named(sentinel, owner, false)
             ? Effect.succeed({})
             : named(sentinel, owner, true)
-              ? sentinelsUnderOtherKind(ctx, owner)
+              ? sentinelsUnderOtherKind(ctx, owner, { constraintName, key: keyOf(sentinel) })
               : Effect.succeed(undefined)
       const judged = yield* judge(row, yield* sentinelOwnerRow(ctx.tableName, row))
       if (judged !== undefined) return judged
@@ -14057,11 +14114,13 @@ const makeImpl = <
 
   /**
    * The sentinels of `owner`, a row under its current key, brought from under the other numeric
-   * kind's text ({@link sentinelHeldAt}). A row under an old key moves them itself when it moves.
+   * kind's text ({@link sentinelHeldAt}), `scanned` the one the scan found. A row under an old key
+   * moves them itself when it moves.
    */
   const sentinelsUnderOtherKind = (
     ctx: Rekey.RekeyRowContext,
     owner: StoredRow,
+    scanned: { readonly constraintName: string; readonly key: SentinelKey },
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const targets = rowTargets(owner)
@@ -14069,7 +14128,16 @@ const makeImpl = <
       if (targets === undefined || ownerAt === undefined) return {}
       if (!sameStoredKey(ownerAt, targets.current)) return {}
       return targets.kind === "tombstone"
-        ? yield* rekeySentinels(ctx, "tombstone", owner, targets.isLive, targets.live, 0, true)
+        ? yield* rekeySentinels(
+            ctx,
+            "tombstone",
+            owner,
+            targets.isLive,
+            targets.live,
+            0,
+            true,
+            scanned,
+          )
         : yield* rekeySentinels(
             ctx,
             "item",
@@ -14078,6 +14146,7 @@ const makeImpl = <
             ownerAt,
             0,
             true,
+            scanned,
           )
     })
 

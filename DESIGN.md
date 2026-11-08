@@ -1018,18 +1018,24 @@ left is composed to confirm it. Each field is one decision: a composite in both 
 (`pk: [a, b]`, `sk: [a, b]`) has a stretch in each, and its later stretches follow its first. That
 is one composition per field, plus two, under each form, and no key is split on its delimiters.
 Where two fields' stretches overlap in one half, each is read as the other kind only alone. A moving row's unique sentinel is looked for before there is a stored key to compare,
-so it is read at the keys of a few readings: the values as they are, as the row's own key gives
-them, each alone as the other kind, and all of them, which is every reading of a constraint over
-one or two numeric fields. A sentinel under another mix is found from its own row, whose stored
-key is compared like any other, when the scan reaches it. `test/RekeyNumericKinds.test.ts` pins a
+so it is read at the keys of a few readings first: the values as they are, as the row's own key
+gives them, each alone as the other kind, and all of them, which is every reading of a constraint
+over one or two numeric fields. When none of them, and not its current key, holds a sentinel, the
+other mixes are read, fewest values as the other kind first, until one does: nothing else moves a
+moving row's sentinel, which names its old key. That is at most 2^k reads under each text, `k` the
+constraint's numeric values, only for a row that moves and whose sentinel the first readings don't
+find; a constraint over one or two numeric fields reads nothing more. `test/RekeyNumericKinds.test.ts` pins a
 clean run of an 18-composite index key to its one `Scan`, and a third of them under the bigint's
 text to one rewrite, each well under a quarter of a second (`f4ecbf7` took about half a second for
 the clean run alone); `test/CompositeCodec.test.ts` pins the count of compositions.
 
 An item or tombstone under its current key doesn't read its sentinels' keys under the other kind's
-text, which would cost a read per item on every run: the scan reaches such a sentinel, and its own
-handler moves it (`sentinelsUnderOtherKind`). A row that moves looks there, since its sentinels
-name its old key.
+text, which would cost a read per item on every run: the scan reaches such a sentinel, whose stored
+key is compared like any other (`sentinelHeldAt`), and its handler moves it from the key the scan
+found it at, whatever mix of kinds that is (`sentinelsUnderOtherKind`). A row that moves looks
+there, since its sentinels name its old key. The rows 1.39.0 stored for a constraint over four
+fields, each sentinel under another mix (`fixtures/kind-sentinel-mix-1.39.0.json`), pin both, and
+the reads each costs, in `test/RekeyNumericKinds.test.ts` and its connected twin.
 
 An event's sort key is composed from the `orderBy` value `append` stored, the Encoded value: a
 `Schema.BigInt` is read back below 2^53 as a number and lifted (`storedNumericForm`). Through 1.39.0
@@ -1260,9 +1266,11 @@ one declaring the other kind than the model's field, whose events would be keyed
 by text no read composes. A field whose kinds can't be read at load,
 `Schema.Unknown`, `Schema.Any`, an opaque `Schema.declare`, or a transform whose
 stored side is one of those, is judged by value at write instead
-(`readsBackOtherwise`): the value DynamoDB returns for it (a `number` for a
-`bigint` safe integer, a `bigint` for an integer `number` past 2^53) is decoded
-through the field and compared with the value written, decoded. One that reads
+(`readsBackOtherwise`): the value DynamoDB returns for it, the marshaller and
+the unmarshaller run for real (a `number` for a `bigint` safe integer, `0` for
+`-0`), is decoded through the field and compared with the value written,
+decoded. A `number` past 2^53 has no stored form: the marshaller refuses it, and
+the write's own marshalling reports it, as in any attribute (EDD-9124). One that reads
 back as something else is refused with a `ValidationError` (EDD-9128) naming
 what it reads back as, and nothing written, on every entity write
 (`encodeForWrite`, and `_refuseNotReadBack` for transactions and batches) and

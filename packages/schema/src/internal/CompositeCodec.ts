@@ -381,9 +381,9 @@ export interface ReadBackText {
  * or the value it reads back as. `undefined` for a value that reads back as written.
  *
  * `asRead` is what DynamoDB hands back for a stored value, the marshaller and the unmarshaller run
- * for real: a safe-integer `bigint` comes back as a `number`, an integer `number` past 2^53 as a
- * `bigint`, and `-0` as `0`. A value that comes back as it went is never judged. One that doesn't is
- * judged twice: each of `texts` composed from the value written and from the value read back must be
+ * for real: a safe-integer `bigint` comes back as a `number`, and `-0` as `0`. A `number` past
+ * 2^53 the marshaller refuses, which the write's own marshalling reports (`EDD-9124`). A value that
+ * comes back as it went is never judged. One that doesn't is judged twice: each of `texts` composed from the value written and from the value read back must be
  * the same text, and the value read back, decoded through `field`, must be the value written
  * decoded (when that decodes). `Schema.Unknown` reads `5n` back as `5`, and a declaration of either
  * kind does the same, so both are refused; `Schema.Unknown` decoded to a `Schema.BigInt` with
@@ -407,6 +407,9 @@ export const readsBackOtherwise = (
     return undefined
   }
   const decode = Schema.decodeUnknownOption(field as unknown as Schema.Codec<unknown, unknown>)
+  // A read takes what DynamoDB hands back as the one numeric kind the field stores, when it stores
+  // one ({@link storedNumericForm}): `OptionFromNullOr(Schema.BigInt)` reads `5` as `5n`.
+  const lift = storedNumericForm(field)
   const texts = options.texts ?? []
   return (stored) => {
     // A string or a boolean comes back as it went.
@@ -419,7 +422,7 @@ export const readsBackOtherwise = (
       return undefined
     }
     if (Object.is(returned, stored)) return undefined
-    const read = decode(returned)
+    const read = decode(lift?.(returned) ?? returned)
     const written = decode(stored)
     const textMoved = texts.some((text) => {
       const at = text.written(stored)

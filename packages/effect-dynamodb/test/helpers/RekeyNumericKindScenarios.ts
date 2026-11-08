@@ -251,3 +251,131 @@ export const scenarios: ReadonlyArray<Scenario> = [
       }),
   },
 ]
+
+/**
+ * What published 1.39.0 stored for a unique constraint over four fields declared the union, each
+ * item holding another mix of the kinds (`fixtures/kind-sentinel-mix-1.39.0.json`): two of four as
+ * bigints, three of four, one of four, and a tombstone keeping its reservation with two of four.
+ * The sentinel's key gives each value its own kind's text, so it is under one mix of the two.
+ */
+export const mixRows = (
+  JSON.parse(
+    readFileSync(new URL("../fixtures/kind-sentinel-mix-1.39.0.json", import.meta.url), "utf8"),
+  ) as { readonly rows: ReadonlyArray<Row> }
+).rows
+
+/** The fixture's definitions, the four fields now declared `Schema.Number`. */
+export const mixDefinitions = (escapeKeys: boolean) => {
+  const Mixed = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      a: Schema.Number,
+      b: Schema.Number,
+      c: Schema.Number,
+      d: Schema.Number,
+      note: Schema.String,
+    }),
+    entityType: "Mixed",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    unique: { four: ["a", "b", "c", "d"] },
+    softDelete: { preserveUnique: true },
+  } as never) as any
+  const Main = Table.make({
+    schema: DynamoSchema.make({ name: "mix", version: 1, escapeKeys }),
+    entities: { Mixed },
+  } as never) as any
+  return { Mixed, Main }
+}
+
+/** A row's keys, and for a sentinel the key it names, sorted, a tombstone's time of delete left out. */
+export const mixKeysOf = (rows: ReadonlyArray<Row>): ReadonlyArray<string> =>
+  rows
+    .map((row) => [row.pk?.S, row.sk?.S, row._entity_pk?.S ?? ""].join(" "))
+    .map((key) => key.replace(/#\d{4}-\d\d-\d\dT\S*/, "#<deleted at>"))
+    .sort()
+
+/** The constraint's sentinel key, each value under its number text, or `B` under the bigint's. */
+export const mixSentinel = (...values: ReadonlyArray<number | `B${number}`>) =>
+  `$mix#v1#mixed.four#${values
+    .map((value) => (typeof value === "number" ? N(String(value)) : B(value.slice(1))))
+    .join("#")}`
+
+/** The items' values, as 1.39.0 stored them (`B`, a bigint) and as they read back now. */
+const mixItems = [
+  { id: "a#b", stored: ["B1", "B2", 3, 4], now: [1, 2, 3, 4], live: true },
+  { id: "m3", stored: [5, "B6", "B7", "B8"], now: [5, 6, 7, 8], live: true },
+  { id: "one", stored: ["B9", 10, 11, 12], now: [9, 10, 11, 12], live: true },
+  { id: "g#1", stored: ["B13", 14, "B15", 16], now: [13, 14, 15, 16], live: false },
+] as const
+
+export const mixScenarios: ReadonlyArray<{
+  readonly name: string
+  readonly escapeKeys: boolean
+  readonly check: (
+    db: any,
+    keys: Effect.Effect<ReadonlyArray<string>>,
+  ) => Effect.Effect<void, unknown, any>
+}> = [false, true].map((escapeKeys) => ({
+  name: `escapeKeys ${escapeKeys}: each sentinel moves from whichever mix of kinds it is under`,
+  escapeKeys,
+  check: (db, keys) =>
+    Effect.gen(function* () {
+      const idKey = (id: string) => `$mix#v1#mixed#id_${escapeKeys ? id.replace("#", "%23") : id}`
+      const before = yield* keys
+      expect(before).toEqual(
+        [
+          ...mixItems.map(
+            (item) =>
+              `$mix#v1#mixed#id_${item.id} $mix#v1#mixed${item.live ? "" : "#deleted#<deleted at>"} `,
+          ),
+          ...mixItems.map(
+            (item) =>
+              `${mixSentinel(...item.stored)} $mix#v1#mixed.four $mix#v1#mixed#id_${item.id}`,
+          ),
+        ].sort(),
+      )
+      const dry = yield* db.tables.Main.rekey({ dryRun: true })
+      expect(yield* keys).toEqual(before)
+      const report = yield* db.tables.Main.rekey()
+      // The keys `#` is in move when they're escaped: the item and the tombstone.
+      expect(report.moved).toEqual({ ...ZERO, ...(escapeKeys && { item: 1, tombstone: 1 }) })
+      expect(report.sentinelsMoved).toBe(4)
+      expect(report.conflicts).toEqual([])
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(dry.moved).toEqual(report.moved)
+      expect(dry.sentinelsMoved).toBe(report.sentinelsMoved)
+      expect(dry.conflicts).toEqual(report.conflicts)
+      expect(yield* keys).toEqual(
+        [
+          ...mixItems.map(
+            (item) => `${idKey(item.id)} $mix#v1#mixed${item.live ? "" : "#deleted#<deleted at>"} `,
+          ),
+          ...mixItems.map(
+            (item) => `${mixSentinel(...item.now)} $mix#v1#mixed.four ${idKey(item.id)}`,
+          ),
+        ].sort(),
+      )
+
+      // Each reservation holds under the number's text, the tombstone's too.
+      for (const item of mixItems) {
+        const [a, b, c, d] = item.now
+        const taken = yield* Effect.exit(
+          db.entities.Mixed.put({ id: "z", a, b, c, d, note: "x" }).asEffect(),
+        )
+        expect(Exit.isFailure(taken) && JSON.stringify(taken)).toContain(
+          "UniqueConstraintViolation",
+        )
+      }
+      expect(yield* db.entities.Mixed.get({ id: "a#b" })).toMatchObject({ a: 1, b: 2, c: 3, d: 4 })
+
+      // Nothing more to move.
+      const again = yield* db.tables.Main.rekey()
+      expect(again.moved).toEqual(ZERO)
+      expect(again.sentinelsMoved).toBe(0)
+      expect(again.conflicts).toEqual([])
+      expect(again.skipped.unrecognizedKey).toBe(0)
+
+      // The tombstone's reservation is its item's, under the key it has now: restore takes it back.
+      expect(yield* db.entities.Mixed.restore({ id: "g#1" })).toMatchObject({ a: 13, c: 15 })
+    }),
+}))

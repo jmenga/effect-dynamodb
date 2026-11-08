@@ -1,0 +1,321 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "escapeKeys false": [
+  {
+   "sk": {
+    "S": "$opaque#v1#asnumber"
+   },
+   "note": {
+    "S": "event"
+   },
+   "at": {
+    "N": "5"
+   },
+   "id": {
+    "S": "x"
+   },
+   "pk": {
+    "S": "$opaque#v1#asnumber#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsNumber"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#asnumber#e#00000000000000000000000000000000000005"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "x"
+   },
+   "at": {
+    "N": "5"
+   },
+   "pk": {
+    "S": "$opaque#v1#asnumber#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsNumber"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#asunknown"
+   },
+   "note": {
+    "S": "event"
+   },
+   "at": {
+    "N": "5"
+   },
+   "id": {
+    "S": "x"
+   },
+   "pk": {
+    "S": "$opaque#v1#asunknown#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsUnknown"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#asunknown#e#00000000000000000000000000000000000005"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "x"
+   },
+   "at": {
+    "N": "5"
+   },
+   "pk": {
+    "S": "$opaque#v1#asunknown#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsUnknown"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#series"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "one"
+   },
+   "pk": {
+    "S": "$opaque#v1#series#id_one"
+   },
+   "n": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#series#e#00000000000000000000000000000000000005"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "one"
+   },
+   "pk": {
+    "S": "$opaque#v1#series#id_one"
+   },
+   "n": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#unique.byn"
+   },
+   "_entity_sk": {
+    "S": "$opaque#v1#unique"
+   },
+   "pk": {
+    "S": "$opaque#v1#unique.byn#00000000000000000000000000000000000005"
+   },
+   "_entity_pk": {
+    "S": "$opaque#v1#unique#id_one"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byN"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#unique"
+   },
+   "note": {
+    "S": "first"
+   },
+   "id": {
+    "S": "one"
+   },
+   "pk": {
+    "S": "$opaque#v1#unique#id_one"
+   },
+   "n": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   }
+  }
+ ],
+ "escapeKeys true": [
+  {
+   "sk": {
+    "S": "$opaque#v1#asnumber"
+   },
+   "note": {
+    "S": "event"
+   },
+   "at": {
+    "N": "5"
+   },
+   "id": {
+    "S": "x"
+   },
+   "pk": {
+    "S": "$opaque#v1#asnumber#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsNumber"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#asnumber#e#0000000000000005"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "x"
+   },
+   "at": {
+    "N": "5"
+   },
+   "pk": {
+    "S": "$opaque#v1#asnumber#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsNumber"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#asunknown"
+   },
+   "note": {
+    "S": "event"
+   },
+   "at": {
+    "N": "5"
+   },
+   "id": {
+    "S": "x"
+   },
+   "pk": {
+    "S": "$opaque#v1#asunknown#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsUnknown"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#asunknown#e#00000000000000000000000000000000000005"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "x"
+   },
+   "at": {
+    "N": "5"
+   },
+   "pk": {
+    "S": "$opaque#v1#asunknown#id_x"
+   },
+   "__edd_e__": {
+    "S": "AsUnknown"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#series"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "one"
+   },
+   "pk": {
+    "S": "$opaque#v1#series#id_one"
+   },
+   "n": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#series#e#00000000000000000000000000000000000005"
+   },
+   "note": {
+    "S": "event"
+   },
+   "id": {
+    "S": "one"
+   },
+   "pk": {
+    "S": "$opaque#v1#series#id_one"
+   },
+   "n": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#unique.byn"
+   },
+   "_entity_sk": {
+    "S": "$opaque#v1#unique"
+   },
+   "pk": {
+    "S": "$opaque#v1#unique.byn#00000000000000000000000000000000000005"
+   },
+   "_entity_pk": {
+    "S": "$opaque#v1#unique#id_one"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byN"
+   }
+  },
+  {
+   "sk": {
+    "S": "$opaque#v1#unique"
+   },
+   "note": {
+    "S": "first"
+   },
+   "id": {
+    "S": "one"
+   },
+   "pk": {
+    "S": "$opaque#v1#unique#id_one"
+   },
+   "n": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   }
+  }
+ ]
+}

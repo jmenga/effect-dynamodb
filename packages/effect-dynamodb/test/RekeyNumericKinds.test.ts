@@ -8,7 +8,9 @@
  * The rows are what published 1.39.0 stored: items, an index key, unique sentinels, a tombstone,
  * time-series events, an aggregate's partition and a `many` edge's rows, and a `Schema.Unknown` key
  * holding a bigint safe integer, which reads back as a number. Two items holding `3` and `3n` read
- * back as one item; they're reported and left. Scenarios: `helpers/RekeyNumericKindScenarios.ts`;
+ * back as one item; they're reported and left. A unique constraint over four such fields stored
+ * each sentinel under another mix of the kinds (`fixtures/kind-sentinel-mix-1.39.0.json`): each
+ * moves, and the reads it costs are pinned. Scenarios: `helpers/RekeyNumericKindScenarios.ts`;
  * connected twin: `connected.rekey-numeric-kinds.test.ts`.
  */
 
@@ -26,6 +28,11 @@ import {
   definitions,
   fixtureRows,
   keysOf,
+  mixDefinitions,
+  mixKeysOf,
+  mixRows,
+  mixScenarios,
+  mixSentinel,
   type Row,
   scenarios,
 } from "./helpers/RekeyNumericKindScenarios.js"
@@ -261,4 +268,89 @@ describe("rekey reports a many edge's rows that read back as one element (EDD-91
       )
     })
   }
+})
+
+describe("rekey moves a unique sentinel from whichever mix of kinds it is under (EDD-9128)", () => {
+  const mix = <A, E>(
+    escapeKeys: boolean,
+    body: (db: any, table: any) => Effect.Effect<A, E, any>,
+  ) => {
+    const { Mixed, Main } = mixDefinitions(escapeKeys)
+    const table = makeRecordingTable()
+    for (const row of mixRows)
+      table.items.set(`${row.pk!.S}|${row.sk!.S}`, structuredClone(row) as never)
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Mixed },
+        tables: { Main },
+      } as never) as Effect.Effect<any, never, any>
+      return yield* body(db, table)
+    }).pipe(
+      Effect.provide(Main.layer({ name: "t" })),
+      Effect.provide(table.layer),
+    ) as Effect.Effect<A, unknown>
+  }
+  const sentinelReads = (requests: ReadonlyArray<any>) =>
+    requests
+      .filter((request) => request.command === "GetItem")
+      .map((request) => request.input.Key.pk.S as string)
+      .filter((pk) => pk.startsWith("$mix#v1#mixed.four#"))
+
+  for (const scenario of mixScenarios) {
+    it.effect(scenario.name, () =>
+      mix(scenario.escapeKeys, (db, table) =>
+        scenario.check(
+          db,
+          Effect.sync(() => mixKeysOf([...table.items.values()] as unknown as ReadonlyArray<Row>)),
+        ),
+      ),
+    )
+  }
+
+  it.effect("a row under its current key: its sentinel is read where the scan found it", () =>
+    mix(false, (db, table) =>
+      Effect.gen(function* () {
+        table.take()
+        yield* db.tables.Main.rekey()
+        // Each sentinel under its current key, and where 1.39.0 stored it: no other mix is read.
+        expect(new Set(sentinelReads(table.take()))).toEqual(
+          new Set([
+            ...[
+              [1, 2, 3, 4],
+              [5, 6, 7, 8],
+              [9, 10, 11, 12],
+              [13, 14, 15, 16],
+            ].map((values) => mixSentinel(...values)),
+            mixSentinel("B1", "B2", 3, 4),
+            mixSentinel(5, "B6", "B7", "B8"),
+            mixSentinel("B9", 10, 11, 12),
+            mixSentinel("B13", 14, "B15", 16),
+          ]),
+        )
+      }),
+    ),
+  )
+
+  it.effect("a moving row reads the other mixes, fewest first, until one holds its sentinel", () =>
+    mix(true, (db, table) =>
+      Effect.gen(function* () {
+        table.take()
+        yield* db.tables.Main.rekey()
+        // The tombstone's: 14 is its second value, under either text.
+        const tombstone = sentinelReads(table.take()).filter((pk) => /#0+14#/.test(pk))
+        expect(tombstone.slice(0, 8)).toEqual([
+          mixSentinel(13, 14, 15, 16),
+          // Each value alone as the other kind, and all of them.
+          mixSentinel("B13", 14, 15, 16),
+          mixSentinel(13, "B14", 15, 16),
+          mixSentinel(13, 14, "B15", 16),
+          mixSentinel(13, 14, 15, "B16"),
+          mixSentinel("B13", "B14", "B15", "B16"),
+          // Then two of them: the first holds no sentinel, the second the tombstone's.
+          mixSentinel("B13", "B14", 15, 16),
+          mixSentinel("B13", 14, "B15", 16),
+        ])
+      }),
+    ),
+  )
 })

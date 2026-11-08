@@ -208,14 +208,17 @@ describe("CompositeCodec", () => {
 
     it("judges a value of a field whose kinds can't be read by the value DynamoDB returns", () => {
       // What DynamoDB hands back, as the marshaller and the unmarshaller do: a safe-integer bigint
-      // as a number, an integer number past 2^53 as a bigint, and -0 as 0.
+      // as a number, and -0 as 0. A number past 2^53 the marshaller refuses.
       const asRead = (stored: unknown): unknown => {
         if (typeof stored === "bigint") {
           return Number.isSafeInteger(Number(stored)) ? Number(stored) : stored
         }
         if (typeof stored === "number") {
           if (Object.is(stored, -0)) return 0
-          return Number.isInteger(stored) && !Number.isSafeInteger(stored) ? BigInt(stored) : stored
+          if (Number.isInteger(stored) && !Number.isSafeInteger(stored)) {
+            throw new Error(`Number ${stored} is greater than Number.MAX_SAFE_INTEGER.`)
+          }
+          return stored
         }
         return stored
       }
@@ -226,7 +229,8 @@ describe("CompositeCodec", () => {
       expect(readsOther(2n ** 60n + 1n)).toBeUndefined()
       expect(readsOther(5)).toBeUndefined()
       expect(readsOther(1.5)).toBeUndefined()
-      expect(readsOther(2 ** 60)).toBe("a bigint")
+      // The write's own marshalling refuses it, as in any attribute (EDD-9124).
+      expect(readsOther(2 ** 60)).toBeUndefined()
       expect(readsOther("5")).toBeUndefined()
       expect(judge(Schema.Any)).toBeDefined()
       // A transform whose stored side can't be read is judged through its decode: a bigint that
@@ -243,6 +247,12 @@ describe("CompositeCodec", () => {
       )
       expect(judge(declared)?.(5n)).toBe("a number")
       expect(judge(declared)?.(5)).toBeUndefined()
+      // A field storing one numeric kind reads the number DynamoDB returns as that kind, as every
+      // read does: the bigint written is read back.
+      expect(judge(Schema.OptionFromNullOr(Schema.BigInt))?.(5n)).toBeUndefined()
+      expect(
+        judge(Schema.BigInt.pipe(Schema.withDecodingDefault(Effect.succeed(7n))))?.(5n),
+      ).toBeUndefined()
       // Kinds known at load are never judged at write.
       expect(judge(Schema.BigInt)).toBeUndefined()
       expect(judge(Schema.String)).toBeUndefined()
