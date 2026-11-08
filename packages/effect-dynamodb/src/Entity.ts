@@ -51,6 +51,7 @@ import {
   compositeKeyFormKind,
   keyFormValueKind,
   makeCompositeKeyForm,
+  readsBackAsOtherKind,
   storedNumericForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -769,7 +770,8 @@ export interface Entity<
   readonly _fillDecodingDefaults: (input: unknown) => Effect.Effect<unknown, ValidationError>
   /**
    * Refuses an encoded payload holding a value of a custom declaration that wouldn't read back
-   * (`EDD-9126`). For a write path outside this entity's own operations.
+   * (`EDD-9126`), or a key value of a field taking both numeric kinds that reads back as the other
+   * (`EDD-9128`). For a write path outside this entity's own operations.
    * @internal
    */
   readonly _refuseNotReadBack: (
@@ -3009,6 +3011,72 @@ const makeImpl = <
         )
 
   /**
+   * The fields that take both numeric kinds without declaring either (`Schema.Unknown`,
+   * `Schema.Any`), each with the test of a value that reads back as the other kind. A key composed
+   * from one is refused when a write gives it such a value (`EDD-9128`); a declared one is refused
+   * at load. Empty for a model with none, which pays nothing more on a write.
+   */
+  const otherKindReads: ReadonlyMap<string, (value: unknown) => boolean> = new Map(
+    Object.entries(data.modelFields as globalThis.Record<string, Schema.Top>).flatMap(
+      ([field, schema]) => {
+        const readsOther = readsBackAsOtherKind(schema)
+        return readsOther === undefined ? [] : [[field, readsOther] as const]
+      },
+    ),
+  )
+
+  /** What composes `field` into key text, in words, or `undefined` when nothing does. */
+  const composedInto = (field: string): string | undefined => {
+    for (const [name, def] of Object.entries(allIndexes)) {
+      if (def.pk.composite.includes(field) || def.sk.composite.includes(field)) {
+        return name === "primary" ? "the primary key" : `index "${name}"`
+      }
+    }
+    for (const [name, def] of Object.entries(
+      (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+    )) {
+      if (resolveUniqueFields(def).includes(field)) return `unique constraint "${name}"`
+    }
+    for (const [name, def] of Object.entries(data.vectorIndexes)) {
+      if (def.partition.includes(field)) return `vector index "${name}"'s partition`
+    }
+    const timeSeries = config.timeSeries as TimeSeriesConfig<any> | undefined
+    return timeSeries?.orderBy === field ? "an event's sort key (timeSeries.orderBy)" : undefined
+  }
+
+  /**
+   * Refuses a payload giving a key composed from a field that takes both numeric kinds a value that
+   * reads back as the other kind: a stored row would compose other key text (`EDD-9128`).
+   */
+  const refuseOtherKindRead = (
+    encoded: unknown,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    for (const [field, readsOther] of otherKindReads) {
+      const value = (encoded as globalThis.Record<string, unknown>)[field]
+      if (value == null || !readsOther(value)) continue
+      const into = composedInto(field)
+      if (into === undefined) continue
+      const [given, read] =
+        typeof value === "bigint"
+          ? [`the bigint ${value}n`, "a number"]
+          : [`the number ${value}`, "a bigint"]
+      return Effect.fail(
+        new ValidationError({
+          entityType,
+          operation,
+          cause:
+            `Field "${field}" is composed into ${into}, and ${given} would read back as ${read}, ` +
+            "whose key text isn't the one written: DynamoDB stores a number and a bigint alike. A " +
+            "key composed again from the stored row wouldn't be this one. Nothing was written. " +
+            "Declare the field's kind, such as Schema.Number or Schema.BigInt. [EDD-9128]",
+        }),
+      )
+    }
+    return Effect.void
+  }
+
+  /**
    * A write's payload, encoded (see `encodeOrDecodeEncode`) and refused if it wouldn't read back.
    * Every write of the entity's own encodes through this.
    */
@@ -3016,12 +3084,16 @@ const makeImpl = <
     schema: Schema.Codec<any>,
     input: unknown,
     operation: string,
-  ): Effect.Effect<unknown, ValidationError> =>
-    readBacks.size === 0
-      ? encodeOrDecodeEncode(schema, input, entityType, operation)
-      : encodeOrDecodeEncode(schema, input, entityType, operation).pipe(
-          Effect.tap((encoded) => refuseNotReadBack(encoded, operation)),
-        )
+  ): Effect.Effect<unknown, ValidationError> => {
+    const encoded = encodeOrDecodeEncode(schema, input, entityType, operation)
+    const readBack =
+      readBacks.size === 0
+        ? encoded
+        : encoded.pipe(Effect.tap((value) => refuseNotReadBack(value, operation)))
+    return otherKindReads.size === 0
+      ? readBack
+      : readBack.pipe(Effect.tap((value) => refuseOtherKindRead(value, operation)))
+  }
 
   /**
    * An update's operand that wouldn't read back. An operand of `.add`, `.subtract` or `.deleteFromSet`
@@ -13950,7 +14022,13 @@ const makeImpl = <
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
-    _refuseNotReadBack: refuseNotReadBack,
+    _refuseNotReadBack: (encoded: unknown, operation: string) =>
+      otherKindReads.size === 0
+        ? refuseNotReadBack(encoded, operation)
+        : Effect.andThen(
+            refuseNotReadBack(encoded, operation),
+            refuseOtherKindRead(encoded, operation),
+          ),
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),

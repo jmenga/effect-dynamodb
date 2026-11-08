@@ -214,9 +214,18 @@ export type NumericKind = "number" | "bigint"
  * `Schema.BigInt` and `Schema.Union([Schema.String, Schema.BigInt])` store only a `bigint`;
  * `Schema.Union([Schema.Number, Schema.BigInt])` stores both, and so does an unknown value. Read back,
  * a field storing one kind is that kind ({@link storedNumericForm}); a field storing both can't say
- * which from the value alone, so no key is composed from one ({@link bothKindsKeyRefusal}).
+ * which from the value alone, so no key is composed from one: declared, it's refused at load
+ * ({@link bothKindsKeyRefusal}), and a `Schema.Unknown` or `Schema.Any` key refuses a value that
+ * reads back as the other kind at write ({@link readsBackAsOtherKind}).
  */
-export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> => {
+export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> =>
+  numericKinds(field, true)
+
+/**
+ * The numeric kinds a field's Encoded side declares: {@link storedNumericKinds} but for what
+ * `Schema.Unknown` and `Schema.Any` take, which declare no kind.
+ */
+const numericKinds = (field: Schema.Top, open: boolean): ReadonlySet<NumericKind> => {
   const kinds = new Set<NumericKind>()
   const seen = new Set<SchemaAST.AST>()
   const walk = (ast: SchemaAST.AST): void => {
@@ -227,8 +236,10 @@ export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> 
     } else if (SchemaAST.isNumber(ast)) kinds.add("number")
     else if (SchemaAST.isBigInt(ast)) kinds.add("bigint")
     else if (SchemaAST.isUnknown(ast) || SchemaAST.isAny(ast)) {
-      kinds.add("number")
-      kinds.add("bigint")
+      if (open) {
+        kinds.add("number")
+        kinds.add("bigint")
+      }
     } else if (SchemaAST.isLiteral(ast)) {
       if (typeof ast.literal === "number") kinds.add("number")
       if (typeof ast.literal === "bigint") kinds.add("bigint")
@@ -243,14 +254,15 @@ export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> 
 }
 
 /**
- * `[EDD-9128]`: a key composite storing both numeric kinds ({@link storedNumericKinds}), or
- * `undefined` for one that doesn't. DynamoDB stores `5` and `5n` alike, as `{N:"5"}`, and a safe
- * integer reads back as a `number` whichever was written, while the two compose different key text
- * (16 digits, 38). So a key composed again from a row read back (`restore`, an update reading the
- * item first, a delete releasing a unique constraint, `rekey`, an aggregate's `update` and `list`)
- * wouldn't be the key `put` wrote, and the value can't say which kind it was. Refused at load
- * wherever a value is composed into key text: a key, a unique constraint, a vector partition, a
- * time-series `orderBy`. A field no key reads may store both.
+ * `[EDD-9128]`: a key composite declaring both numeric kinds, or `undefined` for one that doesn't.
+ * DynamoDB stores `5` and `5n` alike, as `{N:"5"}`, and a safe integer reads back as a `number`
+ * whichever was written, while the two compose different key text (16 digits, 38). So a key composed
+ * again from a row read back (`restore`, an update reading the item first, a delete releasing a
+ * unique constraint, `rekey`, an aggregate's `update` and `list`) wouldn't be the key `put` wrote,
+ * and the value can't say which kind it was. Refused at load wherever a value is composed into key
+ * text: a key, a unique constraint, a vector partition, a time-series `orderBy`. A field no key reads
+ * may store both. `Schema.Unknown` and `Schema.Any` declare no kind, and a key over one that holds
+ * strings works, so they're judged by value at write instead ({@link readsBackAsOtherKind}).
  */
 export const bothKindsKeyRefusal = (
   owner: string,
@@ -258,7 +270,7 @@ export const bothKindsKeyRefusal = (
   attr: string,
   field: Schema.Top,
 ): Error | undefined => {
-  if (storedNumericKinds(field).size < 2) return undefined
+  if (numericKinds(field, false).size < 2) return undefined
   return new Error(
     `[EDD-9128] ${owner}: ${where} can't be composed from "${attr}", which stores both a number ` +
       `and a bigint. DynamoDB stores 5 and 5n alike and reads a safe integer back as a number, ` +
@@ -266,6 +278,23 @@ export const bothKindsKeyRefusal = (
       `wouldn't be the key the write composed. Declare the one kind it holds, such as ` +
       `Schema.Number or Schema.BigInt.`,
   )
+}
+
+/**
+ * For a key composite whose field takes both numeric kinds without declaring them
+ * (`Schema.Unknown`, `Schema.Any`): whether a value a write stores reads back as the other kind,
+ * and so composes other key text from a stored row. A `bigint` that's a safe integer reads back as
+ * a `number`, and an integer `number` past 2^53 as a `bigint`. `undefined` for a field that can't
+ * hold both, which never needs asking.
+ */
+export const readsBackAsOtherKind = (
+  field: Schema.Top,
+): ((value: unknown) => boolean) | undefined => {
+  if (storedNumericKinds(field).size < 2) return undefined
+  return (value) =>
+    typeof value === "bigint"
+      ? Number.isSafeInteger(Number(value)) && BigInt(Number(value)) === value
+      : typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)
 }
 
 /**

@@ -28,12 +28,17 @@ const BOTH: ReadonlyArray<readonly [string, Schema.Top]> = [
     Schema.optional(Schema.Union([Schema.Number, Schema.BigInt])),
   ],
   ["a branded union", Schema.Union([Schema.Number, Schema.BigInt]).pipe(Schema.brand("N"))],
-  ["Unknown", Schema.Unknown],
-  ["Any", Schema.Any],
 ]
 
-/** Fields storing one numeric kind, or none: composed as before. */
+/**
+ * Fields storing one numeric kind, or none, composed as before; and `Schema.Unknown` and
+ * `Schema.Any`, which declare no kind: a key over one holding strings works, so its values are judged
+ * at write instead (`effect-dynamodb`'s `test/UnknownKeyKinds.test.ts`).
+ */
 const ONE: ReadonlyArray<readonly [string, Schema.Top]> = [
+  ["Unknown", Schema.Unknown],
+  ["Any", Schema.Any],
+  ["Union([Unknown, BigInt])", Schema.Union([Schema.Unknown, Schema.BigInt])],
   ["Number", Schema.Number],
   ["BigInt", Schema.BigInt],
   ["Union([String, BigInt])", Schema.Union([Schema.String, Schema.BigInt])],

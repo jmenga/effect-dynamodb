@@ -35,6 +35,7 @@ import {
 } from "@effect-dynamodb/schema/Errors.js"
 import {
   makeCompositeKeyForm,
+  readsBackAsOtherKind,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
@@ -1674,6 +1675,94 @@ const makeAggregate = <TSchema extends Schema.Top>(
           )
         })
 
+  /**
+   * `[EDD-9128]`, by value: each key composite whose field takes both numeric kinds without declaring
+   * either (`Schema.Unknown`, `Schema.Any`), with what composes it and the test of a value that reads
+   * back as the other kind. A declared one is refused at load. Empty for an aggregate with none, which
+   * pays nothing more on a write.
+   */
+  const otherKindKeys = (() => {
+    type Check = { readonly into: string; readonly readsOther: (value: unknown) => boolean }
+    const root = new Map<string, Check>()
+    const addRoot = (into: string, composites: ReadonlyArray<string>) => {
+      for (const field of composites) {
+        const fieldSchema = schemaFields?.[field]
+        const readsOther = fieldSchema === undefined ? undefined : readsBackAsOtherKind(fieldSchema)
+        if (readsOther !== undefined && !root.has(field)) root.set(field, { into, readsOther })
+      }
+    }
+    addRoot("its partition key", config.pk.composite)
+    addRoot("its collection sort key", config.collection.sk?.composite ?? [])
+    if (config.list !== undefined) {
+      addRoot("its list partition key", config.list.pk.composite)
+      addRoot("its list sort key", config.list.sk.composite)
+    }
+    const edges = new Map<string, Map<string, Check>>()
+    const walk = (node: ResolvedNode): void => {
+      if (node.cardinality === "many" && node.skComposite !== undefined) {
+        const checks = new Map<string, Check>()
+        for (const field of node.skComposite) {
+          const fieldSchema = node.ownFields?.[field]
+          const readsOther =
+            fieldSchema === undefined ? undefined : readsBackAsOtherKind(fieldSchema)
+          if (readsOther !== undefined) {
+            checks.set(field, { into: `edge "${node.fieldName}"'s sort key`, readsOther })
+          }
+        }
+        if (checks.size > 0) edges.set(node.entityType, checks)
+      }
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return { root, edges }
+  })()
+
+  /**
+   * Refuses a write giving a key composite of a field that takes both numeric kinds a value that
+   * reads back as the other kind: a stored row would compose other key text (`EDD-9128`).
+   */
+  const refuseOtherKindKeys = (
+    groups: ReadonlyArray<TransactionGroup>,
+    value: Record<string, unknown>,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    if (otherKindKeys.root.size === 0 && otherKindKeys.edges.size === 0) return Effect.void
+    const found: Array<readonly [string, string, string, unknown]> = []
+    for (const [field, { into, readsOther }] of otherKindKeys.root) {
+      if (value[field] != null && readsOther(value[field])) {
+        found.push([field, config.root.entityType, into, value[field]])
+      }
+    }
+    for (const group of groups) {
+      for (const item of group.items) {
+        for (const [field, { into, readsOther }] of otherKindKeys.edges.get(item.entityType) ??
+          []) {
+          const held = item.attributes[field]
+          if (held != null && readsOther(held)) found.push([field, item.member, into, held])
+        }
+      }
+    }
+    const [first] = found
+    if (first === undefined) return Effect.void
+    const [field, member, into, held] = first
+    const [given, read] =
+      typeof held === "bigint"
+        ? [`the bigint ${held}n`, "a number"]
+        : [`the number ${String(held)}`, "a bigint"]
+    return Effect.fail(
+      new ValidationError({
+        entityType: aggregateName,
+        operation,
+        cause:
+          `Field "${field}" of "${member}" is composed into ${into}, and ${given} would read back ` +
+          `as ${read}, whose key text isn't the one written: DynamoDB stores a number and a ` +
+          "bigint alike. A key composed again from the stored rows wouldn't be this one. Nothing " +
+          "was written. Declare the field's kind, such as Schema.Number or Schema.BigInt. " +
+          "[EDD-9128]",
+      }),
+    )
+  }
+
   /** Shared: compose PK and query all items, a rejected read a `ValidationError`. */
   const fetchPartition = (key: Record<string, unknown>, operation: string, rekeyRead?: RekeyRead) =>
     readPartition(
@@ -1926,6 +2015,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           stampFor(now, existingCreated, undefined, updatedBefore),
         ),
       )
+      yield* refuseOtherKindKeys(newGroups, assembledNew, "aggregate.update")
       yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
@@ -2633,6 +2723,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               stampFor(now, EMPTY_CREATED),
             ),
           )
+          yield* refuseOtherKindKeys(groups, assembled, "aggregate.create")
           yield* refuseNotReadBack(
             dynamoGroups,
             assembled,

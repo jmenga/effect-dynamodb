@@ -14,6 +14,7 @@ import {
   bothKindsKeyRefusal,
   keyFormValueKind,
   makeCompositeKeyForm,
+  readsBackAsOtherKind,
   storedNumericForm,
   storedNumericKinds,
   toCompositeKeyRecord,
@@ -199,13 +200,30 @@ describe("CompositeCodec", () => {
       expect(storedNumericForm(Schema.Union([Schema.String, Schema.BigInt]))?.(5)).toBe(5n)
     })
 
+    it("judges a value of a field taking both kinds undeclared by its kind read back", () => {
+      const readsOther = readsBackAsOtherKind(Schema.Unknown)!
+      expect(readsOther(5n)).toBe(true)
+      expect(readsOther(-5n)).toBe(true)
+      expect(readsOther(2n ** 60n + 1n)).toBe(false)
+      expect(readsOther(5)).toBe(false)
+      expect(readsOther(1.5)).toBe(false)
+      expect(readsOther(2 ** 60)).toBe(true)
+      expect(readsOther("5")).toBe(false)
+      expect(readsBackAsOtherKind(Schema.Any)).toBeDefined()
+      expect(readsBackAsOtherKind(Schema.BigInt)).toBeUndefined()
+      expect(readsBackAsOtherKind(Schema.String)).toBeUndefined()
+    })
+
     it("refuses a key over a field storing both, and only that (EDD-9128)", () => {
       const refusal = (field: Schema.Top) =>
         bothKindsKeyRefusal('Entity "E"', "the primary key", "n", field)?.message
       expect(refusal(Schema.Union([Schema.Number, Schema.BigInt]))).toMatch(
         /^\[EDD-9128\] Entity "E": the primary key can't be composed from "n", which stores both/,
       )
-      expect(refusal(Schema.Unknown)).toMatch(/EDD-9128/)
+      // Unknown and Any declare no kind: their values are judged at write.
+      expect(refusal(Schema.Unknown)).toBeUndefined()
+      expect(refusal(Schema.Any)).toBeUndefined()
+      expect(refusal(Schema.Union([Schema.Literal(1), Schema.Literal(2n)]))).toMatch(/EDD-9128/)
       expect(refusal(Schema.BigInt)).toBeUndefined()
       expect(refusal(Schema.Number)).toBeUndefined()
       expect(refusal(Schema.Union([Schema.String, Schema.BigInt]))).toBeUndefined()
