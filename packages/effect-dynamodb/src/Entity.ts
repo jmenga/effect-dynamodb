@@ -12224,13 +12224,16 @@ const makeImpl = <
       if (timeSeriesConfig !== undefined) {
         const orderBy = timeSeriesConfig.orderBy
         if (values[orderBy] === undefined || values[orderBy] === null) return undefined
+        // What `append` composed the key from: the Encoded value it stored, which a `bigint`
+        // reads back from as a number while it's a safe integer.
+        const appended = storedSentinelValue(orderBy, values[orderBy]) ?? values[orderBy]
         return targets("event", (form, key) =>
           keyAt(
             key[rekeyPk]!,
             KeyComposer.composeEventSk(
               form.sk,
               key[rekeySk]!,
-              KeyComposer.eventOrderByValue(form.sk, values[orderBy], rowKeyForm[orderBy]),
+              KeyComposer.eventOrderByValue(form.sk, appended, rowKeyForm[orderBy]),
             ),
           ),
         )
