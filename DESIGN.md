@@ -992,6 +992,27 @@ is a text half like any other, and its sort half is rewritten only when a prefix
 differs: the address keeps its bytes. A run that moves an item reads the moved row and does
 the same (`rekeyAfterMove`). The move itself recomposes index keys as an update would.
 
+**Rows under the other numeric kind's text (EDD-9128).** A key composite that stored both
+numeric kinds composed each value's own kind's text: 16 digits for `5`, 38 for `5n`. That's a
+`Schema.Union([Schema.Number, Schema.BigInt])` before 1.40.0 refused it, or a `Schema.Unknown` given
+a `bigint` safe integer. Declared one kind now, a row written with the other is under text its
+values, as read back, don't compose. Each form is also composed with the row's numeric key
+composites as the other kind (`CompositeCodec.numericKindVariants`: every set of them, the other
+kind read from the digits of the stored `N`). So such a row is recognised and moved to the text of
+its values as read back: an item, its index keys and vector partitions, its unique sentinels
+(`otherSentinelKeys`), a snapshot or tombstone, a time-series event, an aggregate's partition and a
+`many` edge's rows (`oldPosition`). A projection's row tombstone or outbox item holds no values, so
+its key is read with a numeric composite as the other kind when the declared reading fits nothing
+(`readAsOtherNumericKind`). Two items whose values read back as one item (`3` and `3n`) are the
+conflict `bothKeys`, and both are left. A key with no numeric composite has one variant, and nothing
+changes for it. A unique constraint over one has more candidate keys, and each costs `rekey` a
+consistent read.
+
+An event's sort key is composed from the `orderBy` value `append` stored, the Encoded value: a
+`Schema.BigInt` is read back below 2^53 as a number and lifted (`storedNumericForm`). Through 1.39.0
+`rekey` composed it from the number under `escapeKeys: false` and moved the event to the number's
+text. The other-kind variants find such an event and move it back.
+
 **The accepted limit.** The text rewrite leaves an index key that isn't any form's text, as when a row
 cleared a composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
 broader query finds it where its old text sorts, and under a partition key half `get` still reads it.
@@ -1213,7 +1234,9 @@ on an aggregate's `create` and `update` (`refuseOtherKindKeys`). A field no key
 reads may store both, and is read as it comes back. Since 1.40.0; 1.39.0 loaded
 such a model and composed its keys from the value as read, so a `bigint` safe
 integer was restored, updated and listed under the `number`'s key, and a delete
-left its sentinel behind.
+left its sentinel behind. A field once declared both and now one kind keeps rows
+under the other kind's text, and `rekey` moves them ("Rows under the other
+numeric kind's text", under `rekey`).
 
 ### Isolated vs Clustered Key Prefixes
 

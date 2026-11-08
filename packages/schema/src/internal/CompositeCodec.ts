@@ -298,6 +298,51 @@ export const readsBackAsOtherKind = (
 }
 
 /**
+ * `record` with its `fields` that hold a number or a bigint as each numeric kind: `record` first,
+ * then with each set of them as the other kind, naming the fields given as the other kind. A field
+ * that stored both (`Schema.Union([Schema.Number, Schema.BigInt])` before {@link
+ * bothKindsKeyRefusal}, or a `Schema.Unknown`) composed each value's own kind's text, so `rekey`
+ * looks for a row now one kind under the other's. The other kind is read from `digits`, the `N`
+ * a field stored, when there is one: a bigint past 2^53 keeps its digits, and a number that isn't
+ * an integer has no bigint.
+ */
+export const numericKindVariants = (
+  record: Record<string, unknown>,
+  fields: ReadonlyArray<string>,
+  digits: (field: string) => string | undefined,
+): ReadonlyArray<{
+  readonly record: Record<string, unknown>
+  readonly asOther: ReadonlySet<string>
+}> => {
+  const others: Array<readonly [string, number | bigint]> = []
+  for (const field of fields) {
+    const value = record[field]
+    if (typeof value !== "number" && typeof value !== "bigint") continue
+    const stored = digits(field)
+    if (typeof value === "bigint") {
+      others.push([field, Number(stored ?? value)])
+    } else if (stored !== undefined ? /^-?\d+$/.test(stored) : Number.isInteger(value)) {
+      others.push([field, BigInt(stored ?? value)])
+    }
+  }
+  const variants: Array<{
+    readonly record: Record<string, unknown>
+    readonly asOther: ReadonlySet<string>
+  }> = [{ record, asOther: new Set() }]
+  for (let set = 1; set < 2 ** others.length; set++) {
+    const flipped = { ...record }
+    const asOther = new Set<string>()
+    for (const [i, [field, other]] of others.entries()) {
+      if ((set & (2 ** i)) === 0) continue
+      flipped[field] = other
+      asOther.add(field)
+    }
+    variants.push({ record: flipped, asOther })
+  }
+  return variants
+}
+
+/**
  * Apply a `CompositeKeyForm` across every entry of a record, so a whole key or
  * composite record can be normalised in one call.
  */

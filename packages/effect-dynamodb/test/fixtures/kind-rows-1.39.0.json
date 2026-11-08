@@ -1,0 +1,409 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "rows": [
+  {
+   "sk": {
+    "S": "$kin#v1#counters.bym"
+   },
+   "_entity_sk": {
+    "S": "$kin#v1#counters#n_00000000000000000000000000000000000005"
+   },
+   "pk": {
+    "S": "$kin#v1#counters.bym#00000000000000000000000000000000000007"
+   },
+   "_entity_pk": {
+    "S": "$kin#v1#counters#id_a"
+   },
+   "__edd_e__": {
+    "S": "Counters._unique.byM"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#counters.bym"
+   },
+   "_entity_sk": {
+    "S": "$kin#v1#counters#n_00000000000000000000000000000000000009"
+   },
+   "pk": {
+    "S": "$kin#v1#counters.bym#00000000000000000000000000000000000010"
+   },
+   "_entity_pk": {
+    "S": "$kin#v1#counters#id_c"
+   },
+   "__edd_e__": {
+    "S": "Counters._unique.byM"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#counters.bym"
+   },
+   "_entity_sk": {
+    "S": "$kin#v1#counters#n_00000000000000000000000000000000000003"
+   },
+   "pk": {
+    "S": "$kin#v1#counters.bym#00000000000000000000000000000000000012"
+   },
+   "_entity_pk": {
+    "S": "$kin#v1#counters#id_f"
+   },
+   "__edd_e__": {
+    "S": "Counters._unique.byM"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#counters.bym"
+   },
+   "_entity_sk": {
+    "S": "$kin#v1#counters#n_0000000000000006"
+   },
+   "pk": {
+    "S": "$kin#v1#counters.bym#0000000000000008"
+   },
+   "_entity_pk": {
+    "S": "$kin#v1#counters#id_b"
+   },
+   "__edd_e__": {
+    "S": "Counters._unique.byM"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#counters.bym"
+   },
+   "_entity_sk": {
+    "S": "$kin#v1#counters#n_0000000000000003"
+   },
+   "pk": {
+    "S": "$kin#v1#counters.bym#0000000000000011"
+   },
+   "_entity_pk": {
+    "S": "$kin#v1#counters#id_f"
+   },
+   "__edd_e__": {
+    "S": "Counters._unique.byM"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#counters.bym"
+   },
+   "_entity_sk": {
+    "S": "$kin#v1#counters#n_00000000000000000001152921504606846977"
+   },
+   "pk": {
+    "S": "$kin#v1#counters.bym#0000000000000013"
+   },
+   "_entity_pk": {
+    "S": "$kin#v1#counters#id_e"
+   },
+   "__edd_e__": {
+    "S": "Counters._unique.byM"
+   }
+  },
+  {
+   "note": {
+    "S": "bigint"
+   },
+   "gsi1sk": {
+    "S": "$kin#v1#counters#m_00000000000000000000000000000000000007"
+   },
+   "__edd_e__": {
+    "S": "Counters"
+   },
+   "gsi1pk": {
+    "S": "$kin#v1#counters#id_a"
+   },
+   "sk": {
+    "S": "$kin#v1#counters#n_00000000000000000000000000000000000005"
+   },
+   "id": {
+    "S": "a"
+   },
+   "pk": {
+    "S": "$kin#v1#counters#id_a"
+   },
+   "m": {
+    "N": "7"
+   },
+   "n": {
+    "N": "5"
+   }
+  },
+  {
+   "note": {
+    "S": "number"
+   },
+   "gsi1sk": {
+    "S": "$kin#v1#counters#m_0000000000000008"
+   },
+   "__edd_e__": {
+    "S": "Counters"
+   },
+   "gsi1pk": {
+    "S": "$kin#v1#counters#id_b"
+   },
+   "sk": {
+    "S": "$kin#v1#counters#n_0000000000000006"
+   },
+   "id": {
+    "S": "b"
+   },
+   "pk": {
+    "S": "$kin#v1#counters#id_b"
+   },
+   "m": {
+    "N": "8"
+   },
+   "n": {
+    "N": "6"
+   }
+  },
+  {
+   "note": {
+    "S": "deleted"
+   },
+   "deletedAt": {
+    "S": "2026-11-08T07:14:44.134Z"
+   },
+   "__edd_e__": {
+    "S": "Counters"
+   },
+   "sk": {
+    "S": "$kin#v1#counters#deleted#n_00000000000000000000000000000000000009#2026-11-08T07:14:44.134Z"
+   },
+   "id": {
+    "S": "c"
+   },
+   "pk": {
+    "S": "$kin#v1#counters#id_c"
+   },
+   "m": {
+    "N": "10"
+   },
+   "n": {
+    "N": "9"
+   }
+  },
+  {
+   "note": {
+    "S": "past 2^53"
+   },
+   "gsi1sk": {
+    "S": "$kin#v1#counters#m_0000000000000013"
+   },
+   "__edd_e__": {
+    "S": "Counters"
+   },
+   "gsi1pk": {
+    "S": "$kin#v1#counters#id_e"
+   },
+   "sk": {
+    "S": "$kin#v1#counters#n_00000000000000000001152921504606846977"
+   },
+   "id": {
+    "S": "e"
+   },
+   "pk": {
+    "S": "$kin#v1#counters#id_e"
+   },
+   "m": {
+    "N": "13"
+   },
+   "n": {
+    "N": "1152921504606846977"
+   }
+  },
+  {
+   "note": {
+    "S": "bigint three"
+   },
+   "gsi1sk": {
+    "S": "$kin#v1#counters#m_00000000000000000000000000000000000012"
+   },
+   "__edd_e__": {
+    "S": "Counters"
+   },
+   "gsi1pk": {
+    "S": "$kin#v1#counters#id_f"
+   },
+   "sk": {
+    "S": "$kin#v1#counters#n_00000000000000000000000000000000000003"
+   },
+   "id": {
+    "S": "f"
+   },
+   "pk": {
+    "S": "$kin#v1#counters#id_f"
+   },
+   "m": {
+    "N": "12"
+   },
+   "n": {
+    "N": "3"
+   }
+  },
+  {
+   "note": {
+    "S": "number three"
+   },
+   "gsi1sk": {
+    "S": "$kin#v1#counters#m_0000000000000011"
+   },
+   "__edd_e__": {
+    "S": "Counters"
+   },
+   "gsi1pk": {
+    "S": "$kin#v1#counters#id_f"
+   },
+   "sk": {
+    "S": "$kin#v1#counters#n_0000000000000003"
+   },
+   "id": {
+    "S": "f"
+   },
+   "pk": {
+    "S": "$kin#v1#counters#id_f"
+   },
+   "m": {
+    "N": "11"
+   },
+   "n": {
+    "N": "3"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#loose#n_00000000000000000000000000000000000005"
+   },
+   "note": {
+    "S": "bigint in unknown"
+   },
+   "id": {
+    "S": "u"
+   },
+   "pk": {
+    "S": "$kin#v1#loose#id_u"
+   },
+   "n": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "Loose"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#readings"
+   },
+   "at": {
+    "N": "6"
+   },
+   "id": {
+    "S": "r"
+   },
+   "pk": {
+    "S": "$kin#v1#readings#id_r"
+   },
+   "v": {
+    "S": "number"
+   },
+   "__edd_e__": {
+    "S": "Readings"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#readings#e#00000000000000000000000000000000000005"
+   },
+   "id": {
+    "S": "r"
+   },
+   "at": {
+    "N": "5"
+   },
+   "pk": {
+    "S": "$kin#v1#readings#id_r"
+   },
+   "v": {
+    "S": "bigint"
+   },
+   "__edd_e__": {
+    "S": "Readings"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#readings#e#0000000000000006"
+   },
+   "id": {
+    "S": "r"
+   },
+   "at": {
+    "N": "6"
+   },
+   "pk": {
+    "S": "$kin#v1#readings#id_r"
+   },
+   "v": {
+    "S": "number"
+   },
+   "__edd_e__": {
+    "S": "Readings"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#team"
+   },
+   "id": {
+    "S": "t"
+   },
+   "k": {
+    "N": "5"
+   },
+   "pk": {
+    "S": "$kin#v1#team#t#00000000000000000000000000000000000005"
+   },
+   "__edd_e__": {
+    "S": "Team"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#teamline#00000000000000000000000000000000000007"
+   },
+   "note": {
+    "S": "bigint"
+   },
+   "pk": {
+    "S": "$kin#v1#team#t#00000000000000000000000000000000000005"
+   },
+   "n": {
+    "N": "7"
+   },
+   "__edd_e__": {
+    "S": "TeamLine"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kin#v1#teamline#0000000000000006"
+   },
+   "note": {
+    "S": "number"
+   },
+   "pk": {
+    "S": "$kin#v1#team#t#00000000000000000000000000000000000005"
+   },
+   "n": {
+    "N": "6"
+   },
+   "__edd_e__": {
+    "S": "TeamLine"
+   }
+  }
+ ]
+}

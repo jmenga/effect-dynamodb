@@ -14,6 +14,7 @@ import {
   bothKindsKeyRefusal,
   keyFormValueKind,
   makeCompositeKeyForm,
+  numericKindVariants,
   readsBackAsOtherKind,
   storedNumericForm,
   storedNumericKinds,
@@ -212,6 +213,27 @@ describe("CompositeCodec", () => {
       expect(readsBackAsOtherKind(Schema.Any)).toBeDefined()
       expect(readsBackAsOtherKind(Schema.BigInt)).toBeUndefined()
       expect(readsBackAsOtherKind(Schema.String)).toBeUndefined()
+    })
+
+    it("gives a record's numeric fields as each kind, for rekey to find a row under the other's text", () => {
+      const variants = (record: Record<string, unknown>, digits: Record<string, string> = {}) =>
+        numericKindVariants(record, ["a", "b", "s"], (field) => digits[field]).map((variant) => [
+          variant.record,
+          [...variant.asOther],
+        ])
+      expect(variants({ a: 5, b: 7n, s: "x" })).toEqual([
+        [{ a: 5, b: 7n, s: "x" }, []],
+        [{ a: 5n, b: 7n, s: "x" }, ["a"]],
+        [{ a: 5, b: 7, s: "x" }, ["b"]],
+        [{ a: 5n, b: 7, s: "x" }, ["a", "b"]],
+      ])
+      // A number that isn't an integer has no bigint; a field not named is left.
+      expect(variants({ a: 1.5, c: 5 })).toEqual([[{ a: 1.5, c: 5 }, []]])
+      // The digits stored, not the number they read back as.
+      expect(variants({ a: Number(2n ** 60n + 1n) }, { a: String(2n ** 60n + 1n) })[1]![0]).toEqual(
+        { a: 2n ** 60n + 1n },
+      )
+      expect(variants({ a: 1.5 }, { a: "1.5" })).toHaveLength(1)
     })
 
     it("refuses a key over a field storing both, and only that (EDD-9128)", () => {

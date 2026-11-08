@@ -35,6 +35,7 @@ import {
 } from "@effect-dynamodb/schema/Errors.js"
 import {
   makeCompositeKeyForm,
+  numericKindVariants as numericKindVariantsOf,
   readsBackAsOtherKind,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -1818,10 +1819,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
     skOther: string,
     sk: string,
     storedAt: ReadonlyMap<string, Record<string, unknown>>,
-  ): { readonly pk: string; readonly sk: string } =>
-    pk !== pkNow && !storedAt.has(positionOf(pk, skOther)) && storedAt.has(positionOf(pk, sk))
-      ? { pk, sk }
-      : { pk, sk: skOther }
+    otherKinds: () => ReadonlyArray<string>,
+  ): { readonly pk: string; readonly sk: string } => {
+    if (storedAt.has(positionOf(pk, skOther))) return { pk, sk: skOther }
+    if (pk !== pkNow && storedAt.has(positionOf(pk, sk))) return { pk, sk }
+    // A sort key holding a numeric composite's other kind's text.
+    const otherKind = otherKinds().find(
+      (other) => other !== sk && storedAt.has(positionOf(pk, other)),
+    )
+    return { pk, sk: otherKind ?? skOther }
+  }
 
   /**
    * `rekey`'s view of where the aggregate's rows are stored (#183, DESIGN.md §7 "`rekey`"): for
@@ -1857,6 +1864,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             otherSortKey(config.schema, item, sk),
             sk,
             storedAt,
+            () => otherKindSortKeys(config.schema, item),
           ),
         }
       }),
@@ -2427,6 +2435,42 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
+   * Every partition key a root row's values have composed: under each setting's text, and with a
+   * numeric composite as the other kind (`numericKindVariants`), the other kind read from the
+   * digits the row stored.
+   */
+  const storedPartitionsOf = (
+    row: Record<string, AttributeValue>,
+    key: Record<string, unknown>,
+  ): ReadonlyArray<string> => {
+    const variants = numericKindVariantsOf(
+      keyRecord(key),
+      config.pk.composite,
+      (field) => row[field]?.N,
+    )
+    return [
+      config.schema,
+      KeyText136.schema136(config.schema),
+      KeyText136.schema137(config.schema),
+      KeyText136.schemaEscaped(config.schema),
+    ].flatMap((under) =>
+      variants.flatMap(({ record: kindKeyForm }) => {
+        try {
+          return [
+            composeCollectionKey(
+              config.schema,
+              config.collection.name,
+              KeyComposer.extractKeyComposites(under, {}, config.pk.composite, kindKeyForm),
+            ),
+          ]
+        } catch {
+          return []
+        }
+      }),
+    )
+  }
+
+  /**
    * The root of another aggregate at `pk`, stored there under text its values no longer compose:
    * it moves first, or this move's rows would land in its partition.
    */
@@ -2517,15 +2561,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const key = fromAttributeMap(row) as Record<string, unknown>
       const current = partitionUnder(config.schema, key)
       // Under none of the keys its values have had: nothing here can place it.
-      if (
-        current === undefined ||
-        ![
-          current,
-          partitionUnder(KeyText136.schema136(config.schema), key),
-          partitionUnder(KeyText136.schema137(config.schema), key),
-          partitionUnder(KeyText136.schemaEscaped(config.schema), key),
-        ].includes(pk)
-      ) {
+      if (current === undefined || !storedPartitionsOf(row, key).includes(pk)) {
         return { skipped: { unrecognizedKey: 1 } }
       }
       const { rooted } = rekeyRunOf(ctx)
@@ -4042,6 +4078,12 @@ interface DecomposedItem {
    * them. Asked for only there: a value that setting refuses (`NaN`) stops nothing else.
    */
   readonly skCompositesOther: () => ReadonlyArray<string>
+  /**
+   * A `many` element's sort key composites with a numeric value as the other kind, in either
+   * setting's text: a field that stored both composed each value's own kind's text (`EDD-9128`),
+   * and `rekey` looks for a row there too. A value a setting refuses (`NaN`) gives none.
+   */
+  readonly skCompositesOtherKinds?: (() => ReadonlyArray<ReadonlyArray<string>>) | undefined
   /** Edge field name (entity type for the root) — used to name the culprit in errors. */
   readonly member: string
   /** What the row does with each timestamp. */
@@ -4234,6 +4276,19 @@ const otherSortKey = (
   }
 }
 
+/** A decomposed row's sort keys with a numeric composite as the other kind, in either setting. */
+const otherKindSortKeys = (
+  schema: DynamoSchemaModule.DynamoSchema,
+  item: DecomposedItem,
+): ReadonlyArray<string> =>
+  (item.skCompositesOtherKinds?.() ?? []).flatMap((composites) => {
+    try {
+      return [composeKey(schema, item.entityType, [...composites])]
+    } catch {
+      return []
+    }
+  })
+
 /** A node's own static discriminator values as {@link DiscriminatorValues}. */
 const ownDiscriminatorValues = (
   node: ResolvedNode,
@@ -4402,6 +4457,34 @@ const decomposeNode = (
             ...parentDiscriminators.other(),
             ...values.map((value) => otherKeyText(schema, value)),
           ],
+          skCompositesOtherKinds: () => {
+            const slots = values.map((_, i) => String(i))
+            return numericKindVariantsOf({ ...values }, slots, () => undefined)
+              .slice(1)
+              .flatMap(({ record }) => {
+                const flipped = slots.map((slot) => record[slot])
+                const texts: Array<ReadonlyArray<string>> = []
+                try {
+                  texts.push([
+                    ...parentDiscriminators.current,
+                    ...flipped.map((value) =>
+                      KeyComposer.keyValueText(schema, value, schema.casing),
+                    ),
+                  ])
+                } catch {
+                  // No text under this setting.
+                }
+                try {
+                  texts.push([
+                    ...parentDiscriminators.other(),
+                    ...flipped.map((value) => otherKeyText(schema, value)),
+                  ])
+                } catch {
+                  // No text under the other setting.
+                }
+                return texts
+              })
+          },
           member: node.fieldName ?? node.entityType,
           rowStamps: node.rowStamps,
           storedAsGiven,
