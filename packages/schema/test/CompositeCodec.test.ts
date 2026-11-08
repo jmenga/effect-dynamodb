@@ -595,6 +595,32 @@ describe("CompositeCodec", () => {
       }
     })
 
+    it("bigints inside a declaration, read back as numbers, are taken as a read lifts them", () => {
+      // `Option.some(5n)` is stored as a map holding `{N:"5"}` and comes back a plain map holding
+      // `5`, which the field's own decode refuses: an entity read lifts it, and so does a key
+      // composed again from the row.
+      const form = makeCompositeKeyForm(
+        Schema.Struct({
+          opt: Schema.Option(Schema.BigInt),
+          inner: Schema.Option(Schema.Struct({ b: Schema.BigInt })),
+        }),
+        refuse,
+      )
+      const readBack = (value: unknown) => ({
+        _op: "Some",
+        "~effect/Option": {},
+        _tag: "Some",
+        value,
+      })
+      expect(serializeValue(form("opt", readBack(5)))).toBe(
+        serializeValue(form("opt", Option.some(5n))),
+      )
+      expect(serializeValue(form("inner", readBack({ b: 5 })))).toBe(
+        serializeValue(form("inner", Option.some({ b: 5n }))),
+      )
+      expect(serializeValue(form("opt", readBack(5)))).not.toMatch(/object/i)
+    })
+
     it("a value that was never stored is still refused", () => {
       expect(() => fromRow("opt", 2.5)).toThrow(/EDD-9050.*opt/)
       expect(() => fromRow("opt", Number.MAX_SAFE_INTEGER + 2)).toThrow(/EDD-9050.*opt/)

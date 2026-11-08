@@ -28,10 +28,10 @@
    "seeded": [
     {
      "sk": {
-      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:35.982Z"
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T20:45:44.307Z"
      },
      "deletedAt": {
-      "S": "2026-11-08T19:50:35.982Z"
+      "S": "2026-11-08T20:45:44.307Z"
      },
      "id": {
       "S": "a"
@@ -90,14 +90,15 @@
     }
    ],
    "restore": "died: [EDD-9050] Composite \"f\" on entity \"Soft\" could not be encoded to its stored form. The attribute's schema carries an encoding transformation, so the stored key holds the ENCODED value, but \"5\" encodes",
+   "get": "ok",
    "delete": "ok",
    "afterRestoreAndDelete": [
     {
      "sk": {
-      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:35.982Z"
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T20:45:44.307Z"
      },
      "deletedAt": {
-      "S": "2026-11-08T19:50:35.982Z"
+      "S": "2026-11-08T20:45:44.307Z"
      },
      "id": {
       "S": "a"
@@ -145,10 +146,10 @@
    "seeded": [
     {
      "sk": {
-      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:36.096Z"
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T20:45:44.350Z"
      },
      "deletedAt": {
-      "S": "2026-11-08T19:50:36.096Z"
+      "S": "2026-11-08T20:45:44.350Z"
      },
      "id": {
       "S": "a"
@@ -207,14 +208,15 @@
     }
    ],
    "restore": "died: [EDD-9050] Composite \"f\" on entity \"Soft\" could not be encoded to its stored form. The attribute's schema carries an encoding transformation, so the stored key holds the ENCODED value, but \"5\" encodes",
+   "get": "ok",
    "delete": "ok",
    "afterRestoreAndDelete": [
     {
      "sk": {
-      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:36.096Z"
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T20:45:44.350Z"
      },
      "deletedAt": {
-      "S": "2026-11-08T19:50:36.096Z"
+      "S": "2026-11-08T20:45:44.350Z"
      },
      "id": {
       "S": "a"
@@ -231,6 +233,358 @@
      },
      "__edd_e__": {
       "S": "Soft"
+     }
+    }
+   ]
+  },
+  "Option(BigInt)": {
+   "put": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#f_some(5n)"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#deleted#f_some(5n)#2026-11-08T20:45:44.382Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T20:45:44.382Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$nested#v1#unique"
+     },
+     "pk": {
+      "S": "$nested#v1#unique.byf#some(5n)"
+     },
+     "_entity_pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "restore": "failed: ValidationError",
+   "get": "failed: ValidationError",
+   "delete": "ok",
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#f_[object object]"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$nested#v1#unique"
+     },
+     "pk": {
+      "S": "$nested#v1#unique.byf#some(5n)"
+     },
+     "_entity_pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    }
+   ]
+  },
+  "Option(Struct{BigInt})": {
+   "put": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#f_some({\"b\":5n})"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "M": {
+         "b": {
+          "N": "5"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#deleted#f_some({\"b\":5n})#2026-11-08T20:45:44.418Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T20:45:44.418Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "M": {
+         "b": {
+          "N": "5"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$nested#v1#unique"
+     },
+     "pk": {
+      "S": "$nested#v1#unique.byf#some({\"b\":5n})"
+     },
+     "_entity_pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "M": {
+         "b": {
+          "N": "5"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "restore": "failed: ValidationError",
+   "get": "failed: ValidationError",
+   "delete": "ok",
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#f_[object object]"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "M": {
+         "b": {
+          "N": "5"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$nested#v1#unique"
+     },
+     "pk": {
+      "S": "$nested#v1#unique.byf#some({\"b\":5n})"
+     },
+     "_entity_pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
      }
     }
    ]

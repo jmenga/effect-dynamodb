@@ -173,14 +173,7 @@ export const makeCompositeKeyForm = (
     let readDecode: ((value: unknown) => Option.Option<unknown>) | null | undefined
     const asRead = (value: unknown): Option.Option<unknown> => {
       if (readDecode === undefined) {
-        readDecode = holdsPlainBigint(SchemaAST.toEncoded(field.ast))
-          ? Schema.decodeUnknownOption(
-              substituteSchemaDeep(field, { legacyReads: true }) as unknown as Schema.Codec<
-                unknown,
-                unknown
-              >,
-            )
-          : null
+        readDecode = holdsPlainBigint(SchemaAST.toEncoded(field.ast)) ? readDecodeOf(field) : null
       }
       return readDecode === null ? Option.none() : readDecode(value)
     }
@@ -246,24 +239,38 @@ const holdsDeclaration = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set
 }
 
 /**
+ * A field's decode as an entity's read decodes a row's value (`legacyReads`): what the marshaller
+ * changed is taken back first, a stored bigint read back as a number lifted wherever it sits (in a
+ * list, a struct, a declaration's value).
+ */
+const readDecodeOf = (field: Schema.Top): ((value: unknown) => Option.Option<unknown>) =>
+  Schema.decodeUnknownOption(
+    substituteSchemaDeep(field, { legacyReads: true }) as unknown as Schema.Codec<unknown, unknown>,
+  )
+
+/**
  * The value a field storing a declaration ({@link holdsDeclaration}) stored, from what a read of it
- * hands back: the value decoded through the field, as a read decodes it, and encoded again, as a
- * write encodes it. A declaration's value goes to DynamoDB as a map, a list or a set, and comes back a
- * plain one: `Option.some(5)` composes `some(5)`, and the map read back `[object Object]`, until the
- * field decodes it to `Option.some(5)` again. `undefined` for a field storing none, and from the
- * function returned for a value that isn't an object or that the field doesn't decode, which is then
- * taken as it is.
+ * hands back: the value decoded through the field, as a read decodes it ({@link readDecodeOf}), and
+ * encoded again, as a write encodes it. A declaration's value goes to DynamoDB as a map, a list or a
+ * set, and comes back a plain one: `Option.some(5)` composes `some(5)`, and the map read back
+ * `[object Object]`, until the field decodes it to `Option.some(5)` again; `Option.some(5n)` comes
+ * back a map holding `5`, which a read lifts to `5n`. `undefined` for a field storing none, and from
+ * the function returned for a value that isn't an object or that the field doesn't decode, which is
+ * then taken as it is.
  */
 export const storedFormOfDeclaration = (
   field: Schema.Top,
 ): ((value: unknown) => unknown) | undefined => {
   if (!holdsDeclaration(SchemaAST.toEncoded(field.ast))) return undefined
   const codec = field as unknown as Schema.Codec<unknown, unknown>
+  const asRead = readDecodeOf(field)
   const decode = Schema.decodeUnknownOption(codec)
   const encode = Schema.encodeUnknownOption(codec)
   return (value) => {
     if (typeof value !== "object" || value === null) return undefined
-    const stored = Option.flatMap(decode(value), (decoded) => encode(decoded))
+    const read = asRead(value)
+    const decoded = Option.isSome(read) ? read : decode(value)
+    const stored = Option.flatMap(decoded, (domain) => encode(domain))
     return Option.isSome(stored) ? stored.value : undefined
   }
 }

@@ -1,16 +1,18 @@
 /**
- * A key composite holding a list of bigints beneath a step (a decoding default, a transformation over
- * itself): DynamoDB hands `[5n]` back as `[5]`, which the field refuses until a read lifts it, as
- * every entity read does. The key composed again from the row is the one written, so a write is
- * stored and not refused (EDD-9128). The rows are published 1.39.0's own
- * (`fixtures/nested-bigint-keys-1.39.0.json`), whose `restore` couldn't compose the live key from the
- * row at all (EDD-9050).
+ * A key composite holding bigints beneath a step (a list under a decoding default or a transformation
+ * over itself) or inside a declaration (`Schema.Option`): DynamoDB hands `[5n]` back as `[5]` and
+ * `Option.some(5n)` as a map holding `5`, which the field refuses until a read lifts it, as every
+ * entity read does. The key composed again from the row is the one written, so a write is stored and
+ * not refused (EDD-9128). The rows are published 1.39.0's own
+ * (`fixtures/nested-bigint-keys-1.39.0.json`): its `restore` couldn't compose the live key from a list
+ * at all (EDD-9050), and put an `Option` back under `[object object]`, whose sentinel its `delete`
+ * then left behind.
  */
 import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Schema, SchemaTransformation } from "effect"
+import { Effect, Option, Schema, SchemaTransformation } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -28,6 +30,7 @@ const fixture = JSON.parse(
       readonly put: ReadonlyArray<Row>
       readonly seeded: ReadonlyArray<Row>
       readonly restore: string
+      readonly get: string
       readonly delete: string
       readonly afterRestoreAndDelete: ReadonlyArray<Row>
     }
@@ -83,14 +86,21 @@ const typed = (rows: ReadonlyArray<Row>, prefix: string) =>
 const keysOf = (rows: ReadonlyArray<Row>) => rows.map((row) => `${row.pk?.S}|${row.sk?.S}`).sort()
 
 const list = Schema.Array(Schema.BigInt)
-const shapes = {
-  "default(Array(BigInt))": list.pipe(Schema.withDecodingDefault(Effect.succeed([5n]))),
-  "OverItself(Array(BigInt))": list.pipe(Schema.decodeTo(list, SchemaTransformation.passthrough())),
-} as const
-const value = [5n]
+const shapes: Record<string, readonly [Schema.Top, unknown]> = {
+  "default(Array(BigInt))": [list.pipe(Schema.withDecodingDefault(Effect.succeed([5n]))), [5n]],
+  "OverItself(Array(BigInt))": [
+    list.pipe(Schema.decodeTo(list, SchemaTransformation.passthrough())),
+    [5n],
+  ],
+  "Option(BigInt)": [Schema.Option(Schema.BigInt), Option.some(5n)],
+  "Option(Struct{BigInt})": [
+    Schema.Option(Schema.Struct({ b: Schema.BigInt })),
+    Option.some({ b: 5n }),
+  ],
+}
 
-describe("a key composite holding bigints beneath a step, read back as numbers", () => {
-  for (const [label, field] of Object.entries(shapes)) {
+describe("a key composite holding bigints beneath a step or a declaration, read back as numbers", () => {
+  for (const [label, [field, value]] of Object.entries(shapes)) {
     const stored = fixture.shapes[label]!
 
     it.effect(`${label}: put composes the key 1.39.0 wrote`, () =>
@@ -131,12 +141,27 @@ describe("a key composite holding bigints beneath a step, read back as numbers",
       )
     }
 
-    it(`${label}: 1.39.0 couldn't compose the restored item's key from the row`, () => {
-      expect(stored.restore).toMatch(/^died: \[EDD-9050\] Composite "f" on entity "Soft"/)
-      expect(stored.delete).toBe("ok")
-      expect(keysOf(typed(stored.afterRestoreAndDelete, "Soft"))).toEqual(
-        keysOf(typed(stored.seeded, "Soft")),
-      )
-    })
+    if (label.startsWith("Option")) {
+      it(`${label}: 1.39.0 restored the item under another key and left the sentinel behind`, () => {
+        expect(stored.restore).toBe("failed: ValidationError")
+        expect(stored.get).toBe("failed: ValidationError")
+        expect(stored.delete).toBe("ok")
+        expect(keysOf(typed(stored.afterRestoreAndDelete, "Soft"))).toEqual([
+          "$nested#v1#soft#id_a|$nested#v1#soft#f_[object object]",
+        ])
+        expect(keysOf(typed(stored.afterRestoreAndDelete, "Unique"))).toEqual(
+          keysOf(typed(stored.seeded, "Unique._unique")),
+        )
+      })
+    } else {
+      it(`${label}: 1.39.0 couldn't compose the restored item's key from the row`, () => {
+        expect(stored.restore).toMatch(/^died: \[EDD-9050\] Composite "f" on entity "Soft"/)
+        expect(stored.get).toBe("ok")
+        expect(stored.delete).toBe("ok")
+        expect(keysOf(typed(stored.afterRestoreAndDelete, "Soft"))).toEqual(
+          keysOf(typed(stored.seeded, "Soft")),
+        )
+      })
+    }
   }
 })
