@@ -69,6 +69,7 @@ import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/S
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
   type Context,
+  Data,
   DateTime,
   Effect,
   Equal,
@@ -2101,14 +2102,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * ({@link decomposedAsWritten}) is its row's only if the row holds what it would write there.
    * (As read, the reading 1.39.0 took, the key is enough, as it was on 1.39.0.) Under a `decompose`
    * that reads values back otherwise than it wrote them, a key only the second reading gives can
-   * be another owner's row (another aggregate's, an entity's), and a row of this edge's can change
-   * under a concurrent write; neither holds what the reading writes.
-   * Every attribute but those the library manages compares exactly. A value 1.39.0 stored as
-   * given, before a keyed edge's values were put in their stored form, compares as that form.
-   * Only the rows read are compared: nothing is read for it.
+   * be another owner's row (another aggregate's, an entity's), which doesn't hold what the reading
+   * writes. Every attribute but those the library manages compares exactly, with what this reading
+   * would store: the stored side is never transformed, so a row is claimed only if it holds those
+   * very values. Only the rows read are compared: nothing is read for it. A write can replace the
+   * row after the read, so `update`'s Delete of it is conditioned on the row being as read.
    */
   const holdsItem = (
-    item: DecomposedItem,
     composed: () => Record<string, AttributeValue>,
     stored: Record<string, unknown> | undefined,
   ): boolean => {
@@ -2121,15 +2121,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     }
     const names = new Set([...Object.keys(written), ...Object.keys(stored)])
     for (const name of names) {
-      if (managedAttribute(name) || sameStoredValue(written[name], stored[name])) continue
-      const encode = item.custom?.attrEncoders?.[name]
-      if (encode === undefined || stored[name] == null) return false
-      try {
-        const asStored = fromAttributeMap({ [name]: toAttributeValue(encode(stored[name])) })
-        if (!sameStoredValue(written[name], asStored[name])) return false
-      } catch {
-        return false
-      }
+      if (!managedAttribute(name) && !sameStoredValue(written[name], stored[name])) return false
     }
     return true
   }
@@ -2272,6 +2264,17 @@ const makeAggregate = <TSchema extends Schema.Top>(
     from: string | undefined,
     /** Whether another aggregate took the row at this position in this run (`rowOwners`). */
     takenElsewhere: (position: string, current: boolean) => boolean,
+    /**
+     * Whether this run read a row at the position that isn't this aggregate's (`rowsRead`): a
+     * destination held when the run read it stays held for the run, though an earlier move of the
+     * run has vacated it since.
+     */
+    readInRun: (position: string) => boolean = () => false,
+    /**
+     * Whether another aggregate's move in this run put the row at the position, where the run had
+     * read none: under an old key, it's no row of this aggregate's, as when the run read it.
+     */
+    movedIn: (position: string) => boolean = () => false,
   ) => {
     const storedAt = storedPositions(allItems)
     /** The sort keys stored in a partition, other than `sk` ({@link oldPosition}). */
@@ -2292,6 +2295,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
         hasPrefix: inPartition.hasPrefix,
       }
     }
+    // The row at an old key as the run read it: none where another aggregate's move has put one.
+    const storedAsOld = (position: string) =>
+      movedIn(position) ? undefined : storedAt.get(position)
     // `source`: the decomposed item's index, its row written as decomposed; or "stored", for a
     // custom `decompose`'s row, moved as stored. `holds`: for such a row, where it is.
     const found: Array<{
@@ -2331,7 +2337,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             // As read, the reading 1.39.0 took: a row stored under its key is the edge's, by its
             // key, and is placed by where it is, as any edge's row is.
             const keyed = [...new Set([atCurrent, atOld])].filter((position) =>
-              storedAt.has(position),
+              position === atCurrent ? storedAt.has(position) : storedAsOld(position) !== undefined,
             )
             if (keyed.length === 0) return
             for (const position of keyed) held.add(position)
@@ -2342,7 +2348,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // earlier reading or edge holds is placed by it, and isn't compared again.
           const holds = [...new Set([atCurrent, atOld])].filter(
             (position) =>
-              !held.has(position) && holdsItem(item, () => row(g, i), storedAt.get(position)),
+              !held.has(position) &&
+              holdsItem(
+                () => row(g, i),
+                position === atCurrent ? storedAt.get(position) : storedAsOld(position),
+              ),
           )
           if (holds.length === 0) return
           for (const position of holds) held.add(position)
@@ -2350,12 +2360,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
         })
       })
     })
-    const placements = placeRows(
-      found.map((row) => ({
-        current: positionOf(row.current.pk, row.current.sk),
-        old: positionOf(row.old.pk, row.old.sk),
-      })),
-      (position) => storedAt.has(position),
+    const slots = found.map((row) => ({
+      current: positionOf(row.current.pk, row.current.sk),
+      old: positionOf(row.old.pk, row.old.sk),
+    }))
+    // Each key is judged by what the run read there. A destination a row held when the run read it
+    // stays held, though an earlier move of the run took the row away; an old key a row was put at
+    // by an earlier move of the run, where the run read none, holds none. So whichever aggregate
+    // the scan reaches first, a run moves what its dry run says, and the next run the next link.
+    const sourcesHere = new Set(slots.map((slot) => slot.old))
+    const placements = placeRows(slots, (position) =>
+      sourcesHere.has(position)
+        ? storedAsOld(position) !== undefined
+        : storedAt.has(position) || readInRun(position),
     )
     // One placement per stored row: its source is where the row is, by content or by placement. A
     // row held under both keys, or in a chain of keys that can't be told apart, moves nothing.
@@ -2386,18 +2403,62 @@ const makeAggregate = <TSchema extends Schema.Top>(
     return rows.map((row) => ({
       ...row,
       atCurrent: storedAt.get(positionOf(row.current.pk, row.current.sk)),
-      atOld: storedAt.get(positionOf(row.old.pk, row.old.sk)),
+      atOld: storedAsOld(positionOf(row.old.pk, row.old.sk)),
     }))
   }
 
+  /** How many times `update` reads the aggregate again when a guarded Delete loses a race. */
+  const GUARDED_DELETE_ATTEMPTS = 3
+
+  /**
+   * `update`, read again when a Delete of a row only its content told the aggregate's
+   * ({@link holdsItem}) finds the row changed since the read (`GuardedDeleteLost`): that row may
+   * now be another owner's, and is never deleted. A transaction cancelled so wrote nothing; with no
+   * earlier transaction of the write committed, the update runs again from a fresh read, as an
+   * entity's guarded delete does for a lost race. Otherwise, or on the last attempt, the
+   * cancellation is reported.
+   */
   const updateCore = (
     key: Record<string, unknown>,
     mutationFn: (
       context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
-  ): Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError, DynamoClient | TableConfig> =>
+  ): Effect.Effect<
+    Schema.Schema.Type<TSchema>,
+    AggregateWriteError,
+    DynamoClient | TableConfig
+  > => {
+    const attempt = (
+      left: number,
+    ): Effect.Effect<
+      Schema.Schema.Type<TSchema>,
+      AggregateWriteError,
+      DynamoClient | TableConfig
+    > =>
+      updateOnce(key, mutationFn).pipe(
+        Effect.catchTag("GuardedDeleteLost", (lost) =>
+          lost.committed.length === 0 && left > 1 ? attempt(left - 1) : Effect.fail(lost.cancelled),
+        ),
+      )
+    return attempt(GUARDED_DELETE_ATTEMPTS)
+  }
+
+  const updateOnce = (
+    key: Record<string, unknown>,
+    mutationFn: (
+      context: UpdateContext<TSchema["Iso"], Schema.Schema.Type<TSchema>>,
+    ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
+  ): Effect.Effect<
+    Schema.Schema.Type<TSchema>,
+    AggregateWriteError | GuardedDeleteLost,
+    DynamoClient | TableConfig
+  > =>
     Effect.gen(function* () {
-      const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "update")
+      // Each row as stored: a Delete only a row's content decided is guarded on it.
+      const storedRows: Array<Record<string, AttributeValue>> = []
+      const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "update", {
+        stored: storedRows,
+      })
 
       if (allItems.length === 0) {
         return yield* new AggregateAssemblyError({
@@ -2554,7 +2615,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       // writes there (`holdsItem`): the keys 1.39.0 wrote are found under either convention, and a
       // row another owner wrote at a key only the second reading gives isn't the aggregate's,
       // whatever its entity type. Only a row read is deleted, once, in the transaction of the group
-      // the edge is written in. Nothing more is read, and no condition is added.
+      // the edge is written in. Nothing more is read. A Delete 1.39.0 sent too, by key, is sent as it
+      // was; one only the content decided carries the row as read (`asReadGuard`), so a row another
+      // owner wrote there after the read is never deleted (`GuardedDeleteLost`).
       const storedAtSk = !customDecompose
         ? undefined
         : new Map(
@@ -2570,7 +2633,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
               ? []
               : [
                   {
-                    item,
                     sk: oldAsWritten!.sk(g, i),
                     row: () => oldAsWritten!.row(g, i),
                   } as const,
@@ -2578,38 +2640,55 @@ const makeAggregate = <TSchema extends Schema.Top>(
           ),
         ]),
       )
-      /** The rows of `name` that `update` deletes if the new state doesn't hold their keys. */
-      const heldRows = (name: string): ReadonlyArray<Record<string, AttributeValue>> => {
+      const rawAtSk = new Map(
+        storedRows.flatMap((item) =>
+          item[config.pk.field]?.S === pkValue ? [[item.sk?.S ?? "", item] as const] : [],
+        ),
+      )
+      const updatedField = stampFields?.updatedAt ?? null
+      /**
+       * The rows of `name` that `update` deletes if the new state doesn't hold their keys, each with
+       * the condition its Delete carries: none for a row the reading as read holds by key, as on
+       * 1.39.0, and the row as read for one only the reading as a write's value holds by content.
+       */
+      const heldRows = (
+        name: string,
+      ): ReadonlyArray<{
+        readonly row: Record<string, AttributeValue>
+        readonly guard?: ReturnType<typeof asReadGuard> | undefined
+      }> => {
         const items = oldItemsByGroup.get(name) ?? []
-        if (storedAtSk === undefined) return items
+        if (storedAtSk === undefined) return items.map((row) => ({ row }))
         const decomposed = oldGroupMap.get(name)?.items ?? []
         // Two readings, or two edges, give one key: the first to hold its row deletes it, and the
         // others aren't compared with it.
         const taken = new Set<string>()
-        const held: Array<Record<string, AttributeValue>> = []
-        const take = (sk: string, row: () => Record<string, AttributeValue>) => {
-          taken.add(sk)
-          held.push(row())
-        }
+        const held: Array<{
+          readonly row: Record<string, AttributeValue>
+          readonly guard?: ReturnType<typeof asReadGuard> | undefined
+        }> = []
         for (const [i, row] of items.entries()) {
           const sk = skOf(row)
           if (taken.has(sk)) continue
           if (decomposed[i]?.custom !== undefined && !storedAtSk.has(sk)) continue
-          take(sk, () => row)
+          taken.add(sk)
+          held.push({ row })
         }
-        for (const { item, sk, row } of asWrittenByGroup.get(name) ?? []) {
-          if (taken.has(sk) || !holdsItem(item, row, storedAtSk.get(sk))) continue
-          take(sk, row)
+        for (const { sk, row } of asWrittenByGroup.get(name) ?? []) {
+          if (taken.has(sk) || !holdsItem(row, storedAtSk.get(sk))) continue
+          taken.add(sk)
+          held.push({
+            row: row(),
+            guard: asReadGuard(rawAtSk.get(sk) ?? {}, config.pk.field, [
+              ...(updatedField === null ? [] : [updatedField]),
+            ]),
+          })
         }
         return held
       }
 
       // 7. Per group (union of old + new names), collect PUTs + orphan DELETEs.
-      const groupWrites: Array<{
-        group: string
-        puts: ReadonlyArray<Record<string, AttributeValue>>
-        deletes: ReadonlyArray<Record<string, AttributeValue>>
-      }> = []
+      const groupWrites: Array<WriteGroups[number]> = []
       const groupNames = new Set<string>([...newGroupMap.keys(), ...oldGroupMap.keys()])
       for (const name of groupNames) {
         const oldGroup = oldGroupMap.get(name)
@@ -2622,14 +2701,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
         if (!changed) continue
 
         const puts = newItemsByGroup.get(name) ?? []
-        const deletes = heldRows(name)
-          .filter((item) => !survivingSks.has(skOf(item)))
-          .map((item) => ({
-            [config.pk.field]: item[config.pk.field]!,
-            sk: item.sk!,
-          }))
+        const removed = heldRows(name).filter(({ row }) => !survivingSks.has(skOf(row)))
+        const deletes = removed.map(({ row }) => ({
+          [config.pk.field]: row[config.pk.field]!,
+          sk: row.sk!,
+        }))
         if (puts.length === 0 && deletes.length === 0) continue
-        groupWrites.push({ group: name, puts, deletes })
+        groupWrites.push({
+          group: name,
+          puts,
+          deletes,
+          ...(removed.some(({ guard }) => guard !== undefined) && {
+            deleteGuards: removed.map(({ guard }) => guard),
+          }),
+        })
       }
 
       if (groupWrites.length > 0) {
@@ -2693,6 +2778,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
     fromOnly: boolean,
     /** The run's rows by the aggregate that took them ({@link Rekey.RekeyRowContext.rowOwners}). */
     rowOwners: Map<string, string> | undefined,
+    /** The positions the run read a row at ({@link Rekey.RekeyRowContext.rowsRead}). */
+    rowsRead?: Set<string> | undefined,
   ): Effect.Effect<Rekey.RekeyTally, AggregateWriteError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       let movedRows = 0
@@ -2759,13 +2846,28 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const owner = rowOwners?.get(position)
           return owner !== undefined && owner !== aggregateName && (dryRun || atCurrent)
         }
+        // What another aggregate's read in this run found where this one's rows go.
+        const readInRun = (position: string) =>
+          rowsRead?.has(position) === true && rowOwners?.get(position) !== aggregateName
+        // A row another aggregate's move in this run put where the run had read none.
+        const movedIn = (position: string) => {
+          const owner = rowOwners?.get(position)
+          return owner !== undefined && owner !== aggregateName && rowsRead?.has(position) !== true
+        }
         const rows = locateRows(
           [readingOf(groups, identities), ...(asWritten === undefined ? [] : [asWritten])],
           allItems,
           pkValue,
           from,
           takenElsewhere,
+          readInRun,
+          movedIn,
         )
+        // The rows the run read, but those its own moves put there.
+        for (const item of allItems) {
+          const position = positionOf(String(item[config.pk.field]), String(item.sk))
+          if (!movedIn(position)) rowsRead?.add(position)
+        }
         // The move is the aggregate's whole or nothing: a row stored under both keys, or held where
         // it belongs by a row it doesn't place, leaves every row where it is, the root included,
         // and takes none, so which aggregate the scan reached first doesn't change the outcome.
@@ -3214,7 +3316,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
               fromOnly = ctx.dryRun
             }
           }
-          const moved = yield* rekeyCore(key, ctx.dryRun, from, fromOnly, ctx.rowOwners).pipe(
+          const moved = yield* rekeyCore(
+            key,
+            ctx.dryRun,
+            from,
+            fromOnly,
+            ctx.rowOwners,
+            ctx.rowsRead,
+          ).pipe(
             Effect.catch(
               (error: AggregateWriteError): Effect.Effect<Rekey.RekeyTally, DynamoClientError> => {
                 if (Rekey.isDynamoClientError(error)) return Effect.fail(error)
@@ -5721,7 +5830,24 @@ type WriteGroups = ReadonlyArray<{
   group: string
   puts: ReadonlyArray<Record<string, AttributeValue>>
   deletes: ReadonlyArray<Record<string, AttributeValue>>
+  /**
+   * The condition each Delete of `deletes` carries, by position: the row as read
+   * ({@link asReadGuard}), for a row 1.39.0 never deleted, which only its content
+   * told this aggregate's. `undefined`, or no entry, for a Delete by key alone.
+   */
+  deleteGuards?: ReadonlyArray<ReturnType<typeof asReadGuard> | undefined>
 }>
+
+/**
+ * A guarded Delete's condition failed: the row changed after the read, and may now be another
+ * owner's. Nothing of that transaction was written. `committed` names the groups earlier
+ * transactions of the write already committed. Never surfaced: `update` reads again and runs once
+ * more, or reports `cancelled`.
+ */
+class GuardedDeleteLost extends Data.TaggedError("GuardedDeleteLost")<{
+  readonly committed: ReadonlyArray<string>
+  readonly cancelled: TransactionCancelled
+}> {}
 
 /**
  * `create`: the first group's first Put is the root item, written only when it
@@ -5754,7 +5880,7 @@ function writeTransactionGroups(
   groups: WriteGroups,
   aggregateName: string,
   keys: GroupKeys,
-): Effect.Effect<void, WriteGroupsError>
+): Effect.Effect<void, WriteGroupsError | GuardedDeleteLost>
 function writeTransactionGroups(
   client: DynamoClientService,
   tableName: string,
@@ -5770,7 +5896,7 @@ function writeTransactionGroups(
   aggregateName: string,
   keys: GroupKeys,
   rootGuard?: RootGuard,
-): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed> {
+): Effect.Effect<void, WriteGroupsError | ConditionalCheckFailed | GuardedDeleteLost> {
   return Effect.gen(function* () {
     // Each group is its own transaction (DynamoDB: 100 items per
     // TransactWriteItems, Puts AND Deletes together). DynamoDB's limits are
@@ -5803,7 +5929,9 @@ function writeTransactionGroups(
               : {}),
           },
         })),
-        ...group.deletes.map((key) => ({ Delete: { TableName: tableName, Key: key } })),
+        ...group.deletes.map((key, i) => ({
+          Delete: { TableName: tableName, Key: key, ...group.deleteGuards?.[i] },
+        })),
       ]
 
       // Named once, for both diagnoses below.
@@ -5879,7 +6007,7 @@ function writeTransactionGroups(
                 key: rootGuard.key,
               })
             }
-            return new TransactionCancelled({
+            const transactionCancelled = new TransactionCancelled({
               operation: "TransactWriteItems",
               reasons: (cancelled.CancellationReasons ?? []).map((r) => ({
                 code: r?.Code,
@@ -5887,6 +6015,14 @@ function writeTransactionGroups(
               })),
               cause: error.cause,
             })
+            const lostGuard = group.deletes.some(
+              (_, i) =>
+                group.deleteGuards?.[i] !== undefined &&
+                reasons?.[group.puts.length + i]?.Code === "ConditionalCheckFailed",
+            )
+            return lostGuard
+              ? new GuardedDeleteLost({ committed: already, cancelled: transactionCancelled })
+              : transactionCancelled
           }
           return error
         }),

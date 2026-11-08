@@ -4216,16 +4216,26 @@ the edge never wrote. A's field multiplying by 10 stores A's 50 at key 500, whic
 decomposes as written to 5000, where B's row is, or an entity's. **As a write's value is, a row is the
 edge's only if its key and its content both match** (`holdsItem`): the row that reading writes there
 holds the stored row's attributes, compared exactly on every attribute but those the library manages
-(the table and index keys, the stamps, `__edd_*` but `__edd_e__`). A value 1.39.0 stored as given,
-before a keyed edge's values took their element's encoders (#201), compares as that encoder puts it.
-A row a concurrent write changed after the read fails the comparison too. Only the rows read are
-compared: no request and no condition is added. The reading as written is decomposed for its keys
+(the table and index keys, the stamps, `__edd_*` but `__edd_e__`). The stored row is compared as
+stored, never transformed: encoding B's 5000 through A's field gives the 500 A would store there, and
+the row is still B's. A value 1.39.0 stored as given under a keyed (`Schema.Record`) edge is found by
+the reading as read when its `decompose` encodes the field, and by neither reading when it hands the
+value back, which stays as on 1.39.0. The reading as written is decomposed for its keys
 (`decomposeAggregate`'s `forKeys`): its rows are put in their stored form only when one is compared,
 and a key the reading as read already holds never is.
 
 `update` deletes, from each changed group, the keys either reading holds a row under and the new state
 doesn't, each `Delete` in the transaction of the group that owns the edge; the first reading or
-edge to hold a key deletes it, once. `rekey` takes the same two readings per aggregate: a row either
+edge to hold a key deletes it, once. A key the reading as read holds is deleted as 1.39.0 deleted it,
+unconditioned. A key only the reading as written holds is a `Delete` 1.39.0 never sent, and the
+comparison was made on the row read: another owner's write can replace that row before the
+transaction. So that `Delete` carries the condition that the row still holds what was read
+(`asReadGuard`: the row exists and holds `updatedAt`, or `__edd_e__` and the attributes compared, as
+read). When the condition fails, nothing of that transaction is written, and the update runs again from
+a fresh read, as an entity's guarded delete does for a lost race (`GuardedDeleteLost`, up to three
+attempts); the replaced row is never deleted. If an earlier group's transaction of the same update
+has committed, it is reported as the `TransactionCancelled` it is. No request is added, and an update
+without such a key sends the requests it did. `rekey` takes the same two readings per aggregate: a row either
 holds, in either key text, is moved as stored, with its partition key, sort key and collection sort key
 mirror replaced, since decomposing the value read back needn't give the attributes it holds. **Each
 stored row is placed once**, by its source position, whichever edge (custom or not), reading or
@@ -4234,13 +4244,21 @@ aggregate reaches it first: within an aggregate by the positions its items place
 item's, so it stops the move: **an aggregate's move is all or nothing**. If any of its rows is stored
 under both keys, or its destination holds a row it doesn't place (another aggregate's, or one already
 there), the aggregate reports `bothKeys` and moves none of its rows, its root included, and takes none
-in `rowOwners`, so the outcome doesn't depend on which aggregate the scan reached first. Rows are chosen
+in `rowOwners`, so the outcome doesn't depend on which aggregate the scan reached first. **Each key is
+judged by the rows the run read there** (`rowsRead`, one set per run): a destination held when the run
+read it stays held, though an earlier move of the same run has taken that row away since, and an old
+key holds no row of the aggregate's where an earlier move of the run put one and the run had read none.
+So in a chain of keys across aggregates (A's row belongs where B's is, and B's where C's is), a run
+moves what its dry run names, whatever order the scan meets the rows in, and a run again moves the next
+link. Once every link has moved, an aggregate whose old key holds the next link's row reports
+`bothKeys` on each later run, as 1.39.0 does, and nothing moves. Rows are chosen
 by key (and, for a key only the second reading gives, content), never by entity type, so another
 owner's rows in the partition (another aggregate whose edges are of the same entity type, the entity's
 own rows, retained snapshots or time-series events) are never deleted or moved; a row nothing the aggregate decomposes holds stays where it is,
 unreported, and the aggregate still moves (`AggregateSharedPartition.test.ts`,
 `connected.aggregate-shared-partition.test.ts`, `fixtures/aggregate-shared-partition-1.39.0.json`,
-`fixtures/aggregate-ownership-1.39.0.json`, `fixtures/aggregate-decompose-rename-1.39.0.json`). An
+`fixtures/aggregate-ownership-1.39.0.json`, `fixtures/aggregate-decompose-rename-1.39.0.json`,
+`fixtures/aggregate-foreign-rows-1.39.0.json`). An
 aggregate without a custom `decompose` sends exactly the requests it did.
 
 A date field's attribute encoder stores a value already in the field's stored form as it is: one its

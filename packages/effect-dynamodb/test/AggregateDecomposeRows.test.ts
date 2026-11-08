@@ -706,3 +706,177 @@ describe("a keyed edge whose decompose returns a field's stored form", () => {
     }),
   )
 })
+
+describe("a Delete only the content decided is on condition the row is still as read", () => {
+  // A sub-aggregate's edge whose `decompose` divides by 10: its row, stored at 50, is keyed there
+  // only by the reading as written, so removing the element sends a guarded Delete. Another writer
+  // replaces the row between the update's read and its transactions.
+  const guarded = () => {
+    const schema = DynamoSchema.make({ name: "dg", version: 1 })
+    const Main = Table.make({ schema, entities: {} })
+    const Line = Schema.Struct({ lineId: Schema.String, f: X10 })
+    const Lines = Schema.Struct({ lines: Schema.Array(Line) })
+    const Sub = Aggregate.make(Lines, {
+      root: { entityType: "Sub" },
+      edges: {
+        lines: Aggregate.many({
+          entityType: "SubLine",
+          sk: { composite: ["f"] },
+          decompose: (lines) =>
+            (lines as ReadonlyArray<typeof Line.Type>).map((line) => ({ ...line, f: line.f / 10 })),
+        }),
+      },
+    } as any)
+    const Orders = Aggregate.make(
+      Schema.Struct({ id: Schema.String, note: Schema.String, sub: Lines }),
+      {
+        table: Main,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "orders" },
+        root: { entityType: "Order" },
+        edges: { sub: (Sub as any).with({}) },
+      } as any,
+    )
+    const table = makeRecordingTable()
+    const run = <A, E>(body: (db: any) => Effect.Effect<A, E, never>) =>
+      Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: {},
+          aggregates: { Orders },
+          tables: { Main },
+        } as never)
+        return yield* body(db)
+      }).pipe(
+        Effect.provide(Layer.merge(table.layer, Main.layer({ name: "dg" })) as never),
+        Effect.exit,
+      ) as Effect.Effect<Exit.Exit<A, E>>
+    return { table, run }
+  }
+  const lineKey = "$dg#v1#subline#0000000000000050"
+  const lineRow = (table: ReturnType<typeof makeRecordingTable>) =>
+    [...table.items.values()].find((row) => row.sk?.S === lineKey)
+  /** Another writer's row at the line's key, put before the `n`th transaction is answered. */
+  const replaceBefore = (table: ReturnType<typeof makeRecordingTable>, n: number) => {
+    let seen = 0
+    table.hooks.onRequest = (request) => {
+      if (request.command !== "TransactWriteItems" || ++seen !== n) return
+      table.hooks.onRequest = undefined
+      const row = lineRow(table)!
+      table.items.set(`${row.pk!.S}|${row.sk!.S}`, { ...row, lineId: { S: "other" } })
+    }
+  }
+
+  it.effect("with no other write, the row is deleted, and nothing else is sent", () =>
+    Effect.gen(function* () {
+      const { table, run } = guarded()
+      succeed(
+        yield* run((db) =>
+          db.aggregates.Orders.create({
+            id: "o",
+            note: "n",
+            sub: { lines: [{ lineId: "a", f: 50 }] },
+          }),
+        ),
+      )
+      expect(lineRow(table)?.f).toEqual({ N: "5" })
+      table.requests.length = 0
+      succeed(
+        yield* run((db) =>
+          db.aggregates.Orders.update({ id: "o" }, ({ state }: any) => ({
+            ...state,
+            sub: { lines: [] },
+          })),
+        ),
+      )
+      expect(lineRow(table)).toBeUndefined()
+      expect(table.requests.map((request) => request.command)).toEqual([
+        "Query",
+        "TransactWriteItems",
+      ])
+      const [del] = (table.requests[1]!.input.TransactItems as ReadonlyArray<any>).flatMap(
+        (item) => (item.Delete === undefined ? [] : [item.Delete]),
+      )
+      expect(del.Key.sk).toEqual({ S: lineKey })
+      expect(del.ConditionExpression).toBe(
+        "attribute_exists(#gpk) AND #g0 = :g0 AND #g1 = :g1 AND #g2 = :g2",
+      )
+    }),
+  )
+
+  it.effect(
+    "replaced in its own transaction's group: the update reads again and keeps the row",
+    () =>
+      Effect.gen(function* () {
+        const { table, run } = guarded()
+        succeed(
+          yield* run((db) =>
+            db.aggregates.Orders.create({
+              id: "o",
+              note: "n",
+              sub: { lines: [{ lineId: "a", f: 50 }] },
+            }),
+          ),
+        )
+        table.requests.length = 0
+        replaceBefore(table, 1)
+        const done = succeed(
+          yield* run((db) =>
+            db.aggregates.Orders.update({ id: "o" }, ({ state }: any) => ({
+              ...state,
+              sub: { lines: state.sub.lines.filter((line: any) => line.lineId !== "a") },
+            })),
+          ),
+        )
+        // Read again, the row is the other writer's line, which the update keeps: it's written as
+        // the group's lines are (a value read back keys elsewhere, as on 1.39.0), and not deleted.
+        expect(done.sub.lines).toEqual([{ lineId: "other", f: 50 }])
+        expect(lineRow(table)).toMatchObject({ lineId: { S: "other" }, f: { N: "5" } })
+        expect(table.requests.map((request) => request.command)).toEqual([
+          "Query",
+          "TransactWriteItems",
+          "Query",
+          "TransactWriteItems",
+        ])
+        const deleted = (table.requests[3]!.input.TransactItems as ReadonlyArray<any>).flatMap(
+          (item) => (item.Delete === undefined ? [] : [item.Delete.Key.sk.S]),
+        )
+        expect(deleted).not.toContain(lineKey)
+      }),
+  )
+
+  it.effect(
+    "replaced after an earlier group committed: reported as cancelled, and the row is kept",
+    () =>
+      Effect.gen(function* () {
+        const { table, run } = guarded()
+        succeed(
+          yield* run((db) =>
+            db.aggregates.Orders.create({
+              id: "o",
+              note: "n",
+              sub: { lines: [{ lineId: "a", f: 50 }] },
+            }),
+          ),
+        )
+        table.requests.length = 0
+        replaceBefore(table, 2)
+        const exit = yield* run((db) =>
+          db.aggregates.Orders.update({ id: "o" }, ({ state }: any) => ({
+            ...state,
+            note: "changed",
+            sub: { lines: state.sub.lines.filter((line: any) => line.lineId !== "a") },
+          })),
+        )
+        expect(Exit.isFailure(exit) && (Cause.squash(exit.cause) as any)._tag).toBe(
+          "TransactionCancelled",
+        )
+        expect(lineRow(table)?.lineId).toEqual({ S: "other" })
+        expect(table.requests.map((request) => request.command)).toEqual([
+          "Query",
+          "TransactWriteItems",
+          "TransactWriteItems",
+        ])
+      }),
+  )
+})
