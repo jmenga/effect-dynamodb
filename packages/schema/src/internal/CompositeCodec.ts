@@ -34,9 +34,11 @@
  */
 
 import { Equal, Option, Schema, SchemaAST } from "effect"
+import { substituteSchemaDeep } from "./EntitySchemas.js"
 import {
   getSchemaFields,
   hasEncodingTransformation,
+  holdsPlainBigint,
   numericTypeWithStringEncoding,
 } from "./SchemaAccessors.js"
 
@@ -164,6 +166,24 @@ export const makeCompositeKeyForm = (
     // reaches neither form. It is the value `put` handed this rule (the write
     // path holds encoded records), so it takes the steps `put`'s value took.
     const stored = storedNumericForm(field)
+    // A row read back holds a stored bigint beneath the field's step as a number
+    // (`Schema.Array(Schema.BigInt)` under a decoding default stores `[5n]`, which
+    // comes back `[5]`). A read lifts it back, so the value is taken as a read
+    // decodes it, and encoded again: asked last, of a value nothing else takes.
+    let readDecode: ((value: unknown) => Option.Option<unknown>) | null | undefined
+    const asRead = (value: unknown): Option.Option<unknown> => {
+      if (readDecode === undefined) {
+        readDecode = holdsPlainBigint(SchemaAST.toEncoded(field.ast))
+          ? Schema.decodeUnknownOption(
+              substituteSchemaDeep(field, { legacyReads: true }) as unknown as Schema.Codec<
+                unknown,
+                unknown
+              >,
+            )
+          : null
+      }
+      return readDecode === null ? Option.none() : readDecode(value)
+    }
     const fn = (value: unknown): unknown => {
       const given = toEncoded(value)
       if (Option.isSome(given)) return given.value
@@ -172,6 +192,8 @@ export const makeCompositeKeyForm = (
         const fromStored = toEncoded(lifted)
         if (Option.isSome(fromStored)) return fromStored.value
       }
+      const fromRead = Option.flatMap(asRead(value), (decoded) => encode(decoded))
+      if (Option.isSome(fromRead)) return fromRead.value
       return refuse(attr, value)
     }
     cache.set(attr, fn)

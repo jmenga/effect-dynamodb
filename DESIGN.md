@@ -1289,7 +1289,12 @@ text alone: one whose field decodes the map to the value written is stored, as
 on 1.39.0, and one whose field takes the map as it is (`Schema.Duration`,
 `[object Object]` for `1000 millis`) is refused. 1.39.0 composed the map's own
 text: a `restore` put the item back under `[object object]`, where `get` didn't
-find it, and a delete left its unique-constraint sentinel behind. That costs two synchronous
+find it, and a delete left its unique-constraint sentinel behind. A list or
+struct of `Schema.BigInt` beneath a step (a decoding default, a transformation)
+comes back holding numbers, `[5]` for `[5n]`, which the field refuses; every
+entity read lifts them back (`legacyReads`), and the key form does the same
+for a value nothing else takes, so its text is `put`'s and it is stored, where
+1.39.0's `restore` couldn't compose the key at all (EDD-9050). That costs two synchronous
 decodes of such a value, only for a key composite whose kinds can't be read at
 load, and never for a field no key reads. A field no key reads may store both,
 and is read as it comes back. Since 1.40.0; 1.39.0 loaded

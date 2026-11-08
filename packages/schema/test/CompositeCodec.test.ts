@@ -7,7 +7,7 @@
  * strings for a transformed composite.
  */
 
-import { DateTime, Effect, Option, Schema, SchemaGetter } from "effect"
+import { DateTime, Effect, Option, Schema, SchemaGetter, SchemaTransformation } from "effect"
 import { describe, expect, it } from "vitest"
 import { DateEpochMs } from "../src/DynamoModel.js"
 import {
@@ -574,6 +574,25 @@ describe("CompositeCodec", () => {
       const form = makeCompositeKeyForm(Schema.Struct({ p: Positive }), refuse)
       expect(form("p", 5)).toBe(5n)
       expect(() => form("p", -5)).toThrow(/EDD-9050.*p/)
+    })
+
+    it("bigints beneath a step, read back as numbers, are taken as a read lifts them", () => {
+      // `[5n]` is stored `{L:[{N:"5"}]}` and comes back `[5]`, which neither encode nor decode
+      // takes: an entity read lifts it, and so does a key composed again from the row.
+      const list = Schema.Array(Schema.BigInt)
+      const form = makeCompositeKeyForm(
+        Schema.Struct({
+          dflt: list.pipe(Schema.withDecodingDefault(Effect.succeed([1n]))),
+          over: list.pipe(Schema.decodeTo(list, SchemaTransformation.passthrough())),
+        }),
+        refuse,
+      )
+      for (const attr of ["dflt", "over"]) {
+        expect(form(attr, [5])).toEqual([5n])
+        expect(serializeValue(form(attr, [5]))).toBe(serializeValue(form(attr, [5n])))
+        // Not a value any read of the field gives.
+        expect(() => form(attr, [2.5])).toThrow(new RegExp(`EDD-9050.*${attr}`))
+      }
     })
 
     it("a value that was never stored is still refused", () => {

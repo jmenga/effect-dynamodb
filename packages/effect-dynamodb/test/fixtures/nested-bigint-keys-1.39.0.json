@@ -1,0 +1,239 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "shapes": {
+  "default(Array(BigInt))": {
+   "put": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#f_5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:35.982Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:50:35.982Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$nested#v1#unique"
+     },
+     "pk": {
+      "S": "$nested#v1#unique.byf#5"
+     },
+     "_entity_pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "restore": "died: [EDD-9050] Composite \"f\" on entity \"Soft\" could not be encoded to its stored form. The attribute's schema carries an encoding transformation, so the stored key holds the ENCODED value, but \"5\" encodes",
+   "delete": "ok",
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:35.982Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:50:35.982Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ]
+  },
+  "OverItself(Array(BigInt))": {
+   "put": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#f_5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:36.096Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:50:36.096Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$nested#v1#unique"
+     },
+     "pk": {
+      "S": "$nested#v1#unique.byf#5"
+     },
+     "_entity_pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$nested#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$nested#v1#unique#id_b"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "restore": "died: [EDD-9050] Composite \"f\" on entity \"Soft\" could not be encoded to its stored form. The attribute's schema carries an encoding transformation, so the stored key holds the ENCODED value, but \"5\" encodes",
+   "delete": "ok",
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$nested#v1#soft#deleted#f_5#2026-11-08T19:50:36.096Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:50:36.096Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$nested#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "N": "5"
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ]
+  }
+ }
+}
