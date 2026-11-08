@@ -52,6 +52,7 @@ import {
   keyFormValueKind,
   kindReadingOf,
   makeCompositeKeyForm,
+  makeCompositeStoredForm,
   otherNumericKind,
   type ReadBackText,
   readsBackOtherwise,
@@ -761,6 +762,18 @@ export interface Entity<
    * enforces it across all of them.
    */
   readonly _keyForm: (
+    record: globalThis.Record<string, unknown>,
+  ) => globalThis.Record<string, unknown>
+
+  /**
+   * @internal {@link _keyForm} of a caller's key record, a DOMAIN record: each
+   * composite first put into the form `Entity.put` stores it in
+   * (`makeCompositeStoredForm`), so the key is the one `put` wrote for that value,
+   * the key this entity's own `get` composes. For the key-taking multi-item ops
+   * (`Batch.get`, `Batch.write` deletes, `transactGet`, `transactWrite` deletes and
+   * condition checks), which hold the caller's key.
+   */
+  readonly _domainKeyForm: (
     record: globalThis.Record<string, unknown>,
   ) => globalThis.Record<string, unknown>
 
@@ -3779,6 +3792,7 @@ const makeImpl = <
     // is left as it is.
     { reads: readsKey },
   )
+  const compositeStoredForm = makeCompositeStoredForm(schemas.inputSchema as unknown as Schema.Top)
 
   /**
    * PUBLIC key boundary. Converts a caller-supplied key record from the model's
@@ -3889,6 +3903,15 @@ const makeImpl = <
       return forms.get(field)?.(value)
     }
   })()
+
+  /**
+   * `keyForm` of a caller's DOMAIN key record: each composite first put into
+   * the form `put` stores it in, as `put`'s encode and `get`'s `encodeKey` do,
+   * so a codec `encode` takes on its own output composes the key `put` wrote.
+   * Every other composite composes exactly what `keyForm` alone does.
+   */
+  const domainKeyForm = (record: globalThis.Record<string, unknown>) =>
+    keyForm(compositeStoredForm(record))
 
   // -------------------------------------------------------------------------
   // Write-limit diagnosis (#144)
@@ -14968,6 +14991,7 @@ const makeImpl = <
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
     _keyForm: keyForm,
+    _domainKeyForm: domainKeyForm,
     _renameToDynamo: renameToDynamo,
     _fieldOfAttribute: fieldOfAttribute,
     _incarnationToken: stampsIncarnation,

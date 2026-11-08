@@ -1359,6 +1359,21 @@ left its sentinel behind. A field once declared both and now one kind keeps rows
 under the other kind's text, and `rekey` moves them ("Rows under the other
 numeric kind's text", under `rekey`).
 
+**A codec whose `encode` takes its own output is encoded twice.** `Entity.put`
+encodes its input (`inputSchema`), then applies the key form, whose fallback
+assumes encoding is idempotent. For a codec prepending `x:` it isn't: `"MiX"`
+is stored with the key text `x:x:mix`. The entity's own `get` and `delete` do
+the same (`encodeKey`, then the key form), so they find it. A multi-item op
+takes the caller's DOMAIN key the same way: `composePrimaryKeyOrFail` (`Batch.get`,
+`Batch.write` deletes, `transactGet`, `transactWrite` deletes and condition
+checks) composes through `_domainKeyForm` =
+`_keyForm ∘ makeCompositeStoredForm`, the stored form `put` encodes first
+(applied to transformed, non-numeric composites only; every other composite
+passes through as given, so its key is what 1.39.0 composed). Up to 1.39.0 these
+paths applied the key form alone and composed `x:mix`, so they found, deleted and
+checked nothing for such an item. The double encode itself is stored key text and
+is left as it is: correcting it is a key-format change.
+
 ### Isolated vs Clustered Key Prefixes
 
 **Isolated:**
@@ -3055,7 +3070,7 @@ none.
 
 **`BoundGet` is the exception, and must remain one.** `db.entities.X.get(key)` has returned a real `Effect` since the client gateway existed, and call sites depend on that: `db.entities.X.get(k).pipe(Effect.catchTag("ItemNotFound", …))`, `Effect.map`, `Effect.all`. So `BoundGet` is built on `Effectable.Prototype` and **is** an `Effect<A, E, never>` — the same mechanism `effect`'s own `Statement` uses for a builder that is also an Effect. It additionally carries the bound-op marker, which is what lets it be handed to `Batch.get`, `Transaction.transactGet` and `Transaction.check` (#108). Downgrading it to merely-yieldable would be a silent, wide breaking change.
 
-**One unwrap protocol, both directions.** A bound op joins the multi-item paths by carrying `BoundOpTypeId` plus `_op`; `Entity.extractTransactable` unwraps it to the underlying `EntityOp` / `EntityDelete`. That is the whole mechanism, for reads and writes alike — there is no second one to add. Because `BoundGet` wraps the entity's own `EntityGet`, the key it composes is by construction identical to the one `db.entities.X.get(key)` composes (both go through `entity._keyForm`; see §7). A value that is not a get descriptor is rejected with a `ValidationError` carrying **EDD-9052** on the error channel.
+**One unwrap protocol, both directions.** A bound op joins the multi-item paths by carrying `BoundOpTypeId` plus `_op`; `Entity.extractTransactable` unwraps it to the underlying `EntityOp` / `EntityDelete`. That is the whole mechanism, for reads and writes alike — there is no second one to add. Because `BoundGet` wraps the entity's own `EntityGet`, the key it composes is by construction identical to the one `db.entities.X.get(key)` composes (the multi-item paths through `entity._domainKeyForm`, which `get`'s `encodeKey` and key form agree with; see §7 "Composite key form"). A value that is not a get descriptor is rejected with a `ValidationError` carrying **EDD-9052** on the error channel.
 
 **Immutable accumulator.** Every chainable call returns a new builder — same semantics as `BoundQuery`.
 

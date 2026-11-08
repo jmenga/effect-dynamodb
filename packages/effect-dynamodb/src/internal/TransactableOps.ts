@@ -481,21 +481,13 @@ export const marshalOrFail = <A>(
     ),
   )
 
-/**
- * Compose the primary key for an entity item.
- */
-export const composePrimaryKey = (
+/** An entity item's primary key, from a record already in the composite key form. */
+const primaryKeyOf = (
   entity: Entity,
-  key: Record<string, unknown>,
+  recordKeyForm: Record<string, unknown>,
 ): Record<string, unknown> => {
   const primary = entity.indexes.primary!
   const schema = entity._schema
-  // The caller's key is a DOMAIN record (`{ takenAt: DateTime }`), and every
-  // `KeyComposer` input must first go through the composite key-form rule or it
-  // composes a different string than `Entity.put` wrote — a `DateEpochMs` PK
-  // composite made `Batch.get` return null and `Batch.write(delete)` report
-  // success against a row it never touched (#111).
-  const recordKeyForm = entity._keyForm(key)
   return {
     [primary.pk.field]: KeyComposer.composePk(schema, entity.entityType, primary, recordKeyForm),
     [primary.sk.field]: KeyComposer.composeSk(schema, entity.entityType, 1, primary, recordKeyForm),
@@ -503,18 +495,42 @@ export const composePrimaryKey = (
 }
 
 /**
- * {@link composePrimaryKey}, failing with a `ValidationError` for `operation`
- * where a composite has no key text (`NaN`, `[EDD-9096]`) — the key-taking
- * multi-item ops (`Batch.get`, `Batch.write` deletes, `transactGet`,
- * `transactWrite` deletes and condition checks), as an entity's own `get` and
- * `delete` do.
+ * Compose the primary key for an entity item, from a record in the key form
+ * `_keyForm` takes. The projection engine writes and reads its rows through this.
+ */
+export const composePrimaryKey = (
+  entity: Entity,
+  key: Record<string, unknown>,
+): Record<string, unknown> => {
+  // Every `KeyComposer` input must first go through the composite key-form rule
+  // or it composes a different string than `Entity.put` wrote — a `DateEpochMs`
+  // PK composite made `Batch.get` return null and `Batch.write(delete)` report
+  // success against a row it never touched (#111).
+  const recordKeyForm = entity._keyForm(key)
+  return primaryKeyOf(entity, recordKeyForm)
+}
+
+/**
+ * The primary key of the item a caller's key names, failing with a
+ * `ValidationError` for `operation` where a composite has no key text (`NaN`,
+ * `[EDD-9096]`) — the key-taking multi-item ops (`Batch.get`, `Batch.write`
+ * deletes, `transactGet`, `transactWrite` deletes and condition checks), as an
+ * entity's own `get` and `delete` do.
+ *
+ * The caller's key is a DOMAIN record (`{ takenAt: DateTime }`), as an entity's
+ * own `get` takes it, so it goes through `_domainKeyForm`: the key `Entity.put`
+ * wrote for it, the key that `get` composes. Up to 1.39.0 it went through
+ * `_keyForm` alone, which for a codec `encode` takes on its own output (`x:`
+ * prepended) encoded it once where `put` encoded twice, and found nothing.
  */
 export const composePrimaryKeyOrFail = (
   entity: Entity,
   key: Record<string, unknown>,
   operation: string,
 ): Effect.Effect<Record<string, unknown>, ValidationError> =>
-  composeKeysOrFail(entity.entityType, operation, () => composePrimaryKey(entity, key))
+  composeKeysOrFail(entity.entityType, operation, () =>
+    primaryKeyOf(entity, entity._domainKeyForm(key)),
+  )
 
 /**
  * Validate input, compose all keys, and build a marshalled put item.
