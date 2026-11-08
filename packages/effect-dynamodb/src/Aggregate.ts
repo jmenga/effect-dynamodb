@@ -1693,15 +1693,31 @@ const makeAggregate = <TSchema extends Schema.Top>(
       readonly into: string
       readonly readsOther: (value: unknown) => string | undefined
     }
+    // The text the root's key composes from a composite's value, written and read back alike: the
+    // key form takes a value read back as its field reads it.
+    const rootKeyText = (path: string) => (value: unknown) => {
+      try {
+        return KeyComposer.compositeText(config.schema, compositeKeyForm(path, value))
+      } catch {
+        return undefined
+      }
+    }
     const checksOf = (
       fields: Record<string, Schema.Top> | undefined,
       into: string,
       composites: ReadonlyArray<string>,
+      root = false,
     ): ReadonlyArray<Check> =>
       composites.flatMap((path) => {
         const fieldSchema = fieldAtPath(fields, path)
+        const text = rootKeyText(path)
         const readsOther =
-          fieldSchema === undefined ? undefined : readsBackOtherwise(fieldSchema, { asRead })
+          fieldSchema === undefined
+            ? undefined
+            : readsBackOtherwise(fieldSchema, {
+                asRead,
+                texts: root ? [{ written: text, read: text }] : [],
+              })
         return readsOther === undefined ? [] : [{ path, into, readsOther }]
       })
     const byType = new Map<string, ReadonlyArray<Check>>()
@@ -1709,13 +1725,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (checks.length > 0) byType.set(entityType, [...(byType.get(entityType) ?? []), ...checks])
     }
     add(config.root.entityType, [
-      ...checksOf(schemaFields, "its partition key", config.pk.composite),
-      ...checksOf(schemaFields, "its collection sort key", config.collection.sk?.composite ?? []),
+      ...checksOf(schemaFields, "its partition key", config.pk.composite, true),
+      ...checksOf(
+        schemaFields,
+        "its collection sort key",
+        config.collection.sk?.composite ?? [],
+        true,
+      ),
       ...(config.list === undefined
         ? []
         : [
-            ...checksOf(schemaFields, "its list partition key", config.list.pk.composite),
-            ...checksOf(schemaFields, "its list sort key", config.list.sk.composite),
+            ...checksOf(schemaFields, "its list partition key", config.list.pk.composite, true),
+            ...checksOf(schemaFields, "its list sort key", config.list.sk.composite, true),
           ]),
     ])
     const walk = (node: ResolvedNode): void => {

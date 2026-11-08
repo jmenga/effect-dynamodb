@@ -21,6 +21,7 @@ import {
   readBackUnsure,
   readsBackOtherwise,
   storedFieldAtPath,
+  storedFormOfRead,
   storedNumericForm,
   storedNumericKinds,
   toCompositeKeyRecord,
@@ -593,6 +594,98 @@ describe("CompositeCodec", () => {
       // A value either form takes is the same whatever `reads` says.
       expect(keyed("dflt", 5)).toBe(5n)
       expect(keyed("bfs", "5")).toBe(5n)
+    })
+  })
+
+  describe("a declaration's value read back as a plain map", () => {
+    // What the unmarshaller hands back for `Option.some(5)`: its own enumerable properties, a map.
+    const someMap = (value: unknown) => ({
+      _op: "Some",
+      _tag: "Some",
+      value,
+      "~effect/Option": {},
+    })
+    const Declared = Schema.Struct({
+      opt: Schema.Option(Schema.Number),
+      optTx: Schema.Option(Schema.BigIntFromString),
+      list: Schema.Array(Schema.Option(Schema.Number)),
+      plain: Schema.Struct({ n: Schema.Number }),
+    })
+    const form = makeCompositeKeyForm(Declared, refuse)
+    const text = (attr: string, value: unknown) => String(form(attr, value))
+
+    it("composes the text of the value written", () => {
+      expect(text("opt", Option.some(5))).toBe("some(5)")
+      expect(text("opt", someMap(5))).toBe("some(5)")
+      expect(text("optTx", Schema.encodeSync(Declared.fields.optTx)(Option.some(5n)))).toBe(
+        'some("5")',
+      )
+      expect(text("optTx", someMap("5"))).toBe('some("5")')
+      expect(text("list", [Option.some(5)])).toBe("some(5)")
+      expect(text("list", [someMap(5)])).toBe("some(5)")
+    })
+
+    it("leaves a value holding no declaration, and one the field doesn't decode, as it is", () => {
+      const plain = { n: 5 }
+      expect(form("plain", plain)).toBe(plain)
+      const odd = { _tag: "Other" }
+      expect(form("opt", odd)).toBe(odd)
+    })
+
+    it("only for an attribute a key reads, when `reads` names them", () => {
+      const keyed = makeCompositeKeyForm(Declared, refuse, { reads: (attr) => attr === "opt" })
+      expect(String(keyed("opt", someMap(5)))).toBe("some(5)")
+      const map = someMap(5)
+      expect(keyed("list", [map])).toEqual([map])
+    })
+
+    it("is the value a row stored, read back for a sentinel", () => {
+      expect(String(storedFormOfRead(Declared.fields.opt)?.(someMap(5)))).toBe("some(5)")
+      expect(storedFormOfRead(Declared.fields.opt)?.(5)).toBeUndefined()
+      expect(storedFormOfRead(Declared.fields.plain)).toBeUndefined()
+    })
+
+    it("judges an object by the text a key composes from it again", () => {
+      // What DynamoDB hands back for an `Option`: its enumerable properties, its prototype's too,
+      // but for its methods, in a plain map.
+      const asRead = (stored: unknown): unknown => {
+        const map: Record<string, unknown> = {}
+        for (const key in stored as object) {
+          const value = (stored as Record<string, unknown>)[key]
+          if (typeof value !== "function") map[key] = value
+        }
+        return map
+      }
+      const keyText = (value: unknown) => {
+        try {
+          return String(form("optTx", value))
+        } catch {
+          return undefined
+        }
+      }
+      const optTx = readsBackOtherwise(Declared.fields.optTx, {
+        asRead,
+        texts: [{ written: keyText, read: keyText }],
+      })
+      const stored = Schema.encodeSync(Declared.fields.optTx)(Option.some(5n))
+      expect(asRead(stored)).not.toBe(stored)
+      expect(optTx?.(stored)).toBeUndefined()
+      // Composed from the map as it is, the text would be `[object Object]`.
+      expect(
+        readsBackOtherwise(Declared.fields.optTx, {
+          asRead,
+          texts: [{ written: keyText, read: (value) => String(value) }],
+        })?.(stored),
+      ).toBe("something else")
+      // A struct holding a bigint reads back holding a number its field refuses, and composes the
+      // text written all the same.
+      const holding = Schema.Struct({ n: Schema.BigIntFromString, b: Schema.BigInt })
+      expect(
+        readsBackOtherwise(holding, {
+          asRead: (stored) => ({ ...(stored as object), b: 5 }),
+          texts: [{ written: (v) => String(v), read: (v) => String(v) }],
+        })?.({ n: "5", b: 5n }),
+      ).toBeUndefined()
     })
   })
 

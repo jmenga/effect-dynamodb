@@ -1277,7 +1277,19 @@ what it reads back as, and nothing written, on every entity write
 on an aggregate's `create` and `update` (`refuseOtherKindKeys`).
 `Schema.Unknown` reads `5n` back as `5`, so it is refused; a `Schema.Unknown`
 decoded to `Schema.BigInt` by `BigInt(n)` reads it back as `5n`, so it is
-stored, under the bigint's text, as on 1.39.0. That costs two synchronous
+stored, under the bigint's text, as on 1.39.0. A declaration's value
+(`Schema.Option`, `Schema.Result`, `Schema.ReadonlySet`, an array or struct of
+them) goes to DynamoDB as a map, a list or a set, and comes back a plain one:
+`Option.some(5)` composes `some(5)`, and the map read back `[object Object]`.
+So a key composite storing a declaration takes a value read back as its field
+reads it, decoded through the field and encoded again
+(`storedFormOfDeclaration`, in the key form and in `storedFormOfRead`), before
+its text is composed, and composes `some(5)` again. An object is judged by that
+text alone: one whose field decodes the map to the value written is stored, as
+on 1.39.0, and one whose field takes the map as it is (`Schema.Duration`,
+`[object Object]` for `1000 millis`) is refused. 1.39.0 composed the map's own
+text: a `restore` put the item back under `[object object]`, where `get` didn't
+find it, and a delete left its unique-constraint sentinel behind. That costs two synchronous
 decodes of such a value, only for a key composite whose kinds can't be read at
 load, and never for a field no key reads. A field no key reads may store both,
 and is read as it comes back. Since 1.40.0; 1.39.0 loaded

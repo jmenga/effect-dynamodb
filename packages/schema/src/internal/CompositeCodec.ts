@@ -178,10 +178,71 @@ export const makeCompositeKeyForm = (
     return fn
   }
 
+  // A value of a field storing a declaration may be one read back from a row, which the unmarshaller
+  // hands back as a plain map, list or set: it's taken as the field reads it first. Only for an
+  // attribute a key reads, when `reads` names them: no other is key text.
+  const readBacks = new Map<string, ((value: unknown) => unknown) | undefined>()
+  const readBack = (attr: string): ((value: unknown) => unknown) | undefined => {
+    if (!readBacks.has(attr)) {
+      const field = fields?.[attr]
+      readBacks.set(attr, field === undefined ? undefined : storedFormOfDeclaration(field))
+    }
+    const fn = readBacks.get(attr)
+    return fn === undefined || reads === undefined || reads(attr) ? fn : undefined
+  }
+
   return (attr, value) => {
     if (value === undefined || value === null) return value
+    const read = readBack(attr)?.(value)
+    const given = read === undefined ? value : read
     const fn = resolve(attr)
-    return fn === null ? value : fn(value)
+    return fn === null ? given : fn(given)
+  }
+}
+
+/**
+ * Whether a schema's Encoded side holds a declaration anywhere (`Schema.Option`, `Schema.Result`,
+ * `Schema.ReadonlySet`, `Schema.Duration`, …): at its top, or in a member, property, element or
+ * suspension.
+ */
+const holdsDeclaration = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (SchemaAST.isDeclaration(ast)) return true
+  if (SchemaAST.isSuspend(ast)) return holdsDeclaration(ast.thunk(), seen)
+  if (SchemaAST.isUnion(ast)) return ast.types.some((member) => holdsDeclaration(member, seen))
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((property) => holdsDeclaration(property.type, seen)) ||
+      ast.indexSignatures.some((index) => holdsDeclaration(index.type, seen))
+    )
+  }
+  if (SchemaAST.isArrays(ast)) {
+    return [...ast.elements, ...ast.rest].some((element) => holdsDeclaration(element, seen))
+  }
+  return false
+}
+
+/**
+ * The value a field storing a declaration ({@link holdsDeclaration}) stored, from what a read of it
+ * hands back: the value decoded through the field, as a read decodes it, and encoded again, as a
+ * write encodes it. A declaration's value goes to DynamoDB as a map, a list or a set, and comes back a
+ * plain one: `Option.some(5)` composes `some(5)`, and the map read back `[object Object]`, until the
+ * field decodes it to `Option.some(5)` again. `undefined` for a field storing none, and from the
+ * function returned for a value that isn't an object or that the field doesn't decode, which is then
+ * taken as it is.
+ */
+export const storedFormOfDeclaration = (
+  field: Schema.Top,
+): ((value: unknown) => unknown) | undefined => {
+  if (!holdsDeclaration(SchemaAST.toEncoded(field.ast))) return undefined
+  const codec = field as unknown as Schema.Codec<unknown, unknown>
+  const decode = Schema.decodeUnknownOption(codec)
+  const encode = Schema.encodeUnknownOption(codec)
+  return (value) => {
+    if (typeof value !== "object" || value === null) return undefined
+    const stored = Option.flatMap(decode(value), (decoded) => encode(decoded))
+    return Option.isSome(stored) ? stored.value : undefined
   }
 }
 
@@ -341,12 +402,22 @@ export const readBackUnsure = (field: Schema.Top): boolean =>
  * ({@link storedNumericForm}). A field whose kinds can't be read off its schema ({@link
  * kindsUnreadable}) is decoded through the field, as a read decodes it, and encoded again, as a write
  * encodes it: `Schema.Unknown` decoded to a `Schema.BigInt` with `BigInt(n)` stored `5n`, which reads
- * back as `5`, and decoding `5` gives `5n` again. Only a number or a bigint is taken this way, the
- * only values DynamoDB hands back otherwise, and for any other field nothing is.
+ * back as `5`, and decoding `5` gives `5n` again. A field storing a declaration takes an object the
+ * same way ({@link storedFormOfDeclaration}): `Option.some(5)` comes back a plain map. Only these
+ * are taken this way, the only values DynamoDB hands back otherwise, and for any other field nothing
+ * is.
  */
 export const storedFormOfRead = (field: Schema.Top): ((value: unknown) => unknown) | undefined => {
   const lift = storedNumericForm(field)
-  if (lift !== undefined || !kindsUnreadable(field)) return lift
+  const declared = storedFormOfDeclaration(field)
+  const numeric = lift ?? (kindsUnreadable(field) ? numericFormOfRead(field) : undefined)
+  if (declared === undefined) return numeric
+  return (value) =>
+    typeof value === "object" && value !== null ? declared(value) : numeric?.(value)
+}
+
+/** {@link storedFormOfRead} of a number or a bigint, for a field whose kinds can't be read off it. */
+const numericFormOfRead = (field: Schema.Top): ((value: unknown) => unknown) => {
   const codec = field as unknown as Schema.Codec<unknown, unknown>
   const decode = Schema.decodeUnknownOption(codec)
   const encode = Schema.encodeUnknownOption(codec)
@@ -383,13 +454,17 @@ export interface ReadBackText {
  * `asRead` is what DynamoDB hands back for a stored value, the marshaller and the unmarshaller run
  * for real: a safe-integer `bigint` comes back as a `number`, and `-0` as `0`. A `number` past
  * 2^53 the marshaller refuses, which the write's own marshalling reports (`EDD-9124`). A value that
- * comes back as it went is never judged. One that doesn't is judged twice: each of `texts` composed from the value written and from the value read back must be
- * the same text, and the value read back, decoded through `field`, must be the value written
- * decoded (when that decodes). `Schema.Unknown` reads `5n` back as `5`, and a declaration of either
- * kind does the same, so both are refused; `Schema.Unknown` decoded to a `Schema.BigInt` with
- * `BigInt(n)` reads it back as `5n`, and is stored. A codec decoding `-0` and `0` to different values
- * refuses `-0`. The judge itself is `undefined` for a field that reads back as itself by
- * construction, which never needs asking.
+ * comes back as it went is never judged. One that doesn't is judged twice: each of `texts` composed
+ * from the value written and from the value read back must be the same text, and a value that isn't
+ * an object, read back and decoded through `field`, must be the value written decoded (when that
+ * decodes). An object is judged by its texts alone: `Option.some(5)` comes back a plain map, which
+ * the key form decodes to `Option.some(5)` again ({@link storedFormOfDeclaration}), so it composes
+ * the text written, while a struct holding a `bigint` reads back holding a number its field refuses,
+ * and composes the text written all the same. `Schema.Unknown` reads `5n` back as `5`, and a
+ * declaration of either kind does the same, so both are refused; `Schema.Unknown` decoded to a
+ * `Schema.BigInt` with `BigInt(n)` reads it back as `5n`, and is stored. A codec decoding `-0` and
+ * `0` to different values refuses `-0`. The judge itself is `undefined` for a field that reads back
+ * as itself by construction, which never needs asking.
  */
 export const readsBackOtherwise = (
   field: Schema.Top,
@@ -428,12 +503,13 @@ export const readsBackOtherwise = (
       const at = text.written(stored)
       return at !== undefined && text.read(returned) !== at
     })
+    // An object's key text is its texts' to judge: what each composes from the value read back is
+    // what a key composed again from the row holds.
     const valueMoved =
       Option.isSome(written) &&
-      (Option.isNone(read) ||
-        (typeof written.value !== "object" &&
-          typeof written.value !== "function" &&
-          !sameKeyValue(read.value, written.value)))
+      typeof written.value !== "object" &&
+      typeof written.value !== "function" &&
+      (Option.isNone(read) || !sameKeyValue(read.value, written.value))
     if (!textMoved && !valueMoved) return undefined
     if (Option.isNone(read)) return "a value the field refuses"
     const was = Option.isSome(written) ? written.value : stored
