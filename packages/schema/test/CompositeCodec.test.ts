@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest"
 import { DateEpochMs } from "../src/DynamoModel.js"
 import {
   bothKindsKeyRefusal,
+  keyFormValueKind,
   makeCompositeKeyForm,
   storedNumericForm,
   storedNumericKinds,
@@ -148,6 +149,18 @@ describe("CompositeCodec", () => {
       expect(fromRow("sn", "a")).toBe("a")
     })
 
+    it("a suspended schema is the schema it suspends", () => {
+      const Suspended = Schema.Struct({
+        b: Schema.suspend(() => Schema.BigInt),
+        n: Schema.suspend(() => Schema.Number),
+      })
+      const fromRow = makeCompositeKeyForm(Suspended, refuse)
+      expect(fromRow("b", 5)).toBe(5n)
+      expect(serializeValue(fromRow("b", 5))).toBe(serializeValue(5n))
+      expect(fromRow("n", 12n)).toBe(12)
+      expect(keyFormValueKind(Schema.suspend(() => Schema.BigInt))).toBe("bigint")
+    })
+
     it("a union storing both kinds is left: its value alone can't say", () => {
       const Both = Schema.Struct({ n: Schema.Union([Schema.Number, Schema.BigInt]) })
       const fromRow = makeCompositeKeyForm(Both, refuse)
@@ -177,6 +190,10 @@ describe("CompositeCodec", () => {
         "number",
       ])
       expect(kinds(Schema.Any)).toEqual(["bigint", "number"])
+      expect(kinds(Schema.suspend(() => Schema.BigInt))).toEqual(["bigint"])
+      expect(kinds(Schema.suspend(() => Schema.Union([Schema.String, Schema.Number])))).toEqual([
+        "number",
+      ])
       expect(kinds(Schema.String)).toEqual([])
       expect(storedNumericForm(Schema.Union([Schema.Number, Schema.BigInt]))).toBeUndefined()
       expect(storedNumericForm(Schema.Union([Schema.String, Schema.BigInt]))?.(5)).toBe(5n)

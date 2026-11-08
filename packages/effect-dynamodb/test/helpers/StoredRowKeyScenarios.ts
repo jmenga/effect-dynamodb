@@ -126,6 +126,11 @@ const SHAPES: ReadonlyArray<Shape> = [
     given: (value) => Option.some(value),
   },
   {
+    name: "Schema.suspend(() => Schema.BigInt)",
+    schema: Schema.suspend(() => Schema.BigInt),
+    given: (value) => value,
+  },
+  {
     name: "a BigInt under a decoding default",
     schema: Schema.BigInt.pipe(Schema.withDecodingDefault(Effect.succeed(7n))),
     given: (value) => value,

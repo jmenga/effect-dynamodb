@@ -218,8 +218,13 @@ export type NumericKind = "number" | "bigint"
  */
 export const storedNumericKinds = (field: Schema.Top): ReadonlySet<NumericKind> => {
   const kinds = new Set<NumericKind>()
+  const seen = new Set<SchemaAST.AST>()
   const walk = (ast: SchemaAST.AST): void => {
-    if (SchemaAST.isNumber(ast)) kinds.add("number")
+    if (SchemaAST.isSuspend(ast)) {
+      if (seen.has(ast)) return
+      seen.add(ast)
+      walk(ast.thunk())
+    } else if (SchemaAST.isNumber(ast)) kinds.add("number")
     else if (SchemaAST.isBigInt(ast)) kinds.add("bigint")
     else if (SchemaAST.isUnknown(ast) || SchemaAST.isAny(ast)) {
       kinds.add("number")
@@ -303,7 +308,14 @@ export const compositeKeyFormKind = (source: Schema.Top, attr: string): Composit
 /** The JavaScript type a composite's key form takes, when its schema says. */
 export type KeyFormValueKind = "string" | "number" | "bigint" | "boolean"
 
-const astKeyFormValueKind = (ast: SchemaAST.AST): KeyFormValueKind | undefined => {
+const astKeyFormValueKind = (
+  ast: SchemaAST.AST,
+  seen: ReadonlySet<SchemaAST.AST> = new Set(),
+): KeyFormValueKind | undefined => {
+  // A suspended schema is the schema it suspends (`Schema.suspend(() => Schema.BigInt)`).
+  if (SchemaAST.isSuspend(ast)) {
+    return seen.has(ast) ? undefined : astKeyFormValueKind(ast.thunk(), new Set([...seen, ast]))
+  }
   if (SchemaAST.isString(ast) || SchemaAST.isTemplateLiteral(ast)) return "string"
   if (SchemaAST.isNumber(ast)) return "number"
   if (SchemaAST.isBigInt(ast)) return "bigint"
@@ -314,7 +326,7 @@ const astKeyFormValueKind = (ast: SchemaAST.AST): KeyFormValueKind | undefined =
     : SchemaAST.isUnion(ast)
       ? ast.types
           .filter((member) => !SchemaAST.isUndefined(member) && !SchemaAST.isNull(member))
-          .map((member) => astKeyFormValueKind(member))
+          .map((member) => astKeyFormValueKind(member, seen))
       : [undefined]
   const [first] = kinds
   return first !== undefined && kinds.every((kind) => kind === first) ? first : undefined
