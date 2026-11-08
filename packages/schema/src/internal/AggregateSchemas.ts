@@ -12,7 +12,7 @@ import type {
   AggregateStampNames,
   BoundSubAggregate,
 } from "./AggregateTypes.js"
-import { bothKindsKeyRefusal, fieldAtPath } from "./CompositeCodec.js"
+import { bothKindsKeyRefusal, storedFieldAtPath } from "./CompositeCodec.js"
 import type { TimestampsConfig } from "./EntityConfig.js"
 import { optionalField, type ResolvedSystemFields, resolveSystemFields } from "./EntitySchemas.js"
 import {
@@ -132,8 +132,10 @@ export const refuseManySortKeysOverMovingValue = (
  * `[EDD-9128]`: a key an aggregate composes from a field storing both numeric kinds
  * (`bothKindsKeyRefusal`): its partition key, its collection and list keys, and a `many` edge's sort
  * key, on the root's edges and those of the sub-aggregates under it. A sort-key composite that's a
- * path into a value (`player.id`) is followed to the field it names, through an optional, nullable,
- * suspended or class value on the way (`fieldAtPath`).
+ * path into a value (`player.id`) is followed to the field a row stores there, through an optional,
+ * nullable, suspended or class value on the way (`storedFieldAtPath`): a value transformed on the
+ * way is judged by what it's stored as, so a struct storing a number at `n` and decoding it to a
+ * union of both kinds loads, and one storing either kind there doesn't.
  */
 export const refuseAggregateKeysOverBothKinds = (
   aggregate: string,
@@ -155,7 +157,7 @@ export const refuseAggregateKeysOverBothKinds = (
     composites: ReadonlyArray<string>,
   ): void => {
     for (const attr of composites) {
-      const field = fieldAtPath(fields, attr)
+      const field = storedFieldAtPath(fields, attr)
       if (field === undefined) continue
       const refused = bothKindsKeyRefusal(owner, where, attr, field)
       if (refused !== undefined) throw refused

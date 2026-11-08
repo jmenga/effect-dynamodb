@@ -12154,7 +12154,7 @@ const makeImpl = <
     compose: (
       kindKeyForm: globalThis.Record<string, unknown>,
       asOther: ReadonlySet<string>,
-    ) => string | undefined,
+    ) => string | ReadonlyArray<string> | undefined,
     stored: string,
   ) =>
     kindReadingOf(
@@ -12165,8 +12165,20 @@ const makeImpl = <
       stored,
     )
 
-  /** A table key as one text, for {@link kindReading}: both halves, neither running into the other. */
+  /**
+   * A table key as one text, for {@link kindReading}: both halves, neither running into the other.
+   * {@link keySegments} gives it in its halves.
+   */
   const storedKeyText = (key: StoredKey): string => JSON.stringify([key[rekeyPk], key[rekeySk]])
+
+  /**
+   * A key's text ({@link storedKeyText}) in its two halves, which concatenate to it: a composite in
+   * both halves is read as one kind in both (`CompositeCodec.kindReadingOf`).
+   */
+  const keySegments = (pk: string | undefined, sk: string | undefined): ReadonlyArray<string> => [
+    `[${JSON.stringify(pk)}`,
+    `,${JSON.stringify(sk)}]`,
+  ]
 
   /** Bytes as text, one character a byte, for {@link kindReading}. */
   const bytesText = (bytes: Uint8Array): string => String.fromCharCode(...bytes)
@@ -12235,20 +12247,20 @@ const makeImpl = <
               row,
               rowKeyForm,
               fields,
-              (kindKeyForm) =>
-                storedKeyText(
-                  at(
+              (kindKeyForm) => {
+                const placedAt = at(
+                  form,
+                  KeyText136.composeAt(
                     form,
-                    KeyText136.composeAt(
-                      form,
-                      entityType,
-                      entityVersion,
-                      primary,
-                      kindKeyForm,
-                    ) as StoredKey,
+                    entityType,
+                    entityVersion,
+                    primary,
                     kindKeyForm,
-                  ),
-                ),
+                  ) as StoredKey,
+                  kindKeyForm,
+                )
+                return keySegments(placedAt[rekeyPk], placedAt[rekeySk])
+              },
               storedKeyText(key),
             ) !== undefined,
         )
@@ -13505,19 +13517,19 @@ const makeImpl = <
           rowKeyForm,
           fields,
           // A reading of the row's key form: each numeric field read as the kind it composes.
-          (kindKeyForm) =>
-            storedKeyText(
-              at(
-                KeyText136.composeAt(
-                  form,
-                  entityType,
-                  entityVersion,
-                  config.indexes.primary,
-                  kindKeyForm,
-                ) as StoredKey,
+          (kindKeyForm) => {
+            const placedAt = at(
+              KeyText136.composeAt(
+                form,
+                entityType,
+                entityVersion,
+                config.indexes.primary,
                 kindKeyForm,
-              ),
-            ),
+              ) as StoredKey,
+              kindKeyForm,
+            )
+            return keySegments(placedAt[rekeyPk], placedAt[rekeySk])
+          },
           storedKeyText(stored),
         )
         if (reading !== undefined) return reading
@@ -13598,7 +13610,7 @@ const makeImpl = <
           fields,
           (record, asOther) => {
             const at = sentinelKeyUnder(under, constraintName, constraintDef, record, asOther)
-            return at === undefined ? undefined : JSON.stringify([at.pk, at.sk])
+            return at === undefined ? undefined : keySegments(at.pk, at.sk)
           },
           text,
         ) !== undefined,

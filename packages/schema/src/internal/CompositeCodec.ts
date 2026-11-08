@@ -302,6 +302,39 @@ const kindsUnreadable = (field: Schema.Top): boolean => {
   return walk(SchemaAST.toEncoded(field.ast))
 }
 
+/** Whether a schema transforms anywhere: at its top, or in a member, property, element or suspension. */
+const transformsAnywhere = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (ast.encoding !== undefined) return true
+  if (SchemaAST.isSuspend(ast)) return transformsAnywhere(ast.thunk(), seen)
+  if (SchemaAST.isUnion(ast)) return ast.types.some((member) => transformsAnywhere(member, seen))
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((property) => transformsAnywhere(property.type, seen)) ||
+      ast.indexSignatures.some((index) => transformsAnywhere(index.type, seen))
+    )
+  }
+  if (SchemaAST.isArrays(ast)) {
+    return [...ast.elements, ...ast.rest].some((element) => transformsAnywhere(element, seen))
+  }
+  if (SchemaAST.isDeclaration(ast)) {
+    return ast.typeParameters.some((parameter) => transformsAnywhere(parameter, seen))
+  }
+  return false
+}
+
+/**
+ * Whether a key composite's read-back can't be guaranteed at load, so a write judges each value it
+ * stores: a field whose numeric kinds can't be read off its schema (`Schema.Unknown`, `Schema.Any`, a
+ * declaration, alone or in a union), or one with a transformation anywhere on it. Only a field of
+ * known kinds with no transformation reads back as itself by construction: the marshaller's only
+ * changes to such a value (a safe-integer `bigint` read back as a number, a number past 2^53 as a
+ * `bigint`, `-0` as `0`) compose the same key text.
+ */
+export const readBackUnsure = (field: Schema.Top): boolean =>
+  kindsUnreadable(field) || transformsAnywhere(field.ast)
+
 /**
  * What DynamoDB hands back for a stored numeric value, where it's the other kind: a `bigint` that's a
  * safe integer comes back as a `number`, and an integer `number` past 2^53 as a `bigint`. `undefined`
@@ -366,11 +399,28 @@ export const readsBackOtherwise = (
 export const fieldAtPath = (
   fields: Record<string, Schema.Top> | undefined,
   path: string,
+): Schema.Top | undefined => followPath(fields, path, (ast) => ast)
+
+/**
+ * {@link fieldAtPath} on the stored side: each segment looked up in what its holder is stored as, so
+ * a transformation of a value on the way (a struct decoded to another struct) is kept, and the field
+ * found is the one a row holds. `Schema.Struct({ n: Schema.Number })` decoded to a struct whose `n`
+ * is `Schema.Union([Schema.Number, Schema.BigInt])` stores a number at `nested.n`.
+ */
+export const storedFieldAtPath = (
+  fields: Record<string, Schema.Top> | undefined,
+  path: string,
+): Schema.Top | undefined => followPath(fields, path, (ast) => SchemaAST.toEncoded(ast))
+
+const followPath = (
+  fields: Record<string, Schema.Top> | undefined,
+  path: string,
+  side: (ast: SchemaAST.AST) => SchemaAST.AST,
 ): Schema.Top | undefined => {
   const [first, ...rest] = path.split(".")
   const top = fields?.[first!]
   if (top === undefined || rest.length === 0) return top
-  let at: ReadonlyArray<SchemaAST.AST> = [top.ast]
+  let at: ReadonlyArray<SchemaAST.AST> = [side(top.ast)]
   for (const segment of rest) {
     at = at.flatMap((ast) => propertyAt(ast, segment, new Set()))
     if (at.length === 0) return undefined
@@ -478,95 +528,131 @@ interface KindEdit {
  * or a `Schema.Unknown`) composed each value's own kind's text, so `rekey` looks for a row stored
  * under the other kind's. `compose` gives `undefined` for values with no text there.
  *
+ * `compose` may give its text in segments, whose concatenation is the text (a key's partition and
+ * sort key halves): a value is looked for once in each segment, so a composite in both halves of a
+ * key is found in both. Each field is one decision, its kind, whichever segments it is in.
+ *
  * `record` as it is comes first, and when its text is looked for nothing else is composed: that is
  * a row under its current key, every row of a clean run. Otherwise each field is composed once as
- * the other kind by itself, which shows where its value lies in the text: the stretch where that
- * text and `record`'s differ. The readings are then walked field by field from the left, keeping
- * those whose text so far begins a text looked for, and one left whole at the end is composed to
- * confirm it. That is one composition per field and one or two more, never one per combination,
- * and no text is split on its delimiters. When two fields' stretches overlap, a composer that
- * doesn't keep each value in a stretch of its own, each field is read as the other kind only alone.
+ * the other kind by itself, which shows where its value lies in each segment: the stretch where
+ * that segment and `record`'s differ. The readings are then walked stretch by stretch from the
+ * left, keeping those whose text so far begins a text looked for, a field's later stretches
+ * following its first, and one left whole at the end is composed to confirm it. That is one
+ * composition per field and one or two more, never one per combination, and no text is split on
+ * its delimiters. When two fields' stretches overlap in a segment, a composer that doesn't keep
+ * each value in a stretch of its own, each field is read as the other kind only alone.
  */
 export const kindReadingOf = (
   record: Record<string, unknown>,
   fields: ReadonlyArray<string>,
   digits: (field: string) => string | undefined,
-  compose: (reading: KindReading) => string | undefined,
+  compose: (reading: KindReading) => string | ReadonlyArray<string> | undefined,
   stored: string | KindTargets,
 ): KindReading | undefined => {
   const targets: KindTargets =
     typeof stored === "string"
       ? { has: (text) => text === stored, hasPrefix: (prefix) => stored.startsWith(prefix) }
       : stored
-  const composed = (reading: KindReading) => {
+  const composed = (reading: KindReading): ReadonlyArray<string> | undefined => {
     try {
-      return compose(reading)
+      const out = compose(reading)
+      return out === undefined ? undefined : typeof out === "string" ? [out] : out
     } catch {
       return undefined
     }
   }
   const given: KindReading = { record, asOther: new Set() }
-  const base = composed(given)
-  if (base === undefined) return undefined
+  const segments = composed(given)
+  if (segments === undefined) return undefined
+  const base = segments.join("")
   if (targets.has(base)) return given
+  const offsets: Array<number> = []
+  let offset = 0
+  for (const segment of segments) {
+    offsets.push(offset)
+    offset += segment.length
+  }
+  const others = new Map<string, number | bigint>()
   const edits: Array<KindEdit> = []
   for (const field of new Set(fields)) {
     const other = otherNumericKind(record[field], digits(field))
     if (other === undefined) continue
     const alone: KindReading = { record: { ...record, [field]: other }, asOther: new Set([field]) }
-    const text = composed(alone)
-    if (text === undefined || text === base) continue
+    const parts = composed(alone)
+    if (parts === undefined) continue
+    const text = parts.join("")
+    if (text === base) continue
     if (targets.has(text)) return alone
-    let start = 0
-    while (start < base.length && start < text.length && base[start] === text[start]) start++
-    let tail = 0
-    while (
-      tail < base.length - start &&
-      tail < text.length - start &&
-      base[base.length - 1 - tail] === text[text.length - 1 - tail]
-    ) {
-      tail++
+    // Segments that don't line up can't be compared stretch by stretch: read alone only.
+    if (parts.length !== segments.length) continue
+    others.set(field, other)
+    for (let i = 0; i < segments.length; i++) {
+      const was = segments[i]!
+      const now = parts[i]!
+      if (was === now) continue
+      let start = 0
+      while (start < was.length && start < now.length && was[start] === now[start]) start++
+      let tail = 0
+      while (
+        tail < was.length - start &&
+        tail < now.length - start &&
+        was[was.length - 1 - tail] === now[now.length - 1 - tail]
+      ) {
+        tail++
+      }
+      edits.push({
+        field,
+        other,
+        start: offsets[i]! + start,
+        end: offsets[i]! + was.length - tail,
+        text: now.slice(start, now.length - tail),
+      })
     }
-    edits.push({
-      field,
-      other,
-      start,
-      end: base.length - tail,
-      text: text.slice(start, -tail || undefined),
-    })
   }
   // Each field alone has been tried.
-  if (edits.length < 2) return undefined
+  if (others.size < 2) return undefined
   edits.sort((a, b) => a.start - b.start || a.end - b.end)
   if (edits.some((edit, i) => i > 0 && edit.start <= edits[i - 1]!.start)) return undefined
   if (edits.some((edit, i) => i > 0 && edit.start < edits[i - 1]!.end)) return undefined
-  // The readings' texts so far, each with the fields it gives as the other kind.
-  let walked = new Map<string, ReadonlyArray<KindEdit>>([["", []]])
+  // Where each field's last stretch is: a decision is followed until then.
+  const last = new Map<string, number>()
+  for (let i = 0; i < edits.length; i++) last.set(edits[i]!.field, i)
+  // The readings' texts so far, each with its decisions: a field as the other kind, or not.
+  type Walked = { readonly text: string; readonly decided: ReadonlyMap<string, boolean> }
+  let walked = new Map<string, Walked>([["", { text: "", decided: new Map() }]])
   let at = 0
-  for (const edit of edits) {
-    const next = new Map<string, ReadonlyArray<KindEdit>>()
+  for (let i = 0; i < edits.length; i++) {
+    const edit = edits[i]!
+    const next = new Map<string, Walked>()
     const between = base.slice(at, edit.start)
-    for (const [text, taken] of walked) {
-      const kept = `${text}${between}${base.slice(edit.start, edit.end)}`
-      if (!next.has(kept) && targets.hasPrefix(kept)) next.set(kept, taken)
-      const flipped = `${text}${between}${edit.text}`
-      if (!next.has(flipped) && targets.hasPrefix(flipped)) next.set(flipped, [...taken, edit])
+    for (const { text, decided } of walked.values()) {
+      const made = decided.get(edit.field)
+      for (const asOther of made === undefined ? [false, true] : [made]) {
+        const sofar = `${text}${between}${asOther ? edit.text : base.slice(edit.start, edit.end)}`
+        if (!targets.hasPrefix(sofar)) continue
+        const now = new Map(decided).set(edit.field, asOther)
+        // Readings with one text so far differ only in decisions still to be followed.
+        const pending = [...now]
+          .filter(([field]) => last.get(field)! > i)
+          .map(([field, flipped]) => `${field}:${flipped ? 1 : 0}`)
+          .join(",")
+        const key = `${sofar}\u0000${pending}`
+        if (!next.has(key)) next.set(key, { text: sofar, decided: now })
+      }
     }
     if (next.size === 0) return undefined
     walked = next
     at = edit.end
   }
   const rest = base.slice(at)
-  for (const [text, taken] of walked) {
-    if (taken.length < 2 || !targets.has(`${text}${rest}`)) continue
-    const flipped = { ...record }
-    for (const edit of taken) flipped[edit.field] = edit.other
-    const reading: KindReading = {
-      record: flipped,
-      asOther: new Set(taken.map((edit) => edit.field)),
-    }
+  for (const { text, decided } of walked.values()) {
+    const flipped = [...decided].filter(([, asOther]) => asOther).map(([field]) => field)
+    if (flipped.length < 2 || !targets.has(`${text}${rest}`)) continue
+    const values = { ...record }
+    for (const field of flipped) values[field] = others.get(field)
+    const reading: KindReading = { record: values, asOther: new Set(flipped) }
     const confirmed = composed(reading)
-    if (confirmed !== undefined && targets.has(confirmed)) return reading
+    if (confirmed !== undefined && targets.has(confirmed.join(""))) return reading
   }
   return undefined
 }

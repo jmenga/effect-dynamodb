@@ -18,7 +18,9 @@ import {
   kindTargets,
   makeCompositeKeyForm,
   otherNumericKind,
+  readBackUnsure,
   readsBackOtherwise,
+  storedFieldAtPath,
   storedNumericForm,
   storedNumericKinds,
   toCompositeKeyRecord,
@@ -263,6 +265,55 @@ describe("CompositeCodec", () => {
       expect(fieldAtPath({ n: Schema.Number }, "n")).toBeDefined()
     })
 
+    it("follows a dotted composite on the stored side through a transformed struct", () => {
+      const Both = Schema.Union([Schema.Number, Schema.BigInt])
+      const nested = (encoded: Schema.Top, decoded: Schema.Top) =>
+        Schema.Struct({ n: encoded }).pipe(
+          Schema.decodeTo(Schema.Struct({ n: decoded }), {
+            decode: SchemaGetter.transform((x: any) => ({ n: Number(x.n) })),
+            encode: SchemaGetter.transform((x: any) => ({ n: x.n })),
+          }),
+        ) as Schema.Top
+      const kinds = (holder: Schema.Top, at: typeof fieldAtPath) => {
+        const field = at({ nested: holder }, "nested.n")
+        return field === undefined ? undefined : [...storedNumericKinds(field)].sort()
+      }
+      // Stored as a number, decoded to either kind: the row holds a number.
+      expect(kinds(nested(Schema.Number, Both), storedFieldAtPath)).toEqual(["number"])
+      expect(kinds(nested(Schema.Number, Both), fieldAtPath)).toEqual(["bigint", "number"])
+      // Stored as either kind, decoded to a number: the row holds either.
+      expect(kinds(nested(Both, Schema.Number), storedFieldAtPath)).toEqual(["bigint", "number"])
+      // Untransformed, both sides agree.
+      const plain = Schema.Struct({ n: Schema.BigInt })
+      expect(kinds(plain, storedFieldAtPath)).toEqual(kinds(plain, fieldAtPath))
+      expect(storedFieldAtPath({ n: Schema.Number }, "n")).toBeDefined()
+    })
+
+    it("judges at write only a key composite that may not read back as itself", () => {
+      for (const field of [
+        Schema.Unknown,
+        Schema.Any,
+        Schema.declare((n: unknown): n is number => typeof n === "number"),
+        Schema.NumberFromString,
+        Schema.BigIntFromString,
+        Schema.DateTimeUtcFromString,
+        Schema.Union([Schema.String, Schema.NumberFromString]),
+        Schema.Struct({ n: Schema.NumberFromString }),
+      ]) {
+        expect(readBackUnsure(field)).toBe(true)
+      }
+      for (const field of [
+        Schema.Number,
+        Schema.BigInt,
+        Schema.String,
+        Schema.Union([Schema.String, Schema.BigInt]),
+        Schema.Literals(["a", "b"]),
+        Schema.Number.pipe(Schema.brand("N")),
+      ]) {
+        expect(readBackUnsure(field)).toBe(false)
+      }
+    })
+
     it("gives a numeric value as the other kind, from the digits stored", () => {
       expect(otherNumericKind(5, undefined)).toBe(5n)
       expect(otherNumericKind(7n, undefined)).toBe(7)
@@ -368,6 +419,31 @@ describe("CompositeCodec", () => {
             ...(kindReadingOf(record, fields(3), () => undefined, compose, others)?.asOther ?? []),
           ].sort(),
         ).toEqual(["f0", "f2"])
+      })
+
+      it("reads a field in several segments as one kind in all of them", () => {
+        // A key whose two halves both hold `a` and `b`, as `pk [a, b], sk [a, b]` does.
+        const record = { a: 3, b: 5 }
+        let compositions = 0
+        const halves = ({ record: given }: { record: Record<string, unknown> }) => {
+          compositions++
+          const text = `${composite(given.a)}#${composite(given.b)}`
+          return [`pk=${text}`, `|sk=${text}`]
+        }
+        const both = { a: 3n, b: 5n }
+        const stored = halves({ record: both }).join("")
+        compositions = 0
+        const reading = kindReadingOf(record, ["a", "b"], () => undefined, halves, stored)
+        expect([...(reading?.asOther ?? [])].sort()).toEqual(["a", "b"])
+        expect(reading?.record).toEqual(both)
+        // The values, each field alone, and the reading found.
+        expect(compositions).toBe(1 + 2 + 1)
+        // A field read as one kind in one half and the other kind in the other is no reading.
+        const split = `pk=${composite(3n)}#${composite(5)}|sk=${composite(3)}#${composite(5)}`
+        expect(kindReadingOf(record, ["a", "b"], () => undefined, halves, split)).toBeUndefined()
+        // The same composer as one text can't tell `a`'s stretches from `b`'s.
+        const whole = (reading: { record: Record<string, unknown> }) => halves(reading).join("")
+        expect(kindReadingOf(record, ["a", "b"], () => undefined, whole, stored)).toBeUndefined()
       })
 
       it("reads each field alone as the other kind when a composer doesn't keep values apart", () => {
