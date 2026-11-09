@@ -11,7 +11,7 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
 import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
-import { validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
+import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import { Data } from "effect"
 
 const MARSHALL_OPTIONS = { removeUndefinedValues: true, convertClassInstanceToMap: true } as const
@@ -243,13 +243,10 @@ export const encodeSparseFields = (
 /**
  * Rebuild sparse-map fields on a raw item after unmarshalling.
  *
- * For each `(fieldName, { prefix })` in `sparseFields`:
- *  - Walk top-level keys, collect any matching `<prefix>#<key>`,
- *    extract the key portion, and accumulate into `out[fieldName][key]`.
- *  - Delete the flattened attributes from the raw item.
- *  - If no matching attributes are found, the result is `{}` — sparse fields
- *    on the domain side are required (a `Schema.Record` always decodes to an
- *    object, never `undefined`).
+ * Each attribute the reader takes as a sparse map's entry (`sparseReader`: `<prefix>#` and a
+ * non-empty key) moves into `raw[field][key]`. Every sparse field gets a Record, `{}` when no
+ * attribute is its entry — sparse fields on the domain side are required (a `Schema.Record`
+ * always decodes to an object, never `undefined`).
  *
  * Mutates `raw` in place.
  */
@@ -258,37 +255,21 @@ export const decodeSparseFields = (
   sparseFields: Record<string, SparseConfig>,
 ): void => {
   if (Object.keys(sparseFields).length === 0) return
-  // Build a list of (fieldName, prefix, prefixWithDelim) once so we don't
-  // re-concatenate per attribute.
-  const entries: Array<[string, string, string]> = []
-  for (const [fieldName, sparse] of Object.entries(sparseFields)) {
-    entries.push([fieldName, sparse.prefix, `${sparse.prefix}#`])
-  }
-  // Sort by prefix length descending so a longer prefix wins over a shorter
-  // prefix that happens to be its own substring (e.g. `metric` vs `metrics`).
-  entries.sort((a, b) => b[2].length - a[2].length)
+  const { fields, entryOf } = sparseReader(sparseFields)
 
   // Initialize empty buckets for each sparse field.
   const buckets: Record<string, Record<string, unknown>> = {}
-  for (const [fieldName] of entries) buckets[fieldName] = {}
+  for (const fieldName of fields) buckets[fieldName] = {}
 
   // One pass over keys.
-  const keys = Object.keys(raw)
-  for (const k of keys) {
-    for (const [fieldName, , prefixWithDelim] of entries) {
-      if (k.startsWith(prefixWithDelim)) {
-        const subKey = k.substring(prefixWithDelim.length)
-        // Skip empty sub-keys (defensive — would mean the stored attr was
-        // literally `<prefix>#`, which validation rejects on write).
-        if (subKey.length === 0) break
-        buckets[fieldName]![subKey] = raw[k]
-        delete raw[k]
-        break
-      }
-    }
+  for (const k of Object.keys(raw)) {
+    const entry = entryOf(k)
+    if (entry === undefined) continue
+    buckets[entry.field]![entry.key] = raw[k]
+    delete raw[k]
   }
 
-  for (const [fieldName] of entries) {
+  for (const fieldName of fields) {
     raw[fieldName] = buckets[fieldName]!
   }
 }

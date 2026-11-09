@@ -1600,12 +1600,7 @@ export const buildEntityDefinition = (config: {
       .map((name) => [name, name] as readonly [string, string]),
   ]
   refuseStoredInTableKey(config.entityType, primaryIndex, storedAttributes)
-  refuseStoredUnderLibraryAttribute(
-    config.entityType,
-    primaryIndex,
-    storedAttributes,
-    Object.entries(sparseFields).map(([field, { prefix }]) => [field, prefix] as const),
-  )
+  refuseStoredUnderLibraryAttribute(config.entityType, primaryIndex, storedAttributes, sparseFields)
 
   const renameToDynamo = (item: globalThis.Record<string, unknown>): void => {
     if (!hasRenames) return

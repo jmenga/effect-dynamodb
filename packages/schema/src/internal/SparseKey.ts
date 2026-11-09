@@ -1,6 +1,10 @@
 /**
- * @internal A sparse map's entry key, as its writer takes it: each entry is stored in an attribute
- * of its own, named `<prefix>#<key>`.
+ * @internal A sparse map's entries, as its writer and its reader take them: each entry is stored
+ * in an attribute of its own, named `<prefix>#<key>`.
+ *
+ * Every write of an entry runs {@link validateSparseKey}. Everything that decides which stored
+ * attributes belong to a sparse map (the row's reader, `clearMap`, `removeEntries`, a key attribute
+ * the map could name) asks {@link sparseReader}.
  */
 
 /**
@@ -10,8 +14,9 @@
  *  - Must be a string (we don't silently coerce).
  *  - Must be non-empty.
  *  - Must not contain `#` — `#` is reserved as the prefix/key delimiter.
- *  - The composed `<prefix>#<key>` must satisfy DynamoDB's 1–255 byte
- *    attribute-name limit.
+ *  - The composed `<prefix>#<key>` must be 1–255 bytes. DynamoDB takes an attribute name of up to
+ *    64 KB, and 255 bytes only for an index key or an attribute an index projects by name; this
+ *    is the library's own limit on an entry's name.
  *
  * Throws on violation. Caller is expected to translate into a tagged
  * `ValidationError` at the entity boundary.
@@ -29,10 +34,6 @@ export const validateSparseKey = (field: string, prefix: string, key: string): v
     )
   }
   const attrName = `${prefix}#${key}`
-  // DynamoDB attribute names: 1–255 bytes. Length check is approximate (UTF-8
-  // bytes vs JS code units), but `key.length + prefix.length + 1` is an upper
-  // bound on byte length when both are ASCII, which is the common case.
-  // For full UTF-8 correctness, encode via TextEncoder.
   const byteLen = new TextEncoder().encode(attrName).length
   if (byteLen < 1 || byteLen > 255) {
     throw new Error(
@@ -41,12 +42,50 @@ export const validateSparseKey = (field: string, prefix: string, key: string): v
   }
 }
 
-/** Whether the sparse map's writer takes `key` as an entry key ({@link validateSparseKey}). */
-export const isSparseKey = (field: string, prefix: string, key: string): boolean => {
+/** Why the sparse map's writer refuses `key` as an entry key ({@link validateSparseKey}), if it does. */
+export const sparseKeyRefusal = (
+  field: string,
+  prefix: string,
+  key: string,
+): string | undefined => {
   try {
     validateSparseKey(field, prefix, key)
-    return true
-  } catch {
-    return false
+    return undefined
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e)
+  }
+}
+
+/** A stored attribute read as a sparse map's entry ({@link sparseReader}). */
+export type SparseEntry = {
+  /** The sparse map's field. */
+  readonly field: string
+  readonly prefix: string
+  /** The attribute after `<prefix>#`: never empty. It may be a key the writer refuses. */
+  readonly key: string
+}
+
+/**
+ * Which stored attributes are sparse map entries, as the reader reads a row: an attribute is an
+ * entry of the field whose `<prefix>#` begins it, the longest such prefix winning, when something
+ * follows that `#`; the rest is the entry's key. `<prefix>#` itself is no entry (the writer never
+ * writes an empty key). `fields` lists the sparse fields in reading order.
+ */
+export const sparseReader = (
+  sparseFields: Readonly<Record<string, { readonly prefix: string }>>,
+): {
+  readonly fields: ReadonlyArray<string>
+  readonly entryOf: (attribute: string) => SparseEntry | undefined
+} => {
+  const order = Object.entries(sparseFields)
+    .map(([field, { prefix }]) => ({ field, prefix, start: `${prefix}#` }))
+    .sort((a, b) => b.start.length - a.start.length)
+  return {
+    fields: order.map(({ field }) => field),
+    entryOf: (attribute) => {
+      const match = order.find(({ start }) => attribute.startsWith(start))
+      if (match === undefined || attribute.length === match.start.length) return undefined
+      return { field: match.field, prefix: match.prefix, key: attribute.slice(match.start.length) }
+    },
   }
 }

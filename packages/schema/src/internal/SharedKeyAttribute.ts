@@ -25,7 +25,7 @@ import {
   isZOrderHalf,
   unshardedView,
 } from "../KeyComposer.js"
-import { isSparseKey } from "./SparseKey.js"
+import { sparseReader } from "./SparseKey.js"
 
 interface KeyHalf {
   readonly owner: string
@@ -227,16 +227,16 @@ export const refuseStoredInTableKey = (
 /**
  * `[EDD-9140]`: `Entity.make` refuses an attribute it would store under one the library writes
  * itself: a model field, under a `field:` rename or by its own name, or a system timestamp or
- * version field, stored in `__edd_e__`, where every row holds its entity type; and a sparse map
- * whose entries, stored as `<prefix>#<key>`, can be named as a table key attribute is, by a key
- * the map's writer takes (`validateSparseKey`: never the empty one). The
- * `ownsRows` bind check (`EDD-9130`) takes a model attribute to be any name but these.
+ * version field, stored in `__edd_e__`, where every row holds its entity type; and a table key
+ * attribute the reader of a row takes as a sparse map's entry (`sparseReader`: `<prefix>#` and a
+ * non-empty key, so never `<prefix>#` itself). The `ownsRows` bind check (`EDD-9130`) takes a
+ * model attribute to be any name but these.
  */
 export const refuseStoredUnderLibraryAttribute = (
   entityType: string,
   primary: IndexDefinition,
   stored: ReadonlyArray<readonly [name: string, attribute: string]>,
-  sparse: ReadonlyArray<readonly [field: string, prefix: string]>,
+  sparseFields: Readonly<Record<string, { readonly prefix: string }>>,
 ): void => {
   for (const [name, attribute] of stored) {
     if (attribute !== "__edd_e__") continue
@@ -247,19 +247,16 @@ export const refuseStoredUnderLibraryAttribute = (
         "{ field: ... } })`, or name it something else.",
     )
   }
-  for (const [field, prefix] of sparse) {
-    // Reachable only by an entry key the map's writer takes: never `data#` itself (an empty key).
-    const key = [primary.pk.field, primary.sk.field].find(
-      (attribute) =>
-        attribute.startsWith(`${prefix}#`) &&
-        isSparseKey(field, prefix, attribute.slice(prefix.length + 1)),
-    )
-    if (key === undefined) continue
+  const { entryOf } = sparseReader(sparseFields)
+  for (const key of [primary.pk.field, primary.sk.field]) {
+    const entry = entryOf(key)
+    if (entry === undefined) continue
     throw new Error(
-      `[EDD-9140] Entity "${entityType}": sparse map "${field}" stores each entry as ` +
-        `"${prefix}#<key>", and the entry "${key.slice(prefix.length + 1)}" would be stored in ` +
-        `"${key}", an attribute of the table's primary key. A put would replace the row's key ` +
-        "with it. Give the map another prefix, or name the key attributes something else.",
+      `[EDD-9140] Entity "${entityType}": sparse map "${entry.field}" stores each entry as ` +
+        `"${entry.prefix}#<key>", and a row's reader takes "${key}", an attribute of the ` +
+        `table's primary key, as its entry "${entry.key}". Every row would carry a phantom ` +
+        "entry, and a put of that entry would replace the row's key. Give the map another " +
+        "prefix, or name the key attributes something else.",
     )
   }
 }

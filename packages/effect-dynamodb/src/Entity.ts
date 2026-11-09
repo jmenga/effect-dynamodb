@@ -69,6 +69,7 @@ import {
   rowCanLack,
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { sparseKeyRefusal, sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -2339,6 +2340,8 @@ const makeImpl = <
     isSchemaClass,
     hasHiddenFields,
   } = data
+  /** Which stored attributes are this entity's sparse map entries, as a row's reader takes them. */
+  const sparseEntries = sparseReader(sparseFields)
   // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
   // record-based `append`, which bypass the update schema (#133).
   const pathValues = makePathValueEncoder(
@@ -2842,6 +2845,17 @@ const makeImpl = <
         if (reason !== undefined) return `${op} of "${name}": ${reason}. Nothing was sent.`
       }
     }
+    // An operation writing a sparse map's entry by its stored name writes it as the map's writer
+    // does: under a key the writer refuses, it's refused, as `put` refuses it.
+    for (const [op, names] of named) {
+      if (op === ".remove()" || op === "pathRemove") continue
+      for (const name of names) {
+        const entry = sparseEntries.entryOf(name)
+        const refused =
+          entry === undefined ? undefined : sparseKeyRefusal(entry.field, entry.prefix, entry.key)
+        if (refused !== undefined) return `${op} of "${name}": ${refused}. Nothing was sent.`
+      }
+    }
     // A sparse map's entries have an operation of their own to clear them. The other
     // path operations address an entry by its stored name, which is how a counter
     // entry is added to, so that name stays open to them.
@@ -2856,14 +2870,12 @@ const makeImpl = <
     ]
     for (const [op, names] of clearedEntries) {
       for (const name of names) {
-        for (const [field, sparse] of Object.entries(sparseFields)) {
-          if (!name.startsWith(`${sparse.prefix}#`)) continue
-          const entry = name.slice(sparse.prefix.length + 1)
-          return (
-            `${op} of "${name}": "${name}" is an entry of the sparse map "${field}". ` +
-            `Use .removeEntries("${field}", ["${entry}"]). Nothing was sent.`
-          )
-        }
+        const entry = sparseEntries.entryOf(name)
+        if (entry === undefined) continue
+        return (
+          `${op} of "${name}": "${name}" is an entry of the sparse map "${entry.field}". ` +
+          `Use .removeEntries("${entry.field}", ["${entry.key}"]). Nothing was sent.`
+        )
       }
     }
     return undefined
@@ -3513,6 +3525,31 @@ const makeImpl = <
   const deserializeSparseFields = (raw: globalThis.Record<string, unknown>): void => {
     if (!hasSparseFields) return
     decodeSparseFields(raw, sparseFields)
+  }
+
+  /**
+   * A payload's sparse map entry under a key the map's writer refuses (`validateSparseKey`, which
+   * `put`'s flattening runs), refused as `<operation>.sparse` before the write reads, embeds or
+   * sends anything. Every write of an entry from a payload runs it.
+   */
+  const refuseSparseEntryKeys = (
+    payload: unknown,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    if (!hasSparseFields || typeof payload !== "object" || payload === null) return Effect.void
+    for (const [field, sparse] of Object.entries(sparseFields)) {
+      const value = (payload as globalThis.Record<string, unknown>)[field]
+      if (value === null || typeof value !== "object") continue
+      for (const key of Object.keys(value)) {
+        const refused = sparseKeyRefusal(field, sparse.prefix, key)
+        if (refused !== undefined) {
+          return Effect.fail(
+            new ValidationError({ entityType, operation: `${operation}.sparse`, cause: refused }),
+          )
+        }
+      }
+    }
+    return Effect.void
   }
 
   // ---------------------------------------------------------------------------
@@ -6716,6 +6753,7 @@ const makeImpl = <
             )
             yield* refuseUncomposed(encodedInput, operation)
           }
+          yield* refuseSparseEntryKeys(encodedInput, operation)
 
           // Hydrate refs: replace ID fields with full entity domain data
           const encoded: globalThis.Record<string, unknown> = hasRefs
@@ -7133,6 +7171,7 @@ const makeImpl = <
       if (unstorable !== undefined) {
         return yield* new ValidationError({ entityType, operation: "update", cause: unstorable })
       }
+      yield* refuseSparseEntryKeys(encodedUpdates, "update")
 
       // Refs are hydrated by reading the entities they name: a payload holding any has its keys
       // checked after those reads.
@@ -8293,14 +8332,8 @@ const makeImpl = <
         if (hasSparseFields && attr in sparseFields) {
           if (typeof val !== "object") continue
           const sparse = sparseFields[attr]!
+          // Every key is one the writer takes: `prepareUpdate` refused any other.
           for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
-            if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
-              return yield* new ValidationError({
-                entityType,
-                operation: "update.sparse",
-                cause: `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
-              })
-            }
             const nameKey = `#u${counter}`
             names[nameKey] = `${sparse.prefix}#${k}`
             if (hasNoStoredForm(v)) {
@@ -8662,11 +8695,17 @@ const makeImpl = <
           }
           const sparse = sparseFields[op.field]!
           for (const k of op.keys) {
-            if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+            // An entry the reader reads under `k`: never `<prefix>#` itself.
+            if (
+              typeof k !== "string" ||
+              sparseEntries.entryOf(`${sparse.prefix}#${k}`)?.field !== op.field
+            ) {
               return yield* new ValidationError({
                 entityType,
                 operation: "update.removeEntries",
-                cause: `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}`,
+                cause:
+                  `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}: no stored ` +
+                  "attribute is read as its entry under it",
               })
             }
             const nameKey = `#sr${removeClauses.length}`
@@ -8721,10 +8760,9 @@ const makeImpl = <
           }
           const clearItemKeys = Object.keys(clearGetResult.Item)
           for (const field of uState.sparseClearFields) {
-            const sparse = sparseFields[field]!
-            const prefixWithDelim = `${sparse.prefix}#`
+            // Exactly the attributes the reader takes as the map's entries.
             for (const attrName of clearItemKeys) {
-              if (attrName.startsWith(prefixWithDelim)) {
+              if (sparseEntries.entryOf(attrName)?.field === field) {
                 const nameKey = `#sc${removeClauses.length}`
                 names[nameKey] = attrName
                 removeClauses.push(nameKey)
@@ -9964,6 +10002,7 @@ const makeImpl = <
         "upsert",
       )) as globalThis.Record<string, unknown>
       yield* refuseUnstorable({ ...encodedInput, ...opts.withVectors }, "upsert")
+      yield* refuseSparseEntryKeys(encodedInput, "upsert")
       yield* composeAllKeys(encodedInput, "upsert")
       yield* refuseUncomposed(encodedInput, "upsert")
       const record = (input ?? {}) as globalThis.Record<string, unknown>
@@ -10141,6 +10180,7 @@ const makeImpl = <
             { ...(encodedInput as globalThis.Record<string, unknown>), ...opts.withVectors },
             "upsert",
           )
+          yield* refuseSparseEntryKeys(encodedInput, "upsert")
           // Clearing a composite clears what a half says, and one write can't tell what's left of
           // it: the update's own rule says, and that needs the stored row.
           if (
@@ -10238,18 +10278,8 @@ const makeImpl = <
             if (hasSparseFields && attr in sparseFields) {
               if (val === null || typeof val !== "object") continue
               const sparse = sparseFields[attr]!
+              // Every key is one the writer takes: refused before anything else otherwise.
               for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
-                try {
-                  if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
-                    throw new Error(`Sparse map "${attr}": invalid key ${JSON.stringify(k)}`)
-                  }
-                } catch (e) {
-                  return yield* new ValidationError({
-                    entityType,
-                    operation: "upsert.sparse",
-                    cause: e instanceof Error ? e.message : String(e),
-                  })
-                }
                 const nameKey = `#u${counter}`
                 names[nameKey] = `${sparse.prefix}#${k}`
                 if (hasNoStoredForm(v)) {
@@ -11010,14 +11040,11 @@ const makeImpl = <
       // treatment as enrichment fields outside `appendInput`. By design,
       // `appendInput` cannot include sparse fields, so this is defensive.)
       if (hasSparseFields) {
-        for (const fieldName of Object.keys(sparseFields)) {
-          delete eventItem[fieldName]
-          // Also strip any flattened bucket attrs that might have leaked in
-          // via a future code change — defensive cleanup.
-          const prefixWithDelim = `${sparseFields[fieldName]!.prefix}#`
-          for (const k of Object.keys(eventItem)) {
-            if (k.startsWith(prefixWithDelim)) delete eventItem[k]
-          }
+        for (const fieldName of Object.keys(sparseFields)) delete eventItem[fieldName]
+        // Also strip any flattened bucket attrs that might have leaked in
+        // via a future code change — defensive cleanup.
+        for (const k of Object.keys(eventItem)) {
+          if (sparseEntries.entryOf(k) !== undefined) delete eventItem[k]
         }
       }
 
