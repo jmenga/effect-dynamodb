@@ -32,7 +32,7 @@ import type {
 } from "./EntityConfig.js"
 import { BETA_DATE_MARKER, DATE_MARKER } from "./PackedCodec.js"
 import {
-  absentReading,
+  absentStored,
   firstTypeParameterAst,
   getSchemaFields,
   holdsAbsentValue,
@@ -40,8 +40,8 @@ import {
   holdsUndefined,
   isDecodingDefault,
   isSchemaLike,
+  lackDecision,
   numericTypeWithStringEncoding,
-  rowCanLack,
   storedList,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
@@ -1282,7 +1282,7 @@ export interface DeepSubstitutionOptions {
   readonly enforceChecks?: boolean | undefined
   /**
    * READ schemas: a struct field whose stored side includes a value with no
-   * stored form reads an absent attribute as that value (`absentReading`). `"only"`
+   * stored form reads an absent attribute as that value (`absentStored`). `"only"`
    * substitutes nothing else, for a schema the entity derivation doesn't own (an
    * event, a snapshot state). Propagated through the recursion.
    */
@@ -1792,11 +1792,11 @@ const absentAsDeclared = (schema: Schema.Top, withUndefined: boolean) => {
 }
 
 /**
- * The field, reading an absent attribute as the value it stands for (`absentReading`), which is what
+ * The field, reading an absent attribute as the value it stands for (`absentStored`), which is what
  * its `declared` schema says, if the field is that schema read some other way.
  */
 const readingAbsent = (field: Schema.Top, declared: Schema.Top = field): Schema.Top => {
-  const reading = absentReading(declared)
+  const reading = absentStored(declared)
   if (reading === undefined) return field
   return field.pipe(
     Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
@@ -1821,7 +1821,7 @@ const holdsAbsentRead = (schema: Schema.Top): boolean => {
   return (
     fields !== undefined &&
     Object.values(fields).some(
-      (field) => absentReading(field) !== undefined || holdsAbsentRead(field),
+      (field) => absentStored(field) !== undefined || holdsAbsentRead(field),
     )
   )
 }
@@ -2419,7 +2419,7 @@ const withChildren = (
  * no value at all. `undefined` needs nothing: it's what an absent one reads as already.
  */
 const readingAbsentParameter = (declared: SchemaAST.AST, read: SchemaAST.AST): SchemaAST.AST => {
-  const stored = absentReading(Schema.make<Schema.Top>(declared))?.stored
+  const stored = absentStored(Schema.make<Schema.Top>(declared))?.stored
   if (stored === undefined) return read
   return Schema.Unknown.pipe(
     Schema.decodeTo(
@@ -2531,7 +2531,7 @@ const readingUnwalked = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
  * snapshot state, an outbox effect. Every read of one goes through it, so anything a stream's read
  * does differently from its declaration belongs here. Differently, as it stands, in three ways:
  *
- * - An absent attribute reads as the value it stands for (`absentReading`).
+ * - An absent attribute reads as the value it stands for (`absentStored`).
  * - A `Schema.DateTimeUtc` or `Schema.DateTimeZoned` comes back as a real date. Nothing substitutes
  *   these on write, so one is stored as the map the marshaller makes of it, and Effect's guard only
  *   looks for the marker and the tag, which that map has. Left to the guard, it reads back as a plain
@@ -2831,7 +2831,7 @@ export const buildDerivedSchemas = (
   const fields = substituteSchemas(modelFields, fieldEncodings, { enforceChecks: true })
   // READ schemas (model / record / item / deleted / history decode) also take
   // the domain-form values earlier releases left on transform fields (#133),
-  // and read an absent attribute as the value it stands for (`absentReading`).
+  // and read an absent attribute as the value it stands for (`absentStored`).
   // Their encode is the strict one, and keys are composed from `inputSchema`,
   // so neither writes nor keys see a difference.
   const readFields = substituteSchemas(modelFields, fieldEncodings, {
@@ -2977,7 +2977,7 @@ export const buildDerivedSchemas = (
       if (immutableFields.has(key)) continue
       if (refFieldSet.has(key)) continue
       if (strippedFromUpdate.has(key)) continue
-      const clearable = optionalOnCollide.has(key) || rowCanLack(field as Schema.Top)
+      const clearable = optionalOnCollide.has(key) || lackDecision(field as Schema.Top) !== "refuse"
       acc[key] = clearable
         ? Schema.optional(field as Schema.Top)
         : Schema.optionalKey(field as Schema.Top)

@@ -1,0 +1,33 @@
+{
+  "comment": "Captured from published effect-dynamodb@1.39.0 against DynamoDB Local (history-absent.mjs for history, get and getWithout; deleted-absent.mjs for deletedGet, deletedList and decodeMarshalledItem). A record of what 1.39.0 did: never regenerate it.",
+  "version": "1.39.0",
+  "generatedBy": "history-absent.mjs against DynamoDB Local",
+  "history": {
+    "outcome": "ValidationError",
+    "operation": "history.decode",
+    "message": "Missing key\n  at [\"f\"]"
+  },
+  "get": {
+    "outcome": "ok"
+  },
+  "getWithout": {
+    "outcome": "ValidationError",
+    "operation": "decode",
+    "message": "Missing key\n  at [\"f\"]"
+  },
+  "deletedGet": {
+    "outcome": "ValidationError",
+    "operation": "deleted.get.decode",
+    "message": "Missing key\n  at [\"f\"]"
+  },
+  "deletedList": {
+    "outcome": "ValidationError",
+    "operation": "deleted.list.decode",
+    "message": "Missing key\n  at [\"f\"]"
+  },
+  "decodeMarshalledItem": {
+    "outcome": "ValidationError",
+    "operation": "decodeMarshalledItem",
+    "message": "Missing key\n  at [\"f\"]"
+  }
+}

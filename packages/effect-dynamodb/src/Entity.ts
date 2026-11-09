@@ -64,9 +64,10 @@ import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypt
 import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacked.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import {
+  type AbsentReading,
   absentReading,
+  absentStored,
   pathIsRequired,
-  rowCanLack,
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
@@ -2743,32 +2744,55 @@ const makeImpl = <
         )
   }
 
-  const canLack = new Map<string, boolean>()
   /**
-   * Whether a stored row can be without a model field and still be read (a name the
-   * model doesn't know is not the model's to judge). A ref is refused before this is
-   * asked: its read schema needs the target, however the model field is declared.
+   * One write's answers on the model fields it leaves out of a row.
+   *
+   * Where nothing the model runs takes part, the field's schema answers. Where the model's
+   * code does (a decoding default, a step that reads an absent key, a check or a
+   * transformation on the value an absent attribute stands for), the absence is read as the
+   * next read would read it, at most once per field for the write, and never before a write:
+   * defining an entity runs none of it.
    */
-  const fieldCanLack = (field: string): boolean => {
-    if (!isModelField(field)) return true
-    const known = canLack.get(field)
-    if (known !== undefined) return known
-    const judged = rowCanLack(modelFieldSchemas[field]!)
-    canLack.set(field, judged)
-    return judged
+  type Lacks = {
+    /**
+     * Whether a field's key is one a row may leave out. A `null` clears such a field. On a
+     * field a row lacks only because absent is one of its values, a `NullOr` of a set, `null`
+     * is a stored value of its own. A name the model doesn't know is not the model's to judge.
+     */
+    readonly omits: (field: string) => boolean
+    /** What an absent attribute reads back as on this field, if that's one of its values. */
+    readonly absentReading: (field: string) => AbsentReading | undefined
+    /**
+     * Whether a stored row can be without a model field and still be read. A ref is refused
+     * before this is asked: its read schema needs the target, however the field is declared.
+     */
+    readonly canLack: (field: string) => boolean
   }
 
-  /**
-   * Whether a field's key is one a row may leave out. A `null` clears such a field. On a
-   * field a row lacks only because absent is one of its values, a `NullOr` of a set, `null`
-   * is a stored value of its own.
-   */
-  const fieldOmits = (field: string): boolean =>
-    !isModelField(field) || rowOmits(modelFieldSchemas[field]!)
-
-  /** What an absent attribute reads back as on this field, if that's one of its values. */
-  const fieldAbsentReading = (field: string) =>
-    isModelField(field) ? absentReading(modelFieldSchemas[field]!) : undefined
+  const writeLacks = (): Lacks => {
+    const omitted = new Map<string, boolean>()
+    const absent = new Map<string, AbsentReading | undefined>()
+    const omits = (field: string): boolean => {
+      if (!isModelField(field)) return true
+      const known = omitted.get(field)
+      if (known !== undefined) return known
+      const judged = rowOmits(modelFieldSchemas[field]!)
+      omitted.set(field, judged)
+      return judged
+    }
+    const reading = (field: string): AbsentReading | undefined => {
+      if (!isModelField(field)) return undefined
+      if (absent.has(field)) return absent.get(field)
+      const judged = absentReading(modelFieldSchemas[field]!)
+      absent.set(field, judged)
+      return judged
+    }
+    return {
+      omits,
+      absentReading: reading,
+      canLack: (field) => omits(field) || reading(field) !== undefined,
+    }
+  }
 
   /**
    * Why an update can't address `name` as a top-level attribute, or `undefined` when it
@@ -2876,7 +2900,7 @@ const makeImpl = <
   }
 
   /** Clearing a field no row can be without: the row would write, then not be readable. */
-  const clearRefusal = (op: string, field: string): string | undefined => {
+  const clearRefusal = (op: string, field: string, lacks: Lacks): string | undefined => {
     if (isPrimaryComposite(field) || isTableKeyAttribute(field)) {
       return primaryCompositeRefusal(op, field)
     }
@@ -2893,7 +2917,7 @@ const makeImpl = <
         `read. Reassign it with .set({ ${ref.idFieldName} }). Nothing was sent.`
       )
     }
-    if (fieldCanLack(field)) return undefined
+    if (lacks.canLack(field)) return undefined
     return (
       `${op} of "${field}": the model requires "${field}", so a row without it could not be ` +
       `read. Make it optional in the model, or write a new value with .set({ ${field} }). ` +
@@ -2933,7 +2957,7 @@ const makeImpl = <
    * and no entries merge nothing), and a name the model doesn't know, which the
    * payload's schema drops as it drops any other unknown name.
    */
-  const normalizeClears = (uState: UpdateState): UpdateState | string => {
+  const normalizeClears = (uState: UpdateState, lacks: Lacks): UpdateState | string => {
     if (typeof uState.updates !== "object" || uState.updates === null) return uState
     const record = uState.updates as globalThis.Record<string, unknown>
     const payload = { ...record }
@@ -2945,7 +2969,7 @@ const makeImpl = <
       cleared = true
       delete payload[field]
       if (field === systemFields.updatedAt || Object.hasOwn(sparseFields, field)) continue
-      const refused = clearRefusal(".set()", field)
+      const refused = clearRefusal(".set()", field, lacks)
       if (refused !== undefined) return refused
       if (!remove.includes(field)) remove.push(field)
     }
@@ -3338,13 +3362,13 @@ const makeImpl = <
    * whose schema requires it. Primary-key composites, and paths below a field that
    * feeds a key or a sentinel, get their refusal from `normalizeDerivedPathOps`.
    */
-  const refusedPathRemove = (uState: UpdateState): string | undefined => {
+  const refusedPathRemove = (uState: UpdateState, lacks: Lacks): string | undefined => {
     for (const segments of uState.pathRemoves ?? []) {
       const head = segments[0]
       if (typeof head !== "string" || !isModelField(head)) continue
       if (segments.length === 1) {
         if (isPrimaryComposite(head)) continue
-        const refused = clearRefusal("pathRemove", head)
+        const refused = clearRefusal("pathRemove", head, lacks)
         if (refused !== undefined) return refused
         continue
       }
@@ -3367,9 +3391,12 @@ const makeImpl = <
    * `.set()` of one is, before a defaulted composite could turn it into one. A required
    * field, for the same reason.
    */
-  const refusedRecordRemove = (fields: ReadonlyArray<string> | undefined): string | undefined => {
+  const refusedRecordRemove = (
+    fields: ReadonlyArray<string> | undefined,
+    lacks: Lacks,
+  ): string | undefined => {
     for (const field of fields ?? []) {
-      const refused = clearRefusal(".remove()", field)
+      const refused = clearRefusal(".remove()", field, lacks)
       if (refused !== undefined) return refused
     }
     return undefined
@@ -3465,13 +3492,14 @@ const makeImpl = <
    */
   const completeUpsertPayload = (
     updates: unknown,
-    removed: ReadonlyArray<string> = [],
+    removed: ReadonlyArray<string>,
+    lacks: Lacks,
   ): boolean => {
     if (typeof updates !== "object" || updates === null) return false
     const record = updates as globalThis.Record<string, unknown>
     const present = (field: string) =>
       (record[field] !== undefined && record[field] !== null) ||
-      (removed.includes(field) && fieldAbsentReading(field) !== undefined)
+      (removed.includes(field) && lacks.absentReading(field) !== undefined)
     const primary = allIndexes.primary
     if (primary && ![...primary.pk.composite, ...primary.sk.composite].every(present)) return false
     for (const [field, fieldSchema] of Object.entries(
@@ -4228,8 +4256,8 @@ const makeImpl = <
    * A value with no stored form is an absent attribute, so an upsert's replaces what the row
    * holds. A field left unset (an optional `undefined`) doesn't, nor does an immutable one.
    */
-  const upsertClears = (field: string, value: unknown): boolean =>
-    (isEmptySet(value) || (value === undefined && fieldAbsentReading(field) !== undefined)) &&
+  const upsertClears = (field: string, value: unknown, lacks: Lacks): boolean =>
+    (isEmptySet(value) || (value === undefined && lacks.absentReading(field) !== undefined)) &&
     !immutableFields.has(field)
 
   /**
@@ -4358,6 +4386,48 @@ const makeImpl = <
     return corruption === undefined ? Effect.void : Effect.fail(corruption)
   }
 
+  /**
+   * The model field a row is without whose reading of the absence throws, if there is one.
+   *
+   * A field whose absent attribute stands for a value is read as that value, through the
+   * field's own steps (`absentStored`). A step that throws on it kills the read, where 1.39.0,
+   * which read no such value, failed on the missing key. Looked for only once a row's decode
+   * has died, so a read that doesn't die runs nothing more.
+   */
+  const fieldDyingOnAbsence = (raw: globalThis.Record<string, unknown>): string | undefined => {
+    for (const [field, fieldSchema] of Object.entries(modelFieldSchemas)) {
+      if (Object.hasOwn(raw, field)) continue
+      const absent = absentStored(fieldSchema)
+      if (absent === undefined) continue
+      try {
+        const read = Schema.decodeUnknownExit(fieldSchema as unknown as Schema.Codec<unknown>)(
+          absent.stored,
+        )
+        if (Exit.isFailure(read) && !Exit.hasFails(read)) return field
+      } catch {
+        return field
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * A row's decode that died reading a field the row is without fails as 1.39.0's did, on the
+   * missing key ({@link fieldDyingOnAbsence}). Any other defect is the defect it was.
+   */
+  const missingKeyOnDefect =
+    (raw: globalThis.Record<string, unknown>, operation: string) =>
+    <A, R>(decode: Effect.Effect<A, ValidationError, R>): Effect.Effect<A, ValidationError, R> =>
+      Effect.catchDefect(decode, (defect) => {
+        const field = fieldDyingOnAbsence(raw)
+        if (field === undefined) return Effect.die(defect)
+        const missing = Schema.Struct({ [field]: Schema.Never }) as unknown as Schema.Codec<unknown>
+        return Schema.decodeUnknownEffect(missing)({}).pipe(
+          Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
+          Effect.flatMap(() => Effect.die(defect)),
+        )
+      })
+
   const decodeRecord = (
     raw: globalThis.Record<string, unknown>,
   ): Effect.Effect<any, ValidationError> => {
@@ -4376,6 +4446,7 @@ const makeImpl = <
               cause,
             }),
         ),
+        missingKeyOnDefect(raw, "decode"),
       )
     })
   }
@@ -4420,6 +4491,7 @@ const makeImpl = <
               cause,
             }),
         ),
+        missingKeyOnDefect(raw, "decode"),
       )
     })
   }
@@ -4452,6 +4524,7 @@ const makeImpl = <
         Effect.mapError(
           (cause) => new ValidationError({ entityType, operation: "decodeMarshalledItem", cause }),
         ),
+        missingKeyOnDefect(raw, "decodeMarshalledItem"),
       )
       return attachPrototype(decoded)
     })
@@ -7077,7 +7150,8 @@ const makeImpl = <
       }
       // `.set({ field: undefined })` becomes `.remove([field])`, once, here. So does
       // anything else the update holds that DynamoDB can't store.
-      const clearedFields = normalizeClears(requested)
+      const lacks = writeLacks()
+      const clearedFields = normalizeClears(requested, lacks)
       const cleared =
         typeof clearedFields === "string" ? clearedFields : normalizeNoStoredForm(clearedFields)
       if (typeof cleared === "string") {
@@ -7087,7 +7161,7 @@ const makeImpl = <
           cause: cleared,
         })
       }
-      const refusedPath = refusedPathRemove(cleared)
+      const refusedPath = refusedPathRemove(cleared, lacks)
       if (refusedPath !== undefined) {
         return yield* new ValidationError({
           entityType,
@@ -7107,7 +7181,7 @@ const makeImpl = <
         })
       }
       const refusedRemove =
-        refusedRecordRemove(normalized.remove) ?? refusedRecordOperands(normalized)
+        refusedRecordRemove(normalized.remove, lacks) ?? refusedRecordOperands(normalized)
       if (refusedRemove !== undefined) {
         return yield* new ValidationError({
           entityType,
@@ -7135,12 +7209,12 @@ const makeImpl = <
           cause: immutables,
         })
       }
-      const upsertable = completeUpsertPayload(uState.updates, uState.remove)
+      const upsertable = completeUpsertPayload(uState.updates, uState.remove ?? [], lacks)
       // What `put` takes to create the item on a missing row: a field cleared here whose
       // absent attribute is one of its values is that value, and `put` requires its key.
       const createInput = (): unknown => {
         const absent = (uState.remove ?? []).flatMap((field) => {
-          const reading = fieldAbsentReading(field)
+          const reading = lacks.absentReading(field)
           return reading === undefined ? [] : [[field, reading.value] as const]
         })
         return absent.length === 0
@@ -7245,6 +7319,7 @@ const makeImpl = <
         immutables,
         upsertable,
         createInput,
+        lacks,
         requestedRv,
         needsBothImages,
         evExpected,
@@ -7460,6 +7535,7 @@ const makeImpl = <
         immutables,
         upsertable,
         createInput,
+        lacks,
         requestedRv,
         needsBothImages,
         evExpected,
@@ -7560,7 +7636,7 @@ const makeImpl = <
         for (const [attr, val] of Object.entries(
           hydratedUpdates as globalThis.Record<string, unknown>,
         )) {
-          if (val === undefined || (val === null && fieldOmits(attr))) {
+          if (val === undefined || (val === null && lacks.omits(attr))) {
             delete newItem[attr]
             continue
           }
@@ -8484,7 +8560,7 @@ const makeImpl = <
       for (const [attr, val] of Object.entries(encodedUpdatesMap)) {
         if (updateSystemColliders.has(attr)) continue
 
-        if (val === undefined || (val === null && fieldOmits(attr))) {
+        if (val === undefined || (val === null && lacks.omits(attr))) {
           // Sparse fields: clearing a sparse field with null is a no-op
           // here — the `.removeEntries` API is the explicit per-key
           // remove. Skip to avoid REMOVE'ing the whole prefix erroneously.
@@ -10167,6 +10243,7 @@ const makeImpl = <
       const { name: tableName } = yield* tableTag
       const now = yield* DateTime.now
       yield* checkWithVectorNames(opts.withVectors, "upsert")
+      const lacks = writeLacks()
       // Required fields are required whether or not the item exists.
       const encodedInput = (yield* encodeForWrite(
         schemas.inputSchema as Schema.Codec<any>,
@@ -10201,7 +10278,7 @@ const makeImpl = <
                 value === undefined &&
                 (keyedDefaults.has(field) ||
                   ((encodedInput as globalThis.Record<string, unknown>)[field] === undefined &&
-                    fieldAbsentReading(field) === undefined))
+                    lacks.absentReading(field) === undefined))
               ),
           ),
         ),
@@ -10322,6 +10399,7 @@ const makeImpl = <
     new EntityPutImpl(
       (mode: DecodeMode, opts: EntityPutOpts) =>
         Effect.gen(function* () {
+          const lacks = writeLacks()
           // A primary key over `createdAt` the input doesn't supply names no item that exists yet.
           if (
             systemFields.createdAt !== null &&
@@ -10366,7 +10444,11 @@ const makeImpl = <
           if (
             [...indexCompositeFields()].some(
               (field) =>
-                upsertClears(field, (encodedInput as globalThis.Record<string, unknown>)[field]) &&
+                upsertClears(
+                  field,
+                  (encodedInput as globalThis.Record<string, unknown>)[field],
+                  lacks,
+                ) &&
                 field !== systemFields.createdAt &&
                 field !== systemFields.updatedAt,
             )
@@ -10443,7 +10525,7 @@ const makeImpl = <
           for (const [attr, val] of Object.entries(item)) {
             if (keyAttributeFields.has(resolveDbName(attr))) continue
             if (systemColliders.has(attr)) continue
-            if (upsertClears(attr, val)) {
+            if (upsertClears(attr, val, lacks)) {
               const nameKey = `#u${counter}`
               names[nameKey] = resolveDbName(attr)
               upsertRemoveClauses.push(nameKey)
@@ -10787,6 +10869,7 @@ const makeImpl = <
     removeAttrs?: ReadonlyArray<string>,
   ) =>
     Effect.gen(function* () {
+      const lacks = writeLacks()
       if (!timeSeriesConfig) {
         return yield* new ValidationError({
           entityType,
@@ -10884,7 +10967,7 @@ const makeImpl = <
               cause: `Attribute "${attr}" is a ref field — refs are create-time denormalisations and cannot be cleared via .append(). Use .update() to reassign.`,
             })
           }
-          const refused = clearRefusal(".remove()", attr)
+          const refused = clearRefusal(".remove()", attr, lacks)
           if (refused !== undefined) {
             return yield* new ValidationError({
               entityType,
@@ -10963,10 +11046,10 @@ const makeImpl = <
       const absentValues = Object.keys(encoded).filter(
         (attr) =>
           isEmptySet(encoded[attr]) ||
-          (encoded[attr] === undefined && fieldAbsentReading(attr) !== undefined),
+          (encoded[attr] === undefined && lacks.absentReading(attr) !== undefined),
       )
       for (const attr of absentValues) {
-        const refused = clearRefusal(".append()", attr)
+        const refused = clearRefusal(".append()", attr, lacks)
         if (refused !== undefined) {
           return yield* new ValidationError({
             entityType,
@@ -11623,6 +11706,7 @@ const makeImpl = <
                 cause,
               }),
           ),
+          missingKeyOnDefect(raw, "history.decode"),
         )
       })
     }
@@ -11944,6 +12028,7 @@ const makeImpl = <
                   cause,
                 }),
             ),
+            missingKeyOnDefect(raw, "deleted.get.decode"),
           )
         }),
       self,
@@ -11979,6 +12064,7 @@ const makeImpl = <
                 cause,
               }),
           ),
+          missingKeyOnDefect(raw, "deleted.list.decode"),
         )
       })
     }

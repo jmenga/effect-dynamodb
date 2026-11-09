@@ -1057,6 +1057,19 @@ export const holdsUndefined = (ast: SchemaAST.AST): boolean =>
   })
 
 /**
+ * The value a field's absent attribute stands for, from its schema alone: DynamoDB can't
+ * store `undefined` or an empty set, so on a field whose stored side includes one the value
+ * is an absent attribute. `undefined` when the rule doesn't apply: the field's key is
+ * optional, so absent reads as absent (or as its decoding default), or its stored side holds
+ * no such value. Nothing the schema runs is run, so a `.check()` that refuses the value isn't
+ * seen here: {@link absentReading} asks it, at a write.
+ */
+export const absentStored = (field: Schema.Top): { readonly stored: unknown } | undefined => {
+  const encoded = SchemaAST.toEncoded(field.ast)
+  return SchemaAST.isOptional(encoded) ? undefined : valueWithNoStoredForm(encoded)
+}
+
+/**
  * The one rule for values with no stored form. DynamoDB can't store `undefined`
  * or an empty set, so on a field whose stored side includes one the value is an
  * absent attribute, and an absent attribute reads back as that value. Returns
@@ -1065,13 +1078,13 @@ export const holdsUndefined = (ast: SchemaAST.AST): boolean =>
  * its schema refuses the value, as a `.check()` for a non-empty set does, so no
  * row may be without it.
  *
- * The check decodes for real. A transformation that can't run synchronously is
- * taken at its word, reading back as the stored value.
+ * The check decodes for real, running the field's checks and transformations on the value,
+ * so it's asked by the write that leaves the attribute out and never while an entity is
+ * defined ({@link absentStored} answers there). A transformation that can't run
+ * synchronously is taken at its word, reading back as the stored value.
  */
 export const absentReading = (field: Schema.Top): AbsentReading | undefined => {
-  const encoded = SchemaAST.toEncoded(field.ast)
-  if (SchemaAST.isOptional(encoded)) return undefined
-  const found = valueWithNoStoredForm(encoded)
+  const found = absentStored(field)
   if (found === undefined) return undefined
   const decoded = Schema.decodeUnknownExit(field as unknown as Schema.Codec<unknown, unknown>)(
     found.stored,
@@ -1081,23 +1094,123 @@ export const absentReading = (field: Schema.Top): AbsentReading | undefined => {
 }
 
 /**
- * Whether the field's key is one a stored row may leave out: optional fields
- * (`Schema.optional`, `Schema.optionalKey`, the `OptionFromOptional` family) and
- * a decoding default, whose value a read fills in.
- *
- * The stored side's optionality rules most fields out without running anything;
- * what is left is decoded for real, because a transformation may still refuse
- * the missing key. A default that cannot run synchronously is taken at its word.
+ * Whether a step may make something of a key the stored row is without. A getter that only
+ * maps the value it's given (`passthrough`, `transform`, `transformEffect`) leaves an absent
+ * key absent. Anything else may act on the absence: a getter handed the `Option`
+ * (`SchemaGetter.withDefault` beneath every `Schema.withDecodingDefault*`, a step onto an
+ * `Option` as `Schema.OptionFromOptional`'s is, `SchemaGetter.required`), a middleware
+ * (`Schema.middlewareDecoding`, `Schema.catchDecoding`), which is handed the read of the
+ * missing key and can fill it or fail it, and any kind of step this doesn't know.
  */
-export const rowOmits = (field: Schema.Top): boolean => {
-  if (!SchemaAST.isOptional(SchemaAST.toEncoded(field.ast))) return false
+const actsOnAbsentKey = (link: SchemaAST.Link): boolean => {
+  const transformation = link.transformation as {
+    readonly _tag: string
+    readonly decode?: { readonly _tag?: string }
+  }
+  if (transformation._tag !== "Transformation") return true
+  const step = transformation.decode?._tag
+  return !(step === "Passthrough" || step === "Transform" || step === "TransformEffect")
+}
+
+/**
+ * Whether the model's code may take part in reading a missing key through a node: a step
+ * that may act on the absence ({@link actsOnAbsentKey}), anywhere on the way from the most
+ * stored side up. A suspension is taken to: what it suspends isn't looked into here, so
+ * only reading the absence says.
+ */
+const mayReadMissingKey = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isSuspend(ast) ||
+  (ast.encoding ?? []).some((link) => actsOnAbsentKey(link) || mayReadMissingKey(link.to))
+
+/**
+ * Whether reading through a node runs nothing but Effect's own parsing: no check, no
+ * transformation and no declaration of the model's own, anywhere in it. A check on the stored
+ * side of a flipped schema (`encodingChecks`) runs on a read too.
+ */
+const runsNoCode = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (seen.has(ast)) return true
+  seen.add(ast)
+  if (
+    ast.checks !== undefined ||
+    ast.encoding !== undefined ||
+    (ast as { readonly encodingChecks?: unknown }).encodingChecks !== undefined
+  ) {
+    return false
+  }
+  const all = (asts: ReadonlyArray<SchemaAST.AST>) => asts.every((part) => runsNoCode(part, seen))
+  switch (ast._tag) {
+    case "Declaration":
+      return representationIdOf(ast) !== undefined && all(ast.typeParameters)
+    case "Suspend":
+      return runsNoCode(ast.thunk(), seen)
+    case "Union":
+      return all(ast.types)
+    case "Arrays":
+      return all([...ast.elements, ...ast.rest])
+    case "Objects":
+      return all([
+        ...ast.propertySignatures.map((property) => property.type),
+        ...ast.indexSignatures.flatMap((signature) => [signature.parameter, signature.type]),
+      ])
+    default:
+      return true
+  }
+}
+
+/**
+ * How it's decided whether a stored row can be without a field and still be read.
+ *
+ * - `"allow"` and `"refuse"`: the schema says, and nothing it runs takes part. A required
+ *   field can't be lacked. A field whose read side is an optional key can (`Schema.optional`,
+ *   `Schema.optionalKey`, however its stored side is declared: a missing key reaches the read
+ *   side as missing through every step that only maps a value), and so can a field whose
+ *   absent attribute is one of its values (a `Schema.UndefinedOr`, a set) when reading it
+ *   runs no check or transformation.
+ * - `"decode"`: the model's own code takes part in reading the absence, so only reading it
+ *   says. A decoding default, a step of one's own handed the absent key, a middleware or a
+ *   suspension ({@link mayReadMissingKey}), any of which may fill the key, fail, or be
+ *   refused by the field's check; or a check or transformation on the value an absent
+ *   attribute stands for. The write that leaves the attribute out reads the absence once,
+ *   as the next read would ({@link rowOmits}, {@link absentReading}).
+ *
+ * Answered from the schema alone, so defining an entity runs none of a model's code.
+ */
+export type LackDecision = "allow" | "refuse" | "decode"
+
+export const lackDecision = (field: Schema.Top): LackDecision => {
+  if (mayReadMissingKey(field.ast)) return "decode"
+  if (SchemaAST.isOptional(field.ast)) return "allow"
+  if (absentStored(field) === undefined) return "refuse"
+  return runsNoCode(field.ast) ? "allow" : "decode"
+}
+
+/**
+ * Whether a row without this field's key reads, by reading one: a decoding default, an
+ * absent-key step or a middleware runs, and the field's checks see what that makes. Asked
+ * by a write that leaves the key out of a row, once, and never while an entity is defined.
+ * A default that can't run synchronously is taken at its word.
+ */
+const readsMissingKey = (field: Schema.Top): boolean => {
   const probe = Schema.Struct({ field }) as unknown as Schema.Codec<unknown, unknown>
   return !Exit.hasFails(Schema.decodeUnknownExit(probe)({}))
 }
 
 /**
+ * Whether the field's key is one a stored row may leave out: optional fields
+ * (`Schema.optional`, `Schema.optionalKey`, the `OptionFromOptional` family) and
+ * a decoding default, whose value a read fills in.
+ *
+ * The schema answers where nothing it runs takes part: the missing key reaches the read
+ * side as missing, so the read side's key says. Where the model's code may take part in
+ * reading the missing key ({@link mayReadMissingKey}), the key is read for real, so this
+ * belongs to a write and is never asked while an entity is defined.
+ */
+export const rowOmits = (field: Schema.Top): boolean =>
+  mayReadMissingKey(field.ast) ? readsMissingKey(field) : SchemaAST.isOptional(field.ast)
+
+/**
  * Whether what's stored for this can leave out a value that reads back all the same: a struct's
- * field ({@link absentReading}), or the set an `Option` holds as its value. An `undefined` there
+ * field ({@link absentStored}), or the set an `Option` holds as its value. An `undefined` there
  * reads as what it is without anything being done about it.
  */
 export const holdsAbsentValue = (
@@ -1107,7 +1220,7 @@ export const holdsAbsentValue = (
   const found = forced(ast, seen)
   if (found === undefined) return false
   const { node } = found
-  const reading = (part: SchemaAST.AST) => absentReading(Schema.make<Schema.Top>(part))
+  const reading = (part: SchemaAST.AST) => absentStored(Schema.make<Schema.Top>(part))
   const within = (asts: ReadonlyArray<SchemaAST.AST>) =>
     asts.some((part) => holdsAbsentValue(part, found.seen))
   switch (node._tag) {
@@ -1137,6 +1250,9 @@ export const holdsAbsentValue = (
  * be left out ({@link rowOmits}), or an absent attribute is one of its values
  * ({@link absentReading}). A required field cannot, nor can a `NullOr`, whose key
  * is required even though its value may be empty.
+ *
+ * Reads the absence where the model's code takes part in it ({@link lackDecision}), so
+ * this belongs to a write and is never asked while an entity is defined.
  */
 export const rowCanLack = (field: Schema.Top): boolean =>
   rowOmits(field) || absentReading(field) !== undefined
