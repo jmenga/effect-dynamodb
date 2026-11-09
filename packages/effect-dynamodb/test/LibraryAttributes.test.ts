@@ -54,6 +54,21 @@ const POSITIONS: ReadonlyArray<{
     names: '"__edd_e__" would be stored in "__edd_e__"',
   },
   {
+    // The write set the row's type, then the rename moved it into "kind": the row had no type,
+    // and the caller's value was gone.
+    name: "a model field named `__edd_e__` under a rename",
+    refused: {
+      model: DynamoModel.configure(
+        Schema.Struct({ id: Schema.String, __edd_e__: Schema.optional(Schema.String) }),
+        { __edd_e__: { field: "kind" } },
+      ),
+      primaryKey,
+    },
+    accepted: { model: DynamoModel.configure(Doc, { tag: { field: "kind" } }), primaryKey },
+    names:
+      '"__edd_e__" is named "__edd_e__", the attribute that holds each row\'s entity type, which every read filters on, and is stored in "kind"',
+  },
+  {
     name: "a model field renamed `__edd_e__`",
     refused: { model: DynamoModel.configure(Doc, { tag: { field: "__edd_e__" } }), primaryKey },
     accepted: { model: DynamoModel.configure(Doc, { tag: { field: "kind" } }), primaryKey },
@@ -354,6 +369,152 @@ describe("EDD-9140: a key attribute the reader takes as a sparse map's entry", (
           ) as never
         },
       )
+    }
+  }
+})
+
+describe("EDD-9140: a secondary index's key attribute the reader takes as a sparse map's entry", () => {
+  const model = DynamoModel.configure(
+    Schema.Struct({
+      id: Schema.String,
+      region: Schema.String,
+      beds: Schema.Number,
+      data: Schema.Record(Schema.String, Schema.Number),
+    }),
+    { data: { storedAs: DynamoModel.SparseMap() } },
+  )
+  const INDEXES: ReadonlyArray<
+    readonly [what: string, index: (field: string) => Record<string, unknown>, holds: string]
+  > = [
+    [
+      "a secondary index's partition key",
+      (field) => ({
+        name: "gsi1",
+        pk: { field, composite: ["region"] },
+        sk: { field: "gsi1sk", composite: ["id"] },
+      }),
+      `index "byPlace"'s partition key`,
+    ],
+    [
+      "a secondary index's sort key",
+      (field) => ({
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["region"] },
+        sk: { field, composite: ["id"] },
+      }),
+      `index "byPlace"'s sort key`,
+    ],
+    [
+      "a local index's sort key",
+      (field) => ({
+        name: "lsi1",
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field, composite: ["region"] },
+      }),
+      `index "byPlace"'s sort key`,
+    ],
+    [
+      "a Z-order sort key",
+      (field) => ({
+        name: "gsi2",
+        pk: { field: "gsi2pk", composite: ["region"] },
+        sk: { field, zorder: [{ field: "beds", min: 0, max: 15 }] },
+      }),
+      `index "byPlace"'s sort key`,
+    ],
+  ]
+  for (const [what, index, holds] of INDEXES) {
+    for (const [make, build] of MAKES) {
+      it(`${make}: "data#x" as ${what} is refused; "data#" loads`, () => {
+        const load = (field: string) => () =>
+          (build as (config: unknown) => unknown)({
+            entityType: "Doc",
+            model,
+            primaryKey,
+            indexes: { byPlace: index(field) },
+          })
+        expect(load("data#x")).toThrow(
+          `[EDD-9140] Entity "Doc": sparse map "data" stores each entry as "data#<key>", and a row's reader takes "data#x", the attribute that holds ${holds}, as its entry "x"`,
+        )
+        expect(load("data#")).not.toThrow()
+      })
+    }
+  }
+
+  it.effect(
+    'at run time, "data#" as a secondary index\'s partition key keeps the key, and clearMap leaves it',
+    () => {
+      const Docs = Entity.make({
+        entityType: "Doc",
+        model,
+        primaryKey,
+        indexes: {
+          byPlace: {
+            name: "gsi1",
+            pk: { field: "data#", composite: ["region"] },
+            sk: { field: "gsi1sk", composite: ["id"] },
+          },
+        },
+      } as never) as any
+      const MainTable = Table.make({ schema, entities: { Docs } }) as any
+      const table = makeRecordingTable()
+      return Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({ entities: { Docs }, tables: { MainTable } })
+        yield* db.entities.Docs.put({
+          id: "a",
+          region: "north",
+          beds: 1,
+          data: { ok: 1 },
+        }).asEffect()
+        expect((yield* db.entities.Docs.get({ id: "a" })).data).toEqual({ ok: 1 })
+        table.take()
+        yield* db.entities.Docs.update({ id: "a" }).clearMap("data").asEffect()
+        const update = table.requests.find((request) => request.command === "UpdateItem")!
+        const removed = /REMOVE (.*)$/
+          .exec(update.input.UpdateExpression)![1]!
+          .split(", ")
+          .map((name: string) => update.input.ExpressionAttributeNames[name])
+        expect(removed).toEqual(["data#ok"])
+        const [row] = [...table.items.values()] as ReadonlyArray<Record<string, any>>
+        expect(row!["data#"]).toEqual({ S: "$lib#v1#doc#region_north" })
+      }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "lib" })))) as never
+    },
+  )
+})
+
+describe("EDD-9140: a model field stored under a vector index's attribute", () => {
+  const vectorIndexes = {
+    byText: { name: "vec1", dimensions: 2, source: { fields: ["text"] } },
+  }
+  const withField = (field: string, renamed?: string) => ({
+    entityType: "Doc",
+    model: DynamoModel.configure(
+      Schema.Struct({
+        id: Schema.String,
+        text: Schema.String,
+        [field]: Schema.optional(Schema.String),
+      }),
+      renamed === undefined ? {} : { [field]: { field: renamed } },
+    ),
+    primaryKey,
+    vectorIndexes,
+  })
+  for (const [make, build] of MAKES) {
+    for (const attribute of ["__edd_v_vec1__", "__edd_vp_vec1__"]) {
+      it(`${make}: a field named or renamed "${attribute}" is refused; another name loads`, () => {
+        const load = (config: unknown) => () => (build as (config: unknown) => unknown)(config)
+        expect(load(withField(attribute))).toThrow(
+          `[EDD-9140] Entity "Doc": "${attribute}" would be stored in "${attribute}", an attribute of vector index "byText", which the library writes`,
+        )
+        expect(load(withField("note", attribute))).toThrow(
+          `[EDD-9140] Entity "Doc": "note" would be stored in "${attribute}", an attribute of vector index "byText", which the library writes`,
+        )
+        expect(load(withField(attribute, "stored"))).toThrow(
+          `[EDD-9140] Entity "Doc": "${attribute}" is named "${attribute}", an attribute of vector index "byText", which the library writes, and is stored in "stored"`,
+        )
+        expect(load(withField("note"))).not.toThrow()
+        expect(load(withField("note", "stored"))).not.toThrow()
+      })
     }
   }
 })

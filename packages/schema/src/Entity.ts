@@ -79,8 +79,9 @@ import { isShardSourceError } from "./internal/Shards.js"
 import {
   refuseRepeatedIndex,
   refuseSharedKeyAttributeOnEverySchema,
-  refuseStoredInTableKey,
+  refuseStoredInKeyAttribute,
   refuseStoredUnderLibraryAttribute,
+  writtenKeyAttributes,
 } from "./internal/SharedKeyAttribute.js"
 import {
   type BoundDimension,
@@ -1599,8 +1600,14 @@ export const buildEntityDefinition = (config: {
       .filter((name) => name !== null)
       .map((name) => [name, name] as readonly [string, string]),
   ]
-  refuseStoredInTableKey(config.entityType, primaryIndex, storedAttributes)
-  refuseStoredUnderLibraryAttribute(config.entityType, primaryIndex, storedAttributes, sparseFields)
+  const keyAttributes = writtenKeyAttributes(initialIndexes, vectorIndexes)
+  refuseStoredInKeyAttribute(config.entityType, keyAttributes, storedAttributes)
+  refuseStoredUnderLibraryAttribute(
+    config.entityType,
+    keyAttributes,
+    storedAttributes,
+    sparseFields,
+  )
 
   const renameToDynamo = (item: globalThis.Record<string, unknown>): void => {
     if (!hasRenames) return

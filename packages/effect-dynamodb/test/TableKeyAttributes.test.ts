@@ -37,6 +37,8 @@ const ENTITY_POSITIONS: ReadonlyArray<{
   readonly accepted: Record<string, unknown>
   /** The accepted form stores this attribute. */
   readonly stored: string
+  /** The field the run-time input sets, when it isn't `payload` or the stored attribute. */
+  readonly input?: string
 }> = [
   {
     name: "a model attribute renamed onto the partition key",
@@ -87,6 +89,25 @@ const ENTITY_POSITIONS: ReadonlyArray<{
     stored: "sk",
   },
   {
+    name: "a model attribute named as the partition key under a rename",
+    refused: {
+      model: DynamoModel.configure(
+        Schema.Struct({ id: Schema.String, pk: Schema.optional(Schema.String) }),
+        { pk: { field: "stored" } },
+      ),
+      primaryKey,
+    },
+    accepted: {
+      model: DynamoModel.configure(
+        Schema.Struct({ id: Schema.String, pk: Schema.optional(Schema.String) }),
+        { pk: { field: "stored" } },
+      ),
+      primaryKey: upperKey,
+    },
+    stored: "stored",
+    input: "pk",
+  },
+  {
     name: "the created timestamp",
     refused: { model: Doc, primaryKey, timestamps: { created: "pk" } },
     accepted: { model: Doc, primaryKey, timestamps: { created: "stored" } },
@@ -135,7 +156,10 @@ describe("EDD-9109: a value stored in a table key attribute", () => {
       const MainTable = Table.make({ schema, entities: { Docs } }) as any
       const table = makeRecordingTable()
       const named = position.name.includes("named as")
-      const input = { id: "a b", [named ? position.stored : "payload"]: "kept" }
+      const input = {
+        id: "a b",
+        [position.input ?? (named ? position.stored : "payload")]: "kept",
+      }
       return Effect.gen(function* () {
         const db: any = yield* DynamoClient.make({ entities: { Docs }, tables: { MainTable } })
         yield* db.entities.Docs.put(input).asEffect()
@@ -148,6 +172,220 @@ describe("EDD-9109: a value stored in a table key attribute", () => {
         if (keyAttributes.pk.field === "pk") {
           expect((yield* db.entities.Docs.get({ id: "a b" })).id).toBe("a b")
         }
+      }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "keys" })))) as never
+    })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Secondary index key attributes
+// ---------------------------------------------------------------------------
+
+const Placed = Schema.Struct({
+  id: Schema.String,
+  region: Schema.String,
+  beds: Schema.Number,
+  payload: Schema.optional(Schema.String),
+})
+/** The index `byRegion` with its key attributes named `pk` (partition) and `sk` (sort). */
+const byRegion = (pk: string, sk: string) => ({
+  byRegion: {
+    name: "gsi1",
+    pk: { field: pk, composite: ["region"] },
+    sk: { field: sk, composite: ["id"] },
+  },
+})
+/** A local index: the table's partition key, and its own sort key attribute. */
+const local = (sk: string) => ({
+  byPlace: {
+    name: "lsi1",
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: sk, composite: ["region"] },
+  },
+})
+/** A Z-order sort key, stored in the attribute `sk`. */
+const zorder = (sk: string) => ({
+  byBeds: {
+    name: "gsi2",
+    pk: { field: "gsi2pk", composite: ["region"] },
+    sk: { field: sk, zorder: [{ field: "beds", min: 0, max: 15 }] },
+  },
+})
+
+/** Each way an entity could store a value in a secondary index's key attribute: refused, then its accepted form. */
+const INDEX_POSITIONS: ReadonlyArray<{
+  readonly name: string
+  readonly refused: Record<string, unknown>
+  readonly accepted: Record<string, unknown>
+  /** What the refusal names. */
+  readonly names: string
+  /** The accepted form stores the value here. */
+  readonly stored: string
+  /** And the index key it composes here. */
+  readonly key: string
+}> = [
+  {
+    name: "a model attribute named as a secondary index's partition key",
+    refused: {
+      model: Schema.Struct({ ...Placed.fields, gsi1pk: Schema.optional(Schema.String) }),
+      indexes: byRegion("gsi1pk", "gsi1sk"),
+    },
+    accepted: {
+      model: Schema.Struct({ ...Placed.fields, gsi1pk: Schema.optional(Schema.String) }),
+      indexes: byRegion("regionKey", "gsi1sk"),
+    },
+    names: `"gsi1pk" would be stored in "gsi1pk", the attribute that holds index "byRegion"'s partition key`,
+    stored: "gsi1pk",
+    key: "regionKey",
+  },
+  {
+    // The write composed the key, then the rename moved it into "stored": the row held the key's
+    // text as the field, and wasn't in the index.
+    name: "a model attribute named as a secondary index's partition key under a rename",
+    refused: {
+      model: DynamoModel.configure(
+        Schema.Struct({ ...Placed.fields, gsi1pk: Schema.optional(Schema.String) }),
+        { gsi1pk: { field: "stored" } },
+      ),
+      indexes: byRegion("gsi1pk", "gsi1sk"),
+    },
+    accepted: {
+      model: DynamoModel.configure(
+        Schema.Struct({ ...Placed.fields, gsi1pk: Schema.optional(Schema.String) }),
+        { gsi1pk: { field: "stored" } },
+      ),
+      indexes: byRegion("regionKey", "gsi1sk"),
+    },
+    names: `"gsi1pk" is named "gsi1pk", the attribute that holds index "byRegion"'s partition key, and is stored in "stored"`,
+    stored: "stored",
+    key: "regionKey",
+  },
+  {
+    name: "a model attribute renamed onto a secondary index's sort key",
+    refused: {
+      model: DynamoModel.configure(Placed, { payload: { field: "gsi1sk" } }),
+      indexes: byRegion("gsi1pk", "gsi1sk"),
+    },
+    accepted: {
+      model: DynamoModel.configure(Placed, { payload: { field: "stored" } }),
+      indexes: byRegion("gsi1pk", "gsi1sk"),
+    },
+    names: `"payload" would be stored in "gsi1sk", the attribute that holds index "byRegion"'s sort key`,
+    stored: "stored",
+    key: "gsi1sk",
+  },
+  {
+    name: "a model attribute renamed onto a local index's sort key",
+    refused: {
+      model: DynamoModel.configure(Placed, { payload: { field: "lsi1sk" } }),
+      indexes: local("lsi1sk"),
+    },
+    accepted: {
+      model: DynamoModel.configure(Placed, { payload: { field: "stored" } }),
+      indexes: local("lsi1sk"),
+    },
+    names: `"payload" would be stored in "lsi1sk", the attribute that holds index "byPlace"'s sort key`,
+    stored: "stored",
+    key: "lsi1sk",
+  },
+  {
+    name: "a model attribute renamed onto a Z-order sort key",
+    refused: {
+      model: DynamoModel.configure(Placed, { payload: { field: "gsi2sk" } }),
+      indexes: zorder("gsi2sk"),
+    },
+    accepted: {
+      model: DynamoModel.configure(Placed, { payload: { field: "stored" } }),
+      indexes: zorder("gsi2sk"),
+    },
+    names: `"payload" would be stored in "gsi2sk", the attribute that holds index "byBeds"'s sort key`,
+    stored: "stored",
+    key: "gsi2sk",
+  },
+  {
+    name: "the created timestamp",
+    refused: {
+      model: Placed,
+      indexes: byRegion("gsi1pk", "gsi1sk"),
+      timestamps: { created: "gsi1pk" },
+    },
+    accepted: {
+      model: Placed,
+      indexes: byRegion("gsi1pk", "gsi1sk"),
+      timestamps: { created: "made" },
+    },
+    names: `"gsi1pk" would be stored in "gsi1pk", the attribute that holds index "byRegion"'s partition key`,
+    stored: "made",
+    key: "gsi1pk",
+  },
+  {
+    name: "the version",
+    refused: {
+      model: Placed,
+      indexes: byRegion("gsi1pk", "gsi1sk"),
+      versioned: { field: "gsi1sk" },
+    },
+    accepted: { model: Placed, indexes: byRegion("gsi1pk", "gsi1sk"), versioned: { field: "rev" } },
+    names: `"gsi1sk" would be stored in "gsi1sk", the attribute that holds index "byRegion"'s sort key`,
+    stored: "rev",
+    key: "gsi1sk",
+  },
+]
+
+describe("EDD-9109: a value stored in a secondary index's key attribute", () => {
+  // On 1.39.0 the value and the composed index key replaced each other.
+  for (const [make, build] of ENTITY_MAKES) {
+    describe(make, () => {
+      for (const position of INDEX_POSITIONS) {
+        it(`refuses ${position.name}`, () => {
+          expect(() =>
+            (build as (config: unknown) => unknown)({
+              entityType: "Doc",
+              primaryKey,
+              ...position.refused,
+            }),
+          ).toThrow(`[EDD-9109] Entity "Doc": ${position.names}`)
+        })
+        it(`accepts ${position.name} stored elsewhere`, () => {
+          expect(() =>
+            (build as (config: unknown) => unknown)({
+              entityType: "Doc",
+              primaryKey,
+              ...position.accepted,
+            }),
+          ).not.toThrow()
+        })
+      }
+    })
+  }
+
+  for (const position of INDEX_POSITIONS) {
+    it.effect(`at run time, ${position.name} stored elsewhere keeps the index key`, () => {
+      const Docs = Entity.make({
+        entityType: "Doc",
+        primaryKey,
+        ...position.accepted,
+      } as never) as any
+      const MainTable = Table.make({ schema, entities: { Docs } }) as any
+      const table = makeRecordingTable()
+      const input = {
+        id: "a",
+        region: "north",
+        beds: 3,
+        payload: "kept",
+        ...(position.name.includes("named as") ? { gsi1pk: "kept" } : {}),
+      }
+      return Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({ entities: { Docs }, tables: { MainTable } })
+        yield* db.entities.Docs.put(input).asEffect()
+        const [row] = [...table.items.values()] as ReadonlyArray<Record<string, any>>
+        const key = row![position.key]
+        if (key.B !== undefined) expect(key.B).toBeInstanceOf(Uint8Array)
+        else expect(key.S).toMatch(/^\$keys#v1#/)
+        expect(row![position.stored]).toBeDefined()
+        const read = yield* db.entities.Docs.get({ id: "a" })
+        expect(read.region).toBe("north")
+        if (position.name.includes("named as")) expect(read.gsi1pk).toBe("kept")
       }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "keys" })))) as never
     })
   }
