@@ -798,14 +798,13 @@ describe("a keyed edge whose decompose returns a field's stored form", () => {
     }),
   )
 
-  it.effect("an array edge stores them the same way (1.39.0 failed the create with a defect)", () =>
+  it.effect("an array edge fails the create with a defect and writes nothing, as on 1.39.0", () =>
     Effect.gen(function* () {
+      // 1.39.0 gave an array edge its element's encoders, which take a date field's domain value only.
       const { run, rows } = keyedWorld({ array: true })
-      succeed(yield* run((db) => db.aggregates.Dates.create(input(true))))
-      expect(rows()).toEqual(asEncoded(keyedAt("created").rows))
-      expect(plain(succeed(yield* run((db) => db.aggregates.Dates.get({ id: "a" }))))).toEqual(
-        keyedAt("created").read,
-      )
+      const exit = yield* run((db) => db.aggregates.Dates.create(input(true)))
+      expect(Exit.isFailure(exit) && Exit.hasDies(exit)).toBe(true)
+      expect(rows()).toEqual([])
     }),
   )
 
@@ -820,4 +819,110 @@ describe("a keyed edge whose decompose returns a field's stored form", () => {
       expect(rows()).toEqual([])
     }),
   )
+})
+
+// A custom `decompose` renaming a transformed field: `f` stored as `g`, which no field declares, so
+// it's stored as given, and `assemble` maps it back. Decomposing the value read stores it decoded
+// once more (1.39.0's `rekey` did, 500 becoming 5000), so `rekey` moves each row as stored, its keys
+// and its collection sort key mirror replaced.
+describe("rekey moves a custom decompose's rows as stored", () => {
+  const RenameLine = Schema.Struct({ lineId: Schema.String, f: X10 })
+  const renameWorld = (
+    table: ReturnType<typeof makeRecordingTable>,
+    escapeKeys: boolean,
+    shape: "plain" | "sub" | "mirror",
+  ) => {
+    const schema = DynamoSchema.make({ name: "rn", version: 1, escapeKeys })
+    const Main = Table.make({ schema, entities: {} })
+    const edge = Aggregate.many({
+      entityType: "RnLine",
+      sk: { composite: ["lineId"] },
+      decompose: (lines) =>
+        (lines as ReadonlyArray<typeof RenameLine.Type>).map((line) => ({
+          lineId: line.lineId,
+          g: line.f,
+        })),
+      assemble: (rows) =>
+        (rows as ReadonlyArray<{ readonly lineId: string; readonly g: number }>).map((row) => ({
+          lineId: row.lineId,
+          f: row.g,
+        })),
+    })
+    const Lines = Schema.Struct({ lines: Schema.Array(RenameLine) })
+    const Sub = Aggregate.make(Lines, { root: { entityType: "RnSub" }, edges: { lines: edge } })
+    const Renames = Aggregate.make(
+      Schema.Struct({ id: Schema.String, ...(shape === "sub" ? { sub: Lines } : Lines.fields) }),
+      {
+        table: Main,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection:
+          shape === "mirror"
+            ? { name: "rn", index: "gsi2", sk: { field: "gsi2sk", composite: [] } }
+            : { name: "rn" },
+        root: { entityType: "RnRoot" },
+        edges: shape === "sub" ? { sub: (Sub as any).with({}) } : { lines: edge },
+      } as any,
+    )
+    return <A, E>(body: (db: any) => Effect.Effect<A, E, never>) =>
+      Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: {},
+          aggregates: { Renames },
+          tables: { Main },
+        } as never)
+        return yield* body(db)
+      }).pipe(
+        Effect.provide(Layer.merge(table.layer, Main.layer({ name: "rn" })) as never),
+      ) as Effect.Effect<A, E>
+  }
+
+  for (const shape of ["plain", "sub", "mirror"] as const) {
+    it.effect(`${shape}: every run moves the rows as they're stored, keys alone replaced`, () =>
+      Effect.gen(function* () {
+        const table = makeRecordingTable({ indexes: { gsi2: { pk: "pk", sk: "gsi2sk" } } })
+        const off = renameWorld(table, false, shape)
+        const on = renameWorld(table, true, shape)
+        const lines = { lines: [{ lineId: "l 1", f: 50 }] }
+        yield* off((db) =>
+          db.aggregates.Renames.create({
+            id: "a b",
+            ...(shape === "sub" ? { sub: lines } : lines),
+          }),
+        )
+        const lineRow = () =>
+          [...table.items.values()].filter((row) => row.__edd_e__?.S === "RnLine")
+        expect(lineRow().map((row) => row.g)).toEqual([{ N: "500" }])
+        const read: any = yield* off((db) => db.aggregates.Renames.get({ id: "a b" }))
+        expect(shape === "sub" ? read.sub.lines : read.lines).toEqual([{ lineId: "l 1", f: 5000 }])
+        // The root, the sub-aggregate's root where there is one, and the line.
+        const rows = shape === "sub" ? 3 : 2
+        for (const [run, moved] of [
+          [on, rows],
+          [off, rows],
+          [off, 0],
+        ] as const) {
+          const before = lineRow()[0]!
+          table.take()
+          const report: any = yield* run((db) => db.tables.Main.rekey())
+          expect(report.conflicts).toEqual([])
+          expect(report.moved.aggregate ?? 0).toBe(moved)
+          const after = lineRow()[0]!
+          // The row as stored, but for its keys and the mirror of its sort key.
+          const { pk: _pk, sk: _sk, gsi2sk: _mirror, ...kept } = before
+          const { pk: _pk2, sk: _sk2, gsi2sk: mirror, ...now } = after
+          expect(now).toEqual(kept)
+          expect(after.g).toEqual({ N: "500" })
+          expect(mirror).toEqual(shape === "mirror" ? after.sk : undefined)
+          const puts = table
+            .take()
+            .filter((request) => request.command === "TransactWriteItems")
+            .flatMap((request) => request.input.TransactItems)
+            .filter((action: any) => action.Put?.Item?.__edd_e__?.S === "RnLine")
+          expect(puts.map((action: any) => action.Put.Item)).toEqual(moved > 0 ? [after] : [])
+          expect(yield* run((db) => db.aggregates.Renames.get({ id: "a b" }))).toEqual(read)
+        }
+      }),
+    )
+  }
 })

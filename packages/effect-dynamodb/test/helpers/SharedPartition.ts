@@ -29,9 +29,10 @@
  *
  * And against `fixtures/aggregate-decompose-rename-1.39.0.json`, generated the same way, a custom
  * `decompose` renaming a transformed field (`{ lid, f, note }` stored as `{ lid, g: f, note }`), keyed
- * by `lid`: `g` is no field of the element, so it's stored as given. `update` deletes the row and
- * `rekey` moves it, as 1.39.0 did. Kinds `x10`, `nested`, `text`; an edge, one with an `entity`, one
- * of a sub-aggregate.
+ * by `lid`: `g` is no field of the element, so it's stored as given. `update` deletes the row, as
+ * 1.39.0 did, and `rekey` moves it as stored, its partition key alone replaced: 1.39.0 wrote it from
+ * the value read, decoded once more. Kinds `x10`, `nested`, `text`; an edge, one with an `entity`,
+ * one of a sub-aggregate.
  *
  * And against `fixtures/aggregate-foreign-rows-1.39.0.json`, generated the same way, rows another
  * aggregate holds:
@@ -55,7 +56,8 @@
  *   value as read doesn't compose; B's update puts its own line there, adding `z_owner`, a field of
  *   both models. `wide`: 160 more string fields.
  *
- * Every step's rows, requests and results are compared with what 1.39.0 stored, sent and returned.
+ * Every step's rows, requests and results are compared with what 1.39.0 stored, sent and returned,
+ * but for the rows `rekey` moves of the renaming `decompose`, which it moves as stored.
  */
 
 import { readFileSync } from "node:fs"
@@ -1623,7 +1625,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
 
         for (const dryRun of [true, false]) {
           const name = `rekey${dryRun ? " dry run" : ""}`
-          it.effect(`${scenario}: ${name} moves every row, as 1.39.0 did`, () =>
+          it.effect(`${scenario}: ${name} moves every row, as stored`, () =>
             Effect.gen(function* () {
               const w = yield* world(backend, renameDefine(kind, shape), {
                 name: "rename",
@@ -1638,11 +1640,22 @@ export const sharedPartitionSuite = (backend: Backend) => {
               expect(reportOf(done.exit)).toEqual(expected.report)
               if (backend.local)
                 expect(unordered(done.commands)).toEqual(unordered(expected.commands))
-              // A row the decomposition places moves as on 1.39.0: written from the value read,
-              // decoded once more (`g` 500 became 5000), so it reads otherwise (decision A: the
-              // next major hands `decompose` decoded values).
-              expect(done.rows).toEqual(byKey(expected.rows))
-              if (!dryRun) expect(yield* read(w)).toEqual(expected.get)
+              // Each row as it was stored, under the new partition key. 1.39.0 wrote the edge's rows
+              // from their value decoded once more (`g` 500 became 5000), so they read otherwise.
+              expect(done.rows).toEqual(
+                byKey(
+                  dryRun
+                    ? created
+                    : created.map((row) => ({
+                        ...row,
+                        pk: { S: row.pk!.S!.replace("#p q", "#p%20q") },
+                      })),
+                ),
+              )
+              expect(byKey(expected.rows).map((row) => [row.pk, row.sk])).toEqual(
+                done.rows.map((row) => [row.pk, row.sk]),
+              )
+              if (!dryRun) expect(yield* read(w)).toEqual(atRenamed(scenario, "create get"))
               yield* w.opened.close
             }),
           )

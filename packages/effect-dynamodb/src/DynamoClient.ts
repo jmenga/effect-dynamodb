@@ -3277,22 +3277,29 @@ const makeFromConfig = (config: {
           const handler = Rekey.handlerOf(member)
           if (handler !== undefined) handlers.add(handler)
         }
-        // A projection's outbox on this table, of a read model on another (#171).
+        // The outboxes on this table of a read model on another (#171): every projection's, so a
+        // second projection of one read model doesn't hide the first's items.
         const outboxOf = new Set<unknown>()
         for (const entity of [...registered, ...Object.values(config.entities)]) {
-          const outbox = (
+          if (outboxOf.has(entity)) continue
+          outboxOf.add(entity)
+          const outboxes = (
             entity as {
-              readonly _projectionOutbox?: {
-                readonly table: { readonly Tag: { readonly key: string } }
+              readonly _projectionOutboxes?: ReadonlyArray<{
+                readonly table: { readonly Tag: { readonly key: string } } | undefined
                 readonly pk: string
                 readonly sk: string
-              }
+              }>
             }
-          )._projectionOutbox
-          if (outbox === undefined || outbox.table.Tag.key !== tagKey || outboxOf.has(entity)) {
-            continue
+          )._projectionOutboxes
+          // Their key attributes, once each.
+          const layouts = new Map<string, { readonly pk: string; readonly sk: string }>()
+          for (const outbox of outboxes ?? []) {
+            if (outbox.table?.Tag.key !== tagKey) continue
+            layouts.set(`${outbox.pk}\u0000${outbox.sk}`, { pk: outbox.pk, sk: outbox.sk })
           }
-          outboxOf.add(entity)
+          if (layouts.size === 0) continue
+          const keys = [...layouts.values()]
           const readModel = entity as unknown as Pick<
             EntityType,
             "entityType" | "_rekeyProjectionRow"
@@ -3300,8 +3307,14 @@ const makeFromConfig = (config: {
           handlers.add({
             name: readModel.entityType,
             types: [`${readModel.entityType}#outbox`],
+            // A table has one key schema, so its items are under the layout whose attributes they hold.
             row: (row, ctx) =>
-              readModel._rekeyProjectionRow(row, ctx, { pk: outbox.pk, sk: outbox.sk }),
+              readModel._rekeyProjectionRow(
+                row,
+                ctx,
+                keys.find((key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined) ??
+                  keys[0]!,
+              ),
           })
         }
         return provide(Rekey.run({ tableName, members: [...handlers], options }))

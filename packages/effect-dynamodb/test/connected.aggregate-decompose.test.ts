@@ -367,3 +367,108 @@ describeConnected("a custom decompose is handed a write's value as 1.39.0 handed
     )
   }
 })
+
+// A custom `decompose` renaming a transformed field: `f` (multiplying by 10 on decode) stored as
+// `g`, which no field declares, so it's stored as given, and `assemble` maps it back. Decomposing
+// the value read stores it decoded once more, so `rekey` moves each row as stored.
+const renameWorld = (keys: DynamoSchema.DynamoSchema, shape: "plain" | "entity" | "sub") => {
+  const RenameLine = Schema.Struct({ lineId: Schema.String, f: X10 })
+  const LineEntity = Entity.make({
+    model: RenameLine,
+    entityType: "DcRenameLine",
+    primaryKey: {
+      pk: { field: "pk", composite: ["lineId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  })
+  const entities = shape === "entity" ? { LineEntity } : {}
+  const T = Table.make({ schema: keys, entities })
+  const edge = Aggregate.many({
+    entityType: "DcRenameLine",
+    ...(shape === "entity" && { entity: LineEntity }),
+    sk: { composite: ["lineId"] },
+    decompose: (lines) =>
+      (lines as ReadonlyArray<typeof RenameLine.Type>).map((line) => ({
+        lineId: line.lineId,
+        g: line.f,
+      })),
+    assemble: (rows) =>
+      (rows as ReadonlyArray<{ readonly lineId: string; readonly g: number }>).map((row) => ({
+        lineId: row.lineId,
+        f: row.g,
+      })),
+  })
+  const Lines = Schema.Struct({ lines: Schema.Array(RenameLine) })
+  const Sub = Aggregate.make(Lines, { root: { entityType: "DcRenameSub" }, edges: { lines: edge } })
+  const Renames = Aggregate.make(
+    Schema.Struct({ id: Schema.String, ...(shape === "sub" ? { sub: Lines } : Lines.fields) }),
+    {
+      table: T,
+      schema: keys,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "dcrename" },
+      root: { entityType: "DcRename" },
+      edges: shape === "sub" ? { sub: (Sub as any).with({}) } : { lines: edge },
+    } as any,
+  )
+  return { T, entities, Renames }
+}
+
+describeConnected("a custom decompose renaming a transformed field", () => {
+  for (const shape of ["plain", "entity", "sub"] as const) {
+    it.effect(`${shape}: rekey moves its rows as stored, however many times it runs`, () =>
+      onTable((tableName) =>
+        Effect.gen(function* () {
+          const off = DynamoSchema.make({ name: "dc", version: 1, escapeKeys: false })
+          const on = DynamoSchema.make({ name: "dc", version: 1, escapeKeys: true })
+          const using = <A, E>(
+            keys: DynamoSchema.DynamoSchema,
+            body: (db: any) => Effect.Effect<A, E>,
+          ) => {
+            const w = renameWorld(keys, shape)
+            return Effect.gen(function* () {
+              const db = yield* DynamoClient.make({
+                entities: w.entities,
+                aggregates: { Renames: w.Renames },
+                tables: { T: w.T },
+              })
+              return yield* body(db)
+            }).pipe(Effect.provide(w.T.layer({ name: tableName })))
+          }
+          const lines = { lines: [{ lineId: "l1", f: 50 }] }
+          yield* using(off, (db) =>
+            db.aggregates.Renames.create({
+              id: "a b",
+              ...(shape === "sub" ? { sub: lines } : lines),
+            }),
+          )
+          const stored = Effect.promise(async () => {
+            const scan = await raw.send(
+              new ScanCommand({ TableName: tableName, ConsistentRead: true }),
+            )
+            return ((scan.Items ?? []) as ReadonlyArray<Row>)
+              .filter((row) => (row.__edd_e__ as { S: string }).S === "DcRenameLine")
+              .map((row) => [(row.pk as { S: string }).S, row.g])
+          })
+          // `decompose` is handed the write's value read stored form first (500), and stores it as
+          // given; `get` decodes what `assemble` hands back once more.
+          expect(yield* stored).toEqual([["$dc#v1#dcrename#a b", { N: "500" }]])
+          const read: any = yield* using(off, (db) => db.aggregates.Renames.get({ id: "a b" }))
+          expect(shape === "sub" ? read.sub.lines : read.lines).toEqual([{ lineId: "l1", f: 5000 }])
+          for (const [keys, pk] of [
+            [on, "$dc#v1#dcrename#a%20b"],
+            [off, "$dc#v1#dcrename#a b"],
+            [off, "$dc#v1#dcrename#a b"],
+          ] as const) {
+            const report: any = yield* using(keys, (db) => db.tables.T.rekey())
+            expect(report.conflicts).toEqual([])
+            expect(yield* stored).toEqual([[pk, { N: "500" }]])
+            expect(yield* using(keys, (db) => db.aggregates.Renames.get({ id: "a b" }))).toEqual(
+              read,
+            )
+          }
+        }),
+      ),
+    )
+  }
+})

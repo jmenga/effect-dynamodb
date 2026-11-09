@@ -62,6 +62,7 @@ import { KeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import { isDispatchEligible } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import {
   extractArrayElement,
+  extractKeyedValue,
   getSchemaFields,
   hasEncodingTransformation,
   holdsCustomDeclaration,
@@ -216,6 +217,13 @@ interface ResolvedNode {
   readonly entityType: string
   /** The fields of the value this node's rows hold: what they declare. */
   readonly ownFields?: Record<string, Schema.Top> | undefined
+  /**
+   * The model fields this node's rows can hold, as `DynamoClient.make` counts them for an aggregate
+   * declaring `ownsRows` (`EDD-9130`): those the schema its value is decoded with declares, read off
+   * the model's field ({@link writtenFields}). `"any"` when they can't be read off it, as for a custom
+   * `decompose`.
+   */
+  readonly writes: ReadonlyArray<string> | "any"
   /** What this node's rows do with each timestamp. Undefined without `timestamps`. */
   readonly rowStamps?: RowStamps | undefined
   /**
@@ -1048,7 +1056,8 @@ const storedFormFirst = (
  *
  * Exactly ONE encoder per field, so nothing is ever encoded twice:
  *
- * 1. **A date encoding** — see {@link dateAttrEncoder}.
+ * 1. **A date encoding** — see {@link dateAttrEncoder}. With `storedDates`, a value already in
+ *    the field's stored form is stored as it is ({@link storedDateForm}).
  * 2. **Anything that holds a wire transform AT ANY DEPTH** — a leaf transform, a
  *    `Schema.Class`, and also an `Array` / `Struct` / `Union` containing one, or
  *    a self date or `Redacted` nested anywhere ({@link containsWireTransform}).
@@ -1077,6 +1086,11 @@ const storedFormFirst = (
 const buildAttrEncoders = (
   fields: Record<string, Schema.Top> | undefined,
   resolveRef?: RefResolver | undefined,
+  /**
+   * A keyed (`Schema.Record`) `many` edge without an `entity` only: 1.39.0 gave it no encoders, so
+   * it stored a date its custom `decompose` returned in the field's stored form as it was.
+   */
+  storedDates = false,
 ): AttrEncoders => {
   const encoders: AttrEncoders = {}
   if (!fields) return encoders
@@ -1084,10 +1098,15 @@ const buildAttrEncoders = (
   for (const field of Object.keys(fields)) {
     const fieldSchema = fields[field]!
 
-    // 1. Date encoding. A value already in the field's stored form (a custom `decompose` that
-    //    returns the ISO text of a `DateTimeUtcFromString`) is stored as it is, as 1.39.0 stored it
-    //    on a keyed edge; anything else is stored as given, and the write refuses it unless it reads back.
+    // 1. Date encoding. With `storedDates`, a value already in the field's stored form (a custom
+    //    `decompose` that returns the ISO text of a `DateTimeUtcFromString`) is stored as it is, as
+    //    1.39.0 stored it there; anything else is stored as given, and the write refuses it unless
+    //    it reads back. Elsewhere a value the encoding doesn't take fails the write, as on 1.39.0.
     const date = dateAttrEncoder(fieldSchema)
+    if (date && !storedDates) {
+      encoders[field] = date
+      continue
+    }
     if (date) {
       const stored = storedDateForm(fieldSchema)
       encoders[field] = (value, asGiven) => {
@@ -1199,6 +1218,24 @@ const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined => {
 
 /** The value schema of a struct field, with any `optionalKey` / `optional` wrapper removed. */
 const unwrapOptionalField = (field: Schema.Top): Schema.Top => optionalField(field)?.inner ?? field
+
+/**
+ * The model fields a node's rows can hold, for the `ownsRows` bind check (`EDD-9130`): those `value`,
+ * the schema the node's value is decoded with, declares. A decoded value holds no others. `"any"`
+ * when its fields can't be read off it (a `Schema.Union`, a `Schema.suspend`, a `Schema.Record`, a
+ * `Schema.Unknown`, or no schema at all), unless it is an opaque ref, which is the edge entity: its
+ * rows hold `entity`'s fields.
+ */
+const writtenFields = (
+  value: Schema.Top | undefined,
+  entity: Record<string, Schema.Top> | undefined,
+): ReadonlyArray<string> | "any" => {
+  const own = value === undefined ? undefined : getSchemaFields(value)
+  if (own !== undefined) return Object.keys(own)
+  return value !== undefined && entity !== undefined && isOpaqueRefField(value)
+    ? Object.keys(entity)
+    : "any"
+}
 
 /**
  * Whether a field is a class-like value whose fields the schema walker cannot
@@ -2326,19 +2363,22 @@ const makeAggregate = <TSchema extends Schema.Top>(
     const library = [config.pk.field, "sk", "__edd_e__", ...(mirror === undefined ? [] : [mirror])]
     for (const { node } of nodeSlots) {
       const types = [labelled(node.entityType)]
-      if (node.decompose !== undefined) {
+      if (node.decompose !== undefined || node.writes === "any") {
         writers.push({
           field: undefined,
           except: library,
           head: undefined,
           types,
           table,
-          channel: "the attributes its custom `decompose` returns",
+          channel:
+            node.decompose !== undefined
+              ? "the attributes its custom `decompose` returns"
+              : "the attributes of a value whose fields can't be read off its schema",
         })
         continue
       }
       const names = new Set([
-        ...Object.keys(node.ownFields ?? {}),
+        ...node.writes,
         ...Object.keys(node.discriminator ?? {}),
         ...contextFields,
       ])
@@ -2420,6 +2460,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
           group: group.name,
           item,
           built,
+          /** An element of a `many` edge with a custom `decompose`: its row moves as stored. */
+          custom: item.node.decompose !== undefined,
           current: { pk: pkValue, sk },
           old: oldPosition(
             from ?? pkValue,
@@ -2881,6 +2923,24 @@ const makeAggregate = <TSchema extends Schema.Top>(
           ])
         const keyOf = (at: { readonly pk: string; readonly sk: string }) =>
           toAttributeMap({ [config.pk.field]: at.pk, sk: at.sk })
+        // A custom `decompose`'s row is written as stored, its keys and its collection sort key
+        // copy replaced: decomposing the value read back needn't give the attributes it holds (one
+        // renaming a transformed field would store it decoded once more on every run).
+        const mirror =
+          config.collection.index !== undefined && config.collection.sk !== undefined
+            ? config.collection.sk.field
+            : undefined
+        const itemOf = (r: number): Record<string, AttributeValue> => {
+          const row = rows[r]!
+          if (!row.custom) return built[r]!
+          const at = row.placement === "old" ? row.old : row.current
+          return {
+            ...storedAt.get(positionOf(at.pk, at.sk)),
+            [config.pk.field]: { S: row.current.pk },
+            sk: { S: row.current.sk },
+            ...(mirror !== undefined && { [mirror]: { S: row.current.sk } }),
+          }
+        }
 
         type Move = {
           readonly from: { readonly pk: string; readonly sk: string }
@@ -2898,7 +2958,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 {
                   Put: {
                     TableName: tableConfig.name,
-                    Item: built[r]!,
+                    Item: itemOf(r),
                     ConditionExpression: "attribute_not_exists(#pk)",
                     ExpressionAttributeNames: { "#pk": config.pk.field },
                   },
@@ -2911,14 +2971,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
             continue
           }
           if (row.placement !== "current" || row.atCurrent === undefined) continue
-          const stale = staleIndexFields(built[r]!, row.atCurrent)
+          const item = itemOf(r)
+          const stale = staleIndexFields(item, row.atCurrent)
           if (stale.length === 0) continue
           const guard = guardOf(row.current)
           const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
           const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
           const sets = stale.map((field, i) => {
             names[`#x${i}`] = field
-            values[`:x${i}`] = built[r]![field]!
+            values[`:x${i}`] = item[field]!
             return `#x${i} = :x${i}`
           })
           rewrites.push([
@@ -3778,6 +3839,8 @@ interface ResolveNodeArgs {
   readonly parentFields?: Record<string, Schema.Top> | undefined
   /** Fields of the value this node's rows hold, where that isn't `parentFields`. */
   readonly ownFields?: Record<string, Schema.Top> | undefined
+  /** {@link ResolvedNode.writes}, where that isn't `ownFields`' names. */
+  readonly writes?: ReadonlyArray<string> | "any" | undefined
   /** The aggregate's ref resolver, shared with its `decodeSchema`. */
   readonly resolveRef?: RefResolver | undefined
   readonly discriminator?: Record<string, unknown> | undefined
@@ -3903,6 +3966,10 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
             ownFields: valueFields,
+            writes: writtenFields(
+              parentField === undefined ? undefined : unwrapOptionalField(parentField),
+              fieldsOf(edge.entity?.model),
+            ),
             attrEncoders: buildAttrEncoders(valueFields, resolveRef),
             ...edgeStorage(
               edgePackedFields(
@@ -3929,6 +3996,13 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
         // entity's model, which is what such an element IS.
         const entityFields = fieldsOf(edge.entity?.model)
         const elementFields = manyElementFields(parentFields, field) ?? entityFields
+        const parentField = parentFields?.[field]
+        const arrayElement =
+          parentField === undefined ? undefined : extractArrayElement(parentField)
+        const keyedValue =
+          parentField === undefined || arrayElement !== undefined
+            ? undefined
+            : extractKeyedValue(parentField)
         children.push(
           resolveNode({
             fieldName: field,
@@ -3943,7 +4017,15 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
                 ? undefined
                 : storedFormFirst(field, parentFields?.[field], resolveRef),
             ownFields: elementFields,
-            attrEncoders: buildAttrEncoders(elementFields, resolveRef),
+            writes:
+              edge.decompose === undefined
+                ? writtenFields(arrayElement ?? keyedValue, entityFields)
+                : "any",
+            attrEncoders: buildAttrEncoders(
+              elementFields,
+              resolveRef,
+              keyedValue !== undefined && edge.entity === undefined,
+            ),
             // Sort-key composites keep reading the pre-#133 encoding (the entity
             // model's top-level transforms), so no stored key is re-spelled.
             keyAttrEncoders: buildKeyAttrEncoders(entityFields),
@@ -3989,6 +4071,12 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           resolveRef,
           discriminator: inherited,
           ownDiscriminator: bound.discriminator,
+          writes: writtenFields(
+            parentFields?.[field] === undefined
+              ? undefined
+              : unwrapOptionalField(parentFields[field]),
+            subFields,
+          ),
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
           // fields; its child edges get their own encoders via recursion.
           attrEncoders: buildAttrEncoders(subFields, resolveRef),
@@ -3998,11 +4086,13 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     }
   }
 
+  const ownFields = args.ownFields ?? parentFields
   return {
     fieldName,
     entityType,
     cardinality,
-    ownFields: args.ownFields ?? parentFields,
+    ownFields,
+    writes: args.writes ?? (ownFields === undefined ? "any" : Object.keys(ownFields)),
     // Absent optionals stay absent under `exactOptionalPropertyTypes`.
     ...(discriminator !== undefined && { discriminator }),
     ...(ownDiscriminator !== undefined && { ownDiscriminator }),
@@ -5058,15 +5148,14 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
       }
     >
     readonly _projectionTombstones?: unknown
-    readonly _projectionOutboxHere?: {
-      readonly index?: { readonly pk: string; readonly sk: string } | undefined
-    }
-    readonly _projectionOutbox?: {
-      readonly table: { readonly Tag: unknown }
+    /** Every projection's outbox on this read model, one per projection defined on it. */
+    readonly _projectionOutboxes?: ReadonlyArray<{
+      /** Undefined: on the row table, under the row's own key attributes. */
+      readonly table: { readonly Tag: unknown } | undefined
       readonly pk: string
       readonly sk: string
       readonly index?: { readonly pk: string; readonly sk: string } | undefined
-    }
+    }>
     readonly _resolveDbName?: (name: string) => string
     readonly _schema: DynamoSchemaModule.DynamoSchema
     readonly _tableTag: unknown
@@ -5137,8 +5226,10 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
       // name (`id_p`), which an aggregate never does, and its primary key has at least one.
       const tombstone =
         e._projectionTombstones !== undefined ? typed(`${type}#tombstone`, index.casing) : undefined
-      const outboxHere =
-        e._projectionOutboxHere !== undefined ? typed(`${type}#outbox`, index.casing) : undefined
+      const outboxConfigs = e._projectionOutboxes ?? []
+      const outboxHere = outboxConfigs.some((outbox) => outbox.table === undefined)
+        ? typed(`${type}#outbox`, index.casing)
+        : undefined
       if (tombstone !== undefined) projectionTypes.push(tombstone)
       const rows = [
         own,
@@ -5208,29 +5299,12 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
         })
         anyText(["_entity_sk"], [rowType], table, () => `${channel}'s back-pointer "_entity_sk"`)
       }
-      // A projection's outbox items: under the row's partition key, on the row table or another.
-      const outboxes = [
-        ...(outboxHere === undefined
-          ? []
-          : [
-              {
-                on: table,
-                pk: index.pk.field,
-                sk: index.sk?.field,
-                index: e._projectionOutboxHere?.index,
-              },
-            ]),
-        ...(e._projectionOutbox === undefined
-          ? []
-          : [
-              {
-                on: e._projectionOutbox.table.Tag,
-                pk: e._projectionOutbox.pk,
-                sk: e._projectionOutbox.sk,
-                index: e._projectionOutbox.index,
-              },
-            ]),
-      ]
+      // Each projection's outbox items: under the row's partition key, on the row table or another.
+      const outboxes = outboxConfigs.map((outbox) =>
+        outbox.table === undefined
+          ? { on: table, pk: index.pk.field, sk: index.sk?.field, index: outbox.index }
+          : { on: outbox.table.Tag, pk: outbox.pk, sk: outbox.sk, index: outbox.index },
+      )
       for (const outbox of outboxes) {
         const outboxType = typed(`${type}#outbox`, index.casing)
         const channel = "its projection outbox"

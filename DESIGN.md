@@ -933,8 +933,9 @@ each carrying a handler under the `RekeyHandler` symbol that `Entity.make`,
 is `notLibrary`; one no member claims is `unregistered`. A read model's entity
 also claims its projection row tombstones (`<type>#tombstone`) and outbox
 items (`<type>#outbox`); an outbox on another table is claimed on that table,
-for a read model whose projection registered it (`_projectionOutbox`, set when
-the projection is defined). A row of a member stored under no text its values
+for a read model whose projection registered it (`_projectionOutboxes`, one
+entry per projection defined on the read model, so a second projection doesn't
+hide the first's; under the key attributes of the entry the row holds). A row of a member stored under no text its values
 composed is `unrecognizedKey`. A unit that moves together (an aggregate, a
 stream, a moved row's target) is claimed once per run (`claim`, `once`), so it is
 moved and counted once whichever of its rows the scan reaches first, and a row
@@ -1129,7 +1130,7 @@ again or reports the row (`contended`).
 | Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
 | Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
@@ -4272,7 +4273,8 @@ aggregate's table, has its key, or resolves to the same table name. The aggregat
 counted. A member's rows are these (`entityWriters`, and an aggregate's `_attributeWriters`):
 - An entity's live rows, version snapshots, soft-delete tombstones and time-series events, under its
   primary key, and the projection tombstones (`<type>#tombstone`) and outbox items (`<type>#outbox`) a
-  read model writes beside its rows.
+  read model writes beside its rows. Every projection defined on the read model counts, each with its
+  own outbox's table and index keys (`_projectionOutboxes`).
 - Its unique sentinels (type `<type>._unique.<name>`, under the sentinel key), with the back-pointers
   `_entity_pk` and `_entity_sk` naming the owning row.
 - Each secondary index's and vector index's partition attribute, on its live rows.
@@ -4283,7 +4285,10 @@ counted. A member's rows are these (`entityWriters`, and an aggregate's `_attrib
 - Another aggregate's rows: its `pk.field`, `sk` and collection sort-key mirror on every row (the
   root's mirror is its collection key, every other row's a copy of its `sk`), its list index keys on its
   root, its rows' model, context and discriminator attributes as any text, and
-  its timestamps, which it writes last. A node with a custom `decompose` writes any attribute but the
+  its timestamps, which it writes last. A node's model attributes are the fields declared by the
+  schema its value is decoded with, read off the model's field (`writes`): an opaque ref's are the edge
+  entity's. A node with a custom `decompose`, or whose value's fields can't be read off its schema (a
+  `Schema.Union`, `Schema.suspend`, `Schema.Record` or `Schema.Unknown`), writes any attribute but the
   ones the library writes after it.
 
 **`update` with `ownsRows`.** Its group transactions are exactly the ones it sends without the option.
@@ -4342,13 +4347,15 @@ else stays, the collection sort-key mirror under another name and discriminator 
 included. Nothing is decoded: a field that multiplies by 10 on decode is handed 5 where `get` returns
 50. What it returns is decoded with the rest of the aggregate.
 
-A date field's attribute encoder stores a value already in the field's stored form as it is: one its
-date encodings decode (`storedDateForm`), such as the ISO text a `decompose` returns for a
-`DateTimeUtcFromString`. Its key encoder already composed from such a value as given. 1.39.0 stored
-a `Schema.Record` edge's attributes as `decompose` returned them, so such a `decompose` worked there and
-failed `create` with a defect on an array edge; once keyed edges took their element's encoders (#201)
-it failed on both. A value in neither form is stored as given and reported (`asGiven`), so the write
-refuses it unless it reads back (`EDD-9127`).
+On a `Schema.Record` edge without an `entity`, a date field's attribute encoder stores a value already
+in the field's stored form as it is (`storedDates`): one its date encodings decode
+(`storedDateForm`), such as the ISO text a `decompose` returns for a `DateTimeUtcFromString`. Its key
+encoder already composed from such a value as given. 1.39.0 gave such an edge no encoders and stored
+its attributes as `decompose` returned them, so such a `decompose` worked there; once keyed edges took
+their element's encoders (#201) it failed `create` with a defect, and every `update` of the rows
+1.39.0 wrote. There a value in neither form is stored as given and reported (`asGiven`), so the write
+refuses it unless it reads back (`EDD-9127`). On an array edge, and on a keyed edge with an `entity`,
+1.39.0 had the encoders and failed `create` with a defect, and still does.
 
 A caller who passed the stored form on 1.39.0 had the only input that read back as meant (`create(5)` on
 that field read 50). It's a valid domain value too, so it can't be told apart or warned about: it now
