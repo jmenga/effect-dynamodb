@@ -3623,8 +3623,11 @@ conditional failure, which would read as a lost race. On failure only, it:
    read naming an index, a vector index with dimensions outside 1..4096 or over 18 inline
    filters, a `CreateTable` with more vector indexes than DynamoDB stated (else 5), a
    search whose `TopK` is not an integer in 1..100, or a write's request body over
-   16,777,216 bytes as JSON (`jsonBytes`, matching the SDK's body byte for byte; a 413 whose
-   measured body is within the limit passes through). For item size and
+   16,777,216 bytes as JSON (`jsonBytes`, matching the SDK's body byte for byte), measured
+   on the request as sent: the input the client received, `ReturnConsumedCapacity`
+   included, which `Capacity`'s instrumented client records when a request fails
+   (`internal/SentRequest.ts`) and `diagnoseFailure` carries in `SentWrite.input`. A 413
+   whose measured body is within the limit passes through. For item size and
    transaction payload, which DynamoDB itself counts approximately, the recognised message
    is the evidence and the request must hold something it can apply to (a `Put` / `Update`,
    a transaction); the measurement attributes.

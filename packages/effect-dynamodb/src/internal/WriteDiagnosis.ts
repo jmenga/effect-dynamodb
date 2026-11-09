@@ -77,6 +77,7 @@ import {
   transactionBytes,
   transactWriteBodyBytes,
 } from "./ItemSize.js"
+import * as SentRequest from "./SentRequest.js"
 
 /** DynamoDB's limit on a partition (hash) key value, in UTF-8 bytes. */
 export const PARTITION_KEY_MAX_BYTES = 2048
@@ -165,6 +166,10 @@ export const transactItemTarget = (
  * `callerCondition` is the caller's own `.condition()` on the entry at an
  * index (the rest of its `ConditionExpression` is the library's guard), to
  * say how much of an expression rejected for its size is the caller's.
+ *
+ * `input` is the request input as sent: the object the client received,
+ * after `Capacity` added `ReturnConsumedCapacity`. {@link diagnoseFailure}
+ * fills it from the failure (`SentRequest`); a site leaves it out.
  */
 export type SentWrite =
   | {
@@ -172,17 +177,20 @@ export type SentWrite =
       readonly item: TransactWriteItem
       readonly target: () => TransactItemTarget
       readonly callerCondition?: (() => string | undefined) | undefined
+      readonly input?: Readonly<Record<string, unknown>> | undefined
     }
   | {
       readonly _tag: "Transaction"
       readonly items: ReadonlyArray<TransactWriteItem>
       readonly targets: () => ReadonlyArray<TransactItemTarget>
       readonly callerCondition?: ((index: number) => string | undefined) | undefined
+      readonly input?: Readonly<Record<string, unknown>> | undefined
     }
   | {
       readonly _tag: "Batch"
       readonly items: ReadonlyArray<TransactWriteItem>
       readonly targets: () => ReadonlyArray<TransactItemTarget>
+      readonly input?: Readonly<Record<string, unknown>> | undefined
     }
   | {
       readonly _tag: "TransactGet"
@@ -937,10 +945,10 @@ const emptyKey = (message: string, sent: SentWrite): Diagnosis | undefined => {
 }
 
 /**
- * A request rejected for its body, confirmed: the body `sent` builds measures
- * over {@link REQUEST_MAX_BYTES}. Measured as the site sent it, so a field the
- * client adds below it (`ReturnConsumedCapacity`) is not counted: a request
- * that measures within the limit only by that much is left unconfirmed.
+ * A request rejected for its body, confirmed: the body of the request as sent
+ * (`sent.input`, `ReturnConsumedCapacity` included) measures over
+ * {@link REQUEST_MAX_BYTES}. Without a recorded input (a client the library
+ * did not instrument), the body is rebuilt from the site's entries.
  */
 const oversizedRequest = (sent: SentWrite): Diagnosis | undefined => {
   if (sent._tag === "TransactGet" || sent._tag === "BatchGet") return undefined
@@ -952,12 +960,13 @@ const oversizedRequest = (sent: SentWrite): Diagnosis | undefined => {
       : sent._tag === "Batch"
         ? ("BatchWriteItem" as const)
         : ("item" as const)
+  const input = sent.input
   const measured =
     request === "TransactWriteItems"
-      ? transactWriteBodyBytes({ TransactItems: entries })
+      ? transactWriteBodyBytes(input ?? { TransactItems: entries })
       : request === "BatchWriteItem"
-        ? batchWriteBodyBytes({ RequestItems: batchRequestItems(entries) })
-        : jsonBytes(entries[0]!.Put ?? entries[0]!.Update ?? entries[0]!.Delete)
+        ? batchWriteBodyBytes(input ?? { RequestItems: batchRequestItems(entries) })
+        : jsonBytes(input ?? entries[0]!.Put ?? entries[0]!.Update ?? entries[0]!.Delete)
   if (measured <= REQUEST_MAX_BYTES) return undefined
   const sized = entries.map((item, index) => ({
     index,
@@ -1547,6 +1556,13 @@ export const diagnosedValidationError = (
 // Wiring
 // ---------------------------------------------------------------------------
 
+/** `sent`, carrying the request input as sent when the failure recorded it. */
+const asSent = (sent: Sent, input: Readonly<Record<string, unknown>> | undefined): Sent =>
+  input !== undefined &&
+  (sent._tag === "Item" || sent._tag === "Transaction" || sent._tag === "Batch")
+    ? { ...sent, input }
+    : sent
+
 /**
  * Wrap a site's request so that, on failure only, a diagnosable error is read
  * against what was sent and — when confirmed — rewritten by `rewrite`.
@@ -1571,7 +1587,11 @@ export const diagnoseFailure =
   <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E | E2, R> =>
     Effect.catch(self, (error: E): Effect.Effect<never, E | E2> => {
       if (!isDiagnosable(error)) return Effect.fail(error)
-      const diagnosis = diagnoseRejection(error, options.sent(), options.keys?.() ?? NO_KEYS)
+      const diagnosis = diagnoseRejection(
+        error,
+        asSent(options.sent(), SentRequest.inputOf(error)),
+        options.keys?.() ?? NO_KEYS,
+      )
       if (diagnosis === undefined) return Effect.fail(error)
       if (options.only !== undefined && !options.only.includes(diagnosis._tag)) {
         return Effect.fail(error)

@@ -233,6 +233,41 @@ describeConnected("Batch.write at DynamoDB's 16 MB request limit", () => {
     ),
   )
 
+  describe.each([
+    ["capacity reporting off", Layer.empty],
+    ["capacity reporting on", ConsumedCapacity.layer()],
+    ["capacity reporting on, by index", ConsumedCapacity.layer({ level: "indexes" })],
+  ] as const)("%s", (_label, capacity) => {
+    it.effect("a caller's transaction one byte over 16 MB as sent is named at that size", () =>
+      scenario(
+        (proxy, tableName) =>
+          Effect.gen(function* () {
+            const puts = (prefix: string, chars: number, pad: number) =>
+              Array.from({ length: 10 }, (_, i) =>
+                Notes.put({
+                  noteId: id(prefix, i),
+                  body: nul(chars) + (i === 0 ? "a".repeat(pad) : ""),
+                }),
+              )
+            yield* Transaction.transactWrite(puts("p", 0, 0))
+            const empty = sent(proxy, "TransactWriteItems")[0]!
+            const target = REQUEST_MAX_BYTES + 1
+            const chars = Math.floor((target - empty) / 60)
+            const error = yield* Transaction.transactWrite(
+              puts("n", chars, target - empty - 60 * chars),
+            ).pipe(Effect.flip)
+            expect(sent(proxy, "TransactWriteItems").slice(1)).toEqual([target])
+            expect(error).toBeInstanceOf(ValidationError)
+            expect(String((error as ValidationError).cause)).toContain(
+              `measures the body it sent at ${target} bytes`,
+            )
+            expect(yield* count(tableName)).toBe(10)
+          }),
+        capacity,
+      ),
+    )
+  })
+
   it.effect("a caller's transaction over 16 MB is refused whole and named", () =>
     scenario((proxy, tableName) =>
       Effect.gen(function* () {

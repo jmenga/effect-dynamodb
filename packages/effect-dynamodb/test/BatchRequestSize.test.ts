@@ -373,3 +373,94 @@ describe("a caller's own request over 16 MB is sent once and named", () => {
     }),
   )
 })
+
+// ---------------------------------------------------------------------------
+// The diagnosis measures the request as sent: `ReturnConsumedCapacity` included
+// ---------------------------------------------------------------------------
+
+type Needs = DynamoClient | Table.TableConfig
+
+/** `count` strings, NULs (6 bytes each as sent) bringing them close and ASCII the rest. */
+const filled = (count: number, chars: number, pad: number) =>
+  Array.from({ length: count }, (_, i) => nul(chars) + (i === 0 ? "a".repeat(pad) : ""))
+
+const CALLER_SITES: ReadonlyArray<
+  readonly [
+    label: string,
+    command: string,
+    message: string,
+    count: number,
+    write: (strings: ReadonlyArray<string>) => Effect.Effect<unknown, unknown, Needs>,
+  ]
+> = [
+  [
+    "Transaction.transactWrite",
+    "TransactWriteItems",
+    "transactWrite: DynamoDB rejected the transaction",
+    10,
+    (strings) =>
+      Transaction.transactWrite(strings.map((body, i) => Notes.put({ noteId: id(i), body }))),
+  ],
+  [
+    "EventStore.append",
+    "TransactWriteItems",
+    "EventStore.append: DynamoDB rejected the transaction",
+    10,
+    (strings) =>
+      Ledger.append(
+        { ledgerId: "l1" },
+        strings.map((note) => new Recorded({ note })),
+        0,
+      ),
+  ],
+  [
+    "an aggregate's write",
+    "TransactWriteItems",
+    "Aggregate.write(OrderItem): DynamoDB rejected the transaction",
+    12,
+    (strings) =>
+      Effect.gen(function* () {
+        const db = yield* DynamoClient.make({
+          entities: {},
+          aggregates: { Orders },
+          tables: { MainTable },
+        })
+        return yield* db.aggregates.Orders.create({
+          id: "o1",
+          note: "root",
+          lines: strings.map((note, i) => new Line({ lid: `line${i}`, note })),
+        })
+      }),
+  ],
+]
+
+describe.each(
+  CAPACITY,
+)("a caller's request one byte over 16 MB as sent, %s", (_label, capacity) => {
+  it.effect.each(CALLER_SITES)(
+    "%s: named, at the size it was sent",
+    ([, command, message, count, write]) =>
+      Effect.gen(function* () {
+        // The body as sent with no NULs, then the NULs and ASCII that bring it to 16,777,217.
+        const probe = makeRecordingTable()
+        yield* write(filled(count, 0, 0)).pipe(on(probe, capacity))
+        const empty = sdkBodyBytes(
+          command,
+          probe.requests.find((r) => r.command === command)!.input,
+        )
+        const target = REQUEST_MAX_BYTES + 1
+        const chars = Math.floor((target - empty) / (6 * count))
+        const pad = target - empty - 6 * count * chars
+
+        const table = strictTable()
+        const error = yield* write(filled(count, chars, pad)).pipe(on(table, capacity), Effect.flip)
+        const sent = table.requests.filter((r) => r.command === command)
+        expect(sent.map((r) => sdkBodyBytes(command, r.input))).toEqual([target])
+        expect(error).toBeInstanceOf(ValidationError)
+        const explained = String((error as ValidationError).cause)
+        expect(explained).toContain(message)
+        expect(explained).toContain(`measures the body it sent at ${target} bytes`)
+        expect(table.items.size).toBe(0)
+      }),
+  )
+})

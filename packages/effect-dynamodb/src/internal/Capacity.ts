@@ -25,6 +25,7 @@ import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import { Cause, Context, Effect, Exit, Stream, Tracer } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
+import * as SentRequest from "./SentRequest.js"
 
 // ---------------------------------------------------------------------------
 // Public types (re-exported by ConsumedCapacity.ts)
@@ -973,19 +974,26 @@ const instrumentedCache = new WeakMap<DynamoClientService, DynamoClientService>(
 
 type AnyMethod = (input: Record<string, unknown>) => Effect.Effect<unknown, unknown>
 
+/**
+ * `raw(input)`, its failure recorded with the input it was sent with
+ * (`SentRequest`): the failure-time diagnosis measures the request as sent.
+ */
+const sendAs = (raw: AnyMethod, input: Record<string, unknown>) =>
+  raw(input).pipe(Effect.tapError((error) => Effect.sync(() => SentRequest.remember(error, input))))
+
 const send = (command: Command, raw: AnyMethod, input: Record<string, unknown>) =>
   Effect.withFiber((fiber) => {
     const settings = fiber.getRef(Reporting)
-    if (!settings.enabled) return raw(input)
+    if (!settings.enabled) return sendAs(raw, input)
     const current = fiber.getRef(CurrentOperation)
-    if (current === SUPPRESSED) return raw(input)
+    if (current === SUPPRESSED) return sendAs(raw, input)
     const flagged =
       input.ReturnConsumedCapacity !== undefined
         ? input
         : { ...input, ReturnConsumedCapacity: settings.level === "indexes" ? "INDEXES" : "TOTAL" }
     const recorded = Effect.withFiber((inner) => {
       const scope = liveScope(inner.getRef(CurrentOperation))
-      return raw(flagged).pipe(
+      return sendAs(raw, flagged).pipe(
         Effect.onExit((exit) =>
           scope !== undefined ? record(scope, command, input, exit) : Effect.void,
         ),
