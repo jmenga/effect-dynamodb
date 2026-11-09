@@ -14,9 +14,11 @@
  * that 1.39.0 dropped (a number, a bigint, a number for an optional `NumberFromString`) or fetched
  * under a key `Entity.put` never wrote (a string codec) is now fetched by the key `put` wrote; an
  * id of no type of the key composite (`"5"` for a number), or one no item is keyed by (`Infinity`),
- * fails with `EDD-9131`. Every refusal comes before any request. A union element is read as the
- * member it is, so one whose member declares the entity's field a string keeps it, where 1.39.0
- * replaced it with the fetched entity.
+ * fails with `EDD-9131`, as does one `put` refuses deeper in it (`Infinity` in a struct, an `Option`
+ * or a `Result`), whose key text names an item of another value. Every refusal comes before any
+ * request. A union element is read as the member the input schema decodes it as, so one whose member
+ * declares the entity's field a string keeps it, where 1.39.0 replaced it with the fetched entity, and
+ * a checked nested union or a member typing its own id decides as that decode does.
  */
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
@@ -45,10 +47,30 @@ import {
   singleKey,
   UNFETCHABLE,
   UNKEYABLE,
+  UNSTORABLE,
   WRITES_AS,
 } from "./helpers/RefHydrationShapes.js"
 
 type Row = Record<string, AttributeValue>
+
+/** `put` of the shape's entity, an item of it given, on a recording table. */
+const runPut = (shape: Shape, item: Record<string, unknown>) => {
+  const table = makeRecordingTable()
+  const Base = Table.make({
+    schema: shape.schema ?? schema,
+    entities: shape.entities,
+  } as never) as any
+  return Effect.gen(function* () {
+    const edb: any = yield* DynamoClient.make({
+      entities: shape.entities,
+      tables: { Base },
+    } as never) as Effect.Effect<any>
+    return yield* Effect.exit(edb.entities.Lines.put(item).asEffect() as Effect.Effect<unknown>)
+  }).pipe(
+    Effect.provide(Base.layer({ name: "t" })),
+    Effect.provide(table.layer),
+  ) as unknown as Effect.Effect<Exit.Exit<unknown, unknown>>
+}
 type Request = { readonly command: string; readonly input: any }
 
 /** The keys a recorded `BatchGetItem` asked for. */
@@ -60,6 +82,10 @@ const batchGetKeys = (requests: ReadonlyArray<Request>) =>
         request.input.RequestItems as Record<string, { Keys: ReadonlyArray<Row> }>,
       ).flatMap((entry) => entry.Keys),
     )
+
+/** How many `BatchGetItem` requests were sent. */
+const fetches = (requests: ReadonlyArray<string>) =>
+  requests.filter((command) => command === "BatchGetItem").length
 
 /** The key of a row: its `pk` and `sk`. */
 const keyOf = (row: Row) => ({ pk: row.pk, sk: row.sk })
@@ -80,7 +106,10 @@ const refusal = (create: Exit.Exit<unknown, unknown>) => {
 /** Seeds the entity's rows, then runs `create` and `get` on a recording table. */
 const run = (shape: Shape) => {
   const table = makeRecordingTable()
-  const Base = Table.make({ schema, entities: shape.entities } as never) as any
+  const Base = Table.make({
+    schema: shape.schema ?? schema,
+    entities: shape.entities,
+  } as never) as any
   const A = shape.make(Base)
   const Tb = { ...Base, aggregates: { A } }
   return Effect.gen(function* () {
@@ -267,10 +296,95 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
       const message = refusal(
         (yield* run(SHAPES["one, an entity keyed by a number, given Infinity"]!())).create,
       )
-      expect(message).toContain("DynamoDB stores no infinite number")
-      expect(message).toContain('so `put` refuses one for "lineId"')
+      expect(message).toContain("`put` refuses it, as DynamoDB can't store it")
+      expect(message).toContain('"lineId": Special numeric value Infinity is not allowed.')
+      expect(message).toContain("[EDD-9124]")
     }),
   )
+
+  for (const [label, at] of Object.entries(UNSTORABLE)) {
+    it.effect(`${label}: create fails with EDD-9131 as put refuses the id, nothing fetched`, () =>
+      Effect.gen(function* () {
+        const shape = SHAPES[label]!()
+        const { create, requests, rows } = yield* run(shape)
+        const message = refusal(create)
+        expect(message).toContain("[EDD-9131]")
+        expect(message).toContain('entity "Line" can be keyed by: `put` refuses it')
+        expect(message).toContain(
+          `(${at}: Special numeric value Infinity is not allowed. [EDD-9124])`,
+        )
+        expect(message).toContain("Nothing was fetched or written.")
+        // Not even the item of another value its key text names, seeded by 1.39.0's own `put`.
+        expect(requests).toEqual([])
+        expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.seeded))
+        // `put` refuses the same id, with the same words.
+        const given = (shape.input.part ?? shape.input) as { readonly lineId: unknown }
+        const put = yield* runPut(shape, { lineId: given.lineId, f: 5 })
+        expect(refusal(put)).toContain(`${at}: Special numeric value Infinity is not allowed.`)
+        // 1.39.0 refused it as no string, before any request.
+        expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
+      }),
+    )
+  }
+
+  for (const sub of [false, true]) {
+    const at = sub ? "sub-aggregate, " : ""
+    it.effect(
+      `${at}a checked union first: its check decides the member, as the input schema's`,
+      () =>
+        Effect.gen(function* () {
+          const label = `${at}many, element a union whose first member is a checked union of members holding no ref`
+          const shape = SHAPES[label]!()
+          const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
+          const sheets = (input: any) => (sub ? input.part.lines : input.lines)
+          const decode = (input: Record<string, any>) =>
+            sheets(Schema.decodeUnknownSync(A.inputSchema)(input))
+          // Its check refuses the first member, so the input schema takes the value as the one
+          // wrapping the entity, and `create` hydrates it.
+          expect(decode(shape.input)).toEqual([{ kind: "a", lineId: "l", qty: 1 }])
+          const hydrated = yield* run(shape)
+          expect(fetches(hydrated.requests)).toBe(1)
+          // Its check passes: the input schema takes it as the first member, and so does `create`.
+          const passing = sub
+            ? { ...shape.input, part: { lines: [{ kind: "a", lineId: "l", qty: 11 }] } }
+            : { ...shape.input, lines: [{ kind: "a", lineId: "l", qty: 11 }] }
+          expect(decode(passing)).toEqual([{ kind: "a", qty: 11 }])
+          const kept = yield* run({ ...shape, input: passing })
+          expect(fetches(kept.requests)).toBe(0)
+          expect(Exit.isSuccess(kept.create) && sheets(kept.create.value)).toEqual([
+            { kind: "a", qty: 11 },
+          ])
+        }),
+    )
+
+    it.effect(`${at}a member typing its own id is judged by the ids the members take`, () =>
+      Effect.gen(function* () {
+        const label = `${at}many, element a union whose later member declares the entity's field a string and its id a number`
+        const shape = SHAPES[label]!()
+        const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
+        const sheets = (input: any) => (sub ? input.part.lines : input.lines)
+        const given = { kind: "a", line: "KEEP", lineId: 123, qty: 1 }
+        // The member wrapping the entity takes a string id, so a number is the later member's.
+        expect(sheets(Schema.decodeUnknownSync(A.inputSchema)(shape.input))).toEqual([given])
+        const { create, requests } = yield* run(shape)
+        expect(Exit.isSuccess(create) && sheets(create.value)).toEqual([given])
+        expect(fetches(requests)).toBe(0)
+        // A string id is the wrapping member's: hydrated.
+        const byString = sub
+          ? { ...shape.input, part: { lines: [{ kind: "a", lineId: "l", qty: 1 }] } }
+          : { ...shape.input, lines: [{ kind: "a", lineId: "l", qty: 1 }] }
+        const hydrated = yield* run({
+          ...shape,
+          seed: [["Lines", { lineId: "l", f: 5 }]],
+          input: byString,
+        })
+        expect(Exit.isSuccess(hydrated.create) && sheets(hydrated.create.value)).toEqual([
+          { kind: "a", line: { lineId: "l", f: 5 }, qty: 1 },
+        ])
+        expect(fetches(hydrated.requests)).toBe(1)
+      }),
+    )
+  }
 
   it.effect(
     "an element a member of which declares the entity's field a scalar, sharing its discriminator, is stored as given",

@@ -8,8 +8,9 @@
  * (union elements, a key composite in both halves, `Date` and `NumberFromString` keys, alone or in a
  * wrapper) write and read what it did; an id of the key composite's own type 1.39.0 dropped, or
  * fetched under a key `put` never wrote (a string codec), is fetched by the key `put` wrote; an id
- * of no type of it, or one no item is keyed by, fails with `EDD-9131`, nothing written. A union
- * element is read as the member it is.
+ * of no type of it, or one no item is keyed by (`put` refuses it, alone or inside a struct, an
+ * `Option` or a `Result`), fails with `EDD-9131`, nothing written. A union element is read as the
+ * member the input schema decodes it as.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -35,6 +36,7 @@ import {
   sharedDiscriminator,
   UNFETCHABLE,
   UNKEYABLE,
+  UNSTORABLE,
   WRITES_AS,
 } from "./helpers/RefHydrationShapes.js"
 
@@ -76,7 +78,10 @@ let tables = 0
 /** Seeds the entity's rows on a fresh table, then runs `create` and `get`. */
 const run = (shape: Shape) => {
   const tableName = `ref-hydration-${Date.now()}-${tables++}`
-  const Base = Table.make({ schema, entities: shape.entities } as never) as any
+  const Base = Table.make({
+    schema: shape.schema ?? schema,
+    entities: shape.entities,
+  } as never) as any
   const A = shape.make(Base)
   const Tb = { ...Base, aggregates: { A } }
   return Effect.acquireUseRelease(
@@ -208,6 +213,7 @@ describeConnected(
       ["one, an entity keyed by a number, given a numeric string", "[EDD-9131]"],
       ["one and one, the second an entity keyed by two composites", "[EDD-9129]"],
       ...Object.keys(UNKEYABLE).map((label) => [label, "[EDD-9131]"] as const),
+      ...Object.keys(UNSTORABLE).map((label) => [label, "[EDD-9131]"] as const),
     ] as const) {
       it.effect(`${label}: create fails with ${code}, nothing written`, () =>
         Effect.gen(function* () {

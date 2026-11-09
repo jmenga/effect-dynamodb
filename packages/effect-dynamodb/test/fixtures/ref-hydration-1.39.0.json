@@ -2758,6 +2758,589 @@
     }
    ],
    "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by a struct, given one holding Infinity": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "a": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_[object object]"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "a": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_[object object]"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by a struct, given one holding Infinity, its keys escaped": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "a": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_[object%20object]"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "a": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_[object%20object]"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by an Option, given Some(Infinity)": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_some(5)"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_some(5)"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "one, an entity keyed by a Result, given a success of Infinity": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "_op": {
+        "S": "Success"
+       },
+       "success": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Success"
+       },
+       "~effect/Result": {
+        "M": {}
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_success(5)"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "_op": {
+        "S": "Success"
+       },
+       "success": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Success"
+       },
+       "~effect/Result": {
+        "M": {}
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_success(5)"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "sub-aggregate, one, an entity keyed by a struct, given one holding Infinity": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "a": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_[object object]"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "M": {
+       "a": {
+        "N": "5"
+       }
+      }
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_[object object]"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element a union whose first member is a checked union of members holding no ref": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000001"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}"
+  },
+  "sub-aggregate, many, element a union whose first member is a checked union of members holding no ref": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "side": {
+      "N": "1"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     },
+     "sk": {
+      "S": "$hydrate#v1#sheetline#side#0000000000000001#0000000000000001"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"kind\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}}"
+  },
+  "many, element a union whose later member declares the entity's field a string and its id a number": {
+   "make": "ok",
+   "seeded": [],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":\"KEEP\",\"lineId\":123,\"qty\":1}]}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "kind": {
+      "S": "a"
+     },
+     "line": {
+      "S": "KEEP"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     },
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000001"
+     },
+     "lineId": {
+      "N": "123"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"kind\":\"a\",\"line\":\"KEEP\",\"lineId\":123,\"qty\":1}]}"
+  },
+  "sub-aggregate, many, element a union whose later member declares the entity's field a string and its id a number": {
+   "make": "ok",
+   "seeded": [],
+   "create": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"kind\":\"a\",\"line\":\"KEEP\",\"lineId\":123,\"qty\":1}]}}",
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "side": {
+      "N": "1"
+     },
+     "kind": {
+      "S": "a"
+     },
+     "line": {
+      "S": "KEEP"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     },
+     "sk": {
+      "S": "$hydrate#v1#sheetline#side#0000000000000001#0000000000000001"
+     },
+     "lineId": {
+      "N": "123"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"kind\":\"a\",\"line\":\"KEEP\",\"lineId\":123,\"qty\":1}]}}"
   }
  }
 }

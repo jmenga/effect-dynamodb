@@ -5,8 +5,10 @@
  * that is a union wrapping the entity (at the root and in a sub-aggregate); an entity whose key
  * composite is in both halves of its key; entities keyed by a number, a bigint, a `Date`, a
  * `NumberFromString` and a string codec, alone or in a wrapper; an element declaring the entity's
- * field a string; union elements with a nullable discriminator, members sharing a discriminator and a
- * nested union; ids no item is keyed by; and two edges, the second over an entity no one id keys.
+ * field a string; union elements with a nullable discriminator, members sharing a discriminator, a
+ * nested union, a checked nested union first and a member typing its own id (at the root and in a
+ * sub-aggregate); ids no item is keyed by, and ids `put` refuses inside a struct, an `Option` or a
+ * `Result`, keys escaped or not; and two edges, the second over an entity no one id keys.
  * Shared by `AggregateRefHydration.test.ts` (a recording table) and
  * `connected.aggregate-ref-hydration.test.ts` (DynamoDB Local).
  */
@@ -14,7 +16,7 @@ import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Schema, SchemaGetter } from "effect"
+import { Option, Result, Schema, SchemaGetter } from "effect"
 import * as Aggregate from "../../src/Aggregate.js"
 import * as Entity from "../../src/Entity.js"
 
@@ -50,10 +52,27 @@ const twoKey = {
   pk: { field: "pk", composite: ["tenant"] },
   sk: { field: "sk", composite: ["lineId"] },
 }
-export const aggregate = (model: Schema.Top, base: unknown, edges: Record<string, unknown>) =>
+/** The same application namespace, its keys escaped (`escapeKeys: true`). */
+export const escapedSchema = DynamoSchema.make({ name: "hydrate", version: 1, escapeKeys: true })
+/**
+ * The same application namespace, its keys not escaped whatever the default is: for rows whose key
+ * text holds a character `escapeKeys: true` escapes (a struct's `[object object]`), which the
+ * `test:escape-on` runs would otherwise key elsewhere than the rows 1.39.0 wrote.
+ */
+export const unescapedSchema = DynamoSchema.make({
+  name: "hydrate",
+  version: 1,
+  escapeKeys: false,
+})
+export const aggregate = (
+  model: Schema.Top,
+  base: unknown,
+  edges: Record<string, unknown>,
+  over: DynamoSchema.DynamoSchema = schema,
+) =>
   (Aggregate.make as any)(model, {
     table: base,
-    schema,
+    schema: over,
     pk: { field: "pk", composite: ["id"] },
     collection: { name: "agg" },
     root: { entityType: "Root" },
@@ -72,6 +91,8 @@ export const lines = (model: unknown, primaryKey: unknown) =>
   Entity.make({ model, entityType: "Line", primaryKey } as never) as any
 
 export type Shape = {
+  /** The application namespace, when not {@link schema}. */
+  readonly schema?: DynamoSchema.DynamoSchema
   readonly entities: Record<string, unknown>
   readonly make: (base: unknown) => unknown
   /** Each row to seed, as the entity member that puts it and the item. */
@@ -270,7 +291,13 @@ export const Prefixed = Schema.String.pipe(
 
 /** A `one` edge over an entity keyed by `lineId` of `keySchema`, seeded with `id`, given `given`. */
 const keyedBy =
-  (keySchema: Schema.Top, id: unknown, given: unknown, optional = false) =>
+  (
+    keySchema: Schema.Top,
+    id: unknown,
+    given: unknown,
+    optional = false,
+    over: DynamoSchema.DynamoSchema = schema,
+  ) =>
   (): Shape => {
     class Line extends Schema.Class<Line>("Line")({
       lineId: keySchema as never,
@@ -285,11 +312,15 @@ const keyedBy =
       line: optional ? Schema.optional(Line) : Line,
     })
     return {
+      ...(over === schema ? {} : { schema: over }),
       entities: { Lines },
       make: (base) =>
-        aggregate(Model, base, {
-          line: Aggregate.one({ entityType: "AggLine", entity: Lines } as never),
-        }),
+        aggregate(
+          Model,
+          base,
+          { line: Aggregate.one({ entityType: "AggLine", entity: Lines } as never) },
+          over,
+        ),
       seed: [["Lines", { lineId: id, f: 5 }]],
       input: { id: "a", lineId: given },
     }
@@ -574,6 +605,151 @@ const reviewedAgain: Record<string, () => Shape> = {
   ),
 }
 
+/** A struct, holding a number: `{ a: Infinity }` and `{ a: 5 }` compose one key text. */
+const Pair = () => Schema.Struct({ a: Schema.Number })
+
+/** A `many` element whose first member is a checked union of members declaring the field a string. */
+export const checkedNestedSheet = (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("a"),
+        line: Schema.optional(Schema.String),
+        qty: Schema.Number,
+      }),
+      Schema.Struct({
+        kind: Schema.Literal("b"),
+        line: Schema.optional(Schema.String),
+        qty: Schema.Number,
+      }),
+    ]).check(Schema.makeFilter((sheet: { readonly qty: number }) => sheet.qty > 10)),
+    Schema.Struct({
+      kind: Schema.Literal("a"),
+      line: Line.pipe(DynamoModel.ref),
+      qty: Schema.Number,
+    }),
+  ])
+
+/** A `many` element whose later member declares the entity's field a string and its id a number. */
+export const typedIdSheet = (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("a"),
+      line: Line.pipe(DynamoModel.ref),
+      qty: Schema.Number,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("a"),
+      line: Schema.String,
+      lineId: Schema.Number,
+      qty: Schema.Number,
+    }),
+  ])
+
+/** A `many` edge over `Lines` with `sheet`'s element, at the root or in a sub-aggregate `part`. */
+const sheetShape =
+  (sheet: (Line: Schema.Top) => Schema.Top, element: unknown, seeded: boolean, sub: boolean) =>
+  (): Shape => {
+    const { Line, model } = lineClass(true)
+    const Lines = lines(model, singleKey)
+    const edge = () =>
+      Aggregate.many({
+        entityType: "SheetLine",
+        entity: Lines,
+        sk: { composite: ["qty"] },
+      } as never)
+    const Part = Schema.Struct({ lines: Schema.Array(sheet(Line)) })
+    return {
+      entities: { Lines },
+      make: (base) => {
+        if (!sub) {
+          return aggregate(
+            Schema.Struct({ id: Schema.String, lines: Schema.Array(sheet(Line)) }),
+            base,
+            { lines: edge() },
+          )
+        }
+        const Sub = (Aggregate.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: { lines: edge() },
+        })
+        return aggregate(Schema.Struct({ id: Schema.String, part: Part }), base, {
+          part: Sub.with({ discriminator: { side: 1 } }),
+        })
+      },
+      seed: seeded ? [["Lines", { lineId: "l", f: 5 }]] : [],
+      input: sub ? { id: "a", part: { lines: [element] } } : { id: "a", lines: [element] },
+    }
+  }
+
+/** A sub-aggregate `part` with a `one` edge over an entity keyed by a struct, given `given`. */
+const subKeyedByPair = (given: unknown) => (): Shape => {
+  class Line extends Schema.Class<Line>("Line")({ lineId: Pair(), f: Schema.Number }) {}
+  const Lines = lines(DynamoModel.configure(Line, { lineId: { identifier: true } }), singleKey)
+  const Part = Schema.Struct({ line: Line })
+  return {
+    entities: { Lines },
+    make: (base) => {
+      const Sub = (Aggregate.make as any)(Part, {
+        root: { entityType: "Part" },
+        edges: { line: Aggregate.one({ entityType: "AggLine", entity: Lines } as never) },
+      })
+      return aggregate(
+        Schema.Struct({ id: Schema.String, part: Part }),
+        base,
+        { part: Sub.with({ discriminator: { side: 1 } }) },
+        unescapedSchema,
+      )
+    },
+    seed: [["Lines", { lineId: { a: 5 }, f: 5 }]],
+    input: { id: "a", part: { lineId: given } },
+    schema: unescapedSchema,
+  }
+}
+
+/**
+ * Shapes a third review found: ids `put` refuses as DynamoDB can't store them, deeper than a number
+ * (their key text names an item of another value: `{ a: Infinity }` and `{ a: 5 }` compose one), a
+ * union element whose first member is a checked union, and one whose later member types its own id.
+ */
+const reviewedThird: Record<string, () => Shape> = {
+  "one, an entity keyed by a struct, given one holding Infinity": keyedBy(
+    Pair(),
+    { a: 5 },
+    { a: Infinity },
+    false,
+    unescapedSchema,
+  ),
+  "one, an entity keyed by a struct, given one holding Infinity, its keys escaped": keyedBy(
+    Pair(),
+    { a: 5 },
+    { a: Infinity },
+    false,
+    escapedSchema,
+  ),
+  "one, an entity keyed by an Option, given Some(Infinity)": keyedBy(
+    Schema.Option(Schema.Number),
+    Option.some(5),
+    Option.some(Infinity),
+  ),
+  "one, an entity keyed by a Result, given a success of Infinity": keyedBy(
+    Schema.Result(Schema.Number, Schema.String),
+    Result.succeed(5),
+    Result.succeed(Infinity),
+  ),
+  "sub-aggregate, one, an entity keyed by a struct, given one holding Infinity": subKeyedByPair({
+    a: Infinity,
+  }),
+  "many, element a union whose first member is a checked union of members holding no ref":
+    sheetShape(checkedNestedSheet, { kind: "a", lineId: "l", qty: 1 }, true, false),
+  "sub-aggregate, many, element a union whose first member is a checked union of members holding no ref":
+    sheetShape(checkedNestedSheet, { kind: "a", lineId: "l", qty: 1 }, true, true),
+  "many, element a union whose later member declares the entity's field a string and its id a number":
+    sheetShape(typedIdSheet, { kind: "a", line: "KEEP", lineId: 123, qty: 1 }, false, false),
+  "sub-aggregate, many, element a union whose later member declares the entity's field a string and its id a number":
+    sheetShape(typedIdSheet, { kind: "a", line: "KEEP", lineId: 123, qty: 1 }, false, true),
+}
+
 /**
  * A union element whose two members share `kind: "a"`: one declares the entity's field a string and
  * a `lineId` of its own, the other wraps the entity. `refFirst` puts the wrapping member first.
@@ -672,6 +848,7 @@ export const SHAPES: Record<string, () => Shape> = {
   "one, an entity keyed by two composites": () => twoComposites("one"),
   ...reviewed,
   ...reviewedAgain,
+  ...reviewedThird,
 }
 
 export const byKey = (rows: ReadonlyArray<Row>) =>
@@ -709,6 +886,10 @@ export const CONTROLS = [
   "one, an entity keyed by an optional NumberFromString, given its encoded string",
   "one, an entity keyed by an optional BigIntFromString, given its encoded string",
   "one, an entity keyed by a NumberFromString or a literal, given its encoded string",
+  "many, element a union whose first member is a checked union of members holding no ref",
+  "sub-aggregate, many, element a union whose first member is a checked union of members holding no ref",
+  "many, element a union whose later member declares the entity's field a string and its id a number",
+  "sub-aggregate, many, element a union whose later member declares the entity's field a string and its id a number",
 ]
 export const UNFETCHABLE = [
   "many, element wraps an entity keyed by two composites",
@@ -730,6 +911,19 @@ export const NOW_FETCHED = [
   "one, an entity keyed by an optional NumberFromString, given a number",
   "one, an entity keyed by an optional string codec",
 ]
+/**
+ * Ids `put` refuses as DynamoDB can't store them, deeper than a number, each with an item of another
+ * value seeded under the key text the id composes (`{ a: Infinity }` and `{ a: 5 }` compose one):
+ * each fails with `EDD-9131` naming what `put` refuses, nothing fetched, where 1.39.0 refused it
+ * as no string.
+ */
+export const UNSTORABLE = {
+  "one, an entity keyed by a struct, given one holding Infinity": '"lineId.a"',
+  "one, an entity keyed by a struct, given one holding Infinity, its keys escaped": '"lineId.a"',
+  "one, an entity keyed by an Option, given Some(Infinity)": '"lineId.value"',
+  "one, an entity keyed by a Result, given a success of Infinity": '"lineId.success"',
+  "sub-aggregate, one, an entity keyed by a struct, given one holding Infinity": '"lineId.a"',
+} as const
 /** Ids no item can be keyed by, which 1.39.0 dropped: each fails with `EDD-9131`, nothing fetched. */
 export const UNKEYABLE = {
   "one, an entity keyed by a number, given Infinity": "is given Infinity",

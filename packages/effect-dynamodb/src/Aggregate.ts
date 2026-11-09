@@ -123,7 +123,12 @@ import {
   transactItemTarget,
   withCause,
 } from "./internal/WriteDiagnosis.js"
-import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
+import {
+  fromAttributeMap,
+  toAttributeMap,
+  toAttributeValue,
+  type UnstorableValue,
+} from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
 export type {
@@ -184,7 +189,6 @@ import {
   manyEdgePaths,
   manyElementFields,
   manyElementSchema,
-  refIdStorable,
   refIdValue,
   refKeyComposite,
   refKeyComposites,
@@ -4481,6 +4485,12 @@ const stripMetadata = (
 // Internal: Ref hydration (aggregate-level, edge-driven)
 // ---------------------------------------------------------------------------
 
+/** An edge's entity as hydration fetches it: an operational entity, a pure definition promoted. */
+type RuntimeRefEntity = RefEntity & {
+  readonly get: (key: any) => any
+  readonly _unstorableKey: (record: Record<string, unknown>) => UnstorableValue | undefined
+}
+
 /** A ref request collected from walking edges */
 interface RefRequest {
   readonly entity: RefEntity
@@ -4529,8 +4539,8 @@ const refIdText = (id: unknown): string =>
  * fetch referenced entities, and replace IDs with hydrated domain data.
  *
  * Every id is judged before anything is fetched: an id of an entity no one id names
- * (`EDD-9129`), then an id that is no value of the entity's key composite (`EDD-9131`), then
- * one with no key text (`EDD-9096`). Each is then fetched by the key `Entity.put` wrote for it,
+ * (`EDD-9129`), then an id that is no value of the entity's key composite, or one `put` refuses as
+ * DynamoDB can't store it (`EDD-9131`), then one with no key text (`EDD-9096`). Each is then fetched by the key `Entity.put` wrote for it,
  * composed as `Batch.get` composes an entity's own `get` (`composePrimaryKeyOrFail`), once per key.
  */
 const hydrateAggregateRefs = (
@@ -4585,11 +4595,30 @@ const hydrateAggregateRefs = (
       })
     }
 
+    // `RefEntity` is the pure structural bound (no `get` — issue #66): aggregate
+    // edges can be authored from AWS-free `@effect-dynamodb/schema` definitions,
+    // which carry no runtime `.get`/operations. Ref hydration is a runtime
+    // operation, so promote a pure edge target to a full operational Entity (a
+    // thin op-attach over its retained `_data`); runtime-authored targets already
+    // carry `.get` and pass through untouched. Mirrors `DynamoClient.make()`'s
+    // entity binding. Promoted once per distinct edge entity type per hydrate (issue #71).
+    const runtimeEntities = new Map<string, RuntimeRefEntity>()
+    for (const [entityType, { entity }] of byEntityType) {
+      runtimeEntities.set(
+        entityType,
+        (typeof (entity as { readonly get?: unknown }).get === "function"
+          ? entity
+          : entityFromDefinition(entity as unknown as EntityDefinition)) as RuntimeRefEntity,
+      )
+    }
+
     // An id that is no value of the key composite names no item: up to 1.39.0 a string was
     // fetched under a key no `put` writes (`lineid_5` for a number), and anything else was dropped.
-    // Nor does one `put` can't store (an infinite number): it was fetched, and found nothing.
+    // Nor does one `put` refuses as DynamoDB can't store it (an infinite number, at any depth of a
+    // struct, an `Option` or a `Result`): its key text can name an item of another value
+    // (`{ a: Infinity }` and `{ a: 5 }` compose one key), which was fetched in its place.
     for (const req of refRequests) {
-      const composite = refKeyComposite(req.entity)
+      const composite = refKeyComposite(req.entity)!
       if (Option.isNone(req.id)) {
         return yield* new ValidationError({
           entityType: aggregateName,
@@ -4602,15 +4631,18 @@ const hydrateAggregateRefs = (
           ),
         })
       }
-      if (!refIdStorable(req.entity, req.id.value)) {
+      const unstorable = runtimeEntities
+        .get(req.entity.entityType)!
+        ._unstorableKey({ [composite]: req.id.value })
+      if (unstorable !== undefined) {
         return yield* new ValidationError({
           entityType: aggregateName,
           operation: "aggregate.create",
           cause: new Error(
             `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
-              `which no item of entity "${req.entity.entityType}" can be keyed by: DynamoDB stores ` +
-              `no infinite number, so \`put\` refuses one for "${composite}". Give a finite id. ` +
-              `Nothing was fetched or written.`,
+              `which no item of entity "${req.entity.entityType}" can be keyed by: \`put\` ` +
+              `refuses it, as DynamoDB can't store it (${unstorable.describe()}). Give an id ` +
+              `DynamoDB can store. Nothing was fetched or written.`,
           ),
         })
       }
@@ -4621,26 +4653,12 @@ const hydrateAggregateRefs = (
     // under lowercase casing), is fetched once: `BatchGetItem` refuses a repeated key.
     const fetches: Array<{
       readonly entityType: string
-      readonly runtimeEntity: RefEntity & { readonly get: (key: any) => any }
+      readonly runtimeEntity: RuntimeRefEntity
       readonly ops: Array<{ readonly lookupKey: string; readonly req: RefRequest }>
     }> = []
     const lookupKeys = new Map<RefRequest, string>()
     for (const [entityType, { entity, reqs }] of byEntityType) {
-      // `RefEntity` is the pure structural bound (no `get` — issue #66): aggregate
-      // edges can be authored from AWS-free `@effect-dynamodb/schema` definitions,
-      // which carry no runtime `.get`/operations. Ref hydration is a runtime
-      // operation, so promote a pure edge target to a full operational Entity (a
-      // thin op-attach over its retained `_data`); runtime-authored targets already
-      // carry `.get` and pass through untouched. Mirrors `DynamoClient.make()`'s
-      // entity binding. The loop is already grouped by entity type, so this promotes
-      // once per distinct edge entity type per hydrate (issue #71).
-      const runtimeEntity = (
-        typeof (entity as { readonly get?: unknown }).get === "function"
-          ? entity
-          : entityFromDefinition(entity as unknown as EntityDefinition)
-      ) as RefEntity & {
-        readonly get: (key: any) => any
-      }
+      const runtimeEntity = runtimeEntities.get(entityType)!
       const composite = refKeyComposite(entity)!
       const ops: Array<{ readonly lookupKey: string; readonly req: RefRequest }> = []
       const seen = new Set<string>()

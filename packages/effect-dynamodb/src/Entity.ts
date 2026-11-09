@@ -778,6 +778,17 @@ export interface Entity<
   ) => globalThis.Record<string, unknown>
 
   /**
+   * @internal What in a caller's DOMAIN key record DynamoDB can't store, judged as `put` judges
+   * its item (`refuseUnstorable`): each composite in the form `put` stores it in, marshalled, a
+   * `NaN` left to key composition (`EDD-9096`). `undefined` when it all stores. For a path holding
+   * an id it fetches by (aggregate ref hydration): no item can be keyed by a value `put` refuses,
+   * and its key text may name an item of another value.
+   */
+  readonly _unstorableKey: (
+    record: globalThis.Record<string, unknown>,
+  ) => UnstorableValue | undefined
+
+  /**
    * @internal Rename domain field names to their stored DynamoDB attribute
    * names (`storedAs`), in place. `Entity.put` applies this; the transact/batch
    * put builder must apply the SAME one or a `storedAs` entity gets a
@@ -2717,12 +2728,16 @@ const makeImpl = <
     )
   }
 
+  /** What in an encoded payload DynamoDB can't store, as `put` finds it when it marshals. */
+  const unstorableOf = (encoded: globalThis.Record<string, unknown>): UnstorableValue | undefined =>
+    unstorableIn(fieldsToStore(encoded))
+
   /** Refuses a value DynamoDB can't store, for a path about to read or send something. */
   const refuseUnstorable = (
     encoded: unknown,
     operation: string,
   ): Effect.Effect<void, ValidationError> => {
-    const unstorable = unstorableIn(fieldsToStore(encoded as globalThis.Record<string, unknown>))
+    const unstorable = unstorableOf(encoded as globalThis.Record<string, unknown>)
     return unstorable === undefined
       ? Effect.void
       : Effect.fail(
@@ -14992,6 +15007,8 @@ const makeImpl = <
     _serializeSparseFields: serializeSparseFields,
     _keyForm: keyForm,
     _domainKeyForm: domainKeyForm,
+    _unstorableKey: (record: globalThis.Record<string, unknown>) =>
+      unstorableOf(compositeStoredForm(record)),
     _renameToDynamo: renameToDynamo,
     _fieldOfAttribute: fieldOfAttribute,
     _incarnationToken: stampsIncarnation,

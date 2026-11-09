@@ -19,6 +19,7 @@ import {
   type ResolvedSystemFields,
   resolveSystemFields,
   substituteSchemaDeep,
+  withMetadataOf,
 } from "./EntitySchemas.js"
 import {
   extractArrayElement as extractArrayElementImpl,
@@ -495,19 +496,6 @@ export const refIdValue = (entity: RefEntity, value: unknown): Option.Option<unk
   return Option.isSome(fromJson) ? fromJson : Schema.decodeUnknownOption(codec)(value)
 }
 
-/**
- * Whether an id ({@link refIdValue}'s value) is one an item can be keyed by: its stored form, its key
- * composite's field encoding it, is no infinite number. DynamoDB stores none, so `put` refuses one.
- */
-export const refIdStorable = (entity: RefEntity, id: unknown): boolean => {
-  const field = refIdField(entity)
-  const stored =
-    field === undefined
-      ? id
-      : Option.getOrElse(Schema.encodeUnknownOption(field as Schema.Codec<unknown>)(id), () => id)
-  return !(typeof stored === "number" && (stored === Infinity || stored === -Infinity))
-}
-
 /** A type AST's members, `undefined` and `null` left out: a union's, flattened, or the type itself. */
 const astMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> => {
   if (SchemaAST.isUnion(ast)) return ast.types.flatMap((member) => astMembers(member))
@@ -599,56 +587,75 @@ const matchesLiterals = (
     return literals.includes(given)
   })
 
-/** A member of a `many` element's schema, as `create` judges a value of it. */
-interface ElementMember {
+/** A member of a `many` element's schema no union of it breaks down further, as `create` judges it. */
+interface ElementLeaf {
   /** Whether a value of this member holds a ref of the entity, under `${field}Id`. */
   readonly holdsRef: boolean
   /** Its object properties, `undefined` for a member that isn't an object. */
   readonly properties: ReadonlyArray<SchemaAST.PropertySignature> | undefined
-  /**
-   * Whether a value is one of this member as the element's input takes it
-   * (`deriveElementInputSchema`): the entity's field as `${field}Id`, a stamped date optional, and
-   * each field in its domain or its stored form.
-   */
-  readonly takes: (value: unknown) => boolean
+  /** `null` or `undefined`, which no element value is. */
+  readonly empty: boolean
 }
 
-const elementMembers = new WeakMap<
-  AggregateStamps | typeof NO_STAMPS,
-  WeakMap<Schema.Top, WeakMap<RefEntity, ReadonlyArray<ElementMember>>>
->()
-const NO_STAMPS = { config: undefined, names: new Set<string>() } satisfies AggregateStamps
-
-/** A schema's decode that takes a value in its domain form or its stored form, either side. */
-const takesEitherForm = (schema: Schema.Top): ((value: unknown) => boolean) => {
-  try {
-    const tolerant = substituteSchemaDeep(schema, {
-      tolerantTransforms: true,
-      decodeOnly: true,
-      domainValues: true,
-    })
-    const decode = Schema.decodeUnknownOption(tolerant as Schema.Codec<unknown>)
-    return (value) => Option.isSome(decode(value))
-  } catch {
-    // A schema the substitution can't walk: the member is judged by its literals alone.
-    return () => false
+/** A member as `create` judges it, read off the member as declared. */
+const elementLeaf = (declared: Schema.Top, name: string): ElementLeaf => {
+  const ast = declared.ast
+  if (SchemaAST.isNull(ast) || SchemaAST.isUndefined(ast)) {
+    return { holdsRef: false, properties: undefined, empty: true }
+  }
+  const properties = astProperties(ast)
+  if (properties === undefined) {
+    // Not an object: a scalar or a declaration (a date) is a value, not a wrapper, and anything
+    // else (`Schema.Unknown`, a `suspend`) says nothing of what it holds.
+    return {
+      holdsRef: !isScalarOrList(ast) && !SchemaAST.isDeclaration(ast),
+      properties,
+      empty: false,
+    }
+  }
+  const property = properties.find((candidate) => candidate.name === name)
+  return {
+    holdsRef:
+      property === undefined
+        ? // A record (`Schema.Record`) holds whatever keys it's given.
+          SchemaAST.isObjects(ast) && ast.indexSignatures.length > 0
+        : holdsRecordAst(property.type),
+    properties,
+    empty: false,
   }
 }
 
 /**
- * The members of a `many` element's schema, nested unions flattened in the order a union decodes
- * them, each with whether it holds a ref of `entity` and the value its input takes.
+ * How `create` judges a `many` element value: whether it holds a ref of the entity
+ * ({@link elementHoldsRef}).
  */
-const judgeElementMembers = (
+type ElementJudge = (value: Record<string, unknown>) => boolean
+
+const elementJudges = new WeakMap<
+  AggregateStamps | typeof NO_STAMPS,
+  WeakMap<Schema.Top, WeakMap<RefEntity, ElementJudge>>
+>()
+const NO_STAMPS = { config: undefined, names: new Set<string>() } satisfies AggregateStamps
+
+/**
+ * The judge of a `many` element's values: the element's input ({@link elementInput}, what
+ * `inputSchema` holds) decodes the value, and the member it decoded it as says whether it holds a
+ * ref. Each member a union holds, nested ones' included, is wrapped in a union of itself alone
+ * whose check notes what the member decoded the value to; the decode returns one of those, the
+ * member's own, nested unions' checks and a `oneOf` union's mode all applied by the decode itself.
+ * The decode takes each field in its domain form or its stored form, as `create`'s own decode does
+ * after hydration (`writeSchema`), checks included.
+ */
+const elementJudge = (
   element: Schema.Top,
   entity: RefEntity,
   stamps: AggregateStamps | undefined,
-): ReadonlyArray<ElementMember> => {
+): ElementJudge => {
   const byStamps = stamps ?? NO_STAMPS
-  let bySchema = elementMembers.get(byStamps)
+  let bySchema = elementJudges.get(byStamps)
   if (bySchema === undefined) {
     bySchema = new WeakMap()
-    elementMembers.set(byStamps, bySchema)
+    elementJudges.set(byStamps, bySchema)
   }
   let byEntity = bySchema.get(element)
   if (byEntity === undefined) {
@@ -659,77 +666,92 @@ const judgeElementMembers = (
   if (cached !== undefined) return cached
 
   const name = deriveEntityFieldName(entity)
-  const judged = astMembers(element.ast).map((member): ElementMember => {
-    const properties = astProperties(member)
-    if (properties === undefined) {
-      // Not an object: a scalar or a declaration (a date) is a value, not a wrapper, and anything
-      // else (`Schema.Unknown`, a `suspend`) says nothing of what it holds.
-      return {
-        holdsRef: !isScalarOrList(member) && !SchemaAST.isDeclaration(member),
-        properties,
-        takes: takesEitherForm(Schema.make(member)),
-      }
-    }
-    const property = properties.find((candidate) => candidate.name === name)
-    const holdsRef =
-      property === undefined
-        ? // A record (`Schema.Record`) holds whatever keys it's given.
-          SchemaAST.isObjects(member) && member.indexSignatures.length > 0
-        : holdsRecordAst(property.type)
-    const fields = Object.fromEntries(
-      properties.map((candidate) => [String(candidate.name), Schema.make(candidate.type)]),
-    ) as Record<string, Schema.Top>
-    const managed = stamps === undefined ? new Set<string>() : managedDates(stamps, fields)
-    if (!(property !== undefined && holdsRef) && managed.size === 0) {
-      return { holdsRef, properties, takes: takesEitherForm(Schema.make(member)) }
-    }
-    // The member as its input takes it: the entity's field as `${field}Id`, any id (one of the
-    // wrong type is refused by `create`, naming it, `EDD-9131`), and a stamped date optional.
-    const input: Record<string, Schema.Top> = {}
-    for (const [field, schema] of Object.entries(fields)) {
-      if (field === name && holdsRef) {
-        input[`${field}Id`] = (
-          SchemaAST.isOptional(schema.ast) ? Schema.optionalKey(Schema.Unknown) : Schema.Unknown
-        ) as Schema.Top
-      } else {
-        input[field] = managed.has(field) ? stampInput(schema) : schema
-      }
-    }
-    return { holdsRef, properties, takes: takesEitherForm(Schema.Struct(input as never)) }
+  const fetched = refKeyComposite(entity) !== undefined ? entity : undefined
+  const leaves: Array<ElementLeaf> = []
+  const decoded: Array<readonly [ElementLeaf, unknown]> = []
+  const input = elementInput(element, fetched, stamps, (member, declared) => {
+    const leaf = elementLeaf(declared, name)
+    leaves.push(leaf)
+    return Schema.Union([member as Schema.Codec<unknown>]).check(
+      Schema.makeFilter((value: unknown) => {
+        decoded.push([leaf, value])
+        return true
+      }),
+    ) as unknown as Schema.Top
   })
-  byEntity.set(entity, judged)
-  return judged
+  // An element no union breaks down is its one member.
+  const only = leaves.length === 0 ? elementLeaf(element, name) : undefined
+  if (only !== undefined) leaves.push(only)
+
+  let decode: (value: unknown) => Option.Option<unknown>
+  try {
+    decode = Schema.decodeUnknownOption(
+      substituteSchemaDeep(input, {
+        tolerantTransforms: true,
+        decodeOnly: true,
+        enforceChecks: true,
+        domainValues: true,
+      }) as Schema.Codec<unknown>,
+    )
+  } catch {
+    // A schema the substitution can't walk: a value is judged by its literals alone.
+    decode = () => Option.none()
+  }
+
+  /** The member the element's input decodes a value as, `undefined` when it takes none. */
+  const memberOf = (value: unknown): ElementLeaf | undefined => {
+    decoded.length = 0
+    let result: Option.Option<unknown>
+    try {
+      result = decode(value)
+    } catch {
+      // A check that throws on what the input holds (a field it takes as an id): taken by none.
+      return undefined
+    }
+    if (Option.isNone(result)) return undefined
+    if (only !== undefined) return only
+    for (let i = decoded.length - 1; i >= 0; i--) {
+      const [leaf, output] = decoded[i]!
+      if (output === result.value) return leaf
+    }
+    return undefined
+  }
+
+  const judge: ElementJudge = (value) => {
+    const member = memberOf(value)
+    if (member !== undefined) return member.holdsRef
+    const members = leaves.filter((leaf) => !leaf.empty)
+    const candidates = members.filter(
+      ({ properties }) => properties === undefined || matchesLiterals(properties, value),
+    )
+    return (candidates.length > 0 ? candidates : members).some((leaf) => leaf.holdsRef)
+  }
+  byEntity.set(entity, judge)
+  return judge
 }
 
 /**
  * Whether a `many` element value holds a ref of `entity`, under the `${field}Id` its input takes
  * (`deriveElementInputSchema`), decided by the member of the element's schema the value is, as the
- * element's input decodes it: the first member, nested unions flattened, whose input takes it. A
- * member holds one when its property named for the entity (`deriveEntityFieldName`) can hold the
- * entity's record ({@link holdsRecord}). One that declares no such property, the entity's own model
- * among them (`lineId` of a `Line` is its own value), or declares it a scalar, holds none: a value of
- * such a member keeps what it was given, even where another member shares its discriminator.
+ * element's input decodes it ({@link elementJudge}): unions walked as declared, each union's checks
+ * and mode kept, an id taken as a value of the entity's key composite. A member holds one when its
+ * property named for the entity (`deriveEntityFieldName`) can hold the entity's record
+ * ({@link holdsRecord}). One that declares no such property, the entity's own model among them
+ * (`lineId` of a `Line` is its own value), or declares it a scalar, holds none: a value of such a
+ * member keeps what it was given, even where another member shares its discriminator.
  *
- * A value no member's input takes is judged by the members its literal properties (a union's
- * discriminator, `null` included) leave it: it holds one when any of them does. What the schema
- * says nothing of (no element schema, a member that isn't an object) is taken to hold one, as it
- * always was.
+ * A value the element's input takes as no member (an id of the wrong type among them, which
+ * `create` refuses naming it, `EDD-9131`) is judged by the members its literal properties (a union's
+ * discriminator, `null` included) leave it: it holds one when any of them does. What the schema says
+ * nothing of (no element schema, a member that isn't an object) is taken to hold one, as it always
+ * was.
  */
 export const elementHoldsRef = (
   element: Schema.Top | undefined,
   entity: RefEntity,
   value: Record<string, unknown>,
   stamps?: AggregateStamps,
-): boolean => {
-  if (element === undefined) return true
-  const judged = judgeElementMembers(element, entity, stamps)
-  const taken = judged.find((member) => member.takes(value))
-  if (taken !== undefined) return taken.holdsRef
-  const candidates = judged.filter(
-    ({ properties }) => properties === undefined || matchesLiterals(properties, value),
-  )
-  return (candidates.length > 0 ? candidates : judged).some((member) => member.holdsRef)
-}
+): boolean => (element === undefined ? true : elementJudge(element, entity, stamps)(value))
 
 /**
  * The element schema of a `many` edge, read off the parent model's field: the array's element, or a
@@ -776,29 +798,53 @@ export const deriveElementInputSchema = (
     return refIdInput(fetched)
   }
 
-  return deriveElementUnion(elemSchema, fetched, stamps)
+  return elementInput(elemSchema, fetched, stamps)
 }
 
 /**
  * An element, or a member of a union of them, as its input takes it: a member with fields through
  * {@link deriveElementMember}, and a union, nested ones included, member by member, as `create`
- * decides per member (`elementHoldsRef`). The schema itself when nothing changes.
+ * decides per member (`elementHoldsRef`), rebuilt with its own checks, annotations and mode. A union
+ * piped through a transformation is left as declared, its encoding tied to its members. The schema
+ * itself when nothing changes. `mark` is handed each member no union breaks down further, as its
+ * input takes it and as declared, and returns what stands for it (`elementJudge`).
  */
-const deriveElementUnion = (
+const elementInput = (
   schema: Schema.Top,
   fetched: RefEntity | undefined,
   stamps: AggregateStamps | undefined,
+  mark?: (member: Schema.Top, declared: Schema.Top) => Schema.Top,
+  inUnion = false,
 ): Schema.Top => {
   const fields = getSchemaFields(schema)
-  if (fields !== undefined) return deriveElementMember(schema, fields, fetched, stamps)
+  const members = fields === undefined ? unionMembers(schema) : undefined
+  if (members !== undefined) {
+    const derived = members.map((member) => elementInput(member, fetched, stamps, mark, true))
+    return derived.some((member, i) => member !== members[i])
+      ? withMetadataOf(
+          schema,
+          Schema.Union(
+            derived as unknown as ReadonlyArray<Schema.Codec<unknown>>,
+            (schema.ast as SchemaAST.Union).options,
+          ) as unknown as Schema.Top,
+        )
+      : schema
+  }
+  const input = fields === undefined ? schema : deriveElementMember(schema, fields, fetched, stamps)
+  return mark === undefined || !inUnion ? input : mark(input, schema)
+}
+
+/**
+ * A union's members, in the order it decodes them: its schemas', or its AST's. `undefined` for
+ * anything else, and for a union piped through a transformation.
+ */
+const unionMembers = (schema: Schema.Top): ReadonlyArray<Schema.Top> | undefined => {
+  const ast = schema.ast
+  if (!SchemaAST.isUnion(ast) || ast.encoding !== undefined) return undefined
   const members = (schema as { readonly members?: unknown }).members
-  if (!SchemaAST.isUnion(schema.ast) || !Array.isArray(members)) return schema
-  const derived = (members as ReadonlyArray<Schema.Top>).map((member) =>
-    deriveElementUnion(member, fetched, stamps),
-  )
-  return derived.some((member, i) => member !== members[i])
-    ? Schema.Union(derived as never)
-    : schema
+  return Array.isArray(members)
+    ? (members as ReadonlyArray<Schema.Top>)
+    : ast.types.map((type) => Schema.make(type))
 }
 
 /**

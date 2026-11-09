@@ -1383,7 +1383,7 @@ const walkedContainer = (schema: Schema.Top): WalkedContainer | undefined => {
  * fresh node without them, so a `.check(Schema.isMaxProperties(1))` on the
  * original was silently dropped and an invalid value accepted (#133).
  */
-const withMetadataOf = (original: Schema.Top, rebuilt: Schema.Top): Schema.Top =>
+export const withMetadataOf = (original: Schema.Top, rebuilt: Schema.Top): Schema.Top =>
   withAstMetadataOf(original.ast, rebuilt)
 
 /** `withMetadataOf`, taking the metadata from an AST node. */
