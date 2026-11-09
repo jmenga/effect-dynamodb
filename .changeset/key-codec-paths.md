@@ -7,7 +7,7 @@
 
 An entity whose key composite is a codec that `encode` takes on its own output is now keyed by the value it stores, so every path finds its items. **Rows 1.39.0 wrote for such an entity can't be read or written by key until you run `db.tables.<Table>.rekey()`, whatever `escapeKeys` says.**
 
-These codecs are `Schema.StringFromBase64`, `StringFromBase64Url`, `StringFromHex` and `StringFromUriComponent`, and a custom codec whose `encode` takes what it returns, such as one that prepends a prefix (`x:`) and whose `decode` strips it. A codec whose `encode` refuses its own output, such as `Schema.NumberFromString`, `Schema.Trim` or a date codec, keeps every key byte for byte.
+These are the codecs whose `encode` takes what it returns and changes it again: `Schema.StringFromBase64`, `StringFromBase64Url`, `StringFromHex` and `StringFromUriComponent`, and a custom codec such as one that prepends a prefix (`x:`) and whose `decode` strips it, or one that scales a number. Every other codec keeps every key byte for byte: one whose `encode` gives back what it's given, such as `Schema.Trim`, and one whose `encode` refuses its own output, such as `Schema.NumberFromString` or a date codec.
 
 `put` stores `"MiX"` under such a prefix codec as `x:MiX`. 1.39.0 keyed that row by the stored text encoded once more (`x:x:mix`), while every path that composed a key from a caller's values encoded the value once (`x:mix`). The entity's own `get`, `update` and `delete` agreed with `put`, and nothing else found the row. Now `put` and every other path key it `x:mix`, once:
 
