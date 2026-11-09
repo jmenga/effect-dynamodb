@@ -25,7 +25,13 @@
  */
 
 import * as DynamoSchema from "../DynamoSchema.js"
-import { composePk, composeSk, type IndexDefinition, unescapeKeyText } from "../KeyComposer.js"
+import {
+  composePk,
+  composeSk,
+  type IndexDefinition,
+  keyValueText,
+  unescapeKeyText,
+} from "../KeyComposer.js"
 import { decodeBigInt, decodeNumber } from "./NumericKey.js"
 
 /** The schema composing the key text 1.36 composed: what `escapeKeys` off composes. */
@@ -184,7 +190,9 @@ export const composeAt = (
  * composeAt} writes around it), turned back into a value by `kindOf` ({@link valueOf}); a reading
  * counts only when {@link composeAt} composes exactly `stored` from it. `undefined` unless exactly
  * one reading does: none, when `stored` is not `form`'s text of any values, and more than one when
- * a string value holds the delimiter and the next composite's label.
+ * a string value holds the delimiter and the next composite's label. Given several kinds, a
+ * composite takes the first whose value composes its own text again: a field that stored both
+ * numeric kinds is read one composite at a time, never by trying each combination.
  *
  * A string comes back cased, which composes the same key text as the value it was cased from.
  */
@@ -194,9 +202,27 @@ export const readIndexKeys = (
   entityVersion: number,
   index: IndexDefinition,
   stored: Readonly<Record<string, unknown>>,
-  kindOf: (attr: string) => ValueKind,
+  kindOf: (attr: string) => ValueKind | ReadonlyArray<ValueKind>,
 ): Record<string, unknown> | undefined => {
   const attrs = [...new Set([...index.pk.composite, ...index.sk.composite])]
+  /**
+   * A composite's text as the first of its kinds whose value composes that text again, each
+   * judged by itself; the first kind's value when none does, which the whole key then refuses.
+   */
+  const slotValue = (under: DynamoSchema.DynamoSchema, text: string, attr: string): unknown => {
+    const kinds = kindOf(attr)
+    if (!Array.isArray(kinds)) return valueOf(under, text, kinds as ValueKind)
+    const values = kinds.map((kind) => valueOf(under, text, kind))
+    const exact = values.find((value) => {
+      if (value === undefined) return false
+      try {
+        return keyValueText(under, value, index.casing ?? under.casing) === text
+      } catch {
+        return false
+      }
+    })
+    return exact ?? values[0]
+  }
   // The fixed parts are the same under every form, and off leaves a placeholder as it is.
   const off = schema136(form.pk)
   const template = composeAt(
@@ -240,7 +266,7 @@ export const readIndexKeys = (
       const read = (halves: Map<number, string>, under: DynamoSchema.DynamoSchema) => {
         for (const [slot, text] of halves) {
           const attr = attrs[slot]!
-          const value = valueOf(under, text, kindOf(attr))
+          const value = slotValue(under, text, attr)
           if (value === undefined || (attr in record && record[attr] !== value)) consistent = false
           record[attr] = value
         }

@@ -107,44 +107,58 @@ describeConnected("values that can't be stored, on DynamoDB", () => {
       each(RefusedValues.valueCases(w, Number.POSITIVE_INFINITY), RefusedValues.expectUnstorable)
     })
 
-    it.effect("a row 1.36 stored under NaN's text is scanned, and rekey leaves it", () => {
-      const Readings = Entity.make({
-        model: Schema.Struct({ id: Schema.String, level: Schema.NumberFromString }),
-        entityType: "Reading",
-        primaryKey: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: ["level"] },
-        },
-      })
-      const Readers = Table.make({
-        schema: DynamoSchema.make({ name: "nan136", version: 1, escapeKeys: on }),
-        entities: { Readings },
-      })
-      return onTable(Readers, Readers, (tableName) =>
-        Effect.gen(function* () {
-          const db = yield* DynamoClient.make({ entities: { Readings }, tables: { Readers } })
-          const row = toAttributeMap({
-            pk: "$nan136#v1#reading#id_a",
-            sk: "$nan136#v1#reading#level_0000000000000nan",
-            __edd_e__: "Reading",
-            id: "a",
-            level: "NaN",
-            createdAt: "2026-01-01T00:00:00.000Z",
-            updatedAt: "2026-01-01T00:00:00.000Z",
-          })
-          yield* Effect.promise(() =>
-            raw.send(new PutItemCommand({ TableName: tableName, Item: row })),
-          )
-          const scanned = yield* db.entities.Readings.scan().collect()
-          expect(scanned.map((reading) => Number.isNaN(reading.level))).toEqual([true])
-          const report = yield* db.tables.Readers.rekey()
-          expect(report.skipped.unrecognizedKey).toBe(1)
-          expect(report.moved.item).toBe(0)
-          expect(report.indexKeysRewritten).toBe(0)
-          expect(yield* rowsOf(tableName)).toEqual([row])
-        }),
-      )
-    })
+    it.effect(
+      "a row 1.36 stored under NaN's text is scanned, and rekey reports it and leaves it",
+      () => {
+        const Readings = Entity.make({
+          model: Schema.Struct({ id: Schema.String, level: Schema.NumberFromString }),
+          entityType: "Reading",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: ["level"] },
+          },
+        })
+        const Readers = Table.make({
+          schema: DynamoSchema.make({ name: "nan136", version: 1, escapeKeys: on }),
+          entities: { Readings },
+        })
+        return onTable(Readers, Readers, (tableName) =>
+          Effect.gen(function* () {
+            const db = yield* DynamoClient.make({ entities: { Readings }, tables: { Readers } })
+            const row = toAttributeMap({
+              pk: "$nan136#v1#reading#id_a",
+              sk: "$nan136#v1#reading#level_0000000000000nan",
+              __edd_e__: "Reading",
+              id: "a",
+              level: "NaN",
+              createdAt: "2026-01-01T00:00:00.000Z",
+              updatedAt: "2026-01-01T00:00:00.000Z",
+            })
+            yield* Effect.promise(() =>
+              raw.send(new PutItemCommand({ TableName: tableName, Item: row })),
+            )
+            const scanned = yield* db.entities.Readings.scan().collect()
+            expect(scanned.map((reading) => Number.isNaN(reading.level))).toEqual([true])
+            const report = yield* db.tables.Readers.rekey()
+            // A row it couldn't move, reported as one.
+            expect(report.conflicts).toEqual([
+              {
+                member: "Reading",
+                kind: "item",
+                reason: "uncomposable",
+                key: { pk: row.pk!.S, sk: row.sk!.S },
+                target: undefined,
+                message: expect.stringMatching(/^Its values compose no key: \[EDD-9096\]/),
+              },
+            ])
+            expect(report.skipped.unrecognizedKey).toBe(0)
+            expect(report.moved.item).toBe(0)
+            expect(report.indexKeysRewritten).toBe(0)
+            expect(yield* rowsOf(tableName)).toEqual([row])
+          }),
+        )
+      },
+    )
 
     it.effect("a bigint past the numeric text's limit, as DynamoDB takes it", () => {
       const long = 10n ** 1000n

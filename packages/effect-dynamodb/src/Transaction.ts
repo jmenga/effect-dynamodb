@@ -43,6 +43,7 @@ import {
   GUARDED_TRANSACTION_ATTEMPTS,
   judgeCancellation,
   planTransactWriteOps,
+  prepareTransactWriteOps,
   type TransactWriteOp,
   type TransactWriteUpdateOp,
 } from "./internal/TransactWriteOps.js"
@@ -354,9 +355,15 @@ const transactWriteCore = (
     const client = yield* Capacity.client
     let lost: OptimisticLockError | ConcurrentModification | undefined
     for (let attempt = 0; attempt < GUARDED_TRANSACTION_ATTEMPTS; attempt++) {
-      // Planned every attempt: a lost race is planned again from fresh reads.
-      const plans = yield* planTransactWriteOps(operations)
-      const built = yield* buildTransactWriteItems(operations, "transactWrite", { plans })
+      // Every op is checked and composed before anything is read; then the
+      // planned ops are planned, every attempt, so a lost race is planned
+      // again from fresh reads.
+      const prepared = yield* prepareTransactWriteOps(operations, "transactWrite", { plan: true })
+      const plans = yield* planTransactWriteOps(prepared)
+      const built = yield* buildTransactWriteItems(operations, "transactWrite", {
+        prepared,
+        plans,
+      })
       const transactItems = built.items
       // Every op resolved to no write — as a standalone no-op update does.
       // DynamoDB rejects an empty TransactItems list.

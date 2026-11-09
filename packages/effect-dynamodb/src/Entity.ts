@@ -50,7 +50,14 @@ import {
 import {
   compositeKeyFormKind,
   keyFormValueKind,
+  kindReadingOf,
   makeCompositeKeyForm,
+  otherNumericKind,
+  type ReadBackText,
+  readsBackOtherwise,
+  refuseInexact,
+  storedFormOfRead,
+  storedNumericForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
@@ -132,7 +139,13 @@ import {
 import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
-import { asRead, notReadBack, type ReadBack, readBackOf } from "./internal/RoundTrip.js"
+import {
+  asRead,
+  notReadBack,
+  type ReadBack,
+  readBackOf,
+  readBackRefusal,
+} from "./internal/RoundTrip.js"
 import {
   composeKeysOrFail,
   freshIncarnationToken,
@@ -378,6 +391,12 @@ const composeUniqueSentinel = (
   constraintName: string,
   constraintDef: UniqueConstraintDef,
   source: globalThis.Record<string, unknown>,
+  /**
+   * The value a field held when it was stored (`storedNumericForm`), or `undefined` when it is
+   * that already. A sentinel is composed from the Encoded value `put` stores, and a row read back
+   * holds a stored `bigint` as a number.
+   */
+  stored: (field: string, value: unknown) => unknown,
 ):
   | {
       readonly key: { readonly pk: string; readonly sk: string }
@@ -395,8 +414,9 @@ const composeUniqueSentinel = (
   const serialized: Array<string> = []
   const fieldsRecord: globalThis.Record<string, string> = {}
   for (const f of fields) {
-    const raw = source[f]
-    if (raw === undefined || raw === null) return undefined
+    const given = source[f]
+    if (given === undefined || given === null) return undefined
+    const raw = stored(f, given) ?? given
     const s = KeyComposer.compositeText(schema, raw)
     serialized.push(s)
     fieldsRecord[f] = s
@@ -489,7 +509,8 @@ const keyFormFor = (
   }
   const source = t.schemas?.inputSchema ?? t.model
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value) => {
+  const form = makeCompositeKeyForm(source, (attr, value, reason) => {
+    if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
@@ -761,7 +782,8 @@ export interface Entity<
   readonly _fillDecodingDefaults: (input: unknown) => Effect.Effect<unknown, ValidationError>
   /**
    * Refuses an encoded payload holding a value of a custom declaration that wouldn't read back
-   * (`EDD-9126`). For a write path outside this entity's own operations.
+   * (`EDD-9126`), or a key value of a field taking both numeric kinds that reads back as the other
+   * (`EDD-9128`). For a write path outside this entity's own operations.
    * @internal
    */
   readonly _refuseNotReadBack: (
@@ -823,7 +845,21 @@ export interface Entity<
   readonly _planUpdate: (
     key: unknown,
     state: UpdateState,
+    /** What {@link _prepareUpdate} decided of `state`. */
+    prepared: PreparedUpdate,
   ) => Effect.Effect<TransactPlan, PlanUpdateError, DynamoClient | TableConfig>
+
+  /**
+   * @internal What an `update` decides from its own operands, reading nothing: every refusal of
+   * its names, operands, payload and the keys the payload composes, and its encoded payload. Run by
+   * `Transaction.transactWrite` for every op before any op reads; {@link _planUpdate} plans the
+   * update from it. `encoded` is `key` through {@link _encodeKey}.
+   */
+  readonly _prepareUpdate: (
+    key: unknown,
+    state: UpdateState,
+    encoded: globalThis.Record<string, unknown>,
+  ) => Effect.Effect<PreparedUpdate, ValidationError, TableConfig>
 
   /**
    * @internal Compile a `delete` into the transact items it would issue — the
@@ -839,7 +875,19 @@ export interface Entity<
       readonly condition: Expr | ConditionInput | undefined
       readonly mustExist: boolean
     },
+    /** `key` through {@link _encodeKey}: refused before any op of the transaction reads. */
+    encoded: globalThis.Record<string, unknown>,
   ) => Effect.Effect<TransactPlan, PlanDeleteError, DynamoClient | TableConfig>
+
+  /**
+   * @internal A key as the entity's own ops take it: encoded through its key schema, and its
+   * primary key composed, a composite with no key text a `ValidationError`. What
+   * `Transaction.transactWrite` checks of a planned op before any op reads.
+   */
+  readonly _encodeKey: (
+    key: unknown,
+    operation: string,
+  ) => Effect.Effect<globalThis.Record<string, unknown>, ValidationError>
 
   /**
    * @internal Which of this entity's rows are items: a row is live iff the
@@ -3000,6 +3048,153 @@ const makeImpl = <
           { discard: true },
         )
 
+  /** What composes `field` into key text, in words, or `undefined` when nothing does. */
+  const composedInto = (field: string): string | undefined => {
+    for (const [name, def] of Object.entries(allIndexes)) {
+      if (def.pk.composite.includes(field) || def.sk.composite.includes(field)) {
+        return name === "primary" ? "the primary key" : `index "${name}"`
+      }
+    }
+    for (const [name, def] of Object.entries(
+      (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+    )) {
+      if (resolveUniqueFields(def).includes(field)) return `unique constraint "${name}"`
+    }
+    for (const [name, def] of Object.entries(data.vectorIndexes)) {
+      if (def.partition.includes(field)) return `vector index "${name}"'s partition`
+    }
+    const timeSeries = config.timeSeries as TimeSeriesConfig<any> | undefined
+    return timeSeries?.orderBy === field ? "an event's sort key (timeSeries.orderBy)" : undefined
+  }
+
+  /** A composite value's text, as `KeyComposer` composes it; `undefined` when it composes none. */
+  const compositeTextOf = (value: unknown): string | undefined => {
+    if (value === undefined || value === null) return undefined
+    try {
+      return KeyComposer.compositeText(schema, value)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * The texts a key composite's value is composed into, written and composed again from a row read
+   * back, by what composes it: a key or a vector partition through the key form; a unique sentinel
+   * from the value as stored (`storedSentinelValue`, `readSentinelValue`); and `append`'s event sort
+   * key, with `escapeKeys` and `numericKeyText` off, from the value as given.
+   */
+  const readBackTexts = (field: string, append: boolean): ReadonlyArray<ReadBackText> => {
+    const timeSeries = config.timeSeries as TimeSeriesConfig<any> | undefined
+    const numericOrderBy = schema.escapeKeys === true || schema.numericKeyText === true
+    const inKey =
+      Object.values(allIndexes).some(
+        (def) => def.pk.composite.includes(field) || def.sk.composite.includes(field),
+      ) ||
+      Object.values(data.vectorIndexes).some((def) => def.partition.includes(field)) ||
+      (append && timeSeries?.orderBy === field && numericOrderBy)
+    const inSentinel =
+      !append &&
+      Object.values((config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>).some(
+        (def) => resolveUniqueFields(def).includes(field),
+      )
+    const inEvent = append && timeSeries?.orderBy === field && !numericOrderBy
+    const keyText = (value: unknown) => {
+      try {
+        return compositeTextOf(compositeKeyForm(field, value))
+      } catch {
+        return undefined
+      }
+    }
+    const readText = (value: unknown) => compositeTextOf(readSentinelValue(field, value) ?? value)
+    return [
+      ...(inKey ? [{ written: keyText, read: keyText }] : []),
+      ...(inSentinel
+        ? [
+            {
+              written: (value: unknown) =>
+                compositeTextOf(storedSentinelValue(field, value) ?? value),
+              read: readText,
+            },
+          ]
+        : []),
+      ...(inEvent ? [{ written: compositeTextOf, read: readText }] : []),
+    ]
+  }
+
+  /**
+   * The key composites of `fields` (the model's, or `appendInput`'s for `append`) whose read-back
+   * can't be guaranteed at load (`readBackUnsure`: a transformation, or numeric kinds that can't be
+   * read off the schema), each with what composes it and the test of a stored value that reads back
+   * otherwise (`readsBackOtherwise`): read back by the model's field, as every read and every key
+   * composed again from a row reads it. A write giving one such a value is refused (`EDD-9128`). A
+   * field no key composes isn't asked. Empty for a model with none, which pays nothing more on a
+   * write.
+   */
+  const otherKindReadsOf = (
+    fields: globalThis.Record<string, Schema.Top>,
+    append: boolean,
+  ): ReadonlyMap<
+    string,
+    { readonly into: string; readonly readsOther: (value: unknown) => string | undefined }
+  > =>
+    new Map(
+      Object.entries(fields).flatMap(([field, schema]) => {
+        const into = composedInto(field)
+        if (into === undefined) return []
+        const reading = modelFieldSchemas[field] ?? schema
+        const readsOther = readsBackOtherwise(reading, {
+          asRead,
+          written: schema === reading ? undefined : schema,
+          texts: readBackTexts(field, append),
+        })
+        return readsOther === undefined ? [] : [[field, { into, readsOther }] as const]
+      }),
+    )
+  type KindReads = ReturnType<typeof otherKindReadsOf>
+  /**
+   * The model's and, for `append`, which takes its input through `appendInput`, `appendInput`'s own.
+   * Worked out again when `_injectIndex` adds an index, whose composites it composes.
+   */
+  let kindReadsFor:
+    | { readonly indexes: typeof allIndexes; readonly model: KindReads; readonly append: KindReads }
+    | undefined
+  const kindReads = (): { readonly model: KindReads; readonly append: KindReads } => {
+    if (kindReadsFor?.indexes === allIndexes) return kindReadsFor
+    const appendInput = (config.timeSeries as TimeSeriesConfig<any> | undefined)?.appendInput
+    const appendFields =
+      appendInput === undefined ? undefined : getSchemaFields(appendInput as Schema.Top)
+    kindReadsFor = {
+      indexes: allIndexes,
+      model: otherKindReadsOf(data.modelFields as globalThis.Record<string, Schema.Top>, false),
+      append: appendFields === undefined ? new Map() : otherKindReadsOf(appendFields, true),
+    }
+    return kindReadsFor
+  }
+
+  /**
+   * Refuses a payload storing, for a key composite whose read-back can't be guaranteed at load, a
+   * value that reads back otherwise: a stored row would compose other key text (`EDD-9128`).
+   */
+  const refuseOtherKindRead = (
+    encoded: unknown,
+    operation: string,
+    reads: KindReads = kindReads().model,
+  ): Effect.Effect<void, ValidationError> => {
+    for (const [field, { into, readsOther }] of reads) {
+      const value = (encoded as globalThis.Record<string, unknown>)[field]
+      const readsAs = value == null ? undefined : readsOther(value)
+      if (readsAs === undefined) continue
+      return Effect.fail(
+        new ValidationError({
+          entityType,
+          operation,
+          cause: readBackRefusal(`Field "${field}" is composed into ${into}`, value, readsAs),
+        }),
+      )
+    }
+    return Effect.void
+  }
+
   /**
    * A write's payload, encoded (see `encodeOrDecodeEncode`) and refused if it wouldn't read back.
    * Every write of the entity's own encodes through this.
@@ -3008,12 +3203,17 @@ const makeImpl = <
     schema: Schema.Codec<any>,
     input: unknown,
     operation: string,
-  ): Effect.Effect<unknown, ValidationError> =>
-    readBacks.size === 0
-      ? encodeOrDecodeEncode(schema, input, entityType, operation)
-      : encodeOrDecodeEncode(schema, input, entityType, operation).pipe(
-          Effect.tap((encoded) => refuseNotReadBack(encoded, operation)),
-        )
+  ): Effect.Effect<unknown, ValidationError> => {
+    const encoded = encodeOrDecodeEncode(schema, input, entityType, operation)
+    const readBack =
+      readBacks.size === 0
+        ? encoded
+        : encoded.pipe(Effect.tap((value) => refuseNotReadBack(value, operation)))
+    const reads = operation === "append" ? kindReads().append : kindReads().model
+    return reads.size === 0
+      ? readBack
+      : readBack.pipe(Effect.tap((value) => refuseOtherKindRead(value, operation, reads)))
+  }
 
   /**
    * An update's operand that wouldn't read back. An operand of `.add`, `.subtract` or `.deleteFromSet`
@@ -3520,16 +3720,55 @@ const makeImpl = <
   // `composeAllKeys`. The raw model is not equivalent — entity derivation
   // substitutes date/Redacted fields with their wire transforms, so reading
   // fields off the model would miss encodings the write path applies.
+  /**
+   * Every attribute a key, sentinel or partition of this entity is composed from: the composites
+   * of the primary key and of every index (a Z-order half's prefix and dimensions among them, and
+   * the history segments, which are the primary sort key's), shard sources, unique constraint
+   * fields, vector partitions and a time series' `orderBy`. `allIndexes` grows after `make()`.
+   */
+  let keyReaders:
+    | readonly [globalThis.Record<string, IndexDefinition>, ReadonlySet<string>]
+    | undefined
+  const readsKey = (attr: string): boolean => {
+    if (keyReaders === undefined || keyReaders[0] !== allIndexes) {
+      const readers = new Set<string>()
+      for (const def of Object.values(allIndexes)) {
+        // A shard's `by` and source are composites of the index and the primary key.
+        for (const field of [...def.pk.composite, ...def.sk.composite]) readers.add(field)
+      }
+      for (const def of Object.values(
+        (config.unique ?? {}) as globalThis.Record<string, UniqueConstraintDef>,
+      )) {
+        for (const field of resolveUniqueFields(def)) readers.add(field)
+      }
+      for (const definition of Object.values(data.vectorIndexes)) {
+        for (const field of definition.partition) readers.add(field)
+      }
+      const orderBy = (config.timeSeries as TimeSeriesConfig<any> | undefined)?.orderBy
+      if (orderBy !== undefined) readers.add(orderBy)
+      keyReaders = [allIndexes, readers]
+    }
+    return keyReaders[1].has(attr)
+  }
+
   const compositeKeyForm = makeCompositeKeyForm(
     schemas.inputSchema as unknown as Schema.Top,
-    (attr, value) => {
+    (attr, value, reason) => {
+      if (reason !== undefined) {
+        return refuseInexact(`Composite "${attr}" on entity "${entityType}"`, value, reason)
+      }
       throw new Error(
-        `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to its ` +
-          `stored form. The attribute's schema carries an encoding transformation, so the ` +
-          `stored key holds the ENCODED value, but ${JSON.stringify(String(value))} encodes ` +
-          `under neither encode nor decode->encode. Supply a value of the attribute's own type.`,
+        `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to ` +
+          `its stored form. The attribute's schema carries an encoding transformation, so ` +
+          `the stored key holds the ENCODED value, but ${JSON.stringify(String(value))} ` +
+          `encodes under neither encode nor decode->encode. Supply a value of the ` +
+          `attribute's own type.`,
       )
     },
+    // A record handed here can be a whole row read back (restore, a retain update, rekey): what
+    // no key reads is never key text, so a field stored in a form its schema can't take again
+    // is left as it is.
+    { reads: readsKey },
   )
 
   /**
@@ -3605,6 +3844,42 @@ const makeImpl = <
    */
   const keyForm = (record: globalThis.Record<string, unknown>) =>
     toCompositeKeyRecord(compositeKeyForm, record)
+
+  /**
+   * A unique field's value as `put` stored it, from a row read back: sentinels are composed from
+   * the Encoded value, which for a field stored as `N` the unmarshaller may hand back as the other
+   * numeric kind (`storedNumericForm`). `undefined` when the value is already as stored.
+   */
+  const storedSentinelValue = (() => {
+    const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
+    const forms = new Map<string, ((value: unknown) => unknown) | undefined>()
+    return (field: string, value: unknown): unknown => {
+      if (!forms.has(field)) {
+        const fieldSchema = fields?.[field]
+        forms.set(field, fieldSchema === undefined ? undefined : storedNumericForm(fieldSchema))
+      }
+      return forms.get(field)?.(value)
+    }
+  })()
+
+  /**
+   * A unique field's value, or a time-series `orderBy`, as `put` or `append` stored it, from a row
+   * read back: {@link storedSentinelValue}, and for a field whose numeric kinds can't be read off its
+   * schema, the value decoded through the field, as a read decodes it, and encoded again
+   * (`storedFormOfRead`). `Schema.Unknown` decoded to a `Schema.BigInt` stored `5n`, which reads back
+   * as `5`. Only a value read from a row is taken this way: a write's own value is the one it stores.
+   */
+  const readSentinelValue = (() => {
+    const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
+    const forms = new Map<string, ((value: unknown) => unknown) | undefined>()
+    return (field: string, value: unknown): unknown => {
+      if (!forms.has(field)) {
+        const fieldSchema = fields?.[field]
+        forms.set(field, fieldSchema === undefined ? undefined : storedFormOfRead(fieldSchema))
+      }
+      return forms.get(field)?.(value)
+    }
+  })()
 
   // -------------------------------------------------------------------------
   // Write-limit diagnosis (#144)
@@ -5772,10 +6047,18 @@ const makeImpl = <
             constraintName,
             constraintDef,
             newSource,
+            storedSentinelValue,
           )
           const prior =
             oldSource !== undefined
-              ? composeUniqueSentinel(schema, entityType, constraintName, constraintDef, oldSource)
+              ? composeUniqueSentinel(
+                  schema,
+                  entityType,
+                  constraintName,
+                  constraintDef,
+                  oldSource,
+                  readSentinelValue,
+                )
               : undefined
           if (next !== undefined && prior !== undefined && sameKey(next.key, prior.key)) continue
           changes.push({ constraintName, constraintDef, next, prior: prior?.key })
@@ -6691,15 +6974,18 @@ const makeImpl = <
   // update operation
   // ---------------------------------------------------------------------------
 
-  const runUpdate = (
+  /**
+   * What an update decides from its own operands, before reading anything: every refusal of the
+   * names, operands and payload it holds and of the keys the payload composes, and the encoded
+   * payload and key ({@link checkUpdatePayload}). A payload with refs to hydrate has its keys
+   * checked after the reads that hydrate them, in {@link runPreparedUpdate}. `runUpdate` runs this
+   * first; `Transaction.transactWrite` runs it for every op before any op reads (`_prepareUpdate`)
+   * and plans the update from what it returns. `encoded`: the key, already encoded.
+   */
+  const prepareUpdate = (
     key: unknown,
-    mode: DecodeMode,
     requested: UpdateState,
-    /**
-     * The item as already read — consistently — by the caller (`upsert`).
-     * Used instead of reading it again: the write is guarded on it either way.
-     */
-    preRead?: globalThis.Record<string, AttributeValue>,
+    encoded?: globalThis.Record<string, unknown> | undefined,
   ) =>
     Effect.gen(function* () {
       // A packed field takes only a whole-value .set() / .remove() (#147).
@@ -6819,15 +7105,10 @@ const makeImpl = <
         uState.patch ? { attributeExists: [config.indexes.primary.pk.field] } : undefined,
         uState.condition,
       )
-      const client = yield* Capacity.client
-      const tableName = tc.name
-      // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
-      const now = yield* DateTime.now
-
       yield* checkWithVectorNames(uState.withVectors, "update")
 
       // Caller key: Type side in, ENCODED out (see `encodeKey`).
-      const encodedKey = yield* encodeKey(key, "update.decodeKey")
+      const encodedKey = encoded ?? (yield* encodeKey(key, "update.decodeKey"))
       // A missing item: `patch`'s exists guard failed — `ConditionalCheckFailed`,
       // on every path, including those that read first (#134); for `update`,
       // `ItemNotFound`.
@@ -6853,19 +7134,58 @@ const makeImpl = <
         return yield* new ValidationError({ entityType, operation: "update", cause: unstorable })
       }
 
-      // Hydrate refs in updates: for any ${field}Id present, fetch and embed
-      let hydratedUpdates = encodedUpdates as globalThis.Record<string, unknown>
-      if (hasRefs) {
-        const refsToHydrate = resolvedRefs.filter(
-          (ref) =>
-            ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
-            (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !== undefined,
-        )
-        if (refsToHydrate.length > 0) {
-          hydratedUpdates = yield* hydrateRefs(hydratedUpdates, refsToHydrate)
-        }
+      // Refs are hydrated by reading the entities they name: a payload holding any has its keys
+      // checked after those reads.
+      const refsToHydrate = hasRefs
+        ? resolvedRefs.filter(
+            (ref) =>
+              ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
+              (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !== undefined,
+          )
+        : []
+      const checked =
+        refsToHydrate.length === 0
+          ? yield* checkUpdatePayload(
+              uState,
+              needsBothImages,
+              encodedKey,
+              encodedUpdates,
+              encodedUpdates as globalThis.Record<string, unknown>,
+            )
+          : undefined
+      return {
+        uState,
+        removedToDefault,
+        immutables,
+        upsertable,
+        createInput,
+        requestedRv,
+        needsBothImages,
+        evExpected,
+        userCond,
+        tc,
+        ttlAttrName,
+        encodedKey,
+        missingItem,
+        encodedUpdates,
+        refsToHydrate,
+        checked,
       }
+    })
 
+  /**
+   * The refusals an update's keys decide, before reading anything: a key its payload composes with
+   * no key text or level, and path operations no read-then-write can carry. Returns the primary key
+   * and what decides the write's path.
+   */
+  const checkUpdatePayload = (
+    uState: UpdateState,
+    needsBothImages: boolean,
+    encodedKey: globalThis.Record<string, unknown>,
+    encodedUpdates: unknown,
+    hydratedUpdates: globalThis.Record<string, unknown>,
+  ) =>
+    Effect.gen(function* () {
       // The index keys the payload feeds, composed once before anything is
       // marshalled: a composite with no key text (`NaN`, `[EDD-9096]`) or
       // Z-order level (`[EDD-9092]`) fails the update with a
@@ -6956,6 +7276,58 @@ const makeImpl = <
             "`versioned` cannot prove. Drop the path operations, the cascade, or the mode.",
         })
       }
+      return { primaryKey, marshalledKey, touchesUniqueFields, computedComposites, pathOpsPresent }
+    })
+
+  /** An update from what {@link prepareUpdate} decided: its reads and its write. */
+  const runPreparedUpdate = (
+    key: unknown,
+    prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
+    mode: DecodeMode,
+    /**
+     * The item as already read — consistently — by the caller (`upsert`).
+     * Used instead of reading it again: the write is guarded on it either way.
+     */
+    preRead?: globalThis.Record<string, AttributeValue>,
+  ) =>
+    Effect.gen(function* () {
+      const {
+        uState,
+        removedToDefault,
+        immutables,
+        upsertable,
+        createInput,
+        requestedRv,
+        needsBothImages,
+        evExpected,
+        userCond,
+        tc,
+        ttlAttrName,
+        encodedKey,
+        missingItem,
+        encodedUpdates,
+      } = prepared
+      const client = yield* Capacity.client
+      const tableName = tc.name
+      // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
+      const now = yield* DateTime.now
+      // Hydrate refs in updates: for any ${field}Id present, fetch and embed
+      const hydratedUpdates =
+        prepared.refsToHydrate.length > 0
+          ? yield* hydrateRefs(
+              encodedUpdates as globalThis.Record<string, unknown>,
+              prepared.refsToHydrate,
+            )
+          : (encodedUpdates as globalThis.Record<string, unknown>)
+      const { primaryKey, marshalledKey, touchesUniqueFields, computedComposites, pathOpsPresent } =
+        prepared.checked ??
+        (yield* checkUpdatePayload(
+          uState,
+          needsBothImages,
+          encodedKey,
+          encodedUpdates,
+          hydratedUpdates,
+        ))
       if (
         (isRetainEnabled() ||
           touchesUniqueFields ||
@@ -7213,6 +7585,7 @@ const makeImpl = <
               constraintName,
               constraintDef,
               currentRawDomain,
+              readSentinelValue,
             )
             const newSentinel = composeUniqueSentinel(
               schema,
@@ -7220,6 +7593,10 @@ const makeImpl = <
               constraintName,
               constraintDef,
               newItem,
+              (field, value) =>
+                Object.is(value, currentDomainItem[field])
+                  ? readSentinelValue(field, value)
+                  : storedSentinelValue(field, value),
             )
 
             if (!oldSentinel && !newSentinel) continue
@@ -8632,13 +9009,34 @@ const makeImpl = <
       )
     })
 
+  const runUpdate = (
+    key: unknown,
+    mode: DecodeMode,
+    requested: UpdateState,
+    /** See {@link runPreparedUpdate}. */
+    preRead?: globalThis.Record<string, AttributeValue>,
+  ) =>
+    Effect.flatMap(prepareUpdate(key, requested), (prepared) =>
+      runPreparedUpdate(key, prepared, mode, preRead),
+    )
+
   /**
    * An update; on a missing item, a plain `.set()` of a complete item creates
    * it through `create` — exactly the item `put` writes (#133). If another
    * writer creates it first, the update runs once more against that item.
    */
-  const updateOrCreate = (key: unknown, mode: DecodeMode, requested: UpdateState) =>
-    runUpdate(key, mode, requested).pipe(
+  const updateOrCreate = (
+    key: unknown,
+    mode: DecodeMode,
+    requested: UpdateState,
+    /** What {@link prepareUpdate} decided of `requested`, when the caller already ran it. */
+    prepared?: Effect.Success<ReturnType<typeof prepareUpdate>>,
+  ) => {
+    const run = () =>
+      prepared === undefined
+        ? runUpdate(key, mode, requested)
+        : runPreparedUpdate(key, prepared, mode)
+    return run().pipe(
       Effect.catchIf(
         (e): e is MissingForCreate => e instanceof MissingForCreate,
         (missing) =>
@@ -8654,7 +9052,7 @@ const makeImpl = <
               )
               if (Option.isNone(raced)) return yield* created
               // Created concurrently: now an ordinary update of that item.
-              return yield* runUpdate(key, mode, requested).pipe(
+              return yield* run().pipe(
                 Effect.catchIf(
                   (e): e is MissingForCreate => e instanceof MissingForCreate,
                   () =>
@@ -8679,6 +9077,7 @@ const makeImpl = <
           }),
       ),
     )
+  }
 
   const update = (key: unknown) =>
     new EntityUpdateImpl(
@@ -8707,7 +9106,8 @@ const makeImpl = <
    */
   const planned = <E, R>(
     operation: string,
-    key: unknown,
+    /** The key, through `encodeKey`. */
+    encodedKey: globalThis.Record<string, unknown>,
     /** The op itself — a factory, because a missing row means running it again. */
     op: () => Effect.Effect<unknown, E, R>,
     request: {
@@ -8720,7 +9120,6 @@ const makeImpl = <
     },
   ) =>
     Effect.gen(function* () {
-      const encodedKey = yield* encodeKey(key, `${operation}.decodeKey`)
       const primaryKey = composePrimaryKey(encodedKey)
       const ownKey = toAttributeMap(primaryKey)
       const plan = (rowMissing?: { readonly rowMissing: true }) =>
@@ -8820,7 +9219,14 @@ const makeImpl = <
         const reserved =
           constraintDef === undefined
             ? undefined
-            : composeUniqueSentinel(schema, entityType, constraintName, constraintDef, after)
+            : composeUniqueSentinel(
+                schema,
+                entityType,
+                constraintName,
+                constraintDef,
+                after,
+                storedSentinelValue,
+              )
         const putKey = fromAttributeMap(item.Put.Item ?? {})
         // Only values that recompose THIS sentinel are reported — never a guess.
         const fields =
@@ -8919,18 +9325,27 @@ const makeImpl = <
     })
 
   /** Compile an update for `Transaction.transactWrite` — see `_planUpdate`. */
-  const planUpdate = (key: unknown, uState: UpdateState) =>
-    planned("transactWrite.update", key, () => updateOrCreate(key, "native", uState), {
-      payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
-      deltas: {
-        ...uState.add,
-        ...Object.fromEntries(
-          Object.entries(uState.subtract ?? {}).map(([field, by]) => [field, -by]),
-        ),
+  const planUpdate = (
+    key: unknown,
+    uState: UpdateState,
+    prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
+  ) =>
+    planned(
+      "transactWrite.update",
+      prepared.encodedKey,
+      () => updateOrCreate(key, "native", uState, prepared),
+      {
+        payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
+        deltas: {
+          ...uState.add,
+          ...Object.fromEntries(
+            Object.entries(uState.subtract ?? {}).map(([field, by]) => [field, -by]),
+          ),
+        },
+        callerCondition: uState.condition !== undefined,
+        expectedVersion: uState.expectedVersion,
       },
-      callerCondition: uState.condition !== undefined,
-      expectedVersion: uState.expectedVersion,
-    })
+    )
 
   // ---------------------------------------------------------------------------
   // delete operation
@@ -9145,6 +9560,7 @@ const makeImpl = <
                   constraintName,
                   constraintDef,
                   rawDomain,
+                  readSentinelValue,
                 )
                 if (!sentinel) continue
                 held.push({ ...sentinel.key, constraintName })
@@ -9485,10 +9901,11 @@ const makeImpl = <
       readonly condition: Expr | ConditionInput | undefined
       readonly mustExist: boolean
     },
+    encodedKey: globalThis.Record<string, unknown>,
   ) =>
     planned(
       "transactWrite.delete",
-      key,
+      encodedKey,
       () => del(key)._builder({ ...opts, returnValues: undefined }),
       { payload: {}, callerCondition: opts.condition !== undefined },
     )
@@ -11533,6 +11950,7 @@ const makeImpl = <
                 constraintName,
                 constraintDef,
                 restoredDomain,
+                readSentinelValue,
               )
               if (!sentinel) continue
               sentinelConstraints.push(constraintName)
@@ -11789,6 +12207,7 @@ const makeImpl = <
                   constraintName,
                   constraintDef,
                   holderDomain,
+                  readSentinelValue,
                 )
                 if (!sentinel) continue
                 held.set(`${sentinel.key.pk}\u0000${sentinel.key.sk}`, sentinel.key)
@@ -11955,6 +12374,55 @@ const makeImpl = <
       ? [...KeyText136.forms(schema), KeyText136.invertedForm137(schema)]
       : KeyText136.forms(schema)
 
+  /** The fields the primary key's text is composed from. */
+  const primaryTextFields: ReadonlyArray<string> = [
+    ...new Set([...config.indexes.primary.pk.composite, ...config.indexes.primary.sk.composite]),
+  ]
+
+  /**
+   * The reading of `record`, a key-form record, whose `compose` gives `stored`: each of `fields`
+   * holding a number or a bigint as its own kind or as the other one, the other read from the
+   * digits `row` stored (`CompositeCodec.kindReadingOf`): a field that stored both kinds composed
+   * each value's own kind's text. Each value stays in key form (`kindKeyForm`), a numeric value
+   * given as the kind a release stored. `record` itself when it composes `stored`, at the cost of
+   * that one composition; otherwise one composition per field, never one per combination.
+   */
+  const kindReading = (
+    row: StoredRow,
+    record: globalThis.Record<string, unknown>,
+    fields: ReadonlyArray<string>,
+    compose: (
+      kindKeyForm: globalThis.Record<string, unknown>,
+      asOther: ReadonlySet<string>,
+    ) => string | ReadonlyArray<string> | undefined,
+    stored: string,
+  ) =>
+    kindReadingOf(
+      record,
+      fields,
+      (field) => row[resolveDbName(field)]?.N,
+      (reading) => compose(reading.record, reading.asOther),
+      stored,
+    )
+
+  /**
+   * A table key as one text, for {@link kindReading}: both halves, neither running into the other.
+   * {@link keySegments} gives it in its halves.
+   */
+  const storedKeyText = (key: StoredKey): string => JSON.stringify([key[rekeyPk], key[rekeySk]])
+
+  /**
+   * A key's text ({@link storedKeyText}) in its two halves, which concatenate to it: a composite in
+   * both halves is read as one kind in both (`CompositeCodec.kindReadingOf`).
+   */
+  const keySegments = (pk: string | undefined, sk: string | undefined): ReadonlyArray<string> => [
+    `[${JSON.stringify(pk)}`,
+    `,${JSON.stringify(sk)}]`,
+  ]
+
+  /** Bytes as text, one character a byte, for {@link kindReading}. */
+  const bytesText = (bytes: Uint8Array): string => String.fromCharCode(...bytes)
+
   type RowTargets = {
     readonly kind: RowKind
     /** Where the row belongs now. */
@@ -11963,18 +12431,40 @@ const makeImpl = <
     readonly old: StoredKey | undefined
     /** The item's key now: a tombstone's sentinels name the item. */
     readonly live: StoredKey
-    /** The item's key under every text, the keys a tombstone's sentinels may name. */
-    readonly lives: ReadonlyArray<StoredKey>
+    /**
+     * Is `key` the item's key under some text, one a tombstone's sentinels may name: its key now,
+     * or what its values compose under another text, a numeric composite as either kind.
+     */
+    readonly isLive: (key: StoredKey) => boolean
+  }
+
+  /** What a row's sort key says it is, for a row whose values compose no key to say it by. */
+  const storedRowKind = (sk: string): RowKind => {
+    const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+    if (sk.startsWith(versions) && /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) {
+      return "snapshot"
+    }
+    const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+    if (
+      sk.startsWith(tombstones) &&
+      /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))
+    ) {
+      return "tombstone"
+    }
+    return timeSeriesConfig !== undefined && sk.includes("#e#") ? "event" : "item"
   }
 
   /**
    * Where a row of the entity belongs now and whether it is stored where some key text put it,
-   * from its values and the layout of its sort key: `undefined` for a row whose values compose no
-   * key now (`NaN` under `escapeKeys: true`), or of no layout the entity writes. A history row
-   * keeps its layout: one an earlier release wrote without an item segment (#133) moves only its
-   * partition key.
+   * from its values and the layout of its sort key: `uncomposable` with what refused them for a
+   * row holding a composite whose value has no key text (`NaN`) or that no form of its schema takes
+   * (`EDD-9050`), and `undefined` for a row missing one, or of no layout the entity writes. A
+   * history row keeps its layout: one an earlier release wrote without an item segment (#133)
+   * moves only its partition key.
    */
-  const rowTargets = (row: StoredRow): RowTargets | undefined => {
+  const rowPlaces = (
+    row: StoredRow,
+  ): RowTargets | { readonly uncomposable: string } | undefined => {
     if (row.__edd_e__?.S !== entityType) return undefined
     const stored = storedKeyOf(row)
     if (stored === undefined) return undefined
@@ -11983,41 +12473,102 @@ const makeImpl = <
       const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
       const rowKeyForm = keyForm(values)
       const live = composePrimaryKey(values) as StoredKey
-      const places = keyFormsOf().flatMap((form) => {
-        try {
-          const key = KeyText136.composeAt(form, entityType, entityVersion, primary, rowKeyForm)
-          return [{ form, key: key as StoredKey }]
-        } catch {
-          // Values with no key text under this form.
-          return []
-        }
-      })
-      const lives = [live, ...places.map((place) => place.key)].filter(
-        (key, i, all) => all.findIndex((other) => sameStoredKey(other, key)) === i,
-      )
+      const now: KeyText136.KeyForm = { pk: schema, sk: schema }
+      type At = (
+        form: KeyText136.KeyForm,
+        key: StoredKey,
+        record: globalThis.Record<string, unknown>,
+      ) => StoredKey
+      /** Is `key` where `at` puts a row of some reading of the values, under some form? */
+      const placed = (key: StoredKey, at: At, fields: ReadonlyArray<string>) =>
+        keyFormsOf().some(
+          (form) =>
+            kindReading(
+              row,
+              rowKeyForm,
+              fields,
+              (kindKeyForm) => {
+                const placedAt = at(
+                  form,
+                  KeyText136.composeAt(
+                    form,
+                    entityType,
+                    entityVersion,
+                    primary,
+                    kindKeyForm,
+                  ) as StoredKey,
+                  kindKeyForm,
+                )
+                return keySegments(placedAt[rekeyPk], placedAt[rekeySk])
+              },
+              storedKeyText(key),
+            ) !== undefined,
+        )
+      const isLive = (key: StoredKey) =>
+        sameStoredKey(key, live) || placed(key, (_, at) => at, primaryTextFields)
       const targets = (
         kind: RowKind,
-        at: (form: KeyText136.KeyForm, key: StoredKey) => StoredKey,
-      ): RowTargets => ({
-        kind,
-        current: at({ pk: schema, sk: schema }, live),
-        old: places.some(({ form, key }) => sameStoredKey(stored, at(form, key)))
-          ? stored
-          : undefined,
-        live,
-        lives,
-      })
-      if (lives.some((key) => sameStoredKey(stored, key))) {
-        return targets("item", (_, key) => key)
-      }
-      const sk = stored[rekeySk]!
-      const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
-      if (sk.startsWith(versions) && /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) {
-        if (!sk.slice(versions.length).includes("#")) {
-          return targets("snapshot", (_, key) => keyAt(key[rekeyPk]!, sk))
+        at: At,
+        fields: ReadonlyArray<string> = primaryTextFields,
+      ): RowTargets => {
+        const current = at(now, live, rowKeyForm)
+        return {
+          kind,
+          current,
+          old: sameStoredKey(stored, current) || placed(stored, at, fields) ? stored : undefined,
+          live,
+          isLive,
         }
-        const version = versionOfSk(sk)
-        return targets("snapshot", (_, key) =>
+      }
+      const history = historyLayout(stored[rekeySk]!, values, rowKeyForm)
+      if (sameStoredKey(stored, live)) return targets("item", (_, key) => key)
+      // A history row under its current key, which nothing else composes.
+      if (history !== undefined && sameStoredKey(stored, history.at(now, live, rowKeyForm))) {
+        return targets(history.kind, history.at, history.fields)
+      }
+      if (isLive(stored)) return targets("item", (_, key) => key)
+      return history === undefined ? undefined : targets(history.kind, history.at, history.fields)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return Capacity.isRefusedValue(error) || message.startsWith("[EDD-9050]")
+        ? { uncomposable: message }
+        : undefined
+    }
+  }
+
+  /**
+   * A history row's kind by the layout of its sort key `sk`, with where a row of that kind is for
+   * an item at a key ({@link rowPlaces}), and the fields that composes it from; `undefined` for a
+   * sort key of no history layout, or an event missing its `orderBy` value.
+   */
+  const historyLayout = (
+    sk: string,
+    values: globalThis.Record<string, unknown>,
+    rowKeyForm: globalThis.Record<string, unknown>,
+  ):
+    | {
+        readonly kind: RowKind
+        readonly at: (
+          form: KeyText136.KeyForm,
+          key: StoredKey,
+          record: globalThis.Record<string, unknown>,
+        ) => StoredKey
+        readonly fields: ReadonlyArray<string>
+      }
+    | undefined => {
+    const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
+    if (sk.startsWith(versions) && /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) {
+      if (!sk.slice(versions.length).includes("#")) {
+        return {
+          kind: "snapshot",
+          at: (_, key) => keyAt(key[rekeyPk]!, sk),
+          fields: primaryTextFields,
+        }
+      }
+      const version = versionOfSk(sk)
+      return {
+        kind: "snapshot",
+        at: (_, key) =>
           keyAt(
             key[rekeyPk]!,
             DynamoSchema.composeVersionKey(
@@ -12027,18 +12578,25 @@ const makeImpl = <
               historyKeyOptions(key[rekeySk]),
             ),
           ),
-        )
+        fields: primaryTextFields,
       }
-      const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
-      if (
-        sk.startsWith(tombstones) &&
-        /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))
-      ) {
-        if (!sk.slice(tombstones.length).includes("#")) {
-          return targets("tombstone", (_, key) => keyAt(key[rekeyPk]!, sk))
+    }
+    const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
+    if (
+      sk.startsWith(tombstones) &&
+      /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))
+    ) {
+      if (!sk.slice(tombstones.length).includes("#")) {
+        return {
+          kind: "tombstone",
+          at: (_, key) => keyAt(key[rekeyPk]!, sk),
+          fields: primaryTextFields,
         }
-        const timestamp = sk.slice(sk.lastIndexOf("#") + 1)
-        return targets("tombstone", (_, key) =>
+      }
+      const timestamp = sk.slice(sk.lastIndexOf("#") + 1)
+      return {
+        kind: "tombstone",
+        at: (_, key) =>
           keyAt(
             key[rekeyPk]!,
             DynamoSchema.composeDeletedKey(
@@ -12048,26 +12606,39 @@ const makeImpl = <
               historyKeyOptions(key[rekeySk]),
             ),
           ),
-        )
+        fields: primaryTextFields,
       }
-      if (timeSeriesConfig !== undefined) {
-        const orderBy = timeSeriesConfig.orderBy
-        if (values[orderBy] === undefined || values[orderBy] === null) return undefined
-        return targets("event", (form, key) =>
-          keyAt(
-            key[rekeyPk]!,
-            KeyComposer.composeEventSk(
+    }
+    if (timeSeriesConfig === undefined) return undefined
+    const orderBy = timeSeriesConfig.orderBy
+    if (values[orderBy] === undefined || values[orderBy] === null) return undefined
+    // What `append` composed the key from: the Encoded value it stored, which a `bigint`
+    // reads back from as a number while it's a safe integer.
+    const appended = readSentinelValue(orderBy, values[orderBy]) ?? values[orderBy]
+    return {
+      kind: "event",
+      at: (form, key, record) =>
+        keyAt(
+          key[rekeyPk]!,
+          KeyComposer.composeEventSk(
+            form.sk,
+            key[rekeySk]!,
+            KeyComposer.eventOrderByValue(
               form.sk,
-              key[rekeySk]!,
-              KeyComposer.eventOrderByValue(form.sk, values[orderBy], rowKeyForm[orderBy]),
+              // As the other numeric kind, the value is its own Encoded form.
+              record[orderBy] === rowKeyForm[orderBy] ? appended : record[orderBy],
+              record[orderBy],
             ),
           ),
-        )
-      }
-      return undefined
-    } catch {
-      return undefined
+        ),
+      fields: [...new Set([...primaryTextFields, orderBy])],
     }
+  }
+
+  /** {@link rowPlaces}, for a row whose values compose its keys. */
+  const rowTargets = (row: StoredRow): RowTargets | undefined => {
+    const places = rowPlaces(row)
+    return places === undefined || "uncomposable" in places ? undefined : places
   }
 
   /**
@@ -12301,7 +12872,16 @@ const makeImpl = <
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
         const sentinels =
           kind === "tombstone"
-            ? yield* sentinelRekeys(ctx, kind, values, targets.lives, targets.live, depth)
+            ? yield* sentinelRekeys(
+                ctx,
+                kind,
+                values,
+                read!,
+                targets.isLive,
+                targets.live,
+                depth,
+                true,
+              )
             : NO_SENTINEL_REKEYS
         if (ctx.dryRun) {
           return Rekey.mergeTallies(countMove(ctx, kind, to, tally), sentinels.tally, {
@@ -12696,7 +13276,16 @@ const makeImpl = <
         tally = Rekey.mergeTallies(tally, room.tally)
         if (!room.cleared) return tally
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
-        const sentinels = yield* sentinelRekeys(ctx, "item", values, [from], to, depth)
+        const sentinels = yield* sentinelRekeys(
+          ctx,
+          "item",
+          values,
+          read!,
+          (key) => sameStoredKey(key, from),
+          to,
+          depth,
+          true,
+        )
         tally = Rekey.mergeTallies(tally, sentinels.tally)
         if ((sentinels.tally.conflicts ?? []).length > 0) return tally
         const failed = (error: ValidationError) =>
@@ -12788,7 +13377,9 @@ const makeImpl = <
    * row's values, and never reads a value out of a stored key.
    *
    * An unsharded partition key, a sort key, a Z-order sort key or a vector partition is rewritten
-   * only when it is exactly its text under some form, and that isn't the current text. Each half
+   * only when it is exactly its text under some form, and that isn't the current text: the text of
+   * the row's values, or of them with a numeric composite as the other kind ({@link kindReading}),
+   * looked for only behind a key that isn't its current text. Each half
    * is judged by itself and by its bytes: halves in one attribute have the same definition
    * (`EDD-9106`), so none can be another's other text. A sort key missing a trailing composite is
    * judged by the composites before the gap, which is what a row truncated under 1.36 stores.
@@ -12825,17 +13416,38 @@ const makeImpl = <
       for (const attr of attrs) composites.add(resolveDbName(attr))
     }
     const forms = KeyText136.forms(schema)
+    /**
+     * Is `stored` what some reading of the row's values composes under some form: the values, or
+     * them with some of `fields` as the other numeric kind ({@link kindReading})?
+     */
+    const composedUnder = (
+      fields: ReadonlyArray<string>,
+      under: (
+        form: KeyText136.KeyForm,
+        record: globalThis.Record<string, unknown>,
+      ) => string | undefined,
+      stored: string,
+    ) =>
+      forms.some(
+        (form) =>
+          kindReading(row, rowKeyForm, fields, (record) => under(form, record), stored) !==
+          undefined,
+      )
     const consider = (
       field: string,
       attrs: ReadonlyArray<string>,
       now: () => string | undefined,
-      under: (form: KeyText136.KeyForm) => string | undefined,
+      under: (
+        form: KeyText136.KeyForm,
+        record: globalThis.Record<string, unknown>,
+      ) => string | undefined,
     ) => {
       const stored = row[field]?.S
       if (stored === undefined) return
-      if (!forms.some((form) => composing(() => under(form)) === stored)) return
+      // Its current text, which no other text is looked for behind: nothing to rewrite.
       const text = composing(now)
-      if (text !== undefined && text !== stored) rewrite(field, { S: text }, attrs)
+      if (text === undefined || text === stored) return
+      if (composedUnder(attrs, under, stored)) rewrite(field, { S: text }, attrs)
     }
     const sameBytes = (a: Uint8Array, b: Uint8Array | undefined) =>
       b !== undefined && a.length === b.length && a.every((byte, i) => byte === b[i])
@@ -12861,25 +13473,22 @@ const makeImpl = <
           index.pk.field,
           index.pk.composite,
           () => KeyComposer.composePk(schema, entityType, index, rowKeyForm),
-          (form) => KeyComposer.composePk(form.pk, entityType, index, rowKeyForm),
+          (form, kindKeyForm) => KeyComposer.composePk(form.pk, entityType, index, kindKeyForm),
         )
       }
       if (KeyComposer.isZOrderHalf(index.sk)) {
         // An address holds no text, its prefix segments do.
         const stored = row[index.sk.field]?.B
         if (stored === undefined) continue
-        const known = forms.some((form) =>
-          sameBytes(
-            stored,
-            composing(() => KeyComposer.composeZOrderSk(form.sk, index, rowKeyForm)),
-          ),
+        const bytes = composing(() => KeyComposer.composeZOrderSk(schema, index, rowKeyForm))
+        if (bytes === undefined || sameBytes(bytes, stored)) continue
+        const known = composedUnder(
+          index.sk.zorderHalf.prefix.map((segment) => segment.field),
+          (form, kindKeyForm) =>
+            bytesText(KeyComposer.composeZOrderSk(form.sk, index, kindKeyForm)),
+          bytesText(stored),
         )
-        const bytes = known
-          ? composing(() => KeyComposer.composeZOrderSk(schema, index, rowKeyForm))
-          : undefined
-        if (bytes !== undefined && !sameBytes(bytes, stored)) {
-          rewrite(index.sk.field, { B: bytes }, index.sk.composite)
-        }
+        if (known) rewrite(index.sk.field, { B: bytes }, index.sk.composite)
         continue
       }
       consider(
@@ -12887,8 +13496,8 @@ const makeImpl = <
         index.sk.composite,
         () =>
           KeyComposer.composeSortKeyPrefix(schema, entityType, entityVersion, index, rowKeyForm),
-        (form) =>
-          KeyComposer.composeSortKeyPrefix(form.sk, entityType, entityVersion, index, rowKeyForm),
+        (form, kindKeyForm) =>
+          KeyComposer.composeSortKeyPrefix(form.sk, entityType, entityVersion, index, kindKeyForm),
       )
     }
     for (const [, definition] of vectorIndexEntries) {
@@ -12896,8 +13505,8 @@ const makeImpl = <
         definition.partitionField,
         definition.partition,
         () => KeyComposer.tryComposeVectorPartition(schema, entityType, definition, rowKeyForm),
-        (form) =>
-          KeyComposer.tryComposeVectorPartition(form.pk, entityType, definition, rowKeyForm),
+        (form, kindKeyForm) =>
+          KeyComposer.tryComposeVectorPartition(form.pk, entityType, definition, kindKeyForm),
       )
     }
     return { sets, olds, composites: [...composites], uncomposable }
@@ -13007,7 +13616,15 @@ const makeImpl = <
         row = fresh
       }
       const repair = yield* repairIndexKeys(ctx, left, at)
-      const sentinels = yield* rekeySentinels(ctx, "item", row, [at], at, depth)
+      const sentinels = yield* rekeySentinels(
+        ctx,
+        "item",
+        row,
+        (key) => sameStoredKey(key, at),
+        at,
+        depth,
+        false,
+      )
       const refused = heldBackIndexKeys(at, uncomposable)
       return Rekey.mergeTallies(
         rewritten ||
@@ -13067,42 +13684,197 @@ const makeImpl = <
     readonly tally: Rekey.RekeyTally
   } = { items: [], count: 0, moved: 0, tally: {} }
 
-  /** A unique sentinel's key under `under`; `undefined` when the values have none there. */
+  /**
+   * A unique sentinel's key under `under`; `undefined` when the values have none there. A field in
+   * `asOther` is composed as given, not lifted to its kind ({@link kindReading}).
+   */
   const sentinelKeyUnder = (
     under: DynamoSchema.DynamoSchema,
     constraintName: string,
     constraintDef: UniqueConstraintDef,
     source: globalThis.Record<string, unknown>,
+    asOther: ReadonlySet<string> = new Set(),
   ) => {
     try {
-      return composeUniqueSentinel(under, entityType, constraintName, constraintDef, source)?.key
+      return composeUniqueSentinel(
+        under,
+        entityType,
+        constraintName,
+        constraintDef,
+        source,
+        (field, value) => (asOther.has(field) ? undefined : readSentinelValue(field, value)),
+      )?.key
     } catch {
       return undefined
     }
   }
-  /** The keys a unique sentinel of `source`'s values can be stored under, other than `current`. */
+  /** Each of a unique constraint's values as its field's kind, which the other kind is the other of. */
+  const liftedSentinelValues = (
+    constraintDef: UniqueConstraintDef,
+    source: globalThis.Record<string, unknown>,
+  ) => {
+    const lifted = { ...source }
+    for (const field of resolveUniqueFields(constraintDef)) {
+      const value = readSentinelValue(field, source[field])
+      if (value !== undefined) lifted[field] = value
+    }
+    return lifted
+  }
+
+  /** The sentinel texts a unique sentinel's key is looked for under: each setting's. */
+  const sentinelTexts = (): ReadonlyArray<DynamoSchema.DynamoSchema> => [
+    KeyText136.schema136(schema),
+    KeyText136.schema137(schema),
+    KeyText136.schemaEscaped(schema),
+  ]
+
+  /**
+   * The reading of a row's values its own stored key was composed from ({@link kindReading}):
+   * which numeric composites it gives as the other kind. `undefined` when no reading under any
+   * form composes it.
+   */
+  const storedKeyReading = (row: StoredRow) => {
+    const stored = storedKeyOf(row)
+    if (stored === undefined) return undefined
+    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
+    const rowKeyForm = keyForm(values)
+    const history = historyLayout(stored[rekeySk]!, values, rowKeyForm)
+    for (const form of keyFormsOf()) {
+      for (const [at, fields] of [
+        [(key: StoredKey) => key, primaryTextFields],
+        ...(history === undefined
+          ? []
+          : [
+              [
+                (key: StoredKey, record: globalThis.Record<string, unknown>) =>
+                  history.at(form, key, record),
+                history.fields,
+              ] as const,
+            ]),
+      ] as const) {
+        const reading = kindReading(
+          row,
+          rowKeyForm,
+          fields,
+          // A reading of the row's key form: each numeric field read as the kind it composes.
+          (kindKeyForm) => {
+            const placedAt = at(
+              KeyText136.composeAt(
+                form,
+                entityType,
+                entityVersion,
+                config.indexes.primary,
+                kindKeyForm,
+              ) as StoredKey,
+              kindKeyForm,
+            )
+            return keySegments(placedAt[rekeyPk], placedAt[rekeySk])
+          },
+          storedKeyText(stored),
+        )
+        if (reading !== undefined) return reading
+      }
+    }
+    return undefined
+  }
+
+  /** A unique sentinel's key, as `composeUniqueSentinel` gives it. */
+  type SentinelKey = { readonly pk: string; readonly sk: string }
+  const sameSentinelKey = (a: SentinelKey, b: SentinelKey) => a.pk === b.pk && a.sk === b.sk
+
+  /**
+   * The keys a unique sentinel of `source`'s values, read from `row`, can be stored under, other
+   * than `current`: under each text, and with `otherKinds`, with some numeric values as the other
+   * kind. A moving row's sentinel is looked for there, before anything has a key to compare.
+   * `first` reads the values as they are, as `row`'s own key gives them, each alone as the other
+   * kind, and all of them, which is every reading of a constraint over one or two numeric fields.
+   * `mixes` gives every other reading, fewest values as the other kind first: looked at only when
+   * no key of `first`, and not the current key, holds a sentinel, since a moving row's sentinel
+   * names its old key and is moved by nothing else.
+   */
   const otherSentinelKeys = (
     constraintName: string,
     constraintDef: UniqueConstraintDef,
     source: globalThis.Record<string, unknown>,
-    current: { readonly pk: string; readonly sk: string } | undefined,
-  ) => {
-    const others: Array<{ readonly pk: string; readonly sk: string }> = []
-    for (const under of [
-      KeyText136.schema136(schema),
-      KeyText136.schema137(schema),
-      KeyText136.schemaEscaped(schema),
-    ]) {
-      const key = sentinelKeyUnder(under, constraintName, constraintDef, source)
-      if (
-        key !== undefined &&
-        !(key.pk === current?.pk && key.sk === current?.sk) &&
-        !others.some((other) => other.pk === key.pk && other.sk === key.sk)
-      ) {
-        others.push(key)
-      }
+    row: StoredRow,
+    current: SentinelKey | undefined,
+    otherKinds: boolean,
+  ): {
+    readonly first: ReadonlyArray<SentinelKey>
+    readonly mixes: () => ReadonlyArray<SentinelKey>
+  } => {
+    const lifted = liftedSentinelValues(constraintDef, source)
+    const digits = (field: string) => row[resolveDbName(field)]?.N
+    const fields = otherKinds
+      ? resolveUniqueFields(constraintDef).filter(
+          (field) => otherNumericKind(lifted[field], digits(field)) !== undefined,
+        )
+      : []
+    const readings: Array<ReadonlySet<string>> = [new Set()]
+    if (otherKinds) {
+      const keyed = storedKeyReading(row)?.asOther
+      if (keyed !== undefined) readings.push(new Set(fields.filter((field) => keyed.has(field))))
+      for (const field of fields) readings.push(new Set([field]))
+      readings.push(new Set(fields))
     }
-    return others
+    const seen = new Set<string>(current === undefined ? [] : [`${current.pk}\u0000${current.sk}`])
+    const keysOf = (mixes: ReadonlyArray<ReadonlySet<string>>) => {
+      const keys: Array<SentinelKey> = []
+      for (const under of sentinelTexts()) {
+        for (const asOther of mixes) {
+          const record = { ...lifted }
+          for (const field of asOther)
+            record[field] = otherNumericKind(lifted[field], digits(field))
+          const key = sentinelKeyUnder(under, constraintName, constraintDef, record, asOther)
+          if (key === undefined || seen.has(`${key.pk}\u0000${key.sk}`)) continue
+          seen.add(`${key.pk}\u0000${key.sk}`)
+          keys.push(key)
+        }
+      }
+      return keys
+    }
+    const first = keysOf(readings)
+    const mixes = () => {
+      const named = new Set(readings.map((asOther) => [...asOther].sort().join("\u0000")))
+      const others: Array<ReadonlySet<string>> = []
+      for (let mask = 1; mask < 2 ** fields.length; mask++) {
+        const asOther = new Set(fields.filter((_, i) => (mask & (1 << i)) !== 0))
+        if (!named.has([...asOther].sort().join("\u0000"))) others.push(asOther)
+      }
+      return keysOf(others.sort((a, b) => a.size - b.size))
+    }
+    return { first, mixes }
+  }
+
+  /**
+   * Is `key` where a unique sentinel of `source`'s values, read from `row`, is stored: under the
+   * current text or another, and with `otherKinds`, with some numeric values as the other kind,
+   * found from the key itself ({@link kindReading}).
+   */
+  const sentinelHeldAt = (
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    source: globalThis.Record<string, unknown>,
+    row: StoredRow,
+    key: { readonly pk: string; readonly sk: string },
+    otherKinds: boolean,
+  ): boolean => {
+    const lifted = liftedSentinelValues(constraintDef, source)
+    const fields = otherKinds ? resolveUniqueFields(constraintDef) : []
+    const text = JSON.stringify([key.pk, key.sk])
+    return [schema, ...sentinelTexts()].some(
+      (under) =>
+        kindReading(
+          row,
+          lifted,
+          fields,
+          (record, asOther) => {
+            const at = sentinelKeyUnder(under, constraintName, constraintDef, record, asOther)
+            return at === undefined ? undefined : keySegments(at.pk, at.sk)
+          },
+          text,
+        ) !== undefined,
+    )
   }
 
   /** The row a sentinel's back-pointer names: the item, or a tombstone keeping its reservation. */
@@ -13122,11 +13894,11 @@ const makeImpl = <
 
   /**
    * The writes that bring the unique sentinels of `values` to their current keys, naming `to`,
-   * from consistent reads: a sentinel one of `owners` holds under other key text is put under its
-   * current key and released under the old one; one under its current key naming another of
-   * `owners` is re-pointed to `to`. Each write is conditioned on the sentinel as read. An item's
-   * owners are its own key; a tombstone's (`preserveUnique`) are the item's live keys under every
-   * text — the sentinels name the item, not the tombstone.
+   * from consistent reads: a sentinel naming a key `owns` holds under other key text is put under
+   * its current key and released under the old one; one under its current key naming another key
+   * `owns` holds is re-pointed to `to`. Each write is conditioned on the sentinel as read. An
+   * item owns its own key; a tombstone (`preserveUnique`) the item's live keys under every text —
+   * the sentinels name the item, not the tombstone.
    *
    * A sentinel's current key can hold another value's sentinel under other key text: the row it
    * names moves first, with its sentinel. Its current key held by anything else is a conflict and
@@ -13137,9 +13909,22 @@ const makeImpl = <
     ctx: Rekey.RekeyRowContext,
     kind: RowKind,
     values: globalThis.Record<string, unknown>,
-    owners: ReadonlyArray<StoredKey>,
+    /** The row `values` were read from. */
+    row: StoredRow,
+    /** Is a key a sentinel names one of its owners'? */
+    owns: (key: StoredKey) => boolean,
     to: StoredKey,
     depth: number,
+    /**
+     * Look under the other numeric kind's text too ({@link otherSentinelKeys}). A moving row's
+     * sentinels are looked for there, since they name its old key: under the first readings, then,
+     * when none of them nor the current key holds one, under every other mix. One under its current
+     * key leaves it to the scan to find one there ({@link rekeySentinelRow}): each read it costs is
+     * a read of every item, on every run.
+     */
+    otherKinds: boolean,
+    /** A sentinel the scan reached, which names the row: looked at first, for its constraint. */
+    scanned?: { readonly constraintName: string; readonly key: SentinelKey } | undefined,
   ) =>
     Effect.gen(function* () {
       if (config.unique === undefined) return NO_SENTINEL_REKEYS
@@ -13153,13 +13938,13 @@ const makeImpl = <
           }),
           (result) => result.Item,
         )
-      const ownerIn = (held: StoredRow | undefined): StoredKey | undefined =>
-        held === undefined
-          ? undefined
-          : owners.find(
-              (owner) =>
-                held._entity_pk?.S === owner[rekeyPk] && held._entity_sk?.S === owner[rekeySk],
-            )
+      const ownerIn = (held: StoredRow | undefined): StoredKey | undefined => {
+        const pk = held?._entity_pk?.S
+        const sk = held?._entity_sk?.S
+        if (pk === undefined || sk === undefined) return undefined
+        const named = keyAt(pk, sk)
+        return owns(named) ? named : undefined
+      }
       const items: Array<TransactWriteItem> = []
       let count = 0
       let moved = 0
@@ -13188,8 +13973,14 @@ const makeImpl = <
         const now = (() => {
           try {
             return {
-              key: composeUniqueSentinel(schema, entityType, constraintName, constraintDef, values)
-                ?.key,
+              key: composeUniqueSentinel(
+                schema,
+                entityType,
+                constraintName,
+                constraintDef,
+                values,
+                readSentinelValue,
+              )?.key,
             }
           } catch {
             return undefined
@@ -13218,13 +14009,39 @@ const makeImpl = <
               readonly owner: StoredKey
             }
           | undefined
-        for (const key of otherSentinelKeys(constraintName, constraintDef, values, current)) {
-          const held = yield* readAt(key)
-          const owner = ownerIn(held)
-          if (held !== undefined && owner !== undefined) {
-            found = { key, held, owner }
-            break
-          }
+        const keys = otherSentinelKeys(
+          constraintName,
+          constraintDef,
+          values,
+          row,
+          current,
+          otherKinds,
+        )
+        const at =
+          scanned?.constraintName === constraintName && !sameSentinelKey(scanned.key, current)
+            ? [scanned.key]
+            : []
+        const lookAt = (
+          among: ReadonlyArray<SentinelKey>,
+        ): Effect.Effect<typeof found, DynamoClientError> =>
+          Effect.gen(function* () {
+            for (const key of among) {
+              const held = yield* readAt(key)
+              const owner = ownerIn(held)
+              if (held !== undefined && owner !== undefined) return { key, held, owner }
+            }
+            return undefined
+          })
+        found = yield* lookAt([
+          ...at,
+          ...keys.first.filter((key) => !at.some((one) => sameSentinelKey(one, key))),
+        ])
+        // Under no reading looked at, and none under its current key: the sentinel of a moving row
+        // is moved by nothing else, so every mix of kinds is looked at.
+        if (found === undefined && heldNow === undefined && otherKinds) {
+          found = yield* lookAt(
+            keys.mixes().filter((key) => !at.some((one) => sameSentinelKey(one, key))),
+          )
         }
         if (found !== undefined) {
           if (heldNow !== undefined) {
@@ -13344,16 +14161,28 @@ const makeImpl = <
     ctx: Rekey.RekeyRowContext,
     kind: RowKind,
     row: StoredRow,
-    owners: ReadonlyArray<StoredKey>,
+    owns: (key: StoredKey) => boolean,
     to: StoredKey,
     depth: number,
+    otherKinds: boolean,
+    scanned?: { readonly constraintName: string; readonly key: SentinelKey } | undefined,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       if (config.unique === undefined) return {}
       const client = yield* Capacity.client
       const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
-        const planned = yield* sentinelRekeys(ctx, kind, values, owners, to, depth)
+        const planned = yield* sentinelRekeys(
+          ctx,
+          kind,
+          values,
+          row,
+          owns,
+          to,
+          depth,
+          otherKinds,
+          scanned,
+        )
         const moved = planned.count > 0 ? { sentinelsMoved: planned.count } : {}
         if (planned.items.length === 0 || ctx.dryRun) {
           return Rekey.mergeTallies(planned.tally, moved)
@@ -13393,18 +14222,35 @@ const makeImpl = <
       )?.[constraintName]
       const at = storedKeyOf(row)
       if (at === undefined) return { skipped: { unrecognizedKey: 1 } }
-      const named = (sentinel: StoredRow, owner: StoredRow) => {
+      const keyOf = (sentinel: StoredRow): SentinelKey => {
+        const stored = storedKeyOf(sentinel)!
+        return { pk: stored[rekeyPk]!, sk: stored[rekeySk]! }
+      }
+      const named = (sentinel: StoredRow, owner: StoredRow, otherKinds: boolean) => {
         if (constraintDef === undefined) return false
         const values = toDomainView(fromAttributeMap(owner) as globalThis.Record<string, unknown>)
-        const current = sentinelKeyUnder(schema, constraintName, constraintDef, values)
-        const stored = storedKeyOf(sentinel)!
-        return [
-          ...(current === undefined ? [] : [current]),
-          ...otherSentinelKeys(constraintName, constraintDef, values, current),
-        ].some((key) => key.pk === stored[rekeyPk] && key.sk === stored[rekeySk])
+        return sentinelHeldAt(
+          constraintName,
+          constraintDef,
+          values,
+          owner,
+          keyOf(sentinel),
+          otherKinds,
+        )
       }
-      const owner = yield* sentinelOwnerRow(ctx.tableName, row)
-      if (owner !== undefined && named(row, owner)) return {}
+      // Its owner's own pass moves it, except from under the other numeric kind's text, which an
+      // owner under its current key doesn't look under: this one moves it from there, from the key
+      // the scan found it at, whatever mix of kinds that is.
+      const judge = (sentinel: StoredRow, owner: StoredRow | undefined) =>
+        owner === undefined
+          ? Effect.succeed(undefined)
+          : named(sentinel, owner, false)
+            ? Effect.succeed({})
+            : named(sentinel, owner, true)
+              ? sentinelsUnderOtherKind(ctx, owner, { constraintName, key: keyOf(sentinel) })
+              : Effect.succeed(undefined)
+      const judged = yield* judge(row, yield* sentinelOwnerRow(ctx.tableName, row))
+      if (judged !== undefined) return judged
       const client = yield* Capacity.client
       const { Item: fresh } = yield* client.getItem({
         TableName: ctx.tableName,
@@ -13412,10 +14258,49 @@ const makeImpl = <
         ConsistentRead: true,
       })
       if (fresh === undefined) return {}
-      const freshOwner = yield* sentinelOwnerRow(ctx.tableName, fresh)
-      return freshOwner !== undefined && named(fresh, freshOwner)
-        ? {}
-        : { skipped: { unrecognizedKey: 1 } }
+      return (
+        (yield* judge(fresh, yield* sentinelOwnerRow(ctx.tableName, fresh))) ?? {
+          skipped: { unrecognizedKey: 1 },
+        }
+      )
+    })
+
+  /**
+   * The sentinels of `owner`, a row under its current key, brought from under the other numeric
+   * kind's text ({@link sentinelHeldAt}), `scanned` the one the scan found. A row under an old key
+   * moves them itself when it moves.
+   */
+  const sentinelsUnderOtherKind = (
+    ctx: Rekey.RekeyRowContext,
+    owner: StoredRow,
+    scanned: { readonly constraintName: string; readonly key: SentinelKey },
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const targets = rowTargets(owner)
+      const ownerAt = storedKeyOf(owner)
+      if (targets === undefined || ownerAt === undefined) return {}
+      if (!sameStoredKey(ownerAt, targets.current)) return {}
+      return targets.kind === "tombstone"
+        ? yield* rekeySentinels(
+            ctx,
+            "tombstone",
+            owner,
+            targets.isLive,
+            targets.live,
+            0,
+            true,
+            scanned,
+          )
+        : yield* rekeySentinels(
+            ctx,
+            "item",
+            owner,
+            (key) => sameStoredKey(key, ownerAt),
+            ownerAt,
+            0,
+            true,
+            scanned,
+          )
     })
 
   /** The entity's `rekey` handler: one scanned row — or one displaced by a move. */
@@ -13430,9 +14315,19 @@ const makeImpl = <
       if (type?.startsWith(`${entityType}._unique.`)) return yield* rekeySentinelRow(row, ctx)
       if (type !== entityType) return undefined
       const stored = storedKeyOf(row)
-      const targets = rowTargets(row)
+      const targets = rowPlaces(row)
       if (stored === undefined || targets === undefined) {
         return { skipped: { unrecognizedKey: 1 } }
+      }
+      // The member's row, with values no key can be composed from: left where it is, and said so.
+      if ("uncomposable" in targets) {
+        return rekeyConflict(
+          storedRowKind(stored[rekeySk]!),
+          "uncomposable",
+          stored,
+          undefined,
+          `Its values compose no key: ${targets.uncomposable}`,
+        )
       }
       if (sameStoredKey(stored, targets.current)) {
         // A sentinel in another row's way has this row reached before the scan gets to it, and
@@ -13449,9 +14344,10 @@ const makeImpl = <
             ctx,
             "tombstone",
             row,
-            targets.lives,
+            targets.isLive,
             targets.live,
             depth,
+            false,
           )
           return (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
             ? sentinels
@@ -13471,6 +14367,39 @@ const makeImpl = <
       if (ctx.dryRun || (moved.conflicts ?? []).length > 0) return moved
       return Rekey.mergeTallies(moved, yield* rekeyAfterMove(ctx, row, targets.current, depth))
     })
+
+  /**
+   * A key's values read with each numeric composite as its declared kind or the other one, the
+   * one whose value composes that composite's own text again (`KeyText136.readIndexKeys`), then
+   * given as the kind it is declared: a field that stored both composed each value's own kind's
+   * text. One reading, composite by composite, never one per combination. `undefined` when no
+   * reading fits.
+   */
+  const readAsOtherNumericKind = (
+    readAs: (
+      kindOf: (attr: string) => KeyText136.ValueKind | ReadonlyArray<KeyText136.ValueKind>,
+    ) => globalThis.Record<string, unknown> | undefined,
+  ): globalThis.Record<string, unknown> | undefined => {
+    const read = readAs((attr) => {
+      const kind = primaryKeyKinds.get(attr)
+      return kind === "number"
+        ? ["number", "bigint"]
+        : kind === "bigint"
+          ? ["bigint", "number"]
+          : kind
+    })
+    if (read === undefined) return undefined
+    const declared = { ...read }
+    for (const [attr, kind] of primaryKeyKinds) {
+      const value = read[attr]
+      if (kind === "number" && typeof value === "bigint") declared[attr] = Number(value)
+      if (kind === "bigint" && typeof value === "number") {
+        if (!Number.isInteger(value)) return undefined
+        declared[attr] = BigInt(value)
+      }
+    }
+    return declared
+  }
 
   /**
    * Where a projection's row tombstone or outbox item belongs now. It holds no values: only the
@@ -13510,14 +14439,19 @@ const makeImpl = <
     ) {
       return undefined
     }
-    const readKeyForm = KeyText136.readIndexKeys(
-      KeyText136.formOfMark(schema, row[KEY_TEXT]?.N),
-      entityType,
-      entityVersion,
-      primary,
-      { [primary.pk.field]: rowPk, [primary.sk.field]: rowSk },
-      (attr) => primaryKeyKinds.get(attr),
-    )
+    const readAs = (
+      kindOf: (attr: string) => KeyText136.ValueKind | ReadonlyArray<KeyText136.ValueKind>,
+    ) =>
+      KeyText136.readIndexKeys(
+        KeyText136.formOfMark(schema, row[KEY_TEXT]?.N),
+        entityType,
+        entityVersion,
+        primary,
+        { [primary.pk.field]: rowPk, [primary.sk.field]: rowSk },
+        kindOf,
+      )
+    const readKeyForm =
+      readAs((attr) => primaryKeyKinds.get(attr)) ?? readAsOtherNumericKind(readAs)
     if (readKeyForm === undefined) return undefined
     const now = (() => {
       try {
@@ -13819,12 +14753,30 @@ const makeImpl = <
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
-    _refuseNotReadBack: refuseNotReadBack,
+    _refuseNotReadBack: (encoded: unknown, operation: string) =>
+      kindReads().model.size === 0
+        ? refuseNotReadBack(encoded, operation)
+        : Effect.andThen(
+            refuseNotReadBack(encoded, operation),
+            refuseOtherKindRead(encoded, operation),
+          ),
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
-    _planUpdate: (key: unknown, state: UpdateState) =>
-      planUpdate(key, state).pipe(
+    _prepareUpdate: (
+      key: unknown,
+      state: UpdateState,
+      encoded: globalThis.Record<string, unknown>,
+    ) =>
+      prepareUpdate(key, state, encoded).pipe(
+        Effect.map((prepared) => prepared as unknown as PreparedUpdate),
+      ),
+    _planUpdate: (key: unknown, state: UpdateState, prepared: PreparedUpdate) =>
+      planUpdate(
+        key,
+        state,
+        prepared as unknown as Effect.Success<ReturnType<typeof prepareUpdate>>,
+      ).pipe(
         // Planning stops at the write, so only what an update raises BEFORE
         // writing can surface; anything else is a defect (`isPlanUpdateError`).
         Effect.catch((e: unknown) => (isPlanUpdateError(e) ? Effect.fail(e) : Effect.die(e))),
@@ -13832,10 +14784,12 @@ const makeImpl = <
     _planDelete: (
       key: unknown,
       opts: { readonly condition: Expr | ConditionInput | undefined; readonly mustExist: boolean },
+      encoded: globalThis.Record<string, unknown>,
     ) =>
-      planDelete(key, opts).pipe(
+      planDelete(key, opts, encoded).pipe(
         Effect.catch((e: unknown) => (isPlanDeleteError(e) ? Effect.fail(e) : Effect.die(e))),
       ),
+    _encodeKey: encodeKey,
     _liveRows: liveRows,
     _rekeyProjectionRow: rekeyProjectionRow,
     _keyTextMark: (key: globalThis.Record<string, unknown>) =>
@@ -14285,6 +15239,27 @@ export const bind = <
         }
         const schemaRef = entityInternals._schema
         const entityTypeRef = entityInternals.entityType
+        // An orderBy value as its model field stores it, as `append` encodes
+        // it (`encodeForWrite`: encoded, else decoded and encoded) and as the
+        // key form reads it, so a bound names the key an event's row composes;
+        // a value neither takes, as given. Only a bound's key text: nothing is
+        // stored from it.
+        const encodeOrderBy = (() => {
+          const field =
+            orderBy === undefined
+              ? undefined
+              : getSchemaFields(entity.schemas.inputSchema as unknown as Schema.Top)?.[orderBy]
+          if (field === undefined) return (v: unknown) => v
+          const codec = field as unknown as Schema.Codec<unknown, unknown>
+          const encode = Schema.encodeUnknownOption(codec)
+          const decode = Schema.decodeUnknownOption(codec)
+          return (v: unknown): unknown => {
+            const direct = encode(v)
+            if (Option.isSome(direct)) return direct.value
+            const again = Option.flatMap(decode(v), (decoded) => encode(decoded))
+            return Option.isSome(again) ? again.value : v
+          }
+        })()
 
         // composeSkCondition: rewrite user's .where() values by prefixing
         // with `<currentSk>#e#` and applying serialisation, casing and
@@ -14306,13 +15281,25 @@ export const bind = <
             keyFormFor(entityInternals, key as globalThis.Record<string, unknown>),
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
-          // Key form first: the event SK is composed from the key form of the
-          // orderBy value (`Entity.append` composes from `serialisedInput`), so
-          // a transformed orderBy composite must take the same route here.
+          // Exactly as `Entity.append` composes the event's sort key: the value
+          // encoded as `appendInput` encodes it, put into key form from that,
+          // and the one of the two the setting keys on (`eventOrderByValue`).
+          // From the caller's value, a transformed orderBy (`Option(x)`, a
+          // `NumberFromString` with `escapeKeys` off) composed other text.
           const keyFormOf = (v: unknown) =>
-            orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy]
-          const rewrite = (v: unknown) =>
-            `${prefix}${KeyComposer.keyValueText(schemaRef, keyFormOf(v), schemaRef.casing)}`
+            orderBy === undefined ? v : entity._keyForm({ [orderBy]: encodeOrderBy(v) })[orderBy]
+          const rewrite = (v: unknown) => {
+            if (orderBy === undefined) {
+              return `${prefix}${KeyComposer.keyValueText(schemaRef, v, schemaRef.casing)}`
+            }
+            const encoded = encodeOrderBy(v)
+            const value = KeyComposer.eventOrderByValue(
+              schemaRef,
+              encoded,
+              entity._keyForm({ [orderBy]: encoded })[orderBy],
+            )
+            return `${prefix}${KeyComposer.keyValueText(schemaRef, value, schemaRef.casing)}`
+          }
           // DynamoDB allows ONE sort key condition, and this one replaces the
           // history query's `begins_with(prefix)`. Every operator therefore
           // keeps both ends inside `prefix` — the `.where()` clamp of
@@ -14431,6 +15418,14 @@ export const bind = <
  * (`ConditionalCheckFailed`), an op too large for one transaction, and a refused op
  * (`ValidationError`).
  */
+/**
+ * @internal What `Entity._prepareUpdate` decided of an update, opaque outside the entity that
+ * made it: handed back to its `_planUpdate`.
+ */
+export interface PreparedUpdate {
+  readonly _preparedUpdate: unique symbol
+}
+
 export type PlanUpdateError =
   | DynamoClientError
   | ValidationError

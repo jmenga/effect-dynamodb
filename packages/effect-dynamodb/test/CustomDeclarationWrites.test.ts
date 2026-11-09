@@ -416,8 +416,9 @@ describe("a new write path can't go unnoticed", () => {
   const ENCODES: Readonly<Record<string, readonly [number, string]>> = {
     "Aggregate.ts": [4, "attribute encoders, feeding rows `refuseNotReadBack` reads"],
     "Entity.ts": [
-      7,
-      "`encodeOrDecodeEncode` (2), two probes that store nothing, a key (2), a ref's stored row",
+      8,
+      "`encodeOrDecodeEncode` (2), two probes that store nothing, a key (2), a ref's stored row, " +
+        "a history bound's key text",
     ],
     "EventStore.ts": [2, "`encodeToWire`, which checks"],
     "StorageEncoding.ts": [4, "a public helper: what's done with its value is the caller's"],
@@ -438,10 +439,13 @@ describe("a new write path can't go unnoticed", () => {
 
   it("an entity's writes encode through the one function that checks", () => {
     const entity = source("Entity.ts")
-    // The two arms of `encodeForWrite`.
-    expect(count(entity, /\bencodeOrDecodeEncode\(/g)).toBe(2)
+    // `encodeForWrite`'s one encode.
+    expect(count(entity, /\bencodeOrDecodeEncode\(/g)).toBe(1)
     // Put, update, upsert twice, and a time series' append.
     expect(count(entity, /\bencodeForWrite\(/g)).toBe(5)
+    // A key value that reads back as the other numeric kind is refused in `encodeForWrite`, and in
+    // the check a transaction's or a batch's put goes through (`_refuseNotReadBack`).
+    expect(count(entity, /\brefuseOtherKindRead\(/g)).toBe(2)
     // Path values encode in one place, and an update's operands are judged in one.
     expect(count(entity, /\bpathValues\.(?:value|elements)\(/g)).toBe(2)
     expect(count(entity, /\bnotReadBackOperand\(/g)).toBe(1)

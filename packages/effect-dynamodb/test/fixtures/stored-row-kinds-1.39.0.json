@@ -1,0 +1,93 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "aggregate": {
+  "withEntity": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$kinds#v1#line#5"
+     },
+     "note": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "n": {
+      "S": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kinds#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "read": {
+    "id": "a",
+    "lines": [
+     {
+      "n": 5,
+      "note": "a"
+     }
+    ]
+   }
+  },
+  "withoutEntity": {
+   "rows": [
+    {
+     "sk": {
+      "S": "$kinds#v1#line#05"
+     },
+     "note": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "n": {
+      "S": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kinds#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$kinds#v1#root#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    }
+   ],
+   "read": {
+    "id": "a",
+    "lines": [
+     {
+      "n": 5,
+      "note": "a"
+     }
+    ]
+   }
+  }
+ }
+}

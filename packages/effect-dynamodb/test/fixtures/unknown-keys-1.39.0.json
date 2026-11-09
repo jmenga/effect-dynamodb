@@ -1,0 +1,91 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "read": {
+  "string": {
+   "id": "s",
+   "n": "Ab C",
+   "u": "x",
+   "note": "string"
+  },
+  "number": {
+   "id": "n",
+   "n": 5,
+   "u": 6,
+   "note": "number"
+  }
+ },
+ "rows": [
+  {
+   "sk": {
+    "S": "$unk#v1#unknowns.byu"
+   },
+   "_entity_sk": {
+    "S": "$unk#v1#unknowns#n_0000000000000005"
+   },
+   "pk": {
+    "S": "$unk#v1#unknowns.byu#0000000000000006"
+   },
+   "_entity_pk": {
+    "S": "$unk#v1#unknowns#id_n"
+   },
+   "__edd_e__": {
+    "S": "Unknowns._unique.byU"
+   }
+  },
+  {
+   "note": {
+    "S": "number"
+   },
+   "gsi1sk": {
+    "S": "$unk#v1#unknowns#u_0000000000000006"
+   },
+   "u": {
+    "N": "6"
+   },
+   "__edd_e__": {
+    "S": "Unknowns"
+   },
+   "gsi1pk": {
+    "S": "$unk#v1#unknowns#id_n"
+   },
+   "sk": {
+    "S": "$unk#v1#unknowns#n_0000000000000005"
+   },
+   "id": {
+    "S": "n"
+   },
+   "pk": {
+    "S": "$unk#v1#unknowns#id_n"
+   },
+   "n": {
+    "N": "5"
+   }
+  },
+  {
+   "note": {
+    "S": "string"
+   },
+   "deletedAt": {
+    "S": "2026-11-08T07:04:26.214Z"
+   },
+   "u": {
+    "S": "x"
+   },
+   "__edd_e__": {
+    "S": "Unknowns"
+   },
+   "sk": {
+    "S": "$unk#v1#unknowns#deleted#n_ab c#2026-11-08T07:04:26.214Z"
+   },
+   "id": {
+    "S": "s"
+   },
+   "pk": {
+    "S": "$unk#v1#unknowns#id_s"
+   },
+   "n": {
+    "S": "Ab C"
+   }
+  }
+ ]
+}
