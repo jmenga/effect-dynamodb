@@ -14,6 +14,7 @@
  */
 
 import { Exit, Schema, SchemaAST } from "effect"
+import { effectDeclarationOf } from "./EffectInstances.js"
 
 /**
  * Read `.fields` from a `Schema.Struct` or `Schema.Class`.
@@ -983,6 +984,9 @@ export const refuseUnreadable = (
  * duck-typed `Schema.declare`. Only a value can say whether one reads back (`internal/RoundTrip.ts`
  * in `effect-dynamodb`), and this says which schemas have such values. A `Schema.Class`, and a struct
  * decoded to a class, have an encoding: what's stored is the struct, and only what's in it counts.
+ * Effect's own address and DNS record declarations carry no `representation` id, and read back as
+ * the instances they were (`internal/InstanceReads.ts`), so they're not custom: recognised by their
+ * parser, never by a name, so a `Schema.declare` of your own under the same identifier still is.
  */
 export const holdsCustomDeclaration = (
   ast: SchemaAST.AST,
@@ -996,7 +1000,10 @@ export const holdsCustomDeclaration = (
     asts.some((part) => holdsCustomDeclaration(part, seen))
   switch (ast._tag) {
     case "Declaration":
-      return representationIdOf(ast) === undefined || within(ast.typeParameters)
+      return (
+        (representationIdOf(ast) === undefined && effectDeclarationOf(ast) === undefined) ||
+        within(ast.typeParameters)
+      )
     case "Suspend": {
       if (seen.has(ast)) return false
       seen.add(ast)

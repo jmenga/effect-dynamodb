@@ -406,18 +406,15 @@ describeConnected("what a [EDD-9125] refusal points to", () => {
 })
 
 describeConnected("what [EDD-9125] leaves standing, as the modeling guide says", () => {
-  it.effect("a Schema.Duration reads back as a plain object its functions still work on", () =>
+  it.effect("a Schema.Duration reads back as the Duration written", () =>
     onEntity(Schema.Duration, (rows) =>
       Effect.gen(function* () {
         const second = Duration.seconds(1)
         yield* rows.put({ id: "a", f: second }).asEffect()
         const read = (yield* rows.get({ id: "a" })).f
-        expect(Duration.toMillis(read)).toBe(1000)
+        expect(Equal.equals(read, second)).toBe(true)
         expect(Duration.toMillis(Duration.sum(read, second))).toBe(2000)
-        expect(Duration.format(read)).toBe(Duration.format(second))
-        expect(Equal.equals(read, second)).toBe(false)
-        expect(read.pipe).toBeUndefined()
-        expect(Object.getPrototypeOf(read)).toBe(Object.prototype)
+        expect(typeof read.pipe).toBe("function")
       }),
     ),
   )
@@ -504,16 +501,20 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
     ),
   )
 
-  it.effect("a Schema.BigDecimal below 2^53 reads back, and its arithmetic throws", () =>
-    onEntity(Schema.BigDecimal, (rows) =>
-      Effect.gen(function* () {
-        const value = BigDecimal.fromStringUnsafe("1.5")
-        yield* rows.put({ id: "a", f: value }).asEffect()
-        const read = (yield* rows.get({ id: "a" })).f
-        expect(BigDecimal.format(read)).toBe("1.5")
-        expect(() => BigDecimal.sum(read, value)).toThrow("Cannot mix BigInt")
-      }),
-    ),
+  it.effect(
+    "a Schema.BigDecimal reads back as the BigDecimal written, below 2^53 and past it",
+    () =>
+      onEntity(Schema.BigDecimal, (rows) =>
+        Effect.gen(function* () {
+          for (const text of ["1.5", "123456789012345678.9"]) {
+            const value = BigDecimal.fromStringUnsafe(text)
+            yield* rows.put({ id: "a", f: value }).asEffect()
+            const read = (yield* rows.get({ id: "a" })).f
+            expect(BigDecimal.equals(read, value)).toBe(true)
+            expect(BigDecimal.sum(read, value)).toEqual(BigDecimal.sum(value, value))
+          }
+        }),
+      ),
   )
 
   it.effect("a Schema.BigDecimal once normalised is stored as a fresh one of its value is", () =>
@@ -524,6 +525,7 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
         const value = BigDecimal.normalize(BigDecimal.fromStringUnsafe("1.5"))
         yield* rows.put({ id: "a", f: value }).asEffect()
         expect((yield* rowsOf(tableName))[0]?.f).toEqual(fresh)
+        expect(BigDecimal.equals((yield* rows.get({ id: "a" })).f, value)).toBe(true)
       }),
     ),
   )
@@ -540,13 +542,15 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
     ),
   )
 
-  it.effect("a Schema.SemVer reads back as a plain object its functions still work on", () =>
+  it.effect("a Schema.SemVer reads back as the SemVer written", () =>
     onEntity(Schema.SemVer, (rows) =>
       Effect.gen(function* () {
         const value = Schema.decodeUnknownSync(Schema.SemVerFromString)("1.2.3")
         yield* rows.put({ id: "a", f: value }).asEffect()
         const read = (yield* rows.get({ id: "a" })).f
         expect(SemVer.format(read)).toBe("1.2.3")
+        expect(Object.getPrototypeOf(read)).toBe(Object.getPrototypeOf(value))
+        expect(Equal.equals(read, value)).toBe(true)
       }),
     ),
   )

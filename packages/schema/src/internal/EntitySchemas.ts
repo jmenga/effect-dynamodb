@@ -22,6 +22,7 @@ import {
   isHidden,
 } from "../DynamoModel.js"
 import type { IndexDefinition } from "../KeyComposer.js"
+import { reviveMarshalledDateTime } from "./EffectInstances.js"
 import type {
   TimeSeriesConfig,
   TimestampFieldConfig,
@@ -30,6 +31,7 @@ import type {
   UniqueFieldsDef,
   VersionedConfig,
 } from "./EntityConfig.js"
+import { readingInstances } from "./InstanceReads.js"
 import { BETA_DATE_MARKER, DATE_MARKER } from "./PackedCodec.js"
 import {
   absentReading,
@@ -520,52 +522,6 @@ const isPlainObject = (value: unknown): value is globalThis.Record<string, unkno
  */
 const isGenuineDateTime = (value: unknown): value is DateTime.DateTime =>
   DateTime.isDateTime(value) && !isPlainObject(value)
-
-const reviveTimeZone = (zone: unknown): DateTime.TimeZone | undefined => {
-  if (!isPlainObject(zone)) return undefined
-  try {
-    if (zone._tag === "Named" && typeof zone.id === "string") {
-      return DateTime.zoneMakeNamedUnsafe(zone.id)
-    }
-    if (zone._tag === "Offset" && typeof zone.offset === "number") {
-      return DateTime.zoneMakeOffset(zone.offset)
-    }
-  } catch {
-    return undefined
-  }
-  return undefined
-}
-
-/**
- * Rebuild a `DateTime` from a MARSHALLED instance (#133).
- *
- * Before #133 an aggregate stored some `DateTime`s by marshalling the instance
- * itself, which keeps its own enumerable properties:
- *
- * - `Utc`: `{ epochMilliseconds, <type-id>, _tag: "Utc" }`
- * - `Zoned`: the same plus `zone`, itself `{ id, _tag: "Named" }` or
- *   `{ offset, _tag: "Offset" }` (a named zone's `Intl` formatter marshals to
- *   an empty map and is not needed).
- *
- * The type-id key is `~effect/time/DateTime` on effect 4.0.0-rc and
- * `~effect/DateTime` on 4.0.0, so it is deliberately NOT inspected: the instant
- * and the tag are what identify the value, and they are all a `DateTime` holds.
- * A zoned value is rebuilt only when its zone is recoverable.
- *
- * Returns `undefined` for anything else — including a genuine `DateTime`, which
- * needs no rebuilding.
- */
-export const reviveMarshalledDateTime = (value: unknown): DateTime.DateTime | undefined => {
-  if (!isPlainObject(value)) return undefined
-  const epochMs = value.epochMilliseconds
-  if (typeof epochMs !== "number" || !Number.isFinite(epochMs)) return undefined
-  if (value._tag === "Utc") return DateTime.makeUnsafe(epochMs)
-  if (value._tag === "Zoned") {
-    const timeZone = reviveTimeZone(value.zone)
-    return timeZone === undefined ? undefined : DateTime.makeZonedUnsafe(epochMs, { timeZone })
-  }
-  return undefined
-}
 
 /**
  * Convert any input value (string / number / DateTime / Date) to the wire
@@ -2529,7 +2485,7 @@ const readingUnwalked = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
 /**
  * The read schema of a value the library stores but doesn't derive: an event, its metadata, a
  * snapshot state, an outbox effect. Every read of one goes through it, so anything a stream's read
- * does differently from its declaration belongs here. Differently, as it stands, in three ways:
+ * does differently from its declaration belongs here. Differently, as it stands, in four ways:
  *
  * - An absent attribute reads as the value it stands for (`absentReading`).
  * - A `Schema.DateTimeUtc` or `Schema.DateTimeZoned` comes back as a real date. Nothing substitutes
@@ -2539,6 +2495,8 @@ const readingUnwalked = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
  *   `DateTime.getPart` throws.
  * - A `Schema.BigInt` comes back as a bigint. The marshaller stores one as a number, and the
  *   unmarshaller returns a safe integer as a number, so without this only the values past 2^53 read.
+ * - Each of Effect's other look-alike declarations (a `BigDecimal`, a `Duration`, a zone, an address,
+ *   ...) comes back as a real instance, where the read takes one (`readingInstances`).
  *
  * Returned as it came when none applies to it.
  *
@@ -2547,7 +2505,7 @@ const readingUnwalked = (schema: Schema.Top, opts: DeepSubstitutionOptions | und
 export const readingStreamValues = (schema: Schema.Top): Schema.Top => {
   const absent = substituteSchemaDeep(schema, { absentReads: "only", enforceChecks: true })
   const read = readingMarshalled(absent.ast)
-  return read === absent.ast ? absent : Schema.make<Schema.Top>(read)
+  return readingInstances(read === absent.ast ? absent : Schema.make<Schema.Top>(read))
 }
 
 /**
@@ -2856,6 +2814,13 @@ export const buildDerivedSchemas = (
       legacyReads: true,
       absentReads: true,
     })
+  }
+
+  // Each of Effect's look-alike declarations (a `BigDecimal`, a `Duration`, an address, a date in
+  // an `Option`, ...) reads back as a real instance, not the map DynamoDB hands back for it. A field
+  // holding none is the same schema it was. Encoding through one is as it was.
+  for (const [name, field] of Object.entries(readFields)) {
+    readFields[name] = readingInstances(field as Schema.Top)
   }
 
   // --- Model Schema: pure model fields (decode of stored items in "model" mode) ---
