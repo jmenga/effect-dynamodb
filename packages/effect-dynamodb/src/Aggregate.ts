@@ -183,8 +183,8 @@ import {
   deriveAggregateSchemas,
   deriveEntityFieldName,
   elementHoldsRef,
+  isEntityElement,
   isFieldOptional,
-  isUnionElement,
   manyEdgePaths,
   manyElementFields,
   manyElementSchema,
@@ -203,6 +203,7 @@ import type {
   AggregateInputType,
   AggregateStampNames,
   BoundSubAggregate,
+  SchemaFieldsOf,
   SubAggregate,
 } from "@effect-dynamodb/schema/internal/AggregateTypes.js"
 import type { ModelFieldName } from "@effect-dynamodb/schema/internal/EntityTypes.js"
@@ -791,7 +792,8 @@ export function make<
     Schema.Schema.Type<TSchema>,
     TEdges,
     TPK,
-    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
   >
 >
 export function make<
@@ -4614,6 +4616,8 @@ const hydrateAggregateRefs = (
     // number through a digits-only string codec), or one DynamoDB can't store (an infinite number,
     // at any depth of a struct, an `Option` or a `Result`), whose key text can name an item of
     // another value (`{ a: Infinity }` and `{ a: 5 }` compose one key), fetched in its place.
+    // An id given more than once is judged once.
+    const judged = new Map<string, Set<unknown>>()
     for (const req of refRequests) {
       const composite = refKeyComposite(req.entity)!
       if (Option.isNone(req.id)) {
@@ -4628,6 +4632,10 @@ const hydrateAggregateRefs = (
           ),
         })
       }
+      const ids = judged.get(req.entity.entityType) ?? new Set<unknown>()
+      judged.set(req.entity.entityType, ids)
+      if (ids.has(req.id.value)) continue
+      ids.add(req.id.value)
       const unstorable = yield* runtimeEntities
         .get(req.entity.entityType)!
         ._unstorableKey({ [composite]: req.id.value })
@@ -4825,17 +4833,19 @@ const collectRefIdsFromEdges = (
       if (Array.isArray(arr)) {
         const entityFieldName = deriveEntityFieldName(entity)
         const element = manyElementSchema(fields, edgeName)
-        const union = isUnionElement(element)
+        const entityElement = isEntityElement(element, entity)
         for (let i = 0; i < arr.length; i++) {
           const elem = arr[i]
           if (elem == null) continue
           const asId = refId(entity, elem)
           if (
-            union ? typeof elem === "string" : Option.isSome(asId.id) || typeof elem !== "object"
+            entityElement
+              ? Option.isSome(asId.id) || typeof elem !== "object"
+              : typeof elem === "string"
           ) {
-            // Element IS the ref ID (e.g., Array<string> for Array<Umpire>): an id of the
-            // entity's key composite, or a scalar given for one, which names no item. In a union
-            // element, a string, as on 1.39.0.
+            // Element IS the ref ID. Where the element is the entity (`Array<Umpire>`), an id of
+            // the entity's key composite, or a scalar given for one, which names no item. Any
+            // other element, a string, as on 1.39.0.
             result.push({
               entity,
               ...asId,
@@ -4848,9 +4858,10 @@ const collectRefIdsFromEdges = (
             typeof elem === "object" &&
             elementHoldsRef(element, entity, elem as Record<string, unknown>)
           ) {
-            // Element wraps the entity, given as `${field}Id` (`elementHoldsRef`). An element that
-            // is the entity's own model, given whole, whose `lineId` is its own value, or one
-            // declaring the field a scalar, is stored as given.
+            // Element wraps the entity, given as `${field}Id` (`elementHoldsRef`): an id of the
+            // entity's key composite where the element's definition names the field holding the
+            // entity, a string otherwise, as on 1.39.0. An element that is the entity, given
+            // whole, is stored as given.
             const elemObj = elem as Record<string, unknown>
             const idFieldName = `${entityFieldName}Id`
             const idValue = elemObj[idFieldName]

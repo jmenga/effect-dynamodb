@@ -5,19 +5,22 @@
  * of that attribute's type, named `${field}Id`: a number for a number key, a bigint for a bigint
  * key, a `Date` for a `Date` key, a string when the key is in the sort key alone. An edge whose
  * entity is keyed by two attributes takes the entity whole, as `create` fetches nothing for it.
- * These match what `create` does at run time (`AggregateRefHydration.test.ts`). A `many` element
- * declared a union is typed as on 1.39.0, as `create` judges it as 1.39.0 did.
+ * These match what `create` does at run time (`AggregateRefHydration.test.ts`).
  *
- * A `many` element wrapping the entity takes its id in the field of the entity's name, which
- * `create` takes from the model's identifier, or from the `entityType` for a model with none. The
- * type sees that name only for a `Schema.Struct` model (in a `DynamoModel.configure` wrapper or
- * not) and an `entityType` that is one literal. For any other model, a `Schema.Class` included,
- * and for an `entityType` typed `string`, the element is typed as on 1.39.0.
+ * A `many` element is judged from its schema, never its domain type. One that is the entity takes
+ * its id or the entity whole. One that names the field holding the entity takes the element whole,
+ * or with that field's id in its place: a `Schema.Struct` or `Schema.Class` (no union, no
+ * transformation) whose field of the entity's name is the entity's model, under `Schema.optional`
+ * at most, and which declares no `${field}Id` itself. `create` takes the field's name from the
+ * model's identifier, or from the `entityType` for a model with none, so the type sees it only for
+ * a `Schema.Struct` model (in a `DynamoModel.configure` wrapper or not) and an `entityType` that is
+ * one literal. Every other element is typed exactly as on 1.39.0, as `create` judges it as 1.39.0
+ * did.
  */
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Schema } from "effect"
+import { Option, Schema, SchemaGetter } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
@@ -114,6 +117,13 @@ const ConfiguredRows = Entity.make({
   entityType: "ConfiguredRow",
   primaryKey: { pk: { field: "pk", composite: ["lineId"] }, sk: { field: "sk", composite: [] } },
 })
+/** A `Schema.Struct` model keyed by a string. */
+const StringRow = Schema.Struct({ id: Schema.String, f: Schema.Number })
+const StringRows = Entity.make({
+  model: StringRow,
+  entityType: "StringRow",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
 /** An entity type the type sees only as `string`, over a model with an `id: string`. */
 const IdRow = Schema.Struct({ id: Schema.String, f: Schema.Number })
 const looseRowType: string = "LooseRow"
@@ -151,6 +161,7 @@ const MainTable = Table.make({
     IdLines,
     StringIdLines,
     NumberRows,
+    StringRows,
     ConfiguredRows,
     LooseRows,
     LineItems,
@@ -195,6 +206,41 @@ class Root extends Schema.Class<Root>("Root")({
   rowLabels: Schema.Array(Schema.Struct({ numberRow: Schema.String, qty: Schema.Number })),
   configuredRowSheets: Schema.Array(
     Schema.Struct({ configuredRow: NumberRow, qty: Schema.Number }),
+  ),
+  rows: Schema.Array(NumberRow),
+  stringRowSheets: Schema.Array(Schema.Struct({ stringRow: StringRow, qty: Schema.Number })),
+  maybeStringRowSheets: Schema.Array(
+    Schema.Struct({ stringRow: Schema.optional(StringRow), qty: Schema.Number }),
+  ),
+  optionRowSheets: Schema.Array(
+    Schema.Struct({ numberRow: Schema.Option(Schema.String), qty: Schema.Number }),
+  ),
+  nullRowSheets: Schema.Array(
+    Schema.Struct({ numberRow: Schema.NullOr(NumberRow), qty: Schema.Number }),
+  ),
+  ownIdRowSheets: Schema.Array(
+    Schema.Struct({
+      numberRow: Schema.Option(Schema.String),
+      numberRowId: Schema.optional(Schema.Number),
+      qty: Schema.Number,
+    }),
+  ),
+  declaredIdRowSheets: Schema.Array(
+    Schema.Struct({ numberRow: NumberRow, numberRowId: Schema.Number, qty: Schema.Number }),
+  ),
+  sameRowKinds: Schema.Array(
+    Schema.Union([
+      Schema.Struct({ numberRow: NumberRow, qty: Schema.Number }),
+      Schema.Struct({ numberRow: NumberRow, qty: Schema.NumberFromString }),
+    ]),
+  ),
+  codecRowSheets: Schema.Array(
+    Schema.Struct({ numberRow: NumberRow, qty: Schema.Number }).pipe(
+      Schema.decodeTo(Schema.Struct({ numberRow: NumberRow, qty: Schema.Number }), {
+        decode: SchemaGetter.passthrough(),
+        encode: SchemaGetter.passthrough(),
+      }),
+    ),
   ),
   looseSheets: Schema.Array(
     Schema.Struct({ looseRow: IdRow, captain: IdRow, other: NumberRow, qty: Schema.Number }),
@@ -301,6 +347,43 @@ const RootAggregate = Aggregate.make(Root, {
       entity: ConfiguredLines,
       sk: { composite: ["qty"] },
     }),
+    rows: Aggregate.many({
+      entityType: "RootRow",
+      entity: NumberRows,
+      sk: { composite: ["lineId"] },
+    }),
+    stringRowSheets: Aggregate.many({
+      entityType: "RootStringRowSheet",
+      entity: StringRows,
+      sk: { composite: ["qty"] },
+    }),
+    maybeStringRowSheets: Aggregate.many({
+      entityType: "RootMaybeStringRowSheet",
+      entity: StringRows,
+      sk: { composite: ["qty"] },
+    }),
+    optionRowSheets: Aggregate.many({
+      entityType: "RootOptionRowSheet",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    nullRowSheets: Aggregate.many({
+      entityType: "RootNullRowSheet",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    ownIdRowSheets: Aggregate.many({
+      entityType: "RootOwnIdRowSheet",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    declaredIdRowSheets: Aggregate.many({
+      entityType: "RootDeclaredIdRowSheet",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    sameRowKinds: Aggregate.many({ entityType: "RootSameRowKind", entity: NumberRows }),
+    codecRowSheets: Aggregate.many({ entityType: "RootCodecRowSheet", entity: NumberRows }),
   },
 })
 
@@ -333,22 +416,58 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
     expectTypeOf<Input>().not.toHaveProperty("pairLineId")
   })
 
-  it("a many edge of ids takes ids of the key attribute", () => {
-    expectTypeOf<Input["numberLines"]>().toEqualTypeOf<ReadonlyArray<number>>()
+  it("a many edge of the entity takes ids of the key attribute, or the entity whole", () => {
+    expectTypeOf<Input["numberLines"]>().toEqualTypeOf<ReadonlyArray<number | NumberLine>>()
+    expectTypeOf<Input["rows"]>().toEqualTypeOf<ReadonlyArray<number | typeof NumberRow.Type>>()
   })
 
-  it("a many element wrapping the entity takes its id", () => {
-    expectTypeOf<Input["rowSheets"][number]>().toEqualTypeOf<{
-      readonly numberRowId: number
-      readonly qty: number
-    }>()
+  it("a many element wrapping the entity takes it whole, or its id", () => {
+    expectTypeOf<Input["rowSheets"][number]>().toEqualTypeOf<
+      | {
+          readonly numberRow: typeof NumberRow.Type
+          readonly qty: number
+          readonly numberRowId?: never
+        }
+      | { readonly numberRowId: number; readonly qty: number; readonly numberRow?: never }
+    >()
   })
 
-  it("a many element holding the entity optionally takes an optional id", () => {
-    expectTypeOf<Input["maybeRowSheets"][number]>().toEqualTypeOf<{
-      readonly numberRowId?: number | undefined
-      readonly qty: number
-    }>()
+  it("a many element holding the entity optionally takes it whole or by id, either optional", () => {
+    expectTypeOf<Input["maybeRowSheets"][number]>().toEqualTypeOf<
+      | {
+          readonly numberRow?: typeof NumberRow.Type | undefined
+          readonly qty: number
+          readonly numberRowId?: never
+        }
+      | {
+          readonly numberRowId?: number | undefined
+          readonly qty: number
+          readonly numberRow?: never
+        }
+    >()
+  })
+
+  it("a string keyed struct entity's element takes it whole or by id, optional or not", () => {
+    expectTypeOf<Input["stringRowSheets"][number]>().toEqualTypeOf<
+      | {
+          readonly stringRow: typeof StringRow.Type
+          readonly qty: number
+          readonly stringRowId?: never
+        }
+      | { readonly stringRowId: string; readonly qty: number; readonly stringRow?: never }
+    >()
+    expectTypeOf<Input["maybeStringRowSheets"][number]>().toEqualTypeOf<
+      | {
+          readonly stringRow?: typeof StringRow.Type | undefined
+          readonly qty: number
+          readonly stringRowId?: never
+        }
+      | {
+          readonly stringRowId?: string | undefined
+          readonly qty: number
+          readonly stringRow?: never
+        }
+    >()
   })
 
   it("a many element holding the entity in a field of another name takes it whole", () => {
@@ -366,9 +485,59 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
     }>()
   })
 
-  it("a configured struct model's element takes its id in the field its entity type names", () => {
-    expectTypeOf<Input["configuredRowSheets"][number]>().toEqualTypeOf<{
-      readonly configuredRowId: number
+  it("a configured struct model's element takes it in the field its entity type names", () => {
+    expectTypeOf<Input["configuredRowSheets"][number]>().toEqualTypeOf<
+      | {
+          readonly configuredRow: typeof NumberRow.Type
+          readonly qty: number
+          readonly configuredRowId?: never
+        }
+      | { readonly configuredRowId: number; readonly qty: number; readonly configuredRow?: never }
+    >()
+  })
+})
+
+describe("an element whose schema doesn't name the field holding the entity is typed as on 1.39.0", () => {
+  // Each of these compiles against 1.39.0's declarations as given here, and `create` takes it as
+  // 1.39.0 did: a `${field}Id` is fetched only when it is a string.
+
+  it("a field of the entity's name declared an `Option`: as declared", () => {
+    expectTypeOf<Input["optionRowSheets"][number]>().toEqualTypeOf<{
+      readonly numberRow: Option.Option<string>
+      readonly qty: number
+    }>()
+  })
+
+  it("a field of the entity's name declared nullable: as declared", () => {
+    expectTypeOf<Input["nullRowSheets"][number]>().toEqualTypeOf<{
+      readonly numberRow: typeof NumberRow.Type | null
+      readonly qty: number
+    }>()
+  })
+
+  it("an element declaring its own `numberRowId`: as declared, that field its own data", () => {
+    expectTypeOf<Input["ownIdRowSheets"][number]>().toEqualTypeOf<{
+      readonly numberRow: Option.Option<string>
+      readonly numberRowId?: number | undefined
+      readonly qty: number
+    }>()
+    expectTypeOf<Input["declaredIdRowSheets"][number]>().toEqualTypeOf<{
+      readonly numberRow: typeof NumberRow.Type
+      readonly numberRowId: number
+      readonly qty: number
+    }>()
+  })
+
+  it("a union whose members have one domain type is still a union: as declared", () => {
+    expectTypeOf<Input["sameRowKinds"][number]>().toEqualTypeOf<{
+      readonly numberRow: typeof NumberRow.Type
+      readonly qty: number
+    }>()
+  })
+
+  it("a struct through a transformation: as declared", () => {
+    expectTypeOf<Input["codecRowSheets"][number]>().toEqualTypeOf<{
+      readonly numberRow: typeof NumberRow.Type
       readonly qty: number
     }>()
   })
@@ -478,7 +647,7 @@ function _refusals(input: Input): void {
   const _pairId: string = input.pairLineId
   // @ts-expect-error — a sort-key-only key takes a string, so it is not `never`
   const _sortKeyNever: never = input.sortKeyLineId
-  // @ts-expect-error — an element wrapping the entity takes its id, not the entity
+  // @ts-expect-error — an element wrapping the entity may be given by id, so its field may be absent
   const _sheetRow: typeof NumberRow.Type = input.rowSheets[0]!.numberRow
   // @ts-expect-error — an element with no entity to fetch keeps its fields, so has no `idId`
   const _noteId: string = input.notes[0]!.idId
@@ -500,3 +669,60 @@ function _refusals(input: Input): void {
   void _itemLineId
 }
 void _refusals
+
+// Compile-enforced: each of these is a valid input, and fails `pnpm check` if it doesn't compile.
+const _accepted: ReadonlyArray<Partial<Input>> = [
+  {
+    rowSheets: [
+      { numberRow: { lineId: 5, f: 1 }, qty: 1 },
+      { numberRowId: 5, qty: 1 },
+    ],
+  },
+  {
+    maybeRowSheets: [
+      { qty: 1 },
+      { numberRow: { lineId: 5, f: 1 }, qty: 1 },
+      { numberRowId: 5, qty: 1 },
+    ],
+  },
+  {
+    stringRowSheets: [
+      { stringRow: { id: "L", f: 1 }, qty: 1 },
+      { stringRowId: "L", qty: 1 },
+    ],
+  },
+  { maybeStringRowSheets: [{ qty: 1 }, { stringRow: { id: "L", f: 1 }, qty: 1 }] },
+  { maybeStringRowSheets: [{ stringRowId: "L", qty: 1 }] },
+  { rows: [5, { lineId: 5, f: 1 }] },
+  { optionRowSheets: [{ numberRow: Option.some("KEEP"), qty: 1 }] },
+  { ownIdRowSheets: [{ numberRow: Option.some("KEEP"), numberRowId: 5, qty: 1 }] },
+  { sameRowKinds: [{ numberRow: { lineId: 5, f: 1 }, qty: 1 }] },
+]
+void _accepted
+
+// Compile-enforced: no id form is advertised where `create` doesn't take one.
+function _idRefusals(): void {
+  // @ts-expect-error — the whole and the id forms exclude each other
+  const _both: Input["rowSheets"][number] = {
+    numberRow: { lineId: 5, f: 1 },
+    numberRowId: 5,
+    qty: 1,
+  }
+  // @ts-expect-error — a field declared an `Option` is not taken by id
+  const _optionId: Input["optionRowSheets"][number] = { numberRowId: 5, qty: 1 }
+  // @ts-expect-error — a field declared nullable is not taken by id
+  const _nullId: Input["nullRowSheets"][number] = { numberRowId: 5, qty: 1 }
+  // @ts-expect-error — a union element is not taken by a number id
+  const _unionId: Input["sameRowKinds"][number] = { numberRowId: 5, qty: 1 }
+  // @ts-expect-error — a transformed element is not taken by a number id
+  const _codecId: Input["codecRowSheets"][number] = { numberRowId: 5, qty: 1 }
+  // @ts-expect-error — an element declaring `${field}Id` keeps its field
+  const _declaredId: Input["declaredIdRowSheets"][number] = { numberRowId: 5, qty: 1 }
+  void _both
+  void _optionId
+  void _nullId
+  void _unionId
+  void _codecId
+  void _declaredId
+}
+void _idRefusals

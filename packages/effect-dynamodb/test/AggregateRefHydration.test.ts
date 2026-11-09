@@ -15,11 +15,17 @@
  * of the key composite (`"5"` for a number), or one no item is keyed by (`Infinity`), fails with
  * `EDD-9131`, as does one `put` refuses deeper in it (`Infinity` in a struct, an `Option` or a
  * `Result`), whose key text names an item of another value, or one that doesn't encode as `put`
- * stores it. Every refusal comes before any request. A union element is judged as 1.39.0 judged it:
- * a string `lineId` is fetched, whatever member the value is, and the element's input is the union
- * as declared, so every union shape fetches, writes and reads what 1.39.0 did, but for a string id
- * of no type of the key composite (`EDD-9131`). A `NumberFromString` id given an infinity as its
- * encoded string, which `put` stores, is fetched as 1.39.0 fetched it.
+ * stores it. Every refusal comes before any request.
+ *
+ * A `many` element's id is of the key composite's type only where the element's definition says it
+ * holds the entity: the element is the entity, or a plain struct or class whose field of the
+ * entity's name is the entity's own model (under `optional` at most) and which declares no `lineId`
+ * itself. Every other element is judged as 1.39.0 judged it: a string `lineId` is fetched, whatever
+ * the element declares, and its input is as 1.39.0's. So every union shape (through a
+ * transformation or `suspend` too) and every element declaring the entity's field another schema
+ * fetches, writes and reads what 1.39.0 did, but for a string id of no type of the key composite
+ * (`EDD-9131`). A `NumberFromString` id given an infinity as its encoded string, which `put` stores,
+ * is fetched as 1.39.0 fetched it.
  */
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
@@ -36,6 +42,7 @@ import {
   byKey,
   CONTROLS,
   fixture,
+  JUDGED_AS_139,
   json,
   keyedBy,
   lineClass,
@@ -354,7 +361,7 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     )
   }
 
-  for (const label of UNIONS) {
+  for (const label of [...UNIONS, ...JUDGED_AS_139]) {
     it.effect(`${label}: fetches, writes and reads what 1.39.0 did`, () =>
       Effect.gen(function* () {
         const shape = SHAPES[label]!()
@@ -391,7 +398,9 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     for (const label of UNIONS) {
       const shape = SHAPES[label]!()
       const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-      expect(SchemaAST.isUnion(elementOf(A.schema)!)).toBe(true)
+      if (!label.includes("through a transformation")) {
+        expect(SchemaAST.isUnion(elementOf(A.schema)!)).toBe(true)
+      }
       // The model's own element, under the JSON codec the input schema is.
       const declared = elementOf(Schema.toCodecJson(A.schema))
       expect(elementOf(A.inputSchema)).toEqual(declared)
@@ -478,49 +487,47 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     }),
   )
 
-  it.effect("an element declaring the entity's field a scalar holds no ref: stored as given", () =>
+  it.effect("an element declaring the entity's field a scalar is judged as on 1.39.0", () =>
     Effect.gen(function* () {
       const label = "many, element declares the entity's field a string, given it and a lineId"
       const { create, requests, rows, get } = yield* run(SHAPES[label]!())
-      expect(Exit.isSuccess(create) && create.value).toEqual({
-        id: "a",
-        lines: [{ line: "label", qty: 2 }],
-      })
-      expect(requests).toEqual(["TransactWriteItems"])
-      const sheet = rows.find((row) => row.__edd_e__?.S === "SheetLine")!
-      expect(sheet.line).toEqual({ S: "label" })
-      expect(sheet.lineId).toBeUndefined()
-      expect(Exit.isSuccess(get) && get.value).toEqual({
-        id: "a",
-        lines: [{ line: "label", qty: 2 }],
-      })
-      // 1.39.0 fetched the line by that `lineId`, put the record in `line`, and failed decoding.
-      expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
+      // As 1.39.0: the line fetched by that string `lineId`, its record put in `line`, which
+      // fails decoding. Nothing written.
+      expect(outcomeOf(create)).toBe(fixture.shapes[label]!.create)
+      expect(requests).toEqual(["BatchGetItem"])
+      expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
+      expect(outcomeOf(get)).toBe(fixture.shapes[label]!.get)
     }),
   )
 
-  it.effect("an element declaring the entity's field a scalar is not given it by id", () =>
-    Effect.gen(function* () {
-      const { model } = lineClass(true)
-      const Lines = lines(model, singleKey)
-      const Sheet = Schema.Struct({ line: Schema.String, qty: Schema.Number })
-      const shape: Shape = {
-        entities: { Lines },
-        make: (base) =>
-          aggregate(Schema.Struct({ id: Schema.String, lines: Schema.Array(Sheet) }), base, {
-            lines: Aggregate.many({
-              entityType: "SheetLine",
-              entity: Lines,
-              sk: { composite: ["qty"] },
-            } as never),
-          }),
-        seed: [["Lines", { lineId: "l", f: 5 }]],
-        input: { id: "a", lines: [{ lineId: "l", qty: 2 }] },
-      }
-      const { create, requests } = yield* run(shape)
-      expect(refusal(create)).toContain('["line"]')
-      expect(requests).toEqual([])
-    }),
+  it.effect(
+    "an element declaring the entity's field a scalar takes a string id, as on 1.39.0",
+    () =>
+      Effect.gen(function* () {
+        const { model } = lineClass(true)
+        const Lines = lines(model, singleKey)
+        const Sheet = Schema.Struct({ line: Schema.String, qty: Schema.Number })
+        const shape: Shape = {
+          entities: { Lines },
+          make: (base) =>
+            aggregate(Schema.Struct({ id: Schema.String, lines: Schema.Array(Sheet) }), base, {
+              lines: Aggregate.many({
+                entityType: "SheetLine",
+                entity: Lines,
+                sk: { composite: ["qty"] },
+              } as never),
+            }),
+          seed: [["Lines", { lineId: "l", f: 5 }]],
+          input: { id: "a", lines: [{ lineId: "l", qty: 2 }] },
+        }
+        // Its input takes `lineId: string` in place of `line`, as 1.39.0's did.
+        const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
+        expect(Schema.decodeUnknownExit(A.inputSchema)(shape.input)._tag).toBe("Success")
+        // Fetched, and the record put in `line` fails decoding, nothing written.
+        const { create, requests } = yield* run(shape)
+        expect(refusal(create)).toContain('["line"]')
+        expect(requests).toEqual(["BatchGetItem"])
+      }),
   )
 
   it.effect("an element holding the entity in a field of another name is taken whole", () =>

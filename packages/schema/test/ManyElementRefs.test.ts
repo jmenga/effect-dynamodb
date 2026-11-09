@@ -1,12 +1,14 @@
 /**
  * Which `many` element values `create` fetches the edge's entity for, and what the element's input
- * schema takes. A union element is judged as 1.39.0 judged it: a string `${field}Id`, whatever member
- * the value is, its input the union as declared. Any other element is fetched for when its field of
- * the entity's name can hold the entity's record and it's given a `${field}Id`, of the key
- * composite's type. The hydration itself is `effect-dynamodb`'s `AggregateRefHydration.test.ts`.
+ * schema takes, decided from the element's definition alone. An id of the key composite's type is
+ * fetched only where the definition says the element holds the entity: the element is the entity, or
+ * a plain struct or class whose field of the entity's name is the entity's own model (under
+ * `optional` / `optionalKey` at most), and which declares no `${field}Id` itself. Every other element
+ * is judged as 1.39.0 judged it: a string `${field}Id`, whatever the element declares. The hydration
+ * itself is `effect-dynamodb`'s `AggregateRefHydration.test.ts`.
  */
 
-import { Schema } from "effect"
+import { Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as Entity from "../src/Entity.js"
@@ -14,7 +16,8 @@ import type { RefEntity } from "../src/internal/AggregateEdges.js"
 import {
   deriveElementInputSchema,
   elementHoldsRef,
-  isUnionElement,
+  entityFieldOf,
+  isEntityElement,
 } from "../src/internal/AggregateSchemas.js"
 
 class Line extends Schema.Class<Line>("Line")({ lineId: Schema.String, f: Schema.Number }) {}
@@ -35,6 +38,14 @@ const NumberedLines = Entity.make({
   primaryKey: { pk: { field: "pk", composite: ["lineId"] }, sk: { field: "sk", composite: [] } },
 }) as unknown as RefEntity
 
+/** A struct entity keyed by a number: `create` takes it in the field its `entityType` names. */
+const Row = Schema.Struct({ lineId: Schema.Number, f: Schema.Number })
+const Rows = Entity.make({
+  model: Row,
+  entityType: "Row",
+  primaryKey: { pk: { field: "pk", composite: ["lineId"] }, sk: { field: "sk", composite: [] } },
+}) as unknown as RefEntity
+
 const holdsRef = (element: Schema.Top, value: Record<string, unknown>) =>
   elementHoldsRef(element, Lines, value)
 
@@ -51,7 +62,22 @@ class Wrapping extends Schema.Class<Wrapping>("Wrapping")({
   qty: Schema.Number,
 }) {}
 
-/** Union elements of every shape the earlier rounds judged by member. */
+/** An identity transformation, whatever the two sides' types. */
+const identity = {
+  decode: SchemaGetter.transform((x: unknown) => x),
+  encode: SchemaGetter.transform((x: unknown) => x),
+} as never
+const ownOrRef = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("own"),
+    line: Schema.String,
+    lineId: Schema.optional(Schema.String),
+    qty: Schema.Number,
+  }),
+  Schema.Struct({ kind: Schema.Literal("ref"), line, qty: Schema.Number }),
+])
+
+/** Elements with no fields of their own: unions, transformations, `suspend`. */
 const unions: ReadonlyArray<readonly [string, Schema.Top]> = [
   [
     "a checked nested union first",
@@ -114,6 +140,38 @@ const unions: ReadonlyArray<readonly [string, Schema.Top]> = [
     ]),
   ],
   ["a nullable reference", Schema.NullOr(Schema.Struct({ line, qty: Schema.Number }))],
+  [
+    "two members of one domain type",
+    Schema.Union([
+      Schema.Struct({ line, qty: Schema.Number }),
+      Schema.Struct({ line, qty: Schema.NumberFromString }),
+    ]),
+  ],
+  [
+    "a union through a transformation to Unknown",
+    ownOrRef.pipe(Schema.decodeTo(Schema.Unknown, identity)) as unknown as Schema.Top,
+  ],
+  [
+    "a union through a transformation to a struct",
+    ownOrRef.pipe(
+      Schema.decodeTo(
+        Schema.Struct({
+          kind: Schema.String,
+          line: Schema.Unknown,
+          lineId: Schema.optional(Schema.String),
+          qty: Schema.Number,
+        }),
+        identity,
+      ),
+    ) as unknown as Schema.Top,
+  ],
+  ["a suspended union", Schema.suspend(() => ownOrRef)],
+  [
+    "a struct through a transformation",
+    Schema.Struct({ line, qty: Schema.Number }).pipe(
+      Schema.decodeTo(Schema.Struct({ line, qty: Schema.Number }), identity),
+    ) as unknown as Schema.Top,
+  ],
 ]
 
 const values: ReadonlyArray<Record<string, unknown>> = [
@@ -128,16 +186,17 @@ const values: ReadonlyArray<Record<string, unknown>> = [
   { kind: "a", qty: 1 },
 ]
 
-describe("a union element is judged as on 1.39.0", () => {
+describe("an element with no fields of its own is judged as on 1.39.0", () => {
   for (const [name, element] of unions) {
     it(`${name}: a string id, whatever the member`, () => {
-      expect(isUnionElement(element)).toBe(true)
+      expect(isEntityElement(element, Lines)).toBe(false)
+      expect(entityFieldOf(element, Lines)).toBeUndefined()
       for (const value of values) {
         expect(holdsRef(element, value)).toBe(typeof value.lineId === "string")
       }
     })
 
-    it(`${name}: its input is the union as declared`, () => {
+    it(`${name}: its input is the element as declared`, () => {
       expect(deriveElementInputSchema(Schema.Array(element), Lines)).toBe(element)
     })
   }
@@ -156,16 +215,17 @@ describe("a union element is judged as on 1.39.0", () => {
   })
 })
 
-describe("any other element holds a reference when its field can hold the entity's record", () => {
+describe("an element naming the field holding the entity takes an id of the key composite", () => {
   it("a struct wrapping the entity: an id of the key composite's type, a number included", () => {
     const element = Schema.Struct({ numbered: Numbered, qty: Schema.Number })
+    expect(entityFieldOf(element, NumberedLines)).toBe("numbered")
     expect(elementHoldsRef(element, NumberedLines, { numberedId: 5, qty: 1 })).toBe(true)
     expect(elementHoldsRef(element, NumberedLines, { numberedId: "5", qty: 1 })).toBe(true)
     expect(elementHoldsRef(element, NumberedLines, { qty: 1 })).toBe(false)
     expect(elementHoldsRef(element, NumberedLines, { numberedId: null, qty: 1 })).toBe(false)
   })
 
-  it("through optional, a brand and a class", () => {
+  it("through optional, optionalKey, a ref annotation, a check, a brand and a class", () => {
     class Wrapped extends Schema.Class<Wrapped>("Wrapped")({
       line: Schema.optional(line),
       qty: Schema.Number,
@@ -173,25 +233,102 @@ describe("any other element holds a reference when its field can hold the entity
     for (const element of [
       Wrapped,
       Schema.Struct({ line: Schema.optional(line), qty: Schema.Number }),
+      Schema.Struct({ line: Schema.optionalKey(Line), qty: Schema.Number }),
+      Schema.Struct({ line: Line.check(Schema.makeFilter(() => true)), qty: Schema.Number }),
       Schema.Struct({ line: line.pipe(Schema.brand("LineRef")), qty: Schema.Number }),
     ]) {
-      expect(isUnionElement(element)).toBe(false)
+      expect(entityFieldOf(element, Lines)).toBe("line")
       expect(holdsRef(element, { lineId: "l", qty: 1 })).toBe(true)
       expect(holdsRef(element, { qty: 1 })).toBe(false)
     }
   })
 
-  it("a field of the entity's name declared a scalar holds no reference", () => {
-    const element = Schema.Struct({
-      line: Schema.String,
-      lineId: Schema.String,
-      qty: Schema.Number,
-    })
-    expect(holdsRef(element, { line: "x", lineId: "l", qty: 1 })).toBe(false)
-    expect(deriveElementInputSchema(Schema.Array(element), Lines)).toBe(element)
+  it("a struct entity's model, as declared, annotated or checked", () => {
+    for (const field of [
+      Row,
+      Row.annotate({ title: "row" }),
+      Row.check(Schema.makeFilter(() => true)),
+      Schema.optional(Row),
+    ]) {
+      const element = Schema.Struct({ row: field, qty: Schema.Number })
+      expect(entityFieldOf(element, Rows)).toBe("row")
+      expect(elementHoldsRef(element, Rows, { rowId: 5, qty: 1 })).toBe(true)
+    }
   })
 
+  it("its input: the element whole, or with the id in the field's place, each refusing the other", () => {
+    const element = Schema.Struct({ row: Row, qty: Schema.Number })
+    const input = Schema.Array(deriveElementInputSchema(Schema.Array(element), Rows)! as never)
+    const decode = Schema.decodeUnknownExit(input as Schema.Codec<unknown>)
+    expect(decode([{ row: { lineId: 5, f: 1 }, qty: 1 }])._tag).toBe("Success")
+    expect(decode([{ rowId: 5, qty: 1 }])._tag).toBe("Success")
+    expect(decode([{ row: { lineId: 5, f: 1 }, rowId: 5, qty: 1 }])._tag).toBe("Failure")
+    expect(decode([{ rowId: "5", qty: 1 }])._tag).toBe("Failure")
+  })
+})
+
+describe("any other element is judged as on 1.39.0: a string id, its input as 1.39.0's", () => {
+  const fields: ReadonlyArray<readonly [string, Schema.Top]> = [
+    ["a string", Schema.String],
+    ["an Option", Schema.Option(Schema.String)],
+    ["an Option of the entity", Schema.Option(Row)],
+    ["a Result", Schema.Result(Schema.String, Schema.Number)],
+    ["another struct", Schema.Struct({ payload: Schema.String })],
+    ["the entity or null", Schema.NullOr(Row)],
+    ["the entity or null, optional", Schema.optional(Schema.NullOr(Row))],
+    ["a struct declared again with the entity's fields", Schema.Struct(Row.fields)],
+    ["the entity's fields mapped", Row.mapFields((own) => own)],
+  ]
+  for (const [name, field] of fields) {
+    it(`a field of the entity's name declared ${name}`, () => {
+      const element = Schema.Struct({ row: field, qty: Schema.Number })
+      expect(entityFieldOf(element, Rows)).toBeUndefined()
+      expect(elementHoldsRef(element, Rows, { rowId: 5, qty: 1 })).toBe(false)
+      expect(elementHoldsRef(element, Rows, { rowId: "5", qty: 1 })).toBe(true)
+      // 1.39.0's input: the field taken as `rowId: string`.
+      const input = deriveElementInputSchema(Schema.Array(element), Rows)!
+      const decode = Schema.decodeUnknownExit(input as Schema.Codec<unknown>)
+      expect(decode({ rowId: "5", qty: 1 })._tag).toBe("Success")
+      expect(decode({ rowId: 5, qty: 1 })._tag).toBe("Failure")
+    })
+  }
+
+  it("an element declaring its own `rowId`: its own data, as declared there", () => {
+    for (const field of [Row, Schema.Option(Schema.String)]) {
+      const element = Schema.Struct({
+        row: field,
+        rowId: Schema.optional(Schema.Number),
+        qty: Schema.Number,
+      })
+      expect(entityFieldOf(element, Rows)).toBeUndefined()
+      expect(elementHoldsRef(element, Rows, { row: Option.some("KEEP"), rowId: 5, qty: 1 })).toBe(
+        false,
+      )
+      expect(elementHoldsRef(element, Rows, { rowId: "5", qty: 1 })).toBe(true)
+    }
+  })
+
+  it("a field of another name than the entity's holds no reference", () => {
+    const element = Schema.Struct({ captain: Row, qty: Schema.Number })
+    expect(entityFieldOf(element, Rows)).toBeUndefined()
+    expect(elementHoldsRef(element, Rows, { captainId: 5, qty: 1 })).toBe(false)
+    expect(elementHoldsRef(element, Rows, { rowId: "5", qty: 1 })).toBe(true)
+  })
+})
+
+describe("an element that is the entity", () => {
   it("the entity's own model, given whole, holds its own id", () => {
+    expect(isEntityElement(Line, Lines)).toBe(true)
     expect(holdsRef(Line, { lineId: "l", f: 1 })).toBe(false)
+    expect(isEntityElement(Row, Rows)).toBe(true)
+    expect(elementHoldsRef(Row, Rows, { lineId: 5, f: 1 })).toBe(false)
+  })
+
+  it("its input: an id of the key composite's type, or the entity whole", () => {
+    const input = deriveElementInputSchema(Schema.Array(Row), Rows)!
+    const decode = Schema.decodeUnknownExit(input as Schema.Codec<unknown>)
+    expect(decode(5)._tag).toBe("Success")
+    expect(decode({ lineId: 5, f: 1 })._tag).toBe("Success")
+    expect(decode("5")._tag).toBe("Failure")
   })
 })

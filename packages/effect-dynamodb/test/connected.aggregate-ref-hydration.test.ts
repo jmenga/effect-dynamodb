@@ -9,8 +9,11 @@
  * and read what it did; an id of the key composite's own type 1.39.0 dropped, or fetched under a key
  * `put` never wrote (a string codec), is fetched by the key `put` wrote; an id of no type of it, or
  * one no item is keyed by (`put` refuses it, alone or inside a struct, an `Option` or a `Result`),
- * fails with `EDD-9131`, nothing written. A union element is judged as 1.39.0 judged it (a string
- * `lineId`, whatever member the value is), so every union shape writes and reads what 1.39.0 did.
+ * fails with `EDD-9131`, nothing written. An element whose definition doesn't say it holds the
+ * entity (a union, one through a transformation or `suspend`, one declaring the entity's field a
+ * string, an `Option`, a `Result` or another struct, or declaring its id itself) is judged as 1.39.0
+ * judged it (a string `lineId`, whatever the element declares), so each writes and reads what
+ * 1.39.0 did.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -28,6 +31,7 @@ import {
   byKey,
   CONTROLS,
   fixture,
+  JUDGED_AS_139,
   json,
   NOW_FETCHED,
   outcomeOf,
@@ -210,7 +214,11 @@ describeConnected(
       )
     }
 
-    for (const label of UNIONS) {
+    for (const label of [
+      ...UNIONS,
+      ...JUDGED_AS_139,
+      "many, element declares the entity's field a string, given it and a lineId",
+    ]) {
       it.effect(`${label}: writes and reads what 1.39.0 did`, () =>
         Effect.gen(function* () {
           const { create, rows, get } = yield* run(SHAPES[label]!())
@@ -235,19 +243,5 @@ describeConnected(
         }),
       )
     }
-
-    it.effect("an element declaring the entity's field a string is stored as given", () =>
-      Effect.gen(function* () {
-        const { create, rows, get } = yield* run(
-          SHAPES["many, element declares the entity's field a string, given it and a lineId"]!(),
-        )
-        const expected = { id: "a", lines: [{ line: "label", qty: 2 }] }
-        expect(Exit.isSuccess(create) && create.value).toEqual(expected)
-        const sheet = rows.find((row) => row.__edd_e__?.S === "SheetLine")!
-        expect(sheet.line).toEqual({ S: "label" })
-        expect(sheet.lineId).toBeUndefined()
-        expect(Exit.isSuccess(get) && get.value).toEqual(expected)
-      }),
-    )
   },
 )

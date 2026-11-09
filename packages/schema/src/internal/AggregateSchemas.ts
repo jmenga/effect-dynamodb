@@ -11,6 +11,7 @@ import type {
   AggregateInputType,
   AggregateStampNames,
   BoundSubAggregate,
+  SchemaFieldsOf,
 } from "./AggregateTypes.js"
 import { bothKindsKeyRefusal, storedFieldAtPath } from "./CompositeCodec.js"
 import type { TimestampsConfig } from "./EntityConfig.js"
@@ -275,7 +276,8 @@ export const deriveAggregateSchemas = <
     Schema.Schema.Type<TSchema>,
     TEdges,
     TPK,
-    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
   >
 > => {
   const own = resolveAggregateStamps(timestamps, getSchemaFields(schema), "Aggregate")
@@ -477,115 +479,90 @@ export const refIdValue = (entity: RefEntity, value: unknown): Option.Option<unk
   return Option.isSome(fromJson) ? fromJson : Schema.decodeUnknownOption(codec)(value)
 }
 
-/** A type AST's members, `undefined` and `null` left out: a union's, flattened, or the type itself. */
-const astMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> => {
-  if (SchemaAST.isUnion(ast)) return ast.types.flatMap((member) => astMembers(member))
-  if (SchemaAST.isUndefined(ast) || SchemaAST.isNull(ast)) return []
-  return [ast]
-}
-
-/** A value with no fields of its own: a scalar, a literal, or a list. */
-const isScalarOrList = (ast: SchemaAST.AST): boolean =>
-  SchemaAST.isString(ast) ||
-  SchemaAST.isNumber(ast) ||
-  SchemaAST.isBigInt(ast) ||
-  SchemaAST.isBoolean(ast) ||
-  SchemaAST.isLiteral(ast) ||
-  SchemaAST.isEnum(ast) ||
-  SchemaAST.isTemplateLiteral(ast) ||
-  SchemaAST.isSymbol(ast) ||
-  SchemaAST.isUniqueSymbol(ast) ||
-  SchemaAST.isArrays(ast) ||
-  SchemaAST.isNever(ast) ||
-  SchemaAST.isVoid(ast)
-
-/**
- * The properties of an object type: a struct's, or a class's (read off its declaration, so a class
- * an annotation has taken `.fields` from, `Line.pipe(DynamoModel.ref)`, still has them).
- * `undefined` for anything else.
- */
-const astProperties = (
-  ast: SchemaAST.AST,
-): ReadonlyArray<SchemaAST.PropertySignature> | undefined => {
-  if (SchemaAST.isObjects(ast)) return ast.propertySignatures
-  if (SchemaAST.isDeclaration(ast)) {
-    const [struct] = ast.typeParameters
-    if (struct !== undefined && SchemaAST.isObjects(struct)) return struct.propertySignatures
-  }
-  return undefined
-}
-
-/**
- * Whether a field can hold the entity's record, so the field is the entity's: some member of it,
- * `optional` and unions unwrapped, is an object, a class, or something that says nothing of what it
- * holds. A scalar or list field (`line: Schema.String`) never wraps the entity, whatever its name.
- */
-const holdsRecordAst = (ast: SchemaAST.AST): boolean =>
-  astMembers(ast).some((member) => !isScalarOrList(member))
-
-/** {@link holdsRecordAst} of a field's schema. */
-export const holdsRecord = (field: Schema.Top): boolean => holdsRecordAst(field.ast)
-
 // ---------------------------------------------------------------------------
 // A `many` element's references: which values `create` fetches an entity for
 // ---------------------------------------------------------------------------
 
+/** What a copy of a schema node may change without changing what the node holds. */
+const notWhatItHolds: ReadonlySet<string> = new Set(["annotations", "checks", "context"])
+
 /**
- * Whether an element (one that isn't a union) holds a reference of the entity whose field is
- * `name`: an object whose property of that name can hold the entity's record ({@link
- * holdsRecordAst}), a record (`Schema.Record`) holding whatever keys it's given, or a value that says
- * nothing of what it holds (`Schema.Unknown`, a `suspend`). A scalar, a list or a declaration (a
- * date) is a value, never a reference.
+ * Whether two schema nodes are one schema: the same node, or a copy of it that changes only its
+ * annotations (`DynamoModel.ref`, `.annotate`), its checks (`.check`) or the optionality of the key
+ * it's under. Every other part is the same object. Decided from the definitions alone: a struct
+ * declared again with the same fields is another schema.
  */
-const isReferenceMember = (member: Schema.Top, name: string): boolean => {
-  const ast = member.ast
-  if (SchemaAST.isNull(ast) || SchemaAST.isUndefined(ast)) return false
-  const properties = astProperties(ast)
-  if (properties === undefined) return !isScalarOrList(ast) && !SchemaAST.isDeclaration(ast)
-  const property = properties.find((candidate) => candidate.name === name)
-  return property === undefined
-    ? SchemaAST.isObjects(ast) && ast.indexSignatures.length > 0
-    : holdsRecordAst(property.type)
+const isSameSchemaNode = (a: SchemaAST.AST, b: SchemaAST.AST): boolean => {
+  if (a === b) return true
+  if (a._tag !== b._tag) return false
+  const own = (ast: SchemaAST.AST) => Object.keys(ast).filter((key) => !notWhatItHolds.has(key))
+  const keys = own(a)
+  return (
+    keys.length === own(b).length &&
+    keys.every(
+      (key) =>
+        (a as unknown as Record<string, unknown>)[key] ===
+        (b as unknown as Record<string, unknown>)[key],
+    )
+  )
 }
 
-/** Whether an element is the entity's own model, or a class of the same identifier. */
-const isEntityElement = (element: Schema.Top, entity: RefEntity): boolean =>
-  getSchemaFields(element) !== undefined &&
-  (isSchemaMatchingEntity(element, entity) || element.ast === unwrapModel(entity.model).ast)
+/** Whether a schema is the entity's own model (`isSameSchemaNode`), its configure wrapper taken off. */
+const isEntityModel = (schema: Schema.Top, entity: RefEntity): boolean =>
+  isSameSchemaNode(schema.ast, unwrapModel(entity.model).ast)
 
 /**
- * Whether a `many` element is declared a union. `create` judges its values as 1.39.0 judged them:
- * a string given as the element, or as an object's `${field}Id`, is an id it fetches the entity by,
- * whatever member the value is, and nothing else is. Its input is the union as declared.
+ * Whether a `many` element is the entity itself (`Array<Umpire>`): the entity's own model, or a
+ * class of the same identifier, as 1.39.0 found it. Its values are the entity whole, or an id.
  */
-export const isUnionElement = (element: Schema.Top | undefined): boolean =>
-  element !== undefined && SchemaAST.isUnion(element.ast)
+export const isEntityElement = (element: Schema.Top | undefined, entity: RefEntity): boolean =>
+  element !== undefined &&
+  getSchemaFields(element) !== undefined &&
+  (isSchemaMatchingEntity(element, entity) || isEntityModel(element, entity))
 
 /**
- * Whether `create` fetches `entity` for a `many` element value given as an object, under the
- * `${field}Id` the element's input takes (`deriveElementInputSchema`):
+ * The field of a `many` element that holds the entity, where the element's definition says so,
+ * `undefined` where it doesn't. All of these hold:
  *
- * - **A union element is judged as 1.39.0 judged it** ({@link isUnionElement}): a string
- *   `${field}Id`, whatever member the value is.
- * - **Any other element is fetched for when it holds a reference** ({@link isReferenceMember}) and
- *   is given a `${field}Id`. The id is then a value of the entity's key composite (`refIdValue`), so
- *   a number or a bigint id is fetched too. An element that is the entity's own model takes an id:
- *   given whole, it is stored as given. A field declared a scalar (`line: Schema.String`) holds no
- *   reference, whatever its name.
+ * 1. The element is a plain `Schema.Struct` or `Schema.Class`: one with fields of its own. A
+ *    transformation, a union, a `suspend` or a declaration has none.
+ * 2. Its field of the entity's name (`deriveEntityFieldName`) is the entity's own model
+ *    (`isSameSchemaNode`), or that under `Schema.optional` / `Schema.optionalKey` alone. An
+ *    `Option`, a `NullOr` or a `Result` of it is another schema.
+ * 3. It doesn't declare `${field}Id` itself: a declared one is the element's own data.
  *
- * An element whose schema can't be read off the model is fetched for whatever id it's given.
+ * Such an element takes an id of the entity's key composite under `${field}Id` (`refIdValue`),
+ * which `create` fetches. Any other element is judged as 1.39.0 judged it: a string `${field}Id`
+ * is fetched, whatever the element declares.
+ */
+export const entityFieldOf = (
+  element: Schema.Top | undefined,
+  entity: RefEntity,
+): string | undefined => {
+  const fields = element === undefined ? undefined : getSchemaFields(element)
+  if (fields === undefined) return undefined
+  const name = deriveEntityFieldName(entity)
+  const field = fields[name]
+  if (field === undefined || `${name}Id` in fields) return undefined
+  const optional = optionalField(field)
+  if (optional?.union !== undefined) return undefined
+  return isEntityModel(optional?.inner ?? field, entity) ? name : undefined
+}
+
+/**
+ * Whether `create` fetches `entity` for a `many` element value given as an object, under its
+ * `${field}Id`: any value but `null` and `undefined` where the element's definition names the field
+ * holding the entity ({@link entityFieldOf}), and a string otherwise, as on 1.39.0. An element that is
+ * the entity itself ({@link isEntityElement}) holds no reference: given whole, it's stored as given.
  */
 export const elementHoldsRef = (
   element: Schema.Top | undefined,
   entity: RefEntity,
   value: Record<string, unknown>,
 ): boolean => {
-  const name = deriveEntityFieldName(entity)
-  const id = value[`${name}Id`]
-  if (element === undefined) return id != null
-  if (isUnionElement(element)) return typeof id === "string"
   if (isEntityElement(element, entity)) return false
-  return isReferenceMember(element, name) && id != null
+  const id = value[`${deriveEntityFieldName(entity)}Id`]
+  return entityFieldOf(element, entity) !== undefined ? id != null : typeof id === "string"
 }
 
 /**
@@ -602,13 +579,20 @@ export const manyElementSchema = (
 }
 
 /**
- * Derive input schema for a many-edge array element.
- * Extracts the element type from the field schema (which may be an Array
- * or optional(Array)). If the element IS the entity (its model, or a class of the same
- * identifier), transforms to an id, a value of the entity's key composite. Otherwise, finds the
- * entity-derived field within the element, when it can hold the entity's record, and transforms
- * it to `${field}Id`. An element with no fields of its own, a union among them, is taken as
- * declared, as on 1.39.0, and so is an entity no single id names.
+ * Derive input schema for a many-edge array element, as `create` takes it, for an edge whose entity
+ * one id names:
+ *
+ * - **An element that is the entity** ({@link isEntityElement}): an id of the entity's key composite
+ *   (`refIdInput`), or the entity whole.
+ * - **An element whose definition names the field holding the entity** ({@link entityFieldOf}): the
+ *   element whole, or with `${field}Id`, an id of the entity's key composite, in place of that field.
+ *   Each refuses the other's key, so neither drops the other's value.
+ * - **Any other element**, as on 1.39.0: the field of the entity's name, if it has one, taken as
+ *   `${field}Id: Schema.String`. An element with no fields of its own (a union among them) is taken
+ *   as declared.
+ *
+ * An entity no single id names is given whole, never by id (`EDD-9129`), so its elements are taken as
+ * declared. A date the library stamps is optional throughout.
  */
 export const deriveElementInputSchema = (
   arrayFieldSchema: Schema.Top,
@@ -617,46 +601,91 @@ export const deriveElementInputSchema = (
 ): Schema.Top | undefined => {
   const elemSchema = extractArrayElement(arrayFieldSchema)
   if (!elemSchema) return undefined
-  // An entity no single id names is given whole, never by id (`EDD-9129`).
   const fetched = entity !== undefined && refKeyComposite(entity) !== undefined ? entity : undefined
-  if (fetched !== undefined && isEntityElement(elemSchema, fetched)) return refIdInput(fetched)
+  if (fetched !== undefined && isEntityElement(elemSchema, fetched)) {
+    return Schema.Union([
+      refIdInput(fetched) as Schema.Codec<unknown>,
+      stampedElement(elemSchema, stamps) as Schema.Codec<unknown>,
+    ]) as unknown as Schema.Top
+  }
   const fields = getSchemaFields(elemSchema)
-  if (fields === undefined) return elemSchema
-  return deriveElementMember(elemSchema, fields, fetched, stamps)
+  if (fields === undefined || fetched === undefined) {
+    return fields === undefined ? elemSchema : stampedElement(elemSchema, stamps)
+  }
+  const named = entityFieldOf(elemSchema, fetched)
+  if (named !== undefined) {
+    const own = stampedFields(fields, stamps)
+    const id = refIdInput(fetched)
+    const absent = Schema.optionalKey(Schema.Never)
+    const byId: Record<string, Schema.Top> = {}
+    for (const [name, field] of Object.entries(own)) {
+      if (name === named) {
+        byId[`${name}Id`] = isFieldOptional(field) ? Schema.optionalKey(id) : id
+        byId[name] = absent
+      } else {
+        byId[name] = field
+      }
+    }
+    return Schema.Union([
+      Schema.Struct({ ...own, [`${named}Id`]: absent } as any),
+      Schema.Struct(byId as any),
+    ]) as unknown as Schema.Top
+  }
+  return element139(elemSchema, fields, deriveEntityFieldName(fetched), stamps)
+}
+
+/** An element's fields, the dates the library stamps optional. */
+const stampedFields = (
+  fields: Record<string, Schema.Top>,
+  stamps: AggregateStamps | undefined,
+): Record<string, Schema.Top> => {
+  const managed = stamps === undefined ? undefined : managedDates(stamps, fields)
+  return Object.fromEntries(
+    Object.entries(fields).map(([name, field]) => [
+      name,
+      managed?.has(name) === true ? stampInput(field) : field,
+    ]),
+  )
+}
+
+/** An element as declared, the dates the library stamps optional: the element itself when none is. */
+const stampedElement = (element: Schema.Top, stamps: AggregateStamps | undefined): Schema.Top => {
+  const fields = getSchemaFields(element)
+  if (fields === undefined || stamps === undefined || managedDates(stamps, fields).size === 0) {
+    return element
+  }
+  return Schema.Struct(stampedFields(fields, stamps) as any) as unknown as Schema.Top
 }
 
 /**
- * An element with fields, as its input takes it: the entity-derived
- * field, when it can hold the entity's record, as `${field}Id`; a date the library stamps optional.
+ * An element as 1.39.0's input took it: its field of the entity's name, if it has one, as
+ * `${name}Id: Schema.String`, optional when the field is; the dates the library stamps optional.
  * The element itself when nothing changes.
  */
-const deriveElementMember = (
-  elemSchema: Schema.Top,
-  elemFields: Record<string, Schema.Top>,
-  fetched: RefEntity | undefined,
+const element139 = (
+  element: Schema.Top,
+  fields: Record<string, Schema.Top>,
+  entityFieldName: string,
   stamps: AggregateStamps | undefined,
 ): Schema.Top => {
-  const entityFieldName = fetched ? deriveEntityFieldName(fetched) : undefined
-  const managed = stamps === undefined ? undefined : managedDates(stamps, elemFields)
+  const managed = stamps === undefined ? undefined : managedDates(stamps, fields)
   let hasChanges = false
   const newFields: Record<string, unknown> = {}
-  for (const [name, fSchema] of Object.entries(elemFields)) {
-    if (name === entityFieldName && holdsRecord(fSchema)) {
-      // This field references the entity — transform to ${name}Id: <its key composite>
-      const isOpt = isFieldOptional(fSchema)
-      const id = refIdInput(fetched!)
-      newFields[`${name}Id`] = isOpt ? Schema.optionalKey(id) : id
+  for (const [name, field] of Object.entries(fields)) {
+    if (name === entityFieldName) {
+      newFields[`${name}Id`] = isFieldOptional(field)
+        ? Schema.optionalKey(Schema.String)
+        : Schema.String
       hasChanges = true
     } else if (managed?.has(name) === true) {
-      newFields[name] = stampInput(fSchema)
+      newFields[name] = stampInput(field)
       hasChanges = true
     } else {
-      newFields[name] = fSchema
+      newFields[name] = field
     }
   }
-  return hasChanges ? Schema.Struct(newFields as any) : elemSchema
+  return hasChanges ? Schema.Struct(newFields as any) : element
 }
-
 /**
  * The paths of an aggregate's `many` edges, sub-aggregates included. The collection such a field is
  * declared as is taken apart by `decompose` and put back by `assemble`, so it's never stored itself.

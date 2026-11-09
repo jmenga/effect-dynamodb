@@ -4031,34 +4031,60 @@ ids where its input takes them: a `one` or `ref` edge's `${field}Id`, the
 elements of a `many` edge given as ids, and the `${field}Id` of a `many`
 element wrapping the entity in a field of its own (`PlayerSheet.player`, the
 field `deriveEntityFieldName` names, as `deriveElementInputSchema` derives the
-input). An element that isn't a union holds a ref when its field of the
-entity's name can hold the entity's record (an object or a class, `optional`,
-branded or not; `elementHoldsRef`), and its input is the element with that
-field replaced by `${field}Id` of the key composite's own schema
-(`refIdInput`), and a managed timestamp optional. A field declared a scalar
-(`line: Schema.String`) holds no ref, whatever the input gives beside it. An
-element that is the entity's own model, given whole, holds no ref either, so a
-`many` edge of such elements is stored as given: its key field (`lineId` of a
-`Line`) is its own value. Up to 1.39.0 it was taken for a ref because its name
-was `${field}Id`, and `create` died composing the key. The input type
-(`AggregateTypes`) takes the same field by id, and a field of another name
-whole, whatever it holds, where it can see the field's name: for a
-`Schema.Struct` model, in a `DynamoModel.configure` wrapper or not, whose
-`entityType` is one string literal (`create` takes the `entityType` for both).
-`create` takes a `Schema.Class` model's own identifier, which the type sees only
-as `string`, and the `entityType` for a class in a `configure` wrapper, which
-the type can't tell apart from a bare class. For a model the type can't name the
-field of, and an `entityType` typed `string` (`Uncapitalize<string>` would match
-every field), the element is typed as on 1.39.0: a field whose type has an
-`id: string` by id, whatever its name, and every other field as declared.
+input). Whether a `many` element takes an id of the key composite's type is
+decided from the element's definition alone, never from the value given or a
+guess at what a field's schema can hold:
 
-A union element is judged as 1.39.0 judged it (`isUnionElement`): a string
-`${field}Id`, or a string given as the element, is an id `create` fetches by,
-whatever member the value is, and nothing else is; the hydrated value is then
-decoded as declared. Its input in the derived input and create schemas is the
-union as declared, and its input type is 1.39.0's (a ref-like field, one of a
-class with `id: string`, as `${field}Id`). The one change is the id's type:
-a string of no type of the key composite fails with `EDD-9131`, below.
+- **The element is the entity** (`isEntityElement`): a schema with fields of
+  its own that is the entity's model (a class of the same identifier, as 1.39.0
+  found it, or the model's own schema node). Its values are an id of the key
+  composite's type, or the entity whole. Given whole, it holds no ref: its key
+  field (`lineId` of a `Line`) is its own value. Up to 1.39.0 it was taken for a
+  ref because its name was `${field}Id`, and `create` died composing the key.
+- **The element names the field holding the entity** (`entityFieldOf`): a plain
+  `Schema.Struct` or `Schema.Class` (no union, transformation, `suspend` or
+  declaration at the element) whose field of the entity's name is the entity's
+  own model schema, by AST identity, under `Schema.optional` /
+  `Schema.optionalKey` at most, and which doesn't declare `${field}Id` itself (a
+  declared one is the element's own data). A copy of the model's node that
+  changes only its annotations (`DynamoModel.ref`), its checks or its key's
+  optionality is the model; an `Option`, a `NullOr` or a `Result` of it, and a
+  struct declared again with the same fields, are not. Its `${field}Id`, any
+  value but `null` or `undefined`, is an id of the key composite's type
+  (`elementHoldsRef`). Its input is the element whole, or with `${field}Id` of
+  the key composite's own schema (`refIdInput`) in that field's place, each
+  refusing the other's key.
+- **Every other element is judged as 1.39.0 judged it.** A string given as the
+  element, or a string `${field}Id` in an object element, is an id `create`
+  fetches, whatever the element declares, and nothing else is; the hydrated
+  value is then decoded as declared. Its input is 1.39.0's: the field of the
+  entity's name, if it has one, as `${field}Id: Schema.String`, and an element
+  with no fields of its own as declared. That covers every union element
+  (through a transformation or `suspend` too), an element through a
+  transformation, one whose field of the entity's name is a scalar, an
+  `Option`, a `Result`, another struct or the entity under `NullOr`, and one
+  declaring `${field}Id`. The one change is the id's type: a string of no type
+  of the key composite fails with `EDD-9131`, below.
+
+A managed timestamp is optional in every element's input.
+
+The input type (`AggregateTypes`) follows the same rule, read from the
+element's *schema* type, never its domain type, so a union whose members have
+one domain type is still a union. An element of the entity's model schema type
+(with fields of its own) takes an id or the entity whole. A `Schema.Struct` or
+`Schema.Class` element whose field of the entity's name is of the entity's
+model schema type, under `optional` at most, and which declares no
+`${field}Id`, takes the element whole or by id: the id form is added, the
+declared form never removed, and each refuses the other's key. The type sees
+that field's name only for a `Schema.Struct` model (in a
+`DynamoModel.configure` wrapper or not) whose `entityType` is one string
+literal: `create` takes a `Schema.Class` model's own identifier, which the
+type sees only as `string`, and the `entityType` for a class in a `configure`
+wrapper, which the type can't tell apart from a bare class. Every other element
+is typed exactly as on 1.39.0: a field whose type has an `id: string` by id,
+whatever its name, and every other field as declared. Two schemas of one type
+are one to the type, so a struct declared again with the entity's fields is
+typed as the entity, where `create` takes only a string id for it.
 
 Each id is a value of the entity's primary key's only distinct composite
 (`refKeyComposite`; an attribute in both halves of the key is one attribute),

@@ -11,7 +11,11 @@
  * `Result`, keys escaped or not; two edges, the second over an entity no one id keys; union elements
  * whose earlier member would take a value with the id left over, a checked union holding the ref, a
  * class given a `Date` and a stray id (at the root and in a sub-aggregate); and a `NumberFromString`
- * id given an infinity as its encoded string, keys escaped or not.
+ * id given an infinity as its encoded string, keys escaped or not; over an entity keyed by a number,
+ * a union element through a transformation or `suspend`, an element declaring the entity's field an
+ * `Option`, a `Result` or another struct and its id a number (each at the root and in a
+ * sub-aggregate), an element declaring the entity's field an `Option`, given it or a number id, and a
+ * union of two members of one domain type, given it whole or a number id.
  * Shared by `AggregateRefHydration.test.ts` (a recording table) and
  * `connected.aggregate-ref-hydration.test.ts` (DynamoDB Local).
  */
@@ -988,6 +992,180 @@ export const nestedSheet = (Line: Schema.Top) =>
     Schema.Struct({ kind: Schema.Literal("c"), line: Schema.String, qty: Schema.Number }),
   ])
 
+/** An entity class keyed by a number, its key its identifier. */
+const numberLine = () => {
+  class Line extends Schema.Class<Line>("Line")({ lineId: Schema.Number, f: Schema.Number }) {}
+  return { Line, model: DynamoModel.configure(Line, { lineId: { identifier: true } }) }
+}
+
+/**
+ * A `many` edge over a number-keyed `Lines` with `sheet`'s element, at the root or in a sub-aggregate
+ * `part`, seeded with line 5.
+ */
+const numberSheet =
+  (sheet: (Line: Schema.Top) => Schema.Top, element: unknown, sub: boolean) => (): Shape => {
+    const { Line, model } = numberLine()
+    const Lines = lines(model, singleKey)
+    const edge = () =>
+      Aggregate.many({
+        entityType: "SheetLine",
+        entity: Lines,
+        sk: { composite: ["qty"] },
+      } as never)
+    const Part = Schema.Struct({ lines: Schema.Array(sheet(Line)) })
+    return {
+      entities: { Lines },
+      make: (base) => {
+        if (!sub) {
+          return aggregate(
+            Schema.Struct({ id: Schema.String, lines: Schema.Array(sheet(Line)) }),
+            base,
+            { lines: edge() },
+          )
+        }
+        const Sub = (Aggregate.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: { lines: edge() },
+        })
+        return aggregate(Schema.Struct({ id: Schema.String, part: Part }), base, {
+          part: Sub.with({ discriminator: { side: 1 } }),
+        })
+      },
+      seed: [["Lines", { lineId: 5, f: 1 }]],
+      input: sub ? { id: "a", part: { lines: [element] } } : { id: "a", lines: [element] },
+    }
+  }
+
+/** A union of a member declaring the entity's field a string and its id a number, and one holding it. */
+const ownOrRef = (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("own"),
+      line: Schema.String,
+      lineId: Schema.optional(Schema.Number),
+      qty: Schema.Number,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("ref"),
+      line: Line.pipe(DynamoModel.ref),
+      qty: Schema.Number,
+    }),
+  ])
+
+/** {@link ownOrRef} through a transformation to `Unknown` or to a struct, or `suspend`ed. */
+export const wrappedUnion = (wrap: "unknown" | "struct" | "suspend") => (Line: Schema.Top) => {
+  const union = ownOrRef(Line)
+  if (wrap === "suspend") return Schema.suspend(() => union)
+  const target =
+    wrap === "unknown"
+      ? Schema.Unknown
+      : Schema.Struct({
+          kind: Schema.String,
+          line: Schema.Unknown,
+          lineId: Schema.optional(Schema.Number),
+          qty: Schema.Number,
+        })
+  return union.pipe(
+    Schema.decodeTo(
+      target as Schema.Codec<unknown>,
+      {
+        decode: SchemaGetter.transform((x: unknown) => x),
+        encode: SchemaGetter.transform((x: unknown) => x),
+      } as never,
+    ),
+  ) as unknown as Schema.Top
+}
+
+/** A struct declaring the entity's field `field`, and its id a number when `id`. */
+const declaredSheet = (field: () => Schema.Top, id: boolean) => () =>
+  Schema.Struct({
+    line: field(),
+    ...(id ? { lineId: Schema.optional(Schema.Number) } : {}),
+    qty: Schema.Number,
+  })
+
+/** A union of two members holding the entity, whose domain types are one. */
+const sameDomainUnion = (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Struct({ line: Line.pipe(DynamoModel.ref), qty: Schema.Number }),
+    Schema.Struct({ line: Line.pipe(DynamoModel.ref), qty: Schema.NumberFromString }),
+  ])
+
+const ownLine = { kind: "own", line: "KEEP", lineId: 5, qty: 1 }
+
+/**
+ * Shapes a fifth review found, over an entity keyed by a number: an element whose schema doesn't
+ * name the field holding the entity, given a number `lineId`. A union through a transformation or
+ * `suspend`, a member declaring the entity's field a string and its id a number; a struct declaring
+ * the entity's field an `Option`, a `Result` or another struct, and its id a number; an `Option`
+ * field given its value or a number id; a union whose members have one domain type.
+ */
+const reviewedFifth: Record<string, () => Shape> = Object.fromEntries([
+  ...(
+    [
+      [
+        "many, element a union through a transformation to Unknown, a member declaring the entity's field a string and its id a number",
+        wrappedUnion("unknown"),
+        ownLine,
+      ],
+      [
+        "many, element a union through a transformation to a struct, a member declaring the entity's field a string and its id a number",
+        wrappedUnion("struct"),
+        ownLine,
+      ],
+      [
+        "many, element a suspended union, a member declaring the entity's field a string and its id a number",
+        wrappedUnion("suspend"),
+        ownLine,
+      ],
+      [
+        "many, element declares the entity's field an Option and its id a number",
+        declaredSheet(() => Schema.Option(Schema.String), true),
+        { line: Option.some("KEEP"), lineId: 5, qty: 1 },
+      ],
+      [
+        "many, element declares the entity's field a Result and its id a number",
+        declaredSheet(() => Schema.Result(Schema.String, Schema.Number), true),
+        { line: Result.succeed("KEEP"), lineId: 5, qty: 1 },
+      ],
+      [
+        "many, element declares the entity's field another struct and its id a number",
+        declaredSheet(() => Schema.Struct({ payload: Schema.String }), true),
+        { line: { payload: "KEEP" }, lineId: 5, qty: 1 },
+      ],
+    ] as const
+  ).flatMap(([label, sheet, element]) =>
+    [false, true].map((sub) => [
+      sub ? `sub-aggregate, ${label}` : label,
+      numberSheet(sheet, element, sub),
+    ]),
+  ),
+  [
+    "many, element declares the entity's field an Option, given it",
+    numberSheet(
+      declaredSheet(() => Schema.Option(Schema.String), false),
+      { line: Option.some("KEEP"), qty: 1 },
+      false,
+    ),
+  ],
+  [
+    "many, element declares the entity's field an Option, given a number id",
+    numberSheet(
+      declaredSheet(() => Schema.Option(Schema.String), false),
+      { lineId: 5, qty: 1 },
+      false,
+    ),
+  ],
+  [
+    "many, element a union of two members of one domain type, given a number id",
+    numberSheet(sameDomainUnion, { lineId: 5, qty: 1 }, false),
+  ],
+  [
+    "many, element a union of two members of one domain type, given it whole",
+    numberSheet(sameDomainUnion, { line: { lineId: 5, f: 1 }, qty: 1 }, false),
+  ],
+])
+
 export const SHAPES: Record<string, () => Shape> = {
   "many, element the entity's struct, given whole": () => {
     const Line = lineStruct()
@@ -1035,6 +1213,7 @@ export const SHAPES: Record<string, () => Shape> = {
   ...reviewedAgain,
   ...reviewedThird,
   ...reviewedFourth,
+  ...reviewedFifth,
 }
 
 export const byKey = (rows: ReadonlyArray<Row>) =>
@@ -1127,3 +1306,9 @@ export const UNKEYABLE = {
   "one, an entity keyed by a string, given an object whose toString is text":
     'is given an object ({"toString":"x"})',
 } as const
+/**
+ * The fifth review's shapes but its unions ({@link UNIONS}): elements whose schema doesn't name the
+ * field holding the entity, judged as 1.39.0 judged them, so each fetches, writes and reads what
+ * 1.39.0 did. A number `lineId` is the element's own, never an id to fetch.
+ */
+export const JUDGED_AS_139 = Object.keys(reviewedFifth).filter((label) => !UNIONS.includes(label))

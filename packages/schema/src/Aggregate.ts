@@ -35,6 +35,7 @@ import type {
   AggregateInputType,
   AggregateStampNames,
   BoundSubAggregate,
+  SchemaFieldsOf,
   SubAggregate,
 } from "./internal/AggregateTypes.js"
 import type { TimestampsConfig } from "./internal/EntityConfig.js"
@@ -240,7 +241,8 @@ export function make<
     Schema.Schema.Type<TSchema>,
     TEdges,
     TPK,
-    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
   >
 >
 export function make<
