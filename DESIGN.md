@@ -2143,7 +2143,7 @@ A packed value is the attribute's wire form exactly as map storage would write i
 
 **Constraints.** A packed field's encoded side must be object/array-shaped (so `S` is unambiguous; this also excludes dates/TTL), and it cannot be a key or index composite, a unique-constraint field or a ref (EDD-9072–9075). Conditions and filters may only test `attribute_exists` / `attribute_not_exists` on the whole field; projections take it whole; updates only `.set()` / `.remove()` it whole (EDD-9076, EDD-9077). Version snapshots, soft-delete tombstones and time-series event items copy stored values as-is. The key composer is untouched.
 
-**EventStore.** `append` / `commandHandler` pack each event's `data` (and the inline snapshot's `state`); every read path decodes by stored form; `Query.select` raw rows return `data` as plain parsed JSON whatever its stored form, through every stream-index projection; `Query.filterExpr` on `data.*` is refused (EDD-9076) in favour of `Query.filterBy`. `stream.decodeStreamImage(image)` decodes DynamoDB Streams images (B as `Uint8Array` or base64) to the read paths' `StreamEvent`; `stream.measureAppend` / `measureSnapshot` and `StorageEncoding.valueBytes` (or its synchronous twin `valueBytesSync`, with explicit compressors) give callers the exact stored sizes for chunk planning, and `measureAppend`'s `requestBytes` the exact request body the append would send; `StorageEncoding.limits` holds the three limits (`item`, `transaction`, `request`). Size limits are not pre-checked: the failure diagnosis measures the packed request, so it counts stored bytes.
+**EventStore.** `append` / `commandHandler` pack each event's `data` (and the inline snapshot's `state`); every read path decodes by stored form; `Query.select` raw rows return `data` as plain parsed JSON whatever its stored form, through every stream-index projection; `Query.filterExpr` on `data.*` is refused (EDD-9076) in favour of `Query.filterBy`. `stream.decodeStreamImage(image)` decodes DynamoDB Streams images (B as `Uint8Array` or base64) to the read paths' `StreamEvent`; `stream.measureAppend` / `measureSnapshot` and `StorageEncoding.valueBytes` (or its synchronous twin `valueBytesSync`, with explicit compressors) give callers the exact stored sizes for chunk planning, and `measureAppend`'s `requestBytes` the exact request body the append would send (its `additionalItems` passed to it, built as `append` builds them); `StorageEncoding.limits` holds the three limits (`item`, `transaction`, `request`). Size limits are not pre-checked: the failure diagnosis measures the packed request, so it counts stored bytes.
 
 **Entity.** Packing runs after renames and sparse flattening, before marshalling (put / create / upsert / update `.set()` / `Batch.write` / `Transaction.transactWrite` / time-series `append`, which packs once and writes the same value on the current and event item); unpacking runs after unmarshalling, before sparse rebuild and renames, in every decoder (get, queries, scans, collections, batch and transactional reads, versions, history, soft-deleted reads, `ReturnValues`). Reads also dispatch on every object/array-shaped field that is not configured packed, so turning packing off needs no rewrite. `asNative` returns the stored `S` / `B`; raw projections (`select`, `Entity.project`) return a packed field whole as its parsed JSON. The read-merge update path (retain, unique, computed composites) carries packed values the update does not name byte-identical, and a restated immutable packed field is compared by its unpacked JSON. At the type level an entity carries its packed field names (`TPackedFields`): their `PathBuilder` paths are `PackedPath`s, accepted only by `exists` / `notExists` and projections. `Entity.decodeMarshalledItem` decodes DynamoDB Streams images by stored form (`B` as bytes or base64, DynamoDB JSON or unmarshalled) and now also applies renames and sparse maps. Aggregate edges store their edge entity's packed fields packed (a `one` edge's flattened entity, a `many` element that is the entity) and, like entities, read every object/array-shaped edge attribute by its stored form, so an edge written packed still reads after the edge entity's packing is turned off; a packed field cannot be an edge discriminator or `many` sort-key composite (EDD-9072).
 
@@ -5116,12 +5116,19 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
   `attribute_exists` / `attribute_not_exists` on `data`) and a projection inside `data`
   throw `[EDD-9076]`, pointing to `Query.filterBy`.
 - **Planning (caller-side).** `measureAppend(streamId, events, expectedVersion, options)`
-  builds the stream's own items with the same builder `append` uses and returns each
-  event item's size, the sentinel's, the inline snapshot's, the stream-owned
-  transaction bytes (`additionalItems` excluded) and `requestBytes`, the exact request
-  body the append would send (the JSON text, with a transaction's `ClientRequestToken`
-  and, when capacity reporting is on, `ReturnConsumedCapacity`; 0 for a no-op); `measureSnapshot` sizes a snapshot
-  item. `R = TableConfig`; nothing is read or written.
+  builds the request `append` would send for the same arguments, through the same code
+  (`buildAppend`, then `buildAppendTransaction`, which compiles `additionalItems` and lays
+  the transaction out), and returns each event item's size, the sentinel's, the inline
+  snapshot's, the transaction bytes (its every item, the additional items' included) and
+  `requestBytes`, the exact request body (the JSON text, with a transaction's
+  `ClientRequestToken` and, when capacity reporting is on, `ReturnConsumedCapacity`; 0 for
+  a no-op). It is measured on the request, never summed from parts: adding an item to a
+  lone event turns its `PutItem` into a `TransactWriteItems`, another envelope with a
+  token. `measureSnapshot` sizes a snapshot item. Without `additionalItems`,
+  `R = TableConfig` and nothing is read; with them, `R` adds `DynamoClient` and `E`
+  `DynamoClientError`, since building an additional item can read (a guarded put reads
+  its item), and the call is the named operation `EventStream.measureAppend` for
+  consumed-capacity reports. Nothing is written.
 - **Streams.** `decodeStreamImage(image)` returns the read paths' `StreamEvent` for one of
   the stream's event images — DynamoDB JSON (`B` / `BS` as bytes or base64, as Lambda and
   EventBridge Pipes deliver them) or unmarshalled — and `Option.none()` for any other
@@ -5789,7 +5796,7 @@ pre-#147 unions.
 | `EventStream.parseStreamId` | `ValidationError` |
 | `EventStore` multi-source projection `catchUp` / `rebuild` (`applyBatch` / `processBatch` per row) | the sources' `evolve` errors, the read model's errors, `ValidationError`, `ConcurrentModification`, `ProjectionSourceConflict` |
 | `EventStore.batchResponse`, `projection.processBatch`, `EventStore.processBatch` | `StreamRecordIdentifierMissing` (per-row errors are outcome values) |
-| `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` |
+| `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` (`measureAppend` with `additionalItems`, which can read to build them: `ValidationError`, `DynamoClientError`) |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
 

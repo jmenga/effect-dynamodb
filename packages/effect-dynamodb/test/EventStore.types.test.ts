@@ -44,7 +44,8 @@
  *   `snapshot.storedAs` only a `DynamoModel.Packed` config; error channels
  *   are unchanged (a missing compressor is a `ValidationError` whose cause is
  *   `CompressorNotRegistered`); `measureAppend` / `measureSnapshot` need only
- *   `TableConfig` (nothing on a bound stream) and `decodeStreamImage` nothing,
+ *   `TableConfig` (nothing on a bound stream), `measureAppend` with
+ *   `additionalItems` a `DynamoClient` too, and `decodeStreamImage` nothing,
  *   returning the read paths' `StreamEvent`.
  * - Head proof and `loadState` (#164): an inline `loadState` lambda is
  *   contextually typed by the stream id and the decider's state (the handler's
@@ -1275,8 +1276,18 @@ describe("EventStore packed storage types (#147)", () => {
       expectTypeOf(measured).toEqualTypeOf<
         Effect.Effect<EventStore.AppendMeasurement, ValidationError, Table.TableConfig>
       >()
-      // @ts-expect-error — additionalItems are not measured
-      Packed.measureAppend(key, [], 0, { additionalItems: [] })
+      // With additional items, built as `append` builds them: building one can read.
+      expectTypeOf(
+        Packed.measureAppend(key, [], 0, {
+          additionalItems: [Tallies.put({ counterId: "c-1", total: 1 })],
+        }),
+      ).toEqualTypeOf<
+        Effect.Effect<
+          EventStore.AppendMeasurement,
+          ValidationError | DynamoClientError,
+          DynamoClient | Table.TableConfig
+        >
+      >()
       expectTypeOf(Packed.measureSnapshot(key, { total: 1 }, 1)).toEqualTypeOf<
         Effect.Effect<number, ValidationError, Table.TableConfig>
       >()
@@ -1294,6 +1305,9 @@ describe("EventStore packed storage types (#147)", () => {
         const bound = yield* EventStore.bind(Packed)
         expectTypeOf(bound.measureAppend(key, [], 0)).toEqualTypeOf<
           Effect.Effect<EventStore.AppendMeasurement, ValidationError, never>
+        >()
+        expectTypeOf(bound.measureAppend(key, [], 0, { additionalItems: [] })).toEqualTypeOf<
+          Effect.Effect<EventStore.AppendMeasurement, ValidationError | DynamoClientError, never>
         >()
         expectTypeOf(bound.decodeStreamImage({})).toEqualTypeOf<typeof decoded>()
         expectTypeOf(bound.decodeStreamImage({}, { raw: true })).toEqualTypeOf<typeof decodedRaw>()

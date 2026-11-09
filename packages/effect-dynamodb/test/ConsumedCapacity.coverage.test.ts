@@ -553,6 +553,14 @@ const cases: ReadonlyArray<Case> = [
     "EventStream.append",
     () => Ledgers.append({ ledgerId: "l-1" }, [new Deposited({ amount: 1 })], 0),
   ],
+  // A guarded put among its additional items reads to be built.
+  [
+    "EventStream.measureAppend",
+    () =>
+      Ledgers.measureAppend({ ledgerId: "l-1" }, [new Deposited({ amount: 1 })], 0, {
+        additionalItems: [Profiles.put({ profileId: "p-9", name: "Lin" })],
+      }),
+  ],
   ["EventStream.read", () => Ledgers.read({ ledgerId: "l-1" }), seedLedger],
   ["EventStream.read", ({ ledgers }) => ledgers.read({ ledgerId: "l-1" }), seedLedger],
   [

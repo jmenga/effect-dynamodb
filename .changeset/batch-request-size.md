@@ -11,5 +11,5 @@ A request the library doesn't split (`Transaction.transactWrite`, `EventStore.ap
 
 Two planning additions:
 
-- `stream.measureAppend` returns `requestBytes`, the exact request body the append would send. It includes the transaction's client token and, when capacity reporting is on, the `ReturnConsumedCapacity` field.
+- `stream.measureAppend` returns `requestBytes`, the exact request body the append would send. It includes the transaction's client token and, when capacity reporting is on, the `ReturnConsumedCapacity` field. It now also takes the append's `additionalItems` and measures the request with them in it, built by the same code `append` uses, since adding items changes the request: a lone event's `PutItem` becomes a `TransactWriteItems`. `transactionBytes` then counts them too. Building an additional item can read the table (a put of a versioned or unique-constrained entity reads its item), so a call with `additionalItems` needs a `DynamoClient` and can fail with a `DynamoClientError`; a call without them is unchanged.
 - `StorageEncoding.limits` has `request: 16_777_216`. AWS documents 16 MB for `BatchWriteItem`, and DynamoDB Local rejects any request body over 16 MiB with HTTP 413.

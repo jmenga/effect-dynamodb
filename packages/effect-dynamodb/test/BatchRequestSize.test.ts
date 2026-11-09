@@ -14,7 +14,7 @@ import type { TransactWriteItem, WriteRequest } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { type DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Exit, Layer, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
 import * as ConsumedCapacity from "../src/ConsumedCapacity.js"
@@ -463,4 +463,82 @@ describe.each(
         expect(table.items.size).toBe(0)
       }),
   )
+})
+
+// ---------------------------------------------------------------------------
+// measureAppend measures the request append sends, additional items included
+// ---------------------------------------------------------------------------
+
+describe.each(
+  CAPACITY,
+)("measureAppend's requestBytes is the request append sends, %s", (_label, capacity) => {
+  const creates = (strings: ReadonlyArray<string>) =>
+    strings.map((body, i) => Notes.create({ noteId: id(i), body }))
+
+  // A lone event is sent as a `PutItem`, whose one item (400 KB at most) can't reach 16 MB as JSON.
+  it.effect("a lone event: the PutItem, to the byte", () =>
+    Effect.gen(function* () {
+      const table = makeRecordingTable()
+      const events = [new Recorded({ note: `${nul(60_000)}"\\é` })]
+      const planned = yield* Ledger.measureAppend({ ledgerId: "l1" }, events, 0).pipe(
+        on(table, capacity),
+      )
+      yield* Ledger.append({ ledgerId: "l1" }, events, 0).pipe(on(table, capacity))
+      const sent = table.requests.filter((r) => r.command === "PutItem")
+      expect(sent.map((r) => sdkBodyBytes("PutItem", r.input))).toEqual([planned.requestBytes])
+    }),
+  )
+
+  describe.each([
+    ["one event and ten creates", 1],
+    ["no events and ten creates", 0],
+  ] as const)("%s", (_shape, eventCount) => {
+    /** The append planned at `REQUEST_MAX_BYTES + extra` bytes, then sent. */
+    const plannedAt = (extra: number) =>
+      Effect.gen(function* () {
+        const events = Array.from({ length: eventCount }, () => new Recorded({ note: "e" }))
+        const options = (chars: number, pad: number) => ({
+          additionalItems: creates(filled(10, chars, pad)),
+        })
+        const probe = makeRecordingTable()
+        const measure = (chars: number, pad: number) =>
+          Ledger.measureAppend({ ledgerId: "l1" }, events, 0, options(chars, pad)).pipe(
+            on(probe, capacity),
+          )
+        const empty = (yield* measure(0, 0)).requestBytes
+        const target = REQUEST_MAX_BYTES + extra
+        const chars = Math.floor((target - empty) / 60)
+        const pad = target - empty - 60 * chars
+        const planned = yield* measure(chars, pad)
+        const table = strictTable()
+        const exit = yield* Ledger.append({ ledgerId: "l1" }, events, 0, options(chars, pad)).pipe(
+          on(table, capacity),
+          Effect.exit,
+        )
+        const sent = table.requests
+          .filter((r) => r.command === "TransactWriteItems")
+          .map((r) => sdkBodyBytes("TransactWriteItems", r.input))
+        return { planned, exit, sent, table }
+      })
+
+    it.effect("planned at exactly 16,777,216 bytes: sent at that size, and accepted", () =>
+      Effect.gen(function* () {
+        const { planned, exit, sent, table } = yield* plannedAt(0)
+        expect(planned.requestBytes).toBe(REQUEST_MAX_BYTES)
+        expect(sent).toEqual([REQUEST_MAX_BYTES])
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(table.items.size).toBe(10 + eventCount)
+      }),
+    )
+
+    it.effect("planned one byte over: sent at that size, and refused", () =>
+      Effect.gen(function* () {
+        const { planned, exit, sent, table } = yield* plannedAt(1)
+        expect(planned.requestBytes).toBe(REQUEST_MAX_BYTES + 1)
+        expect(sent).toEqual([REQUEST_MAX_BYTES + 1])
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(table.items.size).toBe(0)
+      }),
+    )
+  })
 })
