@@ -84,7 +84,7 @@ const MainTable = Table.make({ schema: AppSchema, entities: { Users, Orders } })
 
 ## Step 3: Batch Write — Create Multiple Items
 
-`Batch.write` accepts a mix of put and delete operations across any number of entity types. DynamoDB limits batch writes to 25 items per request — effect-dynamodb auto-chunks larger batches transparently.
+`Batch.write` accepts a mix of put and delete operations across any number of entity types. DynamoDB limits batch writes to 25 items and 16 MB of request body per request — effect-dynamodb auto-chunks larger batches transparently.
 
 ```typescript region="batch-write" example="batch.ts"
 // Batch.write accepts a mix of put and delete operations.
@@ -262,7 +262,7 @@ The same reasoning rules out the lifecycle configs (**EDD-9049**): entities with
 :::
 
 :::note[Puts of a `versioned` entity are sent as transactions]
-A `PutRequest` can't continue an existing item's version; it would reset the item to version 1. So `Batch.write` sends puts of a `versioned` entity first, as create-only `TransactWriteItems`, each conditioned on `attribute_not_exists`. They are chunked at exactly DynamoDB's limits: 100 items and 4,194,304 bytes per transaction, measured as DynamoDB measures them (each item plus its condition; see [How DynamoDB Sizes Items](/effect-dynamodb/guides/data-integrity/#how-dynamodb-sizes-items)). A batch that touches such an item more than once, for example a delete and a put of it, is refused before anything is written, because the put runs in its own transaction. Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
+A `PutRequest` can't continue an existing item's version; it would reset the item to version 1. So `Batch.write` sends puts of a `versioned` entity first, as create-only `TransactWriteItems`, each conditioned on `attribute_not_exists`. They are chunked at exactly DynamoDB's limits: 100 items and 4,194,304 bytes per transaction, measured as DynamoDB measures them (each item plus its condition; see [How DynamoDB Sizes Items](/effect-dynamodb/guides/data-integrity/#how-dynamodb-sizes-items)), and 16,777,216 bytes of request body. A batch that touches such an item more than once, for example a delete and a put of it, is refused before anything is written, because the put runs in its own transaction. Puts of other entities, and deletes, are still plain `BatchWriteItem` requests.
 
 - A put that would replace an existing item cancels its whole chunk, so nothing in that chunk is written, and `Batch.write` fails with a `ValidationError`. The message says exactly how many earlier chunks were already written, and the remaining requests aren't sent. Replace an existing item with the entity's own `put()` or `Transaction.transactWrite`.
 - Each chunk costs twice the write capacity of a batch write.

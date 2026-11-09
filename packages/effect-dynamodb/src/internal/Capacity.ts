@@ -999,6 +999,22 @@ const send = (command: Command, raw: AnyMethod, input: Record<string, unknown>) 
   })
 
 /**
+ * The request-level field {@link send} adds to a data-plane request sent from
+ * this fiber now, when the request has none: `ReturnConsumedCapacity` while
+ * reporting is on. A request packer counts it toward the request's body.
+ */
+export const requestFields: Effect.Effect<{
+  readonly ReturnConsumedCapacity?: "TOTAL" | "INDEXES"
+}> = Effect.withFiber((fiber) => {
+  const settings = fiber.getRef(Reporting)
+  if (!settings.enabled || fiber.getRef(CurrentOperation) === SUPPRESSED) return Effect.succeed({})
+  return Effect.succeed({
+    ReturnConsumedCapacity:
+      settings.level === "indexes" ? ("INDEXES" as const) : ("TOTAL" as const),
+  })
+})
+
+/**
  * The instrumented view of a client: the data-plane methods record their
  * capacity, everything else is the client's own. Memoised per client; an
  * already-instrumented client is returned as is.

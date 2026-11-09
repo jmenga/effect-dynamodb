@@ -49,7 +49,12 @@ import {
   unpackStoredSync,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import { Effect, Schema } from "effect"
-import { attributeBytes, ITEM_MAX_BYTES, TRANSACT_WRITE_MAX_BYTES } from "./internal/ItemSize.js"
+import {
+  attributeBytes,
+  ITEM_MAX_BYTES,
+  REQUEST_MAX_BYTES,
+  TRANSACT_WRITE_MAX_BYTES,
+} from "./internal/ItemSize.js"
 import {
   normalizeImageSync,
   packAttributeValueSync,
@@ -100,11 +105,21 @@ const lift = <A>(result: A | ValidationError): Effect.Effect<A, ValidationError>
 
 /**
  * DynamoDB's size limits, in bytes: one item (400 KB = 409,600 bytes) and one
- * `TransactWriteItems` request (4 MB = 4,194,304 bytes).
+ * `TransactWriteItems` request (4 MB = 4,194,304 bytes), both by item size;
+ * and `request`, 16 MB = 16,777,216 bytes of one request's body — the JSON
+ * sent, where a control character in a string takes 6 bytes and a quote 2
+ * (`EventStream.measureAppend`'s `requestBytes`). AWS documents 16 MB for
+ * `BatchWriteItem`; DynamoDB Local rejects any request whose body is over
+ * 16 MiB (HTTP 413).
  */
-export const limits: { readonly item: number; readonly transaction: number } = Object.freeze({
+export const limits: {
+  readonly item: number
+  readonly transaction: number
+  readonly request: number
+} = Object.freeze({
   item: ITEM_MAX_BYTES,
   transaction: TRANSACT_WRITE_MAX_BYTES,
+  request: REQUEST_MAX_BYTES,
 })
 
 /**

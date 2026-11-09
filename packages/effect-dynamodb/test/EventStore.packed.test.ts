@@ -956,6 +956,7 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
         sentinel: undefined,
         snapshot: undefined,
         transactionBytes: 0,
+        requestBytes: 0,
       })
       const invalid = yield* ZstdLedger.measureAppend(id, [recorded(1)], 0, {
         eventMetadata: [],

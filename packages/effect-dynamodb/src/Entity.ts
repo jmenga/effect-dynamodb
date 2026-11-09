@@ -12231,7 +12231,9 @@ const makeImpl = <
 
           // Batch delete in chunks of 25. `UnprocessedItems` are retried with
           // `Batch.write`'s backoff; what the purge had deleted is always
-          // stated exactly, whether a request is rejected or retries run out.
+          // stated exactly, whether a request is rejected or retries run out. By count alone: 25
+          // stored keys (at most 2048 + 1024 bytes each, so at most about 0.5 MB as JSON) can't
+          // reach the 16 MB request limit.
           let deleted = 0
           const deletedSoFar = () =>
             deleted === 0

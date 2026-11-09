@@ -102,7 +102,12 @@ import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
 import { asReadGuard } from "./internal/ExpressionLimits.js"
-import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
+import {
+  itemBytes,
+  jsonBytes,
+  transactItemBytes,
+  transactWriteBodyBytes,
+} from "./internal/ItemSize.js"
 import {
   isMultiProjection,
   type MultiProjection,
@@ -411,6 +416,19 @@ export interface AppendMeasurement {
    * included (as it is in `events`).
    */
   readonly transactionBytes: number
+  /**
+   * The body of the request the append would send, in bytes: its JSON text as
+   * the AWS SDK serializes it — the `TransactWriteItems` (its
+   * `ClientRequestToken` included) or, for a single-event append, the
+   * `PutItem` — with `ReturnConsumedCapacity` when consumed-capacity reporting
+   * is on where this runs. Each character counts its UTF-8 bytes as escaped
+   * in JSON (a control character 6, a quote or backslash 2), binary its base64,
+   * so this can be several times `transactionBytes`. Compare it with
+   * `StorageEncoding.limits.request`. Caller `additionalItems` are not
+   * included: each adds its own JSON and a comma. `0` when the append would
+   * send nothing.
+   */
+  readonly requestBytes: number
 }
 
 /**
@@ -2350,7 +2368,8 @@ export interface EventStream<
   /**
    * The bytes {@link EventStream.append} would write for these arguments, by
    * DynamoDB's own size accounting — for planning chunks against the 400 KB
-   * item and 4 MB transaction limits without re-implementing the stream's
+   * item and 4 MB transaction limits, and the request body against 16 MB
+   * (`requestBytes`), without re-implementing the stream's
    * item layout or packing. The items are built by the same code `append`
    * uses (envelope, keys, packed and compressed `data`, metadata, stream-index
    * attributes, the sentinel, the inline snapshot), so the numbers are exact
@@ -4412,7 +4431,13 @@ export const makeStream = <
         options as AppendOptions<unknown, unknown> | undefined,
       )
       if (parts === undefined) {
-        return { events: [], sentinel: undefined, snapshot: undefined, transactionBytes: 0 }
+        return {
+          events: [],
+          sentinel: undefined,
+          snapshot: undefined,
+          transactionBytes: 0,
+          requestBytes: 0,
+        }
       }
       const putBytes = (item: TransactWriteItem): number => itemBytes(item.Put?.Item ?? {})
       const laidOut = [
@@ -4429,11 +4454,16 @@ export const makeStream = <
         typeof options?.headProof !== "object" && isSingleEventPut(laidOut, parts.eventItems.length)
       const owned = single ? [withWriteToken(laidOut[0]!, "0".repeat(WRITE_TOKEN_LENGTH))] : laidOut
       const eventItems = single ? owned : parts.eventItems
+      // What the client sends beside the items: the request as `append` sends it.
+      const fields = yield* Capacity.requestFields
       const measurement: AppendMeasurement = {
         events: eventItems.map(putBytes),
         sentinel: parts.sentinelPut === undefined ? undefined : putBytes(parts.sentinelPut),
         snapshot: parts.snapshotPut === undefined ? undefined : putBytes(parts.snapshotPut),
         transactionBytes: owned.reduce((sum, item) => sum + transactItemBytes(item), 0),
+        requestBytes: single
+          ? jsonBytes({ ...owned[0]!.Put, ...fields })
+          : transactWriteBodyBytes({ TransactItems: owned, ...fields }),
       }
       return measurement
     })

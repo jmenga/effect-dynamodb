@@ -1129,7 +1129,7 @@ again or reports the row (`contended`).
 | Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items and 4,194,304 bytes by the exact size model (`internal/ItemSize.ts`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
 | Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
@@ -2143,7 +2143,7 @@ A packed value is the attribute's wire form exactly as map storage would write i
 
 **Constraints.** A packed field's encoded side must be object/array-shaped (so `S` is unambiguous; this also excludes dates/TTL), and it cannot be a key or index composite, a unique-constraint field or a ref (EDD-9072–9075). Conditions and filters may only test `attribute_exists` / `attribute_not_exists` on the whole field; projections take it whole; updates only `.set()` / `.remove()` it whole (EDD-9076, EDD-9077). Version snapshots, soft-delete tombstones and time-series event items copy stored values as-is. The key composer is untouched.
 
-**EventStore.** `append` / `commandHandler` pack each event's `data` (and the inline snapshot's `state`); every read path decodes by stored form; `Query.select` raw rows return `data` as plain parsed JSON whatever its stored form, through every stream-index projection; `Query.filterExpr` on `data.*` is refused (EDD-9076) in favour of `Query.filterBy`. `stream.decodeStreamImage(image)` decodes DynamoDB Streams images (B as `Uint8Array` or base64) to the read paths' `StreamEvent`; `stream.measureAppend` / `measureSnapshot` and `StorageEncoding.valueBytes` (or its synchronous twin `valueBytesSync`, with explicit compressors) give callers the exact stored sizes for chunk planning. Size limits are not pre-checked: the failure diagnosis measures the packed request, so it counts stored bytes.
+**EventStore.** `append` / `commandHandler` pack each event's `data` (and the inline snapshot's `state`); every read path decodes by stored form; `Query.select` raw rows return `data` as plain parsed JSON whatever its stored form, through every stream-index projection; `Query.filterExpr` on `data.*` is refused (EDD-9076) in favour of `Query.filterBy`. `stream.decodeStreamImage(image)` decodes DynamoDB Streams images (B as `Uint8Array` or base64) to the read paths' `StreamEvent`; `stream.measureAppend` / `measureSnapshot` and `StorageEncoding.valueBytes` (or its synchronous twin `valueBytesSync`, with explicit compressors) give callers the exact stored sizes for chunk planning, and `measureAppend`'s `requestBytes` the exact request body the append would send; `StorageEncoding.limits` holds the three limits (`item`, `transaction`, `request`). Size limits are not pre-checked: the failure diagnosis measures the packed request, so it counts stored bytes.
 
 **Entity.** Packing runs after renames and sparse flattening, before marshalling (put / create / upsert / update `.set()` / `Batch.write` / `Transaction.transactWrite` / time-series `append`, which packs once and writes the same value on the current and event item); unpacking runs after unmarshalling, before sparse rebuild and renames, in every decoder (get, queries, scans, collections, batch and transactional reads, versions, history, soft-deleted reads, `ReturnValues`). Reads also dispatch on every object/array-shaped field that is not configured packed, so turning packing off needs no rewrite. `asNative` returns the stored `S` / `B`; raw projections (`select`, `Entity.project`) return a packed field whole as its parsed JSON. The read-merge update path (retain, unique, computed composites) carries packed values the update does not name byte-identical, and a restated immutable packed field is compared by its unpacked JSON. At the type level an entity carries its packed field names (`TPackedFields`): their `PathBuilder` paths are `PackedPath`s, accepted only by `exists` / `notExists` and projections. `Entity.decodeMarshalledItem` decodes DynamoDB Streams images by stored form (`B` as bytes or base64, DynamoDB JSON or unmarshalled) and now also applies renames and sparse maps. Aggregate edges store their edge entity's packed fields packed (a `one` edge's flattened entity, a `many` element that is the entity) and, like entities, read every object/array-shaped edge attribute by its stored form, so an edge written packed still reads after the edge entity's packing is turned off; a packed field cannot be an edge discriminator or `many` sort-key composite (EDD-9072).
 
@@ -3391,7 +3391,8 @@ upsert as it fails an update.) Each sentinel a write would release costs one con
 one by one with a conditional `DeleteItem`, since a batch delete cannot carry
 the condition, collects them from the live item and every tombstone, and skips
 a release whose reservation changed hands in between. It then batch-deletes the
-item's rows in `BatchWriteItem` chunks of 25, resending `UnprocessedItems` with
+item's rows in `BatchWriteItem` chunks of 25 (by count alone: 25 stored keys can't
+reach the 16 MB request limit), resending `UnprocessedItems` with
 `Batch.write`'s backoff (5 retries); when they run out it fails with a
 `DynamoError` stating how many rows remain and exactly how many it had deleted
 (#144). A sentinel an update
@@ -3481,10 +3482,12 @@ keys checked after the reads that hydrate them, as on its own.
 **`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an
 existing item to version 1 under a new incarnation. So `Batch.write` sends these
 puts first, before any other request, as create-only `TransactWriteItems` Puts
-(`attribute_not_exists(pk)`) in chunks of up to 100 items and at most 4,194,304
-bytes — DynamoDB's own limits, exactly — each measured by `transactItemBytes`
-(the item, plus the create-only condition and the attribute name it
-substitutes). Should DynamoDB still reject a chunk for its size, the batch fails
+(`attribute_not_exists(pk)`) in chunks of up to 100 items, at most 4,194,304
+bytes and at most 16,777,216 bytes of request body — DynamoDB's own limits,
+exactly — each item measured by `transactItemBytes` (the item, plus the
+create-only condition and the attribute name it substitutes) and the body by
+`jsonBytes` (the JSON the SDK sends, with its `ClientRequestToken` and, when
+capacity reporting is on, `ReturnConsumedCapacity`). Should DynamoDB still reject a chunk for its size, the batch fails
 with a `ValidationError` giving both the library's measure and DynamoDB's
 reported size, and saying exactly what was already written; the chunk is not
 re-split or retried. There
@@ -3502,6 +3505,20 @@ never atomic across chunks. A cancellation whose reasons are only
 chunk costs twice the write capacity of a batch write. Puts of other entities,
 and deletes, stay plain `BatchWriteItem` requests. (`unique` and retain
 entities are still refused by EDD-9049.)
+
+**`Batch.write`'s request size.** A `BatchWriteItem` holds up to 25 requests and
+16 MB of request body. The body is the JSON text the SDK sends, which is larger
+than the items: a control character is 1 byte in an item and 6 as JSON (`\u0000`),
+`"` and `\` are 2, and `B` values are base64. So 25 items within 400 KB each can
+pass 16 MB. DynamoDB Local accepts a body of exactly 16,777,216 bytes and refuses
+16,777,217 with HTTP 413, on every operation (AWS documents 16 MB for
+`BatchWriteItem`; its exact measure is unverified). `Batch.write` splits its plain
+requests and its versioned-put transactions with one greedy packer
+(`internal/ItemSize.ts` `packRequests`), which an aggregate's `rekey` uses for its
+waves too: a request takes the next unit (one write request, or one transaction's
+actions, a `rekey` move's Put and Delete together) while every limit holds, and a
+unit over a limit by itself goes alone. A batch within all limits splits exactly as
+it did by count alone, so its requests are byte-identical.
 
 **Known limitations** (inherent):
 
@@ -3565,7 +3582,8 @@ db.Users.update(key, changes, { expectedVersion: 5 })
 
 Full design: [`docs/designs/eventstore-event-metadata.md`](docs/designs/eventstore-event-metadata.md) §6 and §6A.
 **Library-wide rule: a limit or request rule DynamoDB enforces itself is never checked
-before sending.** That covers 400 KB per item, 100 items and 4 MB per transaction, 2048
+before sending.** That covers 400 KB per item, 100 items and 4 MB per transaction, 16 MB
+per request body, 2048
 bytes per partition key and 1024 bytes per sort key, one operation per item (transactions
 and batch requests, `BatchGetItem` included), 4,096 characters / 300 operators per
 expression and 100 operands per `IN`, an `IN ()` with no operands (an `isIn` with no
@@ -3588,7 +3606,9 @@ conditional failure, which would read as a lost race. On failure only, it:
 1. **Recognises** the rejection by a stable message fragment: a request-wide
    `ValidationException` (`DynamoValidationError`) or `LimitExceededException`, or a
    `TransactionCanceledException` whose positional reason carries
-   `Code: "ValidationError"` (or, for a request that repeats an item, any reason).
+   `Code: "ValidationError"` (or, for a request that repeats an item, any reason). A
+   request body over its limit is recognised by HTTP 413 (DynamoDB Local refuses it
+   before parsing, with no message) or a request-size message.
 2. **Confirms** it by measuring the request that was sent (`internal/ItemSize.ts`).
    Exact measures confirm only when over the limit: an item count over 100, a key's
    UTF-8 bytes over its limit — 2048 for a partition key, 1024 for a sort key, measured on
@@ -3601,8 +3621,10 @@ conditional failure, which would read as a lost race. On failure only, it:
    condition or filter DynamoDB named, an empty value written to (or compared with) the
    key attribute DynamoDB named, a `BETWEEN` out of DynamoDB's UTF-8 order, a consistent
    read naming an index, a vector index with dimensions outside 1..4096 or over 18 inline
-   filters, a `CreateTable` with more vector indexes than DynamoDB stated (else 5), or a
-   search whose `TopK` is not an integer in 1..100. For item size and
+   filters, a `CreateTable` with more vector indexes than DynamoDB stated (else 5), a
+   search whose `TopK` is not an integer in 1..100, or a write's request body over
+   16,777,216 bytes as JSON (`jsonBytes`, matching the SDK's body byte for byte; a 413 whose
+   measured body is within the limit passes through). For item size and
    transaction payload, which DynamoDB itself counts approximately, the recognised message
    is the evidence and the request must hold something it can apply to (a `Put` / `Update`,
    a transaction); the measurement attributes.
@@ -3612,12 +3634,13 @@ conditional failure, which would read as a lost race. On failure only, it:
    (`operation 2 (User)`). A request-wide oversized-item rejection is attributed to the
    `Put` over 409,600 bytes by the exact size model, or else the largest `Put`, named as
    the *likely* culprit; a 4 MB rejection names the three largest items (a `retain` put
-   counts twice: its item and its snapshot) alongside DynamoDB's reported `Payload Size`.
+   counts twice: its item and its snapshot) alongside DynamoDB's reported `Payload Size`;
+   a request-body rejection names the three largest items by their JSON bytes.
 4. **Rewrites** a confirmed diagnosis into the site's existing tagged error, with
    DynamoDB's error kept as the cause, or **passes through** anything unrecognised or
    unconfirmed unchanged, as the bare `DynamoValidationError` / `DynamoError` it was.
 
-| Site | Count over 100 | Item size, 4 MB, key size |
+| Site | Count over 100 | Item size, 4 MB, 16 MB body, key size |
 |------|----------------|---------------------------|
 | `Entity` single-item writes (`PutItem` / `UpdateItem` / `DeleteItem`) | — | `ValidationError` |
 | `Entity` transactional writes (guarded put, retain/unique update, retain/soft delete, `restore`) | `TransactionOverflow` | `ValidationError` |
@@ -3651,7 +3674,8 @@ its root guard: update or delete the partial aggregate.
 An eventual cascade's per-item diagnosed `ValidationError` lands in
 `CascadePartialFailure.errors`, as any per-item failure does. `Aggregate` delete's
 `BatchWriteItem` of stored keys is not wrapped: deleting keys that were stored cannot meet
-these limits, and its error union has no `ValidationError` to carry a diagnosis.
+these limits (25 keys are at most about 0.5 MB as JSON), and its error union has no
+`ValidationError` to carry a diagnosis.
 
 A diagnosed `ValidationError` / `DynamoError` sets `cause` to an `Error` whose message is
 the explanation and whose own `cause` is DynamoDB's error; `AppendTooLarge`,
@@ -3668,8 +3692,10 @@ index's non-integer `dimensions` (`[EDD-9070]`: DynamoDB reads integers lenientl
 could accept another, immutable dimensionality); a versioned put's item touched again in `Batch.write`;
 the aggregate sort-key collision check), configuration and definition checks (EDD-90xx,
 including `[EDD-9069]` and `[EDD-9063]`), and strategies that measure to choose, refusing
-nothing (`expressionFits`; `Batch.write`'s chunking at 25 / 100 items and exactly
-4,194,304 bytes). "It prevents a partial multi-request write" is not a reason to keep a
+nothing (`expressionFits`; `Batch.write`'s chunking at 25 / 100 items, exactly
+4,194,304 bytes and exactly 16,777,216 bytes of request body, as `rekey` packs its
+waves). A caller's own request (`transactWrite`, `append`, an aggregate's group) is never
+split or pre-checked against the request limit; it is sent and diagnosed. "It prevents a partial multi-request write" is not a reason to keep a
 pre-check: `Aggregate` groups and `Batch` chunks were never atomic, and the diagnosis says
 exactly what was already written.
 
@@ -5088,8 +5114,10 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
   throw `[EDD-9076]`, pointing to `Query.filterBy`.
 - **Planning (caller-side).** `measureAppend(streamId, events, expectedVersion, options)`
   builds the stream's own items with the same builder `append` uses and returns each
-  event item's size, the sentinel's, the inline snapshot's and the stream-owned
-  transaction bytes (`additionalItems` excluded); `measureSnapshot` sizes a snapshot
+  event item's size, the sentinel's, the inline snapshot's, the stream-owned
+  transaction bytes (`additionalItems` excluded) and `requestBytes`, the exact request
+  body the append would send (the JSON text, with a transaction's `ClientRequestToken`
+  and, when capacity reporting is on, `ReturnConsumedCapacity`; 0 for a no-op); `measureSnapshot` sizes a snapshot
   item. `R = TableConfig`; nothing is read or written.
 - **Streams.** `decodeStreamImage(image)` returns the read paths' `StreamEvent` for one of
   the stream's event images — DynamoDB JSON (`B` / `BS` as bytes or base64, as Lambda and

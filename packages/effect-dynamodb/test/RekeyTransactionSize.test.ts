@@ -1,8 +1,9 @@
 /**
  * An aggregate's `rekey` writes go in transactions DynamoDB accepts. A wave's moves and rewrites go
- * in order, each transaction taking them while it holds at most 100 actions and 4,194,304 bytes by
- * the exact size model (`internal/ItemSize.ts`). A move's Put and Delete are never split, and the
- * root still moves last. A wave that fits in 4 MB keeps the transactions it had, 100 actions each.
+ * in order, each transaction taking them while it holds at most 100 actions, 4,194,304 bytes by
+ * the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts`). A move's Put
+ * and Delete are never split, and the root still moves last. A wave that fits keeps the
+ * transactions it had, 100 actions each.
  */
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
@@ -15,11 +16,12 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import {
   ITEM_MAX_BYTES,
   itemBytes,
+  REQUEST_MAX_BYTES,
   TRANSACT_WRITE_MAX_BYTES,
   transactionBytes,
 } from "../src/internal/ItemSize.js"
 import * as Table from "../src/Table.js"
-import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { makeRecordingTable, sdkBodyBytes } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 
 class Line extends Schema.Class<Line>("Line")({
@@ -60,9 +62,10 @@ const pkOf = (escapeKeys: boolean) => `$sized#v1#orders#${escapeKeys ? "p%20q" :
  * then made `note` characters long in place (the create itself has to fit one transaction).
  * Then a dry run and a run of `rekey` under `escapeKeys`, and the transactions the run sent.
  */
-const rekeyed = (escapeKeys: boolean, count: number, note: number) =>
+const rekeyed = (escapeKeys: boolean, count: number, note: number, char = "x") =>
   Effect.gen(function* () {
-    const table = makeRecordingTable()
+    // Refuses a request body over 16 MiB, as DynamoDB Local does.
+    const table = makeRecordingTable({ refuseBodiesOver: REQUEST_MAX_BYTES })
     const on =
       (w: World) =>
       <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -78,7 +81,7 @@ const rekeyed = (escapeKeys: boolean, count: number, note: number) =>
     }).pipe(on(before))
     for (const [key, row] of table.items) {
       if (row.__edd_e__?.S === "OrderLine") {
-        table.items.set(key, { ...row, note: { S: "x".repeat(note) } })
+        table.items.set(key, { ...row, note: { S: char.repeat(note) } })
       }
     }
     const stored = [...table.items.values()]
@@ -156,6 +159,36 @@ describe.each(SETTINGS)("an aggregate's rekey transactions, %s", (_direction, es
       expect(found.lines.map((line) => [line.lid, line.note.length]).sort()).toEqual(
         Array.from({ length: 12 }, (_, i) => [`line${i}`, 360_000]).sort(),
       )
+    }),
+  )
+
+  it.effect("rows within 4 MB but over 16 MB as JSON move in transactions under 16 MB", () =>
+    Effect.gen(function* () {
+      // A NUL is one byte of item and six of JSON.
+      const { real, sent, found, rows } = yield* rekeyed(escapeKeys, 12, 250_000, "\u0000")
+      const lineMoves = sent.slice(0, -1).flat()
+      // By count and item size, eight moves fit a transaction (24 MB of JSON): five do by body.
+      expect(transactionBytes(lineMoves.slice(0, 16))).toBeLessThanOrEqual(TRANSACT_WRITE_MAX_BYTES)
+      expect(sent.map((actions) => actions.length)).toEqual([10, 10, 4, 2])
+      for (const actions of sent) {
+        expect(sdkBodyBytes("TransactWriteItems", { TransactItems: actions })).toBeLessThanOrEqual(
+          REQUEST_MAX_BYTES,
+        )
+        expect(pairs(actions).puts).toEqual(pairs(actions).deletes)
+      }
+      // Each took every move that fit: the next move would pass 16 MB.
+      for (let i = 0; i + 1 < sent.length - 1; i++) {
+        expect(
+          sdkBodyBytes("TransactWriteItems", {
+            TransactItems: [...sent[i]!, ...sent[i + 1]!.slice(0, 2)],
+          }),
+        ).toBeGreaterThan(REQUEST_MAX_BYTES)
+      }
+      expect(sent.at(-1)!.map(entityOf).filter(Boolean)).toEqual(["OrderItem"])
+      expect(real.conflicts).toEqual([])
+      expect(real.moved.aggregate).toBe(13)
+      expect(new Set(rows.map((row) => row.pk!.S))).toEqual(new Set([pkOf(escapeKeys)]))
+      expect(found.lines.map((line) => line.note.length)).toEqual(Array(12).fill(250_000))
     }),
   )
 
