@@ -1164,7 +1164,7 @@ down, the other rows, event 1 last. A delete that loses to a write reads again.
 different snapshot of the version), `taken` (another row
 holds the target), `contended` (concurrent writes on every attempt, or the attempts exhausted),
 `failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, or an
-aggregate that doesn't assemble or decompose, `message` naming why), `uncomposable` (a sharded key from another layout whose values can't
+aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
 compose a current one; a row whose own key holds a value with no key text, `NaN`, or one of whose key
 composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or

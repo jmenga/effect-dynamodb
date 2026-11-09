@@ -22,6 +22,4 @@ A `many` edge whose custom `decompose` returns a date field's stored form, such 
 
 A `Schema.Record` `many` edge now encodes its fields as an array edge does, where 1.39.0 stored what `decompose` returned. A `Schema.NumberFromString` is stored as its text, not the number, under the same key, and reads the same value. A field that multiplies by 10 on decode, returned by `decompose` as `f / 10`, reads back the value given, where 1.39.0 read ten times it and multiplied it again on every `update`. A row 1.39.0 wrote reads as it did.
 
-A `failed` `rekey` conflict for an aggregate that doesn't decompose now names the reason in its `message`.
-
 A custom `assemble` on a `many` edge is handed the rows read, unmarshalled, with packed fields unpacked, under their stored names, before anything is decoded. Removed from each are `__edd_e__`, the attributes named `pk` and `sk`, every attribute whose name begins with `gsi` or `lsi`, and the timestamps the edge's model doesn't declare. A collection sort-key mirror under another name stays. This is unchanged; the guide now says so.
