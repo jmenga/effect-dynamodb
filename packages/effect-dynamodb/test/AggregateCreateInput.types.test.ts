@@ -6,8 +6,9 @@
  * caller supplies them (from a path, say). An edge whose entity one id names takes `${field}Id`, or
  * the entity whole under the field's name, or both, when the id is fetched. A many edge over such
  * an entity takes each element as its id or the entity whole, in any mix, and an element wrapping
- * the entity takes either for each field holding it. An id is a value of the key composite's type,
- * or its stored or JSON form where that is another kind of value. A branded id keeps its brand.
+ * the entity takes either in the field of the entity's name. An id is a value of the key
+ * composite's type, or its stored or JSON form where that is another kind of value; in a union
+ * element, a string only, as 1.39.0 fetched. A branded id keeps its brand.
  * Every other field takes its domain value, as `Entity.put`'s type asks, though at run time both
  * also take its wire form. The edges match what `create` does at run time
  * (`AggregateRefHydration.test.ts`).
@@ -42,6 +43,10 @@ class BrandLine extends Schema.Class<BrandLine>("BrandLine")({
   lineId: LineId,
   f: Schema.Number,
 }) {}
+class StringLine extends Schema.Class<StringLine>("StringLine")({
+  lineId: Schema.String,
+  f: Schema.Number,
+}) {}
 class PairLine extends Schema.Class<PairLine>("PairLine")({
   tenant: Schema.String,
   lineId: Schema.String,
@@ -71,6 +76,11 @@ const BrandLines = Entity.make({
   entityType: "BrandLine",
   primaryKey: keyedBy("lineId"),
 })
+const StringLines = Entity.make({
+  model: StringLine,
+  entityType: "StringLine",
+  primaryKey: keyedBy("lineId"),
+})
 const PairLines = Entity.make({
   model: PairLine,
   entityType: "PairLine",
@@ -82,7 +92,7 @@ const PairLines = Entity.make({
 
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { NumberLines, CodecLines, DateLines, BrandLines, PairLines },
+  entities: { NumberLines, CodecLines, DateLines, BrandLines, StringLines, PairLines },
 })
 
 class Team extends Schema.Class<Team>("Team")({
@@ -152,7 +162,8 @@ type Create = Parameters<typeof RootAggregate.create>[0]
 /**
  * A many edge whose element is a union: a nested union of two members wrapping the entity, one of
  * them with a nullable discriminator, a member sharing a discriminator that declares the entity's
- * field a string and an id field of its own, and a member declaring neither.
+ * field a string and an id field of its own, and a member declaring neither. `create` fetches only
+ * a string in a union element, as 1.39.0 did, so over a number-keyed entity no member takes an id.
  */
 const UnionSheet = Schema.Union([
   Schema.Union([
@@ -194,6 +205,62 @@ const UnionAggregate = Aggregate.make(UnionRoot, {
   },
 })
 type UnionCreate = Parameters<typeof UnionAggregate.create>[0]
+
+/** The same union over a string-keyed entity, the entity itself one of its members. */
+const StringUnionSheet = Schema.Union([
+  Schema.Union([
+    Schema.Struct({
+      kind: Schema.NullOr(Schema.Literal("a")),
+      stringLine: StringLine,
+      qty: Schema.Number,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("b"),
+      stringLine: Schema.optional(StringLine),
+      qty: Schema.Number,
+    }),
+  ]),
+  Schema.Struct({
+    kind: Schema.Literal("a"),
+    stringLine: Schema.String,
+    stringLineId: Schema.String,
+    qty: Schema.Number,
+  }),
+  Schema.Struct({ kind: Schema.Literal("c"), qty: Schema.Number }),
+  StringLine,
+])
+class StringUnionRoot extends Schema.Class<StringUnionRoot>("StringUnionRoot")({
+  id: Schema.String,
+  sheets: Schema.Array(StringUnionSheet),
+}) {}
+const StringUnionAggregate = Aggregate.make(StringUnionRoot, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "string-union" },
+  root: { entityType: "StringUnionRoot" },
+  edges: {
+    sheets: Aggregate.many({ entityType: "StringUnionSheet", entity: StringLines }),
+  },
+})
+type StringUnionCreate = Parameters<typeof StringUnionAggregate.create>[0]
+
+/** An element holding the entity in a field of another name than the entity's. */
+class CrewRoot extends Schema.Class<CrewRoot>("CrewRoot")({
+  id: Schema.String,
+  crew: Schema.Array(Schema.Struct({ captain: NumberLine, qty: Schema.Number })),
+}) {}
+const CrewAggregate = Aggregate.make(CrewRoot, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "crew" },
+  root: { entityType: "CrewRoot" },
+  edges: {
+    crew: Aggregate.many({ entityType: "Crew", entity: NumberLines, sk: { composite: ["qty"] } }),
+  },
+})
+type CrewCreate = Parameters<typeof CrewAggregate.create>[0]
 
 const bound = () => Aggregate.bind(RootAggregate)
 type BoundCreate = Parameters<Effect.Success<ReturnType<typeof bound>>["create"]>[0]
@@ -282,14 +349,34 @@ describe("an aggregate's create takes what it takes at run time", () => {
     expectTypeOf({
       id: "a",
       sheets: [
-        { kind: null, numberLineId: 1, qty: 1 },
+        { kind: null, numberLine: line, qty: 1 },
         { kind: "a", numberLine: line, qty: 2 },
         { kind: "b", qty: 3 },
-        { kind: "b", numberLineId: 1, qty: 4 },
         { kind: "a", numberLine: "KEEP", numberLineId: "l", qty: 5 },
         { kind: "c", qty: 6 },
       ],
     } as const).toExtend<UnionCreate>()
+  })
+
+  it("takes a string id in a union element's member holding the entity, or as the element", () => {
+    const stringLine = new StringLine({ lineId: "l", f: 1 })
+    expectTypeOf({
+      id: "a",
+      sheets: [
+        { kind: null, stringLineId: "l", qty: 1 },
+        { kind: "a", stringLine, qty: 2 },
+        { kind: "b", stringLineId: "l", qty: 3 },
+        { kind: "b", qty: 4 },
+        { kind: "a", stringLine: "KEEP", stringLineId: "l", qty: 5 },
+        { kind: "c", qty: 6 },
+        "l",
+        stringLine,
+      ],
+    } as const).toExtend<StringUnionCreate>()
+  })
+
+  it("takes an element holding the entity in a field of another name whole", () => {
+    expectTypeOf({ id: "a", crew: [{ captain: line, qty: 2 }] } as const).toExtend<CrewCreate>()
   })
 
   it("takes a sub-aggregate's edges the same way", () => {
@@ -319,7 +406,17 @@ function _refusals(input: Record<string, unknown>): void {
   RootAggregate.create(input)
   // @ts-expect-error — no member of the union element takes a string in `numberLine` for kind "b"
   UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberLine: "x", qty: 1 }] })
-  // @ts-expect-error — a member declaring neither the entity's field nor its id takes no id, as the input schema refuses one
-  UnionAggregate.create({ id: "a", sheets: [{ kind: "c", numberLineId: 1, qty: 1 }] })
+  // @ts-expect-error — a member declaring neither the entity's field nor its id takes no id
+  StringUnionAggregate.create({ id: "a", sheets: [{ kind: "c", stringLineId: "l", qty: 1 }] })
+  // @ts-expect-error — `create` fetches only a string in a union element: a number id is dropped
+  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberLineId: 1, qty: 1 }] })
+  // @ts-expect-error — nor an optional one
+  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberLineId: 1, qty: 1 }] })
+  // @ts-expect-error — a string id of a number-keyed entity fails with EDD-9131
+  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberLineId: "1", qty: 1 }] })
+  // @ts-expect-error — a union with no member that is the entity takes no id as the element
+  UnionAggregate.create({ id: "a", sheets: ["1"] })
+  // @ts-expect-error — `create` takes the entity by id only in the field of its name
+  CrewAggregate.create({ id: "a", crew: [{ captainId: 1, qty: 2 }] })
 }
 void _refusals

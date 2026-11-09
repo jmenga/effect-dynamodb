@@ -412,22 +412,23 @@ type _OptionalIdOrWhole<K extends string, Id, V> = {
   readonly [P in K]?: V
 }
 
-/** An element's fields that can hold the edge's entity (domain type `M`). */
-type _HoldingKeys<T, M> = {
-  [K in keyof T]-?: _HoldsEntity<T[K], M> extends true ? K : never
+/** An element's field holding the edge's entity: the one of its name, `N` ({@link _IsRefField}). */
+type _RefKeys<T, N extends string> = {
+  [K in keyof T]-?: _IsRefField<T, K, N> extends true ? K : never
 }[keyof T] &
   string
 
 /**
- * A many edge's element as `create` takes it: each field holding the entity takes its id or the
- * entity whole, the other fields as they are. Distributes over a union of element members.
+ * A many edge's element as `create` takes it: the field holding the entity takes its id or the
+ * entity whole, the other fields as they are. Distributes over a union of element members, so each
+ * member holding the entity takes its id.
  */
-type _ElementIdsOrWhole<T, Id, M, TStamps> = T extends unknown
-  ? [_HoldingKeys<T, M>] extends [never]
+type _ElementIdsOrWhole<T, Id, N extends string, TStamps> = T extends unknown
+  ? [_RefKeys<T, N>] extends [never]
     ? _OptionalStamps<T, TStamps>
-    : _OptionalStamps<Omit<T, _HoldingKeys<T, M>>, TStamps> &
+    : _OptionalStamps<Omit<T, _RefKeys<T, N>>, TStamps> &
         _AllOf<{
-          [K in _HoldingKeys<T, M>]: undefined extends T[K]
+          [K in _RefKeys<T, N>]: undefined extends T[K]
             ? _OptionalIdOrWhole<K, Id, T[K]>
             : _IdOrWhole<K, Id, T[K]>
         }>
@@ -435,21 +436,38 @@ type _ElementIdsOrWhole<T, Id, M, TStamps> = T extends unknown
 
 /**
  * A many edge's elements as `create` takes them, for an edge whose entity (domain type `M`) one id
- * names: an element that is the entity is its id or the entity whole, in any mix; an element
- * wrapping it takes, for each field holding it, the id or the entity whole.
+ * names:
+ * - an element that is the entity is its id or the entity whole, in any mix;
+ * - an element wrapping it takes, in the field of the entity's name (`N`), the id or the entity
+ *   whole;
+ * - an element declared a union takes each of its members, a member holding the entity taking a
+ *   string id (`UnionId`) or the entity whole, and a string id as the element when a member is the
+ *   entity. `create` fetches only a string in a union element, as 1.39.0 did.
  */
-type _CreateManyEdge<T, Id, TStamps, M> =
+type _CreateManyEdge<T, Id, UnionId, TStamps, M, N extends string> =
   T extends ReadonlyArray<infer E>
-    ? [E] extends [M]
-      ? ReadonlyArray<Id | _OptionalStamps<E, TStamps>>
-      : ReadonlyArray<_ElementIdsOrWhole<E, Id, M, TStamps>>
-    : _TransformManyEdge<T, Id, TStamps, M>
+    ? true extends _IsUnion<E>
+      ? ReadonlyArray<
+          | _ElementIdsOrWhole<E, UnionId, N, TStamps>
+          | ([Extract<E, M>] extends [never] ? never : UnionId)
+        >
+      : [E] extends [M]
+        ? ReadonlyArray<Id | _OptionalStamps<E, TStamps>>
+        : ReadonlyArray<_ElementIdsOrWhole<E, Id, N, TStamps>>
+    : _TransformManyEdge<T, Id, TStamps, M, never, N>
 
 /** A many edge's input to `create`: {@link _CreateManyEdge} for an entity one id names. */
 type _ManyEdgeCreateInput<T, Edge, TStamps> =
   _Fetchable<Edge> extends true
-    ? _CreateManyEdge<T, _EdgeIdForms<Edge>, TStamps, _EdgeModelType<Edge>>
-    : _TransformManyEdge<T, never, TStamps, never>
+    ? _CreateManyEdge<
+        T,
+        _EdgeIdForms<Edge>,
+        Extract<_EdgeIdForms<Edge>, string>,
+        TStamps,
+        _EdgeModelType<Edge>,
+        _EntityFieldName<_EdgeEntity<Edge>>
+      >
+    : _TransformManyEdge<T, never, TStamps, never, never, never>
 
 /** The input fields {@link AggregateCreateInputType} replaces: id, many and sub-aggregate edges'. */
 type _CreateReplacedKeys<TEdges> = {
@@ -472,9 +490,9 @@ type _CreateReplacedKeys<TEdges> = {
  * - A `ref` or `one` edge whose entity one id names: `${field}Id`, or the entity whole under the
  *   field's name.
  * - A many edge over such an entity: each element its id or the entity whole, or, for an element
- *   wrapping it, each field holding it its id or the entity whole.
+ *   wrapping it, the field of the entity's name its id or the entity whole.
  * - An id in its key composite's type, or its stored or JSON form where that is another kind of
- *   value ({@link _EdgeIdForms}).
+ *   value ({@link _EdgeIdForms}). In a union element, only a string id ({@link _CreateManyEdge}).
  * - Sub-aggregates likewise.
  *
  * A field otherwise takes its domain value, as `Entity.put` does: neither checks the stored form
