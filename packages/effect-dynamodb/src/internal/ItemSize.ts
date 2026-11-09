@@ -1,7 +1,7 @@
 /**
  * @internal Exact sizes by DynamoDB's own accounting (#144), the one measure
  * the library uses: `Batch.write` chunks its versioned-put transactions by
- * it, and the failure-time diagnosis of DynamoDB's write limits
+ * it, an aggregate's `rekey` packs its moves by it, and the failure-time diagnosis of DynamoDB's write limits
  * (`internal/WriteDiagnosis.ts`) names the item at fault by it. Nothing here
  * refuses a write: DynamoDB's own limits are never pre-checked.
  *
