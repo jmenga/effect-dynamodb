@@ -189,13 +189,17 @@ type _ManyEdgeInput<T, Edge, TStamps> =
         _EdgeIdValue<Edge>,
         TStamps,
         _EdgeModelType<Edge>,
-        _UnionEdgeIdValue<Edge>,
+        _EdgeIdValue139<Edge>,
         _EntityFieldName<_EdgeEntity<Edge>>
       >
     : _TransformManyEdge<T, never, TStamps, never, never, never>
 
-/** A union element's id, as 1.39.0 typed it: the entity's partition key composite's type. */
-type _UnionEdgeIdValue<Edge> =
+/**
+ * An id as 1.39.0 typed it: the entity's partition key composite's type. Taken where an element is
+ * typed as on 1.39.0: a union element, and an element whose entity's field name the type can't see
+ * ({@link _EntityFieldName}).
+ */
+type _EdgeIdValue139<Edge> =
   _EdgeEntity<Edge> extends infer E
     ? E extends RefEntity
       ? RefEntityIdentifierValue<E>
@@ -330,20 +334,37 @@ type _NotCallersOwn<TModel, TNames> = TNames extends keyof TModel
 
 /**
  * The field of a `many` element `create` takes an edge's entity in (`deriveEntityFieldName`): the
- * entity model's identifier, or its `entityType`, first letter lowercased. A `Schema.Class` types
- * its identifier as `string`, so for a class the `entityType` stands in for it. The two agree when
- * the class is named as the entity type is.
+ * entity model's identifier, or its `entityType`, first letter lowercased. The type sees it only for
+ * a `Schema.Struct` model, alone or in a `DynamoModel.configure` wrapper, and an `entityType` that
+ * is one string literal: `create` takes the `entityType` for both. Otherwise it's `never`, and the
+ * element is typed as on 1.39.0 ({@link _TransformManyEdge}):
+ * - a model with an identifier (a `Schema.Class`, a brand), which the type sees only as `string`:
+ *   `create` takes it, or the `entityType` when the model is in a `DynamoModel.configure` wrapper,
+ *   and the type can't tell the two apart;
+ * - an `entityType` that isn't one string literal (`string`, a union, a pattern);
+ * - any other model.
  */
 type _EntityFieldName<E> = E extends {
   readonly entityType: infer T extends string
   readonly model: infer M
 }
-  ? M extends { readonly identifier: infer I extends string }
-    ? string extends I
-      ? Uncapitalize<T>
-      : Uncapitalize<I>
-    : Uncapitalize<T>
+  ? M extends { readonly identifier: string }
+    ? never
+    : M extends Schema.Struct<Schema.Struct.Fields>
+      ? _IsOneLiteral<T> extends true
+        ? Uncapitalize<T>
+        : never
+      : never
   : never
+
+/** Whether `S` is one string literal: not `string`, a union of literals, or a pattern. */
+type _IsOneLiteral<S extends string> = string extends S
+  ? false
+  : true extends _IsUnion<S>
+    ? false
+    : {} extends Record<S, 1>
+      ? false
+      : true
 
 /**
  * Whether a value of type `V` can hold a record (`holdsRecord`): one of its members, `null` and
@@ -381,19 +402,23 @@ type _RefFieldsToIds<T, Id, N extends string> = T extends unknown
  * id of type `Id` names:
  * - an element that is the entity (`Array<Umpire>`) is its id: the array becomes `Array<Id>`;
  * - an element wrapping it (`Array<{ player: Player, ... }>`) takes `${field}Id: Id` for the field
- *   of the entity's name (`N`, {@link _EntityFieldName}), when it can hold a record.
- * - an element declared a union is typed as on 1.39.0 ({@link _UnionElementInput}), with `UnionId`.
+ *   of the entity's name (`N`, {@link _EntityFieldName}), when it can hold a record. Where the type
+ *   can't see that name (`N = never`), the element is typed as on 1.39.0
+ *   ({@link _ElementInput139}), with `Id139`.
+ * - an element declared a union is typed as on 1.39.0 ({@link _ElementInput139}), with `Id139`.
  * With no entity to fetch (`M = never`), the elements are taken as given.
  */
-type _TransformManyEdge<T, Id, TStamps, M, UnionId, N extends string> =
+type _TransformManyEdge<T, Id, TStamps, M, Id139, N extends string> =
   T extends ReadonlyArray<infer E>
     ? [M] extends [never]
       ? ReadonlyArray<_OptionalStamps<E, TStamps>>
       : true extends _IsUnion<E>
-        ? _UnionElementInput<E, UnionId, TStamps>
+        ? _ElementInput139<E, Id139, TStamps>
         : [E] extends [M]
           ? ReadonlyArray<Id>
-          : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id, N>, TStamps>>
+          : [N] extends [never]
+            ? _ElementInput139<E, Id139, TStamps>
+            : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id, N>, TStamps>>
     : T extends Readonly<Record<string, infer V>>
       ? string extends keyof T
         ? { readonly [key: string]: _OptionalStamps<V, TStamps> }
@@ -408,23 +433,27 @@ type _IsRefLike<T> = T extends { readonly id: string }
   : false
 
 /**
- * The elements of a union element type as 1.39.0 typed them (`create` judges their values as
- * 1.39.0 did, `isUnionElement`): an element whose members are all ref-like is `Id`; otherwise its
- * ref-like fields are taken as `${field}Id: Id`.
+ * An element's ref-like fields ({@link _IsRefLike}) taken as `${field}Id: Id`, as 1.39.0 took them
+ * (`_RefFieldsToIds` there): whatever their name, and not when the field is optional.
  */
-type _UnionElementInput<E, Id, TStamps> =
+type _RefFieldsToIds139<T, Id> = _Simplify<{
+  readonly [K in keyof T as _IsRefLike<T[K]> extends true ? `${K & string}Id` : K]: _IsRefLike<
+    T[K]
+  > extends true
+    ? Id
+    : T[K]
+}>
+
+/**
+ * A many edge's elements as 1.39.0 typed them (`_TransformManyEdge` there): an element whose
+ * members are all ref-like is `Id`; otherwise its ref-like fields are taken as `${field}Id: Id`.
+ * For an element declared a union (`create` judges its values as 1.39.0 did, `isUnionElement`),
+ * and one whose entity's field name the type can't see ({@link _EntityFieldName}).
+ */
+type _ElementInput139<E, Id, TStamps> =
   _IsRefLike<E> extends true
     ? ReadonlyArray<Id>
-    : ReadonlyArray<
-        _OptionalStamps<
-          _Simplify<{
-            readonly [K in keyof E as _IsRefLike<E[K]> extends true
-              ? `${K & string}Id`
-              : K]: _IsRefLike<E[K]> extends true ? Id : E[K]
-          }>,
-          TStamps
-        >
-      >
+    : ReadonlyArray<_OptionalStamps<_RefFieldsToIds139<E, Id>, TStamps>>
 
 /** `T` with the dates the library stamps optional. */
 type _OptionalStamps<T, TStamps> = [ManagedDateField<T, TStamps>] extends [never]

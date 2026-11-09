@@ -7,6 +7,12 @@
  * entity is keyed by two attributes takes the entity whole, as `create` fetches nothing for it.
  * These match what `create` does at run time (`AggregateRefHydration.test.ts`). A `many` element
  * declared a union is typed as on 1.39.0, as `create` judges it as 1.39.0 did.
+ *
+ * A `many` element wrapping the entity takes its id in the field of the entity's name, which
+ * `create` takes from the model's identifier, or from the `entityType` for a model with none. The
+ * type sees that name only for a `Schema.Struct` model (in a `DynamoModel.configure` wrapper or
+ * not) and an `entityType` that is one literal. For any other model, a `Schema.Class` included,
+ * and for an `entityType` typed `string`, the element is typed as on 1.39.0.
  */
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -95,6 +101,44 @@ const StringIdLines = Entity.make({
   primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
 })
 
+/** A `Schema.Struct` model: `create` takes the entity in the field its `entityType` names. */
+const NumberRow = Schema.Struct({ lineId: Schema.Number, f: Schema.Number })
+const NumberRows = Entity.make({
+  model: NumberRow,
+  entityType: "NumberRow",
+  primaryKey: { pk: { field: "pk", composite: ["lineId"] }, sk: { field: "sk", composite: [] } },
+})
+/** The same model in a `DynamoModel.configure` wrapper, which has no identifier either. */
+const ConfiguredRows = Entity.make({
+  model: DynamoModel.configure(NumberRow, { f: { immutable: true } }),
+  entityType: "ConfiguredRow",
+  primaryKey: { pk: { field: "pk", composite: ["lineId"] }, sk: { field: "sk", composite: [] } },
+})
+/** An entity type the type sees only as `string`, over a model with an `id: string`. */
+const IdRow = Schema.Struct({ id: Schema.String, f: Schema.Number })
+const looseRowType: string = "LooseRow"
+const LooseRows = Entity.make({
+  model: IdRow,
+  entityType: looseRowType,
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+/** A class named otherwise than its entity type: `create` takes the class's name, `lineItem`. */
+class LineItem extends Schema.Class<LineItem>("LineItem")({
+  lineId: Schema.Number,
+  f: Schema.Number,
+}) {}
+const LineItems = Entity.make({
+  model: LineItem,
+  entityType: "Line",
+  primaryKey: { pk: { field: "pk", composite: ["lineId"] }, sk: { field: "sk", composite: [] } },
+})
+/** A class in a `DynamoModel.configure` wrapper: `create` takes the `entityType`. */
+const ConfiguredLines = Entity.make({
+  model: DynamoModel.configure(NumberLine, { f: { immutable: true } }),
+  entityType: "ConfiguredLine",
+  primaryKey: { pk: { field: "pk", composite: ["lineId"] }, sk: { field: "sk", composite: [] } },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
   entities: {
@@ -106,6 +150,11 @@ const MainTable = Table.make({
     PairLines,
     IdLines,
     StringIdLines,
+    NumberRows,
+    ConfiguredRows,
+    LooseRows,
+    LineItems,
+    ConfiguredLines,
   },
 })
 
@@ -138,6 +187,27 @@ class Root extends Schema.Class<Root>("Root")({
     ]),
   ),
   notes: Schema.Array(Schema.Struct({ id: Schema.String, text: Schema.String })),
+  rowSheets: Schema.Array(Schema.Struct({ numberRow: NumberRow, qty: Schema.Number })),
+  maybeRowSheets: Schema.Array(
+    Schema.Struct({ numberRow: Schema.optional(NumberRow), qty: Schema.Number }),
+  ),
+  rowCrews: Schema.Array(Schema.Struct({ captain: NumberRow, qty: Schema.Number })),
+  rowLabels: Schema.Array(Schema.Struct({ numberRow: Schema.String, qty: Schema.Number })),
+  configuredRowSheets: Schema.Array(
+    Schema.Struct({ configuredRow: NumberRow, qty: Schema.Number }),
+  ),
+  looseSheets: Schema.Array(
+    Schema.Struct({ looseRow: IdRow, captain: IdRow, other: NumberRow, qty: Schema.Number }),
+  ),
+  idSheets: Schema.Array(
+    Schema.Struct({ stringIdLine: StringIdLine, captain: StringIdLine, qty: Schema.Number }),
+  ),
+  itemSheets: Schema.Array(
+    Schema.Struct({ line: LineItem, lineItem: LineItem, qty: Schema.Number }),
+  ),
+  configuredLineSheets: Schema.Array(
+    Schema.Struct({ configuredLine: NumberLine, qty: Schema.Number }),
+  ),
 }) {}
 
 const RootAggregate = Aggregate.make(Root, {
@@ -186,6 +256,51 @@ const RootAggregate = Aggregate.make(Root, {
     }),
     notes: Aggregate.many({ entityType: "RootNote", sk: { composite: ["id"] } }),
     idKinds: Aggregate.many({ entityType: "RootIdKind", entity: StringIdLines }),
+    rowSheets: Aggregate.many({
+      entityType: "RootRowSheet",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    maybeRowSheets: Aggregate.many({
+      entityType: "RootMaybeRowSheet",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    rowCrews: Aggregate.many({
+      entityType: "RootRowCrew",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    rowLabels: Aggregate.many({
+      entityType: "RootRowLabel",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    configuredRowSheets: Aggregate.many({
+      entityType: "RootConfiguredRowSheet",
+      entity: ConfiguredRows,
+      sk: { composite: ["qty"] },
+    }),
+    looseSheets: Aggregate.many({
+      entityType: "RootLooseSheet",
+      entity: LooseRows,
+      sk: { composite: ["qty"] },
+    }),
+    idSheets: Aggregate.many({
+      entityType: "RootIdSheet",
+      entity: StringIdLines,
+      sk: { composite: ["qty"] },
+    }),
+    itemSheets: Aggregate.many({
+      entityType: "RootItemSheet",
+      entity: LineItems,
+      sk: { composite: ["qty"] },
+    }),
+    configuredLineSheets: Aggregate.many({
+      entityType: "RootConfiguredLineSheet",
+      entity: ConfiguredLines,
+      sk: { composite: ["qty"] },
+    }),
   },
 })
 
@@ -223,34 +338,102 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
   })
 
   it("a many element wrapping the entity takes its id", () => {
-    expectTypeOf<Input["sheets"][number]>().toEqualTypeOf<{
-      readonly numberLineId: number
+    expectTypeOf<Input["rowSheets"][number]>().toEqualTypeOf<{
+      readonly numberRowId: number
       readonly qty: number
     }>()
   })
 
   it("a many element holding the entity optionally takes an optional id", () => {
-    expectTypeOf<Input["maybeSheets"][number]>().toEqualTypeOf<{
-      readonly numberLineId?: number | undefined
+    expectTypeOf<Input["maybeRowSheets"][number]>().toEqualTypeOf<{
+      readonly numberRowId?: number | undefined
       readonly qty: number
     }>()
   })
 
   it("a many element holding the entity in a field of another name takes it whole", () => {
-    // `create` takes the entity by id only in the field of its name (`numberLine`).
-    expectTypeOf<Input["crews"][number]>().toEqualTypeOf<{
-      readonly captain: NumberLine
+    // `create` takes the entity by id only in the field of its name (`numberRow`).
+    expectTypeOf<Input["rowCrews"][number]>().toEqualTypeOf<{
+      readonly captain: typeof NumberRow.Type
       readonly qty: number
     }>()
   })
 
   it("a many element declaring the entity's field a scalar takes it as declared", () => {
+    expectTypeOf<Input["rowLabels"][number]>().toEqualTypeOf<{
+      readonly numberRow: string
+      readonly qty: number
+    }>()
+  })
+
+  it("a configured struct model's element takes its id in the field its entity type names", () => {
+    expectTypeOf<Input["configuredRowSheets"][number]>().toEqualTypeOf<{
+      readonly configuredRowId: number
+      readonly qty: number
+    }>()
+  })
+})
+
+describe("a many element whose entity's field name the type can't see is typed as on 1.39.0", () => {
+  // 1.39.0 took a field whose type has an `id: string` (and no index signature) as `${field}Id`,
+  // whatever its name, and every other field as declared.
+
+  it("an entity type typed `string` names no field: every field as 1.39.0 typed it", () => {
+    // Not every field holding a record: `Uncapitalize<string>` would match each of them.
+    expectTypeOf<Input["looseSheets"][number]>().toEqualTypeOf<{
+      readonly looseRowId: string
+      readonly captainId: string
+      readonly other: typeof NumberRow.Type
+      readonly qty: number
+    }>()
+  })
+
+  it("a class named as its entity type, with no `id: string`: taken as declared", () => {
+    expectTypeOf<Input["sheets"][number]>().toEqualTypeOf<{
+      readonly numberLine: NumberLine
+      readonly qty: number
+    }>()
+    expectTypeOf<Input["maybeSheets"][number]>().toEqualTypeOf<{
+      readonly numberLine?: NumberLine | undefined
+      readonly qty: number
+    }>()
+    expectTypeOf<Input["crews"][number]>().toEqualTypeOf<{
+      readonly captain: NumberLine
+      readonly qty: number
+    }>()
     expectTypeOf<Input["labels"][number]>().toEqualTypeOf<{
       readonly numberLine: string
       readonly qty: number
     }>()
   })
 
+  it("a class named as its entity type, with an `id: string`: each such field by id", () => {
+    // As on 1.39.0. `create` fetches `stringIdLineId`; it takes `captain` only whole.
+    expectTypeOf<Input["idSheets"][number]>().toEqualTypeOf<{
+      readonly stringIdLineId: string
+      readonly captainId: string
+      readonly qty: number
+    }>()
+  })
+
+  it("a class named otherwise than its entity type: taken as declared", () => {
+    // `create` names the field by the class (`lineItem`), not by the entity type (`line`).
+    expectTypeOf<Input["itemSheets"][number]>().toEqualTypeOf<{
+      readonly line: LineItem
+      readonly lineItem: LineItem
+      readonly qty: number
+    }>()
+  })
+
+  it("a class in a configure wrapper: taken as declared", () => {
+    expectTypeOf<Input["configuredLineSheets"][number]>().toEqualTypeOf<{
+      readonly configuredLine: NumberLine
+      readonly qty: number
+    }>()
+  })
+})
+
+describe("a many element that is a union", () => {
   it("a many element that is a union is typed as on 1.39.0: as declared, holding no ref-like field", () => {
     expectTypeOf<Input["kinds"][number]>().toEqualTypeOf<
       | { readonly kind: "a"; readonly numberLine: NumberLine }
@@ -265,7 +448,9 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
       | { readonly kind: "b"; readonly idLine: IdLine }
     >()
   })
+})
 
+describe("a many element with no entity one id names is taken as given", () => {
   it("a many element wrapping an entity keyed by two attributes is taken as given", () => {
     expectTypeOf<Input["pairSheets"][number]>().toEqualTypeOf<{
       readonly pairLine: PairLine
@@ -294,18 +479,24 @@ function _refusals(input: Input): void {
   // @ts-expect-error — a sort-key-only key takes a string, so it is not `never`
   const _sortKeyNever: never = input.sortKeyLineId
   // @ts-expect-error — an element wrapping the entity takes its id, not the entity
-  const _sheetLine: NumberLine = input.sheets[0]!.numberLine
+  const _sheetRow: typeof NumberRow.Type = input.rowSheets[0]!.numberRow
   // @ts-expect-error — an element with no entity to fetch keeps its fields, so has no `idId`
   const _noteId: string = input.notes[0]!.idId
   // @ts-expect-error — a field of another name than the entity's is not taken by id
-  const _captainId: number = input.crews[0]!.captainId
+  const _captainId: number = input.rowCrews[0]!.captainId
+  // @ts-expect-error — an entity type typed `string` names no field
+  const _looseOtherId: number = input.looseSheets[0]!.otherId
+  // @ts-expect-error — a class named otherwise than its entity type: no field by the entity type
+  const _itemLineId: number = input.itemSheets[0]!.lineId
   void _numberAsString
   void _bigintAsNumber
   void _numbersAsStrings
   void _pairId
   void _sortKeyNever
-  void _sheetLine
+  void _sheetRow
   void _noteId
   void _captainId
+  void _looseOtherId
+  void _itemLineId
 }
 void _refusals

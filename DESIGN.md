@@ -4042,10 +4042,15 @@ element that is the entity's own model, given whole, holds no ref either, so a
 `Line`) is its own value. Up to 1.39.0 it was taken for a ref because its name
 was `${field}Id`, and `create` died composing the key. The input type
 (`AggregateTypes`) takes the same field by id, and a field of another name
-whole, whatever it holds. The field's name comes from the entity model's
-identifier, which a `Schema.Class` types as `string`, so the type names it by
-the entity's `entityType`; the two agree when the class is named as the entity
-type is.
+whole, whatever it holds, where it can see the field's name: for a
+`Schema.Struct` model, in a `DynamoModel.configure` wrapper or not, whose
+`entityType` is one string literal (`create` takes the `entityType` for both).
+`create` takes a `Schema.Class` model's own identifier, which the type sees only
+as `string`, and the `entityType` for a class in a `configure` wrapper, which
+the type can't tell apart from a bare class. For a model the type can't name the
+field of, and an `entityType` typed `string` (`Uncapitalize<string>` would match
+every field), the element is typed as on 1.39.0: a field whose type has an
+`id: string` by id, whatever its name, and every other field as declared.
 
 A union element is judged as 1.39.0 judged it (`isUnionElement`): a string
 `${field}Id`, or a string given as the element, is an id `create` fetches by,
