@@ -4286,7 +4286,9 @@ are these (`entityWriters`, and an aggregate's `_attributeWriters`):
   counted as the primary key.
 - Its model attributes, on its rows and kept on its projection tombstones: any name but `__edd_e__`
   and its table key attributes, which it writes after them. `EDD-9109` and `EDD-9140` refuse a model
-  attribute stored under those, a sparse map's entries included.
+  attribute stored under those, a sparse map's entries included. So an entity of a node's type on the
+  same table is refused when the aggregate's partition key attribute isn't one of that entity's table
+  key attributes.
 - None of an entity's rows is a node's row, so all of them count. An entity composes each composite
   with its field's name (`$x#v1#line#id_p`), which an aggregate never does, and its primary key has at
   least one composite.
