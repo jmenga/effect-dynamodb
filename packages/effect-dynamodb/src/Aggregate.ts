@@ -217,13 +217,6 @@ interface ResolvedNode {
   readonly entityType: string
   /** The fields of the value this node's rows hold: what they declare. */
   readonly ownFields?: Record<string, Schema.Top> | undefined
-  /**
-   * The model fields this node's rows can hold, as `DynamoClient.make` counts them for an aggregate
-   * declaring `ownsRows` (`EDD-9130`): those the schema its value is decoded with declares, read off
-   * the model's field ({@link writtenFields}). `"any"` when they can't be read off it, as for a custom
-   * `decompose`.
-   */
-  readonly writes: ReadonlyArray<string> | "any"
   /** What this node's rows do with each timestamp. Undefined without `timestamps`. */
   readonly rowStamps?: RowStamps | undefined
   /**
@@ -1218,24 +1211,6 @@ const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined => {
 
 /** The value schema of a struct field, with any `optionalKey` / `optional` wrapper removed. */
 const unwrapOptionalField = (field: Schema.Top): Schema.Top => optionalField(field)?.inner ?? field
-
-/**
- * The model fields a node's rows can hold, for the `ownsRows` bind check (`EDD-9130`): those `value`,
- * the schema the node's value is decoded with, declares. A decoded value holds no others. `"any"`
- * when its fields can't be read off it (a `Schema.Union`, a `Schema.suspend`, a `Schema.Record`, a
- * `Schema.Unknown`, or no schema at all), unless it is an opaque ref, which is the edge entity: its
- * rows hold `entity`'s fields.
- */
-const writtenFields = (
-  value: Schema.Top | undefined,
-  entity: Record<string, Schema.Top> | undefined,
-): ReadonlyArray<string> | "any" => {
-  const own = value === undefined ? undefined : getSchemaFields(value)
-  if (own !== undefined) return Object.keys(own)
-  return value !== undefined && entity !== undefined && isOpaqueRefField(value)
-    ? Object.keys(entity)
-    : "any"
-}
 
 /**
  * Whether a field is a class-like value whose fields the schema walker cannot
@@ -2303,9 +2278,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * The attributes the aggregate writes on its rows, for another aggregate declaring `ownsRows` to
    * check at bind (DESIGN.md §7 "Which rows in its partition are an aggregate's"), as each row holds
    * them after the last write of each: its partition key, `sk` and the collection index's sort key
-   * on every row, its list keys on its root row, its rows' own attributes, whose text is the
-   * caller's (their fields, discriminators and context, or any attribute a custom `decompose`
-   * returns, but the ones the library writes after them), and its timestamps, written last.
+   * on every row, its list keys on its root row, its timestamps, written last, and its rows' own
+   * attributes (their fields, discriminators and context, or what a custom `decompose` returns):
+   * any name holding any text, but the ones the library writes after them.
    */
   const attributeWriters: ReadonlyArray<AttributeWriter> = (() => {
     const table = config.table.Tag
@@ -2360,43 +2335,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
         writers.push({ field, head, types: [root], table, channel: "its list index's keys" })
       }
     }
-    const library = [config.pk.field, "sk", "__edd_e__", ...(mirror === undefined ? [] : [mirror])]
-    for (const { node } of nodeSlots) {
-      const types = [labelled(node.entityType)]
-      if (node.decompose !== undefined || node.writes === "any") {
-        writers.push({
-          field: undefined,
-          except: library,
-          head: undefined,
-          types,
-          table,
-          channel:
-            node.decompose !== undefined
-              ? "the attributes its custom `decompose` returns"
-              : "the attributes of a value whose fields can't be read off its schema",
-        })
-        continue
-      }
-      const names = new Set([
-        ...node.writes,
-        ...Object.keys(node.discriminator ?? {}),
-        ...contextFields,
-      ])
-      for (const name of names) {
-        if (library.includes(name)) continue
-        writers.push({
-          field: name,
-          head: undefined,
-          types,
-          table,
-          channel: `its attribute "${name}"`,
-        })
-      }
-    }
     // Its timestamps, written after everything else: one named as a key replaces it.
     for (const name of systemAttrs) {
       writers.push({ field: name, head: undefined, types: all, table, channel: `its "${name}"` })
     }
+    // Its rows' own attributes. Whatever a schema declares, these are any name holding any text, but
+    // the ones the library writes after them.
+    const library = [config.pk.field, "sk", "__edd_e__", ...(mirror === undefined ? [] : [mirror])]
+    writers.push({
+      field: undefined,
+      except: library,
+      head: undefined,
+      types: all,
+      table,
+      channel: "its rows' own attributes",
+    })
     return withTypeOverwrites(writers)
   })()
 
@@ -3839,8 +3792,6 @@ interface ResolveNodeArgs {
   readonly parentFields?: Record<string, Schema.Top> | undefined
   /** Fields of the value this node's rows hold, where that isn't `parentFields`. */
   readonly ownFields?: Record<string, Schema.Top> | undefined
-  /** {@link ResolvedNode.writes}, where that isn't `ownFields`' names. */
-  readonly writes?: ReadonlyArray<string> | "any" | undefined
   /** The aggregate's ref resolver, shared with its `decodeSchema`. */
   readonly resolveRef?: RefResolver | undefined
   readonly discriminator?: Record<string, unknown> | undefined
@@ -3966,10 +3917,6 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
             ownFields: valueFields,
-            writes: writtenFields(
-              parentField === undefined ? undefined : unwrapOptionalField(parentField),
-              fieldsOf(edge.entity?.model),
-            ),
             attrEncoders: buildAttrEncoders(valueFields, resolveRef),
             ...edgeStorage(
               edgePackedFields(
@@ -4017,10 +3964,6 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
                 ? undefined
                 : storedFormFirst(field, parentFields?.[field], resolveRef),
             ownFields: elementFields,
-            writes:
-              edge.decompose === undefined
-                ? writtenFields(arrayElement ?? keyedValue, entityFields)
-                : "any",
             attrEncoders: buildAttrEncoders(
               elementFields,
               resolveRef,
@@ -4071,12 +4014,6 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           resolveRef,
           discriminator: inherited,
           ownDiscriminator: bound.discriminator,
-          writes: writtenFields(
-            parentFields?.[field] === undefined
-              ? undefined
-              : unwrapOptionalField(parentFields[field]),
-            subFields,
-          ),
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
           // fields; its child edges get their own encoders via recursion.
           attrEncoders: buildAttrEncoders(subFields, resolveRef),
@@ -4092,7 +4029,6 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     entityType,
     cardinality,
     ownFields,
-    writes: args.writes ?? (ownFields === undefined ? "any" : Object.keys(ownFields)),
     // Absent optionals stay absent under `exactOptionalPropertyTypes`.
     ...(discriminator !== undefined && { discriminator }),
     ...(ownDiscriminator !== undefined && { ownDiscriminator }),
@@ -5095,7 +5031,8 @@ const typesCollide = (theirs: RowType, ours: RowType): boolean =>
 
 /**
  * A member's writers, every row type of them made any when one stores an attribute under
- * `__edd_e__` other than the library's marker, or any attribute: its rows can carry any type.
+ * `__edd_e__` other than the library's marker, or any attribute: its rows can carry any type. An
+ * aggregate's timestamp so named does, since it's written last. An entity can't (`EDD-9140`).
  */
 const withTypeOverwrites = (
   writers: ReadonlyArray<AttributeWriter>,
@@ -5120,18 +5057,18 @@ const withTypeOverwrites = (
  *   tombstones, time-series events, projection tombstones and outbox items;
  * - each secondary index's partition key on its live rows, and each vector index's partition;
  * - its unique sentinels, under their own key, with back-pointers to the owning row's key;
- * - any sort key, its own attributes (whose text is the caller's) on every row they're written on,
- *   its timestamps, `deletedAt`, and the attributes a projection writes on its tombstones and
- *   outbox items, as any text.
+ * - any sort key, its timestamps, `deletedAt`, and the attributes a projection writes on its
+ *   tombstones and outbox items, as any text;
+ * - its model attributes, on its rows and kept on its projection tombstones: any name holding any
+ *   text, but `__edd_e__` and its table key attributes, which it writes after them (`EDD-9109` and
+ *   `EDD-9140` refuse a model attribute stored under them).
  * None of its rows is an aggregate node's: it composes each composite with its field's name
- * (`id_p`), which an aggregate never does, and its primary key has at least one. An entity that
- * stores another attribute under `__edd_e__` writes rows of any type, and one whose keys can't be
- * read is taken to write any attribute.
+ * (`id_p`), which an aggregate never does, and its primary key has at least one. An entity whose
+ * keys can't be read is taken to write any attribute.
  */
 const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
   const e = entity as {
     readonly entityType: string
-    readonly model: unknown
     readonly indexes: Record<string, KeyComposer.IndexDefinition>
     readonly unique?: Record<string, unknown> | undefined
     readonly softDelete?: unknown
@@ -5156,7 +5093,6 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
       readonly sk: string
       readonly index?: { readonly pk: string; readonly sk: string } | undefined
     }>
-    readonly _resolveDbName?: (name: string) => string
     readonly _schema: DynamoSchemaModule.DynamoSchema
     readonly _tableTag: unknown
   }
@@ -5179,9 +5115,11 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
     // A partition key with composites, or a shard, continues its head after `#`.
     const exactOf = (index: KeyComposer.IndexDefinition): false | undefined =>
       index.pk.composite.length > 0 || index.shards !== undefined ? false : undefined
-    const stored = Object.keys(fieldsOf(e.model) ?? {}).map(
-      (field) => e._resolveDbName?.(field) ?? field,
-    )
+    const primary = e.indexes.primary!
+    const tableKeys = [
+      primary.pk.field,
+      ...(primary.sk?.field === undefined ? [] : [primary.sk.field]),
+    ]
     const stamps = [e.systemFields?.createdAt, e.systemFields?.updatedAt].filter(
       (name): name is string => typeof name === "string",
     )
@@ -5202,15 +5140,19 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
       const exact = exactOf(index)
       const own = typed(type, index.casing)
       if (name !== "primary") {
-        writers.push({
-          field: index.pk.field,
-          head,
-          exact,
-          types: [own],
-          table,
-          channel: `its index "${name}"`,
-        })
-        if (index.sk?.field !== undefined) {
+        // A half on a table key attribute holds the primary key's text (an inverted index): two
+        // halves of one entity share an attribute only with the same fields (`EDD-9106`).
+        if (!tableKeys.includes(index.pk.field)) {
+          writers.push({
+            field: index.pk.field,
+            head,
+            exact,
+            types: [own],
+            table,
+            channel: `its index "${name}"`,
+          })
+        }
+        if (index.sk?.field !== undefined && !tableKeys.includes(index.sk.field)) {
           writers.push({
             field: index.sk.field,
             head: undefined,
@@ -5342,15 +5284,17 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
         channel: `its vector index "${name}"`,
       })
     }
-    // Its own attributes, renamed after its keys are composed: on its rows, and kept on its
-    // projection tombstones.
-    anyText(
-      stored,
-      [typed(type), ...projectionTypes],
-      table,
-      (attribute) => `its attribute "${attribute}"`,
-    )
     anyText([...stamps, INCARNATION_TOKEN], [typed(type)], table, (field) => `its "${field}"`)
+    // Its model attributes: on its rows, and kept on its projection tombstones. Whatever its model
+    // declares, these are any name holding any text, but the ones it writes after them.
+    writers.push({
+      field: undefined,
+      except: ["__edd_e__", ...tableKeys],
+      head: undefined,
+      types: [typed(type), ...projectionTypes],
+      table,
+      channel: "its model attributes",
+    })
     return withTypeOverwrites(writers)
   } catch {
     return [

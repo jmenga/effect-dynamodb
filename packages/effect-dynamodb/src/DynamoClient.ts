@@ -3213,18 +3213,29 @@ const makeFromConfig = (config: {
         Context.getOption(baseCtx, table as Context.Key<TableConfig, TableConfig>),
       )?.name
     }
-    const visibleMembers = [
+    // Every entity the client sees: those it binds, then those of every table it binds, named as a
+    // refusal names them. A member may reach the client only as another bound table's.
+    const visible: ReadonlyArray<readonly [name: string, entity: unknown]> = [
       ...Object.entries(config.entities),
+      ...Object.entries(config.tables ?? {}).flatMap(([tableKey, table]) =>
+        Object.entries(table.entities).map(
+          ([key, entity]) => [`${tableKey}.${key}`, entity] as const,
+        ),
+      ),
+    ]
+    // And every aggregate it sees, the same way.
+    const visibleAggregates: ReadonlyArray<readonly [name: string, aggregate: unknown]> = [
       ...Object.entries(config.aggregates ?? {}),
-      ...Object.values(config.tables ?? {}).flatMap((table) => [
-        ...Object.entries(
-          (table as { readonly entities?: Record<string, unknown> }).entities ?? {},
-        ),
-        ...Object.entries(
+      ...Object.entries(config.tables ?? {}).flatMap(([tableKey, table]) =>
+        Object.entries(
           (table as { readonly aggregates?: Record<string, unknown> }).aggregates ?? {},
-        ),
-      ]),
-    ].map(([name, member]) => ({ name, member: member as unknown }))
+        ).map(([key, aggregate]) => [`${tableKey}.${key}`, aggregate] as const),
+      ),
+    ]
+    const visibleMembers = [...visible, ...visibleAggregates].map(([name, member]) => ({
+      name,
+      member,
+    }))
     for (const [key, aggregate] of Object.entries(config.aggregates ?? {})) {
       if ((aggregate as { readonly _ownsRows?: boolean })._ownsRows !== true) continue
       const own = (aggregate as { readonly _tableTag?: { readonly key: string } })._tableTag

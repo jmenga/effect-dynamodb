@@ -224,6 +224,42 @@ export const refuseStoredInTableKey = (
 }
 
 /**
+ * `[EDD-9140]`: `Entity.make` refuses an attribute it would store under one the library writes
+ * itself: a model field, under a `field:` rename or by its own name, or a system timestamp or
+ * version field, stored in `__edd_e__`, where every row holds its entity type; and a sparse map
+ * whose entries, stored as `<prefix>#<key>`, can be named as a table key attribute is. The
+ * `ownsRows` bind check (`EDD-9130`) takes a model attribute to be any name but these.
+ */
+export const refuseStoredUnderLibraryAttribute = (
+  entityType: string,
+  primary: IndexDefinition,
+  stored: ReadonlyArray<readonly [name: string, attribute: string]>,
+  sparse: ReadonlyArray<readonly [field: string, prefix: string]>,
+): void => {
+  for (const [name, attribute] of stored) {
+    if (attribute !== "__edd_e__") continue
+    throw new Error(
+      `[EDD-9140] Entity "${entityType}": "${name}" would be stored in "__edd_e__", the ` +
+        "attribute that holds each row's entity type, which every read filters on. Store " +
+        `"${name}" under another attribute with \`DynamoModel.configure(model, { ${name}: ` +
+        "{ field: ... } })`, or name it something else.",
+    )
+  }
+  for (const [field, prefix] of sparse) {
+    const key = [primary.pk.field, primary.sk.field].find((attribute) =>
+      attribute.startsWith(`${prefix}#`),
+    )
+    if (key === undefined) continue
+    throw new Error(
+      `[EDD-9140] Entity "${entityType}": sparse map "${field}" stores each entry as ` +
+        `"${prefix}#<key>", and the entry "${key.slice(prefix.length + 1)}" would be stored in ` +
+        `"${key}", an attribute of the table's primary key. A put would replace the row's key ` +
+        "with it. Give the map another prefix, or name the key attributes something else.",
+    )
+  }
+}
+
+/**
  * `[EDD-9112]`: `Aggregate.make` refuses a key it would store in a table key attribute: its
  * list key, or its collection sort key. Aggregate rows are `Put`s, so one would replace the
  * row's own key.

@@ -374,21 +374,30 @@ export const makeEngine = (config: EngineConfig) => {
     }
   }
 
-  // Every projection's outbox, kept on the read model, one entry per projection defined on it: a
-  // second projection doesn't hide the first's, which stays callable. One on another table (`table`)
-  // is moved by that table's `rekey` (#171). Wherever it is, an aggregate declaring `ownsRows` is
-  // checked against its items at bind (DESIGN.md §7 "Which rows in its partition are an
-  // aggregate's"), with the index keys it writes on them.
+  // Every projection's outbox, kept on the read model, one entry per distinct layout, the one defined
+  // last at the end: a second projection doesn't hide the first's, which stays callable, and one
+  // defined again adds nothing. One on another table (`table`) is moved by that table's `rekey`
+  // (#171). Wherever it is, an aggregate declaring `ownsRows` is checked against its items at bind
+  // (DESIGN.md §7 "Which rows in its partition are an aggregate's"), with the index keys it writes
+  // on them.
   if (config.outbox !== undefined) {
-    const holder = readModel as { _projectionOutboxes?: Array<ProjectionOutboxLayout> }
+    const holder = readModel as { _projectionOutboxes?: ReadonlyArray<ProjectionOutboxLayout> }
+    const layout: ProjectionOutboxLayout = {
+      table: config.outbox.table,
+      pk: config.outbox.pk,
+      sk: config.outbox.sk,
+      index: config.outbox.index,
+    }
+    const same = (other: ProjectionOutboxLayout) =>
+      other.table?.Tag === layout.table?.Tag &&
+      other.pk === layout.pk &&
+      other.sk === layout.sk &&
+      other.index?.name === layout.index?.name &&
+      other.index?.pk === layout.index?.pk &&
+      other.index?.sk === layout.index?.sk
     holder._projectionOutboxes = [
-      ...(holder._projectionOutboxes ?? []),
-      {
-        table: config.outbox.table,
-        pk: config.outbox.pk,
-        sk: config.outbox.sk,
-        index: config.outbox.index,
-      },
+      ...(holder._projectionOutboxes ?? []).filter((other) => !same(other)),
+      layout,
     ]
   }
 

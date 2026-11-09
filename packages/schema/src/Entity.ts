@@ -80,6 +80,7 @@ import {
   refuseRepeatedIndex,
   refuseSharedKeyAttributeOnEverySchema,
   refuseStoredInTableKey,
+  refuseStoredUnderLibraryAttribute,
 } from "./internal/SharedKeyAttribute.js"
 import {
   type BoundDimension,
@@ -1590,14 +1591,21 @@ export const buildEntityDefinition = (config: {
     if (field) fieldRenames[domainName] = field
   }
   const hasRenames = Object.keys(fieldRenames).length > 0
-  refuseStoredInTableKey(config.entityType, primaryIndex, [
+  const storedAttributes = [
     ...Object.keys(modelFields).map(
       (name) => [name, fieldRenames[name] ?? name] as readonly [string, string],
     ),
     ...[systemFields.createdAt, systemFields.updatedAt, systemFields.version]
       .filter((name) => name !== null)
       .map((name) => [name, name] as readonly [string, string]),
-  ])
+  ]
+  refuseStoredInTableKey(config.entityType, primaryIndex, storedAttributes)
+  refuseStoredUnderLibraryAttribute(
+    config.entityType,
+    primaryIndex,
+    storedAttributes,
+    Object.entries(sparseFields).map(([field, { prefix }]) => [field, prefix] as const),
+  )
 
   const renameToDynamo = (item: globalThis.Record<string, unknown>): void => {
     if (!hasRenames) return

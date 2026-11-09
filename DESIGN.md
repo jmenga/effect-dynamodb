@@ -4237,7 +4237,9 @@ rests on that declaration. The bind check below is a safety net for it, not a pr
 another member it can see can write a row of one of its types into its partition (`ownershipConflict`).
 The refusal is a defect, as `EDD-9037` is. The check counts every attribute a member writes on a row,
 the library's own included, as the row holds it after the last write of each: an attribute written
-after a key replaces it. A member can write such a row when one of its rows, on the same physical
+after a key replaces it. It reads no schema: a model attribute is any name holding any text. So a
+member's row can hold the aggregate's `pk.field` unless the library writes that attribute on the row
+after every model attribute. A member can write such a row when one of its rows, on the same physical
 table, can hold both of these:
 - Under the aggregate's `pk.field`, text that can be the aggregate's partition key. Most text the
   library composes as a key there begins with a head `$<schema>#v<version>#<label>`. It's exactly the
@@ -4259,8 +4261,9 @@ table, can hold both of these:
   other's after `#`. Each head is cased as its member's keys are. Under `lowercase` or `uppercase`,
   `line` collides with `Line`; under `preserve` it doesn't. `Line#Profile` collides with `Line` under
   every casing. A member that stores another attribute under `__edd_e__` writes any type there, and
-  every type collides with it: a model field renamed to `__edd_e__`, through `put`, `Batch`,
-  `Transaction` or `update`, or a timestamp so named.
+  every type collides with it: an aggregate's timestamp so named, which it writes after its
+  `__edd_e__`. An entity can't: `Entity.make` refuses a model field named or renamed `__edd_e__`, and
+  a timestamp or the version so named (`EDD-9140`).
 
 These two comparisons belong to the bind check only. They never widen the rows the aggregate owns, or
 the rows assembly hands a node; both match `__edd_e__` exactly.
@@ -4270,26 +4273,30 @@ binds, and those of every table the client binds. Which table a row is on is dec
 writes, not per member: a read model's outbox items are on its outbox's table, which can be the
 aggregate's when the entity's own table isn't. A row's table is the same physical table when it is the
 aggregate's table, has its key, or resolves to the same table name. The aggregate itself isn't
-counted. A member's rows are these (`entityWriters`, and an aggregate's `_attributeWriters`):
+counted. A refusal names a member of a table the client binds as `<table>.<key>`. A member's rows
+are these (`entityWriters`, and an aggregate's `_attributeWriters`):
 - An entity's live rows, version snapshots, soft-delete tombstones and time-series events, under its
   primary key, and the projection tombstones (`<type>#tombstone`) and outbox items (`<type>#outbox`) a
   read model writes beside its rows. Every projection defined on the read model counts, each with its
   own outbox's table and index keys (`_projectionOutboxes`).
 - Its unique sentinels (type `<type>._unique.<name>`, under the sentinel key), with the back-pointers
   `_entity_pk` and `_entity_sk` naming the owning row.
-- Each secondary index's and vector index's partition attribute, on its live rows.
+- Each secondary index's and vector index's partition attribute, on its live rows. A secondary index
+  half stored in a table key attribute holds the primary key's text there (`EDD-9106`), so it's
+  counted as the primary key.
+- Its model attributes, on its rows and kept on its projection tombstones: any name but `__edd_e__`
+  and its table key attributes, which it writes after them. `EDD-9109` and `EDD-9140` refuse a model
+  attribute stored under those, a sparse map's entries included.
 - None of an entity's rows is a node's row, so all of them count. An entity composes each composite
   with its field's name (`$x#v1#line#id_p`), which an aggregate never does, and its primary key has at
   least one composite.
 - An entity whose keys can't be read is taken to write any attribute and any type.
 - Another aggregate's rows: its `pk.field`, `sk` and collection sort-key mirror on every row (the
   root's mirror is its collection key, every other row's a copy of its `sk`), its list index keys on its
-  root, its rows' model, context and discriminator attributes as any text, and
-  its timestamps, which it writes last. A node's model attributes are the fields declared by the
-  schema its value is decoded with, read off the model's field (`writes`): an opaque ref's are the edge
-  entity's. A node with a custom `decompose`, or whose value's fields can't be read off its schema (a
-  `Schema.Union`, `Schema.suspend`, `Schema.Record` or `Schema.Unknown`), writes any attribute but the
-  ones the library writes after it.
+  root, its timestamps, which it writes last, and its rows' own attributes (model, context and
+  discriminator attributes, or what a custom `decompose` returns): any name but its `pk.field`, `sk`,
+  `__edd_e__` and the mirror, which it writes after them. Its list keys aren't among those: a root row
+  whose list composites are absent has none, so an attribute of that name stays.
 
 **`update` with `ownsRows`.** Its group transactions are exactly the ones it sends without the option.
 After the last of them commits, it deletes the other rows it read of each node that changed, where the
@@ -6194,8 +6201,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
 | `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackOtherwise`, `fieldAtPath`, `storedFieldAtPath`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. A dotted composite is followed through what holds each segment, and a time-series `appendInput`'s own fields are refused as the model's are, as is one declaring the other kind than the model. In the same places, the value of a field whose kinds can't be read at load (`Schema.Unknown`, `Schema.Any`, an opaque declaration, a transform whose stored side is one) that reads back as something else is refused at write with a `ValidationError` naming the field, with nothing written; an aggregate's dotted `many` edge composite is judged at write through the field holding it (`throughFieldJudge`), never by the value at its path alone. A field no key reads may store both (§7 "Both numeric kinds"). |
 | `EDD-9130` | `DynamoClient.ts` (`make`), through `Aggregate.ts` (`ownershipConflict`) | An aggregate declaring `ownsRows` beside another member the client sees that can write a row of one of its entity types into its partition: the message names the aggregate, the member, the type and the channel. A defect from `DynamoClient.make`, as `EDD-9037` is (§7 "Which rows in its partition are an aggregate's"). |
+| `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute`), through `Entity.make`, pure and operational | An entity that would store an attribute under one the library writes itself: a model field named or renamed `__edd_e__`, or a timestamp or the version field so named (every row holds its entity type there, and every read filters on it), or a sparse map whose entry `<prefix>#<key>` can be named as a table key attribute is (a put would replace the row's key with it). Refused at load, naming the field and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
 
-Next free code: none below `9131` (`9129` and `9131` onward are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: none below `9141` (`9129` and `9131`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

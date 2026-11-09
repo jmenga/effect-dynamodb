@@ -300,7 +300,7 @@ describe("DynamoClient.make refuses `ownsRows` when a member can write a row of 
     )
 
     it.effect(
-      "an entity with an attribute of the partition key's name, its text the caller's",
+      "an entity of a node's type, the partition key's attribute not one it writes after its model",
       () =>
         Effect.gen(function* () {
           const Indexed = Entity.make({
@@ -315,8 +315,13 @@ describe("DynamoClient.make refuses `ownsRows` when a member can write a row of 
             ...keyed(undefined),
           } as any)
           expect(yield* bind({ Indexed, Lines }, {}, { onIndex: true })).toEqual(
-            refused("Lines", "Line", 'its attribute "gsi1pk"'),
+            refused("Lines", "Line", "its model attributes"),
           )
+          // A model attribute is any name holding any text: the check reads no schema, so a model
+          // that doesn't declare `gsi1pk` is refused as one that does is.
+          expect(
+            yield* bind({ Indexed, Lines: entity(keyed(undefined)) }, {}, { onIndex: true }),
+          ).toEqual(refused("Lines", "Line", "its model attributes"))
         }),
     )
 
@@ -346,8 +351,9 @@ describe("DynamoClient.make refuses `ownsRows` when a member can write a row of 
       Effect.gen(function* () {
         const Lines = entity(keyed("orders", ["note"]))
         const Again = Table.make({ schema, entities: { Lines } })
+        // Named as a member of the table the client binds it through.
         expect(yield* bind({}, {}, { tables: { Again: { table: Again, name: "ex" } } })).toEqual(
-          refused("Lines", "Line", "its primary key"),
+          refused("Again.Lines", "Line", "its primary key"),
         )
         // On another physical table, it writes another partition.
         expect(
@@ -638,7 +644,7 @@ describe("the bind check counts each attribute as its row holds it after the las
       // The outbox items are on the target table, the aggregate's, whichever table the entity is on.
       expect(
         yield* binds({ entities: {}, aggregates: { Orders }, tables: { Source, Target } }, layer),
-      ).toEqual(refusal("Tallies", "Tally#outbox", "its projection outbox"))
+      ).toEqual(refusal("Source.Tallies", "Tally#outbox", "its projection outbox"))
       // A client that sees neither the entity nor its table doesn't check it.
       expect(
         yield* binds({ entities: {}, aggregates: { Orders }, tables: { Target } }, layer),
@@ -668,7 +674,7 @@ describe("the bind check counts each attribute as its row holds it after the las
             Second.layer({ name: "events" }),
           ),
         ),
-      ).toEqual(refusal("Tallies", "Tally#outbox", "its projection outbox"))
+      ).toEqual(refusal("Source.Tallies", "Tally#outbox", "its projection outbox"))
     }),
   )
 
@@ -701,136 +707,149 @@ describe("the bind check counts each attribute as its row holds it after the las
     }),
   )
 
-  it.effect("a value whose fields can't be read off its schema can write any attribute", () =>
-    Effect.gen(function* () {
-      // `Other` assembles from `gpk`. Its `Line` rows are in the owner's partition when a line's `pk`
-      // is the owner's partition key: a field its schema declares, or any, when that can't be read.
-      const schema = DynamoSchema.make({ name: "op", version: 1 })
-      const WithPk = Schema.Struct({
-        lid: Schema.String,
-        pk: Schema.optional(Schema.String),
-        note: Schema.String,
-      })
-      const Lines = Entity.make({
-        model: Schema.Struct({ id: Schema.String, lid: Schema.String, note: Schema.String }),
-        entityType: "Line",
-        primaryKey: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: ["lid"] },
-        },
-      } as any)
-      const outcome = (
-        field: Schema.Top,
-        edge: (options: Record<string, unknown>) => unknown,
-        entity?: unknown,
-      ) => {
-        const Main = Table.make({ schema, entities: {} })
-        const Orders = owner(Main, schema, { collection: "shared" })
-        const Other = Aggregate.make(Schema.Struct({ id: Schema.String, lines: field }), {
-          table: Main,
-          schema,
-          pk: { field: "gpk", composite: ["id"] },
-          collection: { name: "other", index: "gsi1", sk: { field: "gsk", composite: ["id"] } },
-          root: { entityType: "OtherRoot" },
-          edges: { lines: edge({ entityType: "Line", ...(entity !== undefined && { entity }) }) },
+  it.effect(
+    "a row's own attributes are any name holding any text, whatever its schema declares",
+    () =>
+      Effect.gen(function* () {
+        // `Other`'s `Line` rows are in the owner's partition when a line's `pk` is the owner's
+        // partition key. The check reads no schema (DESIGN.md §7 "Which rows in its partition are an
+        // aggregate's"): a row's own attributes are any name holding any text but the ones the library
+        // writes after them, `Other`'s `gpk`, `sk`, `__edd_e__` and `gsk`. So a value whose struct
+        // declares no `pk` is refused as one declaring it is, and as one whose fields can't be read
+        // off its schema is.
+        const schema = DynamoSchema.make({ name: "op", version: 1 })
+        const WithPk = Schema.Struct({
+          lid: Schema.String,
+          pk: Schema.optional(Schema.String),
+          note: Schema.String,
+        })
+        const Plain = Schema.Struct({ lid: Schema.String, note: Schema.String })
+        const Lines = Entity.make({
+          model: Schema.Struct({ id: Schema.String, lid: Schema.String, note: Schema.String }),
+          entityType: "Line",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: ["lid"] },
+          },
         } as any)
-        return binds(
-          { entities: {}, aggregates: { Orders, Other }, tables: { Main } },
-          Main.layer({ name: "op" }),
-        )
-      }
-      const many = (options: Record<string, unknown>) =>
-        Aggregate.many({ ...options, sk: { composite: ["lid"] } } as any)
-      const one = (options: Record<string, unknown>) => Aggregate.one(options as any)
-      const any = refusal(
-        "Other",
-        "Line",
-        "the attributes of a value whose fields can't be read off its schema",
-      )
-      const Union = Schema.Union([
-        WithPk,
-        Schema.Struct({ lid: Schema.String, other: Schema.Number }),
-      ])
-      const unreadable = [
-        Union,
-        Schema.suspend(() => WithPk),
-        Schema.Record(Schema.String, Schema.String),
-        Schema.Unknown,
-      ]
-      for (const element of unreadable) {
-        expect(yield* outcome(Schema.Array(element), many)).toEqual(any)
-      }
-      // An element the edge entity's model doesn't describe: its fields are still the element's.
-      expect(yield* outcome(Schema.Array(Union), many, Lines)).toEqual(any)
-      // A `one` edge's value.
-      expect(
-        yield* outcome(
+        const outcome = (
+          field: Schema.Top,
+          edge: (options: Record<string, unknown>) => unknown,
+          entity?: unknown,
+          pkField = "gpk",
+        ) => {
+          const Main = Table.make({ schema, entities: {} })
+          const Orders = owner(Main, schema, { collection: "shared" })
+          const Other = Aggregate.make(Schema.Struct({ id: Schema.String, lines: field }), {
+            table: Main,
+            schema,
+            pk: { field: pkField, composite: ["id"] },
+            collection: { name: "other", index: "gsi1", sk: { field: "gsk", composite: ["id"] } },
+            root: { entityType: "OtherRoot" },
+            edges: { lines: edge({ entityType: "Line", ...(entity !== undefined && { entity }) }) },
+          } as any)
+          return binds(
+            { entities: {}, aggregates: { Orders, Other }, tables: { Main } },
+            Main.layer({ name: "op" }),
+          )
+        }
+        const many = (options: Record<string, unknown>) =>
+          Aggregate.many({ ...options, sk: { composite: ["lid"] } } as any)
+        const one = (options: Record<string, unknown>) => Aggregate.one(options as any)
+        const any = refusal("Other", "Line", "its rows' own attributes")
+        const Union = Schema.Union([
+          WithPk,
+          Schema.Struct({ lid: Schema.String, other: Schema.Number }),
+        ])
+        const elements = [
+          WithPk,
+          Plain,
+          Union,
           Schema.suspend(() => WithPk),
-          one,
-        ),
-      ).toEqual(any)
-      expect(yield* outcome(Union, one)).toEqual(any)
-      // A struct says what it holds.
-      expect(yield* outcome(Schema.Array(WithPk), many)).toEqual(
-        refusal("Other", "Line", 'its attribute "pk"'),
-      )
-      expect(yield* outcome(WithPk, one)).toEqual(refusal("Other", "Line", 'its attribute "pk"'))
-      const Plain = Schema.Struct({ lid: Schema.String, note: Schema.String })
-      expect(yield* outcome(Schema.Array(Plain), many)).toBe("bound")
-      expect(yield* outcome(Schema.Array(Plain), many, Lines)).toBe("bound")
-      expect(yield* outcome(Plain, one)).toBe("bound")
-    }),
+          Schema.Record(Schema.String, Schema.String),
+          Schema.Unknown,
+        ]
+        for (const element of elements) {
+          expect(yield* outcome(Schema.Array(element), many)).toEqual(any)
+        }
+        // With an edge entity, whatever its model declares.
+        expect(yield* outcome(Schema.Array(Union), many, Lines)).toEqual(any)
+        expect(yield* outcome(Schema.Array(Plain), many, Lines)).toEqual(any)
+        // A `one` edge's value.
+        for (const value of [WithPk, Plain, Union, Schema.suspend(() => WithPk)]) {
+          expect(yield* outcome(value, one)).toEqual(any)
+        }
+        // Stored under the owner's `pk.field` itself, `Other`'s partition key is written after them,
+        // and its text can't be the owner's partition key.
+        expect(yield* outcome(Schema.Array(Plain), many, undefined, "pk")).toBe("bound")
+        expect(yield* outcome(Schema.Array(WithPk), many, Lines, "pk")).toBe("bound")
+      }),
   )
 
-  it.effect("a model field stored under `__edd_e__`: its rows can be of any type", () =>
-    Effect.gen(function* () {
-      const schema = DynamoSchema.make({ name: "mk", version: 1 })
-      const Accounts = Entity.make({
-        model: DynamoModel.configure(Schema.Struct({ id: Schema.String, tag: Schema.String }), {
-          tag: { field: "__edd_e__" },
-        }),
-        entityType: "Account",
-        primaryKey: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: [] },
-        },
-      } as any)
-      const Main = Table.make({ schema, entities: { Accounts } })
-      const Orders = owner(Main, schema, { collection: "account" })
-      expect(
-        yield* binds(
-          { entities: { Accounts }, aggregates: { Orders }, tables: { Main } },
-          Main.layer({ name: "mk" }),
-        ),
-      ).toEqual(
-        refusal(
-          "Accounts",
-          "Order",
-          `its primary key; its attribute "__edd_e__", stored under "__edd_e__"`,
-        ),
-      )
-      // Its type alone collides with none of the aggregate's.
-      const Plain = Entity.make({
-        model: Schema.Struct({ id: Schema.String, tag: Schema.String }),
-        entityType: "Account",
-        primaryKey: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: [] },
-        },
-      } as any)
-      const Again = Table.make({ schema, entities: { Plain } })
-      expect(
-        yield* binds(
-          {
-            entities: { Plain },
-            aggregates: { Orders: owner(Again, schema, { collection: "account" }) },
-            tables: { Again },
+  it.effect(
+    "an entity's rows carry its own type: a model field stored under `__edd_e__` doesn't load",
+    () =>
+      Effect.gen(function* () {
+        const schema = DynamoSchema.make({ name: "mk", version: 1 })
+        // `Entity.make` refuses a model field named or renamed `__edd_e__` (`EDD-9140`), so the bind
+        // check can take an entity's rows to carry its own type.
+        expect(() =>
+          Entity.make({
+            model: DynamoModel.configure(Schema.Struct({ id: Schema.String, tag: Schema.String }), {
+              tag: { field: "__edd_e__" },
+            }),
+            entityType: "Account",
+            primaryKey: {
+              pk: { field: "pk", composite: ["id"] },
+              sk: { field: "sk", composite: [] },
+            },
+          } as any),
+        ).toThrow("[EDD-9140]")
+        // Its type alone collides with none of the aggregate's.
+        const Plain = Entity.make({
+          model: Schema.Struct({ id: Schema.String, tag: Schema.String }),
+          entityType: "Account",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
           },
-          Again.layer({ name: "mk" }),
-        ),
-      ).toBe("bound")
-    }),
+        } as any)
+        const Again = Table.make({ schema, entities: { Plain } })
+        expect(
+          yield* binds(
+            {
+              entities: { Plain },
+              aggregates: { Orders: owner(Again, schema, { collection: "account" }) },
+              tables: { Again },
+            },
+            Again.layer({ name: "mk" }),
+          ),
+        ).toBe("bound")
+      }),
   )
+
+  it("a projection defined again with the same outbox adds no entry to its read model", () => {
+    const schema = DynamoSchema.make({ name: "od", version: 1 })
+    const Tallies = tally()
+    const Target = Table.make({ schema, entities: {} })
+    const Elsewhere = Table.make({ schema, entities: {} })
+    const outboxes = () =>
+      (Tallies as unknown as { readonly _projectionOutboxes: ReadonlyArray<unknown> })
+        ._projectionOutboxes
+    outboxOf(schema, Tallies, { table: Target, pk: "pk", sk: "sk" })
+    outboxOf(schema, Tallies, { table: Target, pk: "pk", sk: "sk" })
+    expect(outboxes()).toHaveLength(1)
+    // Another layout is an entry of its own, and one defined again moves to the end.
+    outboxOf(schema, Tallies, { table: Elsewhere, pk: "pk", sk: "sk" })
+    outboxOf(schema, Tallies, { table: Target, pk: "pk", sk: "sk" })
+    expect(outboxes()).toEqual([
+      expect.objectContaining({ table: Elsewhere }),
+      expect.objectContaining({ table: Target }),
+    ])
+    outboxOf(schema, Tallies, { index: { name: "gsi1", pk: "opk", sk: "osk" } })
+    outboxOf(schema, Tallies, { index: { name: "gsi1", pk: "opk", sk: "osk" } })
+    expect(outboxes()).toHaveLength(3)
+  })
 
   it.effect("a singleton aggregate: a partition key that continues its head can't be it", () =>
     Effect.gen(function* () {
