@@ -653,7 +653,8 @@ describe("GeoSearch", () => {
       },
     })
     const FleetTable = Table.make({
-      schema: DynamoSchema.make({ name: "kc", version: 1 }),
+      // 1.39.0's default, under which the seeded row was written.
+      schema: DynamoSchema.make({ name: "kc", version: 1, escapeKeys: false }),
       entities: { Fleet },
     })
     const FleetGeo = GeoIndex.make({

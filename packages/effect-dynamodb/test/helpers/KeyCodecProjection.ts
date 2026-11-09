@@ -53,7 +53,8 @@ export class Added extends Schema.TaggedClass<Added>()("Added", { amount: Schema
 export class Cancelled extends Schema.TaggedClass<Cancelled>()("Cancelled", {}) {}
 type OrderEvent = Placed | Added | Cancelled
 
-const schema = DynamoSchema.make({ name: "kp", version: 1 })
+/** 1.39.0's default (`escapeKeys` off): the rows these tests seed were written under it. */
+const schema = DynamoSchema.make({ name: "kp", version: 1, escapeKeys: false })
 export const EventsTable = Table.make({ schema, entities: {} })
 export const Orders = EventStore.makeStream({
   table: EventsTable,

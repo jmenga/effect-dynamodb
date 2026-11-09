@@ -28,7 +28,8 @@ export const Prefixed = Schema.String.pipe(
   }),
 )
 
-export const schema = DynamoSchema.make({ name: "kc", version: 1 })
+/** 1.39.0's default (`escapeKeys` off): the rows these tests seed were written under it. */
+export const schema = DynamoSchema.make({ name: "kc", version: 1, escapeKeys: false })
 
 class Doc extends Schema.Class<Doc>("Doc")({
   docId: Prefixed,

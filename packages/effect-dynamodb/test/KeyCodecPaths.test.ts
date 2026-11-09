@@ -321,6 +321,62 @@ describe("a codec inside a wrapper composes the key Entity.put wrote", () => {
 })
 
 /**
+ * With `escapeKeys: true` a time series' event key holds its `orderBy` value's key form, which for
+ * a codec `encode` takes on its own output is the value encoded twice (`#e#x:x:t1`), as `put` keys
+ * it. `history().where()` composes its bound the same way. 1.39.0 composed `x:t1` and found
+ * nothing: `eq("t1")` and `lt("t2")` returned no events.
+ */
+describe("history().where() on a codec orderBy, escapeKeys on", () => {
+  class Reading extends Schema.Class<Reading>("Reading")({
+    sensorId: Schema.String,
+    at: Prefixed,
+    n: Schema.Number,
+  }) {}
+  const Readings = Entity.make({
+    model: Reading,
+    entityType: "Reading",
+    primaryKey: {
+      pk: { field: "pk", composite: ["sensorId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    timeSeries: {
+      orderBy: "at",
+      appendInput: Schema.Struct({ sensorId: Schema.String, at: Prefixed, n: Schema.Number }),
+    },
+  })
+  const OnTable = Table.make({
+    schema: DynamoSchema.make({ name: "on", version: 1, escapeKeys: true }),
+    entities: { Readings },
+  })
+
+  it.effect("finds the events append wrote", () => {
+    const table = makeRecordingTable()
+    return Effect.gen(function* () {
+      const db: any = yield* DynamoClient.make({ entities: { Readings }, tables: { OnTable } })
+      for (const at of ["t1", "t2"]) {
+        yield* db.entities.Readings.append({ sensorId: "s", at, n: 1 }).asEffect()
+      }
+      expect([...table.items.values()].map((row) => row.sk!.S).sort()).toEqual([
+        "$on#v1#reading",
+        "$on#v1#reading#e#x:x:t1",
+        "$on#v1#reading#e#x:x:t2",
+      ])
+      const where = (f: (t: any, ops: any) => unknown) =>
+        db.entities.Readings.history({ sensorId: "s" }).where(f).collect() as Effect.Effect<
+          ReadonlyArray<Reading>
+        >
+      const ats = (events: ReadonlyArray<Reading>) => events.map((event) => event.at)
+      expect(ats(yield* where((t, { eq }) => eq(t.at, "t1")))).toEqual(["t1"])
+      expect(ats(yield* where((t, { lt }) => lt(t.at, "t2")))).toEqual(["t1"])
+      expect(ats(yield* where((t, { gte }) => gte(t.at, "t2")))).toEqual(["t2"])
+    }).pipe(
+      Effect.provide(OnTable.layer({ name: "t" })),
+      Effect.provide(table.layer),
+    ) as Effect.Effect<void, unknown>
+  })
+})
+
+/**
  * The rows published 1.39.0 wrote (`fixtures/key-codec-1.39.0.json`, `helpers/KeyCodecShapes.ts`),
  * seeded on a recording table: every read that composes a key from a caller's values finds them,
  * and `put` and the other writes store them byte for byte as 1.39.0 did.
