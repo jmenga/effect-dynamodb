@@ -151,8 +151,8 @@ type Create = Parameters<typeof RootAggregate.create>[0]
 
 /**
  * A many edge whose element is a union: a nested union of two members wrapping the entity, one of
- * them with a nullable discriminator, and a member sharing a discriminator that declares the
- * entity's field a string and an id field of its own.
+ * them with a nullable discriminator, a member sharing a discriminator that declares the entity's
+ * field a string and an id field of its own, and a member declaring neither.
  */
 const UnionSheet = Schema.Union([
   Schema.Union([
@@ -173,6 +173,7 @@ const UnionSheet = Schema.Union([
     numberLineId: Schema.String,
     qty: Schema.Number,
   }),
+  Schema.Struct({ kind: Schema.Literal("c"), qty: Schema.Number }),
 ])
 class UnionRoot extends Schema.Class<UnionRoot>("UnionRoot")({
   id: Schema.String,
@@ -286,6 +287,7 @@ describe("an aggregate's create takes what it takes at run time", () => {
         { kind: "b", qty: 3 },
         { kind: "b", numberLineId: 1, qty: 4 },
         { kind: "a", numberLine: "KEEP", numberLineId: "l", qty: 5 },
+        { kind: "c", qty: 6 },
       ],
     } as const).toExtend<UnionCreate>()
   })
@@ -317,5 +319,7 @@ function _refusals(input: Record<string, unknown>): void {
   RootAggregate.create(input)
   // @ts-expect-error — no member of the union element takes a string in `numberLine` for kind "b"
   UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberLine: "x", qty: 1 }] })
+  // @ts-expect-error — a member declaring neither the entity's field nor its id takes no id, as the input schema refuses one
+  UnionAggregate.create({ id: "a", sheets: [{ kind: "c", numberLineId: 1, qty: 1 }] })
 }
 void _refusals
