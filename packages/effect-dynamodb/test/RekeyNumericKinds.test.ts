@@ -174,7 +174,11 @@ describe("rekey moves rows under the other numeric kind's text (EDD-9128)", () =
   )
 })
 
-describe("rekey reports a many edge's rows that read back as one element (EDD-9128)", () => {
+// Edges 3 and 3n, two elements on 1.39.0, read back as one value once a kind is declared: they
+// compose one sort key, which a write refuses. Whether two rows are one element's can't be told
+// from what's stored, so the aggregate is `failed` with that refusal, as 1.39.0 fails elements
+// composing one sort key.
+describe("rekey fails an aggregate whose many edge's rows read back as one element (EDD-9128)", () => {
   type EdgeRow = Record<string, { readonly S?: string; readonly N?: string }>
   /** What published 1.39.0 stored for edges 3 and 3n, and for -3n alone: `gen-colliding-edges.mjs`. */
   const edgeRows = JSON.parse(
@@ -221,12 +225,12 @@ describe("rekey reports a many edge's rows that read back as one element (EDD-91
   const B = (digits: string) => digits.padStart(38, "0")
 
   for (const escapeKeys of [false, true]) {
-    for (const [declared, Kind, stored, current] of [
-      ["Schema.Number", Schema.Number, B("3"), N(3)],
-      ["Schema.BigInt", Schema.BigInt, N(3), B("3")],
+    for (const [declared, Kind, current] of [
+      ["Schema.Number", Schema.Number, N(3)],
+      ["Schema.BigInt", Schema.BigInt, B("3")],
     ] as const) {
       it.effect(
-        `declared ${declared}, escapeKeys ${escapeKeys}: both rows are left, as bothKeys`,
+        `declared ${declared}, escapeKeys ${escapeKeys}: both rows are left, and the aggregate failed`,
         () => {
           const { table, run } = edges(Kind, escapeKeys)
           const both = (rows: ReadonlyArray<unknown>) =>
@@ -239,10 +243,13 @@ describe("rekey reports a many edge's rows that read back as one element (EDD-91
               expect(report.conflicts).toEqual([
                 expect.objectContaining({
                   member: "Root",
-                  reason: "bothKeys",
-                  key: { pk: "$edges#v1#roots#both", sk: `$edges#v1#line#${stored}` },
-                  target: { pk: "$edges#v1#roots#both", sk: `$edges#v1#line#${current}` },
-                  message: expect.stringContaining("read back as one element"),
+                  kind: "aggregate",
+                  reason: "failed",
+                  message:
+                    `AggregateDecompositionError: "lines" and "lines" both compose the sort key ` +
+                    `"$edges#v1#line#${current}", so one would overwrite the other. Give the ` +
+                    `"lines" edge a declared sort key naming attributes that differ between its ` +
+                    `elements: lines: Aggregate.many({ …, sk: { composite: [...] } }).`,
                 }),
               ])
             }),

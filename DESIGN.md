@@ -1005,9 +1005,13 @@ aggregate's partition (`holdsPartition`) and a `many` edge's rows (`oldPosition`
 row tombstone or outbox item holds no values, so its key is read with each numeric composite as
 either kind when the declared reading fits nothing: each composite takes the kind whose value
 composes its own text again (`readAsOtherNumericKind`, `KeyText136.readIndexKeys`). Two items whose
-values read back as one item (`3` and `3n`) are the conflict `bothKeys`, and both are left; so are
-two rows of an aggregate's `many` edge that read back as one element, reported before anything is
-placed (`locateRows`). A key with no numeric composite has one reading, and nothing changes for it.
+values read back as one item (`3` and `3n`) are the conflict `bothKeys`, and both are left. Two rows
+of an aggregate's `many` edge that read back as one element compose one sort key, which the
+decomposition refuses, as it does for a write: the aggregate is `failed` with that reason and
+nothing moves, as 1.39.0 fails any elements composing one sort key. Whether such rows are one
+element's or two elements' can't be told from what's stored: a changed sort key declaration, a
+setting change and a kind change can each leave two rows under texts of one key. A key with no
+numeric composite has one reading, and nothing changes for it.
 
 The search costs nothing on a clean run, and never one composition per combination of kinds. A
 stored key that is its current text is never looked for under another: one composition, as before.

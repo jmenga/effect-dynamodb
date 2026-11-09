@@ -1972,7 +1972,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     if (storedAt.has(positionOf(pk, sk))) return { pk, sk: pk === pkNow ? skOther : sk }
     // A sort key holding a numeric composite's other kind's text. Looked for only for a row at
     // neither key: one at its current key under the other kind's text too would have been read
-    // back as a second element, which `rekey` reports before placing anything (`bothKeys`).
+    // back as a second element composing that key, which the decomposition refuses.
     return { pk, sk: otherKind(pk) ?? skOther }
   }
 
@@ -2041,37 +2041,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
       })),
       (position) => storedAt.has(position),
     )
-    // Elements composing one sort key: rows of one element stored under two keys, each read back
-    // as an element of its own (a field that stored both numeric kinds, now one). Each is reported
-    // once, at the other row's key, and nothing is placed.
-    const seen = new Set<string>()
-    return rows.flatMap((row, r) => {
-      const at = positionOf(row.current.pk, row.current.sk)
-      const collided = rows.some(
-        (other, o) => o !== r && positionOf(other.current.pk, other.current.sk) === at,
-      )
-      if (collided && seen.has(at)) return []
-      seen.add(at)
-      const old =
-        collided &&
-        (positionOf(row.old.pk, row.old.sk) === at ||
-          !storedAt.has(positionOf(row.old.pk, row.old.sk)))
-          ? {
-              pk: row.old.pk,
-              sk: row.item.otherKindSortKey?.(sortKeysIn(row.old.pk, row.current.sk)) ?? row.old.sk,
-            }
-          : row.old
-      return [
-        {
-          ...row,
-          old,
-          collided,
-          placement: placements[r]!,
-          atCurrent: storedAt.get(at),
-          atOld: storedAt.get(positionOf(old.pk, old.sk)),
-        },
-      ]
-    })
+    return rows.map((row, r) => ({
+      ...row,
+      placement: placements[r]!,
+      atCurrent: storedAt.get(positionOf(row.current.pk, row.current.sk)),
+      atOld: storedAt.get(positionOf(row.old.pk, row.old.sk)),
+    }))
   }
 
   const updateCore = (
@@ -2365,7 +2340,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootEncoders,
           aggregateName,
           config.schema,
-          "keep",
         )
         const rows = locateRows(
           groups,
@@ -2375,7 +2349,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           from,
         )
         const doubled = rows.filter(
-          (row) => row.collided || row.placement === "both" || row.placement === "ambiguous",
+          (row) => row.placement === "both" || row.placement === "ambiguous",
         )
         if (doubled.length > 0) {
           // In one partition, a move during the read shows a row at both keys too: it's
@@ -2397,10 +2371,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
               reason: "bothKeys" as const,
               key: { [config.pk.field]: row.old.pk, sk: row.old.sk },
               target: { [config.pk.field]: row.current.pk, sk: row.current.sk },
-              message: row.collided
-                ? "Rows stored under two keys read back as one element, each key its text under " +
-                  "one numeric kind or setting: the aggregate is left as it is."
-                : row.placement === "both"
+              message:
+                row.placement === "both"
                   ? "The row is also stored under its current key: the aggregate is left as it is."
                   : "Its rows' keys overlap across key text, and which row is stored under which " +
                     "key can't be told from the keys held: the aggregate is left as it is.",
@@ -4329,11 +4301,6 @@ const decomposeAggregate = (
   encoders: NodeEncoders,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
-  /**
-   * `"keep"` returns items that compose one sort key, for `rekey` to report: rows of one element
-   * stored under two keys read back as two elements (`locateRows`).
-   */
-  collisions: "refuse" | "keep" = "refuse",
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
@@ -4403,7 +4370,7 @@ const decomposeAggregate = (
     // decode it and the collision reaches the caller as an opaque client error.
     // Catch it here, where the edge that produced it is still known (#103).
     const seen = new Map<string, DecomposedItem>()
-    for (const item of collisions === "keep" ? [] : items) {
+    for (const item of items) {
       const sk = composeKey(schema, item.entityType, [...item.skComposites])
       const prior = seen.get(sk)
       if (prior !== undefined) {
