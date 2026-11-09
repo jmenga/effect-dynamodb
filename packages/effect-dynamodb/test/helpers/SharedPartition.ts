@@ -4,6 +4,10 @@
  * generated once from the published package: don't regenerate or "fix" it). Shared by the unit
  * suite (an in-memory table) and the connected one (DynamoDB Local).
  *
+ * No owner here declares `ownsRows` (DESIGN.md §7 "Which rows in its partition are an aggregate's"),
+ * so each step is 1.39.0's. An aggregate that declares it is refused at bind (`EDD-9130`) beside
+ * another owner of its entity type in its partition (`AggregateOwnsRows.test.ts`).
+ *
  * - `many`: two aggregates sharing a partition and a `many` edge's entity type, each `assemble`
  *   filtering its own rows, with a custom `decompose` handing each element back.
  * - `one`: the same with `one` edges told apart by static discriminators, no custom `decompose`.
@@ -25,10 +29,9 @@
  *
  * And against `fixtures/aggregate-decompose-rename-1.39.0.json`, generated the same way, a custom
  * `decompose` renaming a transformed field (`{ lid, f, note }` stored as `{ lid, g: f, note }`), keyed
- * by `lid`: `g` is no field of the element, so it's stored as given, and neither reading recomposes
- * the row stored. As read, the reading 1.39.0 took, a row is the edge's by its key, so `update`
- * deletes it and `rekey` moves it, as 1.39.0 did. Kinds `x10`, `nested`, `text`; an edge, one with an
- * `entity`, one of a sub-aggregate.
+ * by `lid`: `g` is no field of the element, so it's stored as given. `update` deletes the row and
+ * `rekey` moves it, as 1.39.0 did. Kinds `x10`, `nested`, `text`; an edge, one with an `entity`, one
+ * of a sub-aggregate.
  *
  * And against `fixtures/aggregate-foreign-rows-1.39.0.json`, generated the same way, rows another
  * aggregate holds:
@@ -36,8 +39,8 @@
  * - `content fallback same` / `different`: A's field multiplies by 10 as it reads, with a decompose
  *   handing each element back, so A's 50 is stored at key 500 and its key as written is 5000, where
  *   B's plain 5000 is. B's 5000 encodes to the 500 A would store there, and the row is still B's.
- * - `concurrent replace`: A's decompose divides by 10, so its row is at key 50 and reads by key as
- *   written alone; B's update puts its own row at that key after A's update read it.
+ * - `concurrent replace`: A's decompose divides by 10, so its row is at key 50, a key its value as
+ *   read doesn't compose; B's update puts its own row at that key after A's update read it.
  * - `three owners`: three aggregates' rows in an escaping sort-key chain, each row's new key another
  *   row's current one, rekeyed in every scan order.
  *
@@ -48,12 +51,11 @@
  *   key 500, and B's 500 at key 5000: A's key as written, holding byte for byte what A would write.
  * - `decimal 0.100` / `decimal 0.10000000000000001`: the same, B's decompose storing `payload` spelled
  *   so, where A's is 0.1 (DynamoDB Local stores `0.100` as `0.1`).
- * - `guard narrow` / `guard wide`: A's decompose divides by 10, so its row is at key 50, A's by its
- *   content alone; B's update puts its own line there, adding `z_owner`, a field of both models.
- *   `wide`: 160 more string fields, too many to prove the row unchanged in one condition.
+ * - `guard narrow` / `guard wide`: A's decompose divides by 10, so its row is at key 50, a key its
+ *   value as read doesn't compose; B's update puts its own line there, adding `z_owner`, a field of
+ *   both models. `wide`: 160 more string fields.
  *
- * The other owner's rows are compared byte for byte after every step: no write of one owner may
- * delete, move or rewrite them.
+ * Every step's rows, requests and results are compared with what 1.39.0 stored, sent and returned.
  */
 
 import { readFileSync } from "node:fs"
@@ -1056,7 +1058,9 @@ export const sharedPartitionSuite = (backend: Backend) => {
   }
 
   describe("two aggregates that both hold one row", () => {
-    it.effect("rekey moves it once, and a dry run counts it once", () =>
+    // `Line` is shared, so each moves it as 1.39.0 did: a dry run counts it under each aggregate,
+    // and a real run moves it once, the second finding it already at its current key.
+    it.effect("rekey moves it once, and a dry run counts it under each, as 1.39.0 did", () =>
       Effect.gen(function* () {
         const w = yield* world(backend, overlapDefine, { name: "ownership" })
         yield* w.run((db) =>
@@ -1089,8 +1093,8 @@ export const sharedPartitionSuite = (backend: Backend) => {
           if (Exit.isFailure(done.exit)) throw new Error(String(done.exit.cause))
           const report: any = done.exit.value
           expect(report.conflicts).toEqual([])
-          expect(moved(report)).toBe(3)
-          expect(report.unchanged).toBe(0)
+          expect(moved(report)).toBe(dryRun ? 4 : 3)
+          expect(report.unchanged).toBe(dryRun ? 0 : 1)
           expect(done.rows).toEqual(
             dryRun
               ? created
@@ -1619,7 +1623,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
 
         for (const dryRun of [true, false]) {
           const name = `rekey${dryRun ? " dry run" : ""}`
-          it.effect(`${scenario}: ${name} moves every row, as stored`, () =>
+          it.effect(`${scenario}: ${name} moves every row, as 1.39.0 did`, () =>
             Effect.gen(function* () {
               const w = yield* world(backend, renameDefine(kind, shape), {
                 name: "rename",
@@ -1634,22 +1638,11 @@ export const sharedPartitionSuite = (backend: Backend) => {
               expect(reportOf(done.exit)).toEqual(expected.report)
               if (backend.local)
                 expect(unordered(done.commands)).toEqual(unordered(expected.commands))
-              // Each row as it was stored, under the new partition key. 1.39.0 wrote the edge's rows
-              // from their value decoded once more (`g` 500 became 5000), so they read otherwise.
-              expect(done.rows).toEqual(
-                byKey(
-                  dryRun
-                    ? created
-                    : created.map((row) => ({
-                        ...row,
-                        pk: { S: row.pk!.S!.replace("#p q", "#p%20q") },
-                      })),
-                ),
-              )
-              expect(byKey(expected.rows).map((row) => [row.pk, row.sk])).toEqual(
-                done.rows.map((row) => [row.pk, row.sk]),
-              )
-              if (!dryRun) expect(yield* read(w)).toEqual(atRenamed(scenario, "create get"))
+              // A row the decomposition places moves as on 1.39.0: written from the value read,
+              // decoded once more (`g` 500 became 5000), so it reads otherwise (decision A: the
+              // next major hands `decompose` decoded values).
+              expect(done.rows).toEqual(byKey(expected.rows))
+              if (!dryRun) expect(yield* read(w)).toEqual(expected.get)
               yield* w.opened.close
             }),
           )
@@ -1742,48 +1735,6 @@ export const sharedPartitionSuite = (backend: Backend) => {
     const created = atForeign(scenario, "created").rows
     const lineOf = (owner: string) => (row: Row) =>
       row.__edd_e__?.S === "Line" && row.note?.S === owner
-    /**
-     * A's removal as 1.39.0 sent it, but for the row's Delete: 1.39.0 deleted the key as read (5),
-     * where no row is. The row is A's by its key as written (50) and by what it holds, so its Delete
-     * is on condition that it still holds what was read.
-     */
-    const removal = (sent139: ReadonlyArray<Request>): ReadonlyArray<Request> => {
-      const [query, write] = named(sent139) as ReadonlyArray<Request>
-      return [
-        query!,
-        {
-          command: "TransactWriteItems",
-          input: {
-            TransactItems: [
-              write!.input.TransactItems[0],
-              {
-                Delete: {
-                  TableName: "t",
-                  Key: {
-                    pk: { S: "$concurrent#v1#shared#p" },
-                    sk: { S: "$concurrent#v1#line#0000000000000050" },
-                  },
-                  ConditionExpression:
-                    "attribute_exists(#gpk) AND #g0 = :g0 AND #g1 = :g1 AND #g2 = :g2",
-                  ExpressionAttributeNames: {
-                    "#gpk": "pk",
-                    "#g0": "__edd_e__",
-                    "#g1": "f",
-                    "#g2": "note",
-                  },
-                  ExpressionAttributeValues: {
-                    ":g0": { S: "Line" },
-                    ":g1": { N: "5" },
-                    ":g2": { S: "a" },
-                  },
-                },
-              },
-            ],
-          },
-        },
-      ]
-    }
-
     it.effect("B's update puts its row at the key, as 1.39.0 did", () =>
       Effect.gen(function* () {
         const w = yield* world(backend, concurrentDefine, { name: "concurrent", seed: created })
@@ -1801,8 +1752,10 @@ export const sharedPartitionSuite = (backend: Backend) => {
       }),
     )
 
-    // 1.39.0 deleted the key as read (5), where no row is, and left A's row at 50 for good.
-    it.effect("removing A's element deletes A's row, on condition it's still the row read", () =>
+    // `Line` is shared by A and B, so A's update is 1.39.0's: it deletes the key as read (5),
+    // where no row is, and leaves A's row at 50 (DESIGN.md §7 "Which rows in its partition are an
+    // aggregate's": a shared type's stale rows stay).
+    it.effect("removing A's element sends what 1.39.0 sent, and A's row stays", () =>
       Effect.gen(function* () {
         const w = yield* world(backend, concurrentDefine, { name: "concurrent", seed: created })
         const done = yield* w.step((db) =>
@@ -1810,36 +1763,32 @@ export const sharedPartitionSuite = (backend: Backend) => {
         )
         const expected = atForeign(scenario, "remove a")
         expect(done.result).toEqual(expected.result)
-        expect(done.rows).toEqual(byKey(created.filter((row) => !lineOf("a")(row))))
-        expect(done.requests).toEqual(removal(expected.requests!))
+        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.rows).toEqual(byKey(expected.rows))
+        expect(done.rows).toContainEqual(created.find(lineOf("a")))
         yield* w.opened.close
       }),
     )
 
-    it.effect(
-      "B's row, put at the key after A's update read it, is kept, and A's update runs again",
-      () =>
-        Effect.gen(function* () {
-          const w = yield* world(backend, concurrentDefine, { name: "concurrent", seed: created })
-          const taken = atForeign(scenario, "b takes the key").rows.find(lineOf("b"))!
-          w.hooks.before = (command) => {
-            if (command !== "TransactWriteItems") return undefined
-            w.hooks.before = undefined
-            return w.opened.put(taken)
-          }
-          const done = yield* w.step((db) =>
-            db.aggregates.A.update({ id: "p" }, ({ state }: any) => ({ ...state, lines: [] })),
-          )
-          const expected = atForeign(scenario, "race remove a")
-          expect(done.result).toEqual(expected.result)
-          expect(done.rows).toEqual(byKey(expected.rows))
-          expect(done.rows).toContainEqual(taken)
-          // The guarded removal fails on B's row, and the update reads again: A holds no row now, so
-          // there's nothing left to write.
-          const [query] = named(expected.requests) as ReadonlyArray<Request>
-          expect(done.requests).toEqual([...removal(expected.requests!), query])
-          yield* w.opened.close
-        }),
+    it.effect("B's row, put at the key after A's update read it, is kept, as 1.39.0 kept it", () =>
+      Effect.gen(function* () {
+        const w = yield* world(backend, concurrentDefine, { name: "concurrent", seed: created })
+        const taken = atForeign(scenario, "b takes the key").rows.find(lineOf("b"))!
+        w.hooks.before = (command) => {
+          if (command !== "TransactWriteItems") return undefined
+          w.hooks.before = undefined
+          return w.opened.put(taken)
+        }
+        const done = yield* w.step((db) =>
+          db.aggregates.A.update({ id: "p" }, ({ state }: any) => ({ ...state, lines: [] })),
+        )
+        const expected = atForeign(scenario, "race remove a")
+        expect(done.result).toEqual(expected.result)
+        expect(done.requests).toEqual(named(expected.requests))
+        expect(done.rows).toEqual(byKey(expected.rows))
+        expect(done.rows).toContainEqual(taken)
+        yield* w.opened.close
+      }),
     )
   })
 
@@ -1856,85 +1805,44 @@ export const sharedPartitionSuite = (backend: Backend) => {
     })
     const lid = (owner: string, rows: ReadonlyArray<Row>) =>
       rows.find((row) => row.owner?.S === owner)?.sk?.S?.split("#line#")[1]
-    // Each run judges a destination by the rows it read: a row an earlier move in the same run took
-    // away still holds its key, so a real run moves what its dry run names, in any scan order.
+    // `Line` is shared by the three, so each run is 1.39.0's. A dry run names the one link that
+    // can move. A real run moves it, and, where an aggregate reads the partition after another's
+    // move in the same run, the next link too: rows are handled concurrently, so how many links one
+    // run moves depends on timing, on 1.39.0 as here. Run again until nothing moves: every row is
+    // then under its new key.
     for (const order of ["abc", "acb", "bac", "bca", "cab", "cba"]) {
-      it.effect(
-        `scanned ${order}: each run moves the one link its dry run names, as 1.39.0 did`,
-        () =>
-          Effect.gen(function* () {
-            const w = yield* world(backend, chainDefine, {
-              name: "chain",
-              escapeKeys: true,
-              seed: created,
-              scanOrder: (row) => order.indexOf(ownerOf(row)),
-            })
-            const dry = yield* w.step((db) => db.tables.Main.rekey({ dryRun: true }))
-            const expectedDry = atForeign(scenario, `rekey ${order} dry run`)
-            expect(inOrder(reportOf(dry.exit))).toEqual(inOrder(expectedDry.report))
-            expect(dry.rows).toEqual(byKey(created))
-
-            // C's row moves; A's and B's are blocked, each by the row at its new key.
-            const real = yield* w.step((db) => db.tables.Main.rekey({}))
-            const expected = atForeign(scenario, `rekey ${order}`)
-            expect(inOrder(reportOf(real.exit))).toEqual(inOrder(expected.report))
-            expect(inOrder(reportOf(real.exit))).toEqual(inOrder(reportOf(dry.exit)))
-            if (backend.local)
-              expect(unordered(real.commands)).toEqual(unordered(expected.commands))
-            expect(real.rows).toEqual(byKey(expected.rows))
-
-            // A run again moves the next link, B's, into the key C's row left.
-            const again = yield* w.step((db) => db.tables.Main.rekey({}))
-            expect(inOrder(reportOf(again.exit))).toEqual(inOrder(expected.again.report))
-            expect(again.rows).toEqual(byKey(expected.again.rows))
-
-            // Then A's. Each row is then under its new key, and an old key holding the next link's
-            // row is reported as both keys held, from then on, as 1.39.0 reports it.
-            const third = yield* w.step((db) => db.tables.Main.rekey({}))
-            expect(inOrder(reportOf(third.exit))).toEqual(inOrder(expected.third.report))
-            expect(third.rows).toEqual(byKey(expected.third.rows))
-            const done = yield* w.step((db) => db.tables.Main.rekey({}))
-            expect(inOrder(reportOf(done.exit))).toEqual(inOrder(expected.fourth.report))
-            expect(done.rows).toEqual(byKey(expected.fourth.rows))
-            expect(["a", "b", "c"].map((owner) => lid(owner, done.rows))).toEqual([
-              "x%20y",
-              "x%2520y",
-              "x%252520y",
-            ])
-            for (const owner of ["A", "B", "C"]) {
-              const read: any = resultOf(
-                yield* w.run((db) => db.aggregates[owner].get({ id: "p" })),
-              )
-              expect(read.ok.lines).toHaveLength(1)
-            }
-            yield* w.opened.close
-          }),
-      )
-    }
-
-    // Two links: A's new key is B's row. B scanned first used to move, and then A into the key it
-    // left, in one run whose dry run named one move.
-    for (const order of ["ab", "ba"]) {
-      it.effect(`two links, scanned ${order}: a run moves what its dry run names`, () =>
+      it.effect(`scanned ${order}: runs move the chain link by link, as 1.39.0 did`, () =>
         Effect.gen(function* () {
           const w = yield* world(backend, chainDefine, {
             name: "chain",
             escapeKeys: true,
-            seed: created.filter((row) => ownerOf(row) !== "c"),
+            seed: created,
             scanOrder: (row) => order.indexOf(ownerOf(row)),
           })
           const dry = yield* w.step((db) => db.tables.Main.rekey({ dryRun: true }))
-          const real = yield* w.step((db) => db.tables.Main.rekey({}))
-          expect(reportOf(real.exit)).toEqual(reportOf(dry.exit))
-          expect(reportOf(real.exit)).toMatchObject({
-            moved: 1,
-            conflicts: [{ member: "Roota", reason: "bothKeys" }],
-          })
-          expect(["a", "b"].map((owner) => lid(owner, real.rows))).toEqual(["x y", "x%2520y"])
-          const again = yield* w.step((db) => db.tables.Main.rekey({}))
-          // A's move puts its row at B's old key: B, read after it, isn't held there.
-          expect(reportOf(again.exit)).toMatchObject({ moved: 1, conflicts: [] })
-          expect(["a", "b"].map((owner) => lid(owner, again.rows))).toEqual(["x%20y", "x%2520y"])
+          const expectedDry = atForeign(scenario, `rekey ${order} dry run`)
+          expect(inOrder(reportOf(dry.exit))).toEqual(inOrder(expectedDry.report))
+          expect(dry.rows).toEqual(byKey(created))
+
+          let moved = 0
+          for (let run = 0; run < 4; run++) {
+            const next = yield* w.step((db) => db.tables.Main.rekey({}))
+            const report = reportOf(next.exit)
+            expect(report.moved).toBeGreaterThanOrEqual(run < 3 && moved < 3 ? 1 : 0)
+            moved += report.moved
+          }
+          expect(moved).toBe(3)
+          const done = byKey(yield* w.opened.rows)
+          expect(done).toEqual(byKey(atForeign(scenario, `rekey ${order}`).fourth.rows))
+          expect(["a", "b", "c"].map((owner) => lid(owner, done))).toEqual([
+            "x%20y",
+            "x%2520y",
+            "x%252520y",
+          ])
+          for (const owner of ["A", "B", "C"]) {
+            const read: any = resultOf(yield* w.run((db) => db.aggregates[owner].get({ id: "p" })))
+            expect(read.ok.lines).toHaveLength(1)
+          }
           yield* w.opened.close
         }),
       )
@@ -1982,7 +1890,8 @@ export const sharedPartitionSuite = (backend: Backend) => {
             const done = yield* w.step((db) => db.tables.Main.rekey({ dryRun }))
             const expected = atClaimed(scenario, `rekey a${dryRun ? " dry run" : ""}`)
             expect(reportOf(done.exit)).toEqual(expected.report)
-            expect(reportOf(done.exit)).toMatchObject({ moved: 2, conflicts: [] })
+            if (backend.local)
+              expect(unordered(done.commands)).toEqual(unordered(expected.commands))
             expect(done.rows).toEqual(byKey(expected.rows))
             expect(others(done.rows, (row) => !ofB(row))).toEqual(
               others(created, (row) => !ofB(row)),
@@ -1994,13 +1903,13 @@ export const sharedPartitionSuite = (backend: Backend) => {
     })
   }
 
-  // A's decompose divides by 10, so its row, at key 50, is A's by its content alone. B's update puts
-  // its own line there, adding `z_owner`, which both models declare.
+  // A's decompose divides by 10, so its row is at key 50, which its value as read (500) doesn't
+  // key. B's update puts its own line there, adding `z_owner`, which both models declare.
   for (const [scenario, wide] of [
     ["guard narrow", 0],
     ["guard wide", 160],
   ] as const) {
-    describe(`${scenario}: a row only its content made A's is written to only while it's whole`, () => {
+    describe(`${scenario}: A's row is at a key its value as read doesn't key`, () => {
       const created = atClaimed(scenario, "created").rows
       const lineKey = "$guard#v1#line#0000000000000050"
       const taken = atClaimed(scenario, "b takes the key").rows.find(
@@ -2036,102 +1945,70 @@ export const sharedPartitionSuite = (backend: Backend) => {
         }),
       )
 
+      // `Line` is shared by A and B, so A's update is 1.39.0's: it deletes the key as read (5),
+      // where no row is, and A's row at 50 stays.
+      it.effect("removing A's element sends what 1.39.0 sent, and A's row stays", () =>
+        Effect.gen(function* () {
+          const w = yield* world(backend, guardDefine(["a", "b"], wide), {
+            name: "guard",
+            seed: created,
+          })
+          const done = yield* w.step((db) =>
+            db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
+          )
+          const expected = atClaimed(scenario, "remove a")
+          expect(done.result).toEqual(expected.result)
+          expect(done.requests).toEqual(named(expected.requests))
+          expect(done.rows).toEqual(byKey(expected.rows))
+          expect(done.rows.map((row) => row.sk?.S)).toContain(lineKey)
+          yield* w.opened.close
+        }),
+      )
+
       it.effect(
-        wide === 0
-          ? "removing A's element deletes A's row, on condition it's whole as read"
-          : "removing A's element leaves A's row, too wide to prove unchanged, as 1.39.0 left it",
+        "B's line, put at the key after A's update read it, is kept, as 1.39.0 kept it",
         () =>
           Effect.gen(function* () {
             const w = yield* world(backend, guardDefine(["a", "b"], wide), {
               name: "guard",
               seed: created,
             })
+            w.hooks.before = (command) => {
+              if (command !== "TransactWriteItems") return undefined
+              w.hooks.before = undefined
+              return w.opened.put(taken)
+            }
             const done = yield* w.step((db) =>
               db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
             )
-            const expected = atClaimed(scenario, "remove a")
+            const expected = atClaimed(scenario, "race remove a")
             expect(done.result).toEqual(expected.result)
-            const deletes = done.requests.flatMap((request) =>
-              ((request.input.TransactItems ?? []) as ReadonlyArray<any>).flatMap((item) =>
-                item.Delete === undefined ? [] : [item.Delete],
-              ),
-            )
-            if (wide === 0) {
-              // 1.39.0 deleted the key as read (5), where no row is, and left A's row for good.
-              expect(done.rows).toEqual(
-                byKey(expected.rows.filter((row: Row) => row.sk?.S !== lineKey)),
-              )
-              const [guard] = deletes.filter((del) => del.Key.sk.S === lineKey)
-              expect(guard.ConditionExpression).toContain("attribute_not_exists(#ga0)")
-              expect(Object.values(guard.ExpressionAttributeNames)).toContain("z_owner")
-            } else {
-              // 1.39.0 also sent a Delete of the key as read (5), where no row is.
-              expect(done.rows).toEqual(byKey(expected.rows))
-              expect(deletes.map((del) => del.Key.sk.S)).not.toContain(lineKey)
-            }
+            expect(done.requests).toEqual(named(expected.requests))
+            expect(done.rows).toEqual(byKey(expected.rows))
+            expect(done.rows).toContainEqual(taken)
             yield* w.opened.close
           }),
       )
 
-      it.effect("B's line, put at the key after A's update read it, is kept", () =>
-        Effect.gen(function* () {
-          const w = yield* world(backend, guardDefine(["a", "b"], wide), {
-            name: "guard",
-            seed: created,
-          })
-          w.hooks.before = (command) => {
-            if (command !== "TransactWriteItems") return undefined
-            w.hooks.before = undefined
-            return w.opened.put(taken)
-          }
-          const done = yield* w.step((db) =>
-            db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
-          )
-          const expected = atClaimed(scenario, "race remove a")
-          expect(done.result).toEqual(expected.result)
-          expect(done.rows).toEqual(byKey(expected.rows))
-          expect(done.rows).toContainEqual(taken)
-          // Narrow, the guarded Delete fails on B's row and the update reads again; wide, nothing
-          // proves the row unchanged, so it's never deleted, as on 1.39.0.
-          expect(done.commands).toEqual(
-            wide === 0 ? ["Query", "TransactWriteItems", "Query"] : ["Query", "TransactWriteItems"],
-          )
-          yield* w.opened.close
-        }),
-      )
-
+      // 1.39.0 found no row at the key as read and moved the root alone, leaving the line in the
+      // old partition (DESIGN.md §7 "Which rows in its partition are an aggregate's": without
+      // `ownsRows`, a row the value doesn't key stays).
       for (const dryRun of [true, false]) {
-        it.effect(
-          wide === 0
-            ? `rekey of A${dryRun ? ", dry run" : ""}: its row moves with it`
-            : `rekey of A${dryRun ? ", dry run" : ""}: the row too wide to prove unchanged is reported, and nothing moves`,
-          () =>
-            Effect.gen(function* () {
-              const w = yield* world(backend, guardDefine(["a"], wide), {
-                name: "guard",
-                escapeKeys: true,
-                seed: created,
-              })
-              const done = yield* w.step((db) => db.tables.Main.rekey({ dryRun }))
-              if (wide === 0) {
-                // 1.39.0 found no row at the key as read, and moved the root alone.
-                expect(atClaimed(scenario, "rekey a").report).toMatchObject({ moved: 1 })
-                expect(reportOf(done.exit)).toMatchObject({ moved: 2, conflicts: [] })
-              } else {
-                expect(reportOf(done.exit)).toMatchObject({
-                  moved: 0,
-                  conflicts: [
-                    {
-                      member: "Roota",
-                      reason: "failed",
-                      key: { pk: "$guard#v1#shared#p q", sk: lineKey },
-                    },
-                  ],
-                })
-                expect(done.rows).toEqual(byKey(created))
-              }
-              yield* w.opened.close
-            }),
+        it.effect(`rekey of A${dryRun ? ", dry run" : ""}: the root moves alone, as 1.39.0`, () =>
+          Effect.gen(function* () {
+            const w = yield* world(backend, guardDefine(["a"], wide), {
+              name: "guard",
+              escapeKeys: true,
+              seed: created,
+            })
+            const done = yield* w.step((db) => db.tables.Main.rekey({ dryRun }))
+            const expected = atClaimed(scenario, `rekey a${dryRun ? " dry run" : ""}`)
+            expect(reportOf(done.exit)).toEqual(expected.report)
+            if (backend.local)
+              expect(unordered(done.commands)).toEqual(unordered(expected.commands))
+            expect(done.rows).toEqual(byKey(expected.rows))
+            yield* w.opened.close
+          }),
         )
       }
     })

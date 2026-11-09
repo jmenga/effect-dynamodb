@@ -362,12 +362,22 @@ export const makeEngine = (config: EngineConfig) => {
     }
   }
 
+  // An outbox on the row table: its items are rows of the read model's partitions, which an
+  // aggregate declaring `ownsRows` is checked against at bind (DESIGN.md §7 "Which rows in its
+  // partition are an aggregate's"), with the index keys it writes on them.
+  if (config.outbox !== undefined && config.outbox.table === undefined) {
+    ;(readModel as { _projectionOutboxHere?: unknown })._projectionOutboxHere = {
+      index: config.outbox.index,
+    }
+  }
+
   // An outbox on another table: that table's `rekey` moves its items (#171).
   if (config.outbox?.table !== undefined) {
     ;(readModel as { _projectionOutbox?: unknown })._projectionOutbox = {
       table: config.outbox.table,
       pk: config.outbox.pk,
       sk: config.outbox.sk,
+      index: config.outbox.index,
     }
   }
 

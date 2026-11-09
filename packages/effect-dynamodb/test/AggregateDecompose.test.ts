@@ -180,13 +180,8 @@ describe("a custom decompose is handed a write's value as 1.39.0 handed it", () 
           ),
         )
         expect(updated.lines).toEqual([{ lineId: "l1", f: 50, note }])
-        // The old state as a write's value (which rows it holds) and as it was read, then the new
-        // state as a write's value.
-        expect(handed.lines).toEqual([
-          [{ ...before, f: 500 }],
-          [before],
-          [{ lineId: "l1", f: 500, note }],
-        ])
+        // The old state as it was read, then the new state as a write's value.
+        expect(handed.lines).toEqual([[before], [{ lineId: "l1", f: 500, note }]])
         before = { lineId: "l1", f: 50, note }
         expect(stored(rows, "OrderLine")).toEqual([
           ["$custom#v1#orderline#0000000000000050", { N: "5" }],

@@ -164,7 +164,7 @@ import {
 } from "effect"
 import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
-import { bind as aggregateBind } from "./Aggregate.js"
+import { bind as aggregateBind, ownershipConflict } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
 import {
@@ -3191,6 +3191,56 @@ const makeFromConfig = (config: {
               provide,
               operation,
             }),
+        )
+      }
+    }
+
+    // An aggregate declaring `ownsRows` takes every row of its types in its partition. Refused when
+    // another member this client can see can write such a row there (DESIGN.md §7 "Which rows in
+    // its partition are an aggregate's"): those its table declares, those the client binds, and
+    // those of every table the client binds, on the same physical table (by table, or by the
+    // name it resolves to here). A writer it doesn't see, here or in another process, isn't checked.
+    const tableNameOf = (table: unknown): string | undefined => {
+      // A table's tag is a function.
+      if (
+        table === null ||
+        (typeof table !== "object" && typeof table !== "function") ||
+        !("key" in table)
+      ) {
+        return undefined
+      }
+      return Option.getOrUndefined(
+        Context.getOption(baseCtx, table as Context.Key<TableConfig, TableConfig>),
+      )?.name
+    }
+    const visibleMembers = [
+      ...Object.entries(config.entities),
+      ...Object.entries(config.aggregates ?? {}),
+      ...Object.values(config.tables ?? {}).flatMap((table) => [
+        ...Object.entries(
+          (table as { readonly entities?: Record<string, unknown> }).entities ?? {},
+        ),
+        ...Object.entries(
+          (table as { readonly aggregates?: Record<string, unknown> }).aggregates ?? {},
+        ),
+      ]),
+    ].map(([name, member]) => ({ name, member: member as unknown }))
+    for (const [key, aggregate] of Object.entries(config.aggregates ?? {})) {
+      if ((aggregate as { readonly _ownsRows?: boolean })._ownsRows !== true) continue
+      const own = (aggregate as { readonly _tableTag?: { readonly key: string } })._tableTag
+      const ownName = tableNameOf(own)
+      const conflict = ownershipConflict(aggregate, visibleMembers, (table) => {
+        if (table === own) return true
+        const keyOf = (t: unknown) => (t as { readonly key?: unknown } | undefined)?.key
+        if (keyOf(table) !== undefined && keyOf(table) === keyOf(own)) return true
+        return ownName !== undefined && tableNameOf(table) === ownName
+      })
+      if (conflict !== undefined) {
+        throw new Error(
+          `[EDD-9130] Aggregate "${key}" declares \`ownsRows\`, but "${conflict.member}" can write ` +
+            `a row of type "${conflict.type}" into its partition (${conflict.channel}). ` +
+            `\`ownsRows\` would take that row for the aggregate's: leave it off, or keep ` +
+            `"${conflict.member}"'s rows out of the aggregate's partition.`,
         )
       }
     }

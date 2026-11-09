@@ -72,17 +72,6 @@ export interface RekeyRowContext {
     unit: string,
     work: Effect.Effect<RekeyTally, E, R>,
   ) => Effect.Effect<RekeyTally, E, R>
-  /**
-   * The rows units of this run took, by position, with the name of the member that took them: a
-   * row two aggregates both hold moves, and a dry run counts it, once.
-   */
-  readonly rowOwners?: Map<string, string> | undefined
-  /**
-   * The positions this run read a row at, in any member's read: a destination is judged by what
-   * the run read there, never by what an earlier move of the same run vacated, so a real run moves
-   * what its dry run says, whatever order the scan meets the rows in.
-   */
-  readonly rowsRead?: Set<string> | undefined
 }
 
 /**
@@ -418,8 +407,6 @@ export const run = (args: {
       const claimed = new Set<string>()
       const running = new Map<string, Deferred.Deferred<void>>()
       const ctx: RekeyRowContext = {
-        rowOwners: new Map(),
-        rowsRead: new Set(),
         tableName,
         dryRun,
         repairIndexKeys: options.repairIndexKeys === true,
