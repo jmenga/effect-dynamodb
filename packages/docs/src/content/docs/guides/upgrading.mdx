@@ -55,11 +55,14 @@ The `legacyKeys` option and the key fallback those releases had are gone, along 
 
 ## Turning `escapeKeys` on over existing data
 
-1. **Set `escapeKeys: true`** in a build, and don't serve traffic from it yet.
-2. **Dry run** `rekey` to see what would move, and any conflicts.
-3. **Run it.** It is resumable and idempotent: bound it to a time slot, stop it, and run it again as often as you like.
-4. **Run it again.** A rerun that moves nothing, with no conflicts, means the table is done.
-5. **Serve traffic.**
+1. **Set `escapeKeys: true`** in a build, and deploy it everywhere without serving traffic from it yet.
+2. **Stop every write to the table**, from instances under either setting, and keep writes stopped until step 5 is done.
+3. **Dry run** `rekey` to see what would move, and any conflicts.
+4. **Run it.** It is resumable and idempotent: bound it to a time slot, stop it, and run it again as often as you like.
+5. **Run it again.** A rerun that moves nothing, with no conflicts, means the table is done.
+6. **Serve traffic**, writes included.
+
+**Run `rekey` before any writer runs under the new setting, and with none still running under the old one.** A write in between leaves a row under each text, and `rekey` can't tell which to keep. An entity's row written beside its old one is the conflict `bothKeys`. An aggregate whose `update` wrote an edge's line under the new text, beside the row under the old text, has two rows that compose one sort key. `rekey` reports the aggregate as `failed`, with a `message` naming the edge and the key: `AggregateDecompositionError: "lines" and "lines" both compose the sort key "…", so one would overwrite the other`. None of its rows move, as on 1.39.0. To repair either one, read the partition with the raw `DynamoClient`, delete the row you don't want (usually the one under the old text, unless the write in between is the one to drop), and run `rekey` again (see [Conflicts](#conflicts)).
 
 <Aside type="caution" title="Until rekey finishes">
 Nothing is promised to an operation on a table whose rows are under other text. With a value whose key text changed:
