@@ -1,7 +1,9 @@
 /**
  * Several projections with `removal` on one read model (#154), against DynamoDB Local: `create` over
  * a tombstone carries the fields of the projection that wrote it, single-item and in a transaction.
- * A read model with one projection sends and stores exactly what the published 1.39.0 did.
+ * A row two projections feed keeps both projections' fields when it becomes a tombstone and when a
+ * write replaces one. A sparse checkpoint map's tombstone is refused as its row is. A read model with
+ * one projection sends and stores exactly what the published 1.39.0 did.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -11,7 +13,7 @@
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Config, Effect, Layer } from "effect"
-import { afterAll, beforeAll, describe } from "vitest"
+import { afterAll, beforeAll, describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -94,9 +96,18 @@ describeConnected("projection tombstones on DynamoDB Local", () => {
     ),
   )
 
-  describe("create over a tombstone, with several projections on the read model", () => {
-    const { firstAndLast, multiSource, transactional, ambiguous } = scenarios(rowOf)
+  const {
+    firstAndLast,
+    multiSource,
+    transactional,
+    ambiguous,
+    sharedRow,
+    sharedCreate,
+    sharedTwice,
+    sparse,
+  } = scenarios(rowOf)
 
+  describe("create over a tombstone, with several projections on the read model", () => {
     it.effect("carries the fields of the projection that wrote the tombstone", () =>
       firstAndLast.pipe(Effect.provide(TestLayer)),
     )
@@ -109,10 +120,34 @@ describeConnected("projection tombstones on DynamoDB Local", () => {
       transactional.pipe(Effect.provide(TestLayer)),
     )
 
-    it.effect("a tombstone two layouts name alike is read by the one defined last", () =>
-      ambiguous.pipe(Effect.provide(TestLayer)),
+    it.effect(
+      "raises an attribute two layouts name in different roles only as the last one's revision",
+      () => ambiguous.pipe(Effect.provide(TestLayer)),
     )
   })
+
+  describe("a row two projections feed", () => {
+    it.effect(
+      "keeps both projections' checkpoints when one removes it, and when the other writes over it",
+      () => sharedRow.pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("create over its tombstone carries both, with both revisions one higher", () =>
+      sharedCreate.pipe(Effect.provide(TestLayer)),
+    )
+
+    it.effect("a tombstone written over another keeps the first projection's fields", () =>
+      sharedTwice.pipe(Effect.provide(TestLayer)),
+    )
+  })
+
+  it.effect("a sparse checkpoint map's tombstone is refused as its row is", () =>
+    Effect.gen(function* () {
+      const { row, tombstone } = yield* sparse
+      expect(row).toMatchObject({ _tag: "ValidationError", entityType: "SparseLedger" })
+      expect(tombstone).toEqual(row)
+    }).pipe(Effect.provide(TestLayer)),
+  )
 
   it.effect("a read model with one projection sends and stores what 1.39.0 did", () => {
     const { run } = scenario(

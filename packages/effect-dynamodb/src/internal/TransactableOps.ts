@@ -65,38 +65,36 @@ export const addProjectionTombstones = (entity: object, layout: ProjectionTombst
 }
 
 /**
- * The layout of the projection that wrote `tombstone`. A tombstone holds that projection's kept
- * fields and revision and nothing else of the model, so it is the layout naming the most of the
- * tombstone's attributes. Of layouts naming as many, the one defined last: the layout every
- * tombstone took before a read model kept more than one, so a tombstone two layouts can't tell
- * apart is read as it always was. With one layout, that one.
+ * The fields `create` carries over from a tombstone, in the layouts' order (each one's kept fields,
+ * then its revision), each with whether it is carried one higher. A tombstone holds the checkpoints
+ * and revisions of every projection whose fields the row held, not only the one that wrote it, so
+ * every layout's fields are carried and no layout is chosen. A revision is carried one higher, so a
+ * projection's write that read the tombstone fails its guard. An attribute one layout names as its
+ * revision and another keeps as a checkpoint is raised only when it is the revision of the layout
+ * defined last, which is what `create` did while a read model held one layout: raising a checkpoint
+ * would skip an event. With one layout: its kept fields, then its revision one higher.
  */
-const layoutOf = (
+const carriedOver = (
   layouts: ReadonlyArray<ProjectionTombstones>,
-  tombstone: Record<string, unknown>,
-  dbName: (field: string) => string,
-): ProjectionTombstones => {
-  let best = layouts[layouts.length - 1]!
-  if (layouts.length === 1) return best
-  let most = -1
+): ReadonlyArray<{ readonly field: string; readonly raise: boolean }> => {
+  const kept = new Set(layouts.flatMap((layout) => layout.kept))
+  const last = layouts[layouts.length - 1]!.revision
+  const carried = new Map<string, boolean>()
   for (const layout of layouts) {
-    const fields = layout.revision === undefined ? layout.kept : [...layout.kept, layout.revision]
-    const held = fields.filter((field) => tombstone[dbName(field)] !== undefined).length
-    if (held >= most) {
-      best = layout
-      most = held
-    }
+    for (const field of layout.kept) if (!carried.has(field)) carried.set(field, false)
+    const revision = layout.revision
+    if (revision !== undefined) carried.set(revision, !kept.has(revision) || revision === last)
   }
-  return best
+  return [...carried].map(([field, raise]) => ({ field, raise }))
 }
 
 /**
  * @internal `create` over a projection tombstone (#154): read the key, and
- * when it holds the entity's tombstone, carry the kept fields of the
- * projection that wrote it over into `item` (stored names, wire values) — its
- * checkpoints, so a late redelivery is still recognised — with the revision
- * one higher, and return the guard naming that very tombstone. `None` when
- * there is no tombstone: `create`'s own guard applies.
+ * when it holds the entity's tombstone, carry the projections' kept fields it
+ * holds over into `item` (stored names, wire values) — their checkpoints, so a
+ * late redelivery is still recognised — with the revisions one higher
+ * (`carriedOver`), and return the guard naming that very tombstone. `None`
+ * when there is no tombstone: `create`'s own guard applies.
  */
 export const overTombstone = (
   entity: {
@@ -132,18 +130,37 @@ export const overTombstone = (
       entity._renameToDynamo(probe)
       return Object.keys(probe)[0] ?? field
     }
-    const layout = layoutOf(layouts, tomb, dbName)
-    for (const field of layout.kept) {
+    for (const { field, raise } of carriedOver(layouts)) {
       const name = dbName(field)
-      if (tomb[name] !== undefined) item[name] = tomb[name]
-    }
-    if (layout.revision !== undefined) {
-      const name = dbName(layout.revision)
-      if (tomb[name] !== undefined) item[name] = Number(tomb[name]) + 1
+      if (tomb[name] !== undefined) item[name] = raise ? Number(tomb[name]) + 1 : tomb[name]
     }
     return Option.some({
       eq: { __edd_e__: `${entity.entityType}#tombstone`, __edd_removed__: tomb.__edd_removed__ },
     } as ConditionInput)
+  })
+
+/**
+ * @internal Flatten `entity`'s sparse-map fields on `item` (stored names) into per-entry
+ * attributes, refusing a key it can't store with a `ValidationError` for `operation`. Every write
+ * of an item goes through it — `Entity.put`, the transactional put and a projection's tombstone —
+ * so each refuses the same key the same way, before sending anything.
+ */
+export const serializeSparseOrFail = (
+  entity: {
+    readonly entityType: string
+    readonly _serializeSparseFields: (item: Record<string, unknown>) => void
+  },
+  item: Record<string, unknown>,
+  operation: string,
+): Effect.Effect<void, ValidationError> =>
+  Effect.try({
+    try: () => entity._serializeSparseFields(item),
+    catch: (e) =>
+      new ValidationError({
+        entityType: entity.entityType,
+        operation,
+        cause: e instanceof Error ? e.message : String(e),
+      }),
   })
 
 /**
@@ -697,17 +714,8 @@ export const validateAndBuildPutItem = (
     // so the snapshot inherited the wrong shape too (#111).
     entity._renameToDynamo(item)
 
-    // Flatten sparse-map fields into per-entry top-level attributes. Throws
-    // on invalid keys; surface as ValidationError at the entity boundary.
-    try {
-      entity._serializeSparseFields(item)
-    } catch (e) {
-      return yield* new ValidationError({
-        entityType: entity.entityType,
-        operation,
-        cause: e instanceof Error ? e.message : String(e),
-      })
-    }
+    // Flatten sparse-map fields into per-entry top-level attributes.
+    yield* serializeSparseOrFail(entity, item, operation)
 
     // Pack `storedAs: DynamoModel.Packed` fields, as `Entity.put` does (#147).
     yield* entity._packFields(item, operation)

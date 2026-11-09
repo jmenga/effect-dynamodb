@@ -147,6 +147,7 @@ import {
   OUTBOX_ROW_SK,
   overTombstone,
   projectionTombstonesOf,
+  serializeSparseOrFail,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
@@ -3304,6 +3305,8 @@ const makeImpl = <
     if (!hasSparseFields) return
     encodeSparseFields(item, sparseFields)
   }
+  /** This entity's sparse fields, for `serializeSparseOrFail`. */
+  const sparseWriter = { entityType, _serializeSparseFields: serializeSparseFields }
 
   /**
    * Rebuild sparse Map fields from flattened top-level attributes.
@@ -6482,16 +6485,7 @@ const makeImpl = <
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
           // Flatten sparse Map fields into per-entry top-level attributes.
-          // Wrapped to surface key-validation errors as ValidationError.
-          try {
-            serializeSparseFields(item)
-          } catch (e) {
-            return yield* new ValidationError({
-              entityType,
-              operation: `${operation}.sparse`,
-              cause: e instanceof Error ? e.message : String(e),
-            })
-          }
+          yield* serializeSparseOrFail(sparseWriter, item, `${operation}.sparse`)
           // Pack `storedAs: DynamoModel.Packed` fields to their stored form
           // (JSON string, or compressed binary over the threshold) — after
           // renames and sparse flattening, before marshalling, so every size
@@ -7270,15 +7264,7 @@ const makeImpl = <
         // Convert back to DynamoDB attribute names for storage
         renameToDynamo(newItem)
         // Flatten sparse Map fields into per-entry top-level attributes.
-        try {
-          serializeSparseFields(newItem)
-        } catch (e) {
-          return yield* new ValidationError({
-            entityType,
-            operation: "update.sparse",
-            cause: e instanceof Error ? e.message : String(e),
-          })
-        }
+        yield* serializeSparseOrFail(sparseWriter, newItem, "update.sparse")
         // Pack only the packed fields this update names: the others still
         // hold the stored value read above (a string or bytes), carried
         // byte-identical so the "write only what differs" diff below leaves

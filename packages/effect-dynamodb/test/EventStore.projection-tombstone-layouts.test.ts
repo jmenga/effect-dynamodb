@@ -2,8 +2,11 @@
  * Several projections with `removal` on one read model (#154): each records
  * the fields its tombstones keep and its revision, and `create` over a
  * tombstone carries the fields of the projection that wrote it — not those of
- * whichever projection was defined last. A read model with one projection
- * sends and stores exactly what the published 1.39.0 did.
+ * whichever projection was defined last. A row two projections feed keeps both
+ * projections' fields when it becomes a tombstone and when a write replaces
+ * one. A sparse checkpoint map's tombstone is refused as its row is. A read
+ * model with one projection sends and stores exactly what the published 1.39.0
+ * did.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -37,7 +40,16 @@ const TestLayer = Layer.mergeAll(
 
 beforeEach(() => resetStore())
 
-const { firstAndLast, multiSource, transactional, ambiguous } = scenarios((id) =>
+const {
+  firstAndLast,
+  multiSource,
+  transactional,
+  ambiguous,
+  sharedRow,
+  sharedCreate,
+  sharedTwice,
+  sparse,
+} = scenarios((id) =>
   Effect.sync(() =>
     [...store.entries()]
       .filter(([key]) => key.startsWith("read|") && key.includes(`#id_${id}|`))
@@ -59,8 +71,9 @@ describe("create over a tombstone, with several projections on the read model", 
     transactional.pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("a tombstone two layouts name alike is read by the one defined last", () =>
-    ambiguous.pipe(Effect.provide(TestLayer)),
+  it.effect(
+    "raises an attribute two layouts name in different roles only as the last one's revision",
+    () => ambiguous.pipe(Effect.provide(TestLayer)),
   )
 
   it("keeps one entry per layout, the one defined last at the end, however often one is defined", () => {
@@ -81,6 +94,63 @@ describe("create over a tombstone, with several projections on the read model", 
       { kept: ["invoiceVersion"], revision: "revision" },
       { kept: ["orderVersion"], revision: "orderRev" },
     ])
+  })
+})
+
+describe("a row two projections feed", () => {
+  it.effect(
+    "keeps both projections' checkpoints when one removes it, and when the other writes over it",
+    () => sharedRow.pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("create over its tombstone carries both, with both revisions one higher", () =>
+    sharedCreate.pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a tombstone written over another keeps the first projection's fields", () =>
+    sharedTwice.pipe(Effect.provide(TestLayer)),
+  )
+})
+
+describe("a checkpoint map stored as a sparse map", () => {
+  it.effect("refuses the tombstone as it refuses the row, before writing anything", () => {
+    const writes: Array<string> = []
+    const recording = Layer.effect(
+      DynamoClient,
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        return new Proxy(client, {
+          get: (target, prop) => {
+            const value = Reflect.get(target, prop)
+            if (typeof value !== "function" || prop === "getItem" || prop === "query") return value
+            return (input: { readonly TableName?: string; readonly TransactItems?: unknown }) => {
+              const named = JSON.stringify(input)
+              if (named.includes('"TableName":"read"')) writes.push(String(prop))
+              return value.call(target, input)
+            }
+          },
+        })
+      }),
+    ).pipe(Layer.provide(InMemoryClient))
+    return Effect.gen(function* () {
+      const { row, tombstone } = yield* sparse
+      expect(row).toMatchObject({
+        _tag: "ValidationError",
+        entityType: "SparseLedger",
+        cause: `Sparse map "checkpoints": key "shipment#<id>" must not contain '#' — the library does not silently escape`,
+      })
+      expect(row.operation).toMatch(/\.write$/)
+      expect(tombstone).toEqual(row)
+      expect(writes).toEqual([])
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          recording,
+          EventsTable.layer({ name: "events" }),
+          ReadTable.layer({ name: "read" }),
+        ),
+      ),
+    )
   })
 })
 

@@ -5077,14 +5077,24 @@ instance).
   place, carrying its kept fields over with the revision one higher. Each
   projection with `removal` records its layout (kept fields, revision) on the
   read model (`_projectionTombstones`): one entry per distinct layout, the one
-  defined last at the end (a layout defined again moves there). A tombstone
-  holds only its projection's fields, so `create` carries those of the layout
-  naming the most of the tombstone's attributes: with several projections on
-  one read model, the fields of the one that wrote it. Of layouts naming as
-  many, the one defined last, which is the layout every tombstone took when the
-  read model kept a single entry, so a tombstone two layouts can't tell apart
-  is read as before. One layout sends and stores exactly what a single entry
-  did.
+  defined last at the end (a layout defined again moves there).
+  - **A row several projections feed.** A row that becomes a tombstone keeps
+    the remover's fields and every other layout's kept fields and revision that
+    the row holds. A projection's write over a tombstone (a row from `initial`,
+    or another tombstone) keeps the other layouts' fields the tombstone holds.
+    So no projection loses its checkpoint to another's removal: a redelivery is
+    still applied once, and a late removal can't remove a row recreated after
+    it.
+  - **`create` over a tombstone** carries every layout's kept fields and
+    revision that the tombstone holds, each revision one higher, and chooses no
+    layout. An attribute one layout names as its revision and another keeps as
+    a checkpoint is raised only when it is the last-defined layout's revision,
+    as when the read model kept a single entry: raising a checkpoint skips an
+    event. One layout sends and stores exactly what a single entry did.
+  - **A sparse-map checkpoint field.** Its keys (`<source>#<streamId>`) hold
+    `#`, which a sparse map can't store. The tombstone write goes through the
+    same check as the row's (`serializeSparseOrFail`) and is refused the same
+    way, before anything is sent.
 - **The outbox** writes effects as items (`<entityType>#outbox`, sort key
   `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
   in the row's transaction. `drain` claims the head item (a conditional update

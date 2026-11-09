@@ -58,8 +58,10 @@ import {
   composePrimaryKey,
   KEY_TEXT,
   marshalOrFail,
+  projectionTombstonesOf,
   OUTBOX_ROW_PK as ROW_PK,
   OUTBOX_ROW_SK as ROW_SK,
+  serializeSparseOrFail,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
 
@@ -144,6 +146,7 @@ export interface EngineEntity {
   readonly create: (input: any) => any
   readonly _tableTag: any
   readonly _renameToDynamo: (item: Record<string, unknown>) => void
+  readonly _serializeSparseFields: (item: Record<string, unknown>) => void
   readonly _attachPrototype?: ((decoded: any) => any) | undefined
   readonly _multiItemWriteFeatures?: ReadonlyArray<string> | undefined
   readonly schemas: any
@@ -314,6 +317,8 @@ interface Row {
   readonly values: Record<string, unknown>
   readonly tombstone: boolean
   readonly createdAt: unknown
+  /** A tombstone's attributes as stored, by stored name. */
+  readonly stored?: Record<string, unknown>
 }
 
 /** @internal */
@@ -396,7 +401,7 @@ export const makeEngine = (config: EngineConfig) => {
           const v = raw[dbName(f)]
           if (v !== undefined) values[f] = v
         }
-        return Option.some<Row>({ values, tombstone: true, createdAt: undefined })
+        return Option.some<Row>({ values, tombstone: true, createdAt: undefined, stored: raw })
       }
       const decoded = (yield* decodeMarshalledItem(readModel as any, item)) as Record<
         string,
@@ -712,6 +717,8 @@ export const makeEngine = (config: EngineConfig) => {
             (DateTime.toEpochMillis(now) + Dur.toMillis(config.removal.ttl)) / 1000,
           )
         }
+        // A sparse-map field is refused as the row's own write refuses it.
+        yield* serializeSparseOrFail(readModel, tomb, `${config.label}.write`)
         rowItem = yield* marshalOrFail(entityType, `${config.label}.write`, () =>
           toAttributeMap(tomb),
         )
@@ -1170,8 +1177,15 @@ export const makeEngine = (config: EngineConfig) => {
         config.revision === undefined ? undefined : (target[config.revision.field] as number)
       let written: Option.Option<unknown>
       if (Option.isNone(state)) {
-        // A tombstone keeps exactly the layout's fields.
-        written = yield* writeRow(key, Option.none(), pick(target), row, enqueued, nextRevision)
+        // A tombstone keeps the layout's fields, and the other projections' the row holds.
+        written = yield* writeRow(
+          key,
+          Option.none(),
+          { ...othersHeld(row), ...pick(target) },
+          row,
+          enqueued,
+          nextRevision,
+        )
       } else {
         const mapped =
           config.toItem === undefined
@@ -1182,7 +1196,16 @@ export const makeEngine = (config: EngineConfig) => {
                 )),
                 ...pick(target),
               }
-        written = yield* writeRow(key, Option.some(mapped), {}, row, enqueued, nextRevision)
+        // A row written over a tombstone keeps the other projections' fields it holds too.
+        const over = Option.isSome(row) && row.value.tombstone
+        written = yield* writeRow(
+          key,
+          Option.some(over ? { ...othersHeld(row), ...mapped } : mapped),
+          {},
+          row,
+          enqueued,
+          nextRevision,
+        )
       }
       const versions = new Map(
         advanced.map((a) => [`${a.source}\u0000${a.streamIdStr}`, a.version]),
@@ -1208,6 +1231,25 @@ export const makeEngine = (config: EngineConfig) => {
   const pick = (target: Record<string, unknown>): Record<string, unknown> => {
     const out: Record<string, unknown> = {}
     for (const f of keptFields) if (target[f] !== undefined) out[f] = target[f]
+    return out
+  }
+
+  /**
+   * The checkpoint and revision fields of the read model's other projections with `removal` that
+   * the row holds. A row that becomes a tombstone, or is written over one, keeps them, so those
+   * projections still recognise what they applied. Empty when the read model has no other layout.
+   */
+  const othersHeld = (row: Option.Option<Row>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    if (Option.isNone(row)) return out
+    for (const layout of projectionTombstonesOf(readModel) ?? []) {
+      const named = layout.revision === undefined ? layout.kept : [...layout.kept, layout.revision]
+      for (const f of named) {
+        if (keptFields.includes(f) || f in out) continue
+        const v = row.value.tombstone ? row.value.stored?.[dbName(f)] : row.value.values[f]
+        if (v !== undefined) out[f] = v
+      }
+    }
     return out
   }
 
