@@ -3236,8 +3236,13 @@ const makeFromConfig = (config: {
       name,
       member,
     }))
-    for (const [key, aggregate] of Object.entries(config.aggregates ?? {})) {
+    // The owners checked are the aggregates it sees, from the same list: `rekey` runs the handler of
+    // a table's aggregate the client doesn't bind itself. Each once, by the first name it has.
+    const checked = new Set<unknown>()
+    for (const [key, aggregate] of visibleAggregates) {
       if ((aggregate as { readonly _ownsRows?: boolean })._ownsRows !== true) continue
+      if (checked.has(aggregate)) continue
+      checked.add(aggregate)
       const own = (aggregate as { readonly _tableTag?: { readonly key: string } })._tableTag
       const ownName = tableNameOf(own)
       const conflict = ownershipConflict(aggregate, visibleMembers, (table) => {

@@ -786,6 +786,63 @@ describe("the bind check counts each attribute as its row holds it after the las
       }),
   )
 
+  describe("an owner the client sees only as a table's aggregate is checked as one it binds", () => {
+    // `rekey` runs the handler of every aggregate of a table the client binds, so the owners
+    // checked are the aggregates it sees, from the same list the writers come from.
+    const schema = DynamoSchema.make({ name: "tb", version: 1 })
+    class ClassLine extends Schema.Class<ClassLine>("ClassLine")({
+      lid: Schema.String,
+      note: Schema.String,
+    }) {}
+    const Sub = Aggregate.make(Schema.Struct({ lines: Schema.Array(Line) }), {
+      root: { entityType: "Sub" },
+      edges: { lines: Aggregate.many({ entityType: "Line", sk: { composite: ["lid"] } }) },
+    } as any)
+    const other = (Main: Table.Table<any, any>, shape: "class" | "sub-aggregate") =>
+      Aggregate.make(
+        shape === "class"
+          ? Schema.Struct({ id: Schema.String, lines: Schema.Array(ClassLine) })
+          : Schema.Struct({ id: Schema.String, sub: Schema.Struct({ lines: Schema.Array(Line) }) }),
+        {
+          table: Main,
+          schema,
+          pk: { field: "gpk", composite: ["id"] },
+          collection: { name: "other", index: "gsi1", sk: { field: "gsk", composite: ["id"] } },
+          root: { entityType: "OtherRoot" },
+          edges:
+            shape === "class"
+              ? { lines: Aggregate.many({ entityType: "Line", sk: { composite: ["lid"] } }) }
+              : { sub: (Sub as any).with({ discriminator: {} }) },
+        } as any,
+      )
+    for (const shape of ["class", "sub-aggregate"] as const) {
+      it.effect(`a writer whose lines are in a ${shape}`, () =>
+        Effect.gen(function* () {
+          const Main = Table.make({ schema, entities: {} })
+          const Orders = owner(Main, schema, { collection: "shared" })
+          const Registered = Table.make({ schema, aggregates: { Orders } } as any)
+          const Other = other(Main, shape)
+          const layer = Layer.merge(Main.layer({ name: "tb" }), Registered.layer({ name: "tb" }))
+          const refused = refusal("Other", "Line", "its rows' own attributes")
+          // Seen only as `Main`'s aggregate, named as a member of the table the client binds.
+          const tableOnly = yield* binds(
+            { entities: {}, aggregates: { Other }, tables: { Main: Registered } },
+            layer,
+          )
+          expect(tableOnly).toEqual(refused)
+          expect(tableOnly).toContain('Aggregate "Main.Orders" declares `ownsRows`')
+          // Bound itself, the same refusal.
+          const bound = yield* binds(
+            { entities: {}, aggregates: { Orders, Other }, tables: { Main: Registered } },
+            layer,
+          )
+          expect(bound).toEqual(refused)
+          expect(bound).toContain('Aggregate "Orders" declares `ownsRows`')
+        }),
+      )
+    }
+  })
+
   it.effect(
     "an entity's rows carry its own type: a model field stored under `__edd_e__` doesn't load",
     () =>

@@ -2,7 +2,8 @@
  * `EDD-9140`: an entity storing an attribute under one the library writes itself is refused when
  * the definition loads. That's a model field named or renamed `__edd_e__`, or a timestamp or the
  * version so named, where every row holds its entity type, and a sparse map whose entries
- * (`<prefix>#<key>`) can be named as a table key attribute is. Each position has a form that loads,
+ * (`<prefix>#<key>`) can be named as a table key attribute is, by a key the map's writer takes. Each
+ * position has a form that loads,
  * whose rows keep their type and keys, and no update reaches `__edd_e__`. The `ownsRows` bind check
  * (`EDD-9130`) relies on it: a model attribute is any name holding any text but these.
  */
@@ -11,10 +12,12 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Exit, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
+import { holds } from "./helpers/InMemoryTables.js"
+import { applyUpdate, mockDynamoClient } from "./helpers/MockDynamoClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const schema = DynamoSchema.make({ name: "lib", version: 1 })
@@ -186,4 +189,139 @@ describe("EDD-9140: an attribute stored under one the library writes", () => {
       }).pipe(Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "lib" })))) as never
     })
   })
+})
+
+describe("EDD-9140: a sparse map's entry is a key attribute only by a key its writer takes", () => {
+  // `<prefix>#` itself is reached only by the empty key, and `<prefix>##` only by `#`: the writer
+  // refuses both, before any request, so neither is refused when the definition loads.
+  const definition = (half: "pk" | "sk", field: string) => ({
+    entityType: "Doc",
+    model: DynamoModel.configure(
+      Schema.Struct({
+        id: Schema.String,
+        note: Schema.String,
+        data: Schema.Record(Schema.String, Schema.Number),
+      }),
+      { data: { storedAs: DynamoModel.SparseMap() } },
+    ),
+    primaryKey: {
+      pk: { field: half === "pk" ? field : "pk", composite: ["id"] },
+      sk: { field: half === "sk" ? field : "sk", composite: [] },
+    },
+  })
+
+  for (const half of ["pk", "sk"] as const) {
+    for (const [make, build] of MAKES) {
+      it(`${make}: "data#" and "data##" as the ${half} attribute load, "data#a" doesn't`, () => {
+        const load = (field: string) => () =>
+          (build as (config: unknown) => unknown)(definition(half, field))
+        expect(load("data#")).not.toThrow()
+        expect(load("data##")).not.toThrow()
+        expect(load("data#a")).toThrow(
+          `[EDD-9140] Entity "Doc": sparse map "data" stores each entry as "data#<key>", and the entry "a" would be stored in "data#a"`,
+        )
+      })
+    }
+
+    it.effect(
+      `"data#" as the ${half} attribute: rows keep their keys and the map its entries`,
+      () => {
+        const config = definition(half, "data#")
+        const pkField = config.primaryKey.pk.field
+        const skField = config.primaryKey.sk.field
+        const Docs = Entity.make(config as never) as any
+        const MainTable = Table.make({ schema, entities: { Docs } }) as any
+        const items = new Map<string, Record<string, any>>()
+        const requests: Array<string> = []
+        const keyOf = (key: Record<string, any>) => {
+          expect(typeof key[pkField]?.S).toBe("string")
+          expect(typeof key[skField]?.S).toBe("string")
+          return `${key[pkField].S}|${key[skField].S}`
+        }
+        const client = mockDynamoClient({
+          putItem: (input) =>
+            Effect.sync(() => {
+              requests.push("PutItem")
+              items.set(keyOf(input.Item!), structuredClone(input.Item!))
+              return {} as never
+            }),
+          getItem: (input) =>
+            Effect.sync(() => {
+              requests.push("GetItem")
+              const item = items.get(keyOf(input.Key!))
+              return (item === undefined ? {} : { Item: structuredClone(item) }) as never
+            }),
+          updateItem: (input) =>
+            Effect.sync(() => {
+              requests.push("UpdateItem")
+              const id = keyOf(input.Key!)
+              const current = items.get(id)
+              expect(
+                holds(
+                  input.ConditionExpression,
+                  current,
+                  input.ExpressionAttributeNames ?? {},
+                  input.ExpressionAttributeValues ?? {},
+                ),
+              ).toBe(true)
+              const next = applyUpdate(current!, input)!
+              expect(keyOf(next)).toBe(id)
+              items.set(id, next)
+              return { Attributes: next } as never
+            }),
+          deleteItem: (input) =>
+            Effect.sync(() => {
+              requests.push("DeleteItem")
+              items.delete(keyOf(input.Key!))
+              return {} as never
+            }),
+        })
+        return Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({ entities: { Docs }, tables: { MainTable } })
+          for (const id of ["a", "b"]) {
+            yield* db.entities.Docs.put({ id, note: "first", data: { ok: 7 } }).asEffect()
+          }
+          for (const id of ["a", "b"]) {
+            expect(yield* db.entities.Docs.get({ id })).toEqual({
+              id,
+              note: "first",
+              data: { ok: 7 },
+            })
+          }
+          for (const row of items.values()) {
+            expect(row[pkField]).toEqual({ S: `$lib#v1#doc#id_${row.id.S}` })
+            expect(row[skField]).toEqual({ S: "$lib#v1#doc" })
+          }
+          yield* db.entities.Docs.update({ id: "a" })
+            .set({ note: "then", data: { more: 9 } })
+            .asEffect()
+          expect(yield* db.entities.Docs.get({ id: "a" })).toEqual({
+            id: "a",
+            note: "then",
+            data: { ok: 7, more: 9 },
+          })
+          // The one key that would name the key attribute is the writer's to refuse.
+          const sent = requests.length
+          const stored = structuredClone([...items.entries()])
+          const empty = yield* Effect.exit(
+            db.entities.Docs.put({ id: "c", note: "x", data: { "": 9 } }).asEffect(),
+          )
+          expect(Exit.isFailure(empty)).toBe(true)
+          expect(requests).toHaveLength(sent)
+          expect([...items.entries()]).toEqual(stored)
+          yield* db.entities.Docs.delete({ id: "a" }).asEffect()
+          expect(items.size).toBe(1)
+          expect(yield* db.entities.Docs.get({ id: "b" })).toEqual({
+            id: "b",
+            note: "first",
+            data: { ok: 7 },
+          })
+        }).pipe(
+          Effect.provide(
+            Layer.merge(Layer.succeed(DynamoClient, client), MainTable.layer({ name: "lib" })),
+          ),
+        ) as never
+      },
+    )
+  }
 })
