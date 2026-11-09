@@ -303,3 +303,120 @@ describe("a transaction refuses an op's inexact key, or a put its schema refuses
     }
   }
 })
+
+describe("a transaction refuses an update's payload, or a nested append, before any op reads", () => {
+  // What an update decides from its own payload, and a nested append's build, read nothing: they
+  // run with every other op's checks, before a planned update or a guarded put reads. A payload
+  // value that reads back otherwise (`EDD-9128`), one its schema refuses, an append op with no
+  // events and an event its schema refuses used to be refused only after those reads.
+  const payloads = [
+    { name: "a value that reads back otherwise", Kind: Schema.Unknown, n: 5n, says: "EDD-9128" },
+    { name: "a value its schema refuses", Kind: Schema.Number, n: "no", says: "Expected number" },
+  ] as const
+  const appends = [
+    { name: "no events", events: [], says: "needs at least one event" },
+    {
+      name: "an event its schema refuses",
+      events: [{ _tag: "Logged", note: 42 }],
+      says: "Expected string",
+    },
+  ] as const
+  const run = (
+    Kind: Schema.Top,
+    ops: (e: any, g: any, Inner: any) => { readonly bad: unknown; readonly good: unknown },
+    send: (ops: ReadonlyArray<unknown>, Outer: any) => Effect.Effect<unknown, unknown, any>,
+    first: boolean,
+    says: string,
+  ) => {
+    const schema = DynamoSchema.make({ name: "inexactp", version: 1 })
+    const E = Entity.make({
+      model: Schema.Struct({ id: Schema.String, n: Kind }),
+      entityType: "E",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      indexes: {
+        byN: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["n"] },
+          sk: { field: "gsi1sk", composite: [] },
+        },
+      },
+    } as never) as any
+    const G = Entity.make({
+      model: Schema.Struct({ id: Schema.String, code: Schema.String }),
+      entityType: "Guarded",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      unique: { code: ["code"] },
+    } as never) as any
+    const Main = Table.make({ schema, entities: { E, G } } as never) as any
+    const stream = (streamName: string) =>
+      EventStore.makeStream({
+        table: Main,
+        streamName,
+        events: [Schema.TaggedStruct("Logged", { note: Schema.String })],
+        streamId: { composite: ["id"] },
+      } as never) as any
+    const Outer = stream("Outer")
+    const Inner = stream("Inner")
+    const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+    return Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { E, G },
+        tables: { Main },
+      } as never) as Effect.Effect<any, never, any>
+      yield* db.entities.E.put({ id: "bad", n: 1 }).asEffect()
+      yield* db.entities.G.put({ id: "good", code: "before" }).asEffect()
+      table.take()
+      const stored = structuredClone([...table.items])
+      const { bad, good } = ops(db.entities.E, db.entities.G, Inner)
+      const exit = yield* Effect.exit(send(first ? [bad, good] : [good, bad], Outer))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(exit.cause.reasons[0]!._tag).toBe("Fail")
+        const error = Cause.squash(exit.cause) as any
+        expect(error._tag).toBe("ValidationError")
+        expect(String(error.cause?.message ?? error.cause)).toContain(says)
+      }
+      expect(table.requests).toEqual([])
+      expect([...table.items]).toEqual(stored)
+    }).pipe(
+      Effect.provide(Main.layer({ name: "t" })),
+      Effect.provide(table.layer),
+    ) as Effect.Effect<void, unknown>
+  }
+  for (const first of [false, true]) {
+    const order = first ? "before" : "after"
+    for (const { name, Kind, n, says } of payloads) {
+      for (const kind of ["update", "patch"] as const) {
+        it.effect(`Transaction.transactWrite: ${kind} to ${name}, ${order} a unique update`, () =>
+          run(
+            Kind,
+            (e, g) => ({
+              bad: e[kind]({ id: "bad" }).set({ n }),
+              good: g.update({ id: "good" }).set({ code: "after" }),
+            }),
+            (ops) => Transaction.transactWrite(ops as never),
+            first,
+            says,
+          ),
+        )
+      }
+    }
+    for (const { name, events, says } of appends) {
+      it.effect(`EventStore.append: an append op with ${name}, ${order} a unique put`, () =>
+        run(
+          Schema.Number,
+          (_e, g, Inner) => ({
+            bad: Inner.appendOp({ id: "inner" }, events, 0),
+            good: g.put({ id: "good", code: "after" }),
+          }),
+          (ops, Outer) =>
+            Outer.append({ id: "outer" }, [{ _tag: "Logged", note: "ok" }], 0, {
+              additionalItems: ops,
+            }),
+          first,
+          says,
+        ),
+      )
+    }
+  }
+})

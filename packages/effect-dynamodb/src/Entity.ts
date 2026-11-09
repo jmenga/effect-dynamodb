@@ -845,9 +845,21 @@ export interface Entity<
   readonly _planUpdate: (
     key: unknown,
     state: UpdateState,
-    /** `key` through {@link _encodeKey}: refused before any op of the transaction reads. */
-    encoded: globalThis.Record<string, unknown>,
+    /** What {@link _prepareUpdate} decided of `state`. */
+    prepared: PreparedUpdate,
   ) => Effect.Effect<TransactPlan, PlanUpdateError, DynamoClient | TableConfig>
+
+  /**
+   * @internal What an `update` decides from its own operands, reading nothing: every refusal of
+   * its names, operands, payload and the keys the payload composes, and its encoded payload. Run by
+   * `Transaction.transactWrite` for every op before any op reads; {@link _planUpdate} plans the
+   * update from it. `encoded` is `key` through {@link _encodeKey}.
+   */
+  readonly _prepareUpdate: (
+    key: unknown,
+    state: UpdateState,
+    encoded: globalThis.Record<string, unknown>,
+  ) => Effect.Effect<PreparedUpdate, ValidationError, TableConfig>
 
   /**
    * @internal Compile a `delete` into the transact items it would issue — the
@@ -6962,15 +6974,18 @@ const makeImpl = <
   // update operation
   // ---------------------------------------------------------------------------
 
-  const runUpdate = (
+  /**
+   * What an update decides from its own operands, before reading anything: every refusal of the
+   * names, operands and payload it holds and of the keys the payload composes, and the encoded
+   * payload and key ({@link checkUpdatePayload}). A payload with refs to hydrate has its keys
+   * checked after the reads that hydrate them, in {@link runPreparedUpdate}. `runUpdate` runs this
+   * first; `Transaction.transactWrite` runs it for every op before any op reads (`_prepareUpdate`)
+   * and plans the update from what it returns. `encoded`: the key, already encoded.
+   */
+  const prepareUpdate = (
     key: unknown,
-    mode: DecodeMode,
     requested: UpdateState,
-    /**
-     * The item as already read — consistently — by the caller (`upsert`).
-     * Used instead of reading it again: the write is guarded on it either way.
-     */
-    preRead?: globalThis.Record<string, AttributeValue>,
+    encoded?: globalThis.Record<string, unknown> | undefined,
   ) =>
     Effect.gen(function* () {
       // A packed field takes only a whole-value .set() / .remove() (#147).
@@ -7090,15 +7105,10 @@ const makeImpl = <
         uState.patch ? { attributeExists: [config.indexes.primary.pk.field] } : undefined,
         uState.condition,
       )
-      const client = yield* Capacity.client
-      const tableName = tc.name
-      // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
-      const now = yield* DateTime.now
-
       yield* checkWithVectorNames(uState.withVectors, "update")
 
       // Caller key: Type side in, ENCODED out (see `encodeKey`).
-      const encodedKey = yield* encodeKey(key, "update.decodeKey")
+      const encodedKey = encoded ?? (yield* encodeKey(key, "update.decodeKey"))
       // A missing item: `patch`'s exists guard failed — `ConditionalCheckFailed`,
       // on every path, including those that read first (#134); for `update`,
       // `ItemNotFound`.
@@ -7124,19 +7134,58 @@ const makeImpl = <
         return yield* new ValidationError({ entityType, operation: "update", cause: unstorable })
       }
 
-      // Hydrate refs in updates: for any ${field}Id present, fetch and embed
-      let hydratedUpdates = encodedUpdates as globalThis.Record<string, unknown>
-      if (hasRefs) {
-        const refsToHydrate = resolvedRefs.filter(
-          (ref) =>
-            ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
-            (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !== undefined,
-        )
-        if (refsToHydrate.length > 0) {
-          hydratedUpdates = yield* hydrateRefs(hydratedUpdates, refsToHydrate)
-        }
+      // Refs are hydrated by reading the entities they name: a payload holding any has its keys
+      // checked after those reads.
+      const refsToHydrate = hasRefs
+        ? resolvedRefs.filter(
+            (ref) =>
+              ref.idFieldName in (encodedUpdates as globalThis.Record<string, unknown>) &&
+              (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !== undefined,
+          )
+        : []
+      const checked =
+        refsToHydrate.length === 0
+          ? yield* checkUpdatePayload(
+              uState,
+              needsBothImages,
+              encodedKey,
+              encodedUpdates,
+              encodedUpdates as globalThis.Record<string, unknown>,
+            )
+          : undefined
+      return {
+        uState,
+        removedToDefault,
+        immutables,
+        upsertable,
+        createInput,
+        requestedRv,
+        needsBothImages,
+        evExpected,
+        userCond,
+        tc,
+        ttlAttrName,
+        encodedKey,
+        missingItem,
+        encodedUpdates,
+        refsToHydrate,
+        checked,
       }
+    })
 
+  /**
+   * The refusals an update's keys decide, before reading anything: a key its payload composes with
+   * no key text or level, and path operations no read-then-write can carry. Returns the primary key
+   * and what decides the write's path.
+   */
+  const checkUpdatePayload = (
+    uState: UpdateState,
+    needsBothImages: boolean,
+    encodedKey: globalThis.Record<string, unknown>,
+    encodedUpdates: unknown,
+    hydratedUpdates: globalThis.Record<string, unknown>,
+  ) =>
+    Effect.gen(function* () {
       // The index keys the payload feeds, composed once before anything is
       // marshalled: a composite with no key text (`NaN`, `[EDD-9096]`) or
       // Z-order level (`[EDD-9092]`) fails the update with a
@@ -7227,6 +7276,58 @@ const makeImpl = <
             "`versioned` cannot prove. Drop the path operations, the cascade, or the mode.",
         })
       }
+      return { primaryKey, marshalledKey, touchesUniqueFields, computedComposites, pathOpsPresent }
+    })
+
+  /** An update from what {@link prepareUpdate} decided: its reads and its write. */
+  const runPreparedUpdate = (
+    key: unknown,
+    prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
+    mode: DecodeMode,
+    /**
+     * The item as already read — consistently — by the caller (`upsert`).
+     * Used instead of reading it again: the write is guarded on it either way.
+     */
+    preRead?: globalThis.Record<string, AttributeValue>,
+  ) =>
+    Effect.gen(function* () {
+      const {
+        uState,
+        removedToDefault,
+        immutables,
+        upsertable,
+        createInput,
+        requestedRv,
+        needsBothImages,
+        evExpected,
+        userCond,
+        tc,
+        ttlAttrName,
+        encodedKey,
+        missingItem,
+        encodedUpdates,
+      } = prepared
+      const client = yield* Capacity.client
+      const tableName = tc.name
+      // Clock-backed time source for the updatedAt timestamp + retain snapshot TTL.
+      const now = yield* DateTime.now
+      // Hydrate refs in updates: for any ${field}Id present, fetch and embed
+      const hydratedUpdates =
+        prepared.refsToHydrate.length > 0
+          ? yield* hydrateRefs(
+              encodedUpdates as globalThis.Record<string, unknown>,
+              prepared.refsToHydrate,
+            )
+          : (encodedUpdates as globalThis.Record<string, unknown>)
+      const { primaryKey, marshalledKey, touchesUniqueFields, computedComposites, pathOpsPresent } =
+        prepared.checked ??
+        (yield* checkUpdatePayload(
+          uState,
+          needsBothImages,
+          encodedKey,
+          encodedUpdates,
+          hydratedUpdates,
+        ))
       if (
         (isRetainEnabled() ||
           touchesUniqueFields ||
@@ -8908,13 +9009,34 @@ const makeImpl = <
       )
     })
 
+  const runUpdate = (
+    key: unknown,
+    mode: DecodeMode,
+    requested: UpdateState,
+    /** See {@link runPreparedUpdate}. */
+    preRead?: globalThis.Record<string, AttributeValue>,
+  ) =>
+    Effect.flatMap(prepareUpdate(key, requested), (prepared) =>
+      runPreparedUpdate(key, prepared, mode, preRead),
+    )
+
   /**
    * An update; on a missing item, a plain `.set()` of a complete item creates
    * it through `create` — exactly the item `put` writes (#133). If another
    * writer creates it first, the update runs once more against that item.
    */
-  const updateOrCreate = (key: unknown, mode: DecodeMode, requested: UpdateState) =>
-    runUpdate(key, mode, requested).pipe(
+  const updateOrCreate = (
+    key: unknown,
+    mode: DecodeMode,
+    requested: UpdateState,
+    /** What {@link prepareUpdate} decided of `requested`, when the caller already ran it. */
+    prepared?: Effect.Success<ReturnType<typeof prepareUpdate>>,
+  ) => {
+    const run = () =>
+      prepared === undefined
+        ? runUpdate(key, mode, requested)
+        : runPreparedUpdate(key, prepared, mode)
+    return run().pipe(
       Effect.catchIf(
         (e): e is MissingForCreate => e instanceof MissingForCreate,
         (missing) =>
@@ -8930,7 +9052,7 @@ const makeImpl = <
               )
               if (Option.isNone(raced)) return yield* created
               // Created concurrently: now an ordinary update of that item.
-              return yield* runUpdate(key, mode, requested).pipe(
+              return yield* run().pipe(
                 Effect.catchIf(
                   (e): e is MissingForCreate => e instanceof MissingForCreate,
                   () =>
@@ -8955,6 +9077,7 @@ const makeImpl = <
           }),
       ),
     )
+  }
 
   const update = (key: unknown) =>
     new EntityUpdateImpl(
@@ -9205,19 +9328,24 @@ const makeImpl = <
   const planUpdate = (
     key: unknown,
     uState: UpdateState,
-    encodedKey: globalThis.Record<string, unknown>,
+    prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
   ) =>
-    planned("transactWrite.update", encodedKey, () => updateOrCreate(key, "native", uState), {
-      payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
-      deltas: {
-        ...uState.add,
-        ...Object.fromEntries(
-          Object.entries(uState.subtract ?? {}).map(([field, by]) => [field, -by]),
-        ),
+    planned(
+      "transactWrite.update",
+      prepared.encodedKey,
+      () => updateOrCreate(key, "native", uState, prepared),
+      {
+        payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
+        deltas: {
+          ...uState.add,
+          ...Object.fromEntries(
+            Object.entries(uState.subtract ?? {}).map(([field, by]) => [field, -by]),
+          ),
+        },
+        callerCondition: uState.condition !== undefined,
+        expectedVersion: uState.expectedVersion,
       },
-      callerCondition: uState.condition !== undefined,
-      expectedVersion: uState.expectedVersion,
-    })
+    )
 
   // ---------------------------------------------------------------------------
   // delete operation
@@ -14635,8 +14763,20 @@ const makeImpl = <
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
-    _planUpdate: (key: unknown, state: UpdateState, encoded: globalThis.Record<string, unknown>) =>
-      planUpdate(key, state, encoded).pipe(
+    _prepareUpdate: (
+      key: unknown,
+      state: UpdateState,
+      encoded: globalThis.Record<string, unknown>,
+    ) =>
+      prepareUpdate(key, state, encoded).pipe(
+        Effect.map((prepared) => prepared as unknown as PreparedUpdate),
+      ),
+    _planUpdate: (key: unknown, state: UpdateState, prepared: PreparedUpdate) =>
+      planUpdate(
+        key,
+        state,
+        prepared as unknown as Effect.Success<ReturnType<typeof prepareUpdate>>,
+      ).pipe(
         // Planning stops at the write, so only what an update raises BEFORE
         // writing can surface; anything else is a defect (`isPlanUpdateError`).
         Effect.catch((e: unknown) => (isPlanUpdateError(e) ? Effect.fail(e) : Effect.die(e))),
@@ -15278,6 +15418,14 @@ export const bind = <
  * (`ConditionalCheckFailed`), an op too large for one transaction, and a refused op
  * (`ValidationError`).
  */
+/**
+ * @internal What `Entity._prepareUpdate` decided of an update, opaque outside the entity that
+ * made it: handed back to its `_planUpdate`.
+ */
+export interface PreparedUpdate {
+  readonly _preparedUpdate: unique symbol
+}
+
 export type PlanUpdateError =
   | DynamoClientError
   | ValidationError

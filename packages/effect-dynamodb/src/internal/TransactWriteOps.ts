@@ -361,15 +361,16 @@ interface PreparedOp {
 export interface PreparedTransactWrite {
   readonly count: number
   readonly ops: ReadonlyArray<PreparedOp>
-  /** The nested stream appends, by caller op index. */
-  readonly streamOps: ReadonlyMap<number, StreamAppendOp>
+  /** The nested stream appends, built, by caller op index. */
+  readonly streamOps: ReadonlyMap<number, BuiltStreamAppend>
 }
 
 /**
  * Check and compose every op of a transaction without reading: refuse what an
- * op can't carry, compile its condition, build a put's item and compose a
- * delete's or a check's key — so a value with no key text, or a put its
- * schema refuses, fails the transaction before any op reads, whatever its
+ * op can't carry, compile its condition, build a put's item, compose a
+ * delete's or a check's key and build a nested stream append — so a value
+ * with no key text, a put or an event its schema refuses, or an append op
+ * with no events, fails the transaction before any op reads, whatever its
  * place in it.
  *
  * With `plan`, `Transaction.transactWrite` carries the ops the build step
@@ -377,8 +378,10 @@ export interface PreparedTransactWrite {
  * more than its own row (`unique`, `versioned: { retain: true }`,
  * `softDelete` — EDD-9048). Each is planned by the entity's own op
  * (`Entity._planUpdate` / `_planDelete`) in {@link planTransactWriteOps}; here
- * its key is encoded and composed (`Entity._encodeKey`) and what it can't
- * carry refused (EDD-9059 – EDD-9061, `rejectUnsupportedOp`). Without `plan`
+ * its key is encoded and composed (`Entity._encodeKey`), what it can't carry
+ * refused (EDD-9059 – EDD-9061, `rejectUnsupportedOp`), and an update's own
+ * operands decided (`Entity._prepareUpdate`: its payload, and the keys the
+ * payload composes), which its plan reuses. Without `plan`
  * (`EventStore.append`), such ops are refused.
  */
 export const prepareTransactWriteOps = (
@@ -390,10 +393,14 @@ export const prepareTransactWriteOps = (
         readonly plan?: boolean | undefined
       }
     | undefined,
-): Effect.Effect<PreparedTransactWrite, ValidationError> =>
+): Effect.Effect<
+  PreparedTransactWrite,
+  ValidationError | DynamoClientError,
+  TableConfig | DynamoClient
+> =>
   Effect.gen(function* () {
     const ops: Array<PreparedOp> = []
-    const streamOps = new Map<number, StreamAppendOp>()
+    const streamOps = new Map<number, BuiltStreamAppend>()
 
     for (let opIndex = 0; opIndex < operations.length; opIndex++) {
       const op = operations[opIndex]!
@@ -409,7 +416,9 @@ export const prepareTransactWriteOps = (
               "additionalItems. Nothing was sent.",
           })
         }
-        streamOps.set(opIndex, op)
+        // Built by its own stream, reading nothing: its refusals (no events, an
+        // event its schema refuses) come before any op reads.
+        streamOps.set(opIndex, yield* op._build(`operation ${opIndex}`))
         continue
       }
       // Check for ConditionCheckOp first (has its own TypeId)
@@ -453,6 +462,8 @@ export const prepareTransactWriteOps = (
           updateState,
         })
         const encoded = yield* entity._encodeKey(key, `${operation}.update.decodeKey`)
+        // What the update decides from its own operands: refused here, and planned from.
+        const prepared = yield* entity._prepareUpdate(key, updateState, encoded)
         // No `condition` here, so a planned op is never in `conditioned`, even
         // with a `.condition()` of its own: its verdict reports that as
         // `"Condition"`. Only `EventStore.append` reads `conditioned`, and it
@@ -461,7 +472,7 @@ export const prepareTransactWriteOps = (
           type: "planned",
           entity,
           opIndex,
-          plan: () => entity._planUpdate(key, updateState, encoded),
+          plan: () => entity._planUpdate(key, updateState, prepared),
         })
         continue
       }
@@ -659,40 +670,37 @@ export const buildTransactWriteItems = (
 
     // The nested stream appends, built by their own streams, are pushed in
     // caller op order between the entity ops' items.
-    const pushStreamOp = (opIndex: number) =>
-      Effect.gen(function* () {
-        const op = streamOps.get(opIndex)!
-        const nested = yield* op._build(`operation ${opIndex}`)
-        streams.push({
-          opIndex,
-          start: items.length,
-          count: nested.items.length,
-          verdict: nested.verdict,
-        })
-        streamKeys.push(nested.keys)
-        // Built once, on failure, then indexed.
-        let built: ReadonlyArray<TransactItemTarget> | undefined
-        const nestedTarget = (i: number): TransactItemTarget => {
-          if (built === undefined) built = nested.targets()
-          return built[i]!
-        }
-        for (const [i, item] of nested.items.entries()) {
-          items.push(item)
-          provenance.push({ opIndex, kind: "stream", entityType: nested.entityType })
-          naming.push(() => nestedTarget(i))
-        }
+    const pushStreamOp = (opIndex: number): void => {
+      const nested = streamOps.get(opIndex)!
+      streams.push({
+        opIndex,
+        start: items.length,
+        count: nested.items.length,
+        verdict: nested.verdict,
       })
+      streamKeys.push(nested.keys)
+      // Built once, on failure, then indexed.
+      let built: ReadonlyArray<TransactItemTarget> | undefined
+      const nestedTarget = (i: number): TransactItemTarget => {
+        if (built === undefined) built = nested.targets()
+        return built[i]!
+      }
+      for (const [i, item] of nested.items.entries()) {
+        items.push(item)
+        provenance.push({ opIndex, kind: "stream", entityType: nested.entityType })
+        naming.push(() => nestedTarget(i))
+      }
+    }
     let nextOpIndex = 0
-    const flushStreamOpsBefore = (opIndex: number) =>
-      Effect.gen(function* () {
-        for (; nextOpIndex < opIndex; nextOpIndex++) {
-          if (streamOps.has(nextOpIndex)) yield* pushStreamOp(nextOpIndex)
-        }
-        nextOpIndex = opIndex + 1
-      })
+    const flushStreamOpsBefore = (opIndex: number): void => {
+      for (; nextOpIndex < opIndex; nextOpIndex++) {
+        if (streamOps.has(nextOpIndex)) pushStreamOp(nextOpIndex)
+      }
+      nextOpIndex = opIndex + 1
+    }
 
     for (const op of opInfos) {
-      yield* flushStreamOpsBefore(op.opIndex)
+      flushStreamOpsBefore(op.opIndex)
       tableName = tableNames.get(op.entity)!
       const primary = op.entity.indexes.primary!
       keyFields = [primary.pk.field, primary.sk.field]
@@ -787,7 +795,7 @@ export const buildTransactWriteItems = (
       }
     }
 
-    yield* flushStreamOpsBefore(operations.length)
+    flushStreamOpsBefore(operations.length)
 
     const keys = () =>
       mergeKeyAttributes(
