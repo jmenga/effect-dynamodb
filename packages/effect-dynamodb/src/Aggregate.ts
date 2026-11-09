@@ -30,6 +30,7 @@ import {
   type ItemNotFound,
   isAwsTransactionCancelled,
   RefNotFound,
+  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
@@ -94,6 +95,7 @@ import {
   parseSimpleShorthand,
 } from "./internal/Expr.js"
 import { asReadGuard } from "./internal/ExpressionLimits.js"
+import { TRANSACT_WRITE_MAX_BYTES, transactionBytes } from "./internal/ItemSize.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
@@ -2498,11 +2500,17 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // In waves: a row moves once no row still to move is stored at its
         // current key, and the root once nothing else is left: while it's under the old partition
         // the next run finds the aggregate there. Each move's Put and Delete share a transaction;
-        // up to TRANSACT_LIMIT items go in one.
+        // a transaction takes the units in order while it holds at most TRANSACT_WRITE_ITEMS_LIMIT
+        // actions and TRANSACT_WRITE_MAX_BYTES bytes by the exact size model, and at least one.
         const units: Array<{
           readonly kind: "move" | "rewrite"
           readonly items: ReadonlyArray<TransactWriteItem>
-        }> = rewrites.map((items) => ({ kind: "rewrite" as const, items }))
+          readonly bytes: number
+        }> = rewrites.map((items) => ({
+          kind: "rewrite" as const,
+          items,
+          bytes: transactionBytes(items),
+        }))
         let pending = moves
         let lost = false
         while (!lost && (pending.length > 0 || units.length > 0)) {
@@ -2516,12 +2524,28 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // none reach here — reported below if one ever does.
           if (wave.length === 0 && units.length === 0) break
           pending = pending.filter((move) => !wave.includes(move))
-          units.push(...wave.map((move) => ({ kind: "move" as const, items: move.items })))
+          units.push(
+            ...wave.map((move) => ({
+              kind: "move" as const,
+              items: move.items,
+              bytes: transactionBytes(move.items),
+            })),
+          )
           while (!lost && units.length > 0) {
             const chunk: typeof units = []
             let size = 0
-            while (units.length > 0 && size + units[0]!.items.length <= TRANSACT_LIMIT) {
-              size += units[0]!.items.length
+            let bytes = 0
+            while (units.length > 0) {
+              const next = units[0]!
+              if (
+                chunk.length > 0 &&
+                (size + next.items.length > TRANSACT_WRITE_ITEMS_LIMIT ||
+                  bytes + next.bytes > TRANSACT_WRITE_MAX_BYTES)
+              ) {
+                break
+              }
+              size += next.items.length
+              bytes += next.bytes
               chunk.push(units.shift()!)
             }
             const written = yield* client
@@ -5318,9 +5342,6 @@ function writeTransactionGroups(
 // ---------------------------------------------------------------------------
 // Internal: Rows under other key text (#171, #183)
 // ---------------------------------------------------------------------------
-
-/** DynamoDB's limit on the items of one `TransactWriteItems`. */
-const TRANSACT_LIMIT = 100
 
 /**
  * Where an aggregate's row is stored (#171): under its current key, its 1.36
