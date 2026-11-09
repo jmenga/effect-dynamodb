@@ -443,17 +443,25 @@ type _ElementIdsOrWhole<T, Id, N extends string, TStamps> = T extends unknown
  * - an element declared a union takes each of its members, a member holding the entity taking a
  *   string id (`UnionId`) or the entity whole, and a string id as the element when a member is the
  *   entity. `create` fetches only a string in a union element, as 1.39.0 did.
+ *
+ * Where the type can't see the field of the entity's name (`N = never`, {@link _EntityFieldName}),
+ * an element other than the entity is `unknown`, as 1.39.0's `create` took it
+ * (`Record<string, unknown>`): no narrower type names every element `create` takes.
  */
 type _CreateManyEdge<T, Id, UnionId, TStamps, M, N extends string> =
   T extends ReadonlyArray<infer E>
     ? true extends _IsUnion<E>
-      ? ReadonlyArray<
-          | _ElementIdsOrWhole<E, UnionId, N, TStamps>
-          | ([Extract<E, M>] extends [never] ? never : UnionId)
-        >
+      ? [N] extends [never]
+        ? ReadonlyArray<unknown>
+        : ReadonlyArray<
+            | _ElementIdsOrWhole<E, UnionId, N, TStamps>
+            | ([Extract<E, M>] extends [never] ? never : UnionId)
+          >
       : [E] extends [M]
         ? ReadonlyArray<Id | _OptionalStamps<E, TStamps>>
-        : ReadonlyArray<_ElementIdsOrWhole<E, Id, N, TStamps>>
+        : [N] extends [never]
+          ? ReadonlyArray<unknown>
+          : ReadonlyArray<_ElementIdsOrWhole<E, Id, N, TStamps>>
     : _TransformManyEdge<T, Id, TStamps, M, never, N>
 
 /** A many edge's input to `create`: {@link _CreateManyEdge} for an entity one id names. */
@@ -490,7 +498,9 @@ type _CreateReplacedKeys<TEdges> = {
  * - A `ref` or `one` edge whose entity one id names: `${field}Id`, or the entity whole under the
  *   field's name.
  * - A many edge over such an entity: each element its id or the entity whole, or, for an element
- *   wrapping it, the field of the entity's name its id or the entity whole.
+ *   wrapping it, the field of the entity's name its id or the entity whole. Where the type can't
+ *   see that name (a `Schema.Class` model, say), an element wrapping the entity is `unknown`, as
+ *   1.39.0's `create` took it.
  * - An id in its key composite's type, or its stored or JSON form where that is another kind of
  *   value ({@link _EdgeIdForms}). In a union element, only a string id ({@link _CreateManyEdge}).
  * - Sub-aggregates likewise.

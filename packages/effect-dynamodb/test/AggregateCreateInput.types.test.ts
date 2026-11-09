@@ -6,7 +6,9 @@
  * caller supplies them (from a path, say). An edge whose entity one id names takes `${field}Id`, or
  * the entity whole under the field's name, or both, when the id is fetched. A many edge over such
  * an entity takes each element as its id or the entity whole, in any mix, and an element wrapping
- * the entity takes either in the field of the entity's name. An id is a value of the key
+ * the entity takes either in the field of the entity's name. The type sees that name for a
+ * `Schema.Struct` model; for a `Schema.Class` model an element wrapping the entity is `unknown`, as
+ * 1.39.0's `create` took it. An id is a value of the key
  * composite's type, or its stored or JSON form where that is another kind of value; in a union
  * element, a string only, as 1.39.0 fetched. A branded id keeps its brand.
  * Every other field takes its domain value, as `Entity.put`'s type asks, though at run time both
@@ -90,9 +92,32 @@ const PairLines = Entity.make({
   },
 })
 
+/** `Schema.Struct` models: `create` takes the entity in the field its `entityType` names. */
+const NumberRow = Schema.Struct({ lineId: Schema.Number, f: Schema.Number })
+const StringRow = Schema.Struct({ lineId: Schema.String, f: Schema.Number })
+const NumberRows = Entity.make({
+  model: NumberRow,
+  entityType: "NumberRow",
+  primaryKey: keyedBy("lineId"),
+})
+const StringRows = Entity.make({
+  model: StringRow,
+  entityType: "StringRow",
+  primaryKey: keyedBy("lineId"),
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { NumberLines, CodecLines, DateLines, BrandLines, StringLines, PairLines },
+  entities: {
+    NumberLines,
+    CodecLines,
+    DateLines,
+    BrandLines,
+    StringLines,
+    PairLines,
+    NumberRows,
+    StringRows,
+  },
 })
 
 class Team extends Schema.Class<Team>("Team")({
@@ -116,10 +141,11 @@ class Root extends Schema.Class<Root>("Root")({
   pairLine: PairLine,
   refLine: NumberLine,
   numberLines: Schema.Array(NumberLine),
-  sheets: Schema.Array(Schema.Struct({ numberLine: NumberLine, qty: Schema.Number })),
+  sheets: Schema.Array(Schema.Struct({ numberRow: NumberRow, qty: Schema.Number })),
   maybeSheets: Schema.Array(
-    Schema.Struct({ numberLine: Schema.optional(NumberLine), qty: Schema.Number }),
+    Schema.Struct({ numberRow: Schema.optional(NumberRow), qty: Schema.Number }),
   ),
+  classSheets: Schema.Array(Schema.Struct({ numberLine: NumberLine, qty: Schema.Number })),
   notes: Schema.Array(Schema.Struct({ id: Schema.String, text: Schema.String })),
   team: Team,
 }) {}
@@ -144,11 +170,16 @@ const RootAggregate = Aggregate.make(Root, {
     }),
     sheets: Aggregate.many({
       entityType: "RootSheet",
-      entity: NumberLines,
+      entity: NumberRows,
       sk: { composite: ["qty"] },
     }),
     maybeSheets: Aggregate.many({
       entityType: "RootMaybeSheet",
+      entity: NumberRows,
+      sk: { composite: ["qty"] },
+    }),
+    classSheets: Aggregate.many({
+      entityType: "RootClassSheet",
       entity: NumberLines,
       sk: { composite: ["qty"] },
     }),
@@ -169,19 +200,19 @@ const UnionSheet = Schema.Union([
   Schema.Union([
     Schema.Struct({
       kind: Schema.NullOr(Schema.Literal("a")),
-      numberLine: NumberLine,
+      numberRow: NumberRow,
       qty: Schema.Number,
     }),
     Schema.Struct({
       kind: Schema.Literal("b"),
-      numberLine: Schema.optional(NumberLine),
+      numberRow: Schema.optional(NumberRow),
       qty: Schema.Number,
     }),
   ]),
   Schema.Struct({
     kind: Schema.Literal("a"),
-    numberLine: Schema.String,
-    numberLineId: Schema.String,
+    numberRow: Schema.String,
+    numberRowId: Schema.String,
     qty: Schema.Number,
   }),
   Schema.Struct({ kind: Schema.Literal("c"), qty: Schema.Number }),
@@ -199,7 +230,7 @@ const UnionAggregate = Aggregate.make(UnionRoot, {
   edges: {
     sheets: Aggregate.many({
       entityType: "UnionSheet",
-      entity: NumberLines,
+      entity: NumberRows,
       sk: { composite: ["qty"] },
     }),
   },
@@ -211,23 +242,23 @@ const StringUnionSheet = Schema.Union([
   Schema.Union([
     Schema.Struct({
       kind: Schema.NullOr(Schema.Literal("a")),
-      stringLine: StringLine,
+      stringRow: StringRow,
       qty: Schema.Number,
     }),
     Schema.Struct({
       kind: Schema.Literal("b"),
-      stringLine: Schema.optional(StringLine),
+      stringRow: Schema.optional(StringRow),
       qty: Schema.Number,
     }),
   ]),
   Schema.Struct({
     kind: Schema.Literal("a"),
-    stringLine: Schema.String,
-    stringLineId: Schema.String,
+    stringRow: Schema.String,
+    stringRowId: Schema.String,
     qty: Schema.Number,
   }),
   Schema.Struct({ kind: Schema.Literal("c"), qty: Schema.Number }),
-  StringLine,
+  StringRow,
 ])
 class StringUnionRoot extends Schema.Class<StringUnionRoot>("StringUnionRoot")({
   id: Schema.String,
@@ -240,15 +271,37 @@ const StringUnionAggregate = Aggregate.make(StringUnionRoot, {
   collection: { name: "string-union" },
   root: { entityType: "StringUnionRoot" },
   edges: {
-    sheets: Aggregate.many({ entityType: "StringUnionSheet", entity: StringLines }),
+    sheets: Aggregate.many({ entityType: "StringUnionSheet", entity: StringRows }),
   },
 })
 type StringUnionCreate = Parameters<typeof StringUnionAggregate.create>[0]
 
+/** A union element over a `Schema.Class` model, whose field name the type can't see. */
+class ClassUnionRoot extends Schema.Class<ClassUnionRoot>("ClassUnionRoot")({
+  id: Schema.String,
+  sheets: Schema.Array(
+    Schema.Union([
+      Schema.Struct({ kind: Schema.Literal("a"), stringLine: StringLine, qty: Schema.Number }),
+      Schema.Struct({ kind: Schema.Literal("c"), qty: Schema.Number }),
+    ]),
+  ),
+}) {}
+const ClassUnionAggregate = Aggregate.make(ClassUnionRoot, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "class-union" },
+  root: { entityType: "ClassUnionRoot" },
+  edges: {
+    sheets: Aggregate.many({ entityType: "ClassUnionSheet", entity: StringLines }),
+  },
+})
+type ClassUnionCreate = Parameters<typeof ClassUnionAggregate.create>[0]
+
 /** An element holding the entity in a field of another name than the entity's. */
 class CrewRoot extends Schema.Class<CrewRoot>("CrewRoot")({
   id: Schema.String,
-  crew: Schema.Array(Schema.Struct({ captain: NumberLine, qty: Schema.Number })),
+  crew: Schema.Array(Schema.Struct({ captain: NumberRow, qty: Schema.Number })),
 }) {}
 const CrewAggregate = Aggregate.make(CrewRoot, {
   table: MainTable,
@@ -257,7 +310,7 @@ const CrewAggregate = Aggregate.make(CrewRoot, {
   collection: { name: "crew" },
   root: { entityType: "CrewRoot" },
   edges: {
-    crew: Aggregate.many({ entityType: "Crew", entity: NumberLines, sk: { composite: ["qty"] } }),
+    crew: Aggregate.many({ entityType: "Crew", entity: NumberRows, sk: { composite: ["qty"] } }),
   },
 })
 type CrewCreate = Parameters<typeof CrewAggregate.create>[0]
@@ -276,6 +329,7 @@ type ClientCreate = Parameters<
 >[0]
 
 const line = new NumberLine({ lineId: 1, f: 5 })
+const row = { lineId: 1, f: 5 }
 const base = {
   id: "a",
   note: "n",
@@ -286,8 +340,9 @@ const base = {
   pairLine: new PairLine({ tenant: "t", lineId: "p", f: 1 }),
   refLineId: 1,
   numberLines: [1],
-  sheets: [{ numberLineId: 1, qty: 2 }],
+  sheets: [{ numberRowId: 1, qty: 2 }],
   maybeSheets: [{ qty: 2 }],
+  classSheets: [{ numberLine: line, qty: 2 }],
   notes: [{ id: "n1", text: "t" }],
   team: { name: "A", captainId: 1 },
 } as const satisfies Create
@@ -340,43 +395,49 @@ describe("an aggregate's create takes what it takes at run time", () => {
   })
 
   it("takes an element wrapping the entity with its id or the entity whole", () => {
-    expectTypeOf({ ...base, sheets: [{ numberLine: line, qty: 2 }] }).toExtend<Create>()
-    expectTypeOf({ ...base, maybeSheets: [{ numberLineId: 1, qty: 2 }] }).toExtend<Create>()
-    expectTypeOf({ ...base, maybeSheets: [{ numberLine: line, qty: 2 }] }).toExtend<Create>()
+    expectTypeOf({ ...base, sheets: [{ numberRow: row, qty: 2 }] }).toExtend<Create>()
+    expectTypeOf({ ...base, maybeSheets: [{ numberRowId: 1, qty: 2 }] }).toExtend<Create>()
+    expectTypeOf({ ...base, maybeSheets: [{ numberRow: row, qty: 2 }] }).toExtend<Create>()
   })
 
   it("takes a union element as each of its members, nested and nullable ones included", () => {
     expectTypeOf({
       id: "a",
       sheets: [
-        { kind: null, numberLine: line, qty: 1 },
-        { kind: "a", numberLine: line, qty: 2 },
+        { kind: null, numberRow: row, qty: 1 },
+        { kind: "a", numberRow: row, qty: 2 },
         { kind: "b", qty: 3 },
-        { kind: "a", numberLine: "KEEP", numberLineId: "l", qty: 5 },
+        { kind: "a", numberRow: "KEEP", numberRowId: "l", qty: 5 },
         { kind: "c", qty: 6 },
       ],
     } as const).toExtend<UnionCreate>()
   })
 
   it("takes a string id in a union element's member holding the entity, or as the element", () => {
-    const stringLine = new StringLine({ lineId: "l", f: 1 })
+    const stringRow = { lineId: "l", f: 1 }
     expectTypeOf({
       id: "a",
       sheets: [
-        { kind: null, stringLineId: "l", qty: 1 },
-        { kind: "a", stringLine, qty: 2 },
-        { kind: "b", stringLineId: "l", qty: 3 },
+        { kind: null, stringRowId: "l", qty: 1 },
+        { kind: "a", stringRow, qty: 2 },
+        { kind: "b", stringRowId: "l", qty: 3 },
         { kind: "b", qty: 4 },
-        { kind: "a", stringLine: "KEEP", stringLineId: "l", qty: 5 },
+        { kind: "a", stringRow: "KEEP", stringRowId: "l", qty: 5 },
         { kind: "c", qty: 6 },
         "l",
-        stringLine,
+        stringRow,
       ],
     } as const).toExtend<StringUnionCreate>()
   })
 
   it("takes an element holding the entity in a field of another name whole", () => {
-    expectTypeOf({ id: "a", crew: [{ captain: line, qty: 2 }] } as const).toExtend<CrewCreate>()
+    expectTypeOf({ id: "a", crew: [{ captain: row, qty: 2 }] } as const).toExtend<CrewCreate>()
+  })
+
+  it("takes an element wrapping a class model's entity as 1.39.0's create did: unknown", () => {
+    // `create` takes the entity in the field of the class's name, which the type can't see.
+    expectTypeOf<Create["classSheets"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
+    expectTypeOf<ClassUnionCreate["sheets"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
   })
 
   it("takes a sub-aggregate's edges the same way", () => {
@@ -404,19 +465,21 @@ function _refusals(input: Record<string, unknown>): void {
   RootAggregate.create({ ...base, numberLines: [{ lineId: "x" }] })
   // @ts-expect-error — a record of unknown values is no input
   RootAggregate.create(input)
-  // @ts-expect-error — no member of the union element takes a string in `numberLine` for kind "b"
-  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberLine: "x", qty: 1 }] })
+  // @ts-expect-error — no member of the union element takes a string in `numberRow` for kind "b"
+  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberRow: "x", qty: 1 }] })
   // @ts-expect-error — a member declaring neither the entity's field nor its id takes no id
-  StringUnionAggregate.create({ id: "a", sheets: [{ kind: "c", stringLineId: "l", qty: 1 }] })
+  StringUnionAggregate.create({ id: "a", sheets: [{ kind: "c", stringRowId: "l", qty: 1 }] })
   // @ts-expect-error — `create` fetches only a string in a union element: a number id is dropped
-  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberLineId: 1, qty: 1 }] })
+  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberRowId: 1, qty: 1 }] })
   // @ts-expect-error — nor an optional one
-  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberLineId: 1, qty: 1 }] })
+  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberRowId: 1, qty: 1 }] })
   // @ts-expect-error — a string id of a number-keyed entity fails with EDD-9131
-  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberLineId: "1", qty: 1 }] })
+  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberRowId: "1", qty: 1 }] })
   // @ts-expect-error — a union with no member that is the entity takes no id as the element
   UnionAggregate.create({ id: "a", sheets: ["1"] })
   // @ts-expect-error — `create` takes the entity by id only in the field of its name
   CrewAggregate.create({ id: "a", crew: [{ captainId: 1, qty: 2 }] })
+  // @ts-expect-error — a class model's element is unknown, but still an element of an array
+  RootAggregate.create({ ...base, classSheets: { numberLine: line, qty: 2 } })
 }
 void _refusals
