@@ -189,9 +189,10 @@ type _ManyEdgeInput<T, Edge, TStamps> =
         _EdgeIdValue<Edge>,
         TStamps,
         _EdgeModelType<Edge>,
-        _UnionEdgeIdValue<Edge>
+        _UnionEdgeIdValue<Edge>,
+        _EntityFieldName<_EdgeEntity<Edge>>
       >
-    : _TransformManyEdge<T, never, TStamps, never, never>
+    : _TransformManyEdge<T, never, TStamps, never, never, never>
 
 /** A union element's id, as 1.39.0 typed it: the entity's partition key composite's type. */
 type _UnionEdgeIdValue<Edge> =
@@ -328,25 +329,48 @@ type _NotCallersOwn<TModel, TNames> = TNames extends keyof TModel
   : TNames
 
 /**
- * Whether a value of type `V` can be the entity (domain type `M`): `V` is it, or a union holding it
- * (`M | undefined`). `never` for `M` (no entity to fetch) holds nothing.
+ * The field of a `many` element `create` takes an edge's entity in (`deriveEntityFieldName`): the
+ * entity model's identifier, or its `entityType`, first letter lowercased. A `Schema.Class` types
+ * its identifier as `string`, so for a class the `entityType` stands in for it. The two agree when
+ * the class is named as the entity type is.
  */
-type _HoldsEntity<V, M> = [M] extends [never]
-  ? false
-  : [Extract<NonNullable<V>, M>] extends [never]
-    ? false
-    : true
+type _EntityFieldName<E> = E extends {
+  readonly entityType: infer T extends string
+  readonly model: infer M
+}
+  ? M extends { readonly identifier: infer I extends string }
+    ? string extends I
+      ? Uncapitalize<T>
+      : Uncapitalize<I>
+    : Uncapitalize<T>
+  : never
 
 /**
- * An element's fields, each holding the edge's entity (domain type `M`) taken as `${field}Id: <Id>`,
- * optional when the field is, as `create` takes it (`deriveElementInputSchema`). Distributes over a
- * union of element members: each member holding the entity takes its id.
+ * Whether a value of type `V` can hold a record (`holdsRecord`): one of its members, `null` and
+ * `undefined` aside, is neither a scalar nor a list.
  */
-type _RefFieldsToIds<T, Id, M> = T extends unknown
+type _HoldsRecord<V> = [
+  Exclude<NonNullable<V>, string | number | bigint | boolean | symbol | ReadonlyArray<unknown>>,
+] extends [never]
+  ? false
+  : true
+
+/**
+ * Whether an element's field `K` holds the edge's entity, as `create` judges it
+ * (`elementHoldsRef`): the field of the entity's name (`N`, {@link _EntityFieldName}), when it can
+ * hold a record. A field of another name holds a value, whatever its type.
+ */
+type _IsRefField<T, K extends keyof T, N extends string> = K extends N ? _HoldsRecord<T[K]> : false
+
+/**
+ * An element's field holding the edge's entity ({@link _IsRefField}) taken as `${field}Id: <Id>`,
+ * optional when the field is, as `create` takes it (`deriveElementInputSchema`).
+ */
+type _RefFieldsToIds<T, Id, N extends string> = T extends unknown
   ? _Simplify<{
-      readonly [K in keyof T as _HoldsEntity<T[K], M> extends true
+      readonly [K in keyof T as _IsRefField<T, K, N> extends true
         ? `${K & string}Id`
-        : K]: _HoldsEntity<T[K], M> extends true
+        : K]: _IsRefField<T, K, N> extends true
         ? Id | (undefined extends T[K] ? undefined : never)
         : T[K]
     }>
@@ -356,11 +380,12 @@ type _RefFieldsToIds<T, Id, M> = T extends unknown
  * A many edge's elements as its input takes them, for an edge whose entity (domain type `M`) one
  * id of type `Id` names:
  * - an element that is the entity (`Array<Umpire>`) is its id: the array becomes `Array<Id>`;
- * - an element wrapping it (`Array<{ player: Player, ... }>`) takes `${field}Id: Id` for the field.
+ * - an element wrapping it (`Array<{ player: Player, ... }>`) takes `${field}Id: Id` for the field
+ *   of the entity's name (`N`, {@link _EntityFieldName}), when it can hold a record.
  * - an element declared a union is typed as on 1.39.0 ({@link _UnionElementInput}), with `UnionId`.
  * With no entity to fetch (`M = never`), the elements are taken as given.
  */
-type _TransformManyEdge<T, Id, TStamps, M, UnionId> =
+type _TransformManyEdge<T, Id, TStamps, M, UnionId, N extends string> =
   T extends ReadonlyArray<infer E>
     ? [M] extends [never]
       ? ReadonlyArray<_OptionalStamps<E, TStamps>>
@@ -368,7 +393,7 @@ type _TransformManyEdge<T, Id, TStamps, M, UnionId> =
         ? _UnionElementInput<E, UnionId, TStamps>
         : [E] extends [M]
           ? ReadonlyArray<Id>
-          : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id, M>, TStamps>>
+          : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id, N>, TStamps>>
     : T extends Readonly<Record<string, infer V>>
       ? string extends keyof T
         ? { readonly [key: string]: _OptionalStamps<V, TStamps> }

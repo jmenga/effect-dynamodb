@@ -4040,7 +4040,12 @@ field replaced by `${field}Id` of the key composite's own schema
 element that is the entity's own model, given whole, holds no ref either, so a
 `many` edge of such elements is stored as given: its key field (`lineId` of a
 `Line`) is its own value. Up to 1.39.0 it was taken for a ref because its name
-was `${field}Id`, and `create` died composing the key.
+was `${field}Id`, and `create` died composing the key. The input type
+(`AggregateTypes`) takes the same field by id, and a field of another name
+whole, whatever it holds. The field's name comes from the entity model's
+identifier, which a `Schema.Class` types as `string`, so the type names it by
+the entity's `entityType`; the two agree when the class is named as the entity
+type is.
 
 A union element is judged as 1.39.0 judged it (`isUnionElement`): a string
 `${field}Id`, or a string given as the element, is an id `create` fetches by,

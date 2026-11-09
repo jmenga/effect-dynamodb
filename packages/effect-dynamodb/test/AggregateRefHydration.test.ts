@@ -523,6 +523,36 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     }),
   )
 
+  it.effect("an element holding the entity in a field of another name is taken whole", () =>
+    Effect.gen(function* () {
+      const { Line } = lineClass(false)
+      const Lines = lines(Line, singleKey)
+      const Crew = Schema.Struct({ captain: Line, qty: Schema.Number })
+      const shape = (input: Record<string, unknown>): Shape => ({
+        entities: { Lines },
+        make: (base) =>
+          aggregate(Schema.Struct({ id: Schema.String, crew: Schema.Array(Crew) }), base, {
+            crew: Aggregate.many({
+              entityType: "Crew",
+              entity: Lines,
+              sk: { composite: ["qty"] },
+            } as never),
+          }),
+        seed: [["Lines", { lineId: "l", f: 5 }]],
+        input,
+      })
+      const whole = yield* run(
+        shape({ id: "a", crew: [{ captain: { lineId: "l", f: 5 }, qty: 2 }] }),
+      )
+      expect(Exit.isSuccess(whole.create)).toBe(true)
+      expect(whole.requests).toEqual(["TransactWriteItems"])
+      // Only the field of the entity's name (`line`) is taken by id, so `captainId` is not fetched.
+      const byId = yield* run(shape({ id: "a", crew: [{ captainId: "l", qty: 2 }] }))
+      expect(refusal(byId.create)).toContain('["captain"]')
+      expect(byId.requests).toEqual([])
+    }),
+  )
+
   it.effect("a NumberFromString id given an infinity as its encoded string: put stores it", () =>
     Effect.gen(function* () {
       for (const [sign, given] of [

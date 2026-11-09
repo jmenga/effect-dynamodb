@@ -122,6 +122,8 @@ class Root extends Schema.Class<Root>("Root")({
   maybeSheets: Schema.Array(
     Schema.Struct({ numberLine: Schema.optional(NumberLine), qty: Schema.Number }),
   ),
+  crews: Schema.Array(Schema.Struct({ captain: NumberLine, qty: Schema.Number })),
+  labels: Schema.Array(Schema.Struct({ numberLine: Schema.String, qty: Schema.Number })),
   kinds: Schema.Array(
     Schema.Union([
       Schema.Struct({ kind: Schema.Literal("a"), numberLine: NumberLine }),
@@ -163,6 +165,16 @@ const RootAggregate = Aggregate.make(Root, {
     }),
     maybeSheets: Aggregate.many({
       entityType: "RootMaybeSheet",
+      entity: NumberLines,
+      sk: { composite: ["qty"] },
+    }),
+    crews: Aggregate.many({
+      entityType: "RootCrew",
+      entity: NumberLines,
+      sk: { composite: ["qty"] },
+    }),
+    labels: Aggregate.many({
+      entityType: "RootLabel",
       entity: NumberLines,
       sk: { composite: ["qty"] },
     }),
@@ -224,6 +236,21 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
     }>()
   })
 
+  it("a many element holding the entity in a field of another name takes it whole", () => {
+    // `create` takes the entity by id only in the field of its name (`numberLine`).
+    expectTypeOf<Input["crews"][number]>().toEqualTypeOf<{
+      readonly captain: NumberLine
+      readonly qty: number
+    }>()
+  })
+
+  it("a many element declaring the entity's field a scalar takes it as declared", () => {
+    expectTypeOf<Input["labels"][number]>().toEqualTypeOf<{
+      readonly numberLine: string
+      readonly qty: number
+    }>()
+  })
+
   it("a many element that is a union is typed as on 1.39.0: as declared, holding no ref-like field", () => {
     expectTypeOf<Input["kinds"][number]>().toEqualTypeOf<
       | { readonly kind: "a"; readonly numberLine: NumberLine }
@@ -270,6 +297,8 @@ function _refusals(input: Input): void {
   const _sheetLine: NumberLine = input.sheets[0]!.numberLine
   // @ts-expect-error — an element with no entity to fetch keeps its fields, so has no `idId`
   const _noteId: string = input.notes[0]!.idId
+  // @ts-expect-error — a field of another name than the entity's is not taken by id
+  const _captainId: number = input.crews[0]!.captainId
   void _numberAsString
   void _bigintAsNumber
   void _numbersAsStrings
@@ -277,5 +306,6 @@ function _refusals(input: Input): void {
   void _sortKeyNever
   void _sheetLine
   void _noteId
+  void _captainId
 }
 void _refusals
