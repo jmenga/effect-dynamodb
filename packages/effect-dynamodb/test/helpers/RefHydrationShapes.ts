@@ -1785,12 +1785,6 @@ export const UNFETCHABLE = [
   "one, an entity keyed by two composites",
 ]
 /**
- * An id of the key composite's own type, which 1.39.0 dropped (so a required edge failed decoding
- * and an optional one was created without it), or fetched under a key `Entity.put` never wrote (a
- * string codec, or one inside a wrapper, which `put` keys by its stored text): each is now fetched
- * by the key `put` wrote.
- */
-/**
  * Shapes keyed by a codec `encode` takes on its own output, which 1.39.0's `put` keyed by its stored
  * text encoded once more (`lineid_x:x:mix`). A `put` now keys the stored text (`lineid_x:mix`), where
  * `create` fetches it, and `rekey` moves 1.39.0's rows there (`KeyCodecPaths.test.ts`).
@@ -1803,6 +1797,12 @@ export const keyedOnce = (row: Row): Row => ({
   ...row,
   pk: { S: row.pk!.S!.replace("#lineid_x:x:", "#lineid_x:") },
 })
+/**
+ * An id of the key composite's own type, which 1.39.0 dropped (so a required edge failed decoding
+ * and an optional one was created without it), or fetched under a key `Entity.put` never wrote (a
+ * string codec, or one inside a wrapper, which `put` keys by its stored text): each is now fetched
+ * by the key `put` wrote.
+ */
 export const NOW_FETCHED = [
   "one, an entity keyed by a number, given a number",
   "one, an entity keyed by a bigint, given a bigint",
