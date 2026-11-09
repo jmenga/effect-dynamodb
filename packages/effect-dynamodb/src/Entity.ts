@@ -55,6 +55,7 @@ import {
   otherNumericKind,
   type ReadBackText,
   readsBackOtherwise,
+  refuseInexact,
   storedFormOfRead,
   storedNumericForm,
   toCompositeKeyRecord,
@@ -508,7 +509,8 @@ const keyFormFor = (
   }
   const source = t.schemas?.inputSchema ?? t.model
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value) => {
+  const form = makeCompositeKeyForm(source, (attr, value, reason) => {
+    if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
@@ -3726,15 +3728,15 @@ const makeImpl = <
   const compositeKeyForm = makeCompositeKeyForm(
     schemas.inputSchema as unknown as Schema.Top,
     (attr, value, reason) => {
+      if (reason !== undefined) {
+        return refuseInexact(`Composite "${attr}" on entity "${entityType}"`, value, reason)
+      }
       throw new Error(
-        reason !== undefined
-          ? `[EDD-9050] Composite "${attr}" on entity "${entityType}" has no key text: ` +
-              `${reason}, so a row storing it is one the field can't read.`
-          : `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to ` +
-              `its stored form. The attribute's schema carries an encoding transformation, so ` +
-              `the stored key holds the ENCODED value, but ${JSON.stringify(String(value))} ` +
-              `encodes under neither encode nor decode->encode. Supply a value of the ` +
-              `attribute's own type.`,
+        `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to ` +
+          `its stored form. The attribute's schema carries an encoding transformation, so ` +
+          `the stored key holds the ENCODED value, but ${JSON.stringify(String(value))} ` +
+          `encodes under neither encode nor decode->encode. Supply a value of the ` +
+          `attribute's own type.`,
       )
     },
     // A record handed here can be a whole row read back (restore, a retain update, rekey): what

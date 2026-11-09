@@ -46,12 +46,16 @@ import { Data, Predicate } from "effect"
 /**
  * A value key composition can't place in sort order: `NaN`, or a bigint of
  * more than 1,000 digits. Thrown synchronously by `serializeValue`; the write
- * paths turn it into a `ValidationError`.
+ * paths turn it into a `ValidationError`. A composite's number its declared
+ * kind can't hold exactly is refused as one too (`CompositeCodec.refuseInexact`).
  */
 export class KeyValueError extends Data.TaggedError("KeyValueError")<{
   readonly value: unknown
   readonly reason: string
-  /** Human-readable description, prefixed with `EDD-9096`. */
+  /**
+   * Human-readable description, prefixed with its code: `EDD-9096`, or `EDD-9050`
+   * for a number its composite's kind can't hold exactly.
+   */
   readonly message: string
 }> {}
 

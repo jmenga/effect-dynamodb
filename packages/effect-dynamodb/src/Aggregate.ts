@@ -42,6 +42,7 @@ import {
   readBackAs,
   readBackUnsure,
   readsBackOtherwise,
+  refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
@@ -1548,7 +1549,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // domain objects, so without this a `DateEpochMs` composite would key on its
   // ISO form here and its epoch form on the entity path, and a numeric
   // composite with a string encoding would not be zero-padded on either.
-  const compositeKeyForm = makeCompositeKeyForm(schema, (attr, value) => {
+  const compositeKeyForm = makeCompositeKeyForm(schema, (attr, value, reason) => {
+    if (reason !== undefined) {
+      return refuseInexact(`Composite "${attr}" on aggregate "${aggregateName}"`, value, reason)
+    }
     throw new Error(
       `[EDD-9050] Composite "${attr}" on aggregate "${aggregateName}" could not be put into ` +
         `its key form. The attribute's schema carries an encoding transformation, but ` +

@@ -35,6 +35,7 @@
 
 import { Equal, Option, Schema, SchemaAST } from "effect"
 import { substituteSchemaDeep } from "./EntitySchemas.js"
+import { KeyValueError } from "./NumericKey.js"
 import {
   getSchemaFields,
   hasEncodingTransformation,
@@ -48,6 +49,23 @@ import {
  * domain values — and lands both on the same result.
  */
 export type CompositeKeyForm = (attr: string, value: unknown) => unknown
+
+/**
+ * The refusal of a composite's number its declared kind can't hold exactly (the
+ * `reason` {@link makeCompositeKeyForm} gives `onError`), `[EDD-9050]`. Thrown as
+ * a value key composition can't place (`KeyValueError`, as `NaN` is), so every
+ * path that takes the value fails with a `ValidationError`, nothing sent, rather
+ * than dying. `composite` names it: `Composite "n" on entity "E"`.
+ */
+export const refuseInexact = (composite: string, value: unknown, reason: string): never => {
+  throw new KeyValueError({
+    value,
+    reason,
+    message:
+      `[EDD-9050] ${composite} has no key text: ${reason}, so a row storing it is one the ` +
+      `field can't read.`,
+  })
+}
 
 /**
  * Build a `CompositeKeyForm` for a model/derived schema.
@@ -74,10 +92,11 @@ export type CompositeKeyForm = (attr: string, value: unknown) => unknown
  * `onError` fires when the value of an attribute a key is composed from
  * reaches neither target form — refuse loudly rather than compose a key that
  * silently matches nothing. `reason` says why, when it's a number its numeric
- * kind can't hold exactly. `reads` names those attributes, when the records
- * normalised hold others too (a whole row read back from DynamoDB): any other
- * attribute's value is never key text, so one that reaches neither form is
- * left as it is. Without `reads`, every attribute is one.
+ * kind can't hold exactly, which `onError` refuses with {@link refuseInexact}.
+ * `reads` names those attributes, when the records normalised hold others too
+ * (a whole row read back from DynamoDB): any other attribute's value is never
+ * key text, so one that reaches neither form is left as it is. Without `reads`,
+ * every attribute is one.
  */
 export const makeCompositeKeyForm = (
   source: Schema.Top,

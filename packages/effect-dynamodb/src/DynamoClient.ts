@@ -131,6 +131,7 @@ import {
   type KeyFormValueKind,
   keyFormValueKind,
   makeCompositeKeyForm,
+  refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
@@ -1403,7 +1404,8 @@ const entityKeyForm = (
 ): Record<string, unknown> => {
   const source = (entityLike.schemas?.inputSchema ?? entityLike.model) as Schema.Top | undefined
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value) => {
+  const form = makeCompositeKeyForm(source, (attr, value, reason) => {
+    if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
@@ -2607,7 +2609,14 @@ const makeFromConfig = (config: {
       // composing keys. The raw model is not equivalent — entity derivation
       // substitutes date/Redacted fields with their wire transforms.
       const encoderSource = entityLike.schemas.inputSchema ?? entityLike.model
-      const compositeKeyForm = makeCompositeKeyForm(encoderSource, (attr, value) => {
+      const compositeKeyForm = makeCompositeKeyForm(encoderSource, (attr, value, reason) => {
+        if (reason !== undefined) {
+          return refuseInexact(
+            `Composite "${attr}" on index "${_indexName}" of entity "${entityLike.entityType}"`,
+            value,
+            reason,
+          )
+        }
         throw new Error(
           `[EDD-9050] Composite "${attr}" on index "${_indexName}" of entity ` +
             `"${entityLike.entityType}" could not be encoded to its stored form. The ` +

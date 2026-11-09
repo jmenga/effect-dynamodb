@@ -13,6 +13,7 @@ import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   compositeKeyFormKind,
   makeCompositeKeyForm,
+  refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -130,7 +131,8 @@ const collectionKeyForm = (
   }
   const source = (e.schemas?.inputSchema ?? e.model) as Schema.Top | undefined
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value) => {
+  const form = makeCompositeKeyForm(source, (attr, value, reason) => {
+    if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
