@@ -932,6 +932,12 @@ export const kindReadingOf = (
 export const makeCompositeStoredForm = (
   source: Schema.Top,
 ): ((record: Record<string, unknown>) => Record<string, unknown>) => {
+  const storedForm = compositeStoredForm(source)
+  return (record) => toCompositeKeyRecord(storedForm, record)
+}
+
+/** {@link makeCompositeStoredForm}, one attribute at a time. */
+const compositeStoredForm = (source: Schema.Top): CompositeKeyForm => {
   const fields = getSchemaFields(source)
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
 
@@ -965,12 +971,69 @@ export const makeCompositeStoredForm = (
     return fn
   }
 
-  const storedForm: CompositeKeyForm = (attr, value) => {
+  return (attr, value) => {
     if (value === undefined || value === null) return value
     const fn = resolve(attr)
     return fn === null ? value : fn(value)
   }
-  return (record) => toCompositeKeyRecord(storedForm, record)
+}
+
+/**
+ * The key form of a caller's DOMAIN value: {@link makeCompositeStoredForm}'s
+ * stored form, then `makeCompositeKeyForm`'s key form — what `Entity.put`
+ * composes for the value. Every path that composes a key from values a caller
+ * gives (an accessor's composites, a `.where()` or `.within()` bound, a
+ * collection's or a vector index's partition, a geo search's filter, a
+ * multi-item op's key) composes through it, so it finds what `put` wrote.
+ * Except for a codec whose `encode` takes its own output, it is exactly the
+ * key form.
+ */
+export const makeCompositeDomainKeyForm = (
+  source: Schema.Top,
+  onError: (attr: string, value: unknown, reason?: string) => never,
+): CompositeKeyForm => {
+  const keyForm = makeCompositeKeyForm(source, onError)
+  const storedForm = compositeStoredForm(source)
+  return (attr, value) => keyForm(attr, storedForm(attr, value))
+}
+
+/**
+ * The key form of a STORED composite value, as `put` composed it: for an
+ * attribute whose schema encodes (the key form's case 3b), the value's
+ * `encode` when the codec takes the stored value (a codec whose `encode` takes
+ * its own output, which `put` encoded twice), else the stored value as it is,
+ * which is its key form; any other value as it is. A row check reads a row's
+ * composite through it, so it compares what the row's key holds with a bound
+ * composed by {@link makeCompositeDomainKeyForm}.
+ */
+export const makeCompositeStoredKeyForm = (source: Schema.Top): CompositeKeyForm => {
+  const fields = getSchemaFields(source)
+  const cache = new Map<string, ((value: unknown) => unknown) | null>()
+  const resolve = (attr: string): ((value: unknown) => unknown) | null => {
+    const cached = cache.get(attr)
+    if (cached !== undefined) return cached
+    const field = fields?.[attr]
+    if (
+      field === undefined ||
+      numericTypeWithStringEncoding(field) ||
+      !hasEncodingTransformation(field)
+    ) {
+      cache.set(attr, null)
+      return null
+    }
+    const encode = Schema.encodeUnknownOption(field as unknown as Schema.Codec<any>)
+    const fn = (value: unknown): unknown => {
+      const encoded = encode(value)
+      return Option.isSome(encoded) ? encoded.value : value
+    }
+    cache.set(attr, fn)
+    return fn
+  }
+  return (attr, value) => {
+    if (value === undefined || value === null) return value
+    const fn = resolve(attr)
+    return fn === null ? value : fn(value)
+  }
 }
 
 /**

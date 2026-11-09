@@ -12,7 +12,7 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   compositeKeyFormKind,
-  makeCompositeKeyForm,
+  makeCompositeDomainKeyForm,
   refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -131,7 +131,9 @@ const collectionKeyForm = (
   }
   const source = (e.schemas?.inputSchema ?? e.model) as Schema.Top | undefined
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value, reason) => {
+  // The caller's composites are DOMAIN values: the key `put` wrote for one is the
+  // key form of the value it stores (`Entity._domainKeyForm`).
+  const form = makeCompositeDomainKeyForm(source, (attr, value, reason) => {
     if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +

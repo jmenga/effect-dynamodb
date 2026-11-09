@@ -24,10 +24,11 @@ export interface SearchConfig<A> {
     readonly indexes: Record<string, KeyComposer.IndexDefinition>
     readonly schemas: { readonly recordSchema: Schema.Codec<any> }
     /**
-     * The entity's composite key-form normaliser. Search composes GSI keys for
-     * rows written by `Entity.put`, so both sides must use the same one (#111).
+     * The key form of a DOMAIN record (`Entity._domainKeyForm`). Search composes
+     * GSI keys for rows written by `Entity.put`, so it composes the key form of
+     * the values `put` stores for its domain values (#111).
      */
-    readonly _keyForm: (record: Record<string, unknown>) => Record<string, unknown>
+    readonly _domainKeyForm: (record: Record<string, unknown>) => Record<string, unknown>
   }
   readonly indexDef: KeyComposer.IndexDefinition
   readonly coordinates: (item: A) => Coordinates | undefined
@@ -145,7 +146,7 @@ export const nearby = <A>(
             // a string on both sides, but a `timePartition: Schema.NumberFromString`
             // (a natural choice, since `computeTimePartition` returns a decimal
             // string) would compose an unpadded key the write never wrote (#111).
-            const pkCompositesKeyForm: Record<string, unknown> = entity._keyForm({
+            const pkCompositesKeyForm: Record<string, unknown> = entity._domainKeyForm({
               ...pkFilter,
               [fields.parentCell.field]: parentCell,
               [fields.timePartition.field]: partition,
@@ -164,14 +165,14 @@ export const nearby = <A>(
               entity.entityType,
               1,
               indexDef,
-              entity._keyForm({ [fields.cell.field]: lowerCell }),
+              entity._domainKeyForm({ [fields.cell.field]: lowerCell }),
             )
             const upper = KeyComposer.composeSk(
               entity._schema,
               entity.entityType,
               1,
               indexDef,
-              entity._keyForm({ [fields.cell.field]: upperCell }),
+              entity._domainKeyForm({ [fields.cell.field]: upperCell }),
             )
 
             return { pkValue, lower, upper }

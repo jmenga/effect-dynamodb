@@ -1,5 +1,6 @@
+import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Schema, SchemaGetter } from "effect"
 import { DynamoClient, DynamoError, DynamoSchema, Entity, Table } from "effect-dynamodb"
 import * as h3 from "h3-js"
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -612,6 +613,79 @@ describe("GeoSearch", () => {
     it("a value with key text queries", async () => {
       expect(await Effect.runPromise(nearby(7))).toEqual([])
       expect(mockQuery).toHaveBeenCalled()
+    })
+  })
+
+  describe("a pkFilter composite whose codec encode takes its own output", () => {
+    // `put` encodes such a composite twice in a key (`depot_x:x:d1`). Up to 1.39.0 a search
+    // encoded the caller's `depot` once and found nothing; the row is the one 1.39.0 wrote.
+    const fixture = JSON.parse(
+      readFileSync(new URL("./fixtures/key-codec-geo-1.39.0.json", import.meta.url), "utf8"),
+    )
+    const Prefixed = Schema.String.pipe(
+      Schema.decodeTo(Schema.String, {
+        decode: SchemaGetter.transform((s: string) => s.slice(2)),
+        encode: SchemaGetter.transform((s: string) => `x:${s}`),
+      }),
+    )
+    const Fleet = Entity.make({
+      model: Schema.Struct({
+        vehicleId: Schema.String,
+        depot: Prefixed,
+        latitude: Schema.Number,
+        longitude: Schema.Number,
+        timestamp: Schema.Number,
+        cell: Schema.optional(Schema.String),
+        parentCell: Schema.optional(Schema.String),
+        timePartition: Schema.optional(Schema.String),
+      }),
+      entityType: "FleetVehicle",
+      primaryKey: {
+        pk: { field: "pk", composite: ["vehicleId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byCell: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["depot", "parentCell", "timePartition"] },
+          sk: { field: "gsi1sk", composite: ["cell"] },
+        },
+      },
+    })
+    const FleetTable = Table.make({
+      schema: DynamoSchema.make({ name: "kc", version: 1 }),
+      entities: { Fleet },
+    })
+    const FleetGeo = GeoIndex.make({
+      entity: Fleet,
+      index: "byCell",
+      coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+      fields: {
+        cell: { field: "cell", resolution: 15 },
+        parentCell: { field: "parentCell", resolution: 3 },
+        timePartition: { field: "timePartition", source: "timestamp", bucket: "hourly" },
+      },
+    })
+
+    it("finds the row put wrote, as 1.39.0 didn't", async () => {
+      expect(fixture.reads["nearby({ pkFilter: { depot } })"]).toEqual({ ok: 0 })
+      const [row] = fixture.rows
+      store.set(`gsi1|${row.gsi1pk.S}|${row.gsi1sk.S}`, row)
+      const hits = await Effect.runPromise(
+        FleetGeo.nearby({
+          center: fixture.center,
+          radius: 1000,
+          unit: "m",
+          timeWindow: { start: fixture.now, end: fixture.now + 1000 },
+          pkFilter: { depot: "D1" },
+        }).pipe(
+          Effect.provide(Layer.merge(TestDynamoClient, FleetTable.layer({ name: "geo-fleet" }))),
+        ),
+      )
+      expect(hits.map((hit: any) => hit.item.vehicleId)).toEqual(["v1"])
+      expect(
+        mockQuery.mock.calls.map(([input]) => input.ExpressionAttributeValues[":pk"].S),
+      ).toContain(row.gsi1pk.S)
     })
   })
 

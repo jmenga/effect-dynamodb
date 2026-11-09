@@ -1,0 +1,821 @@
+{
+ "writtenBy": {
+  "effect-dynamodb": "1.39.0",
+  "effect": "4.1.2"
+ },
+ "rows": [
+  {
+   "deletedAt": {
+    "S": "2026-11-09T00:09:59.830Z"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P2"
+   },
+   "__edd_e__": {
+    "S": "Card"
+   },
+   "sk": {
+    "S": "$kc#v1#card#deleted#part_x:x:p2#2026-11-09T00:09:59.830Z"
+   },
+   "pk": {
+    "S": "$kc#v1#card#cardid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#card#part_x:x:p1"
+   },
+   "pk": {
+    "S": "$kc#v1#card#cardid_x:x:mix"
+   },
+   "n": {
+    "N": "1"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Card"
+   }
+  },
+  {
+   "code": {
+    "S": "x:C1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#doc_1#part_x:x:p1"
+   },
+   "docId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Doc"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#coded#code_x:x:c1"
+   },
+   "sk": {
+    "S": "$kc#v1#doc#part_x:x:p1"
+   },
+   "pk": {
+    "S": "$kc#v1#doc#docid_x:x:mix"
+   },
+   "n": {
+    "N": "1"
+   }
+  },
+  {
+   "code": {
+    "S": "x:C1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#doc_1#part_x:x:p2"
+   },
+   "docId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P2"
+   },
+   "__edd_e__": {
+    "S": "Doc"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#coded#code_x:x:c1"
+   },
+   "sk": {
+    "S": "$kc#v1#doc#part_x:x:p2"
+   },
+   "pk": {
+    "S": "$kc#v1#doc#docid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   }
+  },
+  {
+   "code": {
+    "S": "x:C1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#note_1#part_x:x:p9"
+   },
+   "part": {
+    "S": "x:P9"
+   },
+   "__edd_e__": {
+    "S": "Note"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#coded#code_x:x:c1"
+   },
+   "sk": {
+    "S": "$kc#v1#note"
+   },
+   "noteId": {
+    "S": "n1"
+   },
+   "pk": {
+    "S": "$kc#v1#note#noteid_n1"
+   }
+  },
+  {
+   "__edd_v_vec1__": {
+    "L": [
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "-1"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     }
+    ]
+   },
+   "productId": {
+    "S": "p1"
+   },
+   "__edd_vp_vec1__": {
+    "S": "$kc#v1#product#tenantid_x:x:acme"
+   },
+   "__edd_e__": {
+    "S": "Product"
+   },
+   "tenantId": {
+    "S": "x:Acme"
+   },
+   "name": {
+    "S": "lamp"
+   },
+   "sk": {
+    "S": "$kc#v1#product"
+   },
+   "pk": {
+    "S": "$kc#v1#product#productid_p1"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#reading"
+   },
+   "at": {
+    "S": "x:T2"
+   },
+   "pk": {
+    "S": "$kc#v1#reading#sensorid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   },
+   "__edd_e__": {
+    "S": "Reading"
+   },
+   "sensorId": {
+    "S": "x:MiX"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#reading#e#x:t1"
+   },
+   "at": {
+    "S": "x:T1"
+   },
+   "pk": {
+    "S": "$kc#v1#reading#sensorid_x:x:mix"
+   },
+   "n": {
+    "N": "1"
+   },
+   "sensorId": {
+    "S": "x:MiX"
+   },
+   "__edd_e__": {
+    "S": "Reading"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#reading#e#x:t2"
+   },
+   "at": {
+    "S": "x:T2"
+   },
+   "pk": {
+    "S": "$kc#v1#reading#sensorid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   },
+   "sensorId": {
+    "S": "x:MiX"
+   },
+   "__edd_e__": {
+    "S": "Reading"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "98be6e71-b879-4076-b1be-d358848ee017"
+   },
+   "__edd_e__": {
+    "S": "Rev"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "sk": {
+    "S": "$kc#v1#rev#part_x:x:p1"
+   },
+   "pk": {
+    "S": "$kc#v1#rev#cardid_x:x:mix"
+   },
+   "version": {
+    "N": "2"
+   },
+   "n": {
+    "N": "2"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "98be6e71-b879-4076-b1be-d358848ee017"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Rev"
+   },
+   "sk": {
+    "S": "$kc#v1#rev#v#part_x:x:p1#0000001"
+   },
+   "pk": {
+    "S": "$kc#v1#rev#cardid_x:x:mix"
+   },
+   "version": {
+    "N": "1"
+   },
+   "n": {
+    "N": "1"
+   }
+  },
+  {
+   "owner": {
+    "S": "o1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#tag#kind_x:x:k1#part_x:x:p1"
+   },
+   "tagId": {
+    "S": "t1"
+   },
+   "kind": {
+    "S": "x:K1"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Tag"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#tag#owner_o1"
+   },
+   "sk": {
+    "S": "$kc#v1#tag"
+   },
+   "pk": {
+    "S": "$kc#v1#tag#tagid_t1"
+   }
+  },
+  {
+   "owner": {
+    "S": "o1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#tag#kind_x:x:k2#part_x:x:p2"
+   },
+   "tagId": {
+    "S": "t2"
+   },
+   "kind": {
+    "S": "x:K2"
+   },
+   "part": {
+    "S": "x:P2"
+   },
+   "__edd_e__": {
+    "S": "Tag"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#tag#owner_o1"
+   },
+   "sk": {
+    "S": "$kc#v1#tag"
+   },
+   "pk": {
+    "S": "$kc#v1#tag#tagid_t2"
+   }
+  },
+  {
+   "agency": {
+    "S": "x:AgA"
+   },
+   "gsi2sk": {
+    "B": {
+     "__bytes": "AAd4Ong6YWdhAfQ="
+    }
+   },
+   "price": {
+    "N": "500"
+   },
+   "__edd_e__": {
+    "S": "Zone"
+   },
+   "sk": {
+    "S": "$kc#v1#zone"
+   },
+   "gsi2pk": {
+    "S": "$kc#v1#zone#region_x:x:north"
+   },
+   "zoneId": {
+    "S": "z1"
+   },
+   "pk": {
+    "S": "$kc#v1#zone#zoneid_z1"
+   },
+   "region": {
+    "S": "x:North"
+   }
+  }
+ ],
+ "reads": {
+  "Docs.byCode({ code })": {
+   "ok": 0
+  },
+  "Docs.byCode({ code, part })": {
+   "ok": 0
+  },
+  "Docs.byCode({ code }).where(eq part)": {
+   "ok": 0
+  },
+  "Docs.byCode({ code }).where(beginsWith part)": {
+   "ok": 0
+  },
+  "Docs.byCode({ code }).within(part eq)": {
+   "ok": 0
+  },
+  "Docs.query.byCode({ code })": {
+   "ok": 0
+  },
+  "collections.coded({ code })": {
+   "ok": {
+    "Docs": 0,
+    "Notes": 0
+   }
+  },
+  "Cards.deleted.list": {
+   "ok": 0
+  },
+  "Revs.versions": {
+   "ok": 0
+  },
+  "Readings.history": {
+   "ok": 0
+  },
+  "Readings.history.where(eq at)": {
+   "ok": 0
+  },
+  "Zones.byFacets.within(agency, price)": {
+   "ok": 0
+  },
+  "Tags.byOwner.within(part eq), skip-scan": {
+   "ok": 0
+  },
+  "Tags.byOwner.within(part eq), filter": {
+   "ok": 1
+  },
+  "Tags.byOwner.within(kind eq, part gte)": {
+   "ok": 0
+  },
+  "Products.reembed": {
+   "ok": 1
+  }
+ },
+ "rowsAfterReembed": [
+  {
+   "deletedAt": {
+    "S": "2026-11-09T00:09:59.830Z"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P2"
+   },
+   "__edd_e__": {
+    "S": "Card"
+   },
+   "sk": {
+    "S": "$kc#v1#card#deleted#part_x:x:p2#2026-11-09T00:09:59.830Z"
+   },
+   "pk": {
+    "S": "$kc#v1#card#cardid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#card#part_x:x:p1"
+   },
+   "pk": {
+    "S": "$kc#v1#card#cardid_x:x:mix"
+   },
+   "n": {
+    "N": "1"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Card"
+   }
+  },
+  {
+   "code": {
+    "S": "x:C1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#doc_1#part_x:x:p1"
+   },
+   "docId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Doc"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#coded#code_x:x:c1"
+   },
+   "sk": {
+    "S": "$kc#v1#doc#part_x:x:p1"
+   },
+   "pk": {
+    "S": "$kc#v1#doc#docid_x:x:mix"
+   },
+   "n": {
+    "N": "1"
+   }
+  },
+  {
+   "code": {
+    "S": "x:C1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#doc_1#part_x:x:p2"
+   },
+   "docId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P2"
+   },
+   "__edd_e__": {
+    "S": "Doc"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#coded#code_x:x:c1"
+   },
+   "sk": {
+    "S": "$kc#v1#doc#part_x:x:p2"
+   },
+   "pk": {
+    "S": "$kc#v1#doc#docid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   }
+  },
+  {
+   "code": {
+    "S": "x:C1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#note_1#part_x:x:p9"
+   },
+   "part": {
+    "S": "x:P9"
+   },
+   "__edd_e__": {
+    "S": "Note"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#coded#code_x:x:c1"
+   },
+   "sk": {
+    "S": "$kc#v1#note"
+   },
+   "noteId": {
+    "S": "n1"
+   },
+   "pk": {
+    "S": "$kc#v1#note#noteid_n1"
+   }
+  },
+  {
+   "__edd_v_vec1__": {
+    "L": [
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "-1"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     },
+     {
+      "N": "0"
+     }
+    ]
+   },
+   "productId": {
+    "S": "p1"
+   },
+   "__edd_vp_vec1__": {
+    "S": "$kc#v1#product#tenantid_x:acme"
+   },
+   "__edd_e__": {
+    "S": "Product"
+   },
+   "name": {
+    "S": "lamp"
+   },
+   "sk": {
+    "S": "$kc#v1#product"
+   },
+   "tenantId": {
+    "S": "x:Acme"
+   },
+   "pk": {
+    "S": "$kc#v1#product#productid_p1"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#reading"
+   },
+   "at": {
+    "S": "x:T2"
+   },
+   "pk": {
+    "S": "$kc#v1#reading#sensorid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   },
+   "__edd_e__": {
+    "S": "Reading"
+   },
+   "sensorId": {
+    "S": "x:MiX"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#reading#e#x:t1"
+   },
+   "at": {
+    "S": "x:T1"
+   },
+   "pk": {
+    "S": "$kc#v1#reading#sensorid_x:x:mix"
+   },
+   "n": {
+    "N": "1"
+   },
+   "sensorId": {
+    "S": "x:MiX"
+   },
+   "__edd_e__": {
+    "S": "Reading"
+   }
+  },
+  {
+   "sk": {
+    "S": "$kc#v1#reading#e#x:t2"
+   },
+   "at": {
+    "S": "x:T2"
+   },
+   "pk": {
+    "S": "$kc#v1#reading#sensorid_x:x:mix"
+   },
+   "n": {
+    "N": "2"
+   },
+   "sensorId": {
+    "S": "x:MiX"
+   },
+   "__edd_e__": {
+    "S": "Reading"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "98be6e71-b879-4076-b1be-d358848ee017"
+   },
+   "__edd_e__": {
+    "S": "Rev"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "sk": {
+    "S": "$kc#v1#rev#part_x:x:p1"
+   },
+   "pk": {
+    "S": "$kc#v1#rev#cardid_x:x:mix"
+   },
+   "version": {
+    "N": "2"
+   },
+   "n": {
+    "N": "2"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "98be6e71-b879-4076-b1be-d358848ee017"
+   },
+   "cardId": {
+    "S": "x:MiX"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Rev"
+   },
+   "sk": {
+    "S": "$kc#v1#rev#v#part_x:x:p1#0000001"
+   },
+   "pk": {
+    "S": "$kc#v1#rev#cardid_x:x:mix"
+   },
+   "version": {
+    "N": "1"
+   },
+   "n": {
+    "N": "1"
+   }
+  },
+  {
+   "owner": {
+    "S": "o1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#tag#kind_x:x:k1#part_x:x:p1"
+   },
+   "tagId": {
+    "S": "t1"
+   },
+   "kind": {
+    "S": "x:K1"
+   },
+   "part": {
+    "S": "x:P1"
+   },
+   "__edd_e__": {
+    "S": "Tag"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#tag#owner_o1"
+   },
+   "sk": {
+    "S": "$kc#v1#tag"
+   },
+   "pk": {
+    "S": "$kc#v1#tag#tagid_t1"
+   }
+  },
+  {
+   "owner": {
+    "S": "o1"
+   },
+   "gsi1sk": {
+    "S": "$kc#v1#tag#kind_x:x:k2#part_x:x:p2"
+   },
+   "tagId": {
+    "S": "t2"
+   },
+   "kind": {
+    "S": "x:K2"
+   },
+   "part": {
+    "S": "x:P2"
+   },
+   "__edd_e__": {
+    "S": "Tag"
+   },
+   "gsi1pk": {
+    "S": "$kc#v1#tag#owner_o1"
+   },
+   "sk": {
+    "S": "$kc#v1#tag"
+   },
+   "pk": {
+    "S": "$kc#v1#tag#tagid_t2"
+   }
+  },
+  {
+   "agency": {
+    "S": "x:AgA"
+   },
+   "gsi2sk": {
+    "B": {
+     "__bytes": "AAd4Ong6YWdhAfQ="
+    }
+   },
+   "price": {
+    "N": "500"
+   },
+   "__edd_e__": {
+    "S": "Zone"
+   },
+   "sk": {
+    "S": "$kc#v1#zone"
+   },
+   "gsi2pk": {
+    "S": "$kc#v1#zone#region_x:x:north"
+   },
+   "zoneId": {
+    "S": "z1"
+   },
+   "pk": {
+    "S": "$kc#v1#zone#zoneid_z1"
+   },
+   "region": {
+    "S": "x:North"
+   }
+  }
+ ]
+}

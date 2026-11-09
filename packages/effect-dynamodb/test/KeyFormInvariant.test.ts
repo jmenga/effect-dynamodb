@@ -69,6 +69,10 @@ const RECORD_TAKING = [
   "judgeIndexHalf",
   "extractComposites",
   "tryExtractComposites",
+  "composeReadPartitions",
+  "composeStoredPk",
+  "composeKnownHalves",
+  "composeSkPrefixUpTo",
 ] as const
 
 /** The `KeyText136` function taking a record: `rekey` composing a key at another text. */
@@ -143,5 +147,62 @@ describe("key-form invariant — Entity.ts normaliser shape", () => {
     // normalisers above; using them anywhere else re-opens the bypass.
     expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBeLessThanOrEqual(2)
     expect(src.match(/toCompositeKeyRecord\(/g)?.length ?? 0).toBeLessThanOrEqual(2)
+  })
+})
+
+/**
+ * A key composed from values a CALLER gives (an accessor's composites, a `.where()` / `.within()`
+ * bound, a collection's, vector index's or geo search's partition, a multi-item op's key, a query
+ * builder's key) is the key `put` wrote for them: the key form of the value `put` stores
+ * (`makeCompositeDomainKeyForm`, `Entity._domainKeyForm`). The plain key form takes a value as it is
+ * stored; given a domain value whose codec `encode` takes its own output, it composes a key no `put`
+ * writes, and up to 1.39.0 every one of these paths did, finding nothing.
+ */
+describe("key-form invariant — a caller's values compose the key put wrote", () => {
+  const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8")
+
+  it("collections compose through the domain key form", () => {
+    const src = read("../src/Collection.ts")
+    expect(src).not.toMatch(/makeCompositeKeyForm\(/)
+    expect(src).toMatch(/makeCompositeDomainKeyForm\(/)
+  })
+
+  it("accessors, bounds, collections and vector partitions compose through the domain key form", () => {
+    const src = read("../src/DynamoClient.ts")
+    // The accessor's plain form reads stored values (row checks, a dimension's filter) only.
+    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBe(1)
+    expect(src).not.toMatch(/toCompositeKeyRecord\(compositeKeyForm/)
+    expect(src).not.toMatch(/mapBound\([^)]*compositeKeyForm\(/)
+    expect(src).toMatch(/toCompositeKeyRecord\(domainKeyForm, rawComposites\)/)
+  })
+
+  it("geo search composes through the domain key form", () => {
+    expect(read("../../effect-dynamodb-geo/src/GeoSearch.ts")).not.toMatch(/\._keyForm\(/)
+  })
+
+  it("a multi-item op's key composes through the domain key form", () => {
+    const src = read("../src/internal/TransactableOps.ts")
+    const body = src.slice(src.indexOf("export const composePrimaryKeyOrFail"))
+    expect(body.slice(0, body.indexOf("\n}\n"))).toMatch(/_domainKeyForm\(/)
+  })
+
+  it("a projection reads and tombstones its row at the key the read model's put wrote", () => {
+    const ops = read("../src/internal/TransactableOps.ts")
+    const body = ops.slice(ops.indexOf("export const composeDomainPrimaryKey"))
+    expect(body.slice(0, body.indexOf("\n\n"))).toMatch(/_domainKeyForm\(/)
+    const src = read("../src/internal/ProjectionEngine.ts")
+    const readRow = src.slice(src.indexOf("const readRow = "))
+    expect(readRow.slice(0, readRow.indexOf("\n    })\n"))).toMatch(/composeDomainPrimaryKey\(/)
+    const writeRow = src.slice(src.indexOf("const writeRow = "))
+    expect(writeRow.slice(0, writeRow.indexOf("const condition"))).toMatch(
+      /const rowKey = composeDomainPrimaryKey\(/,
+    )
+    expect(writeRow).toMatch(/const mark = readModel\._domainKeyTextMark\(/)
+  })
+
+  it("the entity's query builders compose a caller's key once", () => {
+    const src = read("../src/Entity.ts")
+    expect(src).not.toMatch(/keyForm\(encodeKeySync\(/)
+    expect(src).not.toMatch(/keyFormFor\(entityInternals, key/)
   })
 })

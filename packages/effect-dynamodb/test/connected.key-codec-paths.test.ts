@@ -9,9 +9,15 @@
  *   (or set DYNAMODB_ENDPOINT to another port)
  */
 
-import { type AttributeValue, DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb"
+import {
+  type AttributeValue,
+  DynamoDBClient,
+  PutItemCommand,
+  ScanCommand,
+} from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
 import { Config, Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
 import { describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
@@ -20,6 +26,9 @@ import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import * as VectorSearchEmulation from "../src/VectorSearchEmulation.js"
+import * as P from "./helpers/KeyCodecProjection.js"
+import * as Shapes from "./helpers/KeyCodecShapes.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -263,4 +272,272 @@ describeConnected("a codec inside a wrapper composes the key Entity.put wrote (c
       }),
     )
   }
+})
+
+/**
+ * The rows published 1.39.0 wrote (`fixtures/key-codec-1.39.0.json`, `helpers/KeyCodecShapes.ts`),
+ * seeded on DynamoDB Local: every read that composes a key from a caller's values finds them, the
+ * writes store them byte for byte as 1.39.0 did, and `reembed` keeps the vector partition `put` wrote.
+ */
+describeConnected("rows 1.39.0 wrote for codec-keyed entities (connected)", () => {
+  const seed = (tableName: string, rows: ReadonlyArray<Row>) =>
+    Effect.promise(async () => {
+      for (const Item of rows) await raw.send(new PutItemCommand({ TableName: tableName, Item }))
+    })
+  const scanAll = (tableName: string) =>
+    Effect.promise(
+      async () =>
+        ((await raw.send(new ScanCommand({ TableName: tableName, ConsistentRead: true }))).Items ??
+          []) as ReadonlyArray<Row>,
+    )
+  /** A fresh table holding `rows`; `body` runs with the typed client, then the rows left. */
+  const withSeeded = <A>(
+    rows: ReadonlyArray<Row>,
+    body: (db: any) => Effect.Effect<A, unknown, any>,
+  ) => {
+    const tableName = `key-codec-139-${Date.now()}-${tables++}`
+    const key = (hash: string, range: string) => [
+      { AttributeName: hash, KeyType: "HASH" as const },
+      { AttributeName: range, KeyType: "RANGE" as const },
+    ]
+    return Effect.acquireUseRelease(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        yield* client.createTable({
+          TableName: tableName,
+          BillingMode: "PAY_PER_REQUEST",
+          KeySchema: key("pk", "sk"),
+          AttributeDefinitions: [
+            ...["pk", "sk", "gsi1pk", "gsi1sk", "gsi2pk"].map((AttributeName) => ({
+              AttributeName,
+              AttributeType: "S" as const,
+            })),
+            { AttributeName: "gsi2sk", AttributeType: "B" as const },
+          ],
+          GlobalSecondaryIndexes: [
+            {
+              IndexName: "gsi1",
+              KeySchema: key("gsi1pk", "gsi1sk"),
+              Projection: { ProjectionType: "ALL" },
+            },
+            {
+              IndexName: "gsi2",
+              KeySchema: key("gsi2pk", "gsi2sk"),
+              Projection: { ProjectionType: "ALL" },
+            },
+          ],
+        })
+        yield* seed(tableName, rows)
+      }),
+      () =>
+        Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: Shapes.entities,
+            tables: { Base: Shapes.Base },
+          })
+          const result = yield* body(db)
+          return { result, rows: yield* scanAll(tableName) }
+        }),
+      () =>
+        Effect.gen(function* () {
+          const client = yield* DynamoClient
+          yield* client.deleteTable({ TableName: tableName })
+        }).pipe(Effect.ignore),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          VectorSearchEmulation.layer(ClientLayer, { tables: { Base: Shapes.Base } }),
+          Shapes.Base.layer({ name: tableName }),
+          Embedder.layerTest({ dimensions: 8 }),
+        ),
+      ),
+    ) as unknown as Effect.Effect<{ result: A; rows: ReadonlyArray<Row> }>
+  }
+
+  for (const read of Shapes.reads)
+    it.effect(`${read.label} finds them`, () =>
+      Effect.gen(function* () {
+        const { result } = yield* withSeeded(Shapes.fixture.rows, read.run)
+        expect(result).toEqual(read.expected)
+      }),
+    )
+
+  it.effect("the writes store the keys 1.39.0 stored", () =>
+    Effect.gen(function* () {
+      const { rows } = yield* withSeeded([], (db) =>
+        Effect.gen(function* () {
+          const e = db.entities
+          yield* e.Docs.put({ docId: "MiX", part: "P1", code: "C1", n: 1 }).asEffect()
+          yield* e.Docs.put({ docId: "MiX", part: "P2", code: "C1", n: 2 }).asEffect()
+          yield* e.Notes.put({ noteId: "n1", code: "C1", part: "P9" }).asEffect()
+          yield* e.Cards.put({ cardId: "MiX", part: "P1", n: 1 }).asEffect()
+          yield* e.Cards.put({ cardId: "MiX", part: "P2", n: 2 }).asEffect()
+          yield* e.Cards.delete({ cardId: "MiX", part: "P2" }).asEffect()
+          yield* e.Revs.put({ cardId: "MiX", part: "P1", n: 1 }).asEffect()
+          yield* e.Revs.update({ cardId: "MiX", part: "P1" }).set({ n: 2 }).asEffect()
+          yield* e.Readings.append({ sensorId: "MiX", at: "T1", n: 1 }).asEffect()
+          yield* e.Readings.append({ sensorId: "MiX", at: "T2", n: 2 }).asEffect()
+          yield* e.Zones.put({
+            zoneId: "z1",
+            region: "North",
+            agency: "AgA",
+            price: 500,
+          }).asEffect()
+          yield* e.Tags.put({ tagId: "t1", owner: "o1", kind: "K1", part: "P1" }).asEffect()
+          yield* e.Tags.put({ tagId: "t2", owner: "o1", kind: "K2", part: "P2" }).asEffect()
+          yield* e.Products.put({ productId: "p1", tenantId: "Acme", name: "lamp" }).asEffect()
+        }),
+      )
+      expect(Shapes.keysOf(rows)).toEqual(Shapes.keysOf(Shapes.fixture.rows))
+    }),
+  )
+
+  it.effect(
+    "reembed keeps the partition put wrote, and moves back one 1.39.0's reembed moved",
+    () =>
+      Effect.gen(function* () {
+        const partition = (rows: ReadonlyArray<Row>) =>
+          rows.find((row) => row.__edd_e__?.S === "Product")!.__edd_vp_vec1__?.S
+        const written = partition(Shapes.fixture.rows)
+        const kept = yield* withSeeded(Shapes.fixture.rows, (db) => db.entities.Products.reembed())
+        expect(kept.result).toBe(1)
+        expect(partition(kept.rows)).toBe(written)
+        const moved = yield* withSeeded(Shapes.fixture.rowsAfterReembed, (db) =>
+          db.entities.Products.reembed(),
+        )
+        expect(moved.result).toBe(1)
+        expect(partition(moved.rows)).toBe(written)
+      }),
+  )
+})
+
+/**
+ * A projection whose read model's key composite is a codec `encode` takes on its own output, over
+ * the rows 1.39.0 wrote (`helpers/KeyCodecProjection.ts`): the next event updates the row `put`
+ * wrote, a removal tombstones it, and outbox items keep the key text 1.39.0 gave them. On 1.39.0
+ * every event after the first failed, and the tombstone went to a key the row was not at.
+ */
+describeConnected("a projection keyed by a codec over 1.39.0's rows (connected)", () => {
+  const scanRead = (TableName: string) =>
+    Effect.promise(
+      async () =>
+        ((await raw.send(new ScanCommand({ TableName, ConsistentRead: true }))).Items ??
+          []) as ReadonlyArray<Row>,
+    )
+  /** Fresh event and read-model tables holding 1.39.0's rows; `body`, then the read model's rows. */
+  const withTables = <A>(body: (readTable: string) => Effect.Effect<A, unknown, any>) => {
+    const suffix = `${Date.now()}-${tables++}`
+    const names = { events: `key-codec-ev-${suffix}`, read: `key-codec-rm-${suffix}` }
+    return Effect.acquireUseRelease(
+      Effect.gen(function* () {
+        const client = yield* DynamoClient
+        for (const TableName of [names.events, names.read]) {
+          yield* client.createTable({
+            TableName,
+            BillingMode: "PAY_PER_REQUEST",
+            KeySchema: [
+              { AttributeName: "pk", KeyType: "HASH" },
+              { AttributeName: "sk", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "pk", AttributeType: "S" },
+              { AttributeName: "sk", AttributeType: "S" },
+            ],
+          })
+        }
+        yield* Effect.promise(async () => {
+          for (const Item of P.fixture.seed.events)
+            await raw.send(new PutItemCommand({ TableName: names.events, Item }))
+          for (const Item of P.fixture.seed.read)
+            await raw.send(new PutItemCommand({ TableName: names.read, Item }))
+        })
+      }),
+      () =>
+        Effect.gen(function* () {
+          const result = yield* body(names.read)
+          return { result, rows: yield* scanRead(names.read) }
+        }),
+      () =>
+        Effect.gen(function* () {
+          const client = yield* DynamoClient
+          yield* client.deleteTable({ TableName: names.events })
+          yield* client.deleteTable({ TableName: names.read })
+        }).pipe(Effect.ignore),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ClientLayer,
+          P.EventsTable.layer({ name: names.events }),
+          P.ReadTable.layer({ name: names.read }),
+        ),
+      ),
+    ) as unknown as Effect.Effect<{ result: A; rows: ReadonlyArray<Row> }>
+  }
+  const at = (rows: ReadonlyArray<Row>, key: { readonly pk: string; readonly sk: string }) =>
+    rows.find((row) => row.pk?.S === key.pk && row.sk?.S === key.sk)
+
+  it.effect("the next event updates the row 1.39.0 wrote", () =>
+    Effect.gen(function* () {
+      const { result, rows } = yield* withTables(() =>
+        Effect.gen(function* () {
+          yield* P.Orders.append({ orderId: "o1" }, [new P.Added({ amount: 3 })], 1)
+          const a = yield* P.A.catchUp({ orderId: "o1" })
+          const b = yield* P.B.catchUp({ orderId: "o1" })
+          return [a.applied.map((e) => e.version), b.applied.map((e) => e.version)]
+        }),
+      )
+      expect(result).toEqual([[2], [2]])
+      expect(at(rows, P.rowKey.Removable)?.total).toEqual({ N: "8" })
+      expect(at(rows, P.rowKey.Effected)?.rev).toEqual({ N: "2" })
+      expect(at(rows, P.singleKey)).toBeUndefined()
+    }),
+  )
+
+  it.effect("a removal tombstones the row put wrote, and the entity reads no row", () =>
+    Effect.gen(function* () {
+      const { result, rows } = yield* withTables(() =>
+        Effect.gen(function* () {
+          yield* P.Orders.append(
+            { orderId: "o1" },
+            [new P.Added({ amount: 3 }), new P.Cancelled()],
+            1,
+          )
+          const a = yield* P.A.catchUp({ orderId: "o1" })
+          const got = yield* Effect.exit(P.Removable.get({ orderId: "o1" }).asEffect())
+          return { removed: a.removed, got: Exit.isFailure(got) && JSON.stringify(got.cause) }
+        }),
+      )
+      expect(result.removed).toBe(true)
+      expect(result.got).toContain("ItemNotFound")
+      expect(at(rows, P.rowKey.Removable)?.__edd_e__).toEqual({ S: "Removable#tombstone" })
+      expect(at(rows, P.singleKey)).toBeUndefined()
+    }),
+  )
+
+  it.effect("outbox items keep the key text 1.39.0 gave them, and drain delivers them", () =>
+    Effect.gen(function* () {
+      const notes: Array<string> = []
+      const { result, rows } = yield* withTables((readTable) =>
+        Effect.gen(function* () {
+          yield* P.Orders.append({ orderId: "o1" }, [new P.Added({ amount: 3 })], 1)
+          yield* P.B.catchUp({ orderId: "o1" })
+          const pending = (yield* scanRead(readTable))
+            .filter((row) => row.__edd_e__?.S === "Effected#outbox")
+            .map((row) => [row.pk?.S, row.sk?.S, row.__edd_row_pk__?.S, row.__edd_row_sk__?.S])
+          const drained = yield* P.B.drain({ orderId: "o1" }, (effect) =>
+            Effect.sync(() => {
+              notes.push(effect.note)
+            }),
+          )
+          return { pending, delivered: drained.delivered }
+        }),
+      )
+      expect(result.pending).toEqual([
+        [P.outboxPk, "$kp#v1#effected#outbox#000000000002#0000", P.outboxPk, P.rowKey.Effected.sk],
+      ])
+      expect(result.delivered).toBe(1)
+      expect(notes).toEqual(["Added v2"])
+      expect(rows.filter((row) => row.__edd_e__?.S === "Effected#outbox")).toEqual([])
+    }),
+  )
 })

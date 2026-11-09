@@ -496,7 +496,8 @@ const primaryKeyOf = (
 
 /**
  * Compose the primary key for an entity item, from a record in the key form
- * `_keyForm` takes. The projection engine writes and reads its rows through this.
+ * `_keyForm` takes. The projection engine keys a row's outbox items through this
+ * (the row itself goes through {@link composeDomainPrimaryKey}).
  */
 export const composePrimaryKey = (
   entity: Entity,
@@ -509,6 +510,19 @@ export const composePrimaryKey = (
   const recordKeyForm = entity._keyForm(key)
   return primaryKeyOf(entity, recordKeyForm)
 }
+
+/**
+ * The primary key of the row a DOMAIN key record names — the key `Entity.put`
+ * wrote for it (`_domainKeyForm`). The projection engine reads a read-model row,
+ * and writes its tombstone, through this, as the row itself is written by the
+ * read model's own `put`. Up to 1.39.0 it went through `_keyForm` alone, which
+ * for a codec `encode` takes on its own output read and tombstoned a key the row
+ * was not at.
+ */
+export const composeDomainPrimaryKey = (
+  entity: Entity,
+  key: Record<string, unknown>,
+): Record<string, unknown> => primaryKeyOf(entity, entity._domainKeyForm(key))
 
 /**
  * The primary key of the item a caller's key names, failing with a

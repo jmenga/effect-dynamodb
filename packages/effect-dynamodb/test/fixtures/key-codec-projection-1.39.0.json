@@ -1,0 +1,269 @@
+{
+  "writtenBy": "1.39.0",
+  "seed": {
+    "events": [
+      {
+        "streamId": {
+          "S": "o1"
+        },
+        "data": {
+          "M": {
+            "amount": {
+              "N": "5"
+            },
+            "_tag": {
+              "S": "Placed"
+            }
+          }
+        },
+        "__edd_wt__": {
+          "S": "9aa5cf16edaae93c107af8b6c6fbbf65"
+        },
+        "__edd_e__": {
+          "S": "order.event"
+        },
+        "sk": {
+          "S": "$kp#v1#order.event_1#0000000001"
+        },
+        "pk": {
+          "S": "$kp#v1#order#o1"
+        },
+        "eventType": {
+          "S": "Placed"
+        },
+        "version": {
+          "N": "1"
+        },
+        "timestamp": {
+          "S": "2026-11-09T00:21:11.022Z"
+        }
+      }
+    ],
+    "read": [
+      {
+        "total": {
+          "N": "5"
+        },
+        "rev": {
+          "N": "1"
+        },
+        "orderId": {
+          "S": "x:o1"
+        },
+        "__edd_e__": {
+          "S": "Effected"
+        },
+        "sk": {
+          "S": "$kp#v1#effected"
+        },
+        "pk": {
+          "S": "$kp#v1#effected#orderid_x:x:o1"
+        },
+        "version": {
+          "N": "1"
+        }
+      },
+      {
+        "sk": {
+          "S": "$kp#v1#removable"
+        },
+        "total": {
+          "N": "5"
+        },
+        "pk": {
+          "S": "$kp#v1#removable#orderid_x:x:o1"
+        },
+        "orderId": {
+          "S": "x:o1"
+        },
+        "version": {
+          "N": "1"
+        },
+        "__edd_e__": {
+          "S": "Removable"
+        }
+      }
+    ]
+  },
+  "steps": [
+    {
+      "label": "1 placed",
+      "append": "ok",
+      "A": {
+        "ok": {
+          "version": 1,
+          "removed": false,
+          "applied": [
+            1
+          ]
+        }
+      },
+      "B": {
+        "ok": {
+          "version": 1,
+          "removed": false,
+          "applied": [
+            1
+          ]
+        }
+      },
+      "outbox": [
+        {
+          "pk": "$kp#v1#effected#orderid_x:o1",
+          "sk": "$kp#v1#effected#outbox#000000000001#0000",
+          "rowPk": "$kp#v1#effected#orderid_x:o1",
+          "rowSk": "$kp#v1#effected",
+          "attrs": [
+            "__edd_e__",
+            "__edd_row_pk__",
+            "__edd_row_sk__",
+            "effect",
+            "eventType",
+            "pk",
+            "sk",
+            "source",
+            "streamId",
+            "version"
+          ]
+        }
+      ],
+      "drain": {
+        "ok": {
+          "delivered": 1,
+          "undelivered": {
+            "_id": "Option",
+            "_tag": "None"
+          }
+        }
+      },
+      "delivered": [
+        "Placed v1"
+      ],
+      "rows": [
+        {
+          "pk": "$kp#v1#effected#orderid_x:x:o1",
+          "sk": "$kp#v1#effected",
+          "e": "Effected",
+          "total": "5",
+          "version": "1"
+        },
+        {
+          "pk": "$kp#v1#removable#orderid_x:x:o1",
+          "sk": "$kp#v1#removable",
+          "e": "Removable",
+          "total": "5",
+          "version": "1"
+        }
+      ]
+    },
+    {
+      "label": "2 added",
+      "append": "ok",
+      "A": {
+        "failed": "ConcurrentModification"
+      },
+      "B": {
+        "failed": "ConcurrentModification"
+      },
+      "outbox": [],
+      "drain": {
+        "ok": {
+          "delivered": 0,
+          "undelivered": {
+            "_id": "Option",
+            "_tag": "None"
+          }
+        }
+      },
+      "delivered": [
+        "Placed v1"
+      ],
+      "rows": [
+        {
+          "pk": "$kp#v1#effected#orderid_x:x:o1",
+          "sk": "$kp#v1#effected",
+          "e": "Effected",
+          "total": "5",
+          "version": "1"
+        },
+        {
+          "pk": "$kp#v1#removable#orderid_x:x:o1",
+          "sk": "$kp#v1#removable",
+          "e": "Removable",
+          "total": "5",
+          "version": "1"
+        }
+      ]
+    },
+    {
+      "label": "3 cancelled",
+      "append": "ok",
+      "A": {
+        "ok": {
+          "version": 3,
+          "removed": true,
+          "applied": [
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      "B": {
+        "failed": "ConcurrentModification"
+      },
+      "outbox": [],
+      "drain": {
+        "ok": {
+          "delivered": 0,
+          "undelivered": {
+            "_id": "Option",
+            "_tag": "None"
+          }
+        }
+      },
+      "delivered": [
+        "Placed v1"
+      ],
+      "rows": [
+        {
+          "pk": "$kp#v1#effected#orderid_x:x:o1",
+          "sk": "$kp#v1#effected",
+          "e": "Effected",
+          "total": "5",
+          "version": "1"
+        },
+        {
+          "pk": "$kp#v1#removable#orderid_x:o1",
+          "sk": "$kp#v1#removable",
+          "e": "Removable#tombstone",
+          "version": "3"
+        },
+        {
+          "pk": "$kp#v1#removable#orderid_x:x:o1",
+          "sk": "$kp#v1#removable",
+          "e": "Removable",
+          "total": "5",
+          "version": "1"
+        }
+      ]
+    }
+  ],
+  "gets": {
+    "A": {
+      "ok": {
+        "orderId": "o1",
+        "total": 5,
+        "version": 1
+      }
+    },
+    "B": {
+      "ok": {
+        "orderId": "o1",
+        "total": 5,
+        "version": 1,
+        "rev": 1
+      }
+    }
+  }
+}

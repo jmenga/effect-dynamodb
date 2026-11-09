@@ -1371,17 +1371,53 @@ numeric kind's text", under `rekey`).
 **A codec whose `encode` takes its own output is encoded twice.** `Entity.put`
 encodes its input (`inputSchema`), then applies the key form, whose fallback
 assumes encoding is idempotent. For a codec prepending `x:` it isn't: `"MiX"`
-is stored with the key text `x:x:mix`. The entity's own `get` and `delete` do
-the same (`encodeKey`, then the key form), so they find it. A multi-item op
-takes the caller's DOMAIN key the same way: `composePrimaryKeyOrFail` (`Batch.get`,
-`Batch.write` deletes, `transactGet`, `transactWrite` deletes and condition
-checks) composes through `_domainKeyForm` =
-`_keyForm ∘ makeCompositeStoredForm`, the stored form `put` encodes first
-(applied to transformed, non-numeric composites only; every other composite
-passes through as given, so its key is what 1.39.0 composed). Up to 1.39.0 these
-paths applied the key form alone and composed `x:mix`, so they found, deleted and
-checked nothing for such an item. The double encode itself is stored key text and
-is left as it is: correcting it is a key-format change.
+is stored as `x:MiX` under the key text `x:x:mix`. A key composed from a stored
+row (the write paths, `liveRows`, `rekey`, restore, purge) applies the key form to
+the stored value, so it agrees. The entity's own `get` and `delete` take the
+caller's DOMAIN key the same way `put` takes its input (`encodeKey`, then the key
+form), so they find it.
+
+Every other path that composes a key from DOMAIN values a caller gives goes
+through ONE rule, the **domain key form** (`makeCompositeDomainKeyForm` per
+attribute, `Entity._domainKeyForm` per record): the key form of the stored form
+(`makeCompositeStoredForm`: `encode`, else `decode -> encode`, for transformed,
+non-numeric composites only; every other composite passes through as given). The
+paths: a multi-item op's key (`composePrimaryKeyOrFail`: `Batch.get`, `Batch.write`
+deletes, `transactGet`, `transactWrite` deletes and condition checks); an index
+accessor's composites, typed (`db.entities.X.byIndex`) and unbound
+(`X.query.byIndex`); `.where()` operands; `.within()` bounds on a composite sort
+key, and a Z-order index's prefix composites and the levels its dimensions'
+bounds quantize to; a collection's partition (`db.collections.*`,
+`Collection.make`); a vector index's `.partition()`; a geo search's composites;
+the key of `versions`, `deleted.list`, `history` and `history().where()`
+(including the event `orderBy` value under `escapeKeys: true`, where the event
+key holds its key form); the keys `reembed` recomposes from a decoded item; and
+the key a projection reads its read-model row at and writes the row's tombstone
+at (`composeDomainPrimaryKey`), since the row itself is written by the read
+model's `put`.
+
+What a row check reads from a row is the key form of its stored value
+(`makeCompositeStoredKeyForm`: the value's `encode` when the codec takes it, else
+the value as stored), so it compares with a bound in the same form. A Z-order
+dimension's `FilterExpression` compares the stored attribute, so its operands stay
+in the stored form.
+
+For every composite whose `encode` refuses its own output, the domain key form IS
+the key form, so these paths compose exactly what 1.39.0 composed. Up to 1.39.0 each
+of them applied the key form alone to a codec that takes its own output and composed
+`x:mix`: queries, collections, history, versions and the multi-item reads found
+nothing, multi-item deletes and condition checks touched nothing, and `reembed`
+rewrote a vector partition to the once-encoded text, out of the partition `put`
+wrote (it now writes `put`'s, which also moves back an item 1.39.0's `reembed`
+moved), and a projection read its row at `x:mix`, found none, and failed every
+event after the row's first with `ConcurrentModification` (its `create` met the
+row), while a removal wrote its tombstone at `x:mix` and left the row in place.
+The double encode itself is stored key text and is left as it is: correcting it
+is a key-format change. Two keys keep their own rule. A projection's outbox items
+are keyed by the plain key form of the projection's key (`composePrimaryKey`), the
+text 1.39.0 wrote and `drain` composes, so for such a codec they sit in another
+partition than their row. An aggregate composes its own keys from domain values
+(one encode for a root's composite, none for an edge's sort key).
 
 ### Isolated vs Clustered Key Prefixes
 

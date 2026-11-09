@@ -964,6 +964,11 @@ export interface Entity<
    * read-model row at `key` (key form): `KeyText136.markOf`.
    */
   readonly _keyTextMark: (key: globalThis.Record<string, unknown>) => 2 | undefined
+  /**
+   * @internal {@link _keyTextMark} for a DOMAIN key record (`_domainKeyForm`): the mark of a row
+   * tombstone, which sits at the key the read model's `put` wrote.
+   */
+  readonly _domainKeyTextMark: (key: globalThis.Record<string, unknown>) => 2 | undefined
 
   /** @internal Attach model class prototype to a decoded plain object (no-op for Schema.Struct models). */
   readonly _attachPrototype: (decoded: any) => any
@@ -4427,10 +4432,16 @@ const makeImpl = <
   ) =>
     composeKeysOrFail(entityType, "upsert", () => {
       const keys = { ...composed }
-      const form = keyForm(record)
+      const recordKeyForm = keyForm(record)
       for (const [indexName, index] of Object.entries(allIndexes)) {
         if (indexName === "primary" || index.pk.field in composed) continue
-        const known = KeyComposer.composeKnownHalves(schema, entityType, entityVersion, index, form)
+        const known = KeyComposer.composeKnownHalves(
+          schema,
+          entityType,
+          entityVersion,
+          index,
+          recordKeyForm,
+        )
         for (const [field, composites] of halvesOf(index)) {
           const value = known[field]
           if (
@@ -11845,7 +11856,8 @@ const makeImpl = <
         `[EDD-9010] Entity "${entityType}": .history() requires timeSeries config on the entity.`,
       )
     }
-    const encodedKey = keyForm(encodeKeySync(key))
+    // Encoded once, as `get`'s `encodeKey`: the `keyForm` below is the key `put` wrote.
+    const encodedKey = encodeKeySync(key)
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const currentSk = KeyComposer.composeSk(
@@ -11920,8 +11932,10 @@ const makeImpl = <
     const zorder = KeyComposer.isZOrderHalf(indexDef.sk)
     const indexQuery = (rawPk: globalThis.Record<string, unknown>) => {
       // Normalise composites to their key form before composing — same rule
-      // and same function the write path uses (see `CompositeCodec`).
-      const pkKeyForm = keyForm(rawPk)
+      // and same function the write path uses (see `CompositeCodec`). They are
+      // the caller's DOMAIN values: the key `put` wrote for one is the key form
+      // of the value it stores.
+      const pkKeyForm = domainKeyForm(rawPk)
       // One partition, or a sharded index's several (#183).
       const read = KeyComposer.composeReadPartitions(schema, entityType, indexDef, pkKeyForm)
       const pkValue = read.partitions[0]!
@@ -12066,7 +12080,8 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   const versionsQuery = (key: unknown) => {
-    const encodedKey = keyForm(encodeKeySync(key))
+    // Encoded once, as `get`'s `encodeKey`: the `keyForm` below is the key `put` wrote.
+    const encodedKey = encodeKeySync(key)
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     const liveSk = liveSkOf(encodedKey)
@@ -12207,7 +12222,8 @@ const makeImpl = <
     )
 
   const deletedListQuery = (key: unknown) => {
-    const encodedKey = keyForm(encodeKeySync(key))
+    // Encoded once, as `get`'s `encodeKey`: the `keyForm` below is the key `put` wrote.
+    const encodedKey = encodeKeySync(key)
     const primary = config.indexes.primary
     const pkValue = KeyComposer.composePk(schema, entityType, primary, keyForm(encodedKey))
     // The whole partition's tombstones — every item's, with sort key
@@ -15273,6 +15289,14 @@ const makeImpl = <
     _rekeyProjectionRow: rekeyProjectionRow,
     _keyTextMark: (key: globalThis.Record<string, unknown>) =>
       KeyText136.markOf(schema, entityType, entityVersion, config.indexes.primary, keyForm(key)),
+    _domainKeyTextMark: (key: globalThis.Record<string, unknown>) =>
+      KeyText136.markOf(
+        schema,
+        entityType,
+        entityVersion,
+        config.indexes.primary,
+        domainKeyForm(key),
+      ),
     [Rekey.RekeyHandler]: rekeyHandler,
     _attachPrototype: attachPrototype,
     _overTombstone: (tableName: string, item: globalThis.Record<string, unknown>) =>
@@ -15536,7 +15560,9 @@ export const bind = <
                 >
                 // Snapshots / tombstones live in the same partition under a
                 // rewritten SK — their SK cannot be recomposed from the record.
-                const decodedKeyForm = keyFormFor(entity, decoded)
+                // `decoded` holds domain values: the keys `put` wrote for them
+                // are the key form of the values it stores.
+                const decodedKeyForm = entity._domainKeyForm(decoded)
                 const liveSk = KeyComposer.composeSk(
                   boundSchema,
                   entity.entityType,
@@ -15750,14 +15776,14 @@ export const bind = <
           // We need the `currentSk` + prefix. The user's `key` lets us derive
           // `currentSk` via the same primary SK composer used by `history()`.
           // `key` is the caller's Type-side key; the stored SK was composed
-          // from the encoded form, so normalise it the same way
-          // `composePrimaryKey` does before recomposing.
+          // from the encoded form, so compose it as `get` does: the key form of
+          // the value `put` stores (`_domainKeyForm`).
           const currentSk = KeyComposer.composeSk(
             schemaRef,
             entityTypeRef,
             1,
             primary,
-            keyFormFor(entityInternals, key as globalThis.Record<string, unknown>),
+            entity._domainKeyForm(key as globalThis.Record<string, unknown>),
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
           // Exactly as `Entity.append` composes the event's sort key: the value
