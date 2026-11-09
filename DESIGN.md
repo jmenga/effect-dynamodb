@@ -3140,7 +3140,22 @@ unsubstituted and decodes its leaves exactly as `put` stores them, and a path
 value under it is passed through as given so the item stays readable. Known
 limitation: plain dates inside such a class are still stored as maps (also by
 `put` / `.set()`), as on 1.22.0. Only those and paths no schema describes (under
-a dynamic key of an untyped value) are passed through.
+a dynamic key of an untyped value) are passed through. Each such operand is
+encoded and checked against the schema at its path once, in `prepareUpdate`
+(`encodeOperands`), and written as encoded there: one the schema refuses fails
+the update with a `ValidationError` (`operation` `update.append`,
+`update.pathSet`, `update.pathAppend`, `update.pathPrepend` or
+`update.pathIfNotExists`) before it reads or sends anything, alone or in a
+`transactWrite`. It used to be decided as the write was built, after the reads
+of an update that reads first, so a failed read was reported in its place.
+Only the moment changes: the check, its verdict, its error and the bytes of an
+operand it accepts are the ones the write was built with. An update refused for
+a second reason reports the operand, where it reported whichever it met first
+as it read and built the write: a missing item (`ItemNotFound`), a stale
+`expectedVersion` (`OptimisticLockError`), an immutable field restated with
+another value on an update that reads first (`ValidationError` `update`), a ref
+whose target isn't there (`RefNotFound`), a packed value with no compressor
+(`ValidationError` `update.packed`).
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to
