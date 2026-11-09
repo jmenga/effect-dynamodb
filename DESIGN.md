@@ -1042,6 +1042,19 @@ An event's sort key is composed from the `orderBy` value `append` stored, the En
 `rekey` composed it from the number under `escapeKeys: false` and moved the event to the number's
 text. The other-kind reading finds such an event and moves it back.
 
+**A number the declared kind can't hold exactly.** A field that stored both kinds also stored
+`bigint`s past 2^53 and fractions. Declared `Schema.Number` now, DynamoDB hands such a `bigint` back
+as a `bigint`, which no number holds exactly and `Schema.Number` doesn't read; declared
+`Schema.BigInt`, a fraction is held by no `bigint`. The key form takes a stored number as the
+declared kind only when that kind holds it exactly (`exactIn`), so such a row composes no key: it's
+the conflict `uncomposable` (EDD-9050, "is a value no number holds exactly"), and it and its unique
+sentinel stay where they are, never moved to the key of the value rounded to fit nor counted
+unchanged. A dry run reports the same. 1.39.0 left them too, but said nothing about why: the
+`bigint`s were `unrecognizedKey` and the fractions counted unchanged. The other-kind reading would
+otherwise round such a `bigint` to a number and move the row to the rounded value's key, where no read
+of it composes. The rows 1.39.0 stored pin it (`fixtures/read-back-keys-1.39.0.json`,
+`test/RekeyExactKinds.test.ts` and its connected twin).
+
 **The accepted limit.** The text rewrite leaves an index key that isn't any form's text, as when a row
 cleared a composite or the key lags its values. A pin misses it if its text changed: under a sort key half a
 broader query finds it where its old text sorts, and under a partition key half `get` still reads it.
@@ -1219,6 +1232,24 @@ domain model holds and `.where()` accepts. Internal paths (retain, restore,
 soft-delete, the update and delete paths that read the item first, `rekey`) hold
 whole rows read back from DynamoDB and reach the composer directly.
 
+**An aggregate's partition key from its stored root.** An aggregate composes its
+partition key from domain values: `create` from the object it assembles, `get`
+from the caller's key. Its root row holds the encoded ones. `list` and `rekey`
+compose the key again from the stored root, so they first decode its partition
+key composites as a read decodes them (`rootKeyAsRead`), and compose the key
+`create` wrote: `Schema.Option(x10)`'s `Option.some(50)`, stored as a map holding
+`5`, composes `some(50)` again, as a top-level number stored divided by ten
+composes its own. Through 1.39.0 they composed it from the stored form, so `list`
+skipped such a root, `rekey` counted it `unrecognizedKey`, and an `escapeKeys`
+change couldn't move it. It costs one synchronous decode of the partition key
+composites per root read, and nothing more sent. A root 1.39.0 created under
+`Schema.Option` of a transformation holds the value its `create` decoded, unencoded
+(that `create` decoded its input as if it were stored), so it reads back as a
+value its key wasn't composed from: `Option.some(500)` under `some(50)`. `list` and
+`rekey` skip it, as on 1.39.0, and `get` with `Option.some(50)` finds it
+(`test/AggregateRootKeyReadBack.test.ts` and its connected twin, over rows 1.39.0
+stored).
+
 **Stored form.** The unmarshaller hands a stored `N` back as a `number` while it
 is a safe integer and as a `bigint` past 2^53 (`{N:"5"}` → `5`,
 `{N:"1152921504606846977"}` → `1152921504606846977n`), whatever the field's
@@ -1274,7 +1305,14 @@ the write's own marshalling reports it, as in any attribute (EDD-9124). One that
 back as something else is refused with a `ValidationError` (EDD-9128) naming
 what it reads back as, and nothing written, on every entity write
 (`encodeForWrite`, and `_refuseNotReadBack` for transactions and batches) and
-on an aggregate's `create` and `update` (`refuseOtherKindKeys`).
+on an aggregate's `create` and `update` (`refuseOtherKindKeys`). A dotted
+composite of a `many` edge is judged through the field holding it, never by the
+value at its path alone: the top-level field's stored value is decoded as a read
+decodes it, the path followed, and the text that composes compared with the key
+written (`throughFieldJudge`). A struct storing `{ n: 5n }` and decoding it to
+`{ n: 5 }` reads back `{ n: 5 }` again, the value its key was composed from, so it
+is stored, as on 1.39.0; one whose decode keeps the `5` DynamoDB hands back for a
+key composed from `5n` is refused.
 `Schema.Unknown` reads `5n` back as `5`, so it is refused; a `Schema.Unknown`
 decoded to `Schema.BigInt` by `BigInt(n)` reads it back as `5n`, so it is
 stored, under the bigint's text, as on 1.39.0. A declaration's value
@@ -2725,14 +2763,34 @@ starts with an emoji (4-byte UTF-8) sorts above U+FFFF.
 
 **Event keys compose the `orderBy`'s key form.** An event key's last segment is
 the `orderBy` value as a key holds it — its key form (§7 "Composite key form"),
-serialized and escaped — the same text `.history().where()`, row checks and
-`liveRows` compose. For a string-encoded number (`NumberFromString`,
-`BigIntFromString`) that is the number's key text, so events sort numerically.
-Up to 1.36 `append` composed it from the encoded string, which sorted `"10"`
-before `"9"`, while `.where()` bounds were numeric: history read out of order
-and bounds missed events. Those event keys changed in 1.37.0. **With `escapeKeys` off, the default
-since 1.39.0, the segment is the encoded value again** (`KeyComposer.eventOrderByValue`), bounds
-compose the same, and such a history reads in text order.
+serialized and escaped — the same text row checks and `liveRows` compose. For a
+string-encoded number (`NumberFromString`, `BigIntFromString`) that is the
+number's key text, so events sort numerically. Up to 1.36 `append` composed it
+from the encoded string, which sorted `"10"` before `"9"`, while `.where()` bounds
+were numeric: history read out of order and bounds missed events. Those event keys
+changed in 1.37.0. **With `escapeKeys` off, the default since 1.39.0, the segment
+is the encoded value again** (`KeyComposer.eventOrderByValue`), and such a history
+reads in text order.
+
+**A `.history().where()` bound composes as `append` composes the event key**: the
+value encoded through the model's `orderBy` field (encode, else decode then encode:
+`encodeOrderBy`), which is the value `append` stores and a read of the row takes,
+then `eventOrderByValue` over it and its key form. The model's field, not
+`appendInput`'s: where they differ, an `append` whose event key a read wouldn't
+compose is refused (EDD-9128), and `rekey` moves an earlier one to the key its row
+composes, so the model's reading is the one every event is under. Through 1.39.0
+a bound was the caller's value through the key form, whatever the setting, so with
+`escapeKeys` off `eq` on a string-encoded number named padded text no event had,
+and with it on a value stored in another form (a number stored divided by ten)
+named its stored value's text, `9` for `90`, where `append` had put that stored
+value through the key form again, `0.9`: `eq` found nothing, and ranges missed. With `escapeKeys` off a string-encoded number's events
+are in text order, so a range in numeric order can be reversed in text
+(`between(9, 10)` is `"9"` to `"10"`): DynamoDB rejects it, diagnosed as a
+`ValidationError` naming both bounds (`BetweenReversed`, #144), where 1.39.0
+returned nothing. `beginsWith` on a numeric `orderBy` still compiles to `eq`
+(`test/HistoryWhereOperand.test.ts` and its connected twin, over events 1.39.0
+stored). An `Option` `orderBy` is stored as a map, and DynamoDB refuses `append`'s
+`<` guard on a map, as it did on 1.39.0, so no such event is ever written there.
 
 **`append` on a string-encoded numeric `orderBy`.** The stored `orderBy` is `S`,
 which DynamoDB compares as text, so the CAS `attribute_not_exists(pk) OR
@@ -5800,7 +5858,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9047` | `Entity.ts` | `.condition()` applied to `purge()`, which spans batched writes and cannot be guarded atomically |
 | `EDD-9048` | `internal/TransactableOps.ts` | A multi-item write path cannot compile a **delete** for an entity with `unique`, `versioned: { retain: true }` or `softDelete` — those side items derive from the *stored* row, which these paths never read |
 | `EDD-9049` | `Batch.ts` | `Batch.write` cannot compile a write for those same configs — `BatchWriteItem` has no `ConditionExpression` (the whole basis of a uniqueness sentinel), no `UpdateRequest`, and no atomicity across chunks |
-| `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing |
+| `EDD-9050` | `internal/CompositeCodec.ts` | A key composite's value cannot be encoded to its wire form, so it cannot be placed in a key — raised rather than composing a string that silently matches nothing. A stored number its declared kind can't hold exactly (a `bigint` past 2^53 under `Schema.Number`, a fraction under `Schema.BigInt`) is one too, "is a value no number holds exactly": `rekey` reports its row as the conflict `uncomposable` |
 | `EDD-9051` | `Aggregate.ts` | `list({ cursor })` on a **sharded** aggregate (`list.cardinality`) — a fan-out over N partitions has no resumable position, so the cursor is rejected rather than silently ignored |
 | `EDD-9052` | `Batch.ts`, `Transaction.ts` | A read path (`Batch.get`, `Transaction.transactGet`, `Transaction.check`) was handed something that is not a get descriptor — pass `Entity.get(key)` or the bound `db.entities.X.get(key)` |
 | `EDD-9053` | `DynamoClient.ts` | `.where()` targets a sort-key composite the accessor already pinned — `Query.where` REPLACES the accessor's sort key condition, so the condition would discard the pin and return rows outside it rather than narrowing within it |
@@ -5869,7 +5927,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9125` | `internal/SchemaAccessors.ts` (schema, `refuseUnreadable`), through `Entity.make` and `Aggregate.make`, pure and operational, `EventStore.makeStream`, and `EventStore.projection` / `multiProjection` | A model's stored side holds something its owner can't read back, at any depth, or a stream's event, `metadata` or snapshot state does, or a projection's `outbox.schema`. On every owner: `Schema.ReadonlyMap`, `Schema.HashMap`, `Schema.Chunk`, `Schema.URL`, `Schema.URLSearchParams`, `Schema.RegExp`, `Schema.FormData`, `Schema.Headers`, `Schema.File`, `Schema.ByteSize`, `Schema.ErrorInstance`, a bigint literal. On a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation over a container, other than one between lists holding the same type: `Schema.Date`, `Schema.Redacted`. `Schema.Redacted` beneath a transformation onto another type, such as `Schema.OptionFromOptional`, on every owner. A union a read can't tell a bigint from something else stored as a number in (`Schema.Number`, a number literal, `Schema.Unknown`, `Schema.Json`, a struct with a number in the same field that a read would try first, or another event), since `5n` and `5` are stored the same: on a stream, a snapshot and an outbox, and on an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation. `Schema.Date` and `Schema.Redacted` also in a struct, a record, a tuple or a union with a decoding default, on an entity, and on an aggregate except for an attribute's own nullable plain date, which its date encoder stores. `Schema.Date` and `Schema.Redacted` as a later member of a `Schema.optionalKey` union, in a struct or a list there too, on an entity and an aggregate, except for an aggregate attribute's own nullable plain date. A transformation over `Schema.Date`: on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or when it decodes to something other than a date. Refused at load, naming the path and the replacement. A type is refused when any value of it is written and can't be read, whatever others do: `Schema.Literals([1n, "a"])` reads back `"a"`. Whatever's stored as something else (a transform from a record, `Schema.toCodecJson`) isn't refused, nor is the collection of a `many` edge, which is rows. `Schema.Duration`, `Schema.BigDecimal`, `Schema.HashSet` and a custom `Schema.instanceOf` aren't refused: rows of the first three read, and the last can't be told from a duck-typed `Schema.declare`, which reads back, so its values are judged at write (`EDD-9126`). |
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
-| `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackOtherwise`, `fieldAtPath`, `storedFieldAtPath`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. A dotted composite is followed through what holds each segment, and a time-series `appendInput`'s own fields are refused as the model's are, as is one declaring the other kind than the model. In the same places, the value of a field whose kinds can't be read at load (`Schema.Unknown`, `Schema.Any`, an opaque declaration, a transform whose stored side is one) that reads back as something else is refused at write with a `ValidationError` naming the field, with nothing written. A field no key reads may store both (§7 "Both numeric kinds"). |
+| `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackOtherwise`, `fieldAtPath`, `storedFieldAtPath`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. A dotted composite is followed through what holds each segment, and a time-series `appendInput`'s own fields are refused as the model's are, as is one declaring the other kind than the model. In the same places, the value of a field whose kinds can't be read at load (`Schema.Unknown`, `Schema.Any`, an opaque declaration, a transform whose stored side is one) that reads back as something else is refused at write with a `ValidationError` naming the field, with nothing written; an aggregate's dotted `many` edge composite is judged at write through the field holding it (`throughFieldJudge`), never by the value at its path alone. A field no key reads may store both (§7 "Both numeric kinds"). |
 
 Next free code: **`EDD-9129`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
