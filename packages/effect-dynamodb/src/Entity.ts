@@ -781,14 +781,14 @@ export interface Entity<
    * @internal What in a caller's DOMAIN key record DynamoDB can't store, as `put` decides it for
    * an item holding those values: each encoded through `inputSchema`'s own field as `put` encodes
    * its input (`encodeOrDecodeEncode`), then judged by the check `put` runs on what it encoded
-   * (`unstorableOf`), a `NaN` left to key composition (`EDD-9096`). `undefined` when it all stores,
-   * or when a value doesn't encode. For a path holding an id it fetches by (aggregate ref
-   * hydration): no item can be keyed by a value `put` refuses, and its key text may name an item
-   * of another value.
+   * (`unstorableOf`), a `NaN` left to key composition (`EDD-9096`). `undefined` when it all stores;
+   * a value that doesn't encode fails with the `ValidationError` `put` fails with. For a path
+   * holding an id it fetches by (aggregate ref hydration): no item can be keyed by a value `put`
+   * refuses, and its key text may name an item of another value.
    */
   readonly _unstorableKey: (
     record: globalThis.Record<string, unknown>,
-  ) => Effect.Effect<UnstorableValue | undefined>
+  ) => Effect.Effect<UnstorableValue | undefined, ValidationError>
 
   /**
    * @internal Rename domain field names to their stored DynamoDB attribute
@@ -2740,12 +2740,12 @@ const makeImpl = <
   /**
    * What DynamoDB can't store in a caller's DOMAIN key record, as `put` decides it: the record
    * encoded through `inputSchema`'s own fields as `put` encodes its input, then `unstorableOf`,
-   * the check `put` runs on what it encoded. `undefined` when it stores, or when a value doesn't
-   * encode (no value of its field, which its caller refuses).
+   * the check `put` runs on what it encoded. `undefined` when it stores; a value that doesn't
+   * encode fails as `put` fails on it, with a `ValidationError`.
    */
   const unstorableKey = (
     record: globalThis.Record<string, unknown>,
-  ): Effect.Effect<UnstorableValue | undefined> => {
+  ): Effect.Effect<UnstorableValue | undefined, ValidationError> => {
     const names = Object.keys(record)
     const id = names.join("\u0000")
     let schema = keyRecordSchemas.get(id)
@@ -2758,7 +2758,6 @@ const makeImpl = <
     }
     return encodeOrDecodeEncode(schema, record, entityType, "aggregate.create").pipe(
       Effect.map((encoded) => unstorableOf(encoded as globalThis.Record<string, unknown>)),
-      Effect.orElseSucceed(() => undefined),
     )
   }
 

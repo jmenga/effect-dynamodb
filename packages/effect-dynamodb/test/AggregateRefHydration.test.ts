@@ -7,29 +7,25 @@
  * Each now writes the rows 1.39.0 wrote for the same shape over an entity whose identifier is its
  * key, and an entity no one id keys fails with `EDD-9129`.
  *
- * Shapes 1.39.0 hydrated as it should (a union element wrapping the entity, at the root and in a
- * sub-aggregate, its discriminator nullable or its union nested; a key composite in both halves of
- * the key; a `Date` key given its ISO string; a `NumberFromString` key, alone or in a wrapper, given
- * its encoded string) write and read exactly what 1.39.0 did. An id of the key composite's own type
- * that 1.39.0 dropped (a number, a bigint, a number for an optional `NumberFromString`) or fetched
- * under a key `Entity.put` never wrote (a string codec) is now fetched by the key `put` wrote; an
- * id of no type of the key composite (`"5"` for a number), or one no item is keyed by (`Infinity`),
- * fails with `EDD-9131`, as does one `put` refuses deeper in it (`Infinity` in a struct, an `Option`
- * or a `Result`), whose key text names an item of another value. Every refusal comes before any
- * request. A union element is read as the member the input schema decodes it as, so one whose member
- * declares the entity's field a string keeps it, where 1.39.0 replaced it with the fetched entity, and
- * a member typing its own id decides as that decode does. In an element with a member wrapping the
- * entity, a member that doesn't declare `lineId` refuses one, and a union holding the wrapping member
- * keeps no check of its own, so the input takes as the wrapping member every value 1.39.0 hydrated
- * and stored (an earlier member that would take it with the id left over, a check reading the
- * entity); a value it refuses (a stray id) is fetched and fails as 1.39.0 did. A `NumberFromString`
- * id given an infinity as its encoded string, which `put` stores, is fetched as 1.39.0 fetched it.
+ * Shapes 1.39.0 hydrated as it should (a key composite in both halves of the key; a `Date` key given
+ * its ISO string; a `NumberFromString` key, alone or in a wrapper, given its encoded string) write
+ * and read exactly what 1.39.0 did. An id of the key composite's own type that 1.39.0 dropped (a
+ * number, a bigint, a number for an optional `NumberFromString`) or fetched under a key
+ * `Entity.put` never wrote (a string codec) is now fetched by the key `put` wrote; an id of no type
+ * of the key composite (`"5"` for a number), or one no item is keyed by (`Infinity`), fails with
+ * `EDD-9131`, as does one `put` refuses deeper in it (`Infinity` in a struct, an `Option` or a
+ * `Result`), whose key text names an item of another value, or one that doesn't encode as `put`
+ * stores it. Every refusal comes before any request. A union element is judged as 1.39.0 judged it:
+ * a string `lineId` is fetched, whatever member the value is, and the element's input is the union
+ * as declared, so every union shape fetches, writes and reads what 1.39.0 did, but for a string id
+ * of no type of the key composite (`EDD-9131`). A `NumberFromString` id given an infinity as its
+ * encoded string, which `put` stores, is fetched as 1.39.0 fetched it.
  */
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Cause, Effect, Exit, Option, Schema } from "effect"
+import { Cause, Effect, Exit, Option, Schema, SchemaAST, SchemaGetter } from "effect"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -41,17 +37,19 @@ import {
   CONTROLS,
   fixture,
   json,
+  keyedBy,
   lineClass,
   lines,
   NOW_FETCHED,
-  nestedSheet,
+  outcomeOf,
   SHAPES,
   type Shape,
-  STRAY_ID,
   schema,
   sharedDiscriminator,
   singleKey,
+  stringIds,
   UNFETCHABLE,
+  UNIONS,
   UNKEYABLE,
   UNSTORABLE,
   WRITES_AS,
@@ -308,6 +306,29 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     }),
   )
 
+  for (const given of [Infinity, -Infinity]) {
+    it.effect(`an id that doesn't encode as put stores it (${given}) fails with EDD-9131`, () =>
+      Effect.gen(function* () {
+        // A digits-only string, decoded to a number: an infinity is a number no string encodes.
+        const Digits = Schema.String.check(Schema.isPattern(/^\d+$/)).pipe(
+          Schema.decodeTo(Schema.Number, {
+            decode: SchemaGetter.transform(Number),
+            encode: SchemaGetter.transform(String),
+          }),
+        )
+        const shape = keyedBy(Digits, 5, given)()
+        const { create, requests } = yield* run(shape)
+        const message = refusal(create)
+        expect(message).toContain("[EDD-9131]")
+        expect(message).toContain('`put` refuses it, as it doesn\'t encode as "lineId" is stored')
+        expect(message).toContain("Nothing was fetched or written.")
+        expect(requests).toEqual([])
+        // `put` refuses the same id, before any request.
+        expect(Exit.isFailure(yield* runPut(shape, { lineId: given, f: 5 }))).toBe(true)
+      }),
+    )
+  }
+
   for (const [label, at] of Object.entries(UNSTORABLE)) {
     it.effect(`${label}: create fails with EDD-9131 as put refuses the id, nothing fetched`, () =>
       Effect.gen(function* () {
@@ -333,150 +354,113 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     )
   }
 
-  for (const sub of [false, true]) {
-    const at = sub ? "sub-aggregate, " : ""
-    it.effect(
-      `${at}a checked union first: its members refuse the id, whether or not its check passes`,
-      () =>
-        Effect.gen(function* () {
-          const label = `${at}many, element a union whose first member is a checked union of members holding no ref`
-          const shape = SHAPES[label]!()
-          const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-          const sheets = (input: any) => (sub ? input.part.lines : input.lines)
-          const decode = (input: Record<string, any>) =>
-            sheets(Schema.decodeUnknownSync(A.inputSchema)(input))
-          // Its check refuses the first member, so the input schema takes the value as the one
-          // wrapping the entity, and `create` hydrates it.
-          expect(decode(shape.input)).toEqual([{ kind: "a", lineId: "l", qty: 1 }])
-          const hydrated = yield* run(shape)
-          expect(fetches(hydrated.requests)).toBe(1)
-          // Its check passes, but its members refuse the id: the input schema takes it as the
-          // member wrapping the entity, as 1.39.0's `create` stored it.
-          const passing = SHAPES[`${label}, its check passing`]!()
-          expect(decode(passing.input)).toEqual([{ kind: "a", lineId: "l", qty: 11 }])
-          const stored = yield* run(passing)
-          expect(fetches(stored.requests)).toBe(1)
-          expect(Exit.isSuccess(stored.create) && sheets(stored.create.value)).toEqual([
-            { kind: "a", line: { lineId: "l", f: 5 }, qty: 11 },
-          ])
-        }),
-    )
-
-    it.effect(`${at}a member typing its own id is judged by the ids the members take`, () =>
+  for (const label of UNIONS) {
+    it.effect(`${label}: fetches, writes and reads what 1.39.0 did`, () =>
       Effect.gen(function* () {
-        const label = `${at}many, element a union whose later member declares the entity's field a string and its id a number`
         const shape = SHAPES[label]!()
-        const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-        const sheets = (input: any) => (sub ? input.part.lines : input.lines)
-        const given = { kind: "a", line: "KEEP", lineId: 123, qty: 1 }
-        // The member wrapping the entity takes a string id, so a number is the later member's.
-        expect(sheets(Schema.decodeUnknownSync(A.inputSchema)(shape.input))).toEqual([given])
-        const { create, requests } = yield* run(shape)
-        expect(Exit.isSuccess(create) && sheets(create.value)).toEqual([given])
-        expect(fetches(requests)).toBe(0)
-        // A string id is the wrapping member's: hydrated.
-        const byString = sub
-          ? { ...shape.input, part: { lines: [{ kind: "a", lineId: "l", qty: 1 }] } }
-          : { ...shape.input, lines: [{ kind: "a", lineId: "l", qty: 1 }] }
-        const hydrated = yield* run({
-          ...shape,
-          seed: [["Lines", { lineId: "l", f: 5 }]],
-          input: byString,
-        })
-        expect(Exit.isSuccess(hydrated.create) && sheets(hydrated.create.value)).toEqual([
-          { kind: "a", line: { lineId: "l", f: 5 }, qty: 1 },
-        ])
-        expect(fetches(hydrated.requests)).toBe(1)
+        const { create, sent, rows, get } = yield* run(shape)
+        expect(outcomeOf(create)).toBe(fixture.shapes[label]!.create)
+        // Fetched as 1.39.0 fetched: a string `lineId`, whatever member the value is.
+        expect(batchGetKeys(sent)).toEqual(
+          stringIds(shape.input).length === 0
+            ? []
+            : fixture.shapes[label]!.seeded.filter((row) => row.__edd_e__?.S === "Line").map(keyOf),
+        )
+        expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
+        expect(outcomeOf(get)).toBe(fixture.shapes[label]!.get)
       }),
     )
   }
 
-  it.effect(
-    "an element a member of which declares the entity's field a scalar, sharing its discriminator, is stored as given",
-    () =>
-      Effect.gen(function* () {
-        const label =
-          "many, element members sharing a discriminator, one declaring the entity's field a string and its id"
-        const { create, requests, rows, get } = yield* run(SHAPES[label]!())
-        const expected = { id: "a", lines: [{ kind: "a", line: "KEEP", lineId: "l", qty: 1 }] }
-        expect(Exit.isSuccess(create) && create.value).toEqual(expected)
-        expect(requests).toEqual(["TransactWriteItems"])
-        const sheet = rows.find((row) => row.__edd_e__?.S === "SheetLine")!
-        expect({ line: sheet.line, lineId: sheet.lineId }).toEqual({
-          line: { S: "KEEP" },
-          lineId: { S: "l" },
-        })
-        expect(Exit.isSuccess(get) && get.value).toEqual(expected)
-        // The input schema takes it as that member too.
-        const A = SHAPES[label]!().make(
-          Table.make({ schema, entities: SHAPES[label]!().entities } as never),
-        ) as any
-        expect(Schema.decodeUnknownSync(A.inputSchema)(expected)).toEqual({
-          lines: expected.lines,
-        })
-        // 1.39.0 replaced the scalar it was given with the fetched entity.
-        expect(fixture.shapes[label]!.create).toBe(
-          'ok {"id":"a","lines":[{"kind":"a","line":{"lineId":"l","f":5},"qty":1}]}',
-        )
-      }),
-  )
+  it("a union element's input is the union as declared, as on 1.39.0", () => {
+    // A field's own type: `undefined` and a class's declaration taken off.
+    const unwrap = (ast: SchemaAST.AST): SchemaAST.AST =>
+      SchemaAST.isUnion(ast) && ast.types.some((member) => SchemaAST.isUndefined(member))
+        ? unwrap(ast.types.find((member) => !SchemaAST.isUndefined(member))!)
+        : SchemaAST.isDeclaration(ast)
+          ? unwrap(ast.typeParameters[0]!)
+          : ast
+    const property = (ast: SchemaAST.AST, name: string) =>
+      (unwrap(ast) as SchemaAST.Objects).propertySignatures.find(
+        (signature) => signature.name === name,
+      )?.type
+    const elementOf = (derived: Schema.Top) => {
+      const lines = property(property(derived.ast, "part") ?? derived.ast, "lines")!
+      return (unwrap(lines) as SchemaAST.Arrays).rest[0]
+    }
+    for (const label of UNIONS) {
+      const shape = SHAPES[label]!()
+      const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
+      expect(SchemaAST.isUnion(elementOf(A.schema)!)).toBe(true)
+      // The model's own element, under the JSON codec the input schema is.
+      const declared = elementOf(Schema.toCodecJson(A.schema))
+      expect(elementOf(A.inputSchema)).toEqual(declared)
+      expect(elementOf(A.createSchema)).toEqual(declared)
+    }
+  })
 
-  it.effect("members sharing a discriminator, the one wrapping the entity first: hydrated", () =>
+  for (const refFirst of [false, true]) {
+    it.effect(
+      `members sharing a discriminator (the wrapping one ${refFirst ? "first" : "second"}): a string id is fetched, as on 1.39.0`,
+      () =>
+        Effect.gen(function* () {
+          const { create, requests } = yield* run(sharedDiscriminator(refFirst))
+          expect(Exit.isSuccess(create) && create.value).toEqual({
+            id: "a",
+            lines: [{ kind: "a", line: { lineId: "l", f: 5 }, qty: 1 }],
+          })
+          expect(requests).toEqual(["BatchGetItem", "TransactWriteItems"])
+        }),
+    )
+  }
+
+  it.effect("a union element given a number id of a string-keyed entity: stored as given", () =>
     Effect.gen(function* () {
-      const shape = sharedDiscriminator(true)
-      const { create, requests } = yield* run(shape)
+      const label =
+        "many, element a union whose later member declares the entity's field a string and its id a number"
+      const { create, requests } = yield* run(SHAPES[label]!())
       expect(Exit.isSuccess(create) && create.value).toEqual({
         id: "a",
-        lines: [{ kind: "a", line: { lineId: "l", f: 5 }, qty: 1 }],
+        lines: [{ kind: "a", line: "KEEP", lineId: 123, qty: 1 }],
       })
-      expect(requests).toEqual(["BatchGetItem", "TransactWriteItems"])
-      // As the input schema takes it: by the first member that does.
-      const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-      expect(Schema.decodeUnknownSync(A.inputSchema)(shape.input)).toEqual({
-        lines: [{ kind: "a", lineId: "l", qty: 1 }],
-      })
+      expect(fetches(requests)).toBe(0)
     }),
   )
 
-  it("a nested union element: the input and create schemas take the id where create does", () => {
-    const { Line, model } = lineClass(true)
-    const Lines = lines(model, singleKey)
-    const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(nestedSheet(Line)) })
-    const A = aggregate(Model, Table.make({ schema, entities: { Lines } } as never), {
-      lines: Aggregate.many({
-        entityType: "SheetLine",
-        entity: Lines,
-        sk: { composite: ["qty"] },
-      } as never),
-    }) as any
-    const input = {
-      lines: [
-        { kind: "a", lineId: "l", qty: 1 },
-        { kind: "b", qty: 2 },
-        { kind: "b", lineId: "l", qty: 3 },
-        { kind: "c", line: "label", qty: 4 },
-      ],
-    }
-    for (const derived of [A.inputSchema, A.createSchema]) {
-      expect(Schema.decodeUnknownSync(derived)(input)).toEqual(input)
-      expect(Schema.encodeUnknownSync(derived)(input)).toEqual(input)
-      // A member wrapping the entity takes its id, not the entity.
-      expect(() =>
-        Schema.decodeUnknownSync(derived)({
-          lines: [{ kind: "a", line: { lineId: "l", f: 5 }, qty: 1 }],
-        }),
-      ).toThrow()
-    }
-  })
-
-  it("a nullable discriminator: the input schema takes the id in the member it names", () => {
-    const label = "many, element a union with a nullable discriminator"
-    const shape = SHAPES[label]!()
-    const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-    expect(Schema.decodeUnknownSync(A.inputSchema)({ lines: shape.input.lines })).toEqual({
-      lines: shape.input.lines,
-    })
-  })
+  it.effect("a union element given a string id of a number-keyed entity fails with EDD-9131", () =>
+    Effect.gen(function* () {
+      const Line = Schema.Struct({ lineId: Schema.Number, f: Schema.Number })
+      const Lines = lines(Line, singleKey)
+      const Sheet = Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("a"), line: Line, qty: Schema.Number }),
+        Schema.Struct({ kind: Schema.Literal("b"), qty: Schema.Number }),
+      ])
+      const shape: Shape = {
+        entities: { Lines },
+        make: (base) =>
+          aggregate(Schema.Struct({ id: Schema.String, lines: Schema.Array(Sheet) }), base, {
+            lines: Aggregate.many({
+              entityType: "SheetLine",
+              entity: Lines,
+              sk: { composite: ["qty"] },
+            } as never),
+          }),
+        seed: [["Lines", { lineId: 5, f: 1 }]],
+        input: {
+          id: "a",
+          lines: [
+            { kind: "a", lineId: "x", qty: 1 },
+            { kind: "b", lineId: 5, qty: 2 },
+          ],
+        },
+      }
+      const { create, requests } = yield* run(shape)
+      const message = refusal(create)
+      expect(message).toContain("[EDD-9131]")
+      expect(message).toContain('"lines[0].lineId"')
+      expect(requests).toEqual([])
+    }),
+  )
 
   it.effect("an edge no one id names is refused before any other edge is fetched", () =>
     Effect.gen(function* () {
@@ -538,97 +522,6 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
       expect(requests).toEqual([])
     }),
   )
-
-  it.effect("a union element is judged by the member its discriminator names", () =>
-    Effect.gen(function* () {
-      const { Line, model } = lineClass(true)
-      const Lines = lines(model, singleKey)
-      const Sheet = Schema.Union([
-        Schema.Struct({
-          kind: Schema.Literal("a"),
-          line: Line.pipe(DynamoModel.ref),
-          qty: Schema.Number,
-        }),
-        Schema.Struct({ kind: Schema.Literal("b"), line: Schema.String, qty: Schema.Number }),
-      ])
-      const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(Sheet) })
-      const shape: Shape = {
-        entities: { Lines },
-        make: (base) =>
-          aggregate(Model, base, {
-            lines: Aggregate.many({
-              entityType: "SheetLine",
-              entity: Lines,
-              sk: { composite: ["qty"] },
-            } as never),
-          }),
-        seed: [["Lines", { lineId: "l", f: 5 }]],
-        input: {
-          id: "a",
-          lines: [
-            { kind: "a", lineId: "l", qty: 1 },
-            { kind: "b", line: "label", qty: 2 },
-          ],
-        },
-      }
-      const { create, requests } = yield* run(shape)
-      expect(Exit.isSuccess(create) && create.value).toEqual({
-        id: "a",
-        lines: [
-          { kind: "a", line: { lineId: "l", f: 5 }, qty: 1 },
-          { kind: "b", line: "label", qty: 2 },
-        ],
-      })
-      expect(requests).toEqual(["BatchGetItem", "TransactWriteItems"])
-      // The input schema takes the id in the member holding the entity, and the value in the other.
-      const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-      expect(Schema.decodeUnknownSync(A.inputSchema)(shape.input)).toEqual({
-        lines: [
-          { kind: "a", lineId: "l", qty: 1 },
-          { kind: "b", line: "label", qty: 2 },
-        ],
-      })
-    }),
-  )
-
-  for (const label of STRAY_ID) {
-    it.effect(`${label}: fetched and refused decoding, as 1.39.0 did`, () =>
-      Effect.gen(function* () {
-        const shape = SHAPES[label]!()
-        const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-        // The member holding no ref refuses the id, and the wrapping member the kind.
-        expect(() => Schema.decodeUnknownSync(A.inputSchema)(shape.input)).toThrow()
-        const { create, sent, rows } = yield* run(shape)
-        expect(refusal(create)).not.toContain("[EDD-")
-        expect(sent.map((request) => request.command)).toEqual(["BatchGetItem"])
-        expect(batchGetKeys(sent)).toEqual(fixture.shapes[label]!.seeded.map(keyOf))
-        expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
-        expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
-      }),
-    )
-  }
-
-  for (const label of CONTROLS.filter((control) => control.includes(", element a union "))) {
-    it.effect(`${label}: fetched exactly when the input schema takes the id`, () =>
-      Effect.gen(function* () {
-        const shape = SHAPES[label]!()
-        const A = shape.make(Table.make({ schema, entities: shape.entities } as never)) as any
-        const decoded = Schema.decodeUnknownExit(A.inputSchema)(shape.input)
-        // Every such value is taken as given (a `Date` by the member its JSON form refuses it for).
-        expect(Exit.isSuccess(decoded)).toBe(true)
-        const value = (decoded as Exit.Success<any, unknown>).value
-        const sheets = (shape.input.part === undefined ? value : value.part).lines as ReadonlyArray<
-          Record<string, unknown>
-        >
-        // The member wrapping the entity takes its id, in place of the entity's field.
-        const takesId = sheets.some(
-          (sheet) => typeof sheet.lineId === "string" && !("line" in sheet),
-        )
-        const { requests } = yield* run(shape)
-        expect(fetches(requests)).toBe(takesId ? 1 : 0)
-      }),
-    )
-  }
 
   it.effect("a NumberFromString id given an infinity as its encoded string: put stores it", () =>
     Effect.gen(function* () {

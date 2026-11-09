@@ -5,13 +5,12 @@
  * or whose identifier is another field, is fetched by its key's only composite, and writes the rows
  * 1.39.0 wrote for the same shape with its identifier on the key; an entity no one id keys fails with
  * `EDD-9129`, nothing written. 1.39.0 died on each of these. Shapes 1.39.0 hydrated as it should
- * (union elements, a key composite in both halves, `Date` and `NumberFromString` keys, alone or in a
- * wrapper) write and read what it did; an id of the key composite's own type 1.39.0 dropped, or
- * fetched under a key `put` never wrote (a string codec), is fetched by the key `put` wrote; an id
- * of no type of it, or one no item is keyed by (`put` refuses it, alone or inside a struct, an
- * `Option` or a `Result`), fails with `EDD-9131`, nothing written. A union element is read as the
- * member the input schema decodes it as; one 1.39.0 hydrated and stored is hydrated and stored as it
- * was, and a stray id on a member holding no ref is fetched and refused as 1.39.0 refused it.
+ * (a key composite in both halves, `Date` and `NumberFromString` keys, alone or in a wrapper) write
+ * and read what it did; an id of the key composite's own type 1.39.0 dropped, or fetched under a key
+ * `put` never wrote (a string codec), is fetched by the key `put` wrote; an id of no type of it, or
+ * one no item is keyed by (`put` refuses it, alone or inside a struct, an `Option` or a `Result`),
+ * fails with `EDD-9131`, nothing written. A union element is judged as 1.39.0 judged it (a string
+ * `lineId`, whatever member the value is), so every union shape writes and reads what 1.39.0 did.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -31,12 +30,12 @@ import {
   fixture,
   json,
   NOW_FETCHED,
+  outcomeOf,
   SHAPES,
   type Shape,
-  STRAY_ID,
   schema,
-  sharedDiscriminator,
   UNFETCHABLE,
+  UNIONS,
   UNKEYABLE,
   UNSTORABLE,
   WRITES_AS,
@@ -211,13 +210,13 @@ describeConnected(
       )
     }
 
-    for (const label of STRAY_ID) {
-      it.effect(`${label}: refused decoding the fetched record, as 1.39.0 was`, () =>
+    for (const label of UNIONS) {
+      it.effect(`${label}: writes and reads what 1.39.0 did`, () =>
         Effect.gen(function* () {
-          const { create, rows } = yield* run(SHAPES[label]!())
-          expect(refusal(create)).not.toContain("[EDD-")
+          const { create, rows, get } = yield* run(SHAPES[label]!())
+          expect(outcomeOf(create)).toBe(fixture.shapes[label]!.create)
           expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
-          expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
+          expect(outcomeOf(get)).toBe(fixture.shapes[label]!.get)
         }),
       )
     }
@@ -236,23 +235,6 @@ describeConnected(
         }),
       )
     }
-
-    it.effect("members sharing a discriminator: judged by the member the element is", () =>
-      Effect.gen(function* () {
-        const scalarFirst = yield* run(
-          SHAPES[
-            "many, element members sharing a discriminator, one declaring the entity's field a string and its id"
-          ]!(),
-        )
-        const kept = { id: "a", lines: [{ kind: "a", line: "KEEP", lineId: "l", qty: 1 }] }
-        expect(Exit.isSuccess(scalarFirst.create) && scalarFirst.create.value).toEqual(kept)
-        expect(Exit.isSuccess(scalarFirst.get) && scalarFirst.get.value).toEqual(kept)
-        const refFirst = yield* run(sharedDiscriminator(true))
-        const hydrated = { id: "a", lines: [{ kind: "a", line: { lineId: "l", f: 5 }, qty: 1 }] }
-        expect(Exit.isSuccess(refFirst.create) && refFirst.create.value).toEqual(hydrated)
-        expect(Exit.isSuccess(refFirst.get) && refFirst.get.value).toEqual(hydrated)
-      }),
-    )
 
     it.effect("an element declaring the entity's field a string is stored as given", () =>
       Effect.gen(function* () {

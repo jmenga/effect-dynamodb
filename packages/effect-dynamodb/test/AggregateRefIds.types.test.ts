@@ -5,7 +5,8 @@
  * of that attribute's type, named `${field}Id`: a number for a number key, a bigint for a bigint
  * key, a `Date` for a `Date` key, a string when the key is in the sort key alone. An edge whose
  * entity is keyed by two attributes takes the entity whole, as `create` fetches nothing for it.
- * These match what `create` does at run time (`AggregateRefHydration.test.ts`).
+ * These match what `create` does at run time (`AggregateRefHydration.test.ts`). A `many` element
+ * declared a union is typed as on 1.39.0, as `create` judges it as 1.39.0 did.
  */
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -77,9 +78,35 @@ const PairLines = Entity.make({
   },
 })
 
+/** An entity with an `id: string` field, which 1.39.0's union element typing takes for a ref. */
+class IdLine extends Schema.Class<IdLine>("IdLine")({ id: Schema.Number, f: Schema.Number }) {}
+class StringIdLine extends Schema.Class<StringIdLine>("StringIdLine")({
+  id: Schema.String,
+  f: Schema.Number,
+}) {}
+const IdLines = Entity.make({
+  model: IdLine,
+  entityType: "IdLine",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+const StringIdLines = Entity.make({
+  model: StringIdLine,
+  entityType: "StringIdLine",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+
 const MainTable = Table.make({
   schema: AppSchema,
-  entities: { NumberLines, BigintLines, DateLines, SortKeyLines, TwiceLines, PairLines },
+  entities: {
+    NumberLines,
+    BigintLines,
+    DateLines,
+    SortKeyLines,
+    TwiceLines,
+    PairLines,
+    IdLines,
+    StringIdLines,
+  },
 })
 
 class Root extends Schema.Class<Root>("Root")({
@@ -102,6 +129,12 @@ class Root extends Schema.Class<Root>("Root")({
     ]),
   ),
   pairSheets: Schema.Array(Schema.Struct({ pairLine: PairLine, qty: Schema.Number })),
+  idKinds: Schema.Array(
+    Schema.Union([
+      Schema.Struct({ kind: Schema.Literal("a"), stringIdLine: StringIdLine }),
+      Schema.Struct({ kind: Schema.Literal("b"), idLine: IdLine }),
+    ]),
+  ),
   notes: Schema.Array(Schema.Struct({ id: Schema.String, text: Schema.String })),
 }) {}
 
@@ -140,6 +173,7 @@ const RootAggregate = Aggregate.make(Root, {
       sk: { composite: ["qty"] },
     }),
     notes: Aggregate.many({ entityType: "RootNote", sk: { composite: ["id"] } }),
+    idKinds: Aggregate.many({ entityType: "RootIdKind", entity: StringIdLines }),
   },
 })
 
@@ -190,10 +224,18 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
     }>()
   })
 
-  it("a many element that is a union takes an id in each member holding the entity", () => {
+  it("a many element that is a union is typed as on 1.39.0: as declared, holding no ref-like field", () => {
     expectTypeOf<Input["kinds"][number]>().toEqualTypeOf<
-      | { readonly kind: "a"; readonly numberLineId: number }
+      | { readonly kind: "a"; readonly numberLine: NumberLine }
       | { readonly kind: "b"; readonly label: string }
+    >()
+  })
+
+  it("a union element's field of a class with an `id: string` takes an id, as on 1.39.0", () => {
+    // 1.39.0's typing: the edge entity's partition key composite's type, for any such field.
+    expectTypeOf<Input["idKinds"][number]>().toEqualTypeOf<
+      | { readonly kind: "a"; readonly stringIdLineId: string }
+      | { readonly kind: "b"; readonly idLine: IdLine }
     >()
   })
 

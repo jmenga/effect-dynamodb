@@ -12,6 +12,7 @@ import type {
   ManagedDateField,
   ModelFieldName,
   ModelFields,
+  RefEntityIdentifierValue,
   UpdatedAtFieldName,
 } from "./EntityTypes.js"
 
@@ -183,8 +184,22 @@ type _EdgeModelType<Edge> =
  */
 type _ManyEdgeInput<T, Edge, TStamps> =
   _Fetchable<Edge> extends true
-    ? _TransformManyEdge<T, _EdgeIdValue<Edge>, TStamps, _EdgeModelType<Edge>>
-    : _TransformManyEdge<T, never, TStamps, never>
+    ? _TransformManyEdge<
+        T,
+        _EdgeIdValue<Edge>,
+        TStamps,
+        _EdgeModelType<Edge>,
+        _UnionEdgeIdValue<Edge>
+      >
+    : _TransformManyEdge<T, never, TStamps, never, never>
+
+/** A union element's id, as 1.39.0 typed it: the entity's partition key composite's type. */
+type _UnionEdgeIdValue<Edge> =
+  _EdgeEntity<Edge> extends infer E
+    ? E extends RefEntity
+      ? RefEntityIdentifierValue<E>
+      : string
+    : string
 
 /**
  * Compute the aggregate input type from the domain model, edges, and PK composites.
@@ -342,20 +357,49 @@ type _RefFieldsToIds<T, Id, M> = T extends unknown
  * id of type `Id` names:
  * - an element that is the entity (`Array<Umpire>`) is its id: the array becomes `Array<Id>`;
  * - an element wrapping it (`Array<{ player: Player, ... }>`) takes `${field}Id: Id` for the field.
+ * - an element declared a union is typed as on 1.39.0 ({@link _UnionElementInput}), with `UnionId`.
  * With no entity to fetch (`M = never`), the elements are taken as given.
  */
-type _TransformManyEdge<T, Id, TStamps, M> =
+type _TransformManyEdge<T, Id, TStamps, M, UnionId> =
   T extends ReadonlyArray<infer E>
     ? [M] extends [never]
       ? ReadonlyArray<_OptionalStamps<E, TStamps>>
-      : [E] extends [M]
-        ? ReadonlyArray<Id>
-        : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id, M>, TStamps>>
+      : true extends _IsUnion<E>
+        ? _UnionElementInput<E, UnionId, TStamps>
+        : [E] extends [M]
+          ? ReadonlyArray<Id>
+          : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id, M>, TStamps>>
     : T extends Readonly<Record<string, infer V>>
       ? string extends keyof T
         ? { readonly [key: string]: _OptionalStamps<V, TStamps> }
         : T
       : T
+
+/** Detect ref-like types: objects with an `id: string` property (Schema.Class entities) */
+type _IsRefLike<T> = T extends { readonly id: string }
+  ? string extends keyof T
+    ? false
+    : true
+  : false
+
+/**
+ * The elements of a union element type as 1.39.0 typed them (`create` judges their values as
+ * 1.39.0 did, `isUnionElement`): an element whose members are all ref-like is `Id`; otherwise its
+ * ref-like fields are taken as `${field}Id: Id`.
+ */
+type _UnionElementInput<E, Id, TStamps> =
+  _IsRefLike<E> extends true
+    ? ReadonlyArray<Id>
+    : ReadonlyArray<
+        _OptionalStamps<
+          _Simplify<{
+            readonly [K in keyof E as _IsRefLike<E[K]> extends true
+              ? `${K & string}Id`
+              : K]: _IsRefLike<E[K]> extends true ? Id : E[K]
+          }>,
+          TStamps
+        >
+      >
 
 /** `T` with the dates the library stamps optional. */
 type _OptionalStamps<T, TStamps> = [ManagedDateField<T, TStamps>] extends [never]

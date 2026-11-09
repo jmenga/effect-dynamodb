@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Option, Result, Schema, SchemaGetter } from "effect"
+import { Cause, Exit, Option, Result, Schema, SchemaGetter } from "effect"
 import * as Aggregate from "../../src/Aggregate.js"
 import * as Entity from "../../src/Entity.js"
 
@@ -293,7 +293,7 @@ export const Prefixed = Schema.String.pipe(
 )
 
 /** A `one` edge over an entity keyed by `lineId` of `keySchema`, seeded with `id`, given `given`. */
-const keyedBy =
+export const keyedBy =
   (
     keySchema: Schema.Top,
     id: unknown,
@@ -1055,36 +1055,39 @@ export const WRITES_AS: Record<string, string> = {
   "one, an entity with a code, its identifier another field":
     "one, an entity with a code, with an identifier",
 }
-/** Shapes 1.39.0 hydrated as it should: each writes and reads exactly what 1.39.0 did. */
+/**
+ * Every union element shape. `create` judges a union element as 1.39.0 judged it (a string `lineId`
+ * is fetched, whatever member the value is), so each fetches, writes and reads what 1.39.0 did:
+ * `create` succeeding or failing as it did, the same rows, the same `get`.
+ */
+export const UNIONS = Object.keys(fixture.shapes).filter((label) =>
+  /, element (a union|a nested union|members sharing)/.test(label),
+)
+/** Every string `lineId` a shape's `many` elements are given: what 1.39.0 fetched. */
+export const stringIds = (input: Record<string, any>): ReadonlyArray<string> =>
+  ((input.part?.lines ?? input.lines ?? []) as ReadonlyArray<Record<string, unknown>>)
+    .map((element) => element.lineId)
+    .filter((id): id is string => typeof id === "string")
+/** An exit as the fixture's generator wrote it. */
+export const outcomeOf = (exit: Exit.Exit<unknown, unknown>): string => {
+  if (Exit.isSuccess(exit)) return `ok ${json(exit.value)}`
+  const error = Option.getOrUndefined(Cause.findErrorOption(exit.cause))
+  return error === undefined
+    ? `died: ${String(Cause.squash(exit.cause))}`
+    : `failed: ${(error as { readonly _tag?: string })._tag}`
+}
+/** Shapes 1.39.0 hydrated as it should, a union element aside: each writes and reads what it did. */
 export const CONTROLS = [
   ...Object.keys(fixture.shapes).filter((label) => label.endsWith("with an identifier")),
-  "many, element a union of structs wrapping the entity",
-  "many, element a union whose members may hold the entity",
-  "sub-aggregate, many, element a union of structs wrapping the entity",
   "one, an entity whose key composite is in its pk and its sk",
   "one, an entity keyed by a Date, given its ISO string",
   "one, an entity keyed by a NumberFromString, given its encoded string",
   "many, ids of an entity keyed by a NumberFromString, given encoded strings",
-  "many, element a union with a nullable discriminator",
-  "many, element a union with a nullable discriminator, the entity optional",
-  "sub-aggregate, many, element a union with a nullable discriminator, the entity optional",
-  "many, element a nested union wrapping the entity",
   "one, an entity keyed by an optional NumberFromString, given its encoded string",
   "one, an entity keyed by an optional BigIntFromString, given its encoded string",
   "one, an entity keyed by a NumberFromString or a literal, given its encoded string",
-  "many, element a union whose first member is a checked union of members holding no ref",
-  "sub-aggregate, many, element a union whose first member is a checked union of members holding no ref",
-  "many, element a union whose later member declares the entity's field a string and its id a number",
-  "sub-aggregate, many, element a union whose later member declares the entity's field a string and its id a number",
-  ...Object.keys(reviewedFourth).filter((label) => !label.endsWith("is given a lineId")),
+  ...Object.keys(reviewedFourth).filter((label) => !UNIONS.includes(label)),
 ]
-/**
- * A stray id on a member holding no ref, which `inputSchema` refuses: fetched as 1.39.0 fetched it,
- * and `create` fails decoding the fetched record, as 1.39.0 failed.
- */
-export const STRAY_ID = Object.keys(reviewedFourth).filter((label) =>
-  label.endsWith("is given a lineId"),
-)
 export const UNFETCHABLE = [
   "many, element wraps an entity keyed by two composites",
   "one, an entity keyed by two composites",
