@@ -1312,9 +1312,12 @@ what it reads back as, and nothing written, on every entity write
 on an aggregate's `create` and `update` (`refuseOtherKindKeys`). A dotted
 composite of a `many` edge is judged through the field holding it, never by the
 value at its path alone: the top-level field's stored value is decoded as a read
-decodes it, the path followed, and the text that composes compared with the key
-written (`throughFieldJudge`). A struct storing `{ n: 5n }` and decoding it to
-`{ n: 5 }` reads back `{ n: 5 }` again, the value its key was composed from, so it
+decodes it, the path followed, and the text that composes compared with the text
+the edge composes from the element written (`throughFieldJudge`). A row is judged
+by each edge a read hands it to (its entity type and discriminators, matched as
+assembly matches them, `takesRow`), against that edge's own sort key, never
+another edge's of the same entity type. A struct storing `{ n: 5n }` and
+decoding it to `{ n: 5 }` reads back `{ n: 5 }` again, the value its key was composed from, so it
 is stored, as on 1.39.0; one whose decode keeps the `5` DynamoDB hands back for a
 key composed from `5n` is refused.
 `Schema.Unknown` reads `5n` back as `5`, so it is refused; a `Schema.Unknown`

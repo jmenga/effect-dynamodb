@@ -1718,10 +1718,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
   /**
    * `[EDD-9128]`, by value: each key composite whose numeric kinds can't be read at load
    * (`Schema.Unknown`, `Schema.Any`, a declaration, or a transformation from one), with what composes
-   * it and the test of a stored value that reads back otherwise (`readsBackOtherwise`). A composite
-   * that's a path into a value (`nested.n`) is followed to the field it names (`fieldAtPath`). A
-   * declared one is refused at load. Empty for an aggregate with none, which pays nothing more on a
-   * write.
+   * it and the test of a stored value that reads back otherwise (`readsBackOtherwise`), per node
+   * whose key composes it. A composite that's a path into a value (`nested.n`) is followed to the
+   * field it names (`fieldAtPath`). A declared one is refused at load. Empty for an aggregate with
+   * none, which pays nothing more on a write.
    */
   const otherKindKeys = (() => {
     type Check = {
@@ -1738,17 +1738,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
         const readsAs = held == null ? undefined : readsOther(held)
         return readsAs === undefined ? undefined : { held, readsAs }
       }
-    // A dotted composite of an edge's sort key (`nested.n`), judged through the field holding it:
-    // the text written against the text composed again from the row as a read takes it, its field
-    // decoded as assembly decodes it and its key read off the result as `decompose` reads it. A
-    // transformation of what holds the value (a struct decoded to another) is a read's too, so the
-    // value at the path alone isn't what a key read back is composed from.
+    // A dotted composite of `node`'s sort key (`nested.n`), judged through the field holding it:
+    // the text `node` composes for it from the element written against the text composed again
+    // from the row as a read takes it, its field decoded as assembly decodes it and its key read
+    // off the result as `decompose` reads it. A transformation of what holds the value (a struct
+    // decoded to another) is a read's too, so the value at the path alone isn't what a key read
+    // back is composed from.
     const throughFieldJudge = (
+      node: ResolvedNode,
       fields: Record<string, Schema.Top>,
       path: string,
-      slot: number,
-      slots: number,
-      keyEncoders: AttrEncoders | undefined,
     ) => {
       const top = path.slice(0, path.indexOf("."))
       const decode = Schema.decodeUnknownOption(
@@ -1759,7 +1758,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           absentReads: true,
         }) as unknown as Schema.Codec<any>,
       )
-      const keyEncoder = keyEncoders?.[top]
+      const keyEncoder = node.keyAttrEncoders?.[top]
       // The value at the path of a top-level value decoded, as `decompose` reads a key off it.
       const leafOf = (value: unknown): Option.Option<unknown> =>
         Option.map(decode({ [top]: value }), (decoded) => {
@@ -1772,6 +1771,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       return (item: DecomposedItem) => {
         const stored = item.attributes[top]
         if (stored == null) return undefined
+        // Only a `many` element has a sort key `node` composes from it.
+        const written = item.skTextFor?.(node, path)
+        if (written === undefined) return undefined
         let returned: unknown
         try {
           returned = asRead(stored)
@@ -1779,7 +1781,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // A value the marshaller refuses is the write's own marshalling's to report.
           return undefined
         }
-        const written = item.skComposites[item.skComposites.length - slots + slot]
         const read = Option.filter(leafOf(returned), (leaf) => leaf != null)
         if (
           Option.isSome(read) &&
@@ -1827,34 +1828,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
     const edgeChecksOf = (node: ResolvedNode, composites: ReadonlyArray<string>) => {
       const into = `edge "${node.fieldName}"'s sort key`
       const fields = node.ownFields
-      return composites.flatMap((path, slot): ReadonlyArray<Check> => {
+      return composites.flatMap((path): ReadonlyArray<Check> => {
         const top = fields?.[path.slice(0, path.indexOf("."))]
         const leaf = fieldAtPath(fields, path)
         return fields !== undefined &&
           top !== undefined &&
           path.includes(".") &&
           (readBackUnsure(top) || (leaf !== undefined && readBackUnsure(leaf)))
-          ? [
-              {
-                path,
-                into,
-                judge: throughFieldJudge(
-                  fields,
-                  path,
-                  slot,
-                  composites.length,
-                  node.keyAttrEncoders,
-                ),
-              },
-            ]
+          ? [{ path, into, judge: throughFieldJudge(node, fields, path) }]
           : checksOf(fields, into, [path])
       })
     }
-    const byType = new Map<string, ReadonlyArray<Check>>()
-    const add = (entityType: string, checks: ReadonlyArray<Check>) => {
-      if (checks.length > 0) byType.set(entityType, [...(byType.get(entityType) ?? []), ...checks])
+    // Each node's own checks: a row is judged by every node assembly hands it to (`takesRow`).
+    const byNode: Array<{ readonly node: ResolvedNode; readonly checks: ReadonlyArray<Check> }> = []
+    const add = (node: ResolvedNode, checks: ReadonlyArray<Check>) => {
+      if (checks.length > 0) byNode.push({ node, checks })
     }
-    add(config.root.entityType, [
+    add(rootNode, [
       ...checksOf(schemaFields, "its partition key", config.pk.composite, true),
       ...checksOf(
         schemaFields,
@@ -1871,40 +1861,52 @@ const makeAggregate = <TSchema extends Schema.Top>(
     ])
     const walk = (node: ResolvedNode): void => {
       if (node.cardinality === "many" && node.skComposite !== undefined) {
-        add(node.entityType, edgeChecksOf(node, node.skComposite))
+        add(node, edgeChecksOf(node, node.skComposite))
       }
       for (const child of node.children) walk(child)
     }
     walk(rootNode)
-    return byType
+    return byNode
   })()
 
   /**
    * Refuses a write storing, for a key composite whose numeric kinds can't be read at load, a value
-   * that reads back otherwise: a stored row would compose other key text (`EDD-9128`). Each row's
-   * composites are read off its stored attributes, a path into a value followed.
+   * that reads back otherwise: a stored row would compose other key text (`EDD-9128`). A row is
+   * judged by the checks of each node assembly hands it to, its composites read off its stored
+   * attributes, a path into a value followed.
    */
   const refuseOtherKindKeys = (
     groups: ReadonlyArray<TransactionGroup>,
     operation: string,
   ): Effect.Effect<void, ValidationError> => {
-    if (otherKindKeys.size === 0) return Effect.void
+    if (otherKindKeys.length === 0) return Effect.void
     for (const group of groups) {
       for (const item of group.items) {
-        for (const { path, into, judge } of otherKindKeys.get(item.entityType) ?? []) {
-          const refused = judge(item)
-          if (refused === undefined) continue
-          return Effect.fail(
-            new ValidationError({
-              entityType: aggregateName,
-              operation,
-              cause: readBackRefusal(
-                `Field "${path}" of "${item.member}" is composed into ${into}`,
-                refused.held,
-                refused.readsAs,
-              ),
-            }),
-          )
+        // An attribute as a read has it: a discriminator is matched against what's read back.
+        const asStored = (attr: string): unknown => {
+          try {
+            return asRead(item.attributes[attr])
+          } catch {
+            return undefined
+          }
+        }
+        for (const { node, checks } of otherKindKeys) {
+          if (!takesRow(node, item.entityType, asStored)) continue
+          for (const { path, into, judge } of checks) {
+            const refused = judge(item)
+            if (refused === undefined) continue
+            return Effect.fail(
+              new ValidationError({
+                entityType: aggregateName,
+                operation,
+                cause: readBackRefusal(
+                  `Field "${path}" of "${item.member}" is composed into ${into}`,
+                  refused.held,
+                  refused.readsAs,
+                ),
+              }),
+            )
+          }
         }
       }
     }
@@ -3710,7 +3712,9 @@ const assembleAggregate = (
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
     // Find the root item
-    const rootItems = allItems.filter((item) => item.__edd_e__ === rootNode.entityType)
+    const rootItems = allItems.filter((item) =>
+      takesRow(rootNode, item.__edd_e__, (attr) => item[attr]),
+    )
 
     if (rootItems.length === 0) {
       return yield* new AggregateAssemblyError({
@@ -3790,6 +3794,25 @@ const assembleAggregate = (
     return decoded
   })
 
+/**
+ * Whether assembly hands a row to `node`: the row's entity type is the node's, and so is each of
+ * the node's static discriminator values (a computed one, a function, isn't matched). A node's
+ * discriminator already holds every enclosing one (`resolveNode`). `valueOf` reads an attribute of
+ * the row as a read has it.
+ */
+const takesRow = (
+  node: ResolvedNode,
+  entityType: unknown,
+  valueOf: (attr: string) => unknown,
+): boolean => {
+  if (entityType !== node.entityType) return false
+  for (const [attr, value] of Object.entries(node.discriminator ?? {})) {
+    if (typeof value === "function") continue
+    if (valueOf(attr) !== value) return false
+  }
+  return true
+}
+
 const assembleNode = (
   node: ResolvedNode,
   allItems: Array<Record<string, unknown>>,
@@ -3798,19 +3821,9 @@ const assembleNode = (
   systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
-    // Find items matching this node's entity type and discriminator
-    const matchingItems = allItems.filter((item) => {
-      if (item.__edd_e__ !== node.entityType) return false
-      // If this node has a discriminator, check that item attributes match
-      if (node.discriminator) {
-        for (const [attr, value] of Object.entries(node.discriminator)) {
-          // Skip computed discriminators (functions) — only match on static values
-          if (typeof value === "function") continue
-          if (item[attr] !== value) return false
-        }
-      }
-      return true
-    })
+    const matchingItems = allItems.filter((item) =>
+      takesRow(node, item.__edd_e__, (attr) => item[attr]),
+    )
 
     if (node.cardinality === "one") {
       // One-to-one: sub-aggregate root or simple one edge
@@ -4250,6 +4263,12 @@ interface DecomposedItem {
    * is. A value a setting refuses (`NaN`) gives none there.
    */
   readonly otherKindSortKey?: ((targets: KindTargets) => string | undefined) | undefined
+  /**
+   * A `many` element only: the text `node`'s sort key composes for the composite `path` from the
+   * element, as `node`'s decomposition composes it (`EDD-9128` judges each node a read hands the
+   * row to); `undefined` when `node` composes none from it.
+   */
+  readonly skTextFor?: ((node: ResolvedNode, path: string) => string | undefined) | undefined
   /** Edge field name (entity type for the root) — used to name the culprit in errors. */
   readonly member: string
   /** What the row does with each timestamp. */
@@ -4637,6 +4656,23 @@ const decomposeNode = (
               if (reading !== undefined && reading.asOther.size > 0) return sortKey(reading.record)
             }
             return undefined
+          },
+          skTextFor: (taker, path) => {
+            try {
+              let from = keyAttrs
+              if (taker !== node) {
+                from = { ...(elem as Record<string, unknown>) }
+                applyNodeAttrEncoders(from, taker.keyAttrEncoders)
+                mergeContextValues(from, contextValues.key)
+              }
+              const value = readCompositePath(from, path)
+              return value == null || !isScalarComposite(value)
+                ? undefined
+                : KeyComposer.keyValueText(schema, value, schema.casing)
+            } catch {
+              // What `taker` can't compose a key from isn't a key it writes.
+              return undefined
+            }
           },
           member: node.fieldName ?? node.entityType,
           rowStamps: node.rowStamps,
