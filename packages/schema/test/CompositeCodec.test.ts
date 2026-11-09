@@ -128,13 +128,19 @@ describe("CompositeCodec", () => {
       expect(fromRow("small", 5)).toBe(5n)
       expect(serializeValue(fromRow("small", 5))).toBe(serializeValue(5n))
       expect(fromRow("small", 5n)).toBe(5n)
-      // Not an integer: left for the composer to refuse, never truncated.
-      expect(fromRow("small", 2.5)).toBe(2.5)
+      // Not an integer: no bigint holds it, so a row storing it is one the field can't read. It's
+      // refused, never truncated, nor composed as the fraction it is (`rekey`: `uncomposable`).
+      expect(() => fromRow("small", 2.5)).toThrow("[EDD-9050] small 2.5")
     })
 
     it("a Schema.Number read back as a bigint is a number again", () => {
       expect(fromRow("big", 12n)).toBe(12)
       expect(fromRow("big", 12)).toBe(12)
+      expect(fromRow("big", -(2n ** 53n) + 1n)).toBe(-(2 ** 53) + 1)
+      // Past 2^53 DynamoDB hands it back as a bigint no number holds exactly: refused, never
+      // rounded to a number whose key no read of the row composes.
+      expect(() => fromRow("big", 2n ** 53n)).toThrow(`[EDD-9050] big ${2n ** 53n}`)
+      expect(() => fromRow("big", 2n ** 60n + 1n)).toThrow(`[EDD-9050] big ${2n ** 60n + 1n}`)
     })
 
     it("a non-numeric field is untouched", () => {

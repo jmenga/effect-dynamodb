@@ -93,6 +93,19 @@ const bothThrees = (stored: string, current: string) => [
   }),
 ]
 
+/**
+ * `e`, stored past 2^53, under `Schema.Number`: a read gives a bigint no number holds exactly, so no
+ * key is composed for it, and it's reported and left with its sentinel.
+ */
+const eUnreadable = expect.objectContaining({
+  member: "Counters",
+  reason: "uncomposable",
+  key: { pk: "$kin#v1#counters#id_e", sk: `$kin#v1#counters#n_${B("1152921504606846977")}` },
+})
+/** A run's conflicts in key order: the scan's order is the table's own. */
+const conflictsByKey = (conflicts: ReadonlyArray<{ readonly key: { readonly pk: string } }>) =>
+  [...conflicts].sort((a, b) => a.key.pk.localeCompare(b.key.pk))
+
 export interface Scenario {
   readonly name: string
   readonly Kind: Schema.Top
@@ -114,23 +127,26 @@ export const scenarios: ReadonlyArray<Scenario> = [
         expect(report.skipped.unrecognizedKey).toBe(0)
         expect(report.moved).toEqual({
           ...ZERO,
-          // `a`, `e` and the Unknown key's row; the tombstone; the `5n` event; the aggregate's root
-          // and both edge rows, which move with the partition.
-          item: 3,
+          // `a` and the Unknown key's row; the tombstone; the `5n` event; the aggregate's root and
+          // both edge rows, which move with the partition.
+          item: 2,
           tombstone: 1,
           event: 1,
           aggregate: 3,
         })
         // `a`'s sentinel and the tombstone's.
         expect(report.sentinelsMoved).toBe(2)
-        expect(report.conflicts).toEqual(bothThrees(B("3"), N("3")))
+        expect(conflictsByKey(report.conflicts)).toEqual([
+          eUnreadable,
+          ...bothThrees(B("3"), N("3")),
+        ])
         expect(yield* keys).toEqual(
           [
             `$kin#v1#counters#id_a $kin#v1#counters#n_${N("5")} $kin#v1#counters#m_${N("7")}`,
             `$kin#v1#counters#id_b $kin#v1#counters#n_${N("6")} $kin#v1#counters#m_${N("8")}`,
             `$kin#v1#counters#id_c $kin#v1#counters#deleted#n_${N("9")}#<deleted at> `,
-            // Read back as the number it rounds to, and keyed by it.
-            `$kin#v1#counters#id_e $kin#v1#counters#n_1152921504606847000 $kin#v1#counters#m_${N("13")}`,
+            // No number holds it, so it stays as stored, its sentinel with it.
+            `$kin#v1#counters#id_e $kin#v1#counters#n_${B("1152921504606846977")} $kin#v1#counters#m_${N("13")}`,
             `$kin#v1#counters#id_f $kin#v1#counters#n_${B("3")} $kin#v1#counters#m_${B("12")}`,
             `$kin#v1#counters#id_f $kin#v1#counters#n_${N("3")} $kin#v1#counters#m_${N("11")}`,
             ...["7", "8", "10", "11", "13"].map(
@@ -176,7 +192,10 @@ export const scenarios: ReadonlyArray<Scenario> = [
         expect(again.moved).toEqual(ZERO)
         expect(again.sentinelsMoved).toBe(0)
         expect(again.skipped.unrecognizedKey).toBe(0)
-        expect(again.conflicts).toEqual(bothThrees(B("3"), N("3")))
+        expect(conflictsByKey(again.conflicts)).toEqual([
+          eUnreadable,
+          ...bothThrees(B("3"), N("3")),
+        ])
       }),
   },
   {

@@ -3725,12 +3725,16 @@ const makeImpl = <
 
   const compositeKeyForm = makeCompositeKeyForm(
     schemas.inputSchema as unknown as Schema.Top,
-    (attr, value) => {
+    (attr, value, reason) => {
       throw new Error(
-        `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to its ` +
-          `stored form. The attribute's schema carries an encoding transformation, so the ` +
-          `stored key holds the ENCODED value, but ${JSON.stringify(String(value))} encodes ` +
-          `under neither encode nor decode->encode. Supply a value of the attribute's own type.`,
+        reason !== undefined
+          ? `[EDD-9050] Composite "${attr}" on entity "${entityType}" has no key text: ` +
+              `${reason}, so a row storing it is one the field can't read.`
+          : `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to ` +
+              `its stored form. The attribute's schema carries an encoding transformation, so ` +
+              `the stored key holds the ENCODED value, but ${JSON.stringify(String(value))} ` +
+              `encodes under neither encode nor decode->encode. Supply a value of the ` +
+              `attribute's own type.`,
       )
     },
     // A record handed here can be a whole row read back (restore, a retain update, rekey): what
@@ -15072,6 +15076,27 @@ export const bind = <
         }
         const schemaRef = entityInternals._schema
         const entityTypeRef = entityInternals.entityType
+        // An orderBy value as its model field stores it, as `append` encodes
+        // it (`encodeForWrite`: encoded, else decoded and encoded) and as the
+        // key form reads it, so a bound names the key an event's row composes;
+        // a value neither takes, as given. Only a bound's key text: nothing is
+        // stored from it.
+        const encodeOrderBy = (() => {
+          const field =
+            orderBy === undefined
+              ? undefined
+              : getSchemaFields(entity.schemas.inputSchema as unknown as Schema.Top)?.[orderBy]
+          if (field === undefined) return (v: unknown) => v
+          const codec = field as unknown as Schema.Codec<unknown, unknown>
+          const encode = Schema.encodeUnknownOption(codec)
+          const decode = Schema.decodeUnknownOption(codec)
+          return (v: unknown): unknown => {
+            const direct = encode(v)
+            if (Option.isSome(direct)) return direct.value
+            const again = Option.flatMap(decode(v), (decoded) => encode(decoded))
+            return Option.isSome(again) ? again.value : v
+          }
+        })()
 
         // composeSkCondition: rewrite user's .where() values by prefixing
         // with `<currentSk>#e#` and applying serialisation, casing and
@@ -15093,13 +15118,25 @@ export const bind = <
             keyFormFor(entityInternals, key as globalThis.Record<string, unknown>),
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
-          // Key form first: the event SK is composed from the key form of the
-          // orderBy value (`Entity.append` composes from `serialisedInput`), so
-          // a transformed orderBy composite must take the same route here.
+          // Exactly as `Entity.append` composes the event's sort key: the value
+          // encoded as `appendInput` encodes it, put into key form from that,
+          // and the one of the two the setting keys on (`eventOrderByValue`).
+          // From the caller's value, a transformed orderBy (`Option(x)`, a
+          // `NumberFromString` with `escapeKeys` off) composed other text.
           const keyFormOf = (v: unknown) =>
-            orderBy === undefined ? v : keyFormFor(entityInternals, { [orderBy]: v })[orderBy]
-          const rewrite = (v: unknown) =>
-            `${prefix}${KeyComposer.keyValueText(schemaRef, keyFormOf(v), schemaRef.casing)}`
+            orderBy === undefined ? v : entity._keyForm({ [orderBy]: encodeOrderBy(v) })[orderBy]
+          const rewrite = (v: unknown) => {
+            if (orderBy === undefined) {
+              return `${prefix}${KeyComposer.keyValueText(schemaRef, v, schemaRef.casing)}`
+            }
+            const encoded = encodeOrderBy(v)
+            const value = KeyComposer.eventOrderByValue(
+              schemaRef,
+              encoded,
+              entity._keyForm({ [orderBy]: encoded })[orderBy],
+            )
+            return `${prefix}${KeyComposer.keyValueText(schemaRef, value, schemaRef.casing)}`
+          }
           // DynamoDB allows ONE sort key condition, and this one replaces the
           // history query's `begins_with(prefix)`. Every operator therefore
           // keeps both ends inside `prefix` — the `.where()` clamp of

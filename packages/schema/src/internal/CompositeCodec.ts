@@ -73,21 +73,26 @@ export type CompositeKeyForm = (attr: string, value: unknown) => unknown
  *
  * `onError` fires when the value of an attribute a key is composed from
  * reaches neither target form — refuse loudly rather than compose a key that
- * silently matches nothing. `reads` names those attributes, when the records
+ * silently matches nothing. `reason` says why, when it's a number its numeric
+ * kind can't hold exactly. `reads` names those attributes, when the records
  * normalised hold others too (a whole row read back from DynamoDB): any other
  * attribute's value is never key text, so one that reaches neither form is
  * left as it is. Without `reads`, every attribute is one.
  */
 export const makeCompositeKeyForm = (
   source: Schema.Top,
-  onError: (attr: string, value: unknown) => never,
+  onError: (attr: string, value: unknown, reason?: string) => never,
   options?: { readonly reads?: ((attr: string) => boolean) | undefined },
 ): CompositeKeyForm => {
   const fields = getSchemaFields(source)
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
   const reads = options?.reads
-  const refuse = (attr: string, value: unknown): unknown =>
-    reads === undefined || reads(attr) ? onError(attr, value) : value
+  const refuse = (attr: string, value: unknown, reason?: string): unknown =>
+    reads === undefined || reads(attr) ? onError(attr, value, reason) : value
+  /** `value` as `kind` holds it exactly, or refused (a row storing it is one `attr` can't read). */
+  const exactly = (attr: string, kind: NumericKind, value: number | bigint): unknown =>
+    exactIn(kind, value) ??
+    refuse(attr, value, `${String(value)} is a value no ${kind} holds exactly`)
 
   const resolve = (attr: string): ((value: unknown) => unknown) | null => {
     const cached = cache.get(attr)
@@ -117,10 +122,8 @@ export const makeCompositeKeyForm = (
       const wantsBigInt = SchemaAST.isBigInt(SchemaAST.toType(field.ast))
       const decode = Schema.decodeUnknownOption(codec)
       const fn = (value: unknown): unknown => {
-        if (typeof value === "bigint") return wantsBigInt ? value : Number(value)
-        if (typeof value === "number") {
-          if (!wantsBigInt) return value
-          return Number.isInteger(value) ? BigInt(value) : refuse(attr, value)
+        if (typeof value === "bigint" || typeof value === "number") {
+          return exactly(attr, wantsBigInt ? "bigint" : "number", value)
         }
         const decoded = decode(value)
         if (Option.isSome(decoded)) return decoded.value
@@ -137,18 +140,23 @@ export const makeCompositeKeyForm = (
     // other kind's width.
     // A union of kinds storing one numeric kind (`Union([String, BigInt])`) takes it the same way: a
     // stored `N` can only have been that kind. One storing both is left: its value alone can't say.
+    // A number the kind can't hold exactly is refused, never rounded: a row holding one is one its
+    // field can't read (`rekey` reports it, and its sentinels stay where they are).
     if (!hasEncodingTransformation(field)) {
-      const kind = keyFormValueKind(field)
-      const lift = kind === undefined ? liftToKind(storedNumericKinds(field)) : undefined
+      const declared = keyFormValueKind(field)
+      const kind =
+        declared === "bigint" || declared === "number"
+          ? declared
+          : declared === undefined
+            ? onlyNumericKind(storedNumericKinds(field))
+            : undefined
       const fn =
-        kind === "bigint"
-          ? (value: unknown): unknown =>
-              typeof value === "number" && Number.isInteger(value) ? BigInt(value) : value
-          : kind === "number"
-            ? (value: unknown): unknown => (typeof value === "bigint" ? Number(value) : value)
-            : lift !== undefined
-              ? (value: unknown): unknown => lift(value) ?? value
-              : null
+        kind === undefined
+          ? null
+          : (value: unknown): unknown =>
+              typeof value === "number" || typeof value === "bigint"
+                ? exactly(attr, kind, value)
+                : value
       cache.set(attr, fn)
       return fn
     }
@@ -293,8 +301,32 @@ const liftToKind = (kinds: ReadonlySet<NumericKind>): ((value: unknown) => unkno
     return (value) =>
       typeof value === "number" && Number.isSafeInteger(value) ? BigInt(value) : undefined
   }
-  return (value) => (typeof value === "bigint" ? Number(value) : undefined)
+  return (value) =>
+    typeof value === "bigint" && Number.isSafeInteger(Number(value)) ? Number(value) : undefined
 }
+
+/** The one numeric kind of `kinds`, when there's one. */
+const onlyNumericKind = (kinds: ReadonlySet<NumericKind>): NumericKind | undefined =>
+  kinds.size === 1 ? [...kinds][0] : undefined
+
+/**
+ * `value` as `kind` holds it, exactly: a bigint as a number only within the safe range (a number
+ * can't be written past it, and DynamoDB hands one back as a bigint there), a number as a bigint
+ * only when it's an integer. `undefined` when `kind` can't hold it: a row storing that value is one
+ * a field of that kind can't read.
+ */
+const exactIn = (kind: NumericKind, value: number | bigint): number | bigint | undefined =>
+  kind === "bigint"
+    ? typeof value === "bigint"
+      ? value
+      : Number.isInteger(value)
+        ? BigInt(value)
+        : undefined
+    : typeof value === "number"
+      ? value
+      : Number.isSafeInteger(Number(value))
+        ? Number(value)
+        : undefined
 
 /** A JavaScript numeric kind a stored `N` may have been written from. */
 export type NumericKind = "number" | "bigint"
@@ -540,23 +572,31 @@ export const readsBackOtherwise = (
       typeof written.value !== "function" &&
       (Option.isNone(read) || !sameKeyValue(read.value, written.value))
     if (!textMoved && !valueMoved) return undefined
-    if (Option.isNone(read)) return "a value the field refuses"
-    const was = Option.isSome(written) ? written.value : stored
-    if (typeof read.value !== typeof was) {
-      return typeof read.value === "bigint"
-        ? "a bigint"
-        : typeof read.value === "number"
-          ? "a number"
-          : "something else"
-    }
-    return typeof read.value === "bigint"
-      ? `${read.value}n`
-      : typeof read.value === "number" || typeof read.value === "boolean"
-        ? String(read.value)
-        : typeof read.value === "string"
-          ? JSON.stringify(read.value)
-          : "something else"
+    return readBackAs(read, Option.isSome(written) ? written.value : stored)
   }
+}
+
+/**
+ * What a value reads back as, in the words of {@link readsBackOtherwise}: `"a value the field
+ * refuses"` when the read fails, `"a number"` or `"a bigint"` for one of another kind than `was`, the
+ * value written, and otherwise the value read back.
+ */
+export const readBackAs = (read: Option.Option<unknown>, was: unknown): string => {
+  if (Option.isNone(read)) return "a value the field refuses"
+  if (typeof read.value !== typeof was) {
+    return typeof read.value === "bigint"
+      ? "a bigint"
+      : typeof read.value === "number"
+        ? "a number"
+        : "something else"
+  }
+  return typeof read.value === "bigint"
+    ? `${read.value}n`
+    : typeof read.value === "number" || typeof read.value === "boolean"
+      ? String(read.value)
+      : typeof read.value === "string"
+        ? JSON.stringify(read.value)
+        : "something else"
 }
 
 /**

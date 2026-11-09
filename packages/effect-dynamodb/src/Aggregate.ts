@@ -39,6 +39,8 @@ import {
   kindReadingOf,
   kindTargets,
   makeCompositeKeyForm,
+  readBackAs,
+  readBackUnsure,
   readsBackOtherwise,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -1595,6 +1597,40 @@ const makeAggregate = <TSchema extends Schema.Top>(
       Effect.as(unpackAggregateItems(read.allItems, dispatchByType, aggregateName), read),
     )
 
+  // A root row's partition key composites as a read takes them: decoded through their fields, as
+  // assembly decodes the root row. `create` composes the key from the value it holds, so a key
+  // composed again from a stored row (`list`, `rekey`) is composed from these, never from the
+  // stored form: a transformation that isn't its own inverse on the other side (a value stored
+  // divided by ten, an `Option` holding one) keys the stored form elsewhere.
+  const decodeRootKey = (() => {
+    const fields: Record<string, Schema.Top> = {}
+    for (const attr of config.pk.composite) {
+      const field = schemaFields?.[attr]
+      if (field !== undefined) fields[attr] = field
+    }
+    return Schema.decodeUnknownOption(
+      substituteSchemaDeep(Schema.Struct(fields), {
+        tolerantTransforms: true,
+        decodeOnly: true,
+        resolveRef,
+        absentReads: true,
+      }) as unknown as Schema.Codec<Record<string, unknown>>,
+    )
+  })()
+  /**
+   * `row` (a stored root row) with its partition key composites as a read takes them. A row whose
+   * composites a read can't take is left as it is: its key composes as the stored form does, and its
+   * read fails as assembly's does.
+   */
+  const rootKeyAsRead = (row: Record<string, unknown>): Record<string, unknown> => {
+    const composites: Record<string, unknown> = {}
+    for (const attr of config.pk.composite) {
+      if (attr in row) composites[attr] = row[attr]
+    }
+    const read = decodeRootKey(composites)
+    return Option.isSome(read) ? { ...row, ...read.value } : row
+  }
+
   /** The collection partition key `record`'s values compose under `under`. */
   const collectionPkUnder = (
     under: DynamoSchemaModule.DynamoSchema,
@@ -1691,7 +1727,73 @@ const makeAggregate = <TSchema extends Schema.Top>(
     type Check = {
       readonly path: string
       readonly into: string
-      readonly readsOther: (value: unknown) => string | undefined
+      /** The value the refusal names and what it reads back as, `undefined` when it reads back. */
+      readonly judge: (item: DecomposedItem) => { held: unknown; readsAs: string } | undefined
+    }
+    // A composite judged by the value at its path alone.
+    const leafJudge =
+      (path: string, readsOther: (value: unknown) => string | undefined) =>
+      (item: DecomposedItem) => {
+        const held = readCompositePath(item.attributes, path)
+        const readsAs = held == null ? undefined : readsOther(held)
+        return readsAs === undefined ? undefined : { held, readsAs }
+      }
+    // A dotted composite of an edge's sort key (`nested.n`), judged through the field holding it:
+    // the text written against the text composed again from the row as a read takes it, its field
+    // decoded as assembly decodes it and its key read off the result as `decompose` reads it. A
+    // transformation of what holds the value (a struct decoded to another) is a read's too, so the
+    // value at the path alone isn't what a key read back is composed from.
+    const throughFieldJudge = (
+      fields: Record<string, Schema.Top>,
+      path: string,
+      slot: number,
+      slots: number,
+      keyEncoders: AttrEncoders | undefined,
+    ) => {
+      const top = path.slice(0, path.indexOf("."))
+      const decode = Schema.decodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [top]: fields[top]! }), {
+          tolerantTransforms: true,
+          decodeOnly: true,
+          resolveRef,
+          absentReads: true,
+        }) as unknown as Schema.Codec<any>,
+      )
+      const keyEncoder = keyEncoders?.[top]
+      // The value at the path of a top-level value decoded, as `decompose` reads a key off it.
+      const leafOf = (value: unknown): Option.Option<unknown> =>
+        Option.map(decode({ [top]: value }), (decoded) => {
+          const held = (decoded as Record<string, unknown>)[top]
+          return readCompositePath(
+            { [top]: keyEncoder === undefined ? held : keyEncoder(held) },
+            path,
+          )
+        })
+      return (item: DecomposedItem) => {
+        const stored = item.attributes[top]
+        if (stored == null) return undefined
+        let returned: unknown
+        try {
+          returned = asRead(stored)
+        } catch {
+          // A value the marshaller refuses is the write's own marshalling's to report.
+          return undefined
+        }
+        const written = item.skComposites[item.skComposites.length - slots + slot]
+        const read = Option.filter(leafOf(returned), (leaf) => leaf != null)
+        if (
+          Option.isSome(read) &&
+          isScalarComposite(read.value) &&
+          KeyComposer.keyValueText(config.schema, read.value, config.schema.casing) === written
+        ) {
+          return undefined
+        }
+        const was = Option.getOrUndefined(leafOf(stored))
+        return {
+          held: was ?? readCompositePath(item.attributes, path),
+          readsAs: readBackAs(read, was),
+        }
+      }
     }
     // The text the root's key composes from a composite's value, written and read back alike: the
     // key form takes a value read back as its field reads it.
@@ -1718,8 +1820,36 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 asRead,
                 texts: root ? [{ written: text, read: text }] : [],
               })
-        return readsOther === undefined ? [] : [{ path, into, readsOther }]
+        return readsOther === undefined ? [] : [{ path, into, judge: leafJudge(path, readsOther) }]
       })
+    // An edge's sort key: a dotted composite is judged through the field holding it when that field's
+    // read-back can't be guaranteed at load, and any other composite by its value.
+    const edgeChecksOf = (node: ResolvedNode, composites: ReadonlyArray<string>) => {
+      const into = `edge "${node.fieldName}"'s sort key`
+      const fields = node.ownFields
+      return composites.flatMap((path, slot): ReadonlyArray<Check> => {
+        const top = fields?.[path.slice(0, path.indexOf("."))]
+        const leaf = fieldAtPath(fields, path)
+        return fields !== undefined &&
+          top !== undefined &&
+          path.includes(".") &&
+          (readBackUnsure(top) || (leaf !== undefined && readBackUnsure(leaf)))
+          ? [
+              {
+                path,
+                into,
+                judge: throughFieldJudge(
+                  fields,
+                  path,
+                  slot,
+                  composites.length,
+                  node.keyAttrEncoders,
+                ),
+              },
+            ]
+          : checksOf(fields, into, [path])
+      })
+    }
     const byType = new Map<string, ReadonlyArray<Check>>()
     const add = (entityType: string, checks: ReadonlyArray<Check>) => {
       if (checks.length > 0) byType.set(entityType, [...(byType.get(entityType) ?? []), ...checks])
@@ -1741,10 +1871,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     ])
     const walk = (node: ResolvedNode): void => {
       if (node.cardinality === "many" && node.skComposite !== undefined) {
-        add(
-          node.entityType,
-          checksOf(node.ownFields, `edge "${node.fieldName}"'s sort key`, node.skComposite),
-        )
+        add(node.entityType, edgeChecksOf(node, node.skComposite))
       }
       for (const child of node.children) walk(child)
     }
@@ -1764,18 +1891,17 @@ const makeAggregate = <TSchema extends Schema.Top>(
     if (otherKindKeys.size === 0) return Effect.void
     for (const group of groups) {
       for (const item of group.items) {
-        for (const { path, into, readsOther } of otherKindKeys.get(item.entityType) ?? []) {
-          const held = readCompositePath(item.attributes, path)
-          const readsAs = held == null ? undefined : readsOther(held)
-          if (readsAs === undefined) continue
+        for (const { path, into, judge } of otherKindKeys.get(item.entityType) ?? []) {
+          const refused = judge(item)
+          if (refused === undefined) continue
           return Effect.fail(
             new ValidationError({
               entityType: aggregateName,
               operation,
               cause: readBackRefusal(
                 `Field "${path}" of "${item.member}" is composed into ${into}`,
-                held,
-                readsAs,
+                refused.held,
+                refused.readsAs,
               ),
             }),
           )
@@ -2539,7 +2665,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
    */
   const staleRootAt = (tableName: string, pk: string) =>
     Effect.map(rootItemAt(tableName, pk), ({ Item }) =>
-      Item === undefined || partitionUnder(config.schema, fromAttributeMap(Item)) === pk
+      Item === undefined ||
+      partitionUnder(config.schema, rootKeyAsRead(fromAttributeMap(Item))) === pk
         ? undefined
         : Item,
     )
@@ -2621,7 +2748,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (row.sk?.S !== rekeyRootSk || row.__edd_e__?.S !== config.root.entityType) {
         return yield* rekeyRowBelowRoot(row, pk, ctx)
       }
-      const key = fromAttributeMap(row) as Record<string, unknown>
+      const key = rootKeyAsRead(fromAttributeMap(row) as Record<string, unknown>)
       const current = partitionUnder(config.schema, key)
       // Under none of the keys its values have had: nothing here can place it.
       if (current === undefined || !holdsPartition(row, key, pk)) {
@@ -3060,10 +3187,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // Extract PK composite values from each root item and assemble
           const aggregates: Array<Schema.Schema.Type<TSchema>> = []
           for (const rootItem of rootItems) {
-            const key: Record<string, unknown> = {}
+            const stored: Record<string, unknown> = {}
             for (const composite of config.pk.composite) {
-              key[composite] = rootItem[composite]
+              stored[composite] = rootItem[composite]
             }
+            // The key the root's values compose as a read takes them, as `create` composed it.
+            const key = rootKeyAsRead(stored)
             const assembled = yield* Effect.gen(function* () {
               const { allItems } = yield* fetchPartition(key, "list")
               if (allItems.length === 0) return undefined

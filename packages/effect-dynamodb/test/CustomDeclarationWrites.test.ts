@@ -416,8 +416,9 @@ describe("a new write path can't go unnoticed", () => {
   const ENCODES: Readonly<Record<string, readonly [number, string]>> = {
     "Aggregate.ts": [4, "attribute encoders, feeding rows `refuseNotReadBack` reads"],
     "Entity.ts": [
-      7,
-      "`encodeOrDecodeEncode` (2), two probes that store nothing, a key (2), a ref's stored row",
+      8,
+      "`encodeOrDecodeEncode` (2), two probes that store nothing, a key (2), a ref's stored row, " +
+        "a history bound's key text",
     ],
     "EventStore.ts": [2, "`encodeToWire`, which checks"],
     "StorageEncoding.ts": [4, "a public helper: what's done with its value is the caller's"],
