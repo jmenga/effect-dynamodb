@@ -10,8 +10,11 @@ import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Cause, Effect, Exit, Schema } from "effect"
 import { describe, expect } from "vitest"
+import * as Aggregate from "../src/Aggregate.js"
+import * as Collection from "../src/Collection.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
@@ -104,6 +107,101 @@ describe("a query operand its composite's kind can't hold exactly fails, sending
       it.effect(`${name}, escapeKeys ${escapeKeys}: an index's partition key composite`, () =>
         run((e) => e.byKey({ n: inexact })),
       )
+    }
+  }
+})
+
+describe("a standalone collection's query and selectors fail on an inexact operand, sending nothing", () => {
+  for (const { name, Kind, inexact, kind } of kinds) {
+    for (const escapeKeys of [false, true]) {
+      const run = (query: (c: any) => Query.Query<unknown>) => {
+        const schema = DynamoSchema.make({ name: "inexactc", version: 1, escapeKeys })
+        const E = Entity.make({
+          model: Schema.Struct({ id: Schema.String, n: Kind }),
+          entityType: "E",
+          primaryKey: {
+            pk: { field: "pk", composite: ["id"] },
+            sk: { field: "sk", composite: [] },
+          },
+          indexes: {
+            byN: {
+              name: "gsi1",
+              collection: "Together",
+              pk: { field: "gsi1pk", composite: ["n"] },
+              sk: { field: "gsi1sk", composite: [] },
+            },
+          },
+        } as never) as any
+        const Main = Table.make({ schema, entities: { E } } as never) as any
+        const Together = Collection.make("Together", { E } as never) as any
+        const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+        return Effect.gen(function* () {
+          yield* DynamoClient.make({ entities: { E }, tables: { Main } } as never) as Effect.Effect<
+            any,
+            never,
+            any
+          >
+          const exit = yield* Effect.exit(Effect.suspend(() => Query.collect(query(Together))))
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) {
+            expect(exit.cause.reasons[0]!._tag).toBe("Fail")
+            const error = Cause.squash(exit.cause) as any
+            expect(error._tag).toBe("ValidationError")
+            expect(String(error.cause?.message)).toContain(`is a value no ${kind} holds exactly`)
+          }
+          expect(table.requests).toEqual([])
+        }).pipe(
+          Effect.provide(Main.layer({ name: "t" })),
+          Effect.provide(table.layer),
+        ) as Effect.Effect<void, unknown>
+      }
+      it.effect(`${name}, escapeKeys ${escapeKeys}: query`, () =>
+        run((c) => c.query({ n: inexact })),
+      )
+      it.effect(`${name}, escapeKeys ${escapeKeys}: a member's selector`, () =>
+        run((c) => c.E({ n: inexact })),
+      )
+    }
+  }
+})
+
+describe("an aggregate's delete reports an inexact key as it reports any key it can't compose", () => {
+  // `delete`'s errors have no `ValidationError`: a key it can't compose is an
+  // `AggregateAssemblyError`, and nothing is sent.
+  for (const { name, Kind, inexact } of kinds) {
+    for (const escapeKeys of [false, true]) {
+      it.effect(`${name}, escapeKeys ${escapeKeys}`, () => {
+        const schema = DynamoSchema.make({ name: "inexacta", version: 1, escapeKeys })
+        const Main = Table.make({ schema, entities: {} } as never) as any
+        const A = (Aggregate.make as any)(Schema.Struct({ n: Kind, note: Schema.String }), {
+          table: Main,
+          schema,
+          pk: { field: "pk", composite: ["n"] },
+          collection: { name: "roots" },
+          root: { entityType: "Root" },
+          edges: {},
+        })
+        const table = makeRecordingTable()
+        return Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: {},
+            aggregates: { A },
+            tables: { Main },
+          } as never) as Effect.Effect<any, never, any>
+          const exit = yield* Effect.exit(db.aggregates.A.delete({ n: inexact }))
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) {
+            expect(exit.cause.reasons[0]!._tag).toBe("Fail")
+            const error = Cause.squash(exit.cause) as any
+            expect(error._tag).toBe("AggregateAssemblyError")
+            expect(String(error.reason)).toContain("EDD-9050")
+          }
+          expect(table.requests).toEqual([])
+        }).pipe(
+          Effect.provide(Main.layer({ name: "t" })),
+          Effect.provide(table.layer),
+        ) as Effect.Effect<void, unknown>
+      })
     }
   }
 })
