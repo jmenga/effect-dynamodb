@@ -144,9 +144,17 @@ describe("key-form invariant — Entity.ts normaliser shape", () => {
 
   it("no call site reaches for the raw composite codec directly", () => {
     // `makeCompositeKeyForm` / `toCompositeKeyRecord` are plumbing for the two
-    // normalisers above; using them anywhere else re-opens the bypass.
-    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBeLessThanOrEqual(2)
-    expect(src.match(/toCompositeKeyRecord\(/g)?.length ?? 0).toBeLessThanOrEqual(2)
+    // normalisers above, and for `keyForm139`, the key form 1.39.0 composed,
+    // which only `rekey` composes; using them anywhere else re-opens the bypass.
+    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBeLessThanOrEqual(3)
+    expect(src.match(/toCompositeKeyRecord\(/g)?.length ?? 0).toBeLessThanOrEqual(3)
+    expect(src.match(/\{ text139: true \}/g)?.length ?? 0).toBe(1)
+  })
+
+  it("only rekey composes 1.39.0's key form, to find the rows it stored", () => {
+    expect(src.match(/keyForm139\(/g)?.length ?? 0).toBe(1)
+    const rowKeyForms = src.slice(src.indexOf("const rowKeyForms = ("))
+    expect(rowKeyForms.slice(0, rowKeyForms.indexOf("\n  }\n"))).toMatch(/keyForm139\(/)
   })
 })
 
@@ -186,23 +194,20 @@ describe("key-form invariant — a caller's values compose the key put wrote", (
     expect(body.slice(0, body.indexOf("\n}\n"))).toMatch(/_domainKeyForm\(/)
   })
 
-  it("a projection reads and tombstones its row at the key the read model's put wrote", () => {
+  it("a projection keys its row, tombstone and outbox items as the read model's put keys the row", () => {
     const ops = read("../src/internal/TransactableOps.ts")
-    const body = ops.slice(ops.indexOf("export const composeDomainPrimaryKey"))
+    const body = ops.slice(ops.indexOf("export const composePrimaryKey ="))
     expect(body.slice(0, body.indexOf("\n\n"))).toMatch(/_domainKeyForm\(/)
     const src = read("../src/internal/ProjectionEngine.ts")
-    const readRow = src.slice(src.indexOf("const readRow = "))
-    expect(readRow.slice(0, readRow.indexOf("\n    })\n"))).toMatch(/composeDomainPrimaryKey\(/)
-    const writeRow = src.slice(src.indexOf("const writeRow = "))
-    expect(writeRow.slice(0, writeRow.indexOf("const condition"))).toMatch(
-      /const rowKey = composeDomainPrimaryKey\(/,
-    )
-    expect(writeRow).toMatch(/const mark = readModel\._domainKeyTextMark\(/)
+    expect(src).not.toMatch(/_keyForm\(/)
+    const entity = read("../src/Entity.ts")
+    const mark = entity.slice(entity.indexOf("    _keyTextMark: ("))
+    expect(mark.slice(0, mark.indexOf("\n    ),\n"))).toMatch(/domainKeyForm\(key\)/)
   })
 
-  it("the entity's query builders compose a caller's key once", () => {
+  it("the entity's query builders compose a caller's key through the domain key form", () => {
     const src = read("../src/Entity.ts")
-    expect(src).not.toMatch(/keyForm\(encodeKeySync\(/)
     expect(src).not.toMatch(/keyFormFor\(entityInternals, key/)
+    expect(src).toMatch(/entity\._domainKeyForm\(\{ \[orderBy\]: v \}\)/)
   })
 })

@@ -133,7 +133,6 @@ import {
   keyFormValueKindOf,
   makeCompositeDomainKeyForm,
   makeCompositeKeyForm,
-  makeCompositeStoredKeyForm,
   refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
@@ -478,17 +477,13 @@ const BOUND_OPERATORS: ReadonlySet<string> = new Set(["eq", "between", "gt", "gt
  * stored attribute — for a ref-derived `${ref}Id`, the referenced identifier
  * inside the stored ref, which is the value the key was composed from —
  * through the accessor's encoder for a numeric field stored as a string, so a
- * stored `"950000"` reads as `950000`, and through `rowKeyForm` for a field
- * whose codec `encode` takes its own output, which `put` composed encoded
- * once more. `undefined` when the row lacks it.
+ * stored `"950000"` reads as `950000`. `undefined` when the row lacks it.
  */
 const storedKeyForm = (
   args: {
     readonly entityLike: EntityLike
     readonly encoderSource: Schema.Top
     readonly compositeKeyForm: CompositeKeyForm
-    /** The key form of a stored value (`makeCompositeStoredKeyForm`). */
-    readonly rowKeyForm: CompositeKeyForm
   },
   field: string,
 ): {
@@ -508,10 +503,9 @@ const storedKeyForm = (
       if (value === undefined) return undefined
       const stored = value.S ?? value.N
       if (typeNumeric && stored !== undefined) return args.compositeKeyForm(field, stored)
-      if (value.S !== undefined) return args.rowKeyForm(field, value.S)
-      if (value.N !== undefined)
-        return args.rowKeyForm(field, wantsBigInt ? BigInt(value.N) : Number(value.N))
-      if (value.BOOL !== undefined) return args.rowKeyForm(field, value.BOOL)
+      if (value.S !== undefined) return value.S
+      if (value.N !== undefined) return wantsBigInt ? BigInt(value.N) : Number(value.N)
+      if (value.BOOL !== undefined) return value.BOOL
       return undefined
     },
   }
@@ -576,7 +570,6 @@ const planCompositeWithin = <A>(args: {
   readonly compositeKeyForm: CompositeKeyForm
   /** A bound's key form: the key form of the value `put` stores for it. */
   readonly domainKeyForm: CompositeKeyForm
-  readonly rowKeyForm: CompositeKeyForm
   /** The accessor's composites, in key form. */
   readonly pinnedKeyForm: Record<string, unknown>
   readonly pkValue: string
@@ -1015,14 +1008,13 @@ const planZOrderWithin = <A>(args: {
   readonly compositeKeyForm: CompositeKeyForm
   /** A bound's key form: the key form of the value `put` stores for it. */
   readonly domainKeyForm: CompositeKeyForm
-  readonly rowKeyForm: CompositeKeyForm
   readonly pkValue: string
   readonly plans: ZOrderPlans
   readonly query: Query.Query<A>
   readonly bounds: Record<string, unknown>
   readonly options: WithinOptions | undefined
 }): Query.Query<A> => {
-  const { entityLike, accessor, indexDef, compositeKeyForm, domainKeyForm } = args
+  const { entityLike, accessor, indexDef, domainKeyForm } = args
   const refuse = (why: string): never => {
     throw new Error(
       `[EDD-9093] .within() on index "${accessor}" of entity "${entityLike.entityType}": ${why}`,
@@ -1039,18 +1031,9 @@ const planZOrderWithin = <A>(args: {
   const dimensions = layout.dimensions
   const named = [...prefix.map((part) => part.field), ...dimensions.map((dim) => dim.field)]
   const fields = getSchemaFields(args.encoderSource)
-  /**
-   * `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type.
-   * `form` is the domain key form for what the key holds (a prefix segment, a dimension's level),
-   * and the key form for what the item's attribute holds (a dimension's filter). The two differ
-   * only for a codec whose `encode` takes its own output, which `put` encodes twice in the key.
-   */
-  const keyForm = (
-    field: string,
-    value: unknown,
-    form: CompositeKeyForm = compositeKeyForm,
-  ): unknown => {
-    const converted = form(field, value)
+  /** `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type. */
+  const keyForm = (field: string, value: unknown): unknown => {
+    const converted = domainKeyForm(field, value)
     const schema = fields?.[field]
     const expected = schema === undefined ? undefined : keyFormValueKind(schema)
     if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
@@ -1066,12 +1049,7 @@ const planZOrderWithin = <A>(args: {
   const prefixValues = new Map<string, unknown>()
   const bounded = new Map<
     string,
-    {
-      readonly raw: Record<string, unknown>
-      readonly keyForm: Record<string, unknown>
-      /** The bound in the domain key form: the levels the key holds. */
-      readonly address: Record<string, unknown>
-    }
+    { readonly raw: Record<string, unknown>; readonly keyForm: Record<string, unknown> }
   >()
   for (const [field, raw] of Object.entries(args.bounds)) {
     if (raw === undefined) continue
@@ -1084,7 +1062,7 @@ const planZOrderWithin = <A>(args: {
           `"${field}" is a prefix composite: it takes one exact value, not a range bound.`,
         )
       }
-      prefixValues.set(field, keyForm(field, raw, domainKeyForm))
+      prefixValues.set(field, keyForm(field, raw))
       continue
     }
     const dimension = dimensions.find((dim) => dim.field === field)
@@ -1120,21 +1098,14 @@ const planZOrderWithin = <A>(args: {
         `"in" bounds only a literals dimension, and "${field}" is ${dimension.spec.kind}.`,
       )
     }
-    const convert = (form: CompositeKeyForm) => {
-      const converted: Record<string, unknown> = {}
-      for (const key of operators) {
-        converted[key] =
-          key === "between" || key === "in"
-            ? (shape![key] as ReadonlyArray<unknown>).map((value) => keyForm(field, value, form))
-            : keyForm(field, shape![key], form)
-      }
-      return converted
+    const converted: Record<string, unknown> = {}
+    for (const key of operators) {
+      converted[key] =
+        key === "between" || key === "in"
+          ? (shape![key] as ReadonlyArray<unknown>).map((value) => keyForm(field, value))
+          : keyForm(field, shape![key])
     }
-    bounded.set(field, {
-      raw: shape!,
-      keyForm: convert(compositeKeyForm),
-      address: convert(domainKeyForm),
-    })
+    bounded.set(field, { raw: shape!, keyForm: converted })
   }
   if (prefixValues.size === 0 && bounded.size === 0) return args.query
 
@@ -1181,9 +1152,9 @@ const planZOrderWithin = <A>(args: {
    * none — inverted only once converted.
    */
   const quantizable = (dimension: ZOrderCurve.BoundDimension): ZOrderCurve.DimensionBound => {
-    const address = bounded.get(dimension.field)!.address as ZOrderCurve.DimensionBound
+    const keyForm = bounded.get(dimension.field)!.keyForm as ZOrderCurve.DimensionBound
     const storage = dimension.storage
-    if (storage._tag !== "Epoch" || storage.unit !== "epochSeconds") return address
+    if (storage._tag !== "Epoch" || storage.unit !== "epochSeconds") return keyForm
     const { lower, upper } = storedEnds(dimension, true)
     return {
       ...(lower === undefined ? {} : { gte: lower.strict ? lower.value + 1 : lower.value }),
@@ -1232,7 +1203,7 @@ const planZOrderWithin = <A>(args: {
     const selected = new Map(
       dimensions
         .filter((dim) => dim.spec.kind === "literals" && bounded.has(dim.field))
-        .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.address)]),
+        .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.keyForm)]),
     )
     const none = [...selected.values()].some((members) => members.length === 0)
     return { box: none ? ("empty" as const) : quantized, selections: selected }
@@ -2677,7 +2648,6 @@ const makeFromConfig = (config: {
       // The caller's composites and bounds are DOMAIN values: the key `put` wrote for one is
       // the key form of the value it stores (`Entity._domainKeyForm`).
       const domainKeyForm = makeCompositeDomainKeyForm(encoderSource, unencodable)
-      const rowKeyForm = makeCompositeStoredKeyForm(encoderSource)
 
       // A Z-order sort key (#171) is a binary address: its prefix composites
       // and dimensions are bounded with `.within()`, never pinned by the
@@ -2919,7 +2889,6 @@ const makeFromConfig = (config: {
                     encoderSource,
                     compositeKeyForm,
                     domainKeyForm,
-                    rowKeyForm,
                     pkValue,
                     plans: zorderPlans!,
                     query: q,
@@ -2936,7 +2905,6 @@ const makeFromConfig = (config: {
                     encoderSource,
                     compositeKeyForm,
                     domainKeyForm,
-                    rowKeyForm,
                     pinnedKeyForm: compositesKeyForm,
                     pkValue,
                     query: q,

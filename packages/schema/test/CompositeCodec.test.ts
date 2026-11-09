@@ -16,6 +16,7 @@ import {
   keyFormValueKind,
   kindReadingOf,
   kindTargets,
+  makeCompositeDomainKeyForm,
   makeCompositeKeyForm,
   otherNumericKind,
   readBackUnsure,
@@ -802,5 +803,103 @@ describe("CompositeCodec", () => {
       const encodeAny = makeCompositeKeyForm(Schema.String, refuse)
       expect(encodeAny("whatever", 1)).toBe(1)
     })
+  })
+})
+
+/**
+ * A codec whose `encode` takes its own output: its stored text is a value `encode` accepts, so
+ * `encode` alone can't tell a stored text from a domain value. Up to 1.39.0 the key form encoded a
+ * stored text once more, so `put` keyed `"MiX"` (stored `"x:MiX"`) `x:x:mix`. The key form now keys
+ * a stored text as it is; the domain key form encodes a caller's value once first; `text139` keeps
+ * 1.39.0's text for `rekey`.
+ */
+describe("CompositeCodec — a codec whose encode takes its own output", () => {
+  const Prefixed = Schema.String.pipe(
+    Schema.decodeTo(Schema.String, {
+      decode: SchemaGetter.transform((s: string) => s.slice(2)),
+      encode: SchemaGetter.transform((s: string) => `x:${s}`),
+    }),
+  )
+  const Cents = Schema.Number.pipe(
+    Schema.decodeTo(Schema.Number, {
+      decode: SchemaGetter.transform((n: number) => n / 100),
+      encode: SchemaGetter.transform((n: number) => n * 100),
+    }),
+  )
+  const Codecs = Schema.Struct({
+    prefixed: Prefixed,
+    base64: Schema.StringFromBase64,
+    base64Url: Schema.StringFromBase64Url,
+    hex: Schema.StringFromHex,
+    uri: Schema.StringFromUriComponent,
+    cents: Cents,
+  })
+  const keyForm = makeCompositeKeyForm(Codecs, refuse)
+  const keyForm139 = makeCompositeKeyForm(Codecs, refuse, { text139: true })
+  const domainKeyForm = makeCompositeDomainKeyForm(Codecs, refuse)
+  const storedOf = (attr: keyof typeof Codecs.fields, value: unknown) =>
+    Schema.encodeUnknownSync(Codecs.fields[attr] as unknown as Schema.Codec<unknown, unknown>)(
+      value,
+    )
+
+  /** Each codec: a domain value, the text `put` stores for it, and that text encoded once more. */
+  const cases = [
+    ["prefixed", "MiX", "x:MiX", "x:x:MiX"],
+    ["base64", "MiX b", "TWlYIGI=", "VFdsWUlHST0="],
+    ["base64Url", "MiX b", "TWlYIGI", "VFdsWUlHSQ"],
+    ["hex", "MiX b", "4d69582062", "34643639353832303632"],
+    ["uri", "MiX b", "MiX%20b", "MiX%2520b"],
+    ["cents", 5, 500, 50000],
+  ] as const
+
+  it.each(cases)("%s: a stored text is keyed as it is", (attr, domain, stored) => {
+    expect(storedOf(attr, domain)).toEqual(stored)
+    expect(keyForm(attr, stored)).toEqual(stored)
+  })
+
+  it.each(cases)("%s: a caller's value is encoded once, to put's key", (attr, domain, stored) => {
+    expect(domainKeyForm(attr, domain)).toEqual(stored)
+  })
+
+  it.each(cases)("%s: text139 composes the text 1.39.0 keyed", (attr, _domain, stored, then) => {
+    expect(keyForm139(attr, stored)).toEqual(then)
+    // A caller's value, as 1.39.0's key form took it, was encoded once: what the domain form gives.
+    expect(keyForm139(attr, _domain)).toEqual(stored)
+  })
+
+  it.each(cases)("%s: the key form of a key form is itself", (attr, domain, stored) => {
+    expect(keyForm(attr, keyForm(attr, stored))).toEqual(stored)
+    expect(keyForm(attr, domainKeyForm(attr, domain))).toEqual(stored)
+  })
+
+  it("a domain value that is also a stored text is encoded by the domain key form", () => {
+    // "x:MiX" as a caller's value is stored "x:x:MiX"; as a stored text it is "MiX"'s.
+    expect(domainKeyForm("prefixed", "x:MiX")).toBe("x:x:MiX")
+    expect(keyForm("prefixed", "x:MiX")).toBe("x:MiX")
+    // "QUJD" is base64 for "ABC", and a string a caller may store.
+    expect(domainKeyForm("base64", "QUJD")).toBe(storedOf("base64", "QUJD"))
+  })
+
+  it("every other codec keys exactly what 1.39.0 keyed", () => {
+    const now = makeCompositeKeyForm(Model, refuse)
+    const then = makeCompositeKeyForm(Model, refuse, { text139: true })
+    const values: ReadonlyArray<readonly [string, unknown]> = [
+      ["id", "abc"],
+      ["status", "active"],
+      ["seq", 42],
+      ["ok", true],
+      ["at", new Date("2024-01-15T10:30:00.000Z")],
+      ["at", "2024-01-15T10:30:00.000Z"],
+      ["utc", DateTime.makeUnsafe("2024-01-15T10:30:00.000Z")],
+      ["utc", "2024-01-15T10:30:00.000Z"],
+      ["txn", 420n],
+      ["txn", "420"],
+      ["epoch", DateTime.makeUnsafe(1705314600000)],
+      ["epoch", 1705314600000],
+      ["teamId", "t-1"],
+    ]
+    for (const [attr, value] of values) {
+      expect(serializeValue(now(attr, value))).toBe(serializeValue(then(attr, value)))
+    }
   })
 })

@@ -3,20 +3,28 @@
  * the entity's own `get` and `delete` compose (`TransactableOps.composePrimaryKeyOrFail`, through
  * `Entity._domainKeyForm`).
  *
- * `put` encodes its input (`inputSchema`), then applies the composite key form, which encodes a
- * transformed composite again when its `encode` takes its own output: a codec prepending `x:` stores
- * `"MiX"` under the key text `x:x:mix`. The standalone `get` and `delete` do the same (`encodeKey`,
- * then the key form). Up to 1.39.0 `Batch.get`, `Batch.write` deletes, `transactGet`, and
- * `transactWrite` deletes and condition checks applied the key form alone, so they composed
- * `x:mix` and found, deleted and checked nothing. A codec inside a wrapper (`Schema.optional`, a
- * union) is keyed by `put` as its stored text, which the key form takes as it comes (`itemid_5`);
- * those paths keyed the caller's domain value (`itemid_0000000000000005`). For every other key, the
- * key is what 1.39.0 composed, byte for byte.
+ * A codec whose `encode` takes its own output (prepending `x:`) is keyed by its stored text, once:
+ * `"MiX"`, stored `"x:MiX"`, is at `docid_x:mix`. Up to 1.39.0 `put`, `get` and `delete` encoded that
+ * text once more (`x:x:mix`), and `Batch.get`, `Batch.write` deletes, `transactGet`, and
+ * `transactWrite` deletes and condition checks keyed the caller's value encoded once, so they
+ * found, deleted and checked nothing. A codec inside a wrapper (`Schema.optional`, a union) is keyed
+ * by `put` as its stored text, which the key form takes as it comes (`itemid_5`); those paths keyed
+ * the caller's domain value (`itemid_0000000000000005`). For every other key, the key is what 1.39.0
+ * composed, byte for byte.
+ *
+ * The rows 1.39.0 wrote for such codecs are found by key once `rekey` has moved them: the last
+ * section seeds them (`helpers/KeyCodecShapes.ts`) under `escapeKeys` off and on, and runs it.
  */
 
+import { readFileSync } from "node:fs"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
+import {
+  makeCompositeKeyForm,
+  toCompositeKeyRecord,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
 import { describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
@@ -51,7 +59,7 @@ const Docs = Entity.make({
 })
 const Base = Table.make({ schema, entities: { Docs } })
 
-const STORED_KEY = { pk: { S: "$codec#v1#doc#docid_x:x:mix" }, sk: { S: "$codec#v1#doc" } }
+const STORED_KEY = { pk: { S: "$codec#v1#doc#docid_x:mix" }, sk: { S: "$codec#v1#doc" } }
 
 const withTable = <A, E>(
   body: (db: any, table: ReturnType<typeof makeRecordingTable>) => Effect.Effect<A, E, any>,
@@ -90,7 +98,7 @@ const keysSent = (requests: ReadonlyArray<{ readonly command: string; readonly i
   })
 
 describe("a multi-item op composes the key Entity.put wrote", () => {
-  it.effect("put stores a codec-keyed item under the key its encode gives twice", () =>
+  it.effect("put keys a codec-keyed item by its stored text, once", () =>
     withTable((_db, table) =>
       Effect.sync(() => {
         expect([...table.items.values()].map((row: any) => ({ pk: row.pk, sk: row.sk }))).toEqual([
@@ -100,7 +108,7 @@ describe("a multi-item op composes the key Entity.put wrote", () => {
     ),
   )
 
-  it.effect("the entity's own get finds it (as on 1.39.0)", () =>
+  it.effect("the entity's own get finds it", () =>
     withTable((db, table) =>
       Effect.gen(function* () {
         const found = yield* db.entities.Docs.get({ docId: "MiX" })
@@ -214,11 +222,22 @@ describe("a key whose encode doesn't take its own output composes as on 1.39.0",
         },
       } as never) as unknown as Entity.Entity
       Table.make({ schema, entities: { Items } } as never)
-      // 1.39.0 composed `composePrimaryKey` of the caller's key; the domain key form adds a step.
-      for (const value of values)
-        expect(composePrimaryKey(Items, Items._domainKeyForm({ itemId: value }))).toEqual(
-          composePrimaryKey(Items, { itemId: value }),
-        )
+      // 1.39.0 composed the key form of the caller's key, whose codec it encoded first.
+      const form139 = makeCompositeKeyForm(
+        Items.schemas.inputSchema as unknown as Schema.Top,
+        (attr) => {
+          throw new Error(attr)
+        },
+        { text139: true },
+      )
+      const primary = Items.indexes.primary!
+      for (const value of values) {
+        const record = toCompositeKeyRecord(form139, { itemId: value })
+        expect(composePrimaryKey(Items, { itemId: value })).toEqual({
+          pk: KeyComposer.composePk(schema, "Item", primary, record),
+          sk: KeyComposer.composeSk(schema, "Item", 1, primary, record),
+        })
+      }
     })
 })
 
@@ -321,9 +340,9 @@ describe("a codec inside a wrapper composes the key Entity.put wrote", () => {
 })
 
 /**
- * With `escapeKeys: true` a time series' event key holds its `orderBy` value's key form, which for
- * a codec `encode` takes on its own output is the value encoded twice (`#e#x:x:t1`), as `put` keys
- * it. `history().where()` composes its bound the same way. 1.39.0 composed `x:t1` and found
+ * With `escapeKeys: true` a time series' event key holds its `orderBy` value's key form: for a codec
+ * `encode` takes on its own output, its stored text (`#e#x:t1`), the bound `history().where()`
+ * composes. 1.39.0's `append` keyed it encoded once more (`#e#x:x:t1`), and its bound found
  * nothing: `eq("t1")` and `lt("t2")` returned no events.
  */
 describe("history().where() on a codec orderBy, escapeKeys on", () => {
@@ -358,8 +377,8 @@ describe("history().where() on a codec orderBy, escapeKeys on", () => {
       }
       expect([...table.items.values()].map((row) => row.sk!.S).sort()).toEqual([
         "$on#v1#reading",
-        "$on#v1#reading#e#x:x:t1",
-        "$on#v1#reading#e#x:x:t2",
+        "$on#v1#reading#e#x:t1",
+        "$on#v1#reading#e#x:t2",
       ])
       const where = (f: (t: any, ops: any) => unknown) =>
         db.entities.Readings.history({ sensorId: "s" }).where(f).collect() as Effect.Effect<
@@ -378,100 +397,206 @@ describe("history().where() on a codec orderBy, escapeKeys on", () => {
 
 /**
  * The rows published 1.39.0 wrote (`fixtures/key-codec-1.39.0.json`, `helpers/KeyCodecShapes.ts`),
- * seeded on a recording table: every read that composes a key from a caller's values finds them,
- * and `put` and the other writes store them byte for byte as 1.39.0 did.
+ * seeded on a recording table, under `escapeKeys` off and on, and the rows of the first moved to
+ * `escapeKeys: true`: one `rekey` pass moves every row kind to the key a write now gives it, which
+ * a fresh write of the same values matches byte for byte, and every read finds them after it.
  */
-describe("rows 1.39.0 wrote for codec-keyed entities", () => {
-  const seeded = () => {
-    const table = makeRecordingTable({
-      indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" }, gsi2: { pk: "gsi2pk", sk: "gsi2sk" } },
-    })
-    for (const row of Shapes.fixture.rows) table.items.set(`${row.pk!.S}|${row.sk!.S}`, row)
+describe.each([
+  ["escapeKeys off", "off", "off"],
+  ["escapeKeys on", "on", "on"],
+  ["escapeKeys off, then on, in one pass", "off", "on"],
+] as const)("rows 1.39.0 wrote for codec-keyed entities, %s", (_label, written, now) => {
+  const w = Shapes.world(now)
+  const rowsOf = (rows: ReadonlyArray<Shapes.Row>) => {
+    const table = makeRecordingTable({ indexes: Shapes.indexes })
+    for (const row of rows) table.items.set(`${row.pk!.S}|${row.sk!.S}`, row)
     return table
   }
+  const seeded = () => rowsOf(Shapes.fixture[written].rows)
   const layerOf = (table: ReturnType<typeof makeRecordingTable>) =>
     Layer.mergeAll(
-      VectorSearchEmulation.layer(table.layer, { tables: { Base: Shapes.Base } }),
-      Shapes.Base.layer({ name: "kc" }),
+      VectorSearchEmulation.layer(table.layer, { tables: { Base: w.Base } }),
+      w.Base.layer({ name: "kc" }),
       Embedder.layerTest({ dimensions: 8 }),
     )
   const withDb = <A>(
     table: ReturnType<typeof makeRecordingTable>,
     body: (db: any) => Effect.Effect<A, unknown, any>,
   ) =>
-    Effect.flatMap(
-      DynamoClient.make({ entities: Shapes.entities, tables: { Base: Shapes.Base } }),
-      (db) => body(db),
+    Effect.flatMap(DynamoClient.make({ entities: w.entities, tables: { Base: w.Base } }), (db) =>
+      body(db),
     ).pipe(Effect.provide(layerOf(table))) as Effect.Effect<A, unknown, never>
+  const rekey = (table: ReturnType<typeof makeRecordingTable>) =>
+    withDb(table, (db) => db.tables.Base.rekey() as Effect.Effect<Table.RekeyReport>)
+  const ZERO = { item: 0, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
 
-  it("1.39.0 found none of them, but where a row check took a range's rows", () => {
-    for (const read of Shapes.reads.filter((read) => read.label in Shapes.fixture.reads))
-      expect(Shapes.fixture.reads[read.label], read.label).toEqual({
-        ok: read.on139 ?? (typeof read.expected === "number" ? 0 : { Docs: 0, Notes: 0 }),
-      })
-  })
+  if (written === now)
+    it("1.39.0 found none of them by a caller's values, but its own get and a row check", () => {
+      expect(Shapes.fixture.writtenBy["effect-dynamodb"]).toBe("1.39.0")
+      for (const read of Shapes.reads.filter((read) => read.label in Shapes.fixture[written].reads))
+        expect(Shapes.fixture[written].reads[read.label], read.label).toEqual({
+          ok: read.on139 ?? (typeof read.expected === "number" ? 0 : { Docs: 0, Notes: 0 }),
+        })
+    })
 
-  for (const read of Shapes.reads)
-    it.effect(`${read.label} finds them`, () =>
-      Effect.gen(function* () {
-        const table = seeded()
-        expect(yield* withDb(table, read.run)).toEqual(read.expected)
-      }),
-    )
-
-  it.effect("the writes store the keys 1.39.0 stored", () =>
+  it.effect("before rekey, an item's own get finds it no more", () =>
     Effect.gen(function* () {
-      const table = makeRecordingTable({
-        indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" }, gsi2: { pk: "gsi2pk", sk: "gsi2sk" } },
-      })
-      yield* withDb(table, (db) =>
-        Effect.gen(function* () {
-          const e = db.entities
-          yield* e.Docs.put({ docId: "MiX", part: "P1", code: "C1", n: 1 }).asEffect()
-          yield* e.Docs.put({ docId: "MiX", part: "P2", code: "C1", n: 2 }).asEffect()
-          yield* e.Notes.put({ noteId: "n1", code: "C1", part: "P9" }).asEffect()
-          yield* e.Cards.put({ cardId: "MiX", part: "P1", n: 1 }).asEffect()
-          yield* e.Cards.put({ cardId: "MiX", part: "P2", n: 2 }).asEffect()
-          yield* e.Cards.delete({ cardId: "MiX", part: "P2" }).asEffect()
-          yield* e.Revs.put({ cardId: "MiX", part: "P1", n: 1 }).asEffect()
-          yield* e.Revs.update({ cardId: "MiX", part: "P1" }).set({ n: 2 }).asEffect()
-          yield* e.Readings.append({ sensorId: "MiX", at: "T1", n: 1 }).asEffect()
-          yield* e.Readings.append({ sensorId: "MiX", at: "T2", n: 2 }).asEffect()
-          yield* e.Zones.put({
-            zoneId: "z1",
-            region: "North",
-            agency: "AgA",
-            price: 500,
-          }).asEffect()
-          yield* e.Tags.put({ tagId: "t1", owner: "o1", kind: "K1", part: "P1" }).asEffect()
-          yield* e.Tags.put({ tagId: "t2", owner: "o1", kind: "K2", part: "P2" }).asEffect()
-          yield* e.Products.put({ productId: "p1", tenantId: "Acme", name: "lamp" }).asEffect()
-        }),
+      const got = yield* withDb(seeded(), (db) =>
+        Effect.exit(db.entities.Docs.get({ docId: "Mi X", part: "P 1" })),
       )
-      expect(Shapes.keysOf([...table.items.values()])).toEqual(Shapes.keysOf(Shapes.fixture.rows))
+      expect(Exit.isFailure(got) && JSON.stringify(got.cause)).toContain("ItemNotFound")
     }),
   )
 
   it.effect(
-    "reembed keeps the partition put wrote, and moves back one 1.39.0's reembed moved",
+    "rekey moves every row kind to the key a write gives it now; a rerun moves nothing",
     () =>
       Effect.gen(function* () {
-        const product = (rows: ReadonlyArray<Shapes.Row>) =>
-          rows.find((row) => row.__edd_e__?.S === "Product")!.__edd_vp_vec1__?.S
-        const written = product(Shapes.fixture.rows)
-        expect(written).toBe("$kc#v1#product#tenantid_x:x:acme")
-        // 1.39.0's reembed rewrote it once encoded, where no query of the partition finds it.
-        expect(product(Shapes.fixture.rowsAfterReembed)).toBe("$kc#v1#product#tenantid_x:acme")
-
         const table = seeded()
-        expect(yield* withDb(table, (db) => db.entities.Products.reembed())).toBe(1)
-        expect(product([...table.items.values()])).toBe(written)
+        const report = yield* rekey(table)
+        expect(report.moved).toEqual(Shapes.MOVED)
+        expect(report.indexKeysRewritten).toBe(Shapes.REWRITTEN)
+        // The sentinel holds the stored text, which 1.39.0 keyed once: it moves only to escape it.
+        expect(report.sentinelsMoved).toBe(written === now ? 0 : 1)
+        expect(report.conflicts).toEqual([])
+        expect(report.skipped).toEqual({
+          notLibrary: 0,
+          unregistered: 0,
+          unrecognizedKey: 0,
+          rootNotSeen: 0,
+        })
 
-        const moved = seeded()
-        for (const row of Shapes.fixture.rowsAfterReembed)
-          moved.items.set(`${row.pk!.S}|${row.sk!.S}`, row)
-        expect(yield* withDb(moved, (db) => db.entities.Products.reembed())).toBe(1)
-        expect(product([...moved.items.values()])).toBe(written)
+        const fresh = makeRecordingTable({ indexes: Shapes.indexes })
+        yield* withDb(fresh, Shapes.writeAll)
+        expect(Shapes.comparable(table.items.values())).toEqual(
+          Shapes.comparable(fresh.items.values()),
+        )
+
+        const again = yield* rekey(table)
+        expect(again.moved).toEqual(ZERO)
+        expect(again.indexKeysRewritten).toBe(0)
+        expect(again.sentinelsMoved).toBe(0)
+        // Every row but the member's uniqueness sentinel, which is no item.
+        expect(again.unchanged).toBe(again.scanned - 1)
+        expect(again.conflicts).toEqual([])
       }),
+  )
+
+  for (const read of Shapes.reads)
+    it.effect(`after rekey, ${read.label} finds them`, () =>
+      Effect.gen(function* () {
+        const table = seeded()
+        yield* rekey(table)
+        expect(yield* withDb(table, (db) => read.run(db, w))).toEqual(read.expected)
+      }),
+    )
+
+  if (written === now)
+    it.effect("a product 1.39.0's reembed moved holds the partition a write gives it now", () =>
+      Effect.gen(function* () {
+        const product = (rows: Iterable<Shapes.Row>) =>
+          [...rows].find((row) => row.__edd_e__?.S === "Product")!.__edd_vp_vec1__?.S
+        const fresh = makeRecordingTable({ indexes: Shapes.indexes })
+        yield* withDb(fresh, Shapes.writeAll)
+        const written = product(fresh.items.values())
+        expect(product(Shapes.fixture[now].rows)).not.toBe(written)
+        expect(product(Shapes.fixture[now].rowsAfterReembed)).toBe(written)
+
+        const table = rowsOf(Shapes.fixture[now].rowsAfterReembed)
+        const report = yield* rekey(table)
+        expect(report.indexKeysRewritten).toBe(Shapes.REWRITTEN - 1)
+        expect(product(table.items.values())).toBe(written)
+        expect(yield* withDb(table, (db) => db.entities.Products.reembed())).toBe(1)
+        expect(product(table.items.values())).toBe(written)
+      }),
+    )
+})
+
+/**
+ * A geo index's partition key holds a codec `pkFilter` composite (`depot`): 1.39.0 keyed it encoded
+ * once more (`fixtures/key-codec-geo-1.39.0.json`, in the geo package, whose `GeoSearch.test.ts`
+ * searches it). `rekey` rewrites it in place to what a write gives it now.
+ */
+describe.each([
+  ["escapeKeys off", "off", "off"],
+  ["escapeKeys on", "on", "on"],
+  ["escapeKeys off, then on, in one pass", "off", "on"],
+] as const)("a geo index's partition 1.39.0 wrote, %s", (_label, written, now) => {
+  const geo = JSON.parse(
+    readFileSync(
+      new URL("../../effect-dynamodb-geo/test/fixtures/key-codec-geo-1.39.0.json", import.meta.url),
+      "utf8",
+    ),
+  )
+  const Fleet = Entity.make({
+    model: Schema.Struct({
+      vehicleId: Schema.String,
+      depot: Prefixed,
+      latitude: Schema.Number,
+      longitude: Schema.Number,
+      timestamp: Schema.Number,
+      cell: Schema.optional(Schema.String),
+      parentCell: Schema.optional(Schema.String),
+      timePartition: Schema.optional(Schema.String),
+    }),
+    entityType: "FleetVehicle",
+    primaryKey: {
+      pk: { field: "pk", composite: ["vehicleId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byCell: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["depot", "parentCell", "timePartition"] },
+        sk: { field: "gsi1sk", composite: ["cell"] },
+      },
+    },
+  })
+  const FleetTable = Table.make({
+    schema: DynamoSchema.make({ name: "kc", version: 1, escapeKeys: now === "on" }),
+    entities: { Fleet },
+  })
+  const withDb = <A>(
+    table: ReturnType<typeof makeRecordingTable>,
+    body: (db: any) => Effect.Effect<A, unknown, any>,
+  ) =>
+    Effect.flatMap(DynamoClient.make({ entities: { Fleet }, tables: { FleetTable } }), (db) =>
+      body(db),
+    ).pipe(
+      Effect.provide(Layer.merge(table.layer, FleetTable.layer({ name: "geo" }))),
+    ) as Effect.Effect<A, unknown, never>
+
+  it.effect("rekey rewrites it to the key a put of its values writes now", () =>
+    Effect.gen(function* () {
+      expect(geo[written].reads["nearby({ pkFilter: { depot } })"]).toEqual({ ok: 0 })
+      const [row] = geo[written].rows as ReadonlyArray<Shapes.Row>
+      const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+      table.items.set(`${row!.pk!.S}|${row!.sk!.S}`, row!)
+      const report = yield* withDb(
+        table,
+        (db) => db.tables.FleetTable.rekey() as Effect.Effect<Table.RekeyReport>,
+      )
+      expect(report.indexKeysRewritten).toBe(1)
+
+      const fresh = makeRecordingTable()
+      yield* withDb(fresh, (db) =>
+        db.entities.Fleet.put({
+          vehicleId: "v1",
+          depot: "D 1",
+          latitude: Number(row!.latitude!.N),
+          longitude: Number(row!.longitude!.N),
+          timestamp: Number(row!.timestamp!.N),
+          cell: row!.cell!.S,
+          parentCell: row!.parentCell!.S,
+          timePartition: row!.timePartition!.S,
+        }).asEffect(),
+      )
+      expect(Shapes.comparable(table.items.values())).toEqual(
+        Shapes.comparable(fresh.items.values()),
+      )
+      expect([...table.items.values()][0]!.gsi1pk!.S).toContain(
+        now === "on" ? "depot_x:d%201#" : "depot_x:d 1#",
+      )
+    }),
   )
 })

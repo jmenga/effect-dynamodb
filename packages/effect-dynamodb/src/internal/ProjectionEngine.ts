@@ -54,7 +54,6 @@ import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
-  composeDomainPrimaryKey,
   composePrimaryKey,
   KEY_TEXT,
   marshalOrFail,
@@ -147,10 +146,8 @@ export interface EngineEntity {
   readonly _attachPrototype?: ((decoded: any) => any) | undefined
   readonly _multiItemWriteFeatures?: ReadonlyArray<string> | undefined
   readonly schemas: any
-  /** The mark an outbox item takes for the key `key` composes — see `Entity`. */
+  /** The mark a row tombstone or outbox item takes for the key `key` composes — see `Entity`. */
   readonly _keyTextMark: (key: Record<string, unknown>) => 2 | undefined
-  /** The mark a row tombstone takes, at the key the read model's `put` wrote for `key`. */
-  readonly _domainKeyTextMark: (key: Record<string, unknown>) => 2 | undefined
 }
 
 /** @internal One source a row engine reads. */
@@ -408,20 +405,14 @@ export const makeEngine = (config: EngineConfig) => {
     Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => tc.name),
   )
 
-  /**
-   * The row, read strongly consistent — raw, so a tombstone reads as one. At the
-   * key the read model's `put` wrote for `key` (a domain record), as its own `get`
-   * reads it.
-   */
+  /** The row, read strongly consistent — raw, so a tombstone reads as one. */
   const readRow = (key: unknown): Effect.Effect<Option.Option<Row>, any, any> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
       const { Item: item } = yield* client.getItem({
         TableName,
-        Key: toAttributeMap(
-          composeDomainPrimaryKey(readModel as any, key as Record<string, unknown>),
-        ),
+        Key: toAttributeMap(composePrimaryKey(readModel as any, key as Record<string, unknown>)),
         ConsistentRead: true,
       })
       if (item === undefined) return Option.none<Row>()
@@ -722,18 +713,13 @@ export const makeEngine = (config: EngineConfig) => {
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
-      // The row's own key: the one the read model's `put` writes (the row path below), so a
-      // tombstone replaces the row. The outbox items keep the key text they have always been
-      // keyed by (`composePrimaryKey`), which `drain` composes to find them.
-      const rowKey = composeDomainPrimaryKey(readModel as any, key as Record<string, unknown>)
-      const outboxRowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
+      const rowKey = composePrimaryKey(readModel as any, key as Record<string, unknown>)
       const condition = guard(row)
       const createdAt = Option.isSome(row) ? row.value.createdAt : undefined
       // A tombstone or outbox item holds no values, so its key alone says which text it is for
       // `rekey` (`KEY_TEXT`): one under the text of `escapeKeys: true`, where that isn't off's, is
       // marked.
-      const mark = readModel._domainKeyTextMark(key as Record<string, unknown>)
-      const outboxMark = readModel._keyTextMark(key as Record<string, unknown>)
+      const mark = readModel._keyTextMark(key as Record<string, unknown>)
 
       // The row's item: the entity's own `put` (no outbox), or built for a transaction.
       let rowItem: Record<string, AttributeValue> | undefined
@@ -809,7 +795,7 @@ export const makeEngine = (config: EngineConfig) => {
         yield* client.putItem(rowPut.Put).pipe(Effect.catch((error) => lostRace(error, false)))
       } else {
         const OutboxTable = yield* outboxTable
-        const items = yield* outboxItems(outboxRowKey, revision ?? 0, enqueued, outboxMark)
+        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, mark)
         yield* client
           .transactWriteItems({
             TransactItems: [

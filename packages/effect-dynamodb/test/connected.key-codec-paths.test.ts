@@ -2,7 +2,8 @@
  * Against DynamoDB Local: a multi-item op finds, checks and deletes a codec-keyed item by the key
  * `Entity.put` wrote (`KeyCodecPaths.test.ts` has the requests). Up to 1.39.0 `Batch.get` and
  * `transactGet` returned nothing for it, a condition check on it was cancelled, and `Batch.write`
- * and `transactWrite` deletes left it in place.
+ * and `transactWrite` deletes left it in place. The rows 1.39.0 wrote, which `put` keyed by their
+ * stored text encoded once more, `rekey` moves to the key a write gives them now.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -127,11 +128,13 @@ const run = <A>(body: (db: any) => Effect.Effect<A, unknown, any>, setup: Setup 
 }
 
 describeConnected("a multi-item op composes the key Entity.put wrote (connected)", () => {
-  it.effect("put stores the item under the key its encode gives twice", () =>
-    Effect.gen(function* () {
-      const { rows } = yield* run(() => Effect.void)
-      expect(rows.map((row) => row.pk?.S)).toEqual(["$codec#v1#doc#docid_x:x:mix"])
-    }),
+  it.effect(
+    "put stores the item under the key of its stored text, as 1.39.0 encoded it once more",
+    () =>
+      Effect.gen(function* () {
+        const { rows } = yield* run(() => Effect.void)
+        expect(rows.map((row) => row.pk?.S)).toEqual(["$codec#v1#doc#docid_x:mix"])
+      }),
   )
 
   it.effect("Batch.get finds it", () =>
@@ -276,10 +279,16 @@ describeConnected("a codec inside a wrapper composes the key Entity.put wrote (c
 
 /**
  * The rows published 1.39.0 wrote (`fixtures/key-codec-1.39.0.json`, `helpers/KeyCodecShapes.ts`),
- * seeded on DynamoDB Local: every read that composes a key from a caller's values finds them, the
- * writes store them byte for byte as 1.39.0 did, and `reembed` keeps the vector partition `put` wrote.
+ * seeded on DynamoDB Local under `escapeKeys` off and on, and the rows of the first moved to
+ * `escapeKeys: true`: one `rekey` pass moves every row kind to where a fresh write of the same
+ * values puts it, and every read that composes a key from a caller's values finds them after it.
  */
-describeConnected("rows 1.39.0 wrote for codec-keyed entities (connected)", () => {
+describeConnected.each([
+  ["escapeKeys off", "off", "off"],
+  ["escapeKeys on", "on", "on"],
+  ["escapeKeys off, then on, in one pass", "off", "on"],
+] as const)("rows 1.39.0 wrote for codec-keyed entities, %s", (_label, written, now) => {
+  const w = Shapes.world(now)
   const seed = (tableName: string, rows: ReadonlyArray<Row>) =>
     Effect.promise(async () => {
       for (const Item of rows) await raw.send(new PutItemCommand({ TableName: tableName, Item }))
@@ -332,8 +341,8 @@ describeConnected("rows 1.39.0 wrote for codec-keyed entities (connected)", () =
       () =>
         Effect.gen(function* () {
           const db: any = yield* DynamoClient.make({
-            entities: Shapes.entities,
-            tables: { Base: Shapes.Base },
+            entities: w.entities,
+            tables: { Base: w.Base },
           })
           const result = yield* body(db)
           return { result, rows: yield* scanAll(tableName) }
@@ -346,86 +355,85 @@ describeConnected("rows 1.39.0 wrote for codec-keyed entities (connected)", () =
     ).pipe(
       Effect.provide(
         Layer.mergeAll(
-          VectorSearchEmulation.layer(ClientLayer, { tables: { Base: Shapes.Base } }),
-          Shapes.Base.layer({ name: tableName }),
+          VectorSearchEmulation.layer(ClientLayer, { tables: { Base: w.Base } }),
+          w.Base.layer({ name: tableName }),
           Embedder.layerTest({ dimensions: 8 }),
         ),
       ),
     ) as unknown as Effect.Effect<{ result: A; rows: ReadonlyArray<Row> }>
   }
-
-  for (const read of Shapes.reads)
-    it.effect(`${read.label} finds them`, () =>
-      Effect.gen(function* () {
-        const { result } = yield* withSeeded(Shapes.fixture.rows, read.run)
-        expect(result).toEqual(read.expected)
-      }),
+  const rekeyed = <A>(body: (db: any) => Effect.Effect<A, unknown, any>) =>
+    withSeeded(Shapes.fixture[written].rows, (db) =>
+      Effect.flatMap(db.tables.Base.rekey() as Effect.Effect<Table.RekeyReport>, (report) =>
+        Effect.map(body(db), (result) => ({ report, result })),
+      ),
     )
 
-  it.effect("the writes store the keys 1.39.0 stored", () =>
+  it.effect("rekey moves every row kind to where a fresh write puts it", () =>
     Effect.gen(function* () {
-      const { rows } = yield* withSeeded([], (db) =>
-        Effect.gen(function* () {
-          const e = db.entities
-          yield* e.Docs.put({ docId: "MiX", part: "P1", code: "C1", n: 1 }).asEffect()
-          yield* e.Docs.put({ docId: "MiX", part: "P2", code: "C1", n: 2 }).asEffect()
-          yield* e.Notes.put({ noteId: "n1", code: "C1", part: "P9" }).asEffect()
-          yield* e.Cards.put({ cardId: "MiX", part: "P1", n: 1 }).asEffect()
-          yield* e.Cards.put({ cardId: "MiX", part: "P2", n: 2 }).asEffect()
-          yield* e.Cards.delete({ cardId: "MiX", part: "P2" }).asEffect()
-          yield* e.Revs.put({ cardId: "MiX", part: "P1", n: 1 }).asEffect()
-          yield* e.Revs.update({ cardId: "MiX", part: "P1" }).set({ n: 2 }).asEffect()
-          yield* e.Readings.append({ sensorId: "MiX", at: "T1", n: 1 }).asEffect()
-          yield* e.Readings.append({ sensorId: "MiX", at: "T2", n: 2 }).asEffect()
-          yield* e.Zones.put({
-            zoneId: "z1",
-            region: "North",
-            agency: "AgA",
-            price: 500,
-          }).asEffect()
-          yield* e.Tags.put({ tagId: "t1", owner: "o1", kind: "K1", part: "P1" }).asEffect()
-          yield* e.Tags.put({ tagId: "t2", owner: "o1", kind: "K2", part: "P2" }).asEffect()
-          yield* e.Products.put({ productId: "p1", tenantId: "Acme", name: "lamp" }).asEffect()
-        }),
-      )
-      expect(Shapes.keysOf(rows)).toEqual(Shapes.keysOf(Shapes.fixture.rows))
+      const moved = yield* rekeyed(() => Effect.void)
+      expect(moved.result.report.moved).toEqual(Shapes.MOVED)
+      expect(moved.result.report.indexKeysRewritten).toBe(Shapes.REWRITTEN)
+      expect(moved.result.report.conflicts).toEqual([])
+      const fresh = yield* withSeeded([], Shapes.writeAll)
+      expect(Shapes.comparable(moved.rows)).toEqual(Shapes.comparable(fresh.rows))
     }),
   )
 
-  it.effect(
-    "reembed keeps the partition put wrote, and moves back one 1.39.0's reembed moved",
-    () =>
+  for (const read of Shapes.reads)
+    it.effect(`after rekey, ${read.label} finds them`, () =>
+      Effect.gen(function* () {
+        const { result } = yield* rekeyed((db) => read.run(db, w))
+        expect(result.result).toEqual(read.expected)
+      }),
+    )
+
+  if (written === now)
+    it.effect("rekey moves back a partition 1.39.0's reembed moved, and reembed keeps it", () =>
       Effect.gen(function* () {
         const partition = (rows: ReadonlyArray<Row>) =>
           rows.find((row) => row.__edd_e__?.S === "Product")!.__edd_vp_vec1__?.S
-        const written = partition(Shapes.fixture.rows)
-        const kept = yield* withSeeded(Shapes.fixture.rows, (db) => db.entities.Products.reembed())
-        expect(kept.result).toBe(1)
-        expect(partition(kept.rows)).toBe(written)
-        const moved = yield* withSeeded(Shapes.fixture.rowsAfterReembed, (db) =>
-          db.entities.Products.reembed(),
+        const fresh = yield* withSeeded([], Shapes.writeAll)
+        const kept = yield* withSeeded(Shapes.fixture[now].rowsAfterReembed, (db) =>
+          Effect.flatMap(db.tables.Base.rekey() as Effect.Effect<unknown>, () =>
+            db.entities.Products.reembed(),
+          ),
         )
-        expect(moved.result).toBe(1)
-        expect(partition(moved.rows)).toBe(written)
+        expect(kept.result).toBe(1)
+        expect(partition(kept.rows)).toBe(partition(fresh.rows))
       }),
-  )
+    )
 })
 
 /**
  * A projection whose read model's key composite is a codec `encode` takes on its own output, over
- * the rows 1.39.0 wrote (`helpers/KeyCodecProjection.ts`): the next event updates the row `put`
- * wrote, a removal tombstones it, and outbox items keep the key text 1.39.0 gave them. On 1.39.0
- * every event after the first failed, and the tombstone went to a key the row was not at.
+ * the rows 1.39.0 wrote (`helpers/KeyCodecProjection.ts`), under `escapeKeys` off and on, and the
+ * rows of the first moved to `escapeKeys: true`. After one `rekey` pass of each table, the next
+ * event updates the row, a removal tombstones it, and drain delivers every effect. On 1.39.0 every
+ * event after the first failed, and the tombstone went to a key the row was not at.
  */
-describeConnected("a projection keyed by a codec over 1.39.0's rows (connected)", () => {
-  const scanRead = (TableName: string) =>
+describeConnected.each([
+  ["escapeKeys off", "off", "off"],
+  ["escapeKeys on", "on", "on"],
+  ["escapeKeys off, then on, in one pass", "off", "on"],
+] as const)("a projection keyed by a codec over 1.39.0's rows, %s", (_label, written, now) => {
+  const f = P.fixture[written]
+  const w = P.world(now)
+  const then = P.world(written)
+  const scan = (TableName: string) =>
     Effect.promise(
       async () =>
         ((await raw.send(new ScanCommand({ TableName, ConsistentRead: true }))).Items ??
           []) as ReadonlyArray<Row>,
     )
-  /** Fresh event and read-model tables holding 1.39.0's rows; `body`, then the read model's rows. */
-  const withTables = <A>(body: (readTable: string) => Effect.Effect<A, unknown, any>) => {
+  /**
+   * Fresh event and read-model tables holding `rows`, each table `rekey`ed; then `body`, and the
+   * read model's rows.
+   */
+  const withTables = <A>(
+    rows: { readonly events: ReadonlyArray<Row>; readonly read: ReadonlyArray<Row> },
+    body: (readTable: string) => Effect.Effect<A, unknown, any>,
+  ) => {
     const suffix = `${Date.now()}-${tables++}`
     const names = { events: `key-codec-ev-${suffix}`, read: `key-codec-rm-${suffix}` }
     return Effect.acquireUseRelease(
@@ -446,16 +454,22 @@ describeConnected("a projection keyed by a codec over 1.39.0's rows (connected)"
           })
         }
         yield* Effect.promise(async () => {
-          for (const Item of P.fixture.seed.events)
+          for (const Item of rows.events)
             await raw.send(new PutItemCommand({ TableName: names.events, Item }))
-          for (const Item of P.fixture.seed.read)
+          for (const Item of rows.read)
             await raw.send(new PutItemCommand({ TableName: names.read, Item }))
         })
       }),
       () =>
         Effect.gen(function* () {
+          const db = yield* DynamoClient.make({
+            entities: { Removable: w.Removable, Effected: w.Effected },
+            tables: { EventsTable: w.EventsTable, ReadTable: w.ReadTable },
+          })
+          const report: Table.RekeyReport = yield* db.tables.ReadTable.rekey()
+          yield* db.tables.EventsTable.rekey({ streams: [w.Orders] })
           const result = yield* body(names.read)
-          return { result, rows: yield* scanRead(names.read) }
+          return { report, result, rows: yield* scan(names.read) }
         }),
       () =>
         Effect.gen(function* () {
@@ -467,77 +481,76 @@ describeConnected("a projection keyed by a codec over 1.39.0's rows (connected)"
       Effect.provide(
         Layer.mergeAll(
           ClientLayer,
-          P.EventsTable.layer({ name: names.events }),
-          P.ReadTable.layer({ name: names.read }),
+          w.EventsTable.layer({ name: names.events }),
+          w.ReadTable.layer({ name: names.read }),
         ),
       ),
-    ) as unknown as Effect.Effect<{ result: A; rows: ReadonlyArray<Row> }>
+    ) as unknown as Effect.Effect<{
+      report: Table.RekeyReport
+      result: A
+      rows: ReadonlyArray<Row>
+    }>
   }
   const at = (rows: ReadonlyArray<Row>, key: { readonly pk: string; readonly sk: string }) =>
     rows.find((row) => row.pk?.S === key.pk && row.sk?.S === key.sk)
 
-  it.effect("the next event updates the row 1.39.0 wrote", () =>
-    Effect.gen(function* () {
-      const { result, rows } = yield* withTables(() =>
-        Effect.gen(function* () {
-          yield* P.Orders.append({ orderId: "o1" }, [new P.Added({ amount: 3 })], 1)
-          const a = yield* P.A.catchUp({ orderId: "o1" })
-          const b = yield* P.B.catchUp({ orderId: "o1" })
-          return [a.applied.map((e) => e.version), b.applied.map((e) => e.version)]
-        }),
-      )
-      expect(result).toEqual([[2], [2]])
-      expect(at(rows, P.rowKey.Removable)?.total).toEqual({ N: "8" })
-      expect(at(rows, P.rowKey.Effected)?.rev).toEqual({ N: "2" })
-      expect(at(rows, P.singleKey)).toBeUndefined()
-    }),
+  it.effect(
+    "after rekey, the next event updates the row, a removal tombstones it, and drain delivers every effect",
+    () =>
+      Effect.gen(function* () {
+        const notes: Array<string> = []
+        const { report, result, rows } = yield* withTables(f.seed, () =>
+          Effect.gen(function* () {
+            yield* w.Orders.append(P.id, [new P.Added({ amount: 3 })], 1)
+            const a = yield* w.A.catchUp(P.id)
+            const b = yield* w.B.catchUp(P.id)
+            yield* w.Orders.append(P.id, [new P.Cancelled()], 2)
+            const removed = yield* w.A.catchUp(P.id)
+            yield* w.B.catchUp(P.id)
+            const got = yield* Effect.exit(w.Removable.get(P.id).asEffect())
+            const drained = yield* w.B.drain(P.id, (effect) =>
+              Effect.sync(() => {
+                notes.push(effect.note)
+              }),
+            )
+            return {
+              applied: [a.applied.map((e) => e.version), b.applied.map((e) => e.version)],
+              removed: removed.removed,
+              got: Exit.isFailure(got) && JSON.stringify(got.cause),
+              delivered: drained.delivered,
+            }
+          }),
+        )
+        expect(report.moved.item).toBe(2)
+        expect(report.conflicts).toEqual([])
+        expect(result.applied).toEqual([[2], [2]])
+        expect(result.removed).toBe(true)
+        expect(result.got).toContain("ItemNotFound")
+        expect(at(rows, w.rowKey.Removable)?.__edd_e__).toEqual({ S: "Removable#tombstone" })
+        expect(at(rows, w.rowKey.Effected)).toMatchObject({ total: { N: "8" }, rev: { N: "3" } })
+        expect(rows.filter((row) => row.pk?.S?.includes("x:x:"))).toEqual([])
+        expect(result.delivered).toBe(3)
+        expect(notes).toEqual(["Placed v1", "Added v2", "Cancelled v3"])
+        expect(rows.filter((row) => row.__edd_e__?.S === "Effected#outbox")).toEqual([])
+      }),
   )
 
-  it.effect("a removal tombstones the row put wrote, and the entity reads no row", () =>
+  it.effect("rekey leaves a row whose key 1.39.0's removal tombstoned, and reports it", () =>
     Effect.gen(function* () {
-      const { result, rows } = yield* withTables(() =>
-        Effect.gen(function* () {
-          yield* P.Orders.append(
-            { orderId: "o1" },
-            [new P.Added({ amount: 3 }), new P.Cancelled()],
-            1,
-          )
-          const a = yield* P.A.catchUp({ orderId: "o1" })
-          const got = yield* Effect.exit(P.Removable.get({ orderId: "o1" }).asEffect())
-          return { removed: a.removed, got: Exit.isFailure(got) && JSON.stringify(got.cause) }
-        }),
-      )
-      expect(result.removed).toBe(true)
-      expect(result.got).toContain("ItemNotFound")
-      expect(at(rows, P.rowKey.Removable)?.__edd_e__).toEqual({ S: "Removable#tombstone" })
-      expect(at(rows, P.singleKey)).toBeUndefined()
-    }),
-  )
-
-  it.effect("outbox items keep the key text 1.39.0 gave them, and drain delivers them", () =>
-    Effect.gen(function* () {
-      const notes: Array<string> = []
-      const { result, rows } = yield* withTables((readTable) =>
-        Effect.gen(function* () {
-          yield* P.Orders.append({ orderId: "o1" }, [new P.Added({ amount: 3 })], 1)
-          yield* P.B.catchUp({ orderId: "o1" })
-          const pending = (yield* scanRead(readTable))
-            .filter((row) => row.__edd_e__?.S === "Effected#outbox")
-            .map((row) => [row.pk?.S, row.sk?.S, row.__edd_row_pk__?.S, row.__edd_row_sk__?.S])
-          const drained = yield* P.B.drain({ orderId: "o1" }, (effect) =>
-            Effect.sync(() => {
-              notes.push(effect.note)
-            }),
-          )
-          return { pending, delivered: drained.delivered }
-        }),
-      )
-      expect(result.pending).toEqual([
-        [P.outboxPk, "$kp#v1#effected#outbox#000000000002#0000", P.outboxPk, P.rowKey.Effected.sk],
+      const { report, rows } = yield* withTables(f.final, () => Effect.void)
+      expect(report.conflicts).toEqual([
+        {
+          member: "Removable",
+          kind: "item",
+          reason: "taken",
+          key: then.doubledKey.Removable,
+          target: w.rowKey.Removable,
+          message: expect.any(String),
+        },
       ])
-      expect(result.delivered).toBe(1)
-      expect(notes).toEqual(["Added v2"])
-      expect(rows.filter((row) => row.__edd_e__?.S === "Effected#outbox")).toEqual([])
+      expect(report.byMember.Effected?.moved.item).toBe(1)
+      expect(at(rows, w.rowKey.Removable)?.__edd_e__).toEqual({ S: "Removable#tombstone" })
+      expect(at(rows, then.doubledKey.Removable)?.__edd_e__).toEqual({ S: "Removable" })
     }),
   )
 })

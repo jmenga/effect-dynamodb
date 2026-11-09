@@ -495,34 +495,20 @@ const primaryKeyOf = (
 }
 
 /**
- * Compose the primary key for an entity item, from a record in the key form
- * `_keyForm` takes. The projection engine keys a row's outbox items through this
- * (the row itself goes through {@link composeDomainPrimaryKey}).
+ * The primary key of the row a caller's DOMAIN key record names: the key
+ * `Entity.put` wrote for it (`_domainKeyForm`). The projection engine reads a
+ * read-model row, writes its tombstone and keys its outbox items through this,
+ * as the row itself is written by the read model's own `put`.
  */
 export const composePrimaryKey = (
   entity: Entity,
   key: Record<string, unknown>,
-): Record<string, unknown> => {
+): Record<string, unknown> =>
   // Every `KeyComposer` input must first go through the composite key-form rule
   // or it composes a different string than `Entity.put` wrote — a `DateEpochMs`
   // PK composite made `Batch.get` return null and `Batch.write(delete)` report
   // success against a row it never touched (#111).
-  const recordKeyForm = entity._keyForm(key)
-  return primaryKeyOf(entity, recordKeyForm)
-}
-
-/**
- * The primary key of the row a DOMAIN key record names — the key `Entity.put`
- * wrote for it (`_domainKeyForm`). The projection engine reads a read-model row,
- * and writes its tombstone, through this, as the row itself is written by the
- * read model's own `put`. Up to 1.39.0 it went through `_keyForm` alone, which
- * for a codec `encode` takes on its own output read and tombstoned a key the row
- * was not at.
- */
-export const composeDomainPrimaryKey = (
-  entity: Entity,
-  key: Record<string, unknown>,
-): Record<string, unknown> => primaryKeyOf(entity, entity._domainKeyForm(key))
+  primaryKeyOf(entity, entity._domainKeyForm(key))
 
 /**
  * The primary key of the item a caller's key names, failing with a
@@ -533,9 +519,11 @@ export const composeDomainPrimaryKey = (
  *
  * The caller's key is a DOMAIN record (`{ takenAt: DateTime }`), as an entity's
  * own `get` takes it, so it goes through `_domainKeyForm`: the key `Entity.put`
- * wrote for it, the key that `get` composes. Up to 1.39.0 it went through
- * `_keyForm` alone, which for a codec `encode` takes on its own output (`x:`
- * prepended) encoded it once where `put` encoded twice, and found nothing.
+ * wrote for it, the key that `get` composes. For a codec `encode` takes on its
+ * own output (`x:` prepended), that is the key of the stored text: a domain
+ * value that is also such a text (`"x:MiX"`) is encoded first, as `put` does.
+ * It sends the key it sent on 1.39.0, whose `put` keyed the stored text encoded
+ * once more, so it found nothing there.
  */
 export const composePrimaryKeyOrFail = (
   entity: Entity,

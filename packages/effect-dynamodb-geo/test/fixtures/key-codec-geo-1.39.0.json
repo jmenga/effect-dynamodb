@@ -3,57 +3,124 @@
   "effect-dynamodb": "1.39.0",
   "effect": "4.1.2"
  },
- "center": {
-  "latitude": 37.7749,
-  "longitude": -122.4194
- },
- "now": 1700000000000,
- "rows": [
-  {
-   "depot": {
-    "S": "x:D1"
-   },
-   "gsi1sk": {
-    "S": "$kc#v1#fleetvehicle#cell_8f283082800b390"
-   },
-   "latitude": {
-    "N": "37.7749"
-   },
-   "gsi1pk": {
-    "S": "$kc#v1#fleetvehicle#depot_x:x:d1#parentcell_832830fffffffff#timepartition_472222"
-   },
-   "cell": {
-    "S": "8f283082800b390"
-   },
-   "parentCell": {
-    "S": "832830fffffffff"
-   },
-   "__edd_e__": {
-    "S": "FleetVehicle"
-   },
-   "sk": {
-    "S": "$kc#v1#fleetvehicle"
-   },
-   "vehicleId": {
-    "S": "v1"
-   },
-   "pk": {
-    "S": "$kc#v1#fleetvehicle#vehicleid_v1"
-   },
-   "timePartition": {
-    "S": "472222"
-   },
-   "longitude": {
-    "N": "-122.4194"
-   },
-   "timestamp": {
-    "N": "1700000000000"
+ "off": {
+  "schema": {
+   "name": "kc",
+   "version": 1,
+   "escapeKeys": false
+  },
+  "center": {
+   "latitude": 37.7749,
+   "longitude": -122.4194
+  },
+  "now": 1700000000000,
+  "rows": [
+   {
+    "depot": {
+     "S": "x:D 1"
+    },
+    "gsi1sk": {
+     "S": "$kc#v1#fleetvehicle#cell_8f283082800b390"
+    },
+    "latitude": {
+     "N": "37.7749"
+    },
+    "gsi1pk": {
+     "S": "$kc#v1#fleetvehicle#depot_x:x:d 1#parentcell_832830fffffffff#timepartition_472222"
+    },
+    "cell": {
+     "S": "8f283082800b390"
+    },
+    "parentCell": {
+     "S": "832830fffffffff"
+    },
+    "__edd_e__": {
+     "S": "FleetVehicle"
+    },
+    "sk": {
+     "S": "$kc#v1#fleetvehicle"
+    },
+    "vehicleId": {
+     "S": "v1"
+    },
+    "pk": {
+     "S": "$kc#v1#fleetvehicle#vehicleid_v1"
+    },
+    "timePartition": {
+     "S": "472222"
+    },
+    "longitude": {
+     "N": "-122.4194"
+    },
+    "timestamp": {
+     "N": "1700000000000"
+    }
+   }
+  ],
+  "reads": {
+   "nearby({ pkFilter: { depot } })": {
+    "ok": 0
    }
   }
- ],
- "reads": {
-  "nearby({ pkFilter: { depot } })": {
-   "ok": 0
+ },
+ "on": {
+  "schema": {
+   "name": "kc",
+   "version": 1,
+   "escapeKeys": true
+  },
+  "center": {
+   "latitude": 37.7749,
+   "longitude": -122.4194
+  },
+  "now": 1700000000000,
+  "rows": [
+   {
+    "depot": {
+     "S": "x:D 1"
+    },
+    "gsi1sk": {
+     "S": "$kc#v1#fleetvehicle#cell_8f283082800b390"
+    },
+    "latitude": {
+     "N": "37.7749"
+    },
+    "gsi1pk": {
+     "S": "$kc#v1#fleetvehicle#depot_x:x:d%201#parentcell_832830fffffffff#timepartition_472222"
+    },
+    "cell": {
+     "S": "8f283082800b390"
+    },
+    "parentCell": {
+     "S": "832830fffffffff"
+    },
+    "__edd_e__": {
+     "S": "FleetVehicle"
+    },
+    "sk": {
+     "S": "$kc#v1#fleetvehicle"
+    },
+    "vehicleId": {
+     "S": "v1"
+    },
+    "pk": {
+     "S": "$kc#v1#fleetvehicle#vehicleid_v1"
+    },
+    "timePartition": {
+     "S": "472222"
+    },
+    "longitude": {
+     "N": "-122.4194"
+    },
+    "timestamp": {
+     "N": "1700000000000"
+    }
+   }
+  ],
+  "reads": {
+   "nearby({ pkFilter: { depot } })": {
+    "ok": 0
+   }
   }
  }
 }
