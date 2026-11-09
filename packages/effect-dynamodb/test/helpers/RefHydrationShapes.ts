@@ -8,7 +8,10 @@
  * field a string; union elements with a nullable discriminator, members sharing a discriminator, a
  * nested union, a checked nested union first and a member typing its own id (at the root and in a
  * sub-aggregate); ids no item is keyed by, and ids `put` refuses inside a struct, an `Option` or a
- * `Result`, keys escaped or not; and two edges, the second over an entity no one id keys.
+ * `Result`, keys escaped or not; two edges, the second over an entity no one id keys; union elements
+ * whose earlier member would take a value with the id left over, a checked union holding the ref, a
+ * class given a `Date` and a stray id (at the root and in a sub-aggregate); and a `NumberFromString`
+ * id given an infinity as its encoded string, keys escaped or not.
  * Shared by `AggregateRefHydration.test.ts` (a recording table) and
  * `connected.aggregate-ref-hydration.test.ts` (DynamoDB Local).
  */
@@ -682,30 +685,41 @@ const sheetShape =
     }
   }
 
-/** A sub-aggregate `part` with a `one` edge over an entity keyed by a struct, given `given`. */
-const subKeyedByPair = (given: unknown) => (): Shape => {
-  class Line extends Schema.Class<Line>("Line")({ lineId: Pair(), f: Schema.Number }) {}
-  const Lines = lines(DynamoModel.configure(Line, { lineId: { identifier: true } }), singleKey)
-  const Part = Schema.Struct({ line: Line })
-  return {
-    entities: { Lines },
-    make: (base) => {
-      const Sub = (Aggregate.make as any)(Part, {
-        root: { entityType: "Part" },
-        edges: { line: Aggregate.one({ entityType: "AggLine", entity: Lines } as never) },
-      })
-      return aggregate(
-        Schema.Struct({ id: Schema.String, part: Part }),
-        base,
-        { part: Sub.with({ discriminator: { side: 1 } }) },
-        unescapedSchema,
-      )
-    },
-    seed: [["Lines", { lineId: { a: 5 }, f: 5 }]],
-    input: { id: "a", part: { lineId: given } },
-    schema: unescapedSchema,
+/**
+ * A sub-aggregate `part` with a `one` edge over an entity keyed by `lineId` of `keySchema`, seeded
+ * with `id`, given `given`.
+ */
+const subKeyedBy =
+  (keySchema: Schema.Top, id: unknown, given: unknown, over: DynamoSchema.DynamoSchema = schema) =>
+  (): Shape => {
+    class Line extends Schema.Class<Line>("Line")({
+      lineId: keySchema as never,
+      f: Schema.Number,
+    }) {}
+    const Lines = lines(
+      DynamoModel.configure(Line, { lineId: { identifier: true } } as never),
+      singleKey,
+    )
+    const Part = Schema.Struct({ line: Line })
+    return {
+      ...(over === schema ? {} : { schema: over }),
+      entities: { Lines },
+      make: (base) => {
+        const Sub = (Aggregate.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: { line: Aggregate.one({ entityType: "AggLine", entity: Lines } as never) },
+        })
+        return aggregate(
+          Schema.Struct({ id: Schema.String, part: Part }),
+          base,
+          { part: Sub.with({ discriminator: { side: 1 } }) },
+          over,
+        )
+      },
+      seed: [["Lines", { lineId: id, f: 5 }]],
+      input: { id: "a", part: { lineId: given } },
+    }
   }
-}
 
 /**
  * Shapes a third review found: ids `put` refuses as DynamoDB can't store them, deeper than a number
@@ -737,9 +751,12 @@ const reviewedThird: Record<string, () => Shape> = {
     Result.succeed(5),
     Result.succeed(Infinity),
   ),
-  "sub-aggregate, one, an entity keyed by a struct, given one holding Infinity": subKeyedByPair({
-    a: Infinity,
-  }),
+  "sub-aggregate, one, an entity keyed by a struct, given one holding Infinity": subKeyedBy(
+    Pair(),
+    { a: 5 },
+    { a: Infinity },
+    unescapedSchema,
+  ),
   "many, element a union whose first member is a checked union of members holding no ref":
     sheetShape(checkedNestedSheet, { kind: "a", lineId: "l", qty: 1 }, true, false),
   "sub-aggregate, many, element a union whose first member is a checked union of members holding no ref":
@@ -748,6 +765,174 @@ const reviewedThird: Record<string, () => Shape> = {
     sheetShape(typedIdSheet, { kind: "a", line: "KEEP", lineId: 123, qty: 1 }, false, false),
   "sub-aggregate, many, element a union whose later member declares the entity's field a string and its id a number":
     sheetShape(typedIdSheet, { kind: "a", line: "KEEP", lineId: 123, qty: 1 }, false, true),
+}
+
+/** A union element whose earlier member holds no ref and transforms a field the later one doesn't. */
+export const transformingSheet = (asClass: boolean) => (Line: Schema.Top) => {
+  const scalar = {
+    kind: Schema.Literal("a"),
+    line: Schema.optional(Schema.String),
+    n: Schema.NumberFromString,
+    qty: Schema.Number,
+  }
+  const wrapping = {
+    kind: Schema.Literal("a"),
+    line: Line.pipe(DynamoModel.ref),
+    n: Schema.Number,
+    qty: Schema.Number,
+  }
+  if (!asClass) return Schema.Union([Schema.Struct(scalar), Schema.Struct(wrapping)])
+  class Scalar extends Schema.Class<Scalar>("Scalar")(scalar) {}
+  class Wrapping extends Schema.Class<Wrapping>("Wrapping")(wrapping) {}
+  return Schema.Union([Scalar, Wrapping])
+}
+
+/** A union element whose first member is a checked union holding the ref, its check reading it. */
+export const checkedRefSheet = (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("a"),
+        line: Line.pipe(DynamoModel.ref),
+        qty: Schema.Number,
+      }),
+      Schema.Struct({ kind: Schema.Literal("b"), qty: Schema.Number }),
+    ]).check(
+      Schema.makeFilter(
+        (sheet: { readonly kind: string; readonly line?: unknown }) =>
+          sheet.kind === "b" || (sheet.line as { readonly f?: number } | undefined)?.f === 5,
+      ),
+    ),
+    Schema.Struct({
+      kind: Schema.Literal("a"),
+      line: Schema.optional(Schema.String),
+      qty: Schema.Number,
+    }),
+  ])
+
+/** A union element whose earlier member, holding no ref, declares `earlier`'s fields. */
+const earlierSheet = (earlier: Record<string, Schema.Top>) => (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Struct({ kind: Schema.Literal("a"), ...earlier, qty: Schema.Number }),
+    Schema.Struct({
+      kind: Schema.Literal("a"),
+      line: Line.pipe(DynamoModel.ref),
+      qty: Schema.Number,
+    }),
+  ])
+
+/** A union of classes: the earlier declares the entity's field a string, its id and a date. */
+const datedClassSheet = (Line: Schema.Top) => {
+  class Scalar extends Schema.Class<Scalar>("Scalar")({
+    kind: Schema.Literal("a"),
+    line: Schema.String,
+    lineId: Schema.String,
+    at: Schema.Date,
+    qty: Schema.Number,
+  }) {}
+  class Wrapping extends Schema.Class<Wrapping>("Wrapping")({
+    kind: Schema.Literal("a"),
+    line: Line.pipe(DynamoModel.ref),
+    qty: Schema.Number,
+  }) {}
+  return Schema.Union([Scalar, Wrapping])
+}
+
+/** A union element whose member holding no ref declares the entity's field a string. */
+const discriminatedSheet = (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("a"),
+      line: Line.pipe(DynamoModel.ref),
+      qty: Schema.Number,
+    }),
+    Schema.Struct({ kind: Schema.Literal("b"), line: Schema.String, qty: Schema.Number }),
+  ])
+
+/** Each shape at the root and in a sub-aggregate, seeded with the line. */
+const atRootAndSub = (
+  shapes: ReadonlyArray<readonly [string, (Line: Schema.Top) => Schema.Top, unknown]>,
+): Record<string, () => Shape> =>
+  Object.fromEntries(
+    shapes.flatMap(([label, sheet, element]) =>
+      [false, true].map((sub) => [
+        sub ? `sub-aggregate, ${label}` : label,
+        sheetShape(sheet, element, true, sub),
+      ]),
+    ),
+  )
+
+/**
+ * Shapes a fourth review found: union elements whose earlier member would take a value with the id
+ * left over (transforming a field, declaring the entity's field an optional string, declaring
+ * neither, a checked union whose check passes), a checked union holding the ref, a class given a
+ * `Date`, a stray id on a member holding no ref, and a `NumberFromString` id given an infinity as
+ * its encoded string, which `put` stores. An infinity's key text differs with `escapeKeys` on, so
+ * the shapes 1.39.0 ran with it off say so ({@link unescapedSchema}).
+ */
+const reviewedFourth: Record<string, () => Shape> = {
+  ...atRootAndSub([
+    [
+      "many, element a union whose earlier member holds no ref and transforms a field",
+      transformingSheet(false),
+      { kind: "a", lineId: "l", n: 5, qty: 1 },
+    ],
+    [
+      "many, element a union of classes whose earlier member holds no ref and transforms a field",
+      transformingSheet(true),
+      { kind: "a", lineId: "l", n: 5, qty: 1 },
+    ],
+    [
+      "many, element a union whose first member is a checked union holding the ref, a later member declaring the entity's field an optional string",
+      checkedRefSheet,
+      { kind: "a", lineId: "l", qty: 1 },
+    ],
+    [
+      "many, element a union whose earlier member declares neither the entity's field nor its id",
+      earlierSheet({}),
+      { kind: "a", lineId: "l", qty: 1 },
+    ],
+    [
+      "many, element a union whose earlier member declares the entity's field an optional string",
+      earlierSheet({ line: Schema.optional(Schema.String) }),
+      { kind: "a", lineId: "l", qty: 1 },
+    ],
+    [
+      "many, element a union whose first member is a checked union of members holding no ref, its check passing",
+      checkedNestedSheet,
+      { kind: "a", lineId: "l", qty: 11 },
+    ],
+    [
+      "many, element a union of classes, the earlier declaring the entity's field a string, its id and a date, given a Date",
+      datedClassSheet,
+      { kind: "a", line: "KEEP", lineId: "l", at: new Date(ISO), qty: 1 },
+    ],
+    [
+      "many, element a union whose member holding no ref is given a lineId",
+      discriminatedSheet,
+      { kind: "b", line: "label", lineId: "l", qty: 2 },
+    ],
+  ]),
+  "one, an entity keyed by a NumberFromString, given Infinity as its encoded string": keyedBy(
+    Schema.NumberFromString,
+    Infinity,
+    "Infinity",
+    false,
+    unescapedSchema,
+  ),
+  "one, an entity keyed by a NumberFromString, given -Infinity as its encoded string": keyedBy(
+    Schema.NumberFromString,
+    -Infinity,
+    "-Infinity",
+    false,
+    unescapedSchema,
+  ),
+  "one, an entity keyed by a NumberFromString, given Infinity as its encoded string, its keys escaped":
+    keyedBy(Schema.NumberFromString, Infinity, "Infinity", false, escapedSchema),
+  "one, an entity keyed by a NumberFromString, given -Infinity as its encoded string, its keys escaped":
+    keyedBy(Schema.NumberFromString, -Infinity, "-Infinity", false, escapedSchema),
+  "sub-aggregate, one, an entity keyed by a NumberFromString, given Infinity as its encoded string":
+    subKeyedBy(Schema.NumberFromString, Infinity, "Infinity", unescapedSchema),
 }
 
 /**
@@ -849,6 +1034,7 @@ export const SHAPES: Record<string, () => Shape> = {
   ...reviewed,
   ...reviewedAgain,
   ...reviewedThird,
+  ...reviewedFourth,
 }
 
 export const byKey = (rows: ReadonlyArray<Row>) =>
@@ -890,7 +1076,15 @@ export const CONTROLS = [
   "sub-aggregate, many, element a union whose first member is a checked union of members holding no ref",
   "many, element a union whose later member declares the entity's field a string and its id a number",
   "sub-aggregate, many, element a union whose later member declares the entity's field a string and its id a number",
+  ...Object.keys(reviewedFourth).filter((label) => !label.endsWith("is given a lineId")),
 ]
+/**
+ * A stray id on a member holding no ref, which `inputSchema` refuses: fetched as 1.39.0 fetched it,
+ * and `create` fails decoding the fetched record, as 1.39.0 failed.
+ */
+export const STRAY_ID = Object.keys(reviewedFourth).filter((label) =>
+  label.endsWith("is given a lineId"),
+)
 export const UNFETCHABLE = [
   "many, element wraps an entity keyed by two composites",
   "one, an entity keyed by two composites",

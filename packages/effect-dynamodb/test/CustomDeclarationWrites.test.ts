@@ -439,8 +439,9 @@ describe("a new write path can't go unnoticed", () => {
 
   it("an entity's writes encode through the one function that checks", () => {
     const entity = source("Entity.ts")
-    // `encodeForWrite`'s one encode.
-    expect(count(entity, /\bencodeOrDecodeEncode\(/g)).toBe(1)
+    // `encodeForWrite`'s one encode, and `_unstorableKey`'s encode of a key record as `put` would
+    // encode it, which writes nothing.
+    expect(count(entity, /\bencodeOrDecodeEncode\(/g)).toBe(2)
     // Put, update, upsert twice, and a time series' append.
     expect(count(entity, /\bencodeForWrite\(/g)).toBe(5)
     // A key value that reads back as the other numeric kind is refused in `encodeForWrite`, and in

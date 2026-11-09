@@ -778,15 +778,17 @@ export interface Entity<
   ) => globalThis.Record<string, unknown>
 
   /**
-   * @internal What in a caller's DOMAIN key record DynamoDB can't store, judged as `put` judges
-   * its item (`refuseUnstorable`): each composite in the form `put` stores it in, marshalled, a
-   * `NaN` left to key composition (`EDD-9096`). `undefined` when it all stores. For a path holding
-   * an id it fetches by (aggregate ref hydration): no item can be keyed by a value `put` refuses,
-   * and its key text may name an item of another value.
+   * @internal What in a caller's DOMAIN key record DynamoDB can't store, as `put` decides it for
+   * an item holding those values: each encoded through `inputSchema`'s own field as `put` encodes
+   * its input (`encodeOrDecodeEncode`), then judged by the check `put` runs on what it encoded
+   * (`unstorableOf`), a `NaN` left to key composition (`EDD-9096`). `undefined` when it all stores,
+   * or when a value doesn't encode. For a path holding an id it fetches by (aggregate ref
+   * hydration): no item can be keyed by a value `put` refuses, and its key text may name an item
+   * of another value.
    */
   readonly _unstorableKey: (
     record: globalThis.Record<string, unknown>,
-  ) => UnstorableValue | undefined
+  ) => Effect.Effect<UnstorableValue | undefined>
 
   /**
    * @internal Rename domain field names to their stored DynamoDB attribute
@@ -2731,6 +2733,34 @@ const makeImpl = <
   /** What in an encoded payload DynamoDB can't store, as `put` finds it when it marshals. */
   const unstorableOf = (encoded: globalThis.Record<string, unknown>): UnstorableValue | undefined =>
     unstorableIn(fieldsToStore(encoded))
+
+  /** `inputSchema`'s fields of a key record, once per set of names (`unstorableKey`). */
+  const keyRecordSchemas = new Map<string, Schema.Codec<any>>()
+
+  /**
+   * What DynamoDB can't store in a caller's DOMAIN key record, as `put` decides it: the record
+   * encoded through `inputSchema`'s own fields as `put` encodes its input, then `unstorableOf`,
+   * the check `put` runs on what it encoded. `undefined` when it stores, or when a value doesn't
+   * encode (no value of its field, which its caller refuses).
+   */
+  const unstorableKey = (
+    record: globalThis.Record<string, unknown>,
+  ): Effect.Effect<UnstorableValue | undefined> => {
+    const names = Object.keys(record)
+    const id = names.join("\u0000")
+    let schema = keyRecordSchemas.get(id)
+    if (schema === undefined) {
+      const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top) ?? {}
+      schema = Schema.Struct(
+        Object.fromEntries(names.map((name) => [name, fields[name] ?? Schema.Unknown])) as never,
+      ) as unknown as Schema.Codec<any>
+      keyRecordSchemas.set(id, schema)
+    }
+    return encodeOrDecodeEncode(schema, record, entityType, "aggregate.create").pipe(
+      Effect.map((encoded) => unstorableOf(encoded as globalThis.Record<string, unknown>)),
+      Effect.orElseSucceed(() => undefined),
+    )
+  }
 
   /** Refuses a value DynamoDB can't store, for a path about to read or send something. */
   const refuseUnstorable = (
@@ -15007,8 +15037,7 @@ const makeImpl = <
     _serializeSparseFields: serializeSparseFields,
     _keyForm: keyForm,
     _domainKeyForm: domainKeyForm,
-    _unstorableKey: (record: globalThis.Record<string, unknown>) =>
-      unstorableOf(compositeStoredForm(record)),
+    _unstorableKey: unstorableKey,
     _renameToDynamo: renameToDynamo,
     _fieldOfAttribute: fieldOfAttribute,
     _incarnationToken: stampsIncarnation,

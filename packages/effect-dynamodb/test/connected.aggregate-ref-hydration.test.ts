@@ -10,7 +10,8 @@
  * fetched under a key `put` never wrote (a string codec), is fetched by the key `put` wrote; an id
  * of no type of it, or one no item is keyed by (`put` refuses it, alone or inside a struct, an
  * `Option` or a `Result`), fails with `EDD-9131`, nothing written. A union element is read as the
- * member the input schema decodes it as.
+ * member the input schema decodes it as; one 1.39.0 hydrated and stored is hydrated and stored as it
+ * was, and a stray id on a member holding no ref is fetched and refused as 1.39.0 refused it.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -32,6 +33,7 @@ import {
   NOW_FETCHED,
   SHAPES,
   type Shape,
+  STRAY_ID,
   schema,
   sharedDiscriminator,
   UNFETCHABLE,
@@ -205,6 +207,17 @@ describeConnected(
             f: seeded[0]!.f,
           })
           expect(Exit.isSuccess(get) && get.value).toEqual(Exit.isSuccess(create) && create.value)
+        }),
+      )
+    }
+
+    for (const label of STRAY_ID) {
+      it.effect(`${label}: refused decoding the fetched record, as 1.39.0 was`, () =>
+        Effect.gen(function* () {
+          const { create, rows } = yield* run(SHAPES[label]!())
+          expect(refusal(create)).not.toContain("[EDD-")
+          expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
+          expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
         }),
       )
     }

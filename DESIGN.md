@@ -4031,34 +4031,48 @@ ids where its input takes them: a `one` or `ref` edge's `${field}Id`, the
 elements of a `many` edge given as ids, and the `${field}Id` of a `many`
 element wrapping the entity in a field of its own (`PlayerSheet.player`, the
 field `deriveEntityFieldName` names, as `deriveElementInputSchema` derives the
-input). Whether an element wraps the entity is read off its schema
-(`elementHoldsRef`), by the member of a union the element is, as the element's
-derived input decodes it (`elementJudge`): that input, built by the same
-`elementInput` that builds `inputSchema`'s, with each member a union holds
-wrapped in a union of itself alone whose check notes what the member decoded
-the value to. The decode returns one of those, so the member is the decode's
-own choice: unions walked as declared, each union's own checks and `oneOf`
-mode applied, and the entity's field as `${field}Id` of the key composite's own
-schema (`refIdInput`). A member's input is the member with its field of the
-entity's name replaced by `${field}Id` when that field can hold the entity's
-record (an object, a class, a union holding one, `optional` or not), and a
-managed timestamp optional; it is decoded as `create`'s own decode is after
-hydration (domain or wire values, container checks kept). So a nullable
-discriminator (`kind: NullOr(Literal("a"))`) names its member by `null`; a
-checked nested union whose check refuses the value is not its member; a member
-typing an id field of its own (`lineId: Number`) takes a number where the
-member wrapping a string-keyed entity doesn't; and of two members sharing a
-discriminator the first that takes the element decides: one declaring the
-entity's field a string and a `lineId` of its own keeps both as given. A value
-the input takes as no member (an id of the wrong type, which `EDD-9131` then
-names) is judged by the members its literal properties leave it. Up to 1.39.0 any member that could hold the entity
-made the element a ref, so that `line` was replaced by the fetched entity. A
-field declared a scalar (`line: Schema.String`) holds no ref, whatever the
-input gives beside it. The derived input and create schemas transform a
-member of a nested union as they do a direct one, each union rebuilt with its
-own checks, annotations and mode (a union piped through a transformation is
-left as declared); up to 1.39.0 they left a union element as declared, so they
-refused the id `create` took. An element declaring no such field holds no ref, so a
+input). Whether `create` fetches for an element is `inputSchema`'s own decode
+of it (`elementHoldsRef`): the element's input carries a check on each member
+holding a reference that notes the value the member decoded
+(`recordReference`), and the element is hydrated when the decode's output is
+one of those. The member, a union's order and `oneOf` mode, and every check are
+the decode's own, so the judge and `inputSchema` can't disagree. A member's
+input is the member with its field of the entity's name replaced by
+`${field}Id` of the key composite's own schema (`refIdInput`) when that field
+can hold the entity's record (an object, a class, a union holding one,
+`optional` or not), and a managed timestamp optional. Two rules make that
+decode take as the wrapping member every value 1.39.0 hydrated and stored. In
+an element that has a reference member, a member that doesn't declare
+`${field}Id` refuses one: it is decoded from its encoded form with
+`${field}Id` never given (`refusingReferenceAsDeclared`), so its class, checks
+and transformations stay its own. And a union holding a reference member keeps
+no check of its own: each was written for the entity's record, and runs on it
+when `create` decodes the hydrated value. Up to 1.39.0 every element giving a
+string `${field}Id` was hydrated and then decoded, so an earlier member that
+would take it with the id left over (one declaring the entity's field an
+optional string, or not at all, or transforming a field the wrapping member
+doesn't), or a check reading the entity, left the value to the wrapping
+member; it does now. A value `inputSchema` refuses as given (a domain value
+its JSON codec doesn't take, a `Date`) is read by the same walk's input in the
+form `create` takes it, domain or wire values field by field, each refusing
+member rebuilt as a struct the tolerant decode walks (`refusingReference`).
+One neither takes (a stray `${field}Id` on a member holding no ref, a `oneOf`
+value two members take, an id of the wrong type, which `EDD-9131` then names)
+is judged by 1.39.0's rule, a string `${field}Id`, so it is fetched and
+decoded as it was. So a nullable discriminator (`kind: NullOr(Literal("a"))`)
+names its member by `null`; a member typing an id field of its own
+(`lineId: Number`) takes a number where the member wrapping a string-keyed
+entity doesn't; and of two members sharing a discriminator the first that takes
+the element decides: one declaring the entity's field a string and a `lineId`
+of its own keeps both as given. Up to 1.39.0 any member that could hold the
+entity made the element a ref, so that `line` was replaced by the fetched
+entity. A field declared a scalar (`line: Schema.String`) holds no ref,
+whatever the input gives beside it. The derived input and create schemas
+transform a member of a nested union as they do a direct one, each union
+rebuilt with its own annotations and mode, and its own checks unless it holds a
+reference member (a union piped through a transformation is left as declared);
+up to 1.39.0 they left a union element as declared, so they refused the id
+`create` took. An element declaring no such field holds no ref, so a
 `many` edge whose element is the entity's own model, given whole, is stored as
 given: its key field (`lineId` of a `Line`) is its own value. Up to 1.39.0 it
 was taken for a ref because its name was `${field}Id`.
@@ -4085,8 +4099,10 @@ composite (`"5"` for a number key, whose key text `put` never writes), or one
 `put` refuses as DynamoDB can't store it, fails with a `ValidationError`
 (`EDD-9131`) naming where it was given and what it was given (an object by its
 JSON). The second is `put`'s own judgement (`Entity._unstorableKey`: the
-composite in the form `put` stores it in, marshalled as `put` marshals its
-item), so an infinite number is refused anywhere in the id, in a struct, an
+composite encoded through `inputSchema`'s own field as `put` encodes its input,
+then the check `put` runs on what it encoded, `unstorableOf`), so a
+`NumberFromString` id given `"Infinity"`, which `put` stores as that string, is
+fetched, and an infinite number is refused anywhere in the id, in a struct, an
 `Option` or a `Result`: its key text can name an item of another value
 (`{ a: Infinity }` and `{ a: 5 }` compose one), which was fetched in its place. Nothing is fetched or written. Rows already stored are untouched: nothing here changes a
 key.

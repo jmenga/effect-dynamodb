@@ -2119,8 +2119,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
     config.pk.composite,
     config.timestamps,
   )
-  // The dates the library stamps, which a `many` element's input takes optional: `create` judges
-  // an element by the member its input takes (`elementHoldsRef`).
+  // The dates the library stamps, which a `many` element's input takes optional: `create` fetches
+  // for an element when its input's own decode takes it as a member wrapping the entity
+  // (`elementHoldsRef`).
   const refStamps = aggregateStamps(config.timestamps, schemaFields)
 
   /** A stored row's position: its partition and sort key. */
@@ -4488,7 +4489,9 @@ const stripMetadata = (
 /** An edge's entity as hydration fetches it: an operational entity, a pure definition promoted. */
 type RuntimeRefEntity = RefEntity & {
   readonly get: (key: any) => any
-  readonly _unstorableKey: (record: Record<string, unknown>) => UnstorableValue | undefined
+  readonly _unstorableKey: (
+    record: Record<string, unknown>,
+  ) => Effect.Effect<UnstorableValue | undefined>
 }
 
 /** A ref request collected from walking edges */
@@ -4631,7 +4634,7 @@ const hydrateAggregateRefs = (
           ),
         })
       }
-      const unstorable = runtimeEntities
+      const unstorable = yield* runtimeEntities
         .get(req.entity.entityType)!
         ._unstorableKey({ [composite]: req.id.value })
       if (unstorable !== undefined) {
@@ -4831,10 +4834,11 @@ const collectRefIdsFromEdges = (
               at: `${at}${inputKey}[${i}]`,
             })
           } else if (elementHoldsRef(element, entity, elem as Record<string, unknown>, stamps)) {
-            // Element wraps the entity: its input takes it as `${field}Id`
-            // (`deriveElementInputSchema`), decided per member of the element's schema. An
-            // element holding no ref (the entity's own model, given whole, whose `lineId` is its
-            // own value; a member declaring the field a scalar) is stored as given.
+            // Element wraps the entity: the element input's own decode
+            // (`deriveElementInputSchema`) takes it as a member holding the entity as
+            // `${field}Id`. An element it takes as another member (the entity's own model, given
+            // whole, whose `lineId` is its own value; a member declaring the field a scalar) is
+            // stored as given.
             const elemObj = elem as Record<string, unknown>
             const idFieldName = `${entityFieldName}Id`
             const idValue = elemObj[idFieldName]
