@@ -1811,7 +1811,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
   static readonly make: {
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
-      TAggregates extends Record<string, AggregateType<any, any, any>>,
+      TAggregates extends Record<string, AggregateType<any, any, any, any>>,
       TTables extends Record<string, TableLike>,
     >(config: {
       readonly entities: TEntities
@@ -1828,7 +1828,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
 
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
-      TAggregates extends Record<string, AggregateType<any, any, any>>,
+      TAggregates extends Record<string, AggregateType<any, any, any, any>>,
     >(config: {
       readonly entities: TEntities
       readonly aggregates: TAggregates
@@ -1988,7 +1988,7 @@ export interface CollectionQuery<TResult> {
  */
 export type TypedClient<
   TEntities extends Record<string, { readonly _tag: "Entity" }>,
-  TAggregates extends Record<string, AggregateType<any, any, any>> = Record<string, never>,
+  TAggregates extends Record<string, AggregateType<any, any, any, any>> = Record<string, never>,
   TTables extends Record<string, TableLike> = Record<string, TableLike>,
 > = {
   /**
@@ -2067,9 +2067,10 @@ export type TypedClient<
     readonly [K in keyof TAggregates]: TAggregates[K] extends AggregateType<
       infer S,
       infer TKey,
-      infer TInput
+      infer TInput,
+      infer TCreate
     >
-      ? BoundAggregate<S, TKey, TInput>
+      ? BoundAggregate<S, TKey, TInput, TCreate>
       : never
   }
 
@@ -2461,7 +2462,7 @@ const packedFieldConfigs = (
 
 const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
-  readonly aggregates?: Record<string, AggregateType<any, any, any>>
+  readonly aggregates?: Record<string, AggregateType<any, any, any, any>>
   readonly tables?: Record<string, TableLike>
   readonly crypto?: SecureRandom.SecureRandom["Service"]
   readonly embedder?: EmbedderService
@@ -3398,7 +3399,7 @@ const makeFromConfig = (config: {
         {
           tag: EntityLike["_tableTag"]
           entities: EntityLike[]
-          aggregates: AggregateType<any, any, any>[]
+          aggregates: AggregateType<any, any, any, any>[]
         }
       >()
       for (const [, entity] of Object.entries(config.entities)) {

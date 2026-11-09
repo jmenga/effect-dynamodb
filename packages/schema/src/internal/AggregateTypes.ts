@@ -321,6 +321,230 @@ export type AggregateInputType<
   }
 >
 
+// ---------------------------------------------------------------------------
+// What `create` takes
+// ---------------------------------------------------------------------------
+
+/** A model's schema, out of a `DynamoModel.configure` wrapper. */
+type _ModelSchema<M> = M extends { readonly model: infer S; readonly attributes: unknown } ? S : M
+
+/** The schema of the field an edge's entity is keyed by: its key composite's. */
+type _EdgeIdField<Edge> =
+  _EdgeEntity<Edge> extends infer E
+    ? E extends { readonly model: infer M }
+      ? _KeyComposite<E> extends infer C extends string
+        ? _ModelSchema<M> extends { readonly fields: infer F }
+          ? C extends keyof F
+            ? F[C]
+            : never
+          : never
+        : never
+      : never
+    : never
+
+/** The stored form of a field's values. */
+type _StoredForm<F> = F extends { readonly Encoded: infer X } ? X : never
+
+/** The kind of value `T` is. A form of the same kind adds nothing to `T` but would erase a brand. */
+type _Kind<T> = T extends string
+  ? string
+  : T extends number
+    ? number
+    : T extends bigint
+      ? bigint
+      : T extends boolean
+        ? boolean
+        : T extends Date
+          ? Date
+          : never
+
+/** The JSON form of a value JSON has no value for: an ISO string of a date, digits of a bigint. */
+type _JsonText<T> = T extends Date | bigint | DateTime.DateTime ? string : never
+
+/**
+ * Every form `create` takes an id of an edge's entity in (`refIdValue`): a value of its key
+ * composite's type, or that value's stored or JSON form where it is another kind of value (`"5"`
+ * for a `NumberFromString` key, an ISO string for a `Date` key). A form of the id's own kind is left
+ * out: a branded id's stored form is the plain string or number, which would erase the brand, and
+ * no run-time check can see a brand.
+ */
+type _EdgeIdForms<Edge> =
+  | _EdgeIdValue<Edge>
+  | Exclude<
+      _StoredForm<_EdgeIdField<Edge>> | _JsonText<_EdgeIdValue<Edge>>,
+      _Kind<_EdgeIdValue<Edge>>
+    >
+
+type _UnionToIntersection<U> = (U extends unknown ? (k: U) => void : never) extends (
+  k: infer I,
+) => void
+  ? I
+  : never
+
+/**
+ * Each of a record's values at once, alternatives kept: `{ a: A1 | A2, b: B1 | B2 }` is
+ * `(A1 | A2) & (B1 | B2)`. Each value is boxed first, so its own alternatives aren't intersected.
+ */
+type _AllOf<A> = [keyof A] extends [never]
+  ? unknown
+  : _UnionToIntersection<{ [K in keyof A]: { readonly box: A[K] } }[keyof A]> extends infer I
+    ? I extends { readonly box: unknown }
+      ? I["box"]
+      : never
+    : never
+
+/**
+ * A field holding an edge's entity, as `create` takes it: its id under `${field}Id`, or the entity
+ * given whole under its own name. Given both, the id is fetched (`collectRefIdsFromEdges`).
+ */
+type _IdOrWhole<K extends string, Id, V> =
+  | ({ readonly [P in `${K}Id`]: Id } & { readonly [P in K]?: V })
+  | ({ readonly [P in K]: V } & { readonly [P in `${K}Id`]?: undefined })
+
+/**
+ * {@link _IdOrWhole} of a field that may be left out: either, both, or neither. `V` is the field's
+ * value as declared, so it holds `undefined` where the field takes it (`Schema.optional`), and the
+ * id then does too.
+ */
+type _OptionalIdOrWhole<K extends string, Id, V> = {
+  readonly [P in `${K}Id`]?: Id | (undefined extends V ? undefined : never)
+} & {
+  readonly [P in K]?: V
+}
+
+/** An element's fields that can hold the edge's entity (domain type `M`). */
+type _HoldingKeys<T, M> = {
+  [K in keyof T]-?: _HoldsEntity<T[K], M> extends true ? K : never
+}[keyof T] &
+  string
+
+/**
+ * A many edge's element as `create` takes it: each field holding the entity takes its id or the
+ * entity whole, the other fields as they are. Distributes over a union of element members.
+ */
+type _ElementIdsOrWhole<T, Id, M, TStamps> = T extends unknown
+  ? [_HoldingKeys<T, M>] extends [never]
+    ? _OptionalStamps<T, TStamps>
+    : _OptionalStamps<Omit<T, _HoldingKeys<T, M>>, TStamps> &
+        _AllOf<{
+          [K in _HoldingKeys<T, M>]: undefined extends T[K]
+            ? _OptionalIdOrWhole<K, Id, T[K]>
+            : _IdOrWhole<K, Id, T[K]>
+        }>
+  : never
+
+/**
+ * A many edge's elements as `create` takes them, for an edge whose entity (domain type `M`) one id
+ * names: an element that is the entity is its id or the entity whole, in any mix; an element
+ * wrapping it takes, for each field holding it, the id or the entity whole.
+ */
+type _CreateManyEdge<T, Id, TStamps, M> =
+  T extends ReadonlyArray<infer E>
+    ? [E] extends [M]
+      ? ReadonlyArray<Id | _OptionalStamps<E, TStamps>>
+      : ReadonlyArray<_ElementIdsOrWhole<E, Id, M, TStamps>>
+    : _TransformManyEdge<T, Id, TStamps, M>
+
+/** A many edge's input to `create`: {@link _CreateManyEdge} for an entity one id names. */
+type _ManyEdgeCreateInput<T, Edge, TStamps> =
+  _Fetchable<Edge> extends true
+    ? _CreateManyEdge<T, _EdgeIdForms<Edge>, TStamps, _EdgeModelType<Edge>>
+    : _TransformManyEdge<T, never, TStamps, never>
+
+/** The input fields {@link AggregateCreateInputType} replaces: id, many and sub-aggregate edges'. */
+type _CreateReplacedKeys<TEdges> = {
+  [K in keyof TEdges]: _IsIdEdge<TEdges[K]> extends true
+    ? `${K & string}Id`
+    : TEdges[K] extends BoundSubAggregate<any, any>
+      ? K
+      : TEdges[K] extends ManyEdge<any>
+        ? TEdges[K] extends { readonly inputField: infer IF extends string }
+          ? IF
+          : K
+        : never
+}[keyof TEdges]
+
+/**
+ * What an aggregate's `create` takes: its {@link AggregateInputType}, plus what the input schema
+ * leaves to the caller, as `create` takes it at run time.
+ *
+ * - The aggregate's own key composites, which `create` doesn't generate.
+ * - A `ref` or `one` edge whose entity one id names: `${field}Id`, or the entity whole under the
+ *   field's name.
+ * - A many edge over such an entity: each element its id or the entity whole, or, for an element
+ *   wrapping it, each field holding it its id or the entity whole.
+ * - An id in its key composite's type, or its stored or JSON form where that is another kind of
+ *   value ({@link _EdgeIdForms}).
+ * - Sub-aggregates likewise.
+ *
+ * A field otherwise takes its domain value, as `Entity.put` does: neither checks the stored form
+ * of a field's value at the type level, though both decode one at run time.
+ */
+export type AggregateCreateInputType<
+  TModel,
+  TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+  TPK extends ReadonlyArray<string>,
+  TStamps = never,
+> = _Simplify<
+  {
+    // The aggregate's key composites
+    readonly [K in keyof TModel as K extends TPK[number] ? K : never]: TModel[K]
+  } & Omit<AggregateInputType<TModel, TEdges, TPK, TStamps>, _CreateReplacedKeys<TEdges>> &
+    _AllOf<{
+      // A ref or one edge whose entity one id names → its id, or the entity whole
+      [K in keyof TEdges & keyof TModel & string as _IsIdEdge<TEdges[K]> extends true
+        ? K
+        : never]: _IsOptionalIn<TModel, K> extends true
+        ? _OptionalIdOrWhole<
+            K,
+            _EdgeIdForms<TEdges[K]>,
+            | _OptionalStamps<_StripUndefined<TModel[K]>, TStamps>
+            | (undefined extends TModel[K] ? undefined : never)
+          >
+        : _IdOrWhole<K, _EdgeIdForms<TEdges[K]>, _OptionalStamps<TModel[K], TStamps>>
+    }> & {
+      // Required BoundSubAggregate fields → recurse
+      readonly [K in keyof TEdges as TEdges[K] extends BoundSubAggregate<any, any>
+        ? _IsOptionalIn<TModel, K> extends true
+          ? never
+          : K
+        : never]: TEdges[K] extends BoundSubAggregate<infer S, infer E>
+        ? AggregateCreateInputType<Schema.Schema.Type<S>, E, [], TStamps>
+        : never
+    } & {
+      // Optional BoundSubAggregate fields → recurse
+      readonly [K in keyof TEdges as TEdges[K] extends BoundSubAggregate<any, any>
+        ? _IsOptionalIn<TModel, K> extends true
+          ? K
+          : never
+        : never]?: TEdges[K] extends BoundSubAggregate<infer S, infer E>
+        ? AggregateCreateInputType<Schema.Schema.Type<S>, E, [], TStamps>
+        : never
+    } & {
+      // Required ManyEdge fields
+      readonly [K in keyof TEdges as TEdges[K] extends ManyEdge<any>
+        ? _IsOptionalIn<TModel, K> extends true
+          ? never
+          : TEdges[K] extends { readonly inputField: infer IF extends string }
+            ? IF
+            : K
+        : never]: K extends keyof TModel
+        ? _ManyEdgeCreateInput<TModel[K], TEdges[K], TStamps>
+        : never
+    } & {
+      // Optional ManyEdge fields
+      readonly [K in keyof TEdges as TEdges[K] extends ManyEdge<any>
+        ? _IsOptionalIn<TModel, K> extends true
+          ? TEdges[K] extends { readonly inputField: infer IF extends string }
+            ? IF
+            : K
+          : never
+        : never]?: K extends keyof TModel
+        ? _ManyEdgeCreateInput<TModel[K], TEdges[K], TStamps>
+        : never
+    }
+>
+
 /**
  * The field names an aggregate's `timestamps` stamps. A root field of that name that isn't a date is
  * the caller's, and no row of the aggregate is stamped (`resolveSystemFields`, rule b).
