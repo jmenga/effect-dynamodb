@@ -910,10 +910,18 @@ export const kindReadingOf = (
  * by `encode`), the normaliser encodes once more, so `put` stores the key of the
  * value encoded twice. A path handing the caller's value straight to the
  * normaliser encoded it once and composed a key no `put` writes: `Batch.get` of
- * an item `put` wrote returned null. Every other composite is untouched here —
- * an untransformed one, a numeric one stored as a string (the normaliser takes
- * either side), and a codec whose `encode` refuses its own output compose the
- * same key whichever form they come in.
+ * an item `put` wrote returned null.
+ *
+ * A codec inside a wrapper (`Schema.optional(Schema.NumberFromString)`, a union
+ * of a codec and a literal) is encoded here too, as `put` encodes it. The
+ * normaliser takes such a field as it comes, so `put` keys its stored text
+ * (`id_5`), and a caller's `5` composed `id_0000000000000005`, a key `put` never
+ * writes.
+ *
+ * Every other composite is untouched here — an untransformed one, a numeric one
+ * stored as a string (the normaliser takes either side), and a codec whose
+ * `encode` refuses its own output compose the same key whichever form they come
+ * in.
  *
  * A value no step takes is passed through, for the normaliser to refuse.
  */
@@ -930,7 +938,8 @@ export const makeCompositeStoredForm = (
     if (
       field === undefined ||
       numericTypeWithStringEncoding(field) ||
-      !hasEncodingTransformation(field)
+      // No transformation anywhere in it, a wrapper's included: stored as given.
+      SchemaAST.toEncoded(field.ast) === field.ast
     ) {
       cache.set(attr, null)
       return null

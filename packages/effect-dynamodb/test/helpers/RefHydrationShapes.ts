@@ -4,9 +4,11 @@
  * whose identifier is a field other than its key, and one keyed by two composites; a `many` element
  * that is a union wrapping the entity (at the root and in a sub-aggregate); an entity whose key
  * composite is in both halves of its key; entities keyed by a number, a bigint, a `Date`, a
- * `NumberFromString` and a string codec; an element declaring the entity's field a string; and two
- * edges, the second over an entity no one id keys. Shared by `AggregateRefHydration.test.ts` (a
- * recording table) and `connected.aggregate-ref-hydration.test.ts` (DynamoDB Local).
+ * `NumberFromString` and a string codec, alone or in a wrapper; an element declaring the entity's
+ * field a string; union elements with a nullable discriminator, members sharing a discriminator and a
+ * nested union; ids no item is keyed by; and two edges, the second over an entity no one id keys.
+ * Shared by `AggregateRefHydration.test.ts` (a recording table) and
+ * `connected.aggregate-ref-hydration.test.ts` (DynamoDB Local).
  */
 import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -33,6 +35,10 @@ export const fixture = JSON.parse(
     }
   >
 }
+
+/** A value as the fixture's generator wrote it: JSON, a bigint as its digits and `n`. */
+export const json = (value: unknown) =>
+  JSON.stringify(value, (_key, v) => (typeof v === "bigint" ? `${v}n` : v))
 
 // The fixture's definitions: they must stay what its generator declared.
 export const schema = DynamoSchema.make({ name: "hydrate", version: 1 })
@@ -439,6 +445,188 @@ const reviewed: Record<string, () => Shape> = {
   },
 }
 
+/** A union element over `Lines` whose wrapping member's discriminator is nullable. */
+const nullableDiscriminator = (optional: boolean) => {
+  const { Line, model } = lineClass(true)
+  const Lines = lines(model, singleKey)
+  const line = Line.pipe(DynamoModel.ref)
+  const Sheet = Schema.Union([
+    Schema.Struct({
+      kind: Schema.NullOr(Schema.Literal("a")),
+      line: optional ? Schema.optional(line) : line,
+      qty: Schema.Number,
+    }),
+    Schema.Struct({ kind: Schema.String, line: Schema.String, qty: Schema.Number }),
+  ])
+  return { Lines, Sheet }
+}
+
+/**
+ * Shapes a second review found: union elements judged by the member a value is (a nullable
+ * discriminator, a discriminator two members share, a nested union), ids of codecs inside a wrapper,
+ * and ids no item can be keyed by.
+ */
+const reviewedAgain: Record<string, () => Shape> = {
+  ...Object.fromEntries(
+    [false, true].map((optional) => [
+      optional
+        ? "many, element a union with a nullable discriminator, the entity optional"
+        : "many, element a union with a nullable discriminator",
+      (): Shape => {
+        const { Lines, Sheet } = nullableDiscriminator(optional)
+        const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(Sheet) })
+        return {
+          entities: { Lines },
+          make: (base) =>
+            aggregate(Model, base, {
+              lines: Aggregate.many({
+                entityType: "SheetLine",
+                entity: Lines,
+                sk: { composite: ["qty"] },
+              } as never),
+            }),
+          seed: [["Lines", { lineId: "l", f: 5 }]],
+          input: { id: "a", lines: [{ kind: null, lineId: "l", qty: 1 }] },
+        }
+      },
+    ]),
+  ),
+  "sub-aggregate, many, element a union with a nullable discriminator, the entity optional": () => {
+    const { Lines, Sheet } = nullableDiscriminator(true)
+    const Part = Schema.Struct({ lines: Schema.Array(Sheet) })
+    return {
+      entities: { Lines },
+      make: (base) => {
+        const Sub = (Aggregate.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: {
+            lines: Aggregate.many({
+              entityType: "SheetLine",
+              entity: Lines,
+              sk: { composite: ["qty"] },
+            } as never),
+          },
+        })
+        return aggregate(Schema.Struct({ id: Schema.String, part: Part }), base, {
+          part: Sub.with({ discriminator: { side: 1 } }),
+        })
+      },
+      seed: [["Lines", { lineId: "l", f: 5 }]],
+      input: { id: "a", part: { lines: [{ kind: null, lineId: "l", qty: 1 }] } },
+    }
+  },
+  "many, element members sharing a discriminator, one declaring the entity's field a string and its id":
+    () => sharedDiscriminator(false),
+  "many, element a nested union wrapping the entity": () => {
+    const { Line, model } = lineClass(true)
+    const Lines = lines(model, singleKey)
+    const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(nestedSheet(Line)) })
+    return {
+      entities: { Lines },
+      make: (base) =>
+        aggregate(Model, base, {
+          lines: Aggregate.many({
+            entityType: "SheetLine",
+            entity: Lines,
+            sk: { composite: ["qty"] },
+          } as never),
+        }),
+      seed: [["Lines", { lineId: "l", f: 5 }]],
+      input: {
+        id: "a",
+        lines: [
+          { kind: "a", lineId: "l", qty: 1 },
+          { kind: "c", line: "label", qty: 2 },
+        ],
+      },
+    }
+  },
+  "one, an entity keyed by an optional NumberFromString, given its encoded string": keyedBy(
+    Schema.optional(Schema.NumberFromString),
+    5,
+    "5",
+  ),
+  "one, an entity keyed by an optional BigIntFromString, given its encoded string": keyedBy(
+    Schema.optional(Schema.BigIntFromString),
+    5n,
+    "5",
+  ),
+  "one, an entity keyed by a NumberFromString or a literal, given its encoded string": keyedBy(
+    Schema.Union([Schema.NumberFromString, Schema.Literal("none")]),
+    5,
+    "5",
+  ),
+  "one, an entity keyed by an optional NumberFromString, given a number": keyedBy(
+    Schema.optional(Schema.NumberFromString),
+    5,
+    5,
+  ),
+  "one, an entity keyed by an optional string codec": keyedBy(
+    Schema.optional(Prefixed),
+    "MiX",
+    "MiX",
+  ),
+  "one, an entity keyed by a number, given Infinity": keyedBy(Schema.Number, 5, Infinity),
+  "one, an entity keyed by a string, given an object whose toString is text": keyedBy(
+    Schema.String,
+    "l",
+    JSON.parse('{"toString":"x"}'),
+  ),
+}
+
+/**
+ * A union element whose two members share `kind: "a"`: one declares the entity's field a string and
+ * a `lineId` of its own, the other wraps the entity. `refFirst` puts the wrapping member first.
+ */
+export const sharedDiscriminator = (refFirst: boolean): Shape => {
+  const { Line, model } = lineClass(true)
+  const Lines = lines(model, singleKey)
+  const scalar = Schema.Struct({
+    kind: Schema.Literal("a"),
+    line: Schema.String,
+    lineId: Schema.String,
+    qty: Schema.Number,
+  })
+  const wrapping = Schema.Struct({
+    kind: Schema.Literal("a"),
+    line: Line.pipe(DynamoModel.ref),
+    qty: Schema.Number,
+  })
+  const Sheet = Schema.Union(refFirst ? [wrapping, scalar] : [scalar, wrapping])
+  const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(Sheet) })
+  return {
+    entities: { Lines },
+    make: (base) =>
+      aggregate(Model, base, {
+        lines: Aggregate.many({
+          entityType: "SheetLine",
+          entity: Lines,
+          sk: { composite: ["qty"] },
+        } as never),
+      }),
+    seed: [["Lines", { lineId: "l", f: 5 }]],
+    input: { id: "a", lines: [{ kind: "a", line: "KEEP", lineId: "l", qty: 1 }] },
+  }
+}
+
+/** A union element nesting a union: two members wrapping the entity, and one declaring it a string. */
+export const nestedSheet = (Line: Schema.Top) =>
+  Schema.Union([
+    Schema.Union([
+      Schema.Struct({
+        kind: Schema.Literal("a"),
+        line: Line.pipe(DynamoModel.ref),
+        qty: Schema.Number,
+      }),
+      Schema.Struct({
+        kind: Schema.Literal("b"),
+        line: Schema.optional(Line.pipe(DynamoModel.ref)),
+        qty: Schema.Number,
+      }),
+    ]),
+    Schema.Struct({ kind: Schema.Literal("c"), line: Schema.String, qty: Schema.Number }),
+  ])
+
 export const SHAPES: Record<string, () => Shape> = {
   "many, element the entity's struct, given whole": () => {
     const Line = lineStruct()
@@ -483,6 +671,7 @@ export const SHAPES: Record<string, () => Shape> = {
   "many, element wraps an entity keyed by two composites": () => twoComposites("many"),
   "one, an entity keyed by two composites": () => twoComposites("one"),
   ...reviewed,
+  ...reviewedAgain,
 }
 
 export const byKey = (rows: ReadonlyArray<Row>) =>
@@ -513,6 +702,13 @@ export const CONTROLS = [
   "one, an entity keyed by a Date, given its ISO string",
   "one, an entity keyed by a NumberFromString, given its encoded string",
   "many, ids of an entity keyed by a NumberFromString, given encoded strings",
+  "many, element a union with a nullable discriminator",
+  "many, element a union with a nullable discriminator, the entity optional",
+  "sub-aggregate, many, element a union with a nullable discriminator, the entity optional",
+  "many, element a nested union wrapping the entity",
+  "one, an entity keyed by an optional NumberFromString, given its encoded string",
+  "one, an entity keyed by an optional BigIntFromString, given its encoded string",
+  "one, an entity keyed by a NumberFromString or a literal, given its encoded string",
 ]
 export const UNFETCHABLE = [
   "many, element wraps an entity keyed by two composites",
@@ -521,7 +717,8 @@ export const UNFETCHABLE = [
 /**
  * An id of the key composite's own type, which 1.39.0 dropped (so a required edge failed decoding
  * and an optional one was created without it), or fetched under a key `Entity.put` never wrote (a
- * string codec, which `put` applies twice): each is now fetched by the key `put` wrote.
+ * string codec, which `put` applies twice, or keys as stored inside a wrapper): each is now fetched
+ * by the key `put` wrote.
  */
 export const NOW_FETCHED = [
   "one, an entity keyed by a number, given a number",
@@ -530,4 +727,12 @@ export const NOW_FETCHED = [
   "one, an entity keyed by a bigint, the edge optional",
   "one, an entity keyed by a string codec",
   "many, ids of an entity keyed by a number, given numbers",
+  "one, an entity keyed by an optional NumberFromString, given a number",
+  "one, an entity keyed by an optional string codec",
 ]
+/** Ids no item can be keyed by, which 1.39.0 dropped: each fails with `EDD-9131`, nothing fetched. */
+export const UNKEYABLE = {
+  "one, an entity keyed by a number, given Infinity": "is given Infinity",
+  "one, an entity keyed by a string, given an object whose toString is text":
+    'is given an object ({"toString":"x"})',
+} as const

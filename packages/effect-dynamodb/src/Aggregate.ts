@@ -175,6 +175,8 @@ import {
 } from "@effect-dynamodb/schema/internal/AggregateCursor.js"
 import type { AggregateEdge, RefEntity } from "@effect-dynamodb/schema/internal/AggregateEdges.js"
 import {
+  type AggregateStamps,
+  aggregateStamps,
   deriveAggregateSchemas,
   deriveEntityFieldName,
   elementHoldsRef,
@@ -182,6 +184,7 @@ import {
   manyEdgePaths,
   manyElementFields,
   manyElementSchema,
+  refIdStorable,
   refIdValue,
   refKeyComposite,
   refKeyComposites,
@@ -2112,6 +2115,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
     config.pk.composite,
     config.timestamps,
   )
+  // The dates the library stamps, which a `many` element's input takes optional: `create` judges
+  // an element by the member its input takes (`elementHoldsRef`).
+  const refStamps = aggregateStamps(config.timestamps, schemaFields)
 
   /** A stored row's position: its partition and sort key. */
   const positionOf = (pk: string, sk: string): string => `${pk}\u0000${sk}`
@@ -3371,6 +3377,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             config.edges,
             schemaFields,
             aggregateName,
+            refStamps,
           )
 
           // 2. Validate via schema decode (decodeSchema substitutes nested edge
@@ -4488,6 +4495,17 @@ interface RefRequest {
   readonly at: string
 }
 
+/** An object as given, to name it in an error, whatever its `toString` (a JSON body's may be text). */
+const describeObject = (value: object): string => {
+  try {
+    const json = JSON.stringify(value)
+    if (json !== undefined) return json
+  } catch {
+    // A cycle, or a `toJSON` that throws: named by its kind below.
+  }
+  return Object.prototype.toString.call(value)
+}
+
 /** An id as given, to name it in an error. */
 const describeId = (id: unknown): string =>
   typeof id === "string"
@@ -4497,8 +4515,10 @@ const describeId = (id: unknown): string =>
       : id instanceof Date
         ? `a Date (${Number.isNaN(id.getTime()) ? "invalid" : id.toISOString()})`
         : typeof id === "object" && id !== null
-          ? `an object (${String(id)})`
-          : String(id)
+          ? `an object (${describeObject(id)})`
+          : typeof id === "function"
+            ? "a function"
+            : String(id)
 
 /** An id as `RefNotFound` names it. */
 const refIdText = (id: unknown): string =>
@@ -4518,6 +4538,7 @@ const hydrateAggregateRefs = (
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
   fields: Record<string, Schema.Top> | undefined,
   aggregateName: string,
+  stamps: AggregateStamps,
 ): Effect.Effect<
   Record<string, unknown>,
   RefNotFound | DynamoClientError | ValidationError,
@@ -4526,7 +4547,7 @@ const hydrateAggregateRefs = (
   Effect.gen(function* () {
     // Collect all ref IDs from the entire input hierarchy
     const refRequests: RefRequest[] = []
-    collectRefIdsFromEdges(refRequests, input, edges, fields, [], "")
+    collectRefIdsFromEdges(refRequests, input, edges, fields, stamps, [], "")
 
     if (refRequests.length === 0) return input
 
@@ -4566,18 +4587,33 @@ const hydrateAggregateRefs = (
 
     // An id that is no value of the key composite names no item: up to 1.39.0 a string was
     // fetched under a key no `put` writes (`lineid_5` for a number), and anything else was dropped.
+    // Nor does one `put` can't store (an infinite number): it was fetched, and found nothing.
     for (const req of refRequests) {
-      if (Option.isSome(req.id)) continue
-      return yield* new ValidationError({
-        entityType: aggregateName,
-        operation: "aggregate.create",
-        cause: new Error(
-          `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
-            `which is no value of "${refKeyComposite(req.entity)}", the attribute entity ` +
-            `"${req.entity.entityType}" is keyed by, so it names no item to fetch. Give an id of ` +
-            `that attribute's type. Nothing was fetched or written.`,
-        ),
-      })
+      const composite = refKeyComposite(req.entity)
+      if (Option.isNone(req.id)) {
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.create",
+          cause: new Error(
+            `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
+              `which is no value of "${composite}", the attribute entity ` +
+              `"${req.entity.entityType}" is keyed by, so it names no item to fetch. Give an id of ` +
+              `that attribute's type. Nothing was fetched or written.`,
+          ),
+        })
+      }
+      if (!refIdStorable(req.entity, req.id.value)) {
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.create",
+          cause: new Error(
+            `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
+              `which no item of entity "${req.entity.entityType}" can be keyed by: DynamoDB stores ` +
+              `no infinite number, so \`put\` refuses one for "${composite}". Give a finite id. ` +
+              `Nothing was fetched or written.`,
+          ),
+        })
+      }
     }
 
     // Each id's key, composed before anything is fetched: one with no key text (`NaN`,
@@ -4715,6 +4751,8 @@ const collectRefIdsFromEdges = (
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
   /** The fields of the schema `input` is a value of: a `many` element's schema is read off it. */
   fields: Record<string, Schema.Top> | undefined,
+  /** The dates the aggregate stamps, which an element's input takes optional. */
+  stamps: AggregateStamps,
   path: ReadonlyArray<string>,
   /** Where `input` is, to name an id in an error: `""` at the root, `"sub."` under `sub`. */
   at: string,
@@ -4746,6 +4784,7 @@ const collectRefIdsFromEdges = (
           subInput as Record<string, unknown>,
           bound.aggregate.edges,
           fieldsOf(bound.aggregate.schema),
+          stamps,
           [...path, edgeName],
           `${at}${edgeName}.`,
         )
@@ -4773,7 +4812,7 @@ const collectRefIdsFromEdges = (
               idFieldName: String(i),
               at: `${at}${inputKey}[${i}]`,
             })
-          } else if (elementHoldsRef(element, entity, elem as Record<string, unknown>)) {
+          } else if (elementHoldsRef(element, entity, elem as Record<string, unknown>, stamps)) {
             // Element wraps the entity: its input takes it as `${field}Id`
             // (`deriveElementInputSchema`), decided per member of the element's schema. An
             // element holding no ref (the entity's own model, given whole, whose `lineId` is its

@@ -8,8 +8,10 @@
  * `"MiX"` under the key text `x:x:mix`. The standalone `get` and `delete` do the same (`encodeKey`,
  * then the key form). Up to 1.39.0 `Batch.get`, `Batch.write` deletes, `transactGet`, and
  * `transactWrite` deletes and condition checks applied the key form alone, so they composed
- * `x:mix` and found, deleted and checked nothing. For every key whose `encode` doesn't take its own
- * output, the key is what 1.39.0 composed, byte for byte.
+ * `x:mix` and found, deleted and checked nothing. A codec inside a wrapper (`Schema.optional`, a
+ * union) is keyed by `put` as its stored text, which the key form takes as it comes (`itemid_5`);
+ * those paths keyed the caller's domain value (`itemid_0000000000000005`). For every other key, the
+ * key is what 1.39.0 composed, byte for byte.
  */
 
 import { it } from "@effect/vitest"
@@ -20,6 +22,7 @@ import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Expression from "../src/Expression.js"
+import { composePrimaryKey } from "../src/internal/TransactableOps.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
@@ -181,9 +184,23 @@ describe("a key whose encode doesn't take its own output composes as on 1.39.0",
       Schema.DateTimeUtcFromString,
       [DateTime.makeUnsafe("2024-01-02T03:04:05.000Z"), "2024-01-02T03:04:05.000Z"],
     ],
+    ["an optional string", Schema.optional(Schema.String), ["MiX"]],
+    ["an optional literal", Schema.optional(Schema.Literals(["a", "b"])), ["a"]],
+    ["an optional number", Schema.optional(Schema.Number), [5, -1.5]],
+    ["an optional bigint", Schema.optional(Schema.BigInt), [5n]],
+    [
+      "an optional Date",
+      Schema.optional(Schema.Date),
+      [new Date("2024-01-02T03:04:05.000Z"), "2024-01-02T03:04:05.000Z"],
+    ],
+    [
+      "an optional DateTimeUtc",
+      Schema.optional(Schema.DateTimeUtc),
+      [DateTime.makeUnsafe("2024-01-02T03:04:05.000Z"), "2024-01-02T03:04:05.000Z"],
+    ],
   ]
   for (const [what, keySchema, values] of cases)
-    it(`${what}: the caller's key is taken as the key form took it`, () => {
+    it(`${what}: the caller's key composes the key 1.39.0 composed`, () => {
       class Item extends Schema.Class<Item>("Item")({ itemId: keySchema as never }) {}
       const Items = Entity.make({
         model: Item,
@@ -193,7 +210,109 @@ describe("a key whose encode doesn't take its own output composes as on 1.39.0",
           sk: { field: "sk", composite: [] },
         },
       } as never) as unknown as Entity.Entity
+      Table.make({ schema, entities: { Items } } as never)
+      // 1.39.0 composed `composePrimaryKey` of the caller's key; the domain key form adds a step.
       for (const value of values)
-        expect(Items._domainKeyForm({ itemId: value })).toEqual(Items._keyForm({ itemId: value }))
+        expect(composePrimaryKey(Items, Items._domainKeyForm({ itemId: value }))).toEqual(
+          composePrimaryKey(Items, { itemId: value }),
+        )
     })
+})
+
+describe("a codec inside a wrapper composes the key Entity.put wrote", () => {
+  // `put` encodes the input, then keys the stored text as it comes: `id_5`, `id_x:mix`. Up to
+  // 1.39.0 a multi-item op keyed the caller's domain value instead: `5` composed the padded
+  // `itemid_0000000000000005` and `"MiX"` composed `itemid_mix`, keys no `put` writes, so it found,
+  // checked and deleted nothing. The stored text given (`"5"`) composed the key `put` wrote, and still
+  // does.
+  const cases: ReadonlyArray<
+    readonly [string, Schema.Top, unknown, string, ReadonlyArray<unknown>]
+  > = [
+    ["an optional NumberFromString", Schema.optional(Schema.NumberFromString), 5, "5", [5, "5"]],
+    ["an optional BigIntFromString", Schema.optional(Schema.BigIntFromString), 5n, "5", [5n, "5"]],
+    [
+      "a NumberFromString or a literal",
+      Schema.Union([Schema.NumberFromString, Schema.Literal("none")]),
+      5,
+      "5",
+      [5, "5"],
+    ],
+    ["an optional string codec", Schema.optional(Prefixed), "MiX", "x:mix", ["MiX"]],
+  ]
+  for (const [what, keySchema, value, keyText, given] of cases) {
+    class Item extends Schema.Class<Item>("Item")({
+      itemId: keySchema as never,
+      n: Schema.Number,
+    }) {}
+    const Items = Entity.make({
+      model: Item,
+      entityType: "Item",
+      primaryKey: {
+        pk: { field: "pk", composite: ["itemId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    } as never) as any
+    const Wrapped = Table.make({ schema, entities: { Items } } as never) as any
+    const key = { pk: { S: `$codec#v1#item#itemid_${keyText}` }, sk: { S: "$codec#v1#item" } }
+    const withItem = (
+      body: (
+        db: any,
+        table: ReturnType<typeof makeRecordingTable>,
+      ) => Effect.Effect<void, unknown, any>,
+    ) => {
+      const table = makeRecordingTable()
+      return Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: { Items },
+          tables: { Wrapped },
+        } as never) as Effect.Effect<any>
+        yield* db.entities.Items.put({ itemId: value, n: 1 }).asEffect()
+        expect([...table.items.values()].map((row: any) => ({ pk: row.pk, sk: row.sk }))).toEqual([
+          key,
+        ])
+        table.take()
+        yield* body(db, table)
+      }).pipe(
+        Effect.provide(Wrapped.layer({ name: "t" })),
+        Effect.provide(table.layer),
+      ) as Effect.Effect<void>
+    }
+    for (const id of given) {
+      const as =
+        typeof id === "string" && typeof value !== "string" ? "its stored text" : "its value"
+      it.effect(`${what}, given ${as}: Batch.get and transactGet find it`, () =>
+        withItem((db, table) =>
+          Effect.gen(function* () {
+            const [batch] = yield* Batch.get([db.entities.Items.get({ itemId: id })])
+            const [transact] = yield* Transaction.transactGet([
+              db.entities.Items.get({ itemId: id }),
+            ])
+            expect(batch).toMatchObject({ itemId: value, n: 1 })
+            expect(transact).toMatchObject({ itemId: value, n: 1 })
+            expect(keysSent(table.take())).toEqual([key, key])
+          }),
+        ),
+      )
+    }
+    it.effect(`${what}: a check tests it, and Batch.write and transactWrite delete it`, () =>
+      withItem((db, table) =>
+        Effect.gen(function* () {
+          yield* Transaction.transactWrite([
+            Transaction.check(
+              db.entities.Items.get({ itemId: value }),
+              Expression.condition({ attributeExists: "n" }),
+            ),
+          ])
+          yield* Batch.write([db.entities.Items.delete({ itemId: value })])
+          expect(table.items.size).toBe(0)
+          expect(keysSent(table.take())).toEqual([key, key])
+          yield* db.entities.Items.put({ itemId: value, n: 1 }).asEffect()
+          table.take()
+          yield* Transaction.transactWrite([db.entities.Items.delete({ itemId: value })])
+          expect(table.items.size).toBe(0)
+          expect(keysSent(table.take())).toEqual([key])
+        }),
+      ),
+    )
+  }
 })

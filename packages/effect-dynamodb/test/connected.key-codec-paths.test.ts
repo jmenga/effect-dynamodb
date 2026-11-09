@@ -62,9 +62,18 @@ const Base = Table.make({ schema, entities: { Docs } })
 
 type Row = Record<string, AttributeValue>
 
+/** The entity a test puts its item with, on a table holding it. */
+type Setup = {
+  readonly member: string
+  readonly entities: Record<string, unknown>
+  readonly base: any
+  readonly item: Record<string, unknown>
+}
+const docs: Setup = { member: "Docs", entities: { Docs }, base: Base, item: { docId: "MiX", n: 1 } }
+
 let tables = 0
 /** Puts the item on a fresh table, runs `body`, and returns its result and the rows left. */
-const run = <A>(body: (db: any) => Effect.Effect<A, unknown, any>) => {
+const run = <A>(body: (db: any) => Effect.Effect<A, unknown, any>, setup: Setup = docs) => {
   const tableName = `key-codec-${Date.now()}-${tables++}`
   return Effect.acquireUseRelease(
     Effect.gen(function* () {
@@ -84,8 +93,11 @@ const run = <A>(body: (db: any) => Effect.Effect<A, unknown, any>) => {
     }),
     () =>
       Effect.gen(function* () {
-        const db: any = yield* DynamoClient.make({ entities: { Docs }, tables: { Base } })
-        yield* db.entities.Docs.put({ docId: "MiX", n: 1 }).asEffect()
+        const db: any = yield* DynamoClient.make({
+          entities: setup.entities,
+          tables: { Base: setup.base },
+        } as never) as Effect.Effect<any>
+        yield* db.entities[setup.member].put(setup.item).asEffect()
         const result = yield* Effect.exit(body(db))
         const rows = yield* Effect.promise(async () => {
           const scan = await raw.send(
@@ -101,7 +113,7 @@ const run = <A>(body: (db: any) => Effect.Effect<A, unknown, any>) => {
         yield* client.deleteTable({ TableName: tableName })
       }).pipe(Effect.ignore),
   ).pipe(
-    Effect.provide(Layer.merge(ClientLayer, Base.layer({ name: tableName }))),
+    Effect.provide(Layer.merge(ClientLayer, setup.base.layer({ name: tableName }))),
   ) as unknown as Effect.Effect<{ result: Exit.Exit<A, unknown>; rows: ReadonlyArray<Row> }>
 }
 
@@ -162,4 +174,93 @@ describeConnected("a multi-item op composes the key Entity.put wrote (connected)
       expect(rows).toEqual([])
     }),
   )
+})
+
+describeConnected("a codec inside a wrapper composes the key Entity.put wrote (connected)", () => {
+  // Up to 1.39.0 a multi-item op keyed a domain `5` as the padded `itemid_0000000000000005` and a
+  // domain `"MiX"` as `itemid_mix`, keys no `put` writes.
+  const cases: ReadonlyArray<
+    readonly [string, Schema.Top, unknown, string, ReadonlyArray<unknown>]
+  > = [
+    ["an optional NumberFromString", Schema.optional(Schema.NumberFromString), 5, "5", [5, "5"]],
+    ["an optional BigIntFromString", Schema.optional(Schema.BigIntFromString), 5n, "5", [5n, "5"]],
+    [
+      "a NumberFromString or a literal",
+      Schema.Union([Schema.NumberFromString, Schema.Literal("none")]),
+      5,
+      "5",
+      [5, "5"],
+    ],
+    ["an optional string codec", Schema.optional(Prefixed), "MiX", "x:mix", ["MiX"]],
+  ]
+  for (const [what, keySchema, value, keyText, given] of cases) {
+    class Item extends Schema.Class<Item>("Item")({
+      itemId: keySchema as never,
+      n: Schema.Number,
+    }) {}
+    const Items = Entity.make({
+      model: Item,
+      entityType: "Item",
+      primaryKey: {
+        pk: { field: "pk", composite: ["itemId"] },
+        sk: { field: "sk", composite: [] },
+      },
+    } as never) as any
+    const setup: Setup = {
+      member: "Items",
+      entities: { Items },
+      base: Table.make({ schema, entities: { Items } } as never),
+      item: { itemId: value, n: 1 },
+    }
+    it.effect(`${what}: put keys its stored text, and Batch.get and transactGet find it`, () =>
+      Effect.gen(function* () {
+        const { result, rows } = yield* run(
+          (db) =>
+            Effect.all(
+              given.flatMap((id) => [
+                Batch.get([db.entities.Items.get({ itemId: id })]),
+                Transaction.transactGet([db.entities.Items.get({ itemId: id })]),
+              ]),
+            ),
+          setup,
+        )
+        expect(rows.map((row) => row.pk?.S)).toEqual([`$codec#v1#item#itemid_${keyText}`])
+        expect(Exit.isSuccess(result) && result.value.map(([found]) => found)).toEqual(
+          given.flatMap(() => [
+            expect.objectContaining({ itemId: value, n: 1 }),
+            expect.objectContaining({ itemId: value, n: 1 }),
+          ]),
+        )
+      }),
+    )
+    it.effect(`${what}: a check tests it, and a Batch.write delete deletes it`, () =>
+      Effect.gen(function* () {
+        const { result, rows } = yield* run(
+          (db) =>
+            Effect.gen(function* () {
+              yield* Transaction.transactWrite([
+                Transaction.check(
+                  db.entities.Items.get({ itemId: value }),
+                  Expression.condition({ attributeExists: "n" }),
+                ),
+              ])
+              yield* Batch.write([db.entities.Items.delete({ itemId: value })])
+            }),
+          setup,
+        )
+        expect(Exit.isSuccess(result)).toBe(true)
+        expect(rows).toEqual([])
+      }),
+    )
+    it.effect(`${what}: a transactWrite delete deletes it`, () =>
+      Effect.gen(function* () {
+        const { result, rows } = yield* run(
+          (db) => Transaction.transactWrite([db.entities.Items.delete({ itemId: value })]),
+          setup,
+        )
+        expect(Exit.isSuccess(result)).toBe(true)
+        expect(rows).toEqual([])
+      }),
+    )
+  }
 })

@@ -5,10 +5,11 @@
  * or whose identifier is another field, is fetched by its key's only composite, and writes the rows
  * 1.39.0 wrote for the same shape with its identifier on the key; an entity no one id keys fails with
  * `EDD-9129`, nothing written. 1.39.0 died on each of these. Shapes 1.39.0 hydrated as it should
- * (union elements, a key composite in both halves, `Date` and `NumberFromString` keys) write and read
- * what it did; an id of the key composite's own type 1.39.0 dropped, or fetched under a key `put`
- * never wrote (a string codec), is fetched by the key `put` wrote; an id of no type of it fails with
- * `EDD-9131`, nothing written.
+ * (union elements, a key composite in both halves, `Date` and `NumberFromString` keys, alone or in a
+ * wrapper) write and read what it did; an id of the key composite's own type 1.39.0 dropped, or
+ * fetched under a key `put` never wrote (a string codec), is fetched by the key `put` wrote; an id
+ * of no type of it, or one no item is keyed by, fails with `EDD-9131`, nothing written. A union
+ * element is read as the member it is.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -26,11 +27,14 @@ import {
   byKey,
   CONTROLS,
   fixture,
+  json,
   NOW_FETCHED,
   SHAPES,
   type Shape,
   schema,
+  sharedDiscriminator,
   UNFETCHABLE,
+  UNKEYABLE,
   WRITES_AS,
 } from "./helpers/RefHydrationShapes.js"
 
@@ -138,9 +142,7 @@ describeConnected(
           const { create, rows, get } = yield* run(SHAPES[label]!())
           expect(Exit.isSuccess(create)).toBe(true)
           expect(byKey(rows)).toEqual(byKey(fixture.shapes[writesAs]!.rows))
-          expect(Exit.isSuccess(get) && `ok ${JSON.stringify(get.value)}`).toBe(
-            fixture.shapes[writesAs]!.get,
-          )
+          expect(Exit.isSuccess(get) && `ok ${json(get.value)}`).toBe(fixture.shapes[writesAs]!.get)
         }),
       )
     }
@@ -166,13 +168,11 @@ describeConnected(
       it.effect(`${label}: writes and reads what 1.39.0 did`, () =>
         Effect.gen(function* () {
           const { create, rows, get } = yield* run(SHAPES[label]!())
-          expect(Exit.isSuccess(create) && `ok ${JSON.stringify(create.value)}`).toBe(
+          expect(Exit.isSuccess(create) && `ok ${json(create.value)}`).toBe(
             fixture.shapes[label]!.create,
           )
           expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
-          expect(Exit.isSuccess(get) && `ok ${JSON.stringify(get.value)}`).toBe(
-            fixture.shapes[label]!.get,
-          )
+          expect(Exit.isSuccess(get) && `ok ${json(get.value)}`).toBe(fixture.shapes[label]!.get)
         }),
       )
     }
@@ -207,6 +207,7 @@ describeConnected(
     for (const [label, code] of [
       ["one, an entity keyed by a number, given a numeric string", "[EDD-9131]"],
       ["one and one, the second an entity keyed by two composites", "[EDD-9129]"],
+      ...Object.keys(UNKEYABLE).map((label) => [label, "[EDD-9131]"] as const),
     ] as const) {
       it.effect(`${label}: create fails with ${code}, nothing written`, () =>
         Effect.gen(function* () {
@@ -216,6 +217,23 @@ describeConnected(
         }),
       )
     }
+
+    it.effect("members sharing a discriminator: judged by the member the element is", () =>
+      Effect.gen(function* () {
+        const scalarFirst = yield* run(
+          SHAPES[
+            "many, element members sharing a discriminator, one declaring the entity's field a string and its id"
+          ]!(),
+        )
+        const kept = { id: "a", lines: [{ kind: "a", line: "KEEP", lineId: "l", qty: 1 }] }
+        expect(Exit.isSuccess(scalarFirst.create) && scalarFirst.create.value).toEqual(kept)
+        expect(Exit.isSuccess(scalarFirst.get) && scalarFirst.get.value).toEqual(kept)
+        const refFirst = yield* run(sharedDiscriminator(true))
+        const hydrated = { id: "a", lines: [{ kind: "a", line: { lineId: "l", f: 5 }, qty: 1 }] }
+        expect(Exit.isSuccess(refFirst.create) && refFirst.create.value).toEqual(hydrated)
+        expect(Exit.isSuccess(refFirst.get) && refFirst.get.value).toEqual(hydrated)
+      }),
+    )
 
     it.effect("an element declaring the entity's field a string is stored as given", () =>
       Effect.gen(function* () {

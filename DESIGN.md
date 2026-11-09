@@ -4032,11 +4032,21 @@ elements of a `many` edge given as ids, and the `${field}Id` of a `many`
 element wrapping the entity in a field of its own (`PlayerSheet.player`, the
 field `deriveEntityFieldName` names, as `deriveElementInputSchema` derives the
 input). Whether an element wraps the entity is read off its schema
-(`elementHoldsRef`), per member of a union: the member its discriminator
-literals name, and among those, one whose field of that name can hold the
-entity's record (an object, a class, a union holding one, `optional` or not). A
+(`elementHoldsRef`), by the member of a union the element is: the first member,
+nested unions flattened, whose input form takes it, the order in which the
+derived input schema decodes it. A member's input form is the member with its
+field of the entity's name replaced by `${field}Id` when that field can hold
+the entity's record (an object, a class, a union holding one, `optional` or
+not), decoded tolerantly (domain or wire values, managed timestamps optional).
+So a nullable discriminator (`kind: NullOr(Literal("a"))`) names its member by
+`null`, and of two members sharing a discriminator the first that takes the
+element decides: one declaring the entity's field a string and a `lineId` of
+its own keeps both as given. Up to 1.39.0 any member that could hold the entity
+made the element a ref, so that `line` was replaced by the fetched entity. A
 field declared a scalar (`line: Schema.String`) holds no ref, whatever the
-input gives beside it. An element declaring no such field holds no ref, so a
+input gives beside it. The derived input and create schemas transform a
+member of a nested union as they do a direct one; up to 1.39.0 they left it
+as declared, so they refused the id `create` took. An element declaring no such field holds no ref, so a
 `many` edge whose element is the entity's own model, given whole, is stored as
 given: its key field (`lineId` of a `Line`) is its own value. Up to 1.39.0 it
 was taken for a ref because its name was `${field}Id`.
@@ -4045,7 +4055,8 @@ Each id is a value of the entity's primary key's only distinct composite
 (`refKeyComposite`; an attribute in both halves of the key is one attribute),
 of that attribute's type (`refIdValue`): the value itself (`5` of a number,
 `5n` of a bigint, a `Date`), or what its stored form or JSON form decodes to
-(`"5"` of a `NumberFromString` or of a bigint, an ISO string of a date). Up to
+(`"5"` of a `NumberFromString` or of a bigint, an ISO string of a date), for a
+codec inside a wrapper (`Schema.optional(Schema.NumberFromString)`) too. Up to
 1.39.0 only a string was taken: a number or bigint id was dropped, so a
 required edge failed decoding and an optional one was created without it. Each
 id is fetched by `Batch.get` of the entity's own `get`, so the key is the key
@@ -4058,9 +4069,10 @@ the key (`Missing composite attribute`).
 Every id is judged before anything is fetched. An entity keyed by more than
 one distinct composite, or none, has nothing one id names: `create` fails with
 a `ValidationError` (`EDD-9129`) naming the edge. An id of no type of the key
-composite (`"5"` for a number key, whose key text `put` never writes) fails
-with a `ValidationError` (`EDD-9131`) naming where it was given. Nothing is
-fetched or written. Rows already stored are untouched: nothing here changes a
+composite (`"5"` for a number key, whose key text `put` never writes), or one
+no item can be keyed by (an infinite number, which `put` refuses), fails with a
+`ValidationError` (`EDD-9131`) naming where it was given and what it was given
+(an object by its JSON). Nothing is fetched or written. Rows already stored are untouched: nothing here changes a
 key.
 
 **Update with diff:**
@@ -6264,7 +6276,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackOtherwise`, `fieldAtPath`, `storedFieldAtPath`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. A dotted composite is followed through what holds each segment, and a time-series `appendInput`'s own fields are refused as the model's are, as is one declaring the other kind than the model. In the same places, the value of a field whose kinds can't be read at load (`Schema.Unknown`, `Schema.Any`, an opaque declaration, a transform whose stored side is one) that reads back as something else is refused at write with a `ValidationError` naming the field, with nothing written; an aggregate's dotted `many` edge composite is judged at write through the field holding it (`throughFieldJudge`), never by the value at its path alone. A field no key reads may store both (§7 "Both numeric kinds"). |
 | `EDD-9129` | `Aggregate.ts` (`hydrateAggregateRefs`, `refKeyComposite`) | An aggregate `create` is given an id for an edge whose `entity` is keyed by more than one distinct primary-key composite, or none, so no one id names one item to fetch (an attribute in both halves of the key is one composite). A `ValidationError` naming the edge and the key's composites, judged for every edge before anything is fetched or written. Up to 1.39.0 the fetch died composing the key (`Missing composite attribute`). |
 | `EDD-9130` | `DynamoClient.ts` (`make`), through `Aggregate.ts` (`ownershipConflict`) | An aggregate declaring `ownsRows` beside another member the client sees that can write a row of one of its entity types into its partition: the message names the aggregate, the member, the type and the channel. A defect from `DynamoClient.make`, as `EDD-9037` is (§7 "Which rows in its partition are an aggregate's"). |
-| `EDD-9131` | `Aggregate.ts` (`hydrateAggregateRefs`, `refIdValue`) | An aggregate `create` is given an id that is no value of the edge's entity's key composite, neither of its type nor its stored or JSON form (`"5"` for a number key), so it names no item. A `ValidationError` naming where the id was given, the composite and the entity, judged before anything is fetched or written. Up to 1.39.0 a string was fetched under a key no `put` writes (`RefNotFound`), and anything else was dropped. |
+| `EDD-9131` | `Aggregate.ts` (`hydrateAggregateRefs`, `refIdValue`) | An aggregate `create` is given an id that is no value of the edge's entity's key composite, neither of its type nor its stored or JSON form (`"5"` for a number key), so it names no item; or an id of its type no item can be keyed by (`Infinity`, which `put` refuses for the composite). A `ValidationError` naming where the id was given, what it was given, the composite and the entity, judged before anything is fetched or written. Up to 1.39.0 a string was fetched under a key no `put` writes (`RefNotFound`), and anything else was dropped. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
 
 Next free code: none below `9141` (`9129` and `9131`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.

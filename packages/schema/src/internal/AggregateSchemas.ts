@@ -14,7 +14,12 @@ import type {
 } from "./AggregateTypes.js"
 import { bothKindsKeyRefusal, storedFieldAtPath } from "./CompositeCodec.js"
 import type { TimestampsConfig } from "./EntityConfig.js"
-import { optionalField, type ResolvedSystemFields, resolveSystemFields } from "./EntitySchemas.js"
+import {
+  optionalField,
+  type ResolvedSystemFields,
+  resolveSystemFields,
+  substituteSchemaDeep,
+} from "./EntitySchemas.js"
 import {
   extractArrayElement as extractArrayElementImpl,
   extractKeyedValue,
@@ -202,9 +207,21 @@ const managedDates = (
 }
 
 /** `timestamps`, and the names it stamps on this aggregate's rows. */
-interface AggregateStamps {
+export interface AggregateStamps {
   readonly config: TimestampsConfig | undefined
   readonly names: ReadonlySet<string>
+}
+
+/** An aggregate's {@link AggregateStamps}: its `timestamps`, over its root model's fields. */
+export const aggregateStamps = (
+  timestamps: TimestampsConfig | undefined,
+  fields: Record<string, Schema.Top> | undefined,
+): AggregateStamps => {
+  const own = resolveAggregateStamps(timestamps, fields, "Aggregate")
+  return {
+    config: timestamps,
+    names: new Set([own.createdAt, own.updatedAt].filter((name) => name !== null)),
+  }
 }
 
 /** A managed date's input field: optional, supplied or not. */
@@ -278,11 +295,12 @@ export const deriveAggregateSchemas = <
     AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
   >
 > => {
-  const own = resolveAggregateStamps(timestamps, getSchemaFields(schema), "Aggregate")
-  return deriveWithStamps(schema, edges, pkComposites, {
-    config: timestamps,
-    names: new Set([own.createdAt, own.updatedAt].filter((name) => name !== null)),
-  }) as never
+  return deriveWithStamps(
+    schema,
+    edges,
+    pkComposites,
+    aggregateStamps(timestamps, getSchemaFields(schema)),
+  ) as never
 }
 
 const deriveWithStamps = (
@@ -477,6 +495,19 @@ export const refIdValue = (entity: RefEntity, value: unknown): Option.Option<unk
   return Option.isSome(fromJson) ? fromJson : Schema.decodeUnknownOption(codec)(value)
 }
 
+/**
+ * Whether an id ({@link refIdValue}'s value) is one an item can be keyed by: its stored form, its key
+ * composite's field encoding it, is no infinite number. DynamoDB stores none, so `put` refuses one.
+ */
+export const refIdStorable = (entity: RefEntity, id: unknown): boolean => {
+  const field = refIdField(entity)
+  const stored =
+    field === undefined
+      ? id
+      : Option.getOrElse(Schema.encodeUnknownOption(field as Schema.Codec<unknown>)(id), () => id)
+  return !(typeof stored === "number" && (stored === Infinity || stored === -Infinity))
+}
+
 /** A type AST's members, `undefined` and `null` left out: a union's, flattened, or the type itself. */
 const astMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> => {
   if (SchemaAST.isUnion(ast)) return ast.types.flatMap((member) => astMembers(member))
@@ -526,17 +557,31 @@ const holdsRecordAst = (ast: SchemaAST.AST): boolean =>
 /** {@link holdsRecordAst} of a field's schema. */
 export const holdsRecord = (field: Schema.Top): boolean => holdsRecordAst(field.ast)
 
-/** The literals a property is limited to, or `undefined`: a discriminator of a union's members. */
-const propertyLiterals = (ast: SchemaAST.AST): ReadonlyArray<unknown> | undefined => {
-  const members = astMembers(ast)
-  if (members.length === 0) return undefined
-  const found: Array<unknown> = []
-  for (const member of members) {
-    if (SchemaAST.isLiteral(member)) found.push(member.literal)
-    else if (SchemaAST.isEnum(member)) found.push(...member.enums.map(([, value]) => value))
-    else return undefined
+/** The values a type is limited to (literals, `null`, `undefined`), or `undefined` when it isn't. */
+const literalValues = (ast: SchemaAST.AST): ReadonlyArray<unknown> | undefined => {
+  if (SchemaAST.isUnion(ast)) {
+    const found: Array<unknown> = []
+    for (const member of ast.types) {
+      const values = literalValues(member)
+      if (values === undefined) return undefined
+      found.push(...values)
+    }
+    return found
   }
-  return found
+  if (SchemaAST.isLiteral(ast)) return [ast.literal]
+  if (SchemaAST.isEnum(ast)) return ast.enums.map(([, value]) => value)
+  if (SchemaAST.isNull(ast)) return [null]
+  if (SchemaAST.isUndefined(ast)) return [undefined]
+  return undefined
+}
+
+/**
+ * The values a property is limited to, or `undefined`: a discriminator of a union's members. A
+ * nullable one (`Schema.NullOr(Schema.Literal("a"))`) takes `null` too.
+ */
+const propertyLiterals = (ast: SchemaAST.AST): ReadonlyArray<unknown> | undefined => {
+  const values = literalValues(ast)
+  return values === undefined || values.length === 0 ? undefined : values
 }
 
 /** Whether `value` can be a value of an object member: each literal property it has, matched. */
@@ -548,42 +593,142 @@ const matchesLiterals = (
     const literals = propertyLiterals(property.type)
     if (literals === undefined) return true
     const given = value[String(property.name)]
-    if (given === undefined) return SchemaAST.isOptional(property.type)
+    if (given === undefined) {
+      return SchemaAST.isOptional(property.type) || literals.includes(undefined)
+    }
     return literals.includes(given)
   })
 
+/** A member of a `many` element's schema, as `create` judges a value of it. */
+interface ElementMember {
+  /** Whether a value of this member holds a ref of the entity, under `${field}Id`. */
+  readonly holdsRef: boolean
+  /** Its object properties, `undefined` for a member that isn't an object. */
+  readonly properties: ReadonlyArray<SchemaAST.PropertySignature> | undefined
+  /**
+   * Whether a value is one of this member as the element's input takes it
+   * (`deriveElementInputSchema`): the entity's field as `${field}Id`, a stamped date optional, and
+   * each field in its domain or its stored form.
+   */
+  readonly takes: (value: unknown) => boolean
+}
+
+const elementMembers = new WeakMap<
+  AggregateStamps | typeof NO_STAMPS,
+  WeakMap<Schema.Top, WeakMap<RefEntity, ReadonlyArray<ElementMember>>>
+>()
+const NO_STAMPS = { config: undefined, names: new Set<string>() } satisfies AggregateStamps
+
+/** A schema's decode that takes a value in its domain form or its stored form, either side. */
+const takesEitherForm = (schema: Schema.Top): ((value: unknown) => boolean) => {
+  try {
+    const tolerant = substituteSchemaDeep(schema, {
+      tolerantTransforms: true,
+      decodeOnly: true,
+      domainValues: true,
+    })
+    const decode = Schema.decodeUnknownOption(tolerant as Schema.Codec<unknown>)
+    return (value) => Option.isSome(decode(value))
+  } catch {
+    // A schema the substitution can't walk: the member is judged by its literals alone.
+    return () => false
+  }
+}
+
+/**
+ * The members of a `many` element's schema, nested unions flattened in the order a union decodes
+ * them, each with whether it holds a ref of `entity` and the value its input takes.
+ */
+const judgeElementMembers = (
+  element: Schema.Top,
+  entity: RefEntity,
+  stamps: AggregateStamps | undefined,
+): ReadonlyArray<ElementMember> => {
+  const byStamps = stamps ?? NO_STAMPS
+  let bySchema = elementMembers.get(byStamps)
+  if (bySchema === undefined) {
+    bySchema = new WeakMap()
+    elementMembers.set(byStamps, bySchema)
+  }
+  let byEntity = bySchema.get(element)
+  if (byEntity === undefined) {
+    byEntity = new WeakMap()
+    bySchema.set(element, byEntity)
+  }
+  const cached = byEntity.get(entity)
+  if (cached !== undefined) return cached
+
+  const name = deriveEntityFieldName(entity)
+  const judged = astMembers(element.ast).map((member): ElementMember => {
+    const properties = astProperties(member)
+    if (properties === undefined) {
+      // Not an object: a scalar or a declaration (a date) is a value, not a wrapper, and anything
+      // else (`Schema.Unknown`, a `suspend`) says nothing of what it holds.
+      return {
+        holdsRef: !isScalarOrList(member) && !SchemaAST.isDeclaration(member),
+        properties,
+        takes: takesEitherForm(Schema.make(member)),
+      }
+    }
+    const property = properties.find((candidate) => candidate.name === name)
+    const holdsRef =
+      property === undefined
+        ? // A record (`Schema.Record`) holds whatever keys it's given.
+          SchemaAST.isObjects(member) && member.indexSignatures.length > 0
+        : holdsRecordAst(property.type)
+    const fields = Object.fromEntries(
+      properties.map((candidate) => [String(candidate.name), Schema.make(candidate.type)]),
+    ) as Record<string, Schema.Top>
+    const managed = stamps === undefined ? new Set<string>() : managedDates(stamps, fields)
+    if (!(property !== undefined && holdsRef) && managed.size === 0) {
+      return { holdsRef, properties, takes: takesEitherForm(Schema.make(member)) }
+    }
+    // The member as its input takes it: the entity's field as `${field}Id`, any id (one of the
+    // wrong type is refused by `create`, naming it, `EDD-9131`), and a stamped date optional.
+    const input: Record<string, Schema.Top> = {}
+    for (const [field, schema] of Object.entries(fields)) {
+      if (field === name && holdsRef) {
+        input[`${field}Id`] = (
+          SchemaAST.isOptional(schema.ast) ? Schema.optionalKey(Schema.Unknown) : Schema.Unknown
+        ) as Schema.Top
+      } else {
+        input[field] = managed.has(field) ? stampInput(schema) : schema
+      }
+    }
+    return { holdsRef, properties, takes: takesEitherForm(Schema.Struct(input as never)) }
+  })
+  byEntity.set(entity, judged)
+  return judged
+}
+
 /**
  * Whether a `many` element value holds a ref of `entity`, under the `${field}Id` its input takes
- * (`deriveElementInputSchema`): decided per member of the element's schema, the members its literal
- * properties (a union's discriminator) leave it. A member holds one when its property named for the
- * entity (`deriveEntityFieldName`) can hold the entity's record ({@link holdsRecord}). One that
- * declares no such property, the entity's own model among them (`lineId` of a `Line` is its own
- * value), or declares it a scalar, holds none. What the schema says nothing of (no element schema,
- * a member that isn't an object) is taken to hold one, as it always was.
+ * (`deriveElementInputSchema`), decided by the member of the element's schema the value is, as the
+ * element's input decodes it: the first member, nested unions flattened, whose input takes it. A
+ * member holds one when its property named for the entity (`deriveEntityFieldName`) can hold the
+ * entity's record ({@link holdsRecord}). One that declares no such property, the entity's own model
+ * among them (`lineId` of a `Line` is its own value), or declares it a scalar, holds none: a value of
+ * such a member keeps what it was given, even where another member shares its discriminator.
+ *
+ * A value no member's input takes is judged by the members its literal properties (a union's
+ * discriminator, `null` included) leave it: it holds one when any of them does. What the schema
+ * says nothing of (no element schema, a member that isn't an object) is taken to hold one, as it
+ * always was.
  */
 export const elementHoldsRef = (
   element: Schema.Top | undefined,
   entity: RefEntity,
   value: Record<string, unknown>,
+  stamps?: AggregateStamps,
 ): boolean => {
   if (element === undefined) return true
-  const name = deriveEntityFieldName(entity)
-  const members = astMembers(element.ast)
-  const judged = members.map((member) => ({ member, properties: astProperties(member) }))
+  const judged = judgeElementMembers(element, entity, stamps)
+  const taken = judged.find((member) => member.takes(value))
+  if (taken !== undefined) return taken.holdsRef
   const candidates = judged.filter(
     ({ properties }) => properties === undefined || matchesLiterals(properties, value),
   )
-  return (candidates.length > 0 ? candidates : judged).some(({ member, properties }) => {
-    // Not an object: a scalar or a declaration (a date) is a value, not a wrapper, and anything
-    // else (`Schema.Unknown`, a `suspend`) says nothing of what it holds.
-    if (properties === undefined) return !isScalarOrList(member) && !SchemaAST.isDeclaration(member)
-    const property = properties.find((candidate) => candidate.name === name)
-    if (property === undefined) {
-      // A record (`Schema.Record`) holds whatever keys it's given.
-      return SchemaAST.isObjects(member) && member.indexSignatures.length > 0
-    }
-    return holdsRecordAst(property.type)
-  })
+  return (candidates.length > 0 ? candidates : judged).some((member) => member.holdsRef)
 }
 
 /**
@@ -631,19 +776,29 @@ export const deriveElementInputSchema = (
     return refIdInput(fetched)
   }
 
-  if (elemFields) return deriveElementMember(elemSchema, elemFields, fetched, stamps)
+  return deriveElementUnion(elemSchema, fetched, stamps)
+}
 
-  // A union of members: each member holding the entity takes its id, as `create` decides per
-  // member (`elementHoldsRef`).
-  const members = (elemSchema as { readonly members?: unknown }).members
-  if (!Array.isArray(members)) return elemSchema
-  const derived = (members as ReadonlyArray<Schema.Top>).map((member) => {
-    const fields = getSchemaFields(member)
-    return fields === undefined ? member : deriveElementMember(member, fields, fetched, stamps)
-  })
+/**
+ * An element, or a member of a union of them, as its input takes it: a member with fields through
+ * {@link deriveElementMember}, and a union, nested ones included, member by member, as `create`
+ * decides per member (`elementHoldsRef`). The schema itself when nothing changes.
+ */
+const deriveElementUnion = (
+  schema: Schema.Top,
+  fetched: RefEntity | undefined,
+  stamps: AggregateStamps | undefined,
+): Schema.Top => {
+  const fields = getSchemaFields(schema)
+  if (fields !== undefined) return deriveElementMember(schema, fields, fetched, stamps)
+  const members = (schema as { readonly members?: unknown }).members
+  if (!SchemaAST.isUnion(schema.ast) || !Array.isArray(members)) return schema
+  const derived = (members as ReadonlyArray<Schema.Top>).map((member) =>
+    deriveElementUnion(member, fetched, stamps),
+  )
   return derived.some((member, i) => member !== members[i])
     ? Schema.Union(derived as never)
-    : elemSchema
+    : schema
 }
 
 /**
