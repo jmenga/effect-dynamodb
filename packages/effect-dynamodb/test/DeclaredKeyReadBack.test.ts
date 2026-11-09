@@ -48,7 +48,7 @@ const definitionsOf = (field: Schema.Top) => {
     unique: { byF: ["f"] },
   } as never) as any
   const Main = Table.make({
-    schema: DynamoSchema.make({ name: "declared", version: 1 }),
+    schema: DynamoSchema.make({ name: "declared", version: 1, escapeKeys: false }),
     entities: { Soft, Unique },
   } as never) as any
   return { Soft, Unique, Main }
