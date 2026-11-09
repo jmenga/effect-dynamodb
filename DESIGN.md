@@ -5073,6 +5073,18 @@ instance).
   TTL is opt-in. Entity `get`, `Batch.get` and `Transaction.transactGet`
   report them as absent. A later event restarts from `initial`. Removal is
   refused for read models with `unique` / `retain` / `softDelete` features.
+  The entity's `create` (single-item and transactional) takes a tombstone's
+  place, carrying its kept fields over with the revision one higher. Each
+  projection with `removal` records its layout (kept fields, revision) on the
+  read model (`_projectionTombstones`): one entry per distinct layout, the one
+  defined last at the end (a layout defined again moves there). A tombstone
+  holds only its projection's fields, so `create` carries those of the layout
+  naming the most of the tombstone's attributes: with several projections on
+  one read model, the fields of the one that wrote it. Of layouts naming as
+  many, the one defined last, which is the layout every tombstone took when the
+  read model kept a single entry, so a tombstone two layouts can't tell apart
+  is read as before. One layout sends and stores exactly what a single entry
+  did.
 - **The outbox** writes effects as items (`<entityType>#outbox`, sort key
   `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
   in the row's transaction. `drain` claims the head item (a conditional update

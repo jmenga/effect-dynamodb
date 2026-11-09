@@ -211,7 +211,7 @@ EventStore.multiProjection({
 ## 9. Review round 2
 
 - **`create` over a tombstone keeps the projection's checkpoints.**
-  - A projection with `removal` records its kept fields and revision on the read model (`_projectionTombstones`).
+  - A projection with `removal` records its kept fields and revision on the read model (`_projectionTombstones`), beside those of the read model's other projections: one entry per distinct layout, the one defined last at the end. `create` carries the fields of the layout naming the most of the tombstone's attributes, so with several projections, the fields of the one that wrote the tombstone. Of layouts naming as many, the one defined last, the layout a single entry held.
   - `create` keeps its plain not-exists guard, but on such an entity it first reads the key. If the key holds the entity's tombstone, `create` copies the tombstone's kept fields over the input, sets the revision one higher, and guards on that tombstone (`__edd_e__` and `__edd_removed__`).
   - The transactional `create` does the same, through `Entity._overTombstone`.
   - A late redelivery is still recognised as applied, so it can't remove the created row.

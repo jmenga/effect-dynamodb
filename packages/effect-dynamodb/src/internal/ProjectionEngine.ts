@@ -52,6 +52,7 @@ import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
+  addProjectionTombstones,
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
@@ -355,11 +356,13 @@ export const makeEngine = (config: EngineConfig) => {
   // one, which may come after the projection is defined.
   // Rows may be tombstones (#154): the entity's `create` takes one's place,
   // keeping these fields — the checkpoints — and the revision one higher.
+  // Recorded beside the layouts of the read model's other projections, so
+  // `create` keeps the fields of the projection whose tombstone it replaces.
   if (config.removal !== undefined) {
-    ;(readModel as { _projectionTombstones?: unknown })._projectionTombstones = {
+    addProjectionTombstones(readModel, {
       kept: keptFields.filter((f) => f !== config.revision?.field),
       revision: config.revision?.field,
-    }
+    })
   }
 
   // An outbox on another table: that table's `rekey` moves its items (#171).

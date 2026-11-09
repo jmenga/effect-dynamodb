@@ -36,17 +36,67 @@ export interface ProjectionTombstones {
   readonly revision: string | undefined
 }
 
-/** @internal */
-export const projectionTombstonesOf = (entity: object): ProjectionTombstones | undefined =>
-  (entity as { readonly _projectionTombstones?: ProjectionTombstones })._projectionTombstones
+/**
+ * @internal Every layout the read model's projections with `removal` record, one entry per distinct
+ * layout, the one defined last at the end; `undefined` when none does.
+ */
+export const projectionTombstonesOf = (
+  entity: object,
+): ReadonlyArray<ProjectionTombstones> | undefined =>
+  (entity as { readonly _projectionTombstones?: ReadonlyArray<ProjectionTombstones> })
+    ._projectionTombstones
+
+/**
+ * @internal Record a projection's tombstone layout on its read model, beside those of the other
+ * projections defined on it. A layout already there moves to the end rather than being added again:
+ * a projection defined over and over (in a function, say) doesn't grow the list, and the layout at
+ * the end is always the one defined last.
+ */
+export const addProjectionTombstones = (entity: object, layout: ProjectionTombstones): void => {
+  const holder = entity as { _projectionTombstones?: ReadonlyArray<ProjectionTombstones> }
+  const same = (other: ProjectionTombstones) =>
+    other.revision === layout.revision &&
+    other.kept.length === layout.kept.length &&
+    other.kept.every((field, i) => field === layout.kept[i])
+  holder._projectionTombstones = [
+    ...(holder._projectionTombstones ?? []).filter((other) => !same(other)),
+    layout,
+  ]
+}
+
+/**
+ * The layout of the projection that wrote `tombstone`. A tombstone holds that projection's kept
+ * fields and revision and nothing else of the model, so it is the layout naming the most of the
+ * tombstone's attributes. Of layouts naming as many, the one defined last: the layout every
+ * tombstone took before a read model kept more than one, so a tombstone two layouts can't tell
+ * apart is read as it always was. With one layout, that one.
+ */
+const layoutOf = (
+  layouts: ReadonlyArray<ProjectionTombstones>,
+  tombstone: Record<string, unknown>,
+  dbName: (field: string) => string,
+): ProjectionTombstones => {
+  let best = layouts[layouts.length - 1]!
+  if (layouts.length === 1) return best
+  let most = -1
+  for (const layout of layouts) {
+    const fields = layout.revision === undefined ? layout.kept : [...layout.kept, layout.revision]
+    const held = fields.filter((field) => tombstone[dbName(field)] !== undefined).length
+    if (held >= most) {
+      best = layout
+      most = held
+    }
+  }
+  return best
+}
 
 /**
  * @internal `create` over a projection tombstone (#154): read the key, and
- * when it holds the entity's tombstone, carry the projection's kept fields
- * over into `item` (stored names, wire values) — its checkpoints, so a late
- * redelivery is still recognised — with the revision one higher, and return
- * the guard naming that very tombstone. `None` when there is no tombstone:
- * `create`'s own guard applies.
+ * when it holds the entity's tombstone, carry the kept fields of the
+ * projection that wrote it over into `item` (stored names, wire values) — its
+ * checkpoints, so a late redelivery is still recognised — with the revision
+ * one higher, and return the guard naming that very tombstone. `None` when
+ * there is no tombstone: `create`'s own guard applies.
  */
 export const overTombstone = (
   entity: {
@@ -64,8 +114,8 @@ export const overTombstone = (
   item: Record<string, unknown>,
 ): Effect.Effect<Option.Option<ConditionInput>, DynamoClientError> =>
   Effect.gen(function* () {
-    const layout = projectionTombstonesOf(entity)
-    if (layout === undefined) return Option.none()
+    const layouts = projectionTombstonesOf(entity)
+    if (layouts === undefined) return Option.none()
     const primary = entity.indexes.primary!
     const { Item } = yield* client.getItem({
       TableName: tableName,
@@ -82,6 +132,7 @@ export const overTombstone = (
       entity._renameToDynamo(probe)
       return Object.keys(probe)[0] ?? field
     }
+    const layout = layoutOf(layouts, tomb, dbName)
     for (const field of layout.kept) {
       const name = dbName(field)
       if (tomb[name] !== undefined) item[name] = tomb[name]
