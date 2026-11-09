@@ -14,8 +14,11 @@ import * as Aggregate from "../src/Aggregate.js"
 import * as Collection from "../src/Collection.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as EventStore from "../src/EventStore.js"
+import * as Expression from "../src/Expression.js"
 import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const kinds = [
@@ -202,6 +205,101 @@ describe("an aggregate's delete reports an inexact key as it reports any key it 
           Effect.provide(table.layer),
         ) as Effect.Effect<void, unknown>
       })
+    }
+  }
+})
+
+describe("a transaction refuses an op's inexact key, or a put its schema refuses, before any op reads", () => {
+  // Every op is checked and composed before the first read of any op: a guarded
+  // put, a retain put or a planned update reads first, and used to read before
+  // another op's key was found to have no text, or its put item refused. The
+  // put's value is refused by its schema (`Expected number`), the delete's and
+  // the check's key by its composite's kind (`EDD-9050`).
+  const transactions = ["Transaction.transactWrite", "EventStore.append"] as const
+  const guards = ["a unique put", "a retain put", "a unique update"] as const
+  const bads = ["delete", "check", "put"] as const
+  for (const path of transactions) {
+    for (const guard of guards) {
+      // An EventStore append's additional items carry no updates.
+      if (path === "EventStore.append" && guard === "a unique update") continue
+      for (const bad of bads) {
+        for (const first of [false, true]) {
+          it.effect(`${path}: a ${bad} ${first ? "before" : "after"} ${guard}`, () => {
+            const schema = DynamoSchema.make({ name: "inexactt", version: 1 })
+            const E = Entity.make({
+              model: Schema.Struct({ id: Schema.String, n: Schema.Number }),
+              entityType: "E",
+              primaryKey: {
+                pk: { field: "pk", composite: ["n"] },
+                sk: { field: "sk", composite: ["id"] },
+              },
+            }) as any
+            const G = Entity.make({
+              model: Schema.Struct({ id: Schema.String, code: Schema.String }),
+              entityType: "Guarded",
+              primaryKey: {
+                pk: { field: "pk", composite: ["id"] },
+                sk: { field: "sk", composite: [] },
+              },
+              ...(guard === "a retain put"
+                ? { versioned: { retain: true } }
+                : { unique: { code: ["code"] } }),
+            } as never) as any
+            const Main = Table.make({ schema, entities: { E, G } } as never) as any
+            const Log = EventStore.makeStream({
+              table: Main,
+              streamName: "Log",
+              events: [Schema.TaggedStruct("Logged", { note: Schema.String })],
+              streamId: { composite: ["id"] },
+            } as never) as any
+            const table = makeRecordingTable()
+            return Effect.gen(function* () {
+              const db = yield* DynamoClient.make({
+                entities: { E, G },
+                tables: { Main },
+              } as never) as Effect.Effect<any, never, any>
+              const e = db.entities.E
+              const g = db.entities.G
+              yield* g.put({ id: "guarded", code: "before" }).asEffect()
+              table.take()
+              const stored = structuredClone([...table.items])
+              const good =
+                guard === "a unique update"
+                  ? g.update({ id: "guarded" }).set({ code: "after" })
+                  : g.put({ id: "guarded", code: "after" })
+              const key = { id: "bad", n: 9007199254740993n }
+              const refused =
+                bad === "delete"
+                  ? e.delete(key)
+                  : bad === "check"
+                    ? Transaction.check(e.get(key), Expression.condition({ attributeExists: "id" }))
+                    : e.put(key)
+              const ops = first ? [refused, good] : [good, refused]
+              const exit = yield* Effect.exit(
+                path === "Transaction.transactWrite"
+                  ? Transaction.transactWrite(ops)
+                  : Log.append({ id: "log" }, [{ _tag: "Logged", note: "event" }], 0, {
+                      additionalItems: ops,
+                    }),
+              )
+              expect(Exit.isFailure(exit)).toBe(true)
+              if (Exit.isFailure(exit)) {
+                expect(exit.cause.reasons[0]!._tag).toBe("Fail")
+                const error = Cause.squash(exit.cause) as any
+                expect(error._tag).toBe("ValidationError")
+                expect(String(error.cause?.message ?? error.cause)).toContain(
+                  bad === "put" ? "Expected number" : "EDD-9050",
+                )
+              }
+              expect(table.requests).toEqual([])
+              expect([...table.items]).toEqual(stored)
+            }).pipe(
+              Effect.provide(Main.layer({ name: "t" })),
+              Effect.provide(table.layer),
+            ) as Effect.Effect<void, unknown>
+          })
+        }
+      }
     }
   }
 })

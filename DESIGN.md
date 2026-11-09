@@ -3468,7 +3468,11 @@ entity's own op (`Entity._planUpdate` / `_planDelete`): the op runs with its
 write recorded instead of sent (`internal/TransactPlan.planWrite`), and its
 items join the transaction as a guarded write, read by the same verdict
 contract as a guarded put. `EventStore.append` plans none, and still refuses
-those deletes (EDD-9048).
+those deletes (EDD-9048). Every op is checked and composed before any op reads
+(`prepareTransactWriteOps`): what an op can't carry, a put's item and a delete's,
+a check's or a planned op's key are refused or built first, and reused, so a
+value a schema refuses or a key with no text fails the transaction with nothing
+read, wherever the op sits in it.
 
 **`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an
 existing item to version 1 under a new incarnation. So `Batch.write` sends these

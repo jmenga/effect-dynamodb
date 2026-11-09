@@ -845,6 +845,8 @@ export interface Entity<
   readonly _planUpdate: (
     key: unknown,
     state: UpdateState,
+    /** `key` through {@link _encodeKey}: refused before any op of the transaction reads. */
+    encoded: globalThis.Record<string, unknown>,
   ) => Effect.Effect<TransactPlan, PlanUpdateError, DynamoClient | TableConfig>
 
   /**
@@ -861,7 +863,19 @@ export interface Entity<
       readonly condition: Expr | ConditionInput | undefined
       readonly mustExist: boolean
     },
+    /** `key` through {@link _encodeKey}: refused before any op of the transaction reads. */
+    encoded: globalThis.Record<string, unknown>,
   ) => Effect.Effect<TransactPlan, PlanDeleteError, DynamoClient | TableConfig>
+
+  /**
+   * @internal A key as the entity's own ops take it: encoded through its key schema, and its
+   * primary key composed, a composite with no key text a `ValidationError`. What
+   * `Transaction.transactWrite` checks of a planned op before any op reads.
+   */
+  readonly _encodeKey: (
+    key: unknown,
+    operation: string,
+  ) => Effect.Effect<globalThis.Record<string, unknown>, ValidationError>
 
   /**
    * @internal Which of this entity's rows are items: a row is live iff the
@@ -8969,7 +8983,8 @@ const makeImpl = <
    */
   const planned = <E, R>(
     operation: string,
-    key: unknown,
+    /** The key, through `encodeKey`. */
+    encodedKey: globalThis.Record<string, unknown>,
     /** The op itself — a factory, because a missing row means running it again. */
     op: () => Effect.Effect<unknown, E, R>,
     request: {
@@ -8982,7 +8997,6 @@ const makeImpl = <
     },
   ) =>
     Effect.gen(function* () {
-      const encodedKey = yield* encodeKey(key, `${operation}.decodeKey`)
       const primaryKey = composePrimaryKey(encodedKey)
       const ownKey = toAttributeMap(primaryKey)
       const plan = (rowMissing?: { readonly rowMissing: true }) =>
@@ -9188,8 +9202,12 @@ const makeImpl = <
     })
 
   /** Compile an update for `Transaction.transactWrite` — see `_planUpdate`. */
-  const planUpdate = (key: unknown, uState: UpdateState) =>
-    planned("transactWrite.update", key, () => updateOrCreate(key, "native", uState), {
+  const planUpdate = (
+    key: unknown,
+    uState: UpdateState,
+    encodedKey: globalThis.Record<string, unknown>,
+  ) =>
+    planned("transactWrite.update", encodedKey, () => updateOrCreate(key, "native", uState), {
       payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
       deltas: {
         ...uState.add,
@@ -9755,10 +9773,11 @@ const makeImpl = <
       readonly condition: Expr | ConditionInput | undefined
       readonly mustExist: boolean
     },
+    encodedKey: globalThis.Record<string, unknown>,
   ) =>
     planned(
       "transactWrite.delete",
-      key,
+      encodedKey,
       () => del(key)._builder({ ...opts, returnValues: undefined }),
       { payload: {}, callerCondition: opts.condition !== undefined },
     )
@@ -14616,8 +14635,8 @@ const makeImpl = <
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
-    _planUpdate: (key: unknown, state: UpdateState) =>
-      planUpdate(key, state).pipe(
+    _planUpdate: (key: unknown, state: UpdateState, encoded: globalThis.Record<string, unknown>) =>
+      planUpdate(key, state, encoded).pipe(
         // Planning stops at the write, so only what an update raises BEFORE
         // writing can surface; anything else is a defect (`isPlanUpdateError`).
         Effect.catch((e: unknown) => (isPlanUpdateError(e) ? Effect.fail(e) : Effect.die(e))),
@@ -14625,10 +14644,12 @@ const makeImpl = <
     _planDelete: (
       key: unknown,
       opts: { readonly condition: Expr | ConditionInput | undefined; readonly mustExist: boolean },
+      encoded: globalThis.Record<string, unknown>,
     ) =>
-      planDelete(key, opts).pipe(
+      planDelete(key, opts, encoded).pipe(
         Effect.catch((e: unknown) => (isPlanDeleteError(e) ? Effect.fail(e) : Effect.die(e))),
       ),
+    _encodeKey: encodeKey,
     _liveRows: liveRows,
     _rekeyProjectionRow: rekeyProjectionRow,
     _keyTextMark: (key: globalThis.Record<string, unknown>) =>

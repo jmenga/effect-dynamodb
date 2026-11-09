@@ -325,134 +325,74 @@ export interface BuiltTransactWriteItems {
   readonly keys: () => KeyAttributes
 }
 
-/**
- * The read pre-pass that lets `Transaction.transactWrite` carry the ops the
- * build step below cannot: every `update`, and every `delete` of an entity
- * whose delete writes more than its own row (`unique`, `versioned: { retain:
- * true }`, `softDelete` — EDD-9048). Each is planned by the entity's own op
- * (`Entity._planUpdate` / `_planDelete`): the standalone op itself, run with
- * its write recorded instead of sent, so the transaction writes exactly what
- * the standalone op would have — every read, item and guard included.
- *
- * Ops a planned write cannot carry are refused before anything is read
- * (EDD-9059 – EDD-9061, `rejectUnsupportedOp`). Returns the plans keyed by
- * index into `operations`; ops that need no plan are absent. Run on every
- * attempt, so a transaction cancelled by a lost race is planned again from
- * fresh reads.
- */
-export const planTransactWriteOps = (
-  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
-): Effect.Effect<
-  ReadonlyMap<number, TransactPlan>,
-  ValidationError | PlanUpdateError | PlanDeleteError,
-  DynamoClient | TableConfig
-> =>
-  Effect.gen(function* () {
-    const plans = new Map<number, TransactPlan>()
-    for (let opIndex = 0; opIndex < operations.length; opIndex++) {
-      const op = operations[opIndex]
-      if (op != null && typeof op === "object" && ConditionCheckTypeId in op) continue
-      const info = extractTransactable(op)
-      if (info === undefined) continue
-      if (info.opType === "update" && info.updateState !== undefined) {
-        yield* rejectUnsupportedOp(info.entity, "transactWrite", "update", undefined, undefined, {
-          updateState: info.updateState,
-        })
-        plans.set(opIndex, yield* info.entity._planUpdate(info.key, info.updateState))
-      } else if (
-        info.opType === "delete" &&
-        info.deleteRequest !== undefined &&
-        info.entity._multiItemWriteFeatures.length > 0
-      ) {
-        yield* rejectUnsupportedOp(info.entity, "transactWrite", "delete", undefined, undefined, {
-          returnValues: info.deleteRequest.returnValues,
-          readsStoredRow: true,
-        })
-        plans.set(
-          opIndex,
-          yield* info.entity._planDelete(info.key, {
-            condition: info.deleteRequest.condition,
-            mustExist: info.deleteRequest.mustExist,
-          }),
-        )
-      }
-    }
-    return plans
-  })
+/** A put's item, built and validated (`validateAndBuildPutItem`). */
+type BuiltPut = Effect.Success<ReturnType<typeof validateAndBuildPutItem>>
+
+/** One caller op, with everything its items need that takes no read. */
+interface PreparedOp {
+  readonly type: "put" | "delete" | "conditionCheck" | "planned"
+  readonly putKind?: "put" | "create" | "upsert" | undefined
+  readonly entity: Entity
+  /** Index into the caller's `operations` array — preserved for provenance. */
+  readonly opIndex: number
+  readonly input?: Record<string, unknown> | undefined
+  readonly condition?: ExpressionResult | undefined
+  /** The caller's own condition — what a `create` over a tombstone keeps. */
+  readonly callerCondition?: Expr | ConditionInput | undefined
+  /** A put's item. */
+  readonly built?: BuiltPut | undefined
+  /** A delete's or a check's primary key. */
+  readonly primaryKey?: Record<string, unknown> | undefined
+  /** A planned op's plan, from its own read: its key is already encoded and composed. */
+  readonly plan?:
+    | (() => Effect.Effect<
+        TransactPlan,
+        ValidationError | PlanUpdateError | PlanDeleteError,
+        DynamoClient | TableConfig
+      >)
+    | undefined
+}
 
 /**
- * Compile a list of Entity write ops into marshalled `TransactWriteItems` entries,
- * preserving caller order.
- *
- * **One caller op may emit several items.** A put of a versioned or
- * unique-constrained entity is a guarded put (#133): it reads the item, and
- * emits the item guarded on what was read, plus its sentinel reservations and
- * releases and its retain snapshot (see {@link GuardedWrite}). `provenance`
- * records which caller op each emitted item belongs to; consumers that map
- * cancellation reasons positionally MUST use it instead of assuming 1:1, and
- * read a guarded put's reasons through {@link judgeCancellation}.
- *
- * DynamoDB's rules (one operation per item, 100 items, 4 MB, 400 KB per
- * item, 2048-byte partition and 1024-byte sort keys, the limits on one expression) are not
- * pre-checked: the caller sends the transaction and diagnoses DynamoDB's
- * rejection through `internal/WriteDiagnosis.ts`, which counts the EXPANDED
- * items and names the culprit through `targets` (and `keys`) — two ops
- * touching one item included, among them two puts that swap unique values
- * and so release and claim the same sentinels. A caller adding items of its
- * own appends their targets to these.
- *
- * A {@link StreamAppendOp} is accepted only with `{ streams: true }` — an
- * `EventStore` append's `additionalItems` — and is refused with
- * `ValidationError` otherwise. Its items are built by the inner stream
- * (provenance `kind: "stream"`), recorded in `streams`, and left out of
- * `conditioned`.
+ * A transaction's ops checked and composed with nothing read
+ * ({@link prepareTransactWriteOps}): every refusal an op's own values decide,
+ * its keys and put items included, comes before the first read of any op.
  */
-export const buildTransactWriteItems = (
+export interface PreparedTransactWrite {
+  readonly count: number
+  readonly ops: ReadonlyArray<PreparedOp>
+  /** The nested stream appends, by caller op index. */
+  readonly streamOps: ReadonlyMap<number, StreamAppendOp>
+}
+
+/**
+ * Check and compose every op of a transaction without reading: refuse what an
+ * op can't carry, compile its condition, build a put's item and compose a
+ * delete's or a check's key — so a value with no key text, or a put its
+ * schema refuses, fails the transaction before any op reads, whatever its
+ * place in it.
+ *
+ * With `plan`, `Transaction.transactWrite` carries the ops the build step
+ * cannot: every `update`, and every `delete` of an entity whose delete writes
+ * more than its own row (`unique`, `versioned: { retain: true }`,
+ * `softDelete` — EDD-9048). Each is planned by the entity's own op
+ * (`Entity._planUpdate` / `_planDelete`) in {@link planTransactWriteOps}; here
+ * its key is encoded and composed (`Entity._encodeKey`) and what it can't
+ * carry refused (EDD-9059 – EDD-9061, `rejectUnsupportedOp`). Without `plan`
+ * (`EventStore.append`), such ops are refused.
+ */
+export const prepareTransactWriteOps = (
   operations: ReadonlyArray<AppendWriteOp | TransactWriteUpdateOp>,
   operation: string,
   options?:
     | {
         readonly streams?: boolean | undefined
-        /**
-         * Updates and multi-item deletes, planned by {@link planTransactWriteOps}
-         * and keyed by index into `operations`. A caller that runs no pre-pass
-         * (`EventStore.append`) passes none, and such ops are refused.
-         */
-        readonly plans?: ReadonlyMap<number, TransactPlan> | undefined
+        readonly plan?: boolean | undefined
       }
     | undefined,
-): Effect.Effect<
-  BuiltTransactWriteItems,
-  ValidationError | DynamoClientError,
-  TableConfig | DynamoClient
-> =>
+): Effect.Effect<PreparedTransactWrite, ValidationError> =>
   Effect.gen(function* () {
-    if (operations.length === 0) {
-      return {
-        items: [],
-        provenance: [],
-        targets: () => [],
-        guarded: [],
-        streams: [],
-        conditioned: new Set(),
-        keys: () => mergeKeyAttributes(),
-      }
-    }
-
-    const opInfos: Array<{
-      type: "put" | "delete" | "conditionCheck" | "planned"
-      putKind?: "put" | "create" | "upsert" | undefined
-      entity: Entity
-      /** Index into the caller's `operations` array — preserved for provenance. */
-      opIndex: number
-      key?: Record<string, unknown> | undefined
-      input?: Record<string, unknown> | undefined
-      condition?: ExpressionResult | undefined
-      /** The caller's own condition — what a `create` over a tombstone keeps. */
-      callerCondition?: Expr | ConditionInput | undefined
-      plan?: TransactPlan | undefined
-    }> = []
-    /** The nested stream appends, by caller op index. */
+    const ops: Array<PreparedOp> = []
     const streamOps = new Map<number, StreamAppendOp>()
 
     for (let opIndex = 0; opIndex < operations.length; opIndex++) {
@@ -484,12 +424,16 @@ export const buildTransactWriteItems = (
             cause: `${operation}: Transaction.check() was given an empty condition. Nothing was sent.`,
           })
         }
-        opInfos.push({
+        ops.push({
           type: "conditionCheck",
           entity: checkOp._entity,
           opIndex,
-          key: checkOp._key,
           condition: checkOp._condition,
+          primaryKey: yield* composePrimaryKeyOrFail(
+            checkOp._entity,
+            checkOp._key,
+            `${operation}.check`,
+          ),
         })
         continue
       }
@@ -503,20 +447,54 @@ export const buildTransactWriteItems = (
         })
       }
 
-      const plan = options?.plans?.get(opIndex)
-      if (plan !== undefined) {
+      if (options?.plan === true && info.opType === "update" && info.updateState !== undefined) {
+        const { entity, key, updateState } = info
+        yield* rejectUnsupportedOp(entity, operation, "update", undefined, undefined, {
+          updateState,
+        })
+        const encoded = yield* entity._encodeKey(key, `${operation}.update.decodeKey`)
         // No `condition` here, so a planned op is never in `conditioned`, even
         // with a `.condition()` of its own: its verdict reports that as
         // `"Condition"`. Only `EventStore.append` reads `conditioned`, and it
         // plans nothing — if it ever does, add planned ops to it.
-        opInfos.push({ type: "planned", entity: info.entity, opIndex, plan })
+        ops.push({
+          type: "planned",
+          entity,
+          opIndex,
+          plan: () => entity._planUpdate(key, updateState, encoded),
+        })
+        continue
+      }
+      if (
+        options?.plan === true &&
+        info.opType === "delete" &&
+        info.deleteRequest !== undefined &&
+        info.entity._multiItemWriteFeatures.length > 0
+      ) {
+        const { entity, key, deleteRequest } = info
+        yield* rejectUnsupportedOp(entity, operation, "delete", undefined, undefined, {
+          returnValues: deleteRequest.returnValues,
+          readsStoredRow: true,
+        })
+        const encoded = yield* entity._encodeKey(key, `${operation}.delete.decodeKey`)
+        ops.push({
+          type: "planned",
+          entity,
+          opIndex,
+          plan: () =>
+            entity._planDelete(
+              key,
+              { condition: deleteRequest.condition, mustExist: deleteRequest.mustExist },
+              encoded,
+            ),
+        })
         continue
       }
 
       if (info.opType === "put") {
         yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
         yield* refuseEmptyParts(info.entity, operation, "put", info.condition)
-        opInfos.push({
+        ops.push({
           type: "put",
           putKind: info.putKind,
           entity: info.entity,
@@ -524,18 +502,19 @@ export const buildTransactWriteItems = (
           input: info.input!,
           condition: compileOpCondition(info.entity, info.condition),
           callerCondition: info.callerCondition,
+          built: yield* validateAndBuildPutItem(info.entity, info.input!, `${operation}.put`),
         })
       } else if (info.opType === "delete") {
         yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined, undefined, {
           returnValues: info.deleteRequest?.returnValues,
         })
         yield* refuseEmptyParts(info.entity, operation, "delete", info.condition)
-        opInfos.push({
+        ops.push({
           type: "delete",
           entity: info.entity,
           opIndex,
-          key: info.key!,
           condition: compileOpCondition(info.entity, info.condition),
+          primaryKey: yield* composePrimaryKeyOrFail(info.entity, info.key!, `${operation}.delete`),
         })
       } else {
         return yield* new ValidationError({
@@ -550,6 +529,101 @@ export const buildTransactWriteItems = (
         })
       }
     }
+    return { count: operations.length, ops, streamOps }
+  })
+
+/**
+ * The read pass that lets `Transaction.transactWrite` carry its planned ops
+ * ({@link prepareTransactWriteOps}): each is the standalone op itself, run
+ * with its write recorded instead of sent, so the transaction writes exactly
+ * what the standalone op would have — every read, item and guard included.
+ * Returns the plans keyed by index into the caller's operations. Run on every
+ * attempt, so a transaction cancelled by a lost race is planned again from
+ * fresh reads.
+ */
+export const planTransactWriteOps = (
+  prepared: PreparedTransactWrite,
+): Effect.Effect<
+  ReadonlyMap<number, TransactPlan>,
+  ValidationError | PlanUpdateError | PlanDeleteError,
+  DynamoClient | TableConfig
+> =>
+  Effect.gen(function* () {
+    const plans = new Map<number, TransactPlan>()
+    for (const op of prepared.ops) {
+      if (op.plan !== undefined) plans.set(op.opIndex, yield* op.plan())
+    }
+    return plans
+  })
+
+/**
+ * Compile a list of Entity write ops into marshalled `TransactWriteItems` entries,
+ * preserving caller order.
+ *
+ * **One caller op may emit several items.** A put of a versioned or
+ * unique-constrained entity is a guarded put (#133): it reads the item, and
+ * emits the item guarded on what was read, plus its sentinel reservations and
+ * releases and its retain snapshot (see {@link GuardedWrite}). `provenance`
+ * records which caller op each emitted item belongs to; consumers that map
+ * cancellation reasons positionally MUST use it instead of assuming 1:1, and
+ * read a guarded put's reasons through {@link judgeCancellation}.
+ *
+ * DynamoDB's rules (one operation per item, 100 items, 4 MB, 400 KB per
+ * item, 2048-byte partition and 1024-byte sort keys, the limits on one expression) are not
+ * pre-checked: the caller sends the transaction and diagnoses DynamoDB's
+ * rejection through `internal/WriteDiagnosis.ts`, which counts the EXPANDED
+ * items and names the culprit through `targets` (and `keys`) — two ops
+ * touching one item included, among them two puts that swap unique values
+ * and so release and claim the same sentinels. A caller adding items of its
+ * own appends their targets to these.
+ *
+ * A {@link StreamAppendOp} is accepted only with `{ streams: true }` — an
+ * `EventStore` append's `additionalItems` — and is refused with
+ * `ValidationError` otherwise. Its items are built by the inner stream
+ * (provenance `kind: "stream"`), recorded in `streams`, and left out of
+ * `conditioned`.
+ *
+ * The ops are checked and composed first ({@link prepareTransactWriteOps}), or
+ * come so (`prepared`, with `plans`, from `transactWrite`), so nothing is read
+ * before every op's own refusals.
+ */
+export const buildTransactWriteItems = (
+  operations: ReadonlyArray<AppendWriteOp | TransactWriteUpdateOp>,
+  operation: string,
+  options?:
+    | {
+        readonly streams?: boolean | undefined
+        /**
+         * `operations` prepared with `plan` ({@link prepareTransactWriteOps}),
+         * and its planned ops' plans ({@link planTransactWriteOps}).
+         */
+        readonly prepared?: PreparedTransactWrite | undefined
+        readonly plans?: ReadonlyMap<number, TransactPlan> | undefined
+      }
+    | undefined,
+): Effect.Effect<
+  BuiltTransactWriteItems,
+  ValidationError | DynamoClientError,
+  TableConfig | DynamoClient
+> =>
+  Effect.gen(function* () {
+    if (operations.length === 0) {
+      return {
+        items: [],
+        provenance: [],
+        targets: () => [],
+        guarded: [],
+        streams: [],
+        conditioned: new Set(),
+        keys: () => mergeKeyAttributes(),
+      }
+    }
+
+    const prepared =
+      options?.prepared ??
+      (yield* prepareTransactWriteOps(operations, operation, { streams: options?.streams }))
+    const opInfos = prepared.ops
+    const streamOps = prepared.streamOps
 
     const tableNames = yield* resolveTableNames(opInfos)
 
@@ -625,8 +699,14 @@ export const buildTransactWriteItems = (
 
       if (op.type === "planned") {
         // Already marshalled and table-resolved; read like a guarded put's.
-        guarded.push({ opIndex: op.opIndex, start: items.length, plan: op.plan! })
-        for (const [i, item] of op.plan!.items.entries()) {
+        const plan = options?.plans?.get(op.opIndex)
+        if (plan === undefined) {
+          return yield* Effect.die(
+            new Error(`${operation}: operation ${op.opIndex} was not planned`),
+          )
+        }
+        guarded.push({ opIndex: op.opIndex, start: items.length, plan })
+        for (const [i, item] of plan.items.entries()) {
           push(
             item,
             { opIndex: op.opIndex, kind: "guarded", entityType: op.entity.entityType },
@@ -637,7 +717,7 @@ export const buildTransactWriteItems = (
       }
 
       if (op.type === "put") {
-        const built = yield* validateAndBuildPutItem(op.entity, op.input!, `${operation}.put`)
+        const built = op.built!
         if (op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")) {
           const plan = yield* op.entity._planPut({
             tableName,
@@ -686,9 +766,7 @@ export const buildTransactWriteItems = (
           {
             Delete: {
               TableName: tableName,
-              Key: toAttributeMap(
-                yield* composePrimaryKeyOrFail(op.entity, op.key!, `${operation}.delete`),
-              ),
+              Key: toAttributeMap(op.primaryKey!),
               ...conditionFields(op.condition),
             },
           },
@@ -699,9 +777,7 @@ export const buildTransactWriteItems = (
           {
             ConditionCheck: {
               TableName: tableName,
-              Key: toAttributeMap(
-                yield* composePrimaryKeyOrFail(op.entity, op.key!, `${operation}.check`),
-              ),
+              Key: toAttributeMap(op.primaryKey!),
               ConditionExpression: op.condition!.expression,
               ...conditionFields(op.condition),
             },
