@@ -19,7 +19,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Cause, Effect, Exit, Schema } from "effect"
+import { Cause, Effect, Exit, Option, Schema } from "effect"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -57,10 +57,15 @@ const batchGetKeys = (requests: ReadonlyArray<Request>) =>
 /** The key of a row: its `pk` and `sk`. */
 const keyOf = (row: Row) => ({ pk: row.pk, sk: row.sk })
 
-/** The `ValidationError` a failed `create` failed with, and its message. */
+/**
+ * The `ValidationError` a failed `create` failed with, and its message. An id is a caller's input,
+ * so it is refused on the error channel, never as a defect.
+ */
 const refusal = (create: Exit.Exit<unknown, unknown>) => {
   expect(Exit.isFailure(create)).toBe(true)
-  const error = Cause.squash((create as Exit.Failure<unknown, unknown>).cause)
+  const cause = (create as Exit.Failure<unknown, unknown>).cause
+  expect(Cause.hasDies(cause)).toBe(false)
+  const error = Option.getOrUndefined(Cause.findErrorOption(cause))
   expect(error).toBeInstanceOf(ValidationError)
   return String((error as ValidationError).cause)
 }
@@ -182,10 +187,7 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
       Effect.gen(function* () {
         const shape = SHAPES[label]!()
         const { create, requests, rows } = yield* run(shape)
-        expect(Exit.isFailure(create)).toBe(true)
-        const error = Cause.squash((create as Exit.Failure<unknown, unknown>).cause)
-        expect(error).toBeInstanceOf(ValidationError)
-        const message = String((error as ValidationError).cause)
+        const message = refusal(create)
         expect(message).toContain("[EDD-9129]")
         expect(message).toContain('"line"')
         expect(message).toContain(

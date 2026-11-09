@@ -18,7 +18,7 @@
 import { type AttributeValue, DynamoDBClient, ScanCommand } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Effect, Exit, Layer, Option } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
@@ -54,6 +54,19 @@ const raw = new DynamoDBClient({ region: "us-east-1", endpoint: ENDPOINT, creden
 const ClientLayer = DynamoClient.layer({ region: "us-east-1", endpoint: ENDPOINT, credentials })
 
 type Row = Record<string, AttributeValue>
+
+/**
+ * The message of the `ValidationError` a failed `create` failed with. An id is a caller's input,
+ * so it is refused on the error channel, never as a defect.
+ */
+const refusal = (create: Exit.Exit<unknown, unknown>) => {
+  expect(Exit.isFailure(create)).toBe(true)
+  const cause = (create as Exit.Failure<unknown, unknown>).cause
+  expect(Cause.hasDies(cause)).toBe(false)
+  const error = Option.getOrUndefined(Cause.findErrorOption(cause))
+  expect(error).toBeInstanceOf(ValidationError)
+  return String((error as ValidationError).cause)
+}
 
 let tables = 0
 /** Seeds the entity's rows on a fresh table, then runs `create` and `get`. */
@@ -168,10 +181,7 @@ describeConnected(
       it.effect(`${label}: create fails with EDD-9129, nothing written`, () =>
         Effect.gen(function* () {
           const { create, rows } = yield* run(SHAPES[label]!())
-          expect(Exit.isFailure(create)).toBe(true)
-          const error = Cause.squash((create as Exit.Failure<unknown, unknown>).cause)
-          expect(error).toBeInstanceOf(ValidationError)
-          expect(String((error as ValidationError).cause)).toContain("[EDD-9129]")
+          expect(refusal(create)).toContain("[EDD-9129]")
           expect(rows.map((row) => row.__edd_e__?.S)).toEqual(["Line"])
         }),
       )
@@ -201,10 +211,7 @@ describeConnected(
       it.effect(`${label}: create fails with ${code}, nothing written`, () =>
         Effect.gen(function* () {
           const { create, rows } = yield* run(SHAPES[label]!())
-          expect(Exit.isFailure(create)).toBe(true)
-          const error = Cause.squash((create as Exit.Failure<unknown, unknown>).cause)
-          expect(error).toBeInstanceOf(ValidationError)
-          expect(String((error as ValidationError).cause)).toContain(code)
+          expect(refusal(create)).toContain(code)
           expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.seeded))
         }),
       )
