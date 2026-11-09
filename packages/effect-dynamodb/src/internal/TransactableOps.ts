@@ -581,26 +581,28 @@ export const validateAndBuildPutItem = (
     item.__edd_e__ = entity.entityType
     if (unsentineled.length > 0) item[UNSENTINELED_DEFAULTS] = new Set(unsentineled)
 
-    // System fields (collision-aware), before the keys, as `Entity.put` does:
-    // an index may be composed from one. When a timestamp field collides with
-    // a model-declared field, the user may have supplied their own value
-    // (already encoded to wire by `Schema.encode`); else generate a wire
-    // primitive directly.
+    // System fields (collision-aware), stamped before the keys are composed,
+    // as `Entity.put` does: an index may be composed from one. When a
+    // timestamp field collides with a model-declared field, the user may have
+    // supplied their own value (already encoded to wire by `Schema.encode`);
+    // else generate a wire primitive directly. They are placed in the item
+    // after the keys, where 1.39.0 placed them, so the request is the same.
     const sf = entity.systemFields
     const createdAtSupplied = sf.createdAt !== null && item[sf.createdAt] !== undefined
+    const stamps: Record<string, unknown> = {}
     if (sf.createdAt) {
       if (options?.createdAt !== undefined) {
-        item[sf.createdAt] = generateTimestampPrimitive(options.createdAt, sf.createdAtEncoding)
+        stamps[sf.createdAt] = generateTimestampPrimitive(options.createdAt, sf.createdAtEncoding)
       } else if (item[sf.createdAt] === undefined) {
-        item[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
+        stamps[sf.createdAt] = generateTimestampPrimitive(now, sf.createdAtEncoding)
       }
     }
     if (sf.updatedAt) {
       if (item[sf.updatedAt] === undefined) {
-        item[sf.updatedAt] = generateTimestampPrimitive(now, sf.updatedAtEncoding)
+        stamps[sf.updatedAt] = generateTimestampPrimitive(now, sf.updatedAtEncoding)
       }
     }
-    if (sf.version) item[sf.version] = 1
+    if (sf.version) stamps[sf.version] = 1
 
     // Same normalisation `Entity.put` applies. Without it a `BigIntFromString`
     // composite composed `txn_420` here and `txn_000…0420` there, so the two
@@ -608,7 +610,7 @@ export const validateAndBuildPutItem = (
     // accessor could read the transact-written one (#111).
     const composed = { ...(encoded as Record<string, unknown>) }
     for (const field of [sf.createdAt, sf.updatedAt, sf.version]) {
-      if (field) composed[field] = item[field]
+      if (field) composed[field] = field in stamps ? stamps[field] : item[field]
     }
     const composeKeys = (carried: Record<string, unknown>) =>
       composeKeysOrFail(entity.entityType, operation, () =>
@@ -636,6 +638,7 @@ export const validateAndBuildPutItem = (
       }
     })
 
+    Object.assign(item, stamps)
     if (entity._incarnationToken) item[INCARNATION_TOKEN] = yield* freshIncarnationToken
 
     // Rename domain fields to their stored attribute names, in the same
