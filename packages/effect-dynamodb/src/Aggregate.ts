@@ -104,7 +104,7 @@ import {
 import {
   asReadGuard,
   preferredGuard,
-  unprovableRow,
+  type UnprovableRow,
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
@@ -2880,8 +2880,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * whose list or collection index key holds other text has those keys rewritten. Nothing else is
    * written, and every write is conditional: the Put only where nothing is, the Delete and the
    * rewrite only while the row is as read, whole, with each attribute its entity type can hold and
-   * it didn't still absent (`wholeRowGuard`; a row too wide for that, on its `updatedAt` first, or
-   * as `unprovableRow` decides). Rows whose keys chain move in order, the
+   * it didn't still absent (`wholeRowGuard`; a row too wide for that, on its `updatedAt` when the
+   * aggregate stamps one, or else as `unprovable` decides: under `"report"` the aggregate is left as
+   * it is, every row, and each such row is reported `unguarded`, dry run or not). Rows whose keys
+   * chain move in order, the
    * one whose current key is free first, so no write lands on a row still to move, and the root
    * moves last, so a move cut short is found by the next run. A write that loses to a concurrent
    * one reads the aggregate again; a row stored under both keys leaves the aggregate as it is,
@@ -2897,6 +2899,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
      * holds it, whose rows this one's move would find gone by then.
      */
     fromOnly: boolean,
+    /** What a row too wide to guard whole, with no `updatedAt` to stand in, gets. */
+    unprovable: UnprovableRow,
   ): Effect.Effect<Rekey.RekeyTally, AggregateWriteError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       let movedRows = 0
@@ -3068,8 +3072,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
           ]),
         )
         // The row as read, whole, with every attribute its entity type can hold and it didn't
-        // still absent. A row too wide for that is guarded on its `updatedAt` first, which every
-        // write changes; one without is the switch point's (`unprovableRow`).
+        // still absent. A row too wide for that is guarded on its `updatedAt` when the aggregate
+        // stamps one, which every write changes, held or absent; otherwise `unprovable` decides,
+        // and `undefined` is a row reported.
         const guardOf = (at: { readonly pk: string; readonly sk: string }, r: number) => {
           const read = storedAt.get(positionOf(at.pk, at.sk)) ?? {}
           const absent = writableAttributes.get(built[r]!.__edd_e__?.S ?? "") ?? []
@@ -3078,7 +3083,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
           if (updatedField !== null) {
             return preferredGuard(read, config.pk.field, [updatedField], absent)
           }
-          switch (unprovableRow()) {
+          switch (unprovable) {
+            case "report":
+              return undefined
             case "strongest":
               return asReadGuard(read, config.pk.field, [])
           }
@@ -3111,8 +3118,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
         const moves: Array<Move> = []
         const rewrites: Array<ReadonlyArray<TransactWriteItem>> = []
+        const unguarded: Array<Pick<Move, "from" | "to">> = []
         for (const [r, row] of rows.entries()) {
           if (row.placement === "old") {
+            const guard = guardOf(row.old, r)
+            if (guard === undefined) {
+              unguarded.push({ from: row.old, to: row.current })
+              continue
+            }
             moves.push({
               from: row.old,
               to: row.current,
@@ -3129,7 +3142,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   Delete: {
                     TableName: tableConfig.name,
                     Key: keyOf(row.old),
-                    ...guardOf(row.old, r),
+                    ...guard,
                   },
                 },
               ],
@@ -3141,6 +3154,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const stale = staleIndexFields(item, row.atCurrent)
           if (stale.length === 0) continue
           const guard = guardOf(row.current, r)
+          if (guard === undefined) {
+            unguarded.push({ from: row.current, to: row.current })
+            continue
+          }
           const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
           const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
           const sets = stale.map((field, i) => {
@@ -3160,6 +3177,22 @@ const makeAggregate = <TSchema extends Schema.Top>(
               },
             },
           ])
+        }
+        // Its rows move together or not at all: one unguarded row leaves the aggregate as it is.
+        if (unguarded.length > 0) {
+          return {
+            ...(movedRows > 0 && { moved: { aggregate: movedRows } }),
+            ...(rewrittenRows > 0 && { indexKeysRewritten: rewrittenRows }),
+            ...left,
+            conflicts: unguarded.map((row) => ({
+              member: aggregateName,
+              kind: "aggregate" as const,
+              reason: "unguarded" as const,
+              key: { [config.pk.field]: row.from.pk, sk: row.from.sk },
+              target: { [config.pk.field]: row.to.pk, sk: row.to.sk },
+              message: `${Rekey.UNGUARDED_MESSAGE} Its aggregate's other rows are left with it.`,
+            })),
+          }
         }
         if (moves.length === 0 && rewrites.length === 0) return tally(counted)
         if (dryRun) {
@@ -3451,7 +3484,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
               fromOnly = ctx.dryRun
             }
           }
-          const moved = yield* rekeyCore(key, ctx.dryRun, from, fromOnly).pipe(
+          const moved = yield* rekeyCore(
+            key,
+            ctx.dryRun,
+            from,
+            fromOnly,
+            Rekey.unprovableRow(ctx),
+          ).pipe(
             Effect.catch(
               (error: AggregateWriteError): Effect.Effect<Rekey.RekeyTally, DynamoClientError> => {
                 if (Rekey.isDynamoClientError(error)) return Effect.fail(error)

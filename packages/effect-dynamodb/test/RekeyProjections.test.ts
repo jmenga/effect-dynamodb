@@ -407,6 +407,42 @@ describe.each(DIRECTIONS)("rekey, a projection's rows, %s", (_direction, from, t
     ),
   )
 
+  it.effect(
+    "an outbox item too wide to guard whole is left and reported; with writes stopped it moves",
+    () =>
+      inTable((table) =>
+        Effect.gen(function* () {
+          yield* layout(from)
+          const old = keyOf(from, "Tally", "moved")
+          // Its second, with more attributes than one condition can name: each row is judged alone.
+          const wide = `${old.pk}|${old.sk}#outbox#000000000001#0001`
+          table.items.set(wide, {
+            ...table.items.get(wide)!,
+            ...toAttributeMap(
+              Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`raw${i}`, `v${i}`])),
+            ),
+          })
+          const held = table.items.get(wide)!
+          for (const dryRun of [true, false]) {
+            const report = yield* rekey(to, { dryRun })
+            expect(report.moved).toEqual({ ...ZERO, item: 1, tombstone: 1, outbox: 2 })
+            expect(report.conflicts.map((c) => [c.kind, c.reason, c.key])).toEqual([
+              ["outbox", "unguarded", { pk: held.pk!.S, sk: held.sk!.S }],
+            ])
+            expect(table.items.get(wide)).toEqual(held)
+          }
+          const stopped = yield* rekey(to, { writesStopped: true })
+          expect(stopped.moved).toEqual({ ...ZERO, outbox: 1 })
+          expect(stopped.conflicts).toEqual([])
+          expect(table.items.has(wide)).toBe(false)
+          const moved = rowsOf(table, "Tally#outbox").filter(([, row]) => row.raw299 !== undefined)
+          expect(moved.map(([stored]) => stored)).toEqual([
+            `${keyOf(to, "Tally", "moved").pk}|${keyOf(to, "Tally", "moved").sk}#outbox#000000000001#0001`,
+          ])
+        }),
+      ),
+  )
+
   it.effect("a claim taken between rekey's read and its move cancels the move", () => {
     let injected: string | undefined
     // A drainer claims the item as the move is sent: after rekey read it unclaimed.

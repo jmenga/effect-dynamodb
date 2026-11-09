@@ -9,11 +9,16 @@
  *   `rekey`'s first transaction under 1.39.0;
  * - whether 1.39.0's `rekey` kept that write.
  *
- * What a guard still can't see:
+ * Each case runs with writes to the table going on (the default) and with them stopped
+ * (`writesStopped: true`). A row too wide to guard whole, of a member with no `updatedAt`, can't be
+ * proven unchanged: by default it's left, reported `unguarded`, with nothing written; with writes
+ * stopped it moves under the strongest guard that fits, as 1.39.0 did.
+ *
+ * What a guard still can't see, writes going on:
  * - a write that only adds an attribute none of the member's declarations name;
  * - on a row too wide to guard whole, a write to an attribute the guard leaves out that doesn't
- *   change `updatedAt`, and with no `updatedAt`, any such write: `unprovableRow` decides those rows,
- *   and guards them as 1.39.0 did.
+ *   change `updatedAt`.
+ * With writes stopped there's no such write.
  */
 import { readFileSync } from "node:fs"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -99,6 +104,16 @@ const aggregateWorld = (wide: boolean, timestamps: boolean) => {
 /** Why a case loses its write, for the cases that still do. */
 export type Unseen = "foreign attribute" | "too wide, no updatedAt" | "too wide, updatedAt kept"
 
+/** The `rekey` setting a scenario runs under. */
+export interface Setting {
+  readonly writesStopped: boolean
+}
+
+export const SETTINGS: ReadonlyArray<readonly [label: string, setting: Setting]> = [
+  ["writes going on", { writesStopped: false }],
+  ["writes stopped", { writesStopped: true }],
+]
+
 const lost: Readonly<Record<string, Unseen>> = {
   "entity narrow plain: raw write adds an attribute the model doesn't have": "foreign attribute",
   "entity narrow timestamps: raw write adds an attribute the model doesn't have":
@@ -137,13 +152,50 @@ export interface RaceScenario {
 export const CASES = Object.keys(fixture.cases).map((name) => name.replace(/^escape /, ""))
 export const LOST = lost
 
-export const scenarios: ReadonlyArray<RaceScenario> = Object.entries(fixture.cases).map(
-  ([fullName, stored]) => {
+/**
+ * A wide row of a member with no `updatedAt`, writes going on: left where it is, reported, before
+ * anything is written, in a dry run too. An aggregate's other rows stay with it.
+ */
+const leftUnguarded = (
+  w: { readonly client: Effect.Effect<any, any, any> },
+  table: Parameters<Parameters<Harness["on"]>[1]>[0],
+  seed: ReadonlyArray<Row>,
+) =>
+  Effect.gen(function* () {
+    for (const row of seed) yield* table.seed(row)
+    const db: any = yield* w.client
+    const before = yield* table.rows()
+    const wide = seed.filter((row) => Object.keys(row).length > 100)
+    expect(wide).toHaveLength(1)
+    for (const dryRun of [true, false]) {
+      table.clear()
+      const report = yield* db.tables.MainTable.rekey({ dryRun })
+      expect(report.conflicts).toEqual([
+        expect.objectContaining({
+          reason: "unguarded",
+          key: { pk: wide[0]!.pk.S, sk: wide[0]!.sk.S },
+          message: expect.stringContaining("writesStopped: true"),
+        }),
+      ])
+      expect(report.moved).toEqual(expect.objectContaining({ item: 0, aggregate: 0 }))
+      const writes = table
+        .requests()
+        .filter((request) =>
+          ["putItem", "deleteItem", "updateItem", "transactWriteItems"].includes(request.command),
+        )
+      expect(writes).toEqual([])
+      expect(yield* table.rows()).toEqual(before)
+    }
+  })
+
+export const scenarios = (setting: Setting): ReadonlyArray<RaceScenario> =>
+  Object.entries(fixture.cases).map(([fullName, stored]) => {
     const name = fullName.replace(/^escape /, "")
     const [kind, width, stamps] = name.split(":")[0]!.split(" ")
+    const unguarded = !setting.writesStopped && width === "wide" && stamps === "plain"
     const why = lost[name]
     return {
-      name: `${name}: ${why === undefined ? "kept" : `lost (${why})`}`,
+      name: `${name}: ${unguarded ? "unguarded" : why === undefined ? "kept" : `lost (${why})`}`,
       run: (harness) => {
         const w =
           kind === "entity"
@@ -151,11 +203,12 @@ export const scenarios: ReadonlyArray<RaceScenario> = Object.entries(fixture.cas
             : aggregateWorld(width === "wide", stamps === "timestamps")
         return harness.on(w, (table) =>
           Effect.gen(function* () {
+            if (unguarded) return yield* leftUnguarded(w, table, stored.seed)
             for (const row of stored.seed) yield* table.seed(row)
             const db: any = yield* w.client
             let landed = 0
             table.beforeTransact(() => (landed++ === 0 ? table.seed(stored.raced) : Effect.void))
-            const report = yield* db.tables.MainTable.rekey()
+            const report = yield* db.tables.MainTable.rekey(setting)
             expect(landed).toBeGreaterThan(0)
             expect(report.conflicts).toEqual([])
             const rows = yield* table.rows()
@@ -183,5 +236,47 @@ export const scenarios: ReadonlyArray<RaceScenario> = Object.entries(fixture.cas
         )
       },
     }
-  },
-)
+  })
+
+/**
+ * A timestamped member's row written before it stamped one: too wide to guard whole, with no
+ * `updatedAt`. Its member stamps one on every write, so the guard holds it absent, proves the row,
+ * and the row moves with writes going on; a write that lands in between stamps one, cancels the
+ * move, and moves with the row.
+ */
+export const unstampedScenarios: ReadonlyArray<RaceScenario> = (["entity", "aggregate"] as const)
+  .flatMap((kind) => SETTINGS.map(([label, setting]) => ({ kind, label, setting })))
+  .map(({ kind, label, setting }) => ({
+    name: `${kind} wide timestamps, a row written before it stamped updatedAt, ${label}: kept`,
+    run: (harness: Harness) => {
+      const stored = fixture.cases[`escape ${kind} wide plain: library update changes f159`]!
+      const w = kind === "entity" ? entityWorld(true, true) : aggregateWorld(true, true)
+      const wide = stored.seed.find((row) => Object.keys(row).length > 100)!
+      expect(wide.updatedAt).toBeUndefined()
+      const raced = {
+        ...wide,
+        f159: { S: "changed" },
+        updatedAt: { S: "2026-11-09T00:00:00.000Z" },
+      }
+      return harness.on(w, (table) =>
+        Effect.gen(function* () {
+          for (const row of stored.seed) yield* table.seed(row)
+          const db: any = yield* w.client
+          let landed = 0
+          table.beforeTransact(() => (landed++ === 0 ? table.seed(raced) : Effect.void))
+          const report = yield* db.tables.MainTable.rekey(setting)
+          expect(landed).toBeGreaterThan(0)
+          expect(report.conflicts).toEqual([])
+          const transactions = table
+            .requests()
+            .filter((request) => request.command === "transactWriteItems")
+          expect(transactions.length).toBeGreaterThan(1)
+          const rows = yield* table.rows()
+          const moved = rows.filter((row: Row) => ["Item", "Line"].includes(row.__edd_e__?.S))
+          expect(moved).toHaveLength(1)
+          expect(moved[0]!.sk.S).toContain("a%20b")
+          expect(moved[0]!.f159?.S).toBe("changed")
+        }),
+      )
+    },
+  }))

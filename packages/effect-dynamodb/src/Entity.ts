@@ -130,7 +130,7 @@ import {
   asReadGuard,
   countOperators,
   expressionFits,
-  unprovableRow,
+  type UnprovableRow,
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
@@ -195,7 +195,7 @@ import {
 } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import { filterExpr, selectPaths } from "./Query.js"
-import { resolveTtlAttributeName, type TableConfig } from "./Table.js"
+import { type RekeyConflict, resolveTtlAttributeName, type TableConfig } from "./Table.js"
 
 // Internal modules (decomposed from Entity.ts)
 export type {
@@ -5415,6 +5415,13 @@ const makeImpl = <
     readonly names: globalThis.Record<string, string>
     readonly values: globalThis.Record<string, AttributeValue>
     readonly inputs: ReadonlyArray<string>
+    /**
+     * Whether the guard proves the row unchanged: it holds the version, the whole row, or the
+     * `updatedAt` every library write of this entity sets (absent when the read had none). When it
+     * doesn't, `rekey` decides by `Rekey.unprovableRow`; a soft, retain or unique delete sends it
+     * anyway, as 1.39.0 did (`UnprovableRow` `"strongest"`).
+     */
+    readonly proves: boolean
   } => {
     // Whether a guard fits beside `others` within DynamoDB's real limits.
     const fits = (guard: string) =>
@@ -5436,7 +5443,7 @@ const makeImpl = <
       }
       const incarnation = incarnationGuard(read, names, values)
       if (incarnation !== undefined) parts.push(incarnation)
-      return { expression: parts.join(" AND "), names, values, inputs: [] }
+      return { expression: parts.join(" AND "), names, values, inputs: [], proves: true }
     }
     names["#dpk"] = pkField
     parts.push("attribute_exists(#dpk)")
@@ -5461,7 +5468,7 @@ const makeImpl = <
       return `#dg${i} = :dg${i}`
     }
     const full = [...parts, ...attrs.map(guardOf)].join(" AND ")
-    if (fits(full)) return { expression: full, names, values, inputs: attrs }
+    if (fits(full)) return { expression: full, names, values, inputs: attrs, proves: true }
     // Too wide to guard attribute by attribute (a sparse map with hundreds of
     // entries): the strongest guard that fits. Every library write sets
     // `updatedAt`, so with timestamps it alone detects any library update;
@@ -5494,14 +5501,12 @@ const makeImpl = <
         expression = `${expression} AND ${clause}`
         inputs.push(attr)
       }
-      return { expression, names, values, inputs }
+      // `updatedAt` goes first, and every library write of the entity sets it: guarded, held or
+      // absent, it proves the row. Without it, nothing guarded is what every write changes.
+      const proves = systemFields.updatedAt !== null && inputs.includes(systemFields.updatedAt)
+      return { expression, names, values, inputs, proves }
     }
-    if (systemFields.updatedAt && attrs.includes(systemFields.updatedAt)) return strongest()
-    // Nothing guarded that every write changes: the switch point decides.
-    switch (unprovableRow()) {
-      case "strongest":
-        return strongest()
-    }
+    return strongest()
   }
 
   /** Which predicate rejected a guarded delete — from the stored item (ALL_OLD). */
@@ -13241,7 +13246,7 @@ const makeImpl = <
 
   const rekeyConflict = (
     kind: RowKind,
-    reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable",
+    reason: RekeyConflict["reason"],
     key: StoredKey,
     target: StoredKey | undefined,
     message: string,
@@ -13447,6 +13452,19 @@ const makeImpl = <
         if (targets === undefined || !sameStoredKey(targets.current, to)) {
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
+        // Its Delete is guarded on the row as read: one nothing proves unchanged is the context's.
+        const guard = deleteGuard(read!, "item", undefined)
+        if (!guard.proves) {
+          switch (Rekey.unprovableRow(ctx)) {
+            case "report":
+              return Rekey.mergeTallies(
+                tally,
+                rekeyConflict(kind, "unguarded", from, to, Rekey.UNGUARDED_MESSAGE),
+              )
+            case "strongest":
+              break
+          }
+        }
         const same = kind === "snapshot" ? sameSnapshotAs(read!) : undefined
         const room = yield* clearTarget(
           ctx,
@@ -13460,7 +13478,6 @@ const makeImpl = <
         tally = Rekey.mergeTallies(tally, room.tally)
         if (room.cleared === "twin") {
           if (ctx.dryRun) return countMove(ctx, kind, to, tally)
-          const guard = deleteGuard(read!, "item", undefined)
           const items: ReadonlyArray<TransactWriteItem> = [
             {
               ConditionCheck: {
@@ -13515,7 +13532,6 @@ const makeImpl = <
             sentinelsMoved: sentinels.count,
           })
         }
-        const guard = deleteGuard(read!, "item", undefined)
         const items: ReadonlyArray<TransactWriteItem> = [
           {
             Put: {
@@ -13899,6 +13915,19 @@ const makeImpl = <
         if (targets?.kind !== "item" || !sameStoredKey(targets.current, to)) {
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
+        // Its Delete is guarded on the item as read: one nothing proves unchanged is the context's.
+        const guard = deleteGuard(read!, "item", undefined)
+        if (!guard.proves) {
+          switch (Rekey.unprovableRow(ctx)) {
+            case "report":
+              return Rekey.mergeTallies(
+                tally,
+                rekeyConflict("item", "unguarded", from, to, Rekey.UNGUARDED_MESSAGE),
+              )
+            case "strongest":
+              break
+          }
+        }
         const room = yield* clearTarget(ctx, "item", from, to, depth, undefined, targets.elsewhere)
         tally = Rekey.mergeTallies(tally, room.tally)
         if (!room.cleared) return tally
@@ -13939,7 +13968,6 @@ const makeImpl = <
             repair.tally,
           )
         }
-        const guard = deleteGuard(read!, "item", undefined)
         const items: ReadonlyArray<TransactWriteItem> = [
           {
             Put: {
@@ -15126,14 +15154,17 @@ const makeImpl = <
   }
 
   /**
-   * A projection's row tombstone or outbox item as read, whole, and unclaimed by a drainer since (a
-   * row too wide for that, as `unprovableRow` decides).
+   * A projection's row tombstone or outbox item as read, whole, and unclaimed by a drainer since. A
+   * row too wide for that holds nothing every write changes, so `unprovable` decides: `undefined`
+   * when it's reported.
    */
-  const valuelessGuard = (read: StoredRow, pkField: string) => {
+  const valuelessGuard = (read: StoredRow, pkField: string, unprovable: UnprovableRow) => {
     const claims = [OUTBOX_CLAIM, OUTBOX_CLAIMED_UNTIL]
     const whole = wholeRowGuard(read, pkField, claims)
     if (whole !== undefined) return whole
-    switch (unprovableRow()) {
+    switch (unprovable) {
+      case "report":
+        return undefined
       case "strongest":
         return asReadGuard(read, pkField, [], claims)
     }
@@ -15148,7 +15179,7 @@ const makeImpl = <
     tableName: string,
     pkField: string,
     from: StoredKey,
-    read: StoredRow,
+    guard: NonNullable<ReturnType<typeof valuelessGuard>>,
     item: StoredRow,
   ): Effect.Effect<boolean, DynamoClientError, DynamoClient> =>
     Effect.gen(function* () {
@@ -15168,7 +15199,7 @@ const makeImpl = <
               Delete: {
                 TableName: tableName,
                 Key: toAttributeMap(from),
-                ...valuelessGuard(read, pkField),
+                ...guard,
               },
             },
           ],
@@ -15226,9 +15257,16 @@ const makeImpl = <
             rekeyConflict(kind, "contended", from, to, "A drainer holds it."),
           )
         }
+        const guard = valuelessGuard(read, keys.pk, Rekey.unprovableRow(ctx))
+        if (guard === undefined) {
+          return Rekey.mergeTallies(
+            tally,
+            rekeyConflict(kind, "unguarded", from, to, Rekey.UNGUARDED_MESSAGE),
+          )
+        }
         if (
           !ctx.dryRun &&
-          (yield* moveValueless(ctx.tableName, keys.pk, from, read, plan.moved(read)))
+          (yield* moveValueless(ctx.tableName, keys.pk, from, guard, plan.moved(read)))
         ) {
           return countMove(ctx, kind, counted, tally)
         }

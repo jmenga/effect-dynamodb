@@ -67,7 +67,14 @@ const harness = RekeyRepair.harnessOn(() => {
 })
 
 describeConnected("rekey's move of a row a write changed after rekey read it, on DynamoDB", () => {
-  for (const scenario of RekeyMoveRaces.scenarios) {
+  for (const [label, setting] of RekeyMoveRaces.SETTINGS) {
+    describe(label, () => {
+      for (const scenario of RekeyMoveRaces.scenarios(setting)) {
+        it.live(scenario.name, () => scenario.run(harness))
+      }
+    })
+  }
+  for (const scenario of RekeyMoveRaces.unstampedScenarios) {
     it.live(scenario.name, () => scenario.run(harness))
   }
 })

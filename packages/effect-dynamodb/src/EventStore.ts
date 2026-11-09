@@ -104,7 +104,7 @@ import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
-import { asReadGuard, unprovableRow, wholeRowGuard } from "./internal/ExpressionLimits.js"
+import { asReadGuard, wholeRowGuard } from "./internal/ExpressionLimits.js"
 import {
   itemBytes,
   jsonBytes,
@@ -5417,6 +5417,7 @@ export const makeStream = <
       const client = yield* Capacity.client
       const firstSk = composeEventSk(1)
       const nowSeconds = DateTime.toEpochSeconds(yield* DateTime.now)
+      const unprovable = Rekey.unprovableRow(ctx)
       const live = (row: Record<string, AttributeValue>) => {
         const ttl = row[ttlAttribute]?.N
         return ttl === undefined || Number(ttl) > nowSeconds
@@ -5461,7 +5462,7 @@ export const makeStream = <
         row.__edd_e__?.S === entityType ? Number(row.version?.N ?? 0) : 0
       const asOfOf = (row: Record<string, AttributeValue>) => Number(row.asOfVersion?.N ?? 0)
       const conflict = (
-        reason: "bothKeys" | "taken" | "contended",
+        reason: "bothKeys" | "taken" | "contended" | "unguarded",
         message: string,
         sk = firstSk,
       ): Rekey.RekeyTally => ({
@@ -5501,24 +5502,50 @@ export const makeStream = <
                 }),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
-      /** `row` as read, whole (a row too wide for that, as `unprovableRow` decides). */
+      /**
+       * `row` as read, whole. A row too wide for that holds nothing every write changes, so
+       * `unprovable` decides: `undefined` when it's reported (`unguardedRows`).
+       */
       const guardOfRow = (row: Record<string, AttributeValue>) => {
         const whole = wholeRowGuard(row, "pk", [])
         if (whole !== undefined) return whole
-        switch (unprovableRow()) {
+        switch (unprovable) {
+          case "report":
+            return undefined
           case "strongest":
             return asReadGuard(row, "pk", [])
         }
       }
+      /**
+       * The stream's rows that have no guard, each reported `unguarded`, before anything is
+       * copied: its rows move together, so one leaves the stream as it is.
+       */
+      const unguardedRows = (rows: ReadonlyArray<Record<string, AttributeValue>>) => {
+        const unguarded = rows.filter((row) => guardOfRow(row) === undefined)
+        if (unguarded.length === 0) return undefined
+        return Rekey.mergeTallies(
+          ...unguarded.map((row) =>
+            conflict(
+              "unguarded",
+              `${Rekey.UNGUARDED_MESSAGE} The stream's other rows are left with it.`,
+              skOf(row),
+            ),
+          ),
+        )
+      }
       /** Delete `row` at `from` while it is as read (`guardOfRow`). `false` when a write changed it. */
-      const remove = (row: Record<string, AttributeValue>) =>
-        client
+      const remove = (row: Record<string, AttributeValue>) => {
+        const guard = guardOfRow(row)
+        // Never without one: `unguardedRows` reported every such row before anything moved.
+        if (guard === undefined) return Effect.succeed(false)
+        return client
           .deleteItem({
             TableName: ctx.tableName,
             Key: toAttributeMap({ pk: from, sk: skOf(row) }),
-            ...guardOfRow(row),
+            ...guard,
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
+      }
 
       /**
        * Bring every row still under `from` over, once the stream lives at
@@ -5533,6 +5560,8 @@ export const makeStream = <
        */
       const drain = Effect.gen(function* () {
         const left = yield* readOwn
+        const refused = unguardedRows(left)
+        if (refused !== undefined) return refused
         const there = new Map((yield* readAll(to)).map((row) => [skOf(row), row]))
         const differing: Array<Record<string, AttributeValue>> = []
         for (const row of left) {
@@ -5579,6 +5608,8 @@ export const makeStream = <
         const rows = yield* readOwn
         // Moved since the scan read it.
         if (rows.length === 0) return tally
+        const refused = unguardedRows(rows)
+        if (refused !== undefined) return Rekey.mergeTallies(tally, refused)
         const first = rows.find((row) => skOf(row) === firstSk)
         // Flipped by an earlier attempt or run — or never started here: the
         // stream lives at `to`, and the rows left move to it.

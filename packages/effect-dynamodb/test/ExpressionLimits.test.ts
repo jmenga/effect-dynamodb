@@ -11,9 +11,9 @@ import {
   EXPRESSION_MAX_OPERATORS,
   expressionFits,
   preferredGuard,
-  unprovableRow,
   wholeRowGuard,
 } from "../src/internal/ExpressionLimits.js"
+import * as Rekey from "../src/internal/Rekey.js"
 
 const row = (fields: number, extra: Record<string, AttributeValue> = {}) => ({
   pk: { S: "p" },
@@ -85,8 +85,10 @@ describe("preferredGuard", () => {
   })
 })
 
-describe("unprovableRow", () => {
-  it("guards what fits, as 1.39.0 did", () => {
-    expect(unprovableRow()).toBe("strongest")
+describe("Rekey.unprovableRow", () => {
+  it("reports the row with writes going on, and guards what fits with them stopped", () => {
+    const ctx = (writesStopped: boolean) => ({ writesStopped }) as Rekey.RekeyRowContext
+    expect(Rekey.unprovableRow(ctx(false))).toBe("report")
+    expect(Rekey.unprovableRow(ctx(true))).toBe("strongest")
   })
 })

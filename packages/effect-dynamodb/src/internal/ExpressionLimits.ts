@@ -245,15 +245,15 @@ export const preferredGuard = (
 }
 
 /**
- * What a write does with a row it can't prove unchanged: one whose whole guard ({@link
- * wholeRowGuard}) doesn't fit DynamoDB's limits on one expression and that holds nothing every
- * library write changes (a version, an `updatedAt`). The one place that decides it, for `rekey`'s
- * moves (an entity's item, history row and value-less row, an aggregate's row, an event stream's
- * row) and a soft, retain or unique delete, each of which switches on it. `"strongest"`, for now: as
- * 1.39.0, the strongest guard that fits is sent, so a concurrent write changing only what it leaves
- * out lands unseen, and the move or delete loses it.
+ * What `rekey`'s move does with a row it can't prove unchanged: one whose whole guard ({@link
+ * wholeRowGuard}) doesn't fit DynamoDB's limits on one expression, with nothing every library write
+ * changes to stand in (its member is neither `versioned` nor `timestamps`, or it's a stream's row or
+ * a projection's row tombstone or outbox item). Every move that meets such a row switches on it, so
+ * a new answer is a type error at each:
+ *
+ * - `"report"` — the default: the row isn't moved, and is reported `unguarded`.
+ * - `"strongest"` — with `writesStopped`, as 1.39.0: the strongest guard that fits is sent, so a
+ *   concurrent write changing only what it leaves out would land unseen. A soft, retain or unique
+ *   delete always sends it.
  */
-export type UnprovableRow = "strongest"
-
-/** What a write does with a row it can't prove unchanged ({@link UnprovableRow}). */
-export const unprovableRow = (): UnprovableRow => "strongest"
+export type UnprovableRow = "report" | "strongest"

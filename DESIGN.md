@@ -1222,12 +1222,27 @@ A row too wide for its whole guard (DynamoDB's limits on one expression) is
 guarded on its `updatedAt` first, which every library write changes, then on as
 many of its other attributes as fit (`deleteGuard`'s fallback,
 `preferredGuard`). A library write is always seen; a write from outside the
-library that changes an attribute left out, and not `updatedAt`, is not. A wide
-row with no `updatedAt` (and no version) is one nothing proves unchanged:
-`unprovableRow` decides it, the one switch point for every move here and for
-the fallback of a soft, retain or unique delete (Guarded read-then-write). It
-answers `"strongest"`: the strongest guard that fits, as 1.39.0 sent, so a
-concurrent write to an attribute left out of it is lost.
+library that changes an attribute left out, and not `updatedAt`, is not.
+Whether `updatedAt` proves the row is the member's configuration, not the row's:
+a timestamped member's row written before it stamped one is guarded on
+`updatedAt` still absent, and a library write sets it. A wide row of a member
+with no `updatedAt` (and no version), and a stream row or a projection's row
+tombstone or outbox item too wide to guard whole, is one nothing proves
+unchanged. `Rekey.unprovableRow` decides it, by `RekeyOptions.writesStopped`:
+
+- **Writes going on** (the default): the row is left where it is and reported
+  `unguarded`, before anything of it is written, and in a dry run too. An
+  aggregate's rows move together or not at all, so one such row leaves the
+  aggregate as it is, each such row reported. A stream is checked before
+  anything of it is copied (and its leftover rows again before they're
+  deleted), and a row of it leaves the stream as it is. A projection's row
+  tombstone or outbox item is judged alone.
+- **Writes stopped** (`writesStopped: true`): nothing can change the row, so it
+  moves under the strongest guard that fits, as 1.39.0 sent.
+
+A soft, retain or unique delete with no `updatedAt` on a wide row is not a move:
+it keeps sending the strongest guard that fits (Guarded read-then-write), as
+1.39.0 did, and a concurrent write to an attribute left out of it is lost.
 
 | Row | Move |
 |---|---|
@@ -1273,7 +1288,9 @@ holds the target), `contended` (concurrent writes on every attempt, or the attem
 `failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, or an
 aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
 compose a current one; a row whose own key holds a value with no key text, `NaN` under `escapeKeys: true`, or one of whose key
-composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal). An aggregate whose root is under both
+composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal),
+`unguarded` (a row nothing proves unchanged, with writes going on: What "as read" proves; `message` says to
+stop writes and run with `writesStopped: true`). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or
 rows are gone since the scan read them (moved or deleted by a write) is
 nothing. A `DynamoClientError` fails the run.
@@ -3404,9 +3421,10 @@ computed on the actual condition, including the caller's `.condition()`
 width: when the full guard does not fit, `deleteGuard` falls back to the
 strongest guard that fits. That is `attribute_exists(pk)`, then `updatedAt`
 unchanged (with timestamps), then as many attributes as fit, unique-constraint
-fields first, then the model's fields, then the rest. Without timestamps the
-fallback is `unprovableRow`'s (§7 "`rekey`", What "as read" proves), which
-answers the same strongest guard. With timestamps, every
+fields first, then the model's fields, then the rest. Without timestamps that
+guard proves nothing about the attributes it leaves out, and the delete sends it
+anyway, as 1.39.0 did; `rekey`'s moves don't (§7 "`rekey`", What "as read"
+proves). With timestamps, every
 library write changes `updatedAt`, so any concurrent library update is detected
 except one in the same millisecond with an identical `updatedAt`. A writer
 outside the library that leaves `updatedAt` alone can change unguarded
