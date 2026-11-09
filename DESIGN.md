@@ -1432,7 +1432,8 @@ compares the stored attribute, so its operands stay in the stored form. Rows
 holding no values were already keyed by the stored text: a unique sentinel holds
 it, and a projection's row tombstone and outbox items were keyed by it, so they
 keep their keys. An aggregate composes its own keys from domain values (one encode
-for a root's composite, none for an edge's sort key).
+for a root's composite, none for an edge's sort key), and only its own paths compose
+them, so it keeps 1.39.0's key form (`text139`) and every byte.
 
 ### Isolated vs Clustered Key Prefixes
 

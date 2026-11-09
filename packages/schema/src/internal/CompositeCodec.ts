@@ -60,9 +60,11 @@ export type CompositeKeyForm = (attr: string, value: unknown) => unknown
  */
 export interface CompositeKeyFormOptions {
   /**
-   * The key text 1.39.0 composed: such a codec's stored text encoded once more
-   * (`x:x:mix` for `"MiX"` stored `"x:MiX"`). Only `rekey` asks for it, to find
-   * a row 1.39.0 stored under it.
+   * The key form 1.39.0 had: such a codec's value encoded whatever it is, its
+   * stored text included (`x:x:mix` for `"MiX"` stored `"x:MiX"`). `rekey` asks
+   * for it to find a row 1.39.0's `put` stored under that text, and an
+   * aggregate, whose keys only its own paths compose, keys with it as it did
+   * (one encode of a domain value).
    */
   readonly text139?: boolean
   /**
@@ -119,8 +121,9 @@ export const refuseInexact = (composite: string, value: unknown, reason: string)
  *    stored text (`encode(decode(value))` is the value) is that text, keyed as
  *    it is: `put` holds `"x:MiX"` for `"MiX"` and keys `x:mix`. Up to 1.39.0
  *    it was encoded once more, so `put` keyed `x:x:mix` (`text139` composes
- *    that, for `rekey`). A domain value can be such a text as well (`"x:MiX"`
- *    itself): a path holding domain values encodes them first
+ *    that, for `rekey`, and keeps an aggregate's keys, which only its own
+ *    paths compose, from domain values). A domain value can be such a text as
+ *    well (`"x:MiX"` itself): a path holding domain values encodes them first
  *    ({@link makeCompositeDomainKeyForm}), so the key form only ever sees
  *    stored text from it. A codec whose `encode` refuses its own output never
  *    reaches this: its stored text takes the `decode -> encode` fallback.

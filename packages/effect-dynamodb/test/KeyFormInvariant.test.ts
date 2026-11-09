@@ -148,7 +148,7 @@ describe("key-form invariant — Entity.ts normaliser shape", () => {
     // which only `rekey` composes; using them anywhere else re-opens the bypass.
     expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBeLessThanOrEqual(3)
     expect(src.match(/toCompositeKeyRecord\(/g)?.length ?? 0).toBeLessThanOrEqual(3)
-    expect(src.match(/\{ text139: true \}/g)?.length ?? 0).toBe(1)
+    expect(src.match(/text139: true/g)?.length ?? 0).toBe(1)
   })
 
   it("only rekey composes 1.39.0's key form, to find the rows it stored", () => {
@@ -208,6 +208,25 @@ describe("key-form invariant — a caller's values compose the key put wrote", (
   it("the entity's query builders compose a caller's key through the domain key form", () => {
     const src = read("../src/Entity.ts")
     expect(src).not.toMatch(/keyFormFor\(entityInternals, key/)
-    expect(src).toMatch(/entity\._domainKeyForm\(\{ \[orderBy\]: v \}\)/)
+    // A history `.where()` bound on the orderBy: encoded as `append` encodes it (`encodeOrderBy`),
+    // then put into key form, as `append` composes the event's key from what it stores.
+    expect(src).toMatch(/entity\._keyForm\(\{ \[orderBy\]: encodeOrderBy\(v\) \}\)/)
+    expect(src).toMatch(/const encoded = encodeOrderBy\(v\)/)
+    expect(src).toMatch(/entity\._keyForm\(\{ \[orderBy\]: encoded \}\)/)
+  })
+})
+
+/**
+ * An aggregate's keys are its own: `create`, `get`, `list` and `rekey` compose them all through one
+ * key form, from domain values, so no other path missed what it wrote on 1.39.0. It keeps 1.39.0's
+ * form, a codec `encode` takes on its own output encoded once, and every byte with it.
+ */
+describe("key-form invariant — an aggregate keys as 1.39.0 did", () => {
+  it("its one key form is 1.39.0's", () => {
+    const src = readFileSync(fileURLToPath(new URL("../src/Aggregate.ts", import.meta.url)), "utf8")
+    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBe(1)
+    expect(src).not.toMatch(/makeCompositeDomainKeyForm\(/)
+    const form = src.slice(src.indexOf("const compositeKeyForm = makeCompositeKeyForm("))
+    expect(form.slice(0, form.indexOf("\n  )\n"))).toMatch(/\{ text139: true \}/)
   })
 })

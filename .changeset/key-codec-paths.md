@@ -25,6 +25,6 @@ These are the codecs whose `encode` takes what it returns and changes it again: 
 - time-series events
 - a projection's read-model rows
 
-Unique sentinels, and a projection's row tombstones and outbox items, already held the stored text, and keep their keys. A projection row whose new key holds the tombstone 1.39.0 wrote for it is left where it is and reported as a conflict (`taken`).
+Unique sentinels, and a projection's row tombstones and outbox items, already held the stored text, and keep their keys. So does an aggregate keyed by such a codec: only its own operations compose its keys, each from the value it holds, encoded once. A projection row whose new key holds the tombstone 1.39.0 wrote for it is left where it is and reported as a conflict (`taken`).
 
 One `rekey` pass also handles turning `escapeKeys` on: it moves each row straight to the escaped text of the value it stores. The bump is minor: nothing else moves, and no other entity's keys change.
