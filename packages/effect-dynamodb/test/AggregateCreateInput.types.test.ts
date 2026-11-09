@@ -6,18 +6,19 @@
  * caller supplies them (from a path, say). An edge whose entity one id names takes `${field}Id`, or
  * the entity whole under the field's name, or both, when the id is fetched. A many edge over such
  * an entity takes each element as its id or the entity whole, in any mix, and an element wrapping
- * the entity takes either in the field of the entity's name. The type sees that name for a
- * `Schema.Struct` model; for a `Schema.Class` model an element wrapping the entity is `unknown`, as
- * 1.39.0's `create` took it. An id is a value of the key
- * composite's type, or its stored or JSON form where that is another kind of value; in a union
- * element, a string only, as 1.39.0 fetched. A branded id keeps its brand.
+ * the entity takes either in the field of the entity's name, where its schema declares that field
+ * the entity's own model schema and declares no `${field}Id` of its own. The type sees that name for
+ * a `Schema.Struct` model. Every other element (a union, a field of another name or another schema,
+ * an element over a `Schema.Class` model) is `unknown`, as 1.39.0's `create` took it: `create`
+ * judges it as 1.39.0 did. An id is a value of the key composite's type, or its stored or JSON form
+ * where that is another kind of value. A branded id keeps its brand.
  * Every other field takes its domain value, as `Entity.put`'s type asks, though at run time both
  * also take its wire form. The edges match what `create` does at run time
  * (`AggregateRefHydration.test.ts`).
  */
 
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { type Effect, Schema } from "effect"
+import { type Effect, Schema, SchemaGetter } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -315,6 +316,52 @@ const CrewAggregate = Aggregate.make(CrewRoot, {
 })
 type CrewCreate = Parameters<typeof CrewAggregate.create>[0]
 
+/**
+ * Elements whose schema doesn't name the field holding the entity by its model schema, as `create`
+ * judges them: the field an `Option`, a union of two members of one domain type, an element
+ * declaring its own `numberRowId`, and the same struct through a transformation.
+ */
+const ownedSheet = Schema.Struct({ numberRow: NumberRow, qty: Schema.Number })
+class OtherRoot extends Schema.Class<OtherRoot>("OtherRoot")({
+  id: Schema.String,
+  optionSheets: Schema.Array(
+    Schema.Struct({ numberRow: Schema.Option(Schema.String), qty: Schema.Number }),
+  ),
+  sameDomain: Schema.Array(
+    Schema.Union([
+      ownedSheet,
+      Schema.Struct({ numberRow: NumberRow, qty: Schema.NumberFromString }),
+    ]),
+  ),
+  ownIdSheets: Schema.Array(
+    Schema.Struct({ numberRow: NumberRow, numberRowId: Schema.Number, qty: Schema.Number }),
+  ),
+  codecSheets: Schema.Array(
+    ownedSheet.pipe(
+      Schema.decodeTo(ownedSheet, {
+        decode: SchemaGetter.passthrough(),
+        encode: SchemaGetter.passthrough(),
+      }),
+    ),
+  ),
+}) {}
+const otherEdge = (entityType: string) =>
+  Aggregate.many({ entityType, entity: NumberRows, sk: { composite: ["qty"] } })
+const OtherAggregate = Aggregate.make(OtherRoot, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "other" },
+  root: { entityType: "OtherRoot" },
+  edges: {
+    optionSheets: otherEdge("OptionSheet"),
+    sameDomain: otherEdge("SameDomainSheet"),
+    ownIdSheets: otherEdge("OwnIdSheet"),
+    codecSheets: otherEdge("CodecSheet"),
+  },
+})
+type OtherCreate = Parameters<typeof OtherAggregate.create>[0]
+
 const bound = () => Aggregate.bind(RootAggregate)
 type BoundCreate = Parameters<Effect.Success<ReturnType<typeof bound>>["create"]>[0]
 
@@ -400,38 +447,30 @@ describe("an aggregate's create takes what it takes at run time", () => {
     expectTypeOf({ ...base, maybeSheets: [{ numberRow: row, qty: 2 }] }).toExtend<Create>()
   })
 
-  it("takes a union element as each of its members, nested and nullable ones included", () => {
+  it("takes a union element as 1.39.0's create did: unknown", () => {
+    // `create` judges a union element as 1.39.0 did: a string id, whatever the member.
+    expectTypeOf<UnionCreate["sheets"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
+    expectTypeOf<StringUnionCreate["sheets"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
     expectTypeOf({
       id: "a",
       sheets: [
         { kind: null, numberRow: row, qty: 1 },
-        { kind: "a", numberRow: row, qty: 2 },
         { kind: "b", qty: 3 },
         { kind: "a", numberRow: "KEEP", numberRowId: "l", qty: 5 },
-        { kind: "c", qty: 6 },
       ],
     } as const).toExtend<UnionCreate>()
   })
 
-  it("takes a string id in a union element's member holding the entity, or as the element", () => {
-    const stringRow = { lineId: "l", f: 1 }
-    expectTypeOf({
-      id: "a",
-      sheets: [
-        { kind: null, stringRowId: "l", qty: 1 },
-        { kind: "a", stringRow, qty: 2 },
-        { kind: "b", stringRowId: "l", qty: 3 },
-        { kind: "b", qty: 4 },
-        { kind: "a", stringRow: "KEEP", stringRowId: "l", qty: 5 },
-        { kind: "c", qty: 6 },
-        "l",
-        stringRow,
-      ],
-    } as const).toExtend<StringUnionCreate>()
+  it("takes an element holding the entity in a field of another name as 1.39.0's create did", () => {
+    expectTypeOf<CrewCreate["crew"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
+    expectTypeOf({ id: "a", crew: [{ captain: row, qty: 2 }] } as const).toExtend<CrewCreate>()
   })
 
-  it("takes an element holding the entity in a field of another name whole", () => {
-    expectTypeOf({ id: "a", crew: [{ captain: row, qty: 2 }] } as const).toExtend<CrewCreate>()
+  it("takes an element whose schema doesn't name the entity's field as 1.39.0's create did", () => {
+    expectTypeOf<OtherCreate["optionSheets"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
+    expectTypeOf<OtherCreate["sameDomain"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
+    expectTypeOf<OtherCreate["ownIdSheets"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
+    expectTypeOf<OtherCreate["codecSheets"]>().toEqualTypeOf<ReadonlyArray<unknown>>()
   })
 
   it("takes an element wrapping a class model's entity as 1.39.0's create did: unknown", () => {
@@ -465,20 +504,10 @@ function _refusals(input: Record<string, unknown>): void {
   RootAggregate.create({ ...base, numberLines: [{ lineId: "x" }] })
   // @ts-expect-error — a record of unknown values is no input
   RootAggregate.create(input)
-  // @ts-expect-error — no member of the union element takes a string in `numberRow` for kind "b"
-  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberRow: "x", qty: 1 }] })
-  // @ts-expect-error — a member declaring neither the entity's field nor its id takes no id
-  StringUnionAggregate.create({ id: "a", sheets: [{ kind: "c", stringRowId: "l", qty: 1 }] })
-  // @ts-expect-error — `create` fetches only a string in a union element: a number id is dropped
-  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberRowId: 1, qty: 1 }] })
-  // @ts-expect-error — nor an optional one
-  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberRowId: 1, qty: 1 }] })
-  // @ts-expect-error — a string id of a number-keyed entity fails with EDD-9131
-  UnionAggregate.create({ id: "a", sheets: [{ kind: null, numberRowId: "1", qty: 1 }] })
-  // @ts-expect-error — a union with no member that is the entity takes no id as the element
-  UnionAggregate.create({ id: "a", sheets: ["1"] })
-  // @ts-expect-error — `create` takes the entity by id only in the field of its name
-  CrewAggregate.create({ id: "a", crew: [{ captainId: 1, qty: 2 }] })
+  // @ts-expect-error — an element naming the entity's field takes it by an id of its key's type
+  RootAggregate.create({ ...base, sheets: [{ numberRowId: "1", qty: 2 }] })
+  // @ts-expect-error — it takes the entity by id or whole, not neither
+  RootAggregate.create({ ...base, sheets: [{ qty: 2 }] })
   // @ts-expect-error — a class model's element is unknown, but still an element of an array
   RootAggregate.create({ ...base, classSheets: { numberLine: line, qty: 2 } })
 }

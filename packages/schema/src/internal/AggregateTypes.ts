@@ -412,70 +412,49 @@ type _OptionalIdOrWhole<K extends string, Id, V> = {
   readonly [P in K]?: V
 }
 
-/** An element's field holding the edge's entity: the one of its name, `N` ({@link _IsRefField}). */
-type _RefKeys<T, N extends string> = {
-  [K in keyof T]-?: _IsRefField<T, K, N> extends true ? K : never
-}[keyof T] &
-  string
+/**
+ * An element whose definition names the field holding the entity (`N`), as `create` takes it: that
+ * field's id under `${N}Id`, or the entity whole under `N`, the other fields as they are.
+ */
+type _ElementIdOrWhole<E, Id, N extends string, TStamps> = N extends keyof E
+  ? _OptionalStamps<Omit<E, N>, TStamps> &
+      (undefined extends E[N] ? _OptionalIdOrWhole<N, Id, E[N]> : _IdOrWhole<N, Id, E[N]>)
+  : _OptionalStamps<E, TStamps>
 
 /**
- * A many edge's element as `create` takes it: the field holding the entity takes its id or the
- * entity whole, the other fields as they are. Distributes over a union of element members, so each
- * member holding the entity takes its id.
+ * A many edge's elements as `create` takes them, for an edge whose entity (model schema `MS`) one id
+ * names, decided from the element's schema (`ES`) by the rule {@link _TransformManyEdge} follows:
+ * - an element that is the entity ({@link _IsEntityElement}) is its id or the entity whole, in any
+ *   mix;
+ * - an element naming the field holding the entity ({@link _NamesEntityField}) takes, in that field
+ *   (`N`), the id or the entity whole;
+ * - any other element is `unknown`, as 1.39.0's `create` took it (`Record<string, unknown>`): it is
+ *   judged as 1.39.0 judged it, and no narrower type names every element `create` takes.
  */
-type _ElementIdsOrWhole<T, Id, N extends string, TStamps> = T extends unknown
-  ? [_RefKeys<T, N>] extends [never]
-    ? _OptionalStamps<T, TStamps>
-    : _OptionalStamps<Omit<T, _RefKeys<T, N>>, TStamps> &
-        _AllOf<{
-          [K in _RefKeys<T, N>]: undefined extends T[K]
-            ? _OptionalIdOrWhole<K, Id, T[K]>
-            : _IdOrWhole<K, Id, T[K]>
-        }>
-  : never
-
-/**
- * A many edge's elements as `create` takes them, for an edge whose entity (domain type `M`) one id
- * names:
- * - an element that is the entity is its id or the entity whole, in any mix;
- * - an element wrapping it takes, in the field of the entity's name (`N`), the id or the entity
- *   whole;
- * - an element declared a union takes each of its members, a member holding the entity taking a
- *   string id (`UnionId`) or the entity whole, and a string id as the element when a member is the
- *   entity. `create` fetches only a string in a union element, as 1.39.0 did.
- *
- * Where the type can't see the field of the entity's name (`N = never`, {@link _EntityFieldName}),
- * an element other than the entity is `unknown`, as 1.39.0's `create` took it
- * (`Record<string, unknown>`): no narrower type names every element `create` takes.
- */
-type _CreateManyEdge<T, Id, UnionId, TStamps, M, N extends string> =
+type _CreateManyEdge<T, Id, TStamps, ES, MS, N extends string> =
   T extends ReadonlyArray<infer E>
-    ? true extends _IsUnion<E>
-      ? [N] extends [never]
-        ? ReadonlyArray<unknown>
-        : ReadonlyArray<
-            | _ElementIdsOrWhole<E, UnionId, N, TStamps>
-            | ([Extract<E, M>] extends [never] ? never : UnionId)
-          >
-      : [E] extends [M]
-        ? ReadonlyArray<Id | _OptionalStamps<E, TStamps>>
-        : [N] extends [never]
-          ? ReadonlyArray<unknown>
-          : ReadonlyArray<_ElementIdsOrWhole<E, Id, N, TStamps>>
-    : _TransformManyEdge<T, Id, TStamps, M, never, N>
+    ? _IsEntityElement<ES, MS> extends true
+      ? ReadonlyArray<Id | _OptionalStamps<E, TStamps>>
+      : _NamesEntityField<ES, MS, N> extends true
+        ? ReadonlyArray<_ElementIdOrWhole<E, Id, N, TStamps>>
+        : ReadonlyArray<unknown>
+    : _TransformManyEdge<T, TStamps, never, never, never, never, never>
 
-/** A many edge's input to `create`: {@link _CreateManyEdge} for an entity one id names. */
-type _ManyEdgeCreateInput<T, Edge, TStamps> =
+/**
+ * A many edge's input to `create`: {@link _CreateManyEdge} for an entity one id names, decided from
+ * the edge's field schema (`FS`).
+ */
+type _ManyEdgeCreateInput<T, Edge, TStamps, FS> =
   _Fetchable<Edge> extends true
     ? _CreateManyEdge<
         T,
         _EdgeIdForms<Edge>,
-        Extract<_EdgeIdForms<Edge>, string>,
         TStamps,
-        _EdgeModelType<Edge>,
+        _ElementSchema<FS>,
+        _EdgeModelSchema<Edge>,
         _EntityFieldName<_EdgeEntity<Edge>>
       >
-    : _TransformManyEdge<T, never, TStamps, never, never, never>
+    : _TransformManyEdge<T, TStamps, never, never, never, never, never>
 
 /** The input fields {@link AggregateCreateInputType} replaces: id, many and sub-aggregate edges'. */
 type _CreateReplacedKeys<TEdges> = {
@@ -497,27 +476,31 @@ type _CreateReplacedKeys<TEdges> = {
  * - The aggregate's own key composites, which `create` doesn't generate.
  * - A `ref` or `one` edge whose entity one id names: `${field}Id`, or the entity whole under the
  *   field's name.
- * - A many edge over such an entity: each element its id or the entity whole, or, for an element
- *   wrapping it, the field of the entity's name its id or the entity whole. Where the type can't
- *   see that name (a `Schema.Class` model, say), an element wrapping the entity is `unknown`, as
- *   1.39.0's `create` took it.
+ * - A many edge over such an entity, decided from the element's schema ({@link _CreateManyEdge}):
+ *   an element that is the entity, its id or the entity whole; an element naming the field holding
+ *   the entity, that field's id or the entity whole. Any other element (a union, a transformation,
+ *   a field of another name or another schema, or one the type can't see the name of, under a
+ *   `Schema.Class` model) is `unknown`, as 1.39.0's `create` took it.
  * - An id in its key composite's type, or its stored or JSON form where that is another kind of
- *   value ({@link _EdgeIdForms}). In a union element, only a string id ({@link _CreateManyEdge}).
+ *   value ({@link _EdgeIdForms}).
  * - Sub-aggregates likewise.
  *
  * A field otherwise takes its domain value, as `Entity.put` does: neither checks the stored form
- * of a field's value at the type level, though both decode one at run time.
+ * of a field's value at the type level, though both decode one at run time. `TFields` is the
+ * aggregate schema's field schemas ({@link SchemaFieldsOf}), which a many edge's element is read
+ * from.
  */
 export type AggregateCreateInputType<
   TModel,
   TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
   TPK extends ReadonlyArray<string>,
   TStamps = never,
+  TFields = never,
 > = _Simplify<
   {
     // The aggregate's key composites
     readonly [K in keyof TModel as K extends TPK[number] ? K : never]: TModel[K]
-  } & Omit<AggregateInputType<TModel, TEdges, TPK, TStamps>, _CreateReplacedKeys<TEdges>> &
+  } & Omit<AggregateInputType<TModel, TEdges, TPK, TStamps, TFields>, _CreateReplacedKeys<TEdges>> &
     _AllOf<{
       // A ref or one edge whose entity one id names → its id, or the entity whole
       [K in keyof TEdges & keyof TModel & string as _IsIdEdge<TEdges[K]> extends true
@@ -537,7 +520,7 @@ export type AggregateCreateInputType<
           ? never
           : K
         : never]: TEdges[K] extends BoundSubAggregate<infer S, infer E>
-        ? AggregateCreateInputType<Schema.Schema.Type<S>, E, [], TStamps>
+        ? AggregateCreateInputType<Schema.Schema.Type<S>, E, [], TStamps, SchemaFieldsOf<S>>
         : never
     } & {
       // Optional BoundSubAggregate fields → recurse
@@ -546,7 +529,7 @@ export type AggregateCreateInputType<
           ? K
           : never
         : never]?: TEdges[K] extends BoundSubAggregate<infer S, infer E>
-        ? AggregateCreateInputType<Schema.Schema.Type<S>, E, [], TStamps>
+        ? AggregateCreateInputType<Schema.Schema.Type<S>, E, [], TStamps, SchemaFieldsOf<S>>
         : never
     } & {
       // Required ManyEdge fields
@@ -557,7 +540,7 @@ export type AggregateCreateInputType<
             ? IF
             : K
         : never]: K extends keyof TModel
-        ? _ManyEdgeCreateInput<TModel[K], TEdges[K], TStamps>
+        ? _ManyEdgeCreateInput<TModel[K], TEdges[K], TStamps, _FieldOf<TFields, K>>
         : never
     } & {
       // Optional ManyEdge fields
@@ -568,7 +551,7 @@ export type AggregateCreateInputType<
             : K
           : never
         : never]?: K extends keyof TModel
-        ? _ManyEdgeCreateInput<TModel[K], TEdges[K], TStamps>
+        ? _ManyEdgeCreateInput<TModel[K], TEdges[K], TStamps, _FieldOf<TFields, K>>
         : never
     }
 >
