@@ -149,6 +149,51 @@ const RootAggregate = Aggregate.make(Root, {
 
 type Create = Parameters<typeof RootAggregate.create>[0]
 
+/**
+ * A many edge whose element is a union: a nested union of two members wrapping the entity, one of
+ * them with a nullable discriminator, and a member sharing a discriminator that declares the
+ * entity's field a string and an id field of its own.
+ */
+const UnionSheet = Schema.Union([
+  Schema.Union([
+    Schema.Struct({
+      kind: Schema.NullOr(Schema.Literal("a")),
+      numberLine: NumberLine,
+      qty: Schema.Number,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("b"),
+      numberLine: Schema.optional(NumberLine),
+      qty: Schema.Number,
+    }),
+  ]),
+  Schema.Struct({
+    kind: Schema.Literal("a"),
+    numberLine: Schema.String,
+    numberLineId: Schema.String,
+    qty: Schema.Number,
+  }),
+])
+class UnionRoot extends Schema.Class<UnionRoot>("UnionRoot")({
+  id: Schema.String,
+  sheets: Schema.Array(UnionSheet),
+}) {}
+const UnionAggregate = Aggregate.make(UnionRoot, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "union" },
+  root: { entityType: "UnionRoot" },
+  edges: {
+    sheets: Aggregate.many({
+      entityType: "UnionSheet",
+      entity: NumberLines,
+      sk: { composite: ["qty"] },
+    }),
+  },
+})
+type UnionCreate = Parameters<typeof UnionAggregate.create>[0]
+
 const bound = () => Aggregate.bind(RootAggregate)
 type BoundCreate = Parameters<Effect.Success<ReturnType<typeof bound>>["create"]>[0]
 
@@ -232,6 +277,19 @@ describe("an aggregate's create takes what it takes at run time", () => {
     expectTypeOf({ ...base, maybeSheets: [{ numberLine: line, qty: 2 }] }).toExtend<Create>()
   })
 
+  it("takes a union element as each of its members, nested and nullable ones included", () => {
+    expectTypeOf({
+      id: "a",
+      sheets: [
+        { kind: null, numberLineId: 1, qty: 1 },
+        { kind: "a", numberLine: line, qty: 2 },
+        { kind: "b", qty: 3 },
+        { kind: "b", numberLineId: 1, qty: 4 },
+        { kind: "a", numberLine: "KEEP", numberLineId: "l", qty: 5 },
+      ],
+    } as const).toExtend<UnionCreate>()
+  })
+
   it("takes a sub-aggregate's edges the same way", () => {
     expectTypeOf({ ...base, team: { name: "A", captain: line } }).toExtend<Create>()
   })
@@ -257,5 +315,7 @@ function _refusals(input: Record<string, unknown>): void {
   RootAggregate.create({ ...base, numberLines: [{ lineId: "x" }] })
   // @ts-expect-error — a record of unknown values is no input
   RootAggregate.create(input)
+  // @ts-expect-error — no member of the union element takes a string in `numberLine` for kind "b"
+  UnionAggregate.create({ id: "a", sheets: [{ kind: "b", numberLine: "x", qty: 1 }] })
 }
 void _refusals
