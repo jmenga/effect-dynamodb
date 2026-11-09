@@ -2486,6 +2486,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 // A root under both partition keys (its sort key is fixed, so one
                 // partition holds one): neither copy is judged.
                 const both = assembly === "Multiple root items found"
+                // What went wrong, as the error says it: a tagged error's own message is empty.
+                const detail =
+                  error._tag === "AggregateAssemblyError" ||
+                  error._tag === "AggregateDecompositionError"
+                    ? error.reason
+                    : error._tag === "ValidationError"
+                      ? String(error.cause ?? error.message)
+                      : error.message
                 return Effect.succeed({
                   conflicts: [
                     {
@@ -2496,7 +2504,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                       target: { [config.pk.field]: current, sk: rekeyRootSk },
                       message: both
                         ? "The aggregate's root is also stored under its current key."
-                        : `${error._tag}: ${String(assembly ?? (error as { message?: unknown }).message ?? "")}`,
+                        : `${error._tag}: ${detail}`,
                     },
                   ],
                 })

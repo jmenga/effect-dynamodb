@@ -852,3 +852,63 @@ describe.each(SETTINGS)("a Z-order index's text, %s", (_direction, escapeKeys) =
     }).pipe(on(w, table))
   })
 })
+
+describe("a failed aggregate's conflict says what went wrong", () => {
+  // Created keyed by `lid`, then read by a declaration keying the edge by `note`, which both lines
+  // share: decomposing the value read composes one sort key twice. A tagged error's own message is
+  // empty, so the conflict gives its reason.
+  const Line = Schema.Struct({ lid: Schema.String, note: Schema.String })
+  const Order = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+  const schema = DynamoSchema.make({ name: "failed", version: 1 })
+  const MainTable = Table.make({ schema, entities: {} })
+  const orders = (sk: "lid" | "note") =>
+    Aggregate.make(Order, {
+      table: MainTable,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "orders" },
+      root: { entityType: "Order" },
+      edges: { lines: Aggregate.many({ entityType: "Line", sk: { composite: [sk] } }) },
+    })
+
+  it.effect("a decomposition error's reason, in the dry run too", () => {
+    const table = tableOf()
+    const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" }))),
+      ) as Effect.Effect<A, E>
+    return Effect.gen(function* () {
+      const created = yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Orders: orders("lid") },
+        tables: { MainTable },
+      })
+      yield* created.aggregates.Orders.create({
+        id: "o",
+        lines: [
+          { lid: "a", note: "same" },
+          { lid: "b", note: "same" },
+        ],
+      })
+      const before = keysOf(table)
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Orders: orders("note") },
+        tables: { MainTable },
+      })
+      const { dry, real } = yield* dryThenReal(db)
+      for (const report of [dry, real]) {
+        expect(report.conflicts.map((conflict) => [conflict.reason, conflict.message])).toEqual([
+          [
+            "failed",
+            'AggregateDecompositionError: "lines" and "lines" both compose the sort key ' +
+              '"$failed#v1#line#same", so one would overwrite the other. Give the "lines" edge a ' +
+              "declared sort key naming attributes that differ between its elements: lines: " +
+              "Aggregate.many({ …, sk: { composite: [...] } }).",
+          ],
+        ])
+      }
+      expect(keysOf(table)).toEqual(before)
+    }).pipe(provide)
+  })
+})
