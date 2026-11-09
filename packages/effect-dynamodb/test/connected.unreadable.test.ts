@@ -516,13 +516,14 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
     ),
   )
 
-  it.effect("a Schema.BigDecimal once normalised dies at put, and writes nothing", () =>
+  it.effect("a Schema.BigDecimal once normalised is stored as a fresh one of its value is", () =>
     onEntity(Schema.BigDecimal, (rows, tableName) =>
       Effect.gen(function* () {
+        yield* rows.put({ id: "a", f: BigDecimal.fromStringUnsafe("1.5") }).asEffect()
+        const fresh = (yield* rowsOf(tableName))[0]?.f
         const value = BigDecimal.normalize(BigDecimal.fromStringUnsafe("1.5"))
-        const exit = yield* Effect.exit(rows.put({ id: "a", f: value }).asEffect())
-        expect(Exit.isFailure(exit)).toBe(true)
-        expect(yield* rowsOf(tableName)).toEqual([])
+        yield* rows.put({ id: "a", f: value }).asEffect()
+        expect((yield* rowsOf(tableName))[0]?.f).toEqual(fresh)
       }),
     ),
   )

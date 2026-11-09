@@ -12,7 +12,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
 import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
-import { Data } from "effect"
+import { BigDecimal, Data } from "effect"
 
 const MARSHALL_OPTIONS = { removeUndefinedValues: true, convertClassInstanceToMap: true } as const
 
@@ -100,6 +100,126 @@ const withoutEmptySets = (value: unknown): unknown => {
   return same ? value : Object.fromEntries(next)
 }
 
+const BIG_DECIMAL = "~effect/BigDecimal"
+
+/**
+ * A `BigDecimal` itself, not the map DynamoDB hands back for one: its marker is on the prototype.
+ */
+const isBigDecimalInstance = (value: object): value is BigDecimal.BigDecimal =>
+  BigDecimal.isBigDecimal(value) && !Object.hasOwn(value, BIG_DECIMAL)
+
+/** Values marshalling stores whole, which hold no `BigDecimal` to swap. */
+const isOpaque = (value: object): boolean =>
+  value instanceof Set ||
+  value instanceof Date ||
+  ArrayBuffer.isView(value) ||
+  value instanceof ArrayBuffer
+
+/**
+ * An own property's value read from its descriptor, or `undefined` for an accessor: a getter is
+ * never called.
+ */
+const ownData = (value: object, key: string): unknown => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key)
+  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined
+}
+
+/**
+ * Whether a decimal's cached `normalized` form leads into a cycle: the one `BigDecimal.normalize`
+ * caches holds itself, so following it never ends.
+ */
+const cachesCycle = (decimal: BigDecimal.BigDecimal): boolean => {
+  const seen = new Set<object>()
+  let current: unknown = decimal
+  while (typeof current === "object" && current !== null && isBigDecimalInstance(current)) {
+    if (seen.has(current)) return true
+    seen.add(current)
+    current = ownData(current, "normalized")
+  }
+  return false
+}
+
+/**
+ * The enumerable data properties marshalling walks on an object, its prototypes' included, read
+ * from their descriptors. A getter is never called, so what's behind one isn't seen.
+ */
+const dataValuesOf = (value: object): ReadonlyArray<unknown> => {
+  const values: Array<unknown> = []
+  const named = new Set<string>()
+  for (let at: object | null = value; at !== null; at = Object.getPrototypeOf(at)) {
+    const descriptors = Object.getOwnPropertyDescriptors(at)
+    for (const key of Object.keys(descriptors)) {
+      if (named.has(key)) continue
+      named.add(key)
+      const descriptor = descriptors[key]!
+      if (descriptor.enumerable && "value" in descriptor) values.push(descriptor.value)
+    }
+  }
+  return values
+}
+
+/**
+ * Whether a value holds a `BigDecimal` whose cached `normalized` form leads into a cycle, anywhere
+ * marshalling would reach it through data. Only looked for once marshalling has refused the value,
+ * and without calling a getter, so a value holding none is then handled exactly as it always was:
+ * the same getter calls, the same bytes.
+ */
+const holdsCachedCycle = (value: unknown, seen = new Set<object>()): boolean => {
+  if (typeof value !== "object" || value === null || isOpaque(value) || seen.has(value)) {
+    return false
+  }
+  seen.add(value)
+  if (isBigDecimalInstance(value) && cachesCycle(value)) return true
+  const parts = value instanceof Map ? [...value.values()] : dataValuesOf(value)
+  return parts.some((part) => holdsCachedCycle(part, seen))
+}
+
+/**
+ * The value with each `BigDecimal` whose cached `normalized` form leads into a cycle written
+ * without that cache: on its own prototype, with every other enumerable property it has, in order.
+ * A decimal nothing has cached on marshals to exactly that, so the stored bytes are a fresh
+ * decimal's. The same reference when the value holds no such decimal.
+ *
+ * `Equal.equals`, `Hash.hash` and `BigDecimal.normalize` cache the normalized decimal on the one
+ * they're given, and that decimal holds itself, so marshalling recursed until the stack ran out.
+ */
+const withoutCachedNormals = (value: unknown, open = new Set<object>()): unknown => {
+  if (typeof value !== "object" || value === null || isOpaque(value) || open.has(value)) {
+    return value
+  }
+  open.add(value)
+  try {
+    if (isBigDecimalInstance(value) && cachesCycle(value)) {
+      const written = Object.create(Object.getPrototypeOf(value))
+      for (const key of Object.keys(value)) {
+        if (key === "normalized") continue
+        written[key] = withoutCachedNormals(
+          (value as unknown as Record<string, unknown>)[key],
+          open,
+        )
+      }
+      return written
+    }
+    if (Array.isArray(value)) {
+      const elements = value.map((element) => withoutCachedNormals(element, open))
+      return elements.some((element, index) => element !== value[index]) ? elements : value
+    }
+    if (value instanceof Map) {
+      const entries = [...value].map(
+        ([key, entry]) => [key, withoutCachedNormals(entry, open)] as const,
+      )
+      return entries.every(([key, entry]) => entry === value.get(key)) ? value : new Map(entries)
+    }
+    const entries = propertiesOf(value)
+    const next = entries.map(([key, entry]) => [key, withoutCachedNormals(entry, open)] as const)
+    return next.every(([, entry], index) => entry === entries[index]![1])
+      ? value
+      : Object.fromEntries(next)
+  } finally {
+    open.delete(value)
+  }
+}
+
 /** Whether marshalling refuses a value. */
 const isRefused = (value: unknown): boolean => {
   try {
@@ -141,14 +261,21 @@ const NO_EMPTY_SET =
 /**
  * DynamoDB can't store an empty set, so one is an absent attribute. Marshalling
  * refuses it, and only then are the item's empty sets looked for: an item without
- * any costs nothing and marshals exactly as it did. Whatever is still refused has
- * no attribute to leave out, and throws {@link UnstorableValue}.
+ * any costs nothing and marshals exactly as it did. A `BigDecimal` something has
+ * cached a normalized form on is refused the same way, since the cache holds
+ * itself: it's written without that cache before anything else walks the item
+ * ({@link withoutCachedNormals}). An item holding no such decimal
+ * ({@link holdsCachedCycle}, which calls no getter) goes on exactly as before.
+ * Whatever is still refused has no attribute to leave out, and throws
+ * {@link UnstorableValue}.
  */
 const marshallStorable = (item: Record<string, unknown>): Record<string, AttributeValue> => {
   try {
     return marshall(item, MARSHALL_OPTIONS)
   } catch {
-    const storable = withoutEmptySets(item) as Record<string, unknown>
+    const storable = withoutEmptySets(
+      holdsCachedCycle(item) ? withoutCachedNormals(item) : item,
+    ) as Record<string, unknown>
     try {
       return marshall(storable, MARSHALL_OPTIONS)
     } catch (cause) {
