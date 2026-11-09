@@ -75,6 +75,7 @@ import {
   DateTime,
   Effect,
   Equal,
+  Exit,
   type Optic,
   Option,
   Schema,
@@ -183,11 +184,13 @@ import {
   deriveAggregateSchemas,
   deriveEntityFieldName,
   elementHoldsRef,
+  holdsRefId,
   isEntityElement,
   isFieldOptional,
   manyEdgePaths,
   manyElementFields,
   manyElementSchema,
+  refIdField,
   refIdValue,
   refKeyComposite,
   refKeyComposites,
@@ -4616,8 +4619,13 @@ const hydrateAggregateRefs = (
     // number through a digits-only string codec), or one DynamoDB can't store (an infinite number,
     // at any depth of a struct, an `Option` or a `Result`), whose key text can name an item of
     // another value (`{ a: Infinity }` and `{ a: 5 }` compose one key), fetched in its place.
-    // An id given more than once is judged once.
-    const judged = new Map<string, Set<unknown>>()
+    // An id given more than once is judged once: one composing the key text of an id already
+    // judged, and equal to it as a value of the key composite (`Schema.toEquivalence`), so three
+    // ISO strings of one instant, each decoded to a `Date` of its own, are judged once. The key
+    // text alone isn't enough: `{ a: Infinity }` composes the key of `{ a: 5 }`, and is refused.
+    // An id whose key isn't composed here is judged, and fails composing below.
+    const judged = new Map<string, Array<unknown>>()
+    const composed = new Map<RefRequest, string>()
     for (const req of refRequests) {
       const composite = refKeyComposite(req.entity)!
       if (Option.isNone(req.id)) {
@@ -4632,29 +4640,40 @@ const hydrateAggregateRefs = (
           ),
         })
       }
-      const ids = judged.get(req.entity.entityType) ?? new Set<unknown>()
-      judged.set(req.entity.entityType, ids)
-      if (ids.has(req.id.value)) continue
-      ids.add(req.id.value)
-      const unstorable = yield* runtimeEntities
-        .get(req.entity.entityType)!
-        ._unstorableKey({ [composite]: req.id.value })
-        .pipe(
-          Effect.mapError(
-            (refused) =>
-              new ValidationError({
-                entityType: aggregateName,
-                operation: "aggregate.create",
-                cause: new Error(
-                  `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ` +
-                    `${describeId(req.given)}, which no item of entity "${req.entity.entityType}" ` +
-                    `can be keyed by: \`put\` refuses it, as it doesn't encode as "${composite}" ` +
-                    `is stored. Give an id that does. Nothing was fetched or written.`,
-                  { cause: refused },
-                ),
-              }),
-          ),
-        )
+      const runtimeEntity = runtimeEntities.get(req.entity.entityType)!
+      const key = yield* Effect.exit(
+        composePrimaryKeyOrFail(
+          runtimeEntity as unknown as Parameters<typeof composePrimaryKeyOrFail>[0],
+          { [composite]: req.id.value },
+          "aggregate.create",
+        ),
+      )
+      if (Exit.isSuccess(key)) {
+        const keyText = `${req.entity.entityType}:${JSON.stringify(Object.values(key.value))}`
+        composed.set(req, keyText)
+        const same = judged.get(keyText) ?? []
+        judged.set(keyText, same)
+        const equivalent = idEquivalence(req.entity)
+        const value = req.id.value
+        if (same.some((other) => equivalent(other, value))) continue
+        same.push(value)
+      }
+      const unstorable = yield* runtimeEntity._unstorableKey({ [composite]: req.id.value }).pipe(
+        Effect.mapError(
+          (refused) =>
+            new ValidationError({
+              entityType: aggregateName,
+              operation: "aggregate.create",
+              cause: new Error(
+                `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ` +
+                  `${describeId(req.given)}, which no item of entity "${req.entity.entityType}" ` +
+                  `can be keyed by: \`put\` refuses it, as it doesn't encode as "${composite}" ` +
+                  `is stored. Give an id that does. Nothing was fetched or written.`,
+                { cause: refused },
+              ),
+            }),
+        ),
+      )
       if (unstorable !== undefined) {
         return yield* new ValidationError({
           entityType: aggregateName,
@@ -4684,12 +4703,16 @@ const hydrateAggregateRefs = (
       const ops: Array<{ readonly lookupKey: string; readonly req: RefRequest }> = []
       const seen = new Set<string>()
       for (const req of reqs) {
-        const key = yield* composePrimaryKeyOrFail(
-          runtimeEntity as unknown as Parameters<typeof composePrimaryKeyOrFail>[0],
-          { [composite]: Option.getOrThrow(req.id) },
-          "aggregate.create",
-        )
-        const lookupKey = `${entityType}:${JSON.stringify(Object.values(key))}`
+        // Composed while judging the id, unless that failed: then composing fails here.
+        let lookupKey = composed.get(req)
+        if (lookupKey === undefined) {
+          const key = yield* composePrimaryKeyOrFail(
+            runtimeEntity as unknown as Parameters<typeof composePrimaryKeyOrFail>[0],
+            { [composite]: Option.getOrThrow(req.id) },
+            "aggregate.create",
+          )
+          lookupKey = `${entityType}:${JSON.stringify(Object.values(key))}`
+        }
         lookupKeys.set(req, lookupKey)
         if (!seen.has(lookupKey)) {
           seen.add(lookupKey)
@@ -4776,6 +4799,28 @@ const renameInputFields = (
 /** An id given for an edge's entity: the id as given, and as a value of its key composite. */
 const refId = (entity: RefEntity, given: unknown) => ({ given, id: refIdValue(entity, given) })
 
+const idEquivalences = new WeakMap<object, (a: unknown, b: unknown) => boolean>()
+
+/**
+ * Whether two ids of `entity` are one value of its key composite (`refIdField`), by the field's
+ * own equivalence (`Schema.toEquivalence`: two `Date`s of one instant are one); `Equal.equals`
+ * where the field can't be read or derives none.
+ */
+const idEquivalence = (entity: RefEntity): ((a: unknown, b: unknown) => boolean) => {
+  const field = refIdField(entity)
+  if (field === undefined) return Equal.equals
+  const cached = idEquivalences.get(field)
+  if (cached !== undefined) return cached
+  let equivalent: (a: unknown, b: unknown) => boolean
+  try {
+    equivalent = Schema.toEquivalence(field as Schema.Schema<unknown>)
+  } catch {
+    equivalent = Equal.equals
+  }
+  idEquivalences.set(field, equivalent)
+  return equivalent
+}
+
 /**
  * Recursively walk input following graph edges to collect ref ID references.
  * Edge-driven: entity lookup comes from the edge directly, not from a refs bag.
@@ -4798,11 +4843,13 @@ const collectRefIdsFromEdges = (
     if (!("_tag" in edge)) continue
 
     if (edge._tag === "RefEdge" || (edge._tag === "OneEdge" && edge.entity)) {
-      // RefEdge, and OneEdge with an entity → ${field}Id in input
+      // RefEdge, and OneEdge with an entity → ${field}Id in input, where it holds an id `create`
+      // fetches (`holdsRefId`): a string as on 1.39.0, an id of another type only where the model's
+      // field is the entity's own model, its id isn't declared, and the entity isn't given whole.
       const entity = edge.entity!
       const idFieldName = `${edgeName}Id`
       const idValue = input[idFieldName]
-      if (idValue != null) {
+      if (holdsRefId(fields, edgeName, entity, input)) {
         result.push({
           entity,
           ...refId(entity, idValue),
@@ -4858,10 +4905,10 @@ const collectRefIdsFromEdges = (
             typeof elem === "object" &&
             elementHoldsRef(element, entity, elem as Record<string, unknown>)
           ) {
-            // Element wraps the entity, given as `${field}Id` (`elementHoldsRef`): an id of the
-            // entity's key composite where the element's definition names the field holding the
-            // entity, a string otherwise, as on 1.39.0. An element that is the entity, given
-            // whole, is stored as given.
+            // Element wraps the entity, given as `${field}Id`, where it holds an id `create`
+            // fetches (`elementHoldsRef`, the rule a `one` edge's id follows): a string as on
+            // 1.39.0, an id of another type only where the element's field of the entity's name is
+            // the entity's own model, its id isn't declared, and the entity isn't given whole.
             const elemObj = elem as Record<string, unknown>
             const idFieldName = `${entityFieldName}Id`
             const idValue = elemObj[idFieldName]

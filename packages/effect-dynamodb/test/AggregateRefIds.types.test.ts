@@ -8,8 +8,8 @@
  * These match what `create` does at run time (`AggregateRefHydration.test.ts`).
  *
  * A `many` element is judged from its schema, never its domain type. One that is the entity takes
- * its id or the entity whole. One that names the field holding the entity takes the element whole,
- * or with that field's id in its place: a `Schema.Struct` or `Schema.Class` (no union, no
+ * its id or the entity whole. One that names the field holding the entity takes the element whole
+ * (that field's id beside it or not), or with that field's id in its place, beside 1.39.0's form: a `Schema.Struct` or `Schema.Class` (no union, no
  * transformation) whose field of the entity's name is the entity's model, under `Schema.optional`
  * at most, and which declares no `${field}Id` itself. `create` takes the field's name from the
  * model's identifier, or from the `entityType` for a model with none, so the type sees it only for
@@ -421,14 +421,16 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
     expectTypeOf<Input["rows"]>().toEqualTypeOf<ReadonlyArray<number | typeof NumberRow.Type>>()
   })
 
-  it("a many element wrapping the entity takes it whole, or its id", () => {
+  it("a many element wrapping the entity takes it whole, its id beside it or not, or its id", () => {
+    // 1.39.0's form (the element as declared) is kept: the id forms are added to it.
     expectTypeOf<Input["rowSheets"][number]>().toEqualTypeOf<
       | {
           readonly numberRow: typeof NumberRow.Type
           readonly qty: number
-          readonly numberRowId?: never
+          readonly numberRowId?: number | undefined
         }
-      | { readonly numberRowId: number; readonly qty: number; readonly numberRow?: never }
+      | { readonly numberRowId: number; readonly qty: number }
+      | { readonly numberRow: typeof NumberRow.Type; readonly qty: number }
     >()
   })
 
@@ -437,36 +439,31 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
       | {
           readonly numberRow?: typeof NumberRow.Type | undefined
           readonly qty: number
-          readonly numberRowId?: never
-        }
-      | {
           readonly numberRowId?: number | undefined
-          readonly qty: number
-          readonly numberRow?: never
         }
+      | { readonly numberRowId?: number | undefined; readonly qty: number }
+      | { readonly numberRow?: typeof NumberRow.Type | undefined; readonly qty: number }
     >()
   })
 
   it("a string keyed struct entity's element takes it whole or by id, optional or not", () => {
+    // A model with an `id: string` is ref-like to 1.39.0, which took it by id: that form is kept.
     expectTypeOf<Input["stringRowSheets"][number]>().toEqualTypeOf<
       | {
           readonly stringRow: typeof StringRow.Type
           readonly qty: number
-          readonly stringRowId?: never
+          readonly stringRowId?: string | undefined
         }
-      | { readonly stringRowId: string; readonly qty: number; readonly stringRow?: never }
+      | { readonly stringRowId: string; readonly qty: number }
     >()
     expectTypeOf<Input["maybeStringRowSheets"][number]>().toEqualTypeOf<
       | {
           readonly stringRow?: typeof StringRow.Type | undefined
           readonly qty: number
-          readonly stringRowId?: never
-        }
-      | {
           readonly stringRowId?: string | undefined
-          readonly qty: number
-          readonly stringRow?: never
         }
+      | { readonly stringRowId?: string | undefined; readonly qty: number }
+      | { readonly stringRow?: typeof StringRow.Type | undefined; readonly qty: number }
     >()
   })
 
@@ -490,9 +487,10 @@ describe("an aggregate edge takes an id of its entity's key attribute", () => {
       | {
           readonly configuredRow: typeof NumberRow.Type
           readonly qty: number
-          readonly configuredRowId?: never
+          readonly configuredRowId?: number | undefined
         }
-      | { readonly configuredRowId: number; readonly qty: number; readonly configuredRow?: never }
+      | { readonly configuredRowId: number; readonly qty: number }
+      | { readonly configuredRow: typeof NumberRow.Type; readonly qty: number }
     >()
   })
 })
@@ -702,12 +700,6 @@ void _accepted
 
 // Compile-enforced: no id form is advertised where `create` doesn't take one.
 function _idRefusals(): void {
-  // @ts-expect-error — the whole and the id forms exclude each other
-  const _both: Input["rowSheets"][number] = {
-    numberRow: { lineId: 5, f: 1 },
-    numberRowId: 5,
-    qty: 1,
-  }
   // @ts-expect-error — a field declared an `Option` is not taken by id
   const _optionId: Input["optionRowSheets"][number] = { numberRowId: 5, qty: 1 }
   // @ts-expect-error — a field declared nullable is not taken by id
@@ -718,7 +710,6 @@ function _idRefusals(): void {
   const _codecId: Input["codecRowSheets"][number] = { numberRowId: 5, qty: 1 }
   // @ts-expect-error — an element declaring `${field}Id` keeps its field
   const _declaredId: Input["declaredIdRowSheets"][number] = { numberRowId: 5, qty: 1 }
-  void _both
   void _optionId
   void _nullId
   void _unionId

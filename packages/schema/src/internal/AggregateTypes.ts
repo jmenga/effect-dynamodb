@@ -456,36 +456,49 @@ type _NamesEntityField<ES, MS, N extends string> = [N] extends [never]
  * An element whose definition names the field holding the entity, given by id: `${N}Id: Id` in
  * place of field `N`, optional when it is.
  */
-type _ElementById<E, Id, N extends string> = _Simplify<
-  {
-    readonly [K in keyof E as K extends N ? `${N}Id` : K]: K extends N
-      ? Id | (undefined extends E[K] ? undefined : never)
-      : E[K]
-  } & { readonly [P in N]?: never }
+type _ElementById<E, Id, N extends string> = _Simplify<{
+  readonly [K in keyof E as K extends N ? `${N}Id` : K]: K extends N
+    ? Id | (undefined extends E[K] ? undefined : never)
+    : E[K]
+}>
+
+/** An element given whole, `${N}Id` beside it optional: neither refuses the other. */
+type _ElementWhole<E, Id, N extends string> = _Simplify<
+  E & { readonly [P in `${N}Id`]?: Id | undefined }
 >
 
 /**
- * A many edge's elements as its input takes them, for an edge whose entity (model schema `MS`) one
- * id of type `Id` names, decided from the element's schema (`ES`):
+ * A many element as its input takes it beside 1.39.0's form ({@link _Element139}), for an edge
+ * whose entity (model schema `MS`) one id of type `Id` names, decided from the element's schema
+ * (`ES`):
  * - an element that is the entity (`Array<Umpire>`, {@link _IsEntityElement}): its id, or the
  *   entity whole;
  * - an element naming the field holding the entity ({@link _NamesEntityField}): the element whole,
- *   or with `${field}Id: Id` in place of that field. Each refuses the other's key.
- * - any other element is typed as on 1.39.0 ({@link _ElementInput139}), with `Id139`.
+ *   `${field}Id` beside it or not, or with `${field}Id: Id` in place of that field. Neither refuses
+ *   the other's key: given both, `create` keeps the entity given whole, and fetches a string id as
+ *   1.39.0 did.
+ * - any other element: 1.39.0's form alone.
+ */
+type _ElementInput<E, TStamps, ES, MS, Id, N extends string> =
+  _IsEntityElement<ES, MS> extends true
+    ? Id | _OptionalStamps<E, TStamps>
+    : _NamesEntityField<ES, MS, N> extends true
+      ?
+          | _OptionalStamps<_ElementWhole<E, Id, N>, TStamps>
+          | _OptionalStamps<_ElementById<E, Id, N>, TStamps>
+      : never
+
+/**
+ * A many edge's elements as its input takes them: every element 1.39.0's input took
+ * ({@link _Element139}, with `Id139`), and, for an edge whose entity one id names, the forms
+ * `create` takes an id of its key composite in ({@link _ElementInput}). Only added to 1.39.0's.
  * With no entity to fetch (`MS = never`), the elements are taken as given.
  */
 type _TransformManyEdge<T, TStamps, ES, MS, Id, Id139, N extends string> =
   T extends ReadonlyArray<infer E>
     ? [MS] extends [never]
       ? ReadonlyArray<_OptionalStamps<E, TStamps>>
-      : _IsEntityElement<ES, MS> extends true
-        ? ReadonlyArray<Id | _OptionalStamps<E, TStamps>>
-        : _NamesEntityField<ES, MS, N> extends true
-          ? ReadonlyArray<
-              | _OptionalStamps<_Simplify<E & { readonly [P in `${N}Id`]?: never }>, TStamps>
-              | _OptionalStamps<_ElementById<E, Id, N>, TStamps>
-            >
-          : _ElementInput139<E, Id139, TStamps>
+      : ReadonlyArray<_ElementInput<E, TStamps, ES, MS, Id, N> | _Element139<E, Id139, TStamps>>
     : T extends Readonly<Record<string, infer V>>
       ? string extends keyof T
         ? { readonly [key: string]: _OptionalStamps<V, TStamps> }
@@ -512,14 +525,11 @@ type _RefFieldsToIds139<T, Id> = _Simplify<{
 }>
 
 /**
- * A many edge's elements as 1.39.0 typed them (`_TransformManyEdge` there): an element whose
- * members are all ref-like is `Id`; otherwise its ref-like fields are taken as `${field}Id: Id`.
- * For any element `create` judges as 1.39.0 did ({@link _TransformManyEdge}).
+ * A many element as 1.39.0 typed it (`_TransformManyEdge` there): an element that is ref-like is
+ * `Id`; otherwise its ref-like fields are taken as `${field}Id: Id`.
  */
-type _ElementInput139<E, Id, TStamps> =
-  _IsRefLike<E> extends true
-    ? ReadonlyArray<Id>
-    : ReadonlyArray<_OptionalStamps<_RefFieldsToIds139<E, Id>, TStamps>>
+type _Element139<E, Id, TStamps> =
+  _IsRefLike<E> extends true ? Id : _OptionalStamps<_RefFieldsToIds139<E, Id>, TStamps>
 
 /** `T` with the dates the library stamps optional. */
 type _OptionalStamps<T, TStamps> = [ManagedDateField<T, TStamps>] extends [never]

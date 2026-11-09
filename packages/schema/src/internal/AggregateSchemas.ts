@@ -507,18 +507,34 @@ const isSameSchemaNode = (a: SchemaAST.AST, b: SchemaAST.AST): boolean => {
   )
 }
 
-/** Whether a schema is the entity's own model (`isSameSchemaNode`), its configure wrapper taken off. */
-const isEntityModel = (schema: Schema.Top, entity: RefEntity): boolean =>
+/**
+ * Whether a schema is the entity's own model: the schema its definition declares (its
+ * `DynamoModel.configure` wrapper taken off), or a copy of it that changes only its annotations, its
+ * checks or its brand (`isSameSchemaNode`), compared by reference. An identifier is never identity:
+ * a class of the entity's identifier is another schema, as is a struct declared again with the
+ * entity's fields. Every question of whether a schema is the entity is asked of this.
+ */
+export const isEntityModel = (schema: Schema.Top, entity: RefEntity): boolean =>
   isSameSchemaNode(schema.ast, unwrapModel(entity.model).ast)
 
 /**
- * Whether a `many` element is the entity itself (`Array<Umpire>`): the entity's own model, or a
- * class of the same identifier, as 1.39.0 found it. Its values are the entity whole, or an id.
+ * Whether a field's schema holds the entity's own model ({@link isEntityModel}), under
+ * `Schema.optional` / `Schema.optionalKey` at most. An `Option`, a `NullOr` or a `Result` of it holds
+ * something else: a record fetched for it is no value of the field.
+ */
+const holdsEntityModel = (field: Schema.Top | undefined, entity: RefEntity): boolean => {
+  if (field === undefined) return false
+  const optional = optionalField(field)
+  if (optional?.union !== undefined) return false
+  return isEntityModel(optional?.inner ?? field, entity)
+}
+
+/**
+ * Whether a `many` element is the entity itself (`Array<Umpire>`): the entity's own model
+ * ({@link isEntityModel}). Its values are the entity whole, or an id.
  */
 export const isEntityElement = (element: Schema.Top | undefined, entity: RefEntity): boolean =>
-  element !== undefined &&
-  getSchemaFields(element) !== undefined &&
-  (isSchemaMatchingEntity(element, entity) || isEntityModel(element, entity))
+  element !== undefined && isEntityModel(element, entity)
 
 /**
  * The field of a `many` element that holds the entity, where the element's definition says so,
@@ -526,14 +542,11 @@ export const isEntityElement = (element: Schema.Top | undefined, entity: RefEnti
  *
  * 1. The element is a plain `Schema.Struct` or `Schema.Class`: one with fields of its own. A
  *    transformation, a union, a `suspend` or a declaration has none.
- * 2. Its field of the entity's name (`deriveEntityFieldName`) is the entity's own model
- *    (`isSameSchemaNode`), or that under `Schema.optional` / `Schema.optionalKey` alone. An
- *    `Option`, a `NullOr` or a `Result` of it is another schema.
+ * 2. Its field of the entity's name (`deriveEntityFieldName`) holds the entity's own model
+ *    (`holdsEntityModel`).
  * 3. It doesn't declare `${field}Id` itself: a declared one is the element's own data.
  *
- * Such an element takes an id of the entity's key composite under `${field}Id` (`refIdValue`),
- * which `create` fetches. Any other element is judged as 1.39.0 judged it: a string `${field}Id`
- * is fetched, whatever the element declares.
+ * Such an element's input takes an id of the entity's key composite under `${field}Id`.
  */
 export const entityFieldOf = (
   element: Schema.Top | undefined,
@@ -542,28 +555,56 @@ export const entityFieldOf = (
   const fields = element === undefined ? undefined : getSchemaFields(element)
   if (fields === undefined) return undefined
   const name = deriveEntityFieldName(entity)
-  const field = fields[name]
-  if (field === undefined || `${name}Id` in fields) return undefined
-  const optional = optionalField(field)
-  if (optional?.union !== undefined) return undefined
-  return isEntityModel(optional?.inner ?? field, entity) ? name : undefined
+  if (`${name}Id` in fields) return undefined
+  return holdsEntityModel(fields[name], entity) ? name : undefined
 }
 
 /**
- * Whether `create` fetches `entity` for a `many` element value given as an object, under its
- * `${field}Id`: any value but `null` and `undefined` where the element's definition names the field
- * holding the entity ({@link entityFieldOf}), and a string otherwise, as on 1.39.0. An element that is
- * the entity itself ({@link isEntityElement}) holds no reference: given whole, it's stored as given.
+ * Whether `create` fetches `entity` for `value`'s `${field}Id`, `value` a value of a definition
+ * declaring `fields` (`undefined` where it declares none: a union, a transformation): the parent
+ * model's, its `field` the edge's name, for a `one` or `ref` edge; a `many` element's, its `field`
+ * the entity's name (`deriveEntityFieldName`). One rule for every edge:
+ *
+ * 1. `null` and `undefined` give no id.
+ * 2. A string is fetched, as on 1.39.0, which replaces a record given whole in `field` with the one
+ *    fetched; except where the definition declares `${field}Id` and not `field`, as an element that
+ *    is the entity declares its own key (`lineId` on a `Line`): there, 1.39.0 dropped the declared
+ *    value and put the record in a field the definition doesn't have.
+ * 3. Any other id (a number, a bigint, a date: a value of the entity's key composite) is fetched only
+ *    where the definition's `field` holds the entity's own model (`holdsEntityModel`), the definition
+ *    doesn't declare `${field}Id`, which is then its own data, and `field` isn't given whole: a
+ *    record given is never replaced or read again. 1.39.0 fetched none of these.
  */
+export const holdsRefId = (
+  fields: Record<string, Schema.Top> | undefined,
+  field: string,
+  entity: RefEntity,
+  value: Record<string, unknown>,
+): boolean => {
+  const id = value[`${field}Id`]
+  if (id == null) return false
+  const declaresId = fields !== undefined && `${field}Id` in fields
+  if (typeof id === "string") return !(declaresId && !(field in fields!))
+  return (
+    fields !== undefined &&
+    !declaresId &&
+    holdsEntityModel(fields[field], entity) &&
+    value[field] == null
+  )
+}
+
+/** {@link holdsRefId} for a `many` element given as an object, of the element's schema. */
 export const elementHoldsRef = (
   element: Schema.Top | undefined,
   entity: RefEntity,
   value: Record<string, unknown>,
-): boolean => {
-  if (isEntityElement(element, entity)) return false
-  const id = value[`${deriveEntityFieldName(entity)}Id`]
-  return entityFieldOf(element, entity) !== undefined ? id != null : typeof id === "string"
-}
+): boolean =>
+  holdsRefId(
+    element === undefined ? undefined : getSchemaFields(element),
+    deriveEntityFieldName(entity),
+    entity,
+    value,
+  )
 
 /**
  * The element schema of a `many` edge, read off the parent model's field: the array's element, or a
@@ -585,8 +626,9 @@ export const manyElementSchema = (
  * - **An element that is the entity** ({@link isEntityElement}): an id of the entity's key composite
  *   (`refIdInput`), or the entity whole.
  * - **An element whose definition names the field holding the entity** ({@link entityFieldOf}): the
- *   element whole, or with `${field}Id`, an id of the entity's key composite, in place of that field.
- *   Each refuses the other's key, so neither drops the other's value.
+ *   element whole, `${field}Id` beside it or not, or with `${field}Id`, an id of the entity's key
+ *   composite, in place of that field. Neither refuses the other's key: given both, both are kept,
+ *   and `create` judges them as it judges a value given to it directly (`elementHoldsRef`).
  * - **Any other element**, as on 1.39.0: the field of the entity's name, if it has one, taken as
  *   `${field}Id: Schema.String`. An element with no fields of its own (a union among them) is taken
  *   as declared.
@@ -616,18 +658,16 @@ export const deriveElementInputSchema = (
   if (named !== undefined) {
     const own = stampedFields(fields, stamps)
     const id = refIdInput(fetched)
-    const absent = Schema.optionalKey(Schema.Never)
     const byId: Record<string, Schema.Top> = {}
     for (const [name, field] of Object.entries(own)) {
       if (name === named) {
         byId[`${name}Id`] = isFieldOptional(field) ? Schema.optionalKey(id) : id
-        byId[name] = absent
       } else {
         byId[name] = field
       }
     }
     return Schema.Union([
-      Schema.Struct({ ...own, [`${named}Id`]: absent } as any),
+      Schema.Struct({ ...own, [`${named}Id`]: Schema.optional(id) } as any),
       Schema.Struct(byId as any),
     ]) as unknown as Schema.Top
   }
@@ -723,10 +763,12 @@ export const unwrapModel = (model: Schema.Top): Schema.Top => {
 }
 
 /**
- * Check if a schema matches an entity model (same Schema.Class identifier).
- * This is used to detect when an array element IS the entity (e.g., Array<Umpire>),
- * as opposed to wrapping the entity (e.g., Array<{ umpire: Umpire, role: string }>).
- * Unwraps ConfiguredModel if the entity uses DynamoModel.configure.
+ * Check if a schema has the same Schema.Class identifier as an entity model,
+ * unwrapping ConfiguredModel if the entity uses DynamoModel.configure.
+ *
+ * An identifier is not identity: two classes can share one. Nothing in the
+ * library decides by this any more; whether an element IS the entity (e.g.,
+ * Array<Umpire>) is decided by comparing the schema itself (`isEntityModel`).
  */
 export const isSchemaMatchingEntity = (schema: Schema.Top, entity: RefEntity): boolean => {
   const s = schema as unknown as Record<string, unknown>

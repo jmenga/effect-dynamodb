@@ -26,6 +26,12 @@
  * fetches, writes and reads what 1.39.0 did, but for a string id of no type of the key composite
  * (`EDD-9131`). A `NumberFromString` id given an infinity as its encoded string, which `put` stores,
  * is fetched as 1.39.0 fetched it.
+ *
+ * An element is the entity only when its schema is the entity's own model, by reference: a class of
+ * the entity's identifier is another schema, and sends, writes and reads what 1.39.0 did. A `one`
+ * edge's id follows the rule a `many` element's does: a string is fetched as on 1.39.0, and an id of
+ * another type is never fetched where the model declares it, or where the entity is given whole,
+ * which is stored as given with the requests 1.39.0 sent. An id given more than once is judged once.
  */
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
@@ -51,6 +57,8 @@ import {
   outcomeOf,
   SHAPES,
   type Shape,
+  SIXTH,
+  STORED_AS_GIVEN,
   schema,
   sharedDiscriminator,
   singleKey,
@@ -59,6 +67,7 @@ import {
   UNIONS,
   UNKEYABLE,
   UNSTORABLE,
+  unescapedSchema,
   WRITES_AS,
 } from "./helpers/RefHydrationShapes.js"
 
@@ -579,6 +588,42 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     }),
   )
 
+  for (const label of SIXTH) {
+    it.effect(`${label}: sends, writes and reads what 1.39.0 did`, () =>
+      Effect.gen(function* () {
+        const { create, requests, rows, get } = yield* run(SHAPES[label]!())
+        const was = fixture.shapes[label]!
+        expect(outcomeOf(create)).toBe(was.create)
+        // The requests 1.39.0's `create` sent, each as the recording table names its command.
+        expect(requests).toEqual(was.requests!.map((op) => `${op[0]!.toUpperCase()}${op.slice(1)}`))
+        expect(byKey(rows)).toEqual(byKey(was.rows))
+        expect(outcomeOf(get)).toBe(was.get)
+      }),
+    )
+  }
+
+  for (const label of STORED_AS_GIVEN) {
+    it.effect(`${label}: stored as given, nothing fetched`, () =>
+      Effect.gen(function* () {
+        const { create, requests, get } = yield* run(SHAPES[label]!())
+        const lines = [{ lineId: "l", f: 5, qty: 1 }]
+        const sub = label.startsWith("sub-aggregate")
+        expect(Exit.isSuccess(create) && json(create.value)).toBe(
+          json(sub ? { id: "a", part: { lines } } : { id: "a", lines }),
+        )
+        expect(requests).toEqual(
+          sub ? ["TransactWriteItems", "TransactWriteItems"] : ["TransactWriteItems"],
+        )
+        expect(Exit.isSuccess(get) && json(get.value)).toBe(
+          json((create as Exit.Success<unknown>).value),
+        )
+        // 1.39.0 took its `lineId` for an id, fetched, and failed decoding.
+        expect(fixture.shapes[label]!.requests).toEqual(["batchGetItem"])
+        expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
+      }),
+    )
+  }
+
   it.effect("ids composing one key (casing) are fetched once, each element hydrated", () =>
     Effect.gen(function* () {
       const { Line, model } = lineClass(true)
@@ -614,6 +659,74 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
       })
       // `BatchGetItem` refuses a repeated key.
       expect(batchGetKeys(sent)).toHaveLength(1)
+    }),
+  )
+
+  /**
+   * A `many` edge over an entity keyed by `lineId` of `key`, its element wrapping the entity, given
+   * `ids`, one per element. `judged` holds each key record `put`'s check (`_unstorableKey`) was run on.
+   */
+  const wrappingIds = (key: Schema.Top, seed: unknown, ids: ReadonlyArray<unknown>) => {
+    class Line extends Schema.Class<Line>("Line")({ lineId: key as never, f: Schema.Number }) {}
+    const Lines = lines(
+      DynamoModel.configure(Line, { lineId: { identifier: true } } as never),
+      singleKey,
+    )
+    const judged: Array<unknown> = []
+    const unstorableKey = Lines._unstorableKey
+    Lines._unstorableKey = (record: unknown) => {
+      judged.push(record)
+      return unstorableKey(record)
+    }
+    const Sheet = Schema.Struct({ line: Line, qty: Schema.Number })
+    const shape: Shape = {
+      schema: unescapedSchema,
+      entities: { Lines },
+      make: (base) =>
+        aggregate(
+          Schema.Struct({ id: Schema.String, lines: Schema.Array(Sheet) }),
+          base,
+          {
+            lines: Aggregate.many({
+              entityType: "SheetLine",
+              entity: Lines,
+              sk: { composite: ["qty"] },
+            } as never),
+          },
+          unescapedSchema,
+        ),
+      seed: [["Lines", { lineId: seed, f: 5 }]],
+      input: { id: "a", lines: ids.map((lineId, i) => ({ lineId, qty: i + 1 })) },
+    }
+    return { shape, judged }
+  }
+
+  it.effect(
+    "an id given more than once, one instant's ISO strings, is judged and fetched once",
+    () =>
+      Effect.gen(function* () {
+        const ISO = "2024-01-02T03:04:05.000Z"
+        const { shape, judged } = wrappingIds(Schema.Date, new Date(ISO), [ISO, ISO, ISO])
+        const { create, sent } = yield* run(shape)
+        expect(Exit.isSuccess(create)).toBe(true)
+        // Three `Date`s of their own, one value of the key composite, one key text: judged once.
+        expect(judged).toHaveLength(1)
+        expect(batchGetKeys(sent)).toHaveLength(1)
+      }),
+  )
+
+  it.effect("ids composing one key text of other values are each judged: Infinity is refused", () =>
+    Effect.gen(function* () {
+      const { shape, judged } = wrappingIds(Schema.Struct({ a: Schema.Number }), { a: 5 }, [
+        { a: 5 },
+        { a: Infinity },
+      ])
+      const { create, requests } = yield* run(shape)
+      const message = refusal(create)
+      expect(message).toContain("[EDD-9131]")
+      expect(message).toContain('"lines[1].lineId"')
+      expect(judged).toHaveLength(2)
+      expect(requests).toEqual([])
     }),
   )
 })

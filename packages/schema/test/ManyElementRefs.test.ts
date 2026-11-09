@@ -8,7 +8,7 @@
  * itself is `effect-dynamodb`'s `AggregateRefHydration.test.ts`.
  */
 
-import { Option, Schema, SchemaGetter } from "effect"
+import { Exit, Option, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import * as DynamoModel from "../src/DynamoModel.js"
 import * as Entity from "../src/Entity.js"
@@ -17,6 +17,7 @@ import {
   deriveElementInputSchema,
   elementHoldsRef,
   entityFieldOf,
+  holdsRefId,
   isEntityElement,
 } from "../src/internal/AggregateSchemas.js"
 
@@ -256,14 +257,19 @@ describe("an element naming the field holding the entity takes an id of the key 
     }
   })
 
-  it("its input: the element whole, or with the id in the field's place, each refusing the other", () => {
+  it("its input: the element whole, the id beside it or not, or the id in the field's place", () => {
     const element = Schema.Struct({ row: Row, qty: Schema.Number })
     const input = Schema.Array(deriveElementInputSchema(Schema.Array(element), Rows)! as never)
     const decode = Schema.decodeUnknownExit(input as Schema.Codec<unknown>)
     expect(decode([{ row: { lineId: 5, f: 1 }, qty: 1 }])._tag).toBe("Success")
     expect(decode([{ rowId: 5, qty: 1 }])._tag).toBe("Success")
-    expect(decode([{ row: { lineId: 5, f: 1 }, rowId: 5, qty: 1 }])._tag).toBe("Failure")
+    // Given both, both are kept: `create` keeps the entity given whole (`elementHoldsRef`).
+    const both = { row: { lineId: 6, f: 99 }, rowId: 5, qty: 1 }
+    expect(decode([both])).toStrictEqual(Exit.succeed([both]))
+    expect(elementHoldsRef(element, Rows, both)).toBe(false)
+    expect(decode([{ row: { lineId: 5, f: 1 }, rowId: undefined, qty: 1 }])._tag).toBe("Success")
     expect(decode([{ rowId: "5", qty: 1 }])._tag).toBe("Failure")
+    expect(decode([{ qty: 1 }])._tag).toBe("Failure")
   })
 })
 
@@ -317,6 +323,44 @@ describe("any other element is judged as on 1.39.0: a string id, its input as 1.
 })
 
 describe("an element that is the entity", () => {
+  it("is the entity's own model, by reference: never a class of the entity's identifier", () => {
+    // A class of the entity's identifier is another schema, wrapping the entity or declaring its
+    // fields again: an identifier is never identity.
+    class Wrapper extends Schema.Class<Wrapper>("Line")({
+      line: Schema.optional(Line),
+      qty: Schema.Number,
+    }) {}
+    class Lookalike extends Schema.Class<Lookalike>("Line")({
+      lineId: Schema.String,
+      f: Schema.Number,
+    }) {}
+    for (const element of [Wrapper, Lookalike, Schema.Struct(Line.fields)]) {
+      expect(isEntityElement(element, Lines)).toBe(false)
+    }
+    // The wrapper names the field holding the entity: its string `lineId` is fetched, as on 1.39.0.
+    expect(entityFieldOf(Wrapper, Lines)).toBe("line")
+    expect(holdsRef(Wrapper, { lineId: "l", qty: 1 })).toBe(true)
+    // The lookalike declares `lineId`, its own value, and no `line`: nothing is fetched.
+    expect(holdsRef(Lookalike, { lineId: "l", f: 1 })).toBe(false)
+    // A copy that changes only annotations, checks or a brand is the entity's model.
+    for (const element of [
+      Line,
+      line,
+      Line.annotate({ title: "line" }),
+      Line.check(Schema.makeFilter(() => true)),
+      line.pipe(Schema.brand("LineRef")),
+    ]) {
+      expect(isEntityElement(element, Lines)).toBe(true)
+    }
+    for (const element of [
+      Row,
+      Row.annotate({ title: "row" }),
+      Row.check(Schema.makeFilter(() => true)),
+    ]) {
+      expect(isEntityElement(element, Rows)).toBe(true)
+    }
+  })
+
   it("the entity's own model, given whole, holds its own id", () => {
     expect(isEntityElement(Line, Lines)).toBe(true)
     expect(holdsRef(Line, { lineId: "l", f: 1 })).toBe(false)
@@ -330,5 +374,46 @@ describe("an element that is the entity", () => {
     expect(decode(5)._tag).toBe("Success")
     expect(decode({ lineId: 5, f: 1 })._tag).toBe("Success")
     expect(decode("5")._tag).toBe("Failure")
+  })
+})
+
+describe("a `one` edge's id follows the rule a `many` element's does (`holdsRefId`)", () => {
+  const whole = { lineId: 6, f: 99 }
+
+  it("an id of the key composite's type, where the model holds the entity's own model", () => {
+    const fields = { numbered: Numbered, qty: Schema.Number }
+    expect(holdsRefId(fields, "numbered", NumberedLines, { numberedId: 5 })).toBe(true)
+    // The entity given whole is never replaced or read again.
+    expect(holdsRefId(fields, "numbered", NumberedLines, { numbered: whole, numberedId: 5 })).toBe(
+      false,
+    )
+    expect(holdsRefId(fields, "numbered", NumberedLines, { numberedId: null })).toBe(false)
+  })
+
+  it("an id the model declares (`numberedId`) is its own data, never an id of another type", () => {
+    for (const id of [Schema.optional(Schema.Number), Schema.Number]) {
+      const fields = { numbered: Numbered, numberedId: id }
+      expect(
+        holdsRefId(fields, "numbered", NumberedLines, { numbered: whole, numberedId: 5 }),
+      ).toBe(false)
+      expect(holdsRefId(fields, "numbered", NumberedLines, { numberedId: 5 })).toBe(false)
+    }
+  })
+
+  it("a field of another schema holds no id of another type", () => {
+    const fields = {
+      numbered: Schema.Struct({ payload: Schema.String }),
+      numberedId: Schema.optional(Schema.Number),
+    }
+    expect(holdsRefId(fields, "numbered", NumberedLines, { numberedId: 5 })).toBe(false)
+    expect(holdsRefId(undefined, "numbered", NumberedLines, { numberedId: 5 })).toBe(false)
+  })
+
+  it("a string is fetched as on 1.39.0, whatever the model declares beside the field", () => {
+    const fields = { numbered: Numbered, numberedId: Schema.optional(Schema.String) }
+    expect(
+      holdsRefId(fields, "numbered", NumberedLines, { numbered: whole, numberedId: "5" }),
+    ).toBe(true)
+    expect(holdsRefId(undefined, "numbered", NumberedLines, { numberedId: "5" })).toBe(true)
   })
 })

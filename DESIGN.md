@@ -4035,12 +4035,17 @@ input). Whether a `many` element takes an id of the key composite's type is
 decided from the element's definition alone, never from the value given or a
 guess at what a field's schema can hold:
 
-- **The element is the entity** (`isEntityElement`): a schema with fields of
-  its own that is the entity's model (a class of the same identifier, as 1.39.0
-  found it, or the model's own schema node). Its values are an id of the key
-  composite's type, or the entity whole. Given whole, it holds no ref: its key
-  field (`lineId` of a `Line`) is its own value. Up to 1.39.0 it was taken for a
-  ref because its name was `${field}Id`, and `create` died composing the key.
+- **The element is the entity** (`isEntityElement`): its schema is the
+  entity's own model (`isEntityModel`): the schema the entity was made with,
+  its `DynamoModel.configure` wrapper taken off, or a copy of it that changes
+  only its annotations, its checks or its brand, compared by reference. An
+  identifier is never identity: a class of the entity's identifier (wrapping
+  the entity, or declaring its fields again) is another schema, judged as any
+  other element. Every question of whether a schema is the entity is asked of
+  `isEntityModel`. Its values are an id of the key composite's type, or the
+  entity whole. Given whole, it holds no ref: its key field (`lineId` of a
+  `Line`) is its own value. Up to 1.39.0 it was taken for a ref because its
+  name was `${field}Id`, and `create` died composing the key.
 - **The element names the field holding the entity** (`entityFieldOf`): a plain
   `Schema.Struct` or `Schema.Class` (no union, transformation, `suspend` or
   declaration at the element) whose field of the entity's name is the entity's
@@ -4049,11 +4054,12 @@ guess at what a field's schema can hold:
   declared one is the element's own data). A copy of the model's node that
   changes only its annotations (`DynamoModel.ref`), its checks or its key's
   optionality is the model; an `Option`, a `NullOr` or a `Result` of it, and a
-  struct declared again with the same fields, are not. Its `${field}Id`, any
-  value but `null` or `undefined`, is an id of the key composite's type
-  (`elementHoldsRef`). Its input is the element whole, or with `${field}Id` of
-  the key composite's own schema (`refIdInput`) in that field's place, each
-  refusing the other's key.
+  struct declared again with the same fields, are not. Its `${field}Id` is an
+  id of the key composite's type (`elementHoldsRef`), unless the element is
+  given the entity whole. Its input is the element whole, `${field}Id` beside
+  it or not, or with `${field}Id` of the key composite's own schema
+  (`refIdInput`) in that field's place: neither refuses the other's key, and
+  given both, both are kept.
 - **Every other element is judged as 1.39.0 judged it.** A string given as the
   element, or a string `${field}Id` in an object element, is an id `create`
   fetches, whatever the element declares, and nothing else is; the hydrated
@@ -4066,23 +4072,42 @@ guess at what a field's schema can hold:
   declaring `${field}Id`. The one change is the id's type: a string of no type
   of the key composite fails with `EDD-9131`, below.
 
+One rule decides whether a `${field}Id` is an id `create` fetches, for a `one`
+or `ref` edge (`field` the edge's name, read off the model's fields) and a
+`many` element (`field` the entity's name, read off the element's fields)
+alike (`holdsRefId`):
+
+1. `null` and `undefined` give no id.
+2. A string is fetched, as on 1.39.0, which replaces an entity given whole in
+   `field` with the one fetched; except where the definition declares
+   `${field}Id` and not `field`, as an element that is the entity declares its
+   own key: 1.39.0 dropped the declared value there and put the record in a
+   field the definition doesn't have.
+3. Any other id is fetched only where `field` holds the entity's own model
+   (under `optional` at most), the definition doesn't declare `${field}Id`
+   (then it is the definition's own data, stored as given), and `field` isn't
+   given whole (then it is stored as given, never replaced or read again).
+   1.39.0 fetched none of these.
+
 A managed timestamp is optional in every element's input.
 
 The input type (`AggregateTypes`) follows the same rule, read from the
 element's *schema* type, never its domain type, so a union whose members have
-one domain type is still a union. An element of the entity's model schema type
-(with fields of its own) takes an id or the entity whole. A `Schema.Struct` or
-`Schema.Class` element whose field of the entity's name is of the entity's
-model schema type, under `optional` at most, and which declares no
-`${field}Id`, takes the element whole or by id: the id form is added, the
-declared form never removed, and each refuses the other's key. The type sees
+one domain type is still a union. It only adds to 1.39.0's: every element is
+typed as 1.39.0 typed it (a field whose type has an `id: string` by id,
+whatever its name, an element with one as an id), and the id forms are added
+beside that. An element of the entity's model schema type (with fields of its
+own) takes an id or the entity whole. A `Schema.Struct` or `Schema.Class`
+element whose field of the entity's name is of the entity's model schema type,
+under `optional` at most, and which declares no `${field}Id`, takes the element
+whole (its id beside it or not) or by id: the id form is added, the declared
+form never removed, and neither refuses the other's key. The type sees
 that field's name only for a `Schema.Struct` model (in a
 `DynamoModel.configure` wrapper or not) whose `entityType` is one string
 literal: `create` takes a `Schema.Class` model's own identifier, which the
 type sees only as `string`, and the `entityType` for a class in a `configure`
 wrapper, which the type can't tell apart from a bare class. Every other element
-is typed exactly as on 1.39.0: a field whose type has an `id: string` by id,
-whatever its name, and every other field as declared. Two schemas of one type
+is typed exactly as on 1.39.0. Two schemas of one type
 are one to the type, so a struct declared again with the entity's fields is
 typed as the entity, where `create` takes only a string id for it.
 
@@ -4106,7 +4131,11 @@ one distinct composite, or none, has nothing one id names: `create` fails with
 a `ValidationError` (`EDD-9129`) naming the edge. An id of no type of the key
 composite (`"5"` for a number key, whose key text `put` never writes), or one
 `put` refuses, fails with a `ValidationError` (`EDD-9131`) naming where it was
-given and what it was given (an object by its JSON). The second is `put`'s own
+given and what it was given (an object by its JSON). An id given more than once
+is judged once: one composing the key text of an id already judged and equal to
+it as a value of the key composite (`Schema.toEquivalence`), so three ISO
+strings of one instant are judged once; the key text alone is not enough, as
+below. The second is `put`'s own
 judgement (`Entity._unstorableKey`: the composite encoded through
 `inputSchema`'s own field as `put` encodes its input, an encode that fails
 being `put`'s refusal too, an infinity through a digits-only string codec, then
