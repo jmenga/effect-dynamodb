@@ -1843,10 +1843,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
           : checksOf(fields, into, [path])
       })
     }
-    // Each node's own checks: a row is judged by every node assembly hands it to (`takesRow`).
-    const byNode: Array<{ readonly node: ResolvedNode; readonly checks: ReadonlyArray<Check> }> = []
+    // Each node's own checks: a row is judged by every node assembly hands it to (`assemblyWalk`).
+    const byNode = new Map<ResolvedNode, ReadonlyArray<Check>>()
     const add = (node: ResolvedNode, checks: ReadonlyArray<Check>) => {
-      if (checks.length > 0) byNode.push({ node, checks })
+      if (checks.length > 0) byNode.set(node, checks)
     }
     add(rootNode, [
       ...checksOf(schemaFields, "its partition key", config.pk.composite, true),
@@ -1875,42 +1875,47 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   /**
    * Refuses a write storing, for a key composite whose numeric kinds can't be read at load, a value
-   * that reads back otherwise: a stored row would compose other key text (`EDD-9128`). A row is
-   * judged by the checks of each node assembly hands it to, its composites read off its stored
-   * attributes, a path into a value followed.
+   * that reads back otherwise: a stored row would compose other key text (`EDD-9128`). `groups` is
+   * the whole decomposition of the value stored, rows a diff leaves alone included: a read of the
+   * aggregate takes them all. A row is judged by the checks of each node a read hands it to
+   * (`assemblyWalk`), its composites read off its stored attributes, a path into a value followed.
    */
   const refuseOtherKindKeys = (
     groups: ReadonlyArray<TransactionGroup>,
     operation: string,
   ): Effect.Effect<void, ValidationError> => {
-    if (otherKindKeys.length === 0) return Effect.void
-    for (const group of groups) {
-      for (const item of group.items) {
-        // An attribute as a read has it: a discriminator is matched against what's read back.
-        const asStored = (attr: string): unknown => {
+    if (otherKindKeys.size === 0) return Effect.void
+    const reached = assemblyWalk(
+      rootNode,
+      groups.flatMap((group) => group.items),
+      // An attribute as a read has it: a discriminator is matched against what's read back.
+      (node, item) =>
+        takesRow(node, item.entityType, (attr) => {
           try {
             return asRead(item.attributes[attr])
           } catch {
             return undefined
           }
-        }
-        for (const { node, checks } of otherKindKeys) {
-          if (!takesRow(node, item.entityType, asStored)) continue
-          for (const { path, into, judge } of checks) {
-            const refused = judge(item)
-            if (refused === undefined) continue
-            return Effect.fail(
-              new ValidationError({
-                entityType: aggregateName,
-                operation,
-                cause: readBackRefusal(
-                  `Field "${path}" of "${item.member}" is composed into ${into}`,
-                  refused.held,
-                  refused.readsAs,
-                ),
-              }),
-            )
-          }
+        }),
+    )
+    for (const [node, taken] of reached) {
+      const checks = otherKindKeys.get(node)
+      if (checks === undefined) continue
+      for (const item of taken) {
+        for (const { path, into, judge } of checks) {
+          const refused = judge(item)
+          if (refused === undefined) continue
+          return Effect.fail(
+            new ValidationError({
+              entityType: aggregateName,
+              operation,
+              cause: readBackRefusal(
+                `Field "${path}" of "${item.member}" is composed into ${into}`,
+                refused.held,
+                refused.readsAs,
+              ),
+            }),
+          )
         }
       }
     }
@@ -3715,10 +3720,11 @@ const assembleAggregate = (
   systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
-    // Find the root item
-    const rootItems = allItems.filter((item) =>
-      takesRow(rootNode, item.__edd_e__, (attr) => item[attr]),
+    const reached = assemblyWalk(rootNode, allItems, (node, item) =>
+      takesRow(node, item.__edd_e__, (attr) => item[attr]),
     )
+    // Find the root item
+    const rootItems = reached.get(rootNode) ?? []
 
     if (rootItems.length === 0) {
       return yield* new AggregateAssemblyError({
@@ -3742,7 +3748,7 @@ const assembleAggregate = (
     const edgeValues: Record<string, unknown> = {}
 
     for (const child of rootNode.children) {
-      const assembled = yield* assembleNode(child, allItems, key, aggregateName, systemAttrs)
+      const assembled = yield* assembleNode(child, reached, key, aggregateName, systemAttrs)
       if (child.fieldName !== null && assembled !== undefined) {
         edgeValues[child.fieldName] = assembled
       }
@@ -3817,17 +3823,39 @@ const takesRow = (
   return true
 }
 
+/**
+ * Assembly's walk over an aggregate's rows: each node a read reaches, with the rows it takes
+ * (`takesRow`). A node with edges (the root, a sub-aggregate) leads to them only through its one
+ * row: one that takes none is absent, and one that takes more can't be assembled, so a read hands
+ * nothing to the nodes under it. Assembly reads each node's rows off this walk, and the write
+ * check (`EDD-9128`) judges a row only by the nodes it reaches, so the two never disagree on which
+ * node a row is.
+ */
+const assemblyWalk = <Row>(
+  rootNode: ResolvedNode,
+  rows: ReadonlyArray<Row>,
+  takes: (node: ResolvedNode, row: Row) => boolean,
+): ReadonlyMap<ResolvedNode, ReadonlyArray<Row>> => {
+  const reached = new Map<ResolvedNode, ReadonlyArray<Row>>()
+  const visit = (node: ResolvedNode): void => {
+    const taken = rows.filter((row) => takes(node, row))
+    reached.set(node, taken)
+    if (node.children.length > 0 && taken.length !== 1) return
+    for (const child of node.children) visit(child)
+  }
+  visit(rootNode)
+  return reached
+}
+
 const assembleNode = (
   node: ResolvedNode,
-  allItems: Array<Record<string, unknown>>,
+  reached: ReadonlyMap<ResolvedNode, ReadonlyArray<Record<string, unknown>>>,
   key: Record<string, unknown>,
   aggregateName: string,
   systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
-    const matchingItems = allItems.filter((item) =>
-      takesRow(node, item.__edd_e__, (attr) => item[attr]),
-    )
+    const matchingItems = reached.get(node) ?? []
 
     if (node.cardinality === "one") {
       // One-to-one: sub-aggregate root or simple one edge
@@ -3846,18 +3874,10 @@ const assembleNode = (
         const subRootItem = matchingItems[0]!
         const edgeValues: Record<string, unknown> = {}
 
+        // Its one row leads to its edges (`assemblyWalk`). Each child's discriminator already holds
+        // this node's (`resolveNode`).
         for (const child of node.children) {
-          // For children within a sub-aggregate, propagate the parent's discriminator
-          const childNode = node.discriminator
-            ? { ...child, discriminator: { ...node.discriminator, ...child.discriminator } }
-            : child
-          const assembled = yield* assembleNode(
-            childNode,
-            allItems,
-            key,
-            aggregateName,
-            systemAttrs,
-          )
+          const assembled = yield* assembleNode(child, reached, key, aggregateName, systemAttrs)
           if (child.fieldName !== null && assembled !== undefined) {
             edgeValues[child.fieldName] = assembled
           }

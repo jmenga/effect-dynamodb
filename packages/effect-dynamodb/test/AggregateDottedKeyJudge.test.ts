@@ -265,4 +265,47 @@ describe("an edge's rows are judged by that edge's own sort key", () => {
         }),
     ),
   )
+
+  // `others` under an optional sub-aggregate: a read reaches it only through the sub-aggregate's
+  // row (`assemblyWalk`). While the sub-aggregate is absent, no read hands `others` a row, so its
+  // check judges none; once present, it takes every `Line` row, the root's among them.
+  const Inner = (Aggregate.make as any)(Schema.Struct({ others }), {
+    root: { entityType: "Inner" },
+    edges: { others: byN("Line") },
+  })
+  const withPart = { lines, part: Schema.optionalKey(Schema.Struct({ others })) }
+  for (const escapeKeys of [false, true]) {
+    it.effect(`escapeKeys ${escapeKeys}: an edge under an absent sub-aggregate judges no row`, () =>
+      onEdges(
+        escapeKeys,
+        withPart,
+        { lines: byN("Line"), part: Inner.with({}) },
+        (aggregate, table) =>
+          Effect.gen(function* () {
+            const absent = { id: "x", lines: [{ nested: { n: 5n }, note: "before" }] }
+            yield* aggregate.create(absent)
+            yield* aggregate.update({ id: "x" }, ({ state }: any) => ({
+              ...state,
+              lines: state.lines.map((line: any) => ({ ...line, note: "after" })),
+            }))
+            expect(yield* aggregate.get({ id: "x" })).toEqual({
+              id: "x",
+              lines: [{ nested: { n: 5n }, note: "after" }],
+            })
+            const rows = structuredClone([...table.items])
+            expect(rows).toHaveLength(2)
+            const present = yield* Effect.exit(
+              aggregate
+                .update({ id: "x" }, ({ state }: any) => ({ ...state, part: { others: [] } }))
+                .pipe(Effect.asVoid),
+            )
+            expect(Exit.isFailure(present)).toBe(true)
+            expect(JSON.stringify(present)).toContain(
+              `Field \\"nested.n\\" of \\"lines\\" is composed into edge \\"others\\"'s sort key`,
+            )
+            expect([...table.items]).toEqual(rows)
+          }),
+      ),
+    )
+  }
 })
