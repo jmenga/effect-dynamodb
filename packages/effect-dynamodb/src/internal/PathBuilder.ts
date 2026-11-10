@@ -200,7 +200,8 @@ export const isPath = (value: unknown): value is Path =>
  *
  * @param segments - Initial segments (default: [])
  * @param resolveDbName - Optional function to resolve domain names to DynamoDB
- *   attribute names. Segments containing `#` are treated as raw literal
+ *   attribute names. It names a path's first segment only (`storedPath`): a
+ *   segment below it is stored under its own name. Segments containing `#` are treated as raw literal
  *   attribute names and bypass `resolveDbName` (this is how sparse-map entry
  *   segments survive through compilation as a single placeholder).
  * @param sparseFields - Optional map of sparse-map field names to their

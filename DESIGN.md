@@ -3095,7 +3095,12 @@ condition (a sparse map's entry). An aggregate's `list` filter compiles with no
 rename at any level, and `.history().where()` is a sort-key condition, so
 neither is affected. A path with no segment below the first spelled as a
 renamed field sends the requests it always sent
-(`test/fixtures/nested-path-requests-1.39.0.json`).
+(`test/fixtures/nested-path-requests-1.39.0.json`). A path does not follow a
+nested struct's own key encoding (`Schema.encodeKeys`) on any release: below
+the first segment it names the property as written. Through 1.39.0 one such
+path reached the stored key by coincidence, when the nested struct encoded a
+property to the name a top-level field of the same spelling was renamed to; it
+now names the property, like every other path below a key-encoded struct.
 
 **Path-addressed values are encoded (#133).** `pathSet`, `pathAppend`,
 `pathPrepend`, `pathIfNotExists` and record-based `append` (including the
