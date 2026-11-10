@@ -3156,8 +3156,8 @@ operand it accepts are the ones the write was built with. An update refused for
 a second reason reports the operand, where it reported whichever it met first
 as it read and built the write: a missing item (`ItemNotFound`), a stale
 `expectedVersion` (`OptimisticLockError`), an immutable field restated with
-another value on an update that reads first (`ValidationError` `update`), a ref
-whose target isn't there (`RefNotFound`), a packed value with no compressor
+another value on a retained entity (`ValidationError` `update`), a ref whose
+target isn't there (`RefNotFound`), a packed value with no compressor
 (`ValidationError` `update.packed`).
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
