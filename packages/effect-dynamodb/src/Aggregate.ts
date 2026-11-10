@@ -4829,6 +4829,13 @@ const idEquivalence = (entity: RefEntity): ((a: unknown, b: unknown) => boolean)
  * by `hydrateAggregateRefs` before anything is fetched. Up to 1.39.0 only a string was taken,
  * so a number or bigint id was dropped, and an optional edge was created without it.
  */
+/**
+ * What an input holds under `name` itself. Never a member every object inherits: an edge named
+ * `constructor` that the input doesn't give is not given.
+ */
+const given = (input: Record<string, unknown>, name: string): unknown =>
+  Object.hasOwn(input, name) ? input[name] : undefined
+
 const collectRefIdsFromEdges = (
   result: RefRequest[],
   input: Record<string, unknown>,
@@ -4848,7 +4855,7 @@ const collectRefIdsFromEdges = (
       // field is the entity's own model, its id isn't declared, and the entity isn't given whole.
       const entity = edge.entity!
       const idFieldName = `${edgeName}Id`
-      const idValue = input[idFieldName]
+      const idValue = given(input, idFieldName)
       if (holdsRefId(fields, edgeName, entity, input)) {
         result.push({
           entity,
@@ -4861,7 +4868,7 @@ const collectRefIdsFromEdges = (
       }
     } else if (edge._tag === "BoundSubAggregate") {
       const bound = edge as BoundSubAggregate<any>
-      const subInput = input[edgeName]
+      const subInput = given(input, edgeName)
       if (subInput != null && typeof subInput === "object") {
         collectRefIdsFromEdges(
           result,
@@ -4876,7 +4883,7 @@ const collectRefIdsFromEdges = (
       // ManyEdge with entity → walk array elements for ref IDs
       const entity = edge.entity
       const inputKey = edge.inputField ?? edgeName
-      const arr = input[inputKey]
+      const arr = given(input, inputKey)
       if (Array.isArray(arr)) {
         const entityFieldName = deriveEntityFieldName(entity)
         const element = manyElementSchema(fields, edgeName)
@@ -4911,7 +4918,7 @@ const collectRefIdsFromEdges = (
             // the entity's own model, its id isn't declared, and the entity isn't given whole.
             const elemObj = elem as Record<string, unknown>
             const idFieldName = `${entityFieldName}Id`
-            const idValue = elemObj[idFieldName]
+            const idValue = given(elemObj, idFieldName)
             if (idValue != null) {
               result.push({
                 entity,

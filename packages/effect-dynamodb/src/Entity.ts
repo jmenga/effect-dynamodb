@@ -2752,7 +2752,9 @@ const makeImpl = <
     if (schema === undefined) {
       const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top) ?? {}
       schema = Schema.Struct(
-        Object.fromEntries(names.map((name) => [name, fields[name] ?? Schema.Unknown])) as never,
+        Object.fromEntries(
+          names.map((name) => [name, Object.hasOwn(fields, name) ? fields[name]! : Schema.Unknown]),
+        ) as never,
       ) as unknown as Schema.Codec<any>
       keyRecordSchemas.set(id, schema)
     }

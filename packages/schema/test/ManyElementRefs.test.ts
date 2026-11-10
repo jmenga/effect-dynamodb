@@ -416,4 +416,18 @@ describe("a `one` edge's id follows the rule a `many` element's does (`holdsRefI
     ).toBe(true)
     expect(holdsRefId(undefined, "numbered", NumberedLines, { numberedId: "5" })).toBe(true)
   })
+
+  it("a field or an id only inherited from every object is neither declared nor given", () => {
+    // `constructor` is a member of every object: a model that doesn't declare it holds no entity
+    // there, and an edge of that name is no declared field.
+    expect(holdsRefId({}, "constructor", NumberedLines, { constructorId: 5 })).toBe(false)
+    // An id the input doesn't hold itself is not given.
+    const fields = { numbered: Numbered }
+    expect(holdsRefId(fields, "numbered", NumberedLines, Object.create({ numberedId: 5 }))).toBe(
+      false,
+    )
+    // A whole record the input only inherits isn't given whole.
+    const inherits = Object.assign(Object.create({ numbered: whole }), { numberedId: 5 })
+    expect(holdsRefId(fields, "numbered", NumberedLines, inherits)).toBe(true)
+  })
 })

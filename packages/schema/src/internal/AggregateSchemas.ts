@@ -429,12 +429,20 @@ export const refKeyComposite = (entity: RefEntity): string | undefined => {
 }
 
 /**
+ * What `record` holds under `name` itself, `undefined` where it holds nothing there. Never a member
+ * every object inherits: a field or an edge named `constructor` or `toString` that the record
+ * doesn't hold is not one.
+ */
+const own = <A>(record: Readonly<Record<string, A>> | undefined, name: string): A | undefined =>
+  record !== undefined && Object.hasOwn(record, name) ? record[name] : undefined
+
+/**
  * The model field an id of `entity` is a value of (its {@link refKeyComposite}), `undefined` when
  * its key has no one composite or its model's fields can't be read.
  */
 export const refIdField = (entity: RefEntity): Schema.Top | undefined => {
   const name = refKeyComposite(entity)
-  return name === undefined ? undefined : getSchemaFields(unwrapModel(entity.model))?.[name]
+  return name === undefined ? undefined : own(getSchemaFields(unwrapModel(entity.model)), name)
 }
 
 /**
@@ -495,10 +503,10 @@ const notWhatItHolds: ReadonlySet<string> = new Set(["annotations", "checks", "c
 const isSameSchemaNode = (a: SchemaAST.AST, b: SchemaAST.AST): boolean => {
   if (a === b) return true
   if (a._tag !== b._tag) return false
-  const own = (ast: SchemaAST.AST) => Object.keys(ast).filter((key) => !notWhatItHolds.has(key))
-  const keys = own(a)
+  const held = (ast: SchemaAST.AST) => Object.keys(ast).filter((key) => !notWhatItHolds.has(key))
+  const keys = held(a)
   return (
-    keys.length === own(b).length &&
+    keys.length === held(b).length &&
     keys.every(
       (key) =>
         (a as unknown as Record<string, unknown>)[key] ===
@@ -555,8 +563,8 @@ export const entityFieldOf = (
   const fields = element === undefined ? undefined : getSchemaFields(element)
   if (fields === undefined) return undefined
   const name = deriveEntityFieldName(entity)
-  if (`${name}Id` in fields) return undefined
-  return holdsEntityModel(fields[name], entity) ? name : undefined
+  if (Object.hasOwn(fields, `${name}Id`)) return undefined
+  return holdsEntityModel(own(fields, name), entity) ? name : undefined
 }
 
 /**
@@ -581,15 +589,15 @@ export const holdsRefId = (
   entity: RefEntity,
   value: Record<string, unknown>,
 ): boolean => {
-  const id = value[`${field}Id`]
+  const id = own(value, `${field}Id`)
   if (id == null) return false
-  const declaresId = fields !== undefined && `${field}Id` in fields
-  if (typeof id === "string") return !(declaresId && !(field in fields!))
+  const declaresId = fields !== undefined && Object.hasOwn(fields, `${field}Id`)
+  if (typeof id === "string") return !(declaresId && !Object.hasOwn(fields, field))
   return (
     fields !== undefined &&
     !declaresId &&
-    holdsEntityModel(fields[field], entity) &&
-    value[field] == null
+    holdsEntityModel(own(fields, field), entity) &&
+    own(value, field) == null
   )
 }
 
@@ -614,7 +622,7 @@ export const manyElementSchema = (
   parentFields: Record<string, Schema.Top> | undefined,
   edgeName: string,
 ): Schema.Top | undefined => {
-  const field = parentFields?.[edgeName]
+  const field = own(parentFields, edgeName)
   if (field === undefined) return undefined
   return extractArrayElement(field) ?? extractKeyedValue(field)
 }

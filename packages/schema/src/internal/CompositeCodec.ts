@@ -934,7 +934,7 @@ export const makeCompositeStoredForm = (
   const resolve = (attr: string): ((value: unknown) => unknown) | null => {
     const cached = cache.get(attr)
     if (cached !== undefined) return cached
-    const field = fields?.[attr]
+    const field = declared(fields, attr)
     if (
       field === undefined ||
       numericTypeWithStringEncoding(field) ||
