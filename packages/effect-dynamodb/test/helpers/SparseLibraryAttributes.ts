@@ -34,6 +34,8 @@ export interface Case {
   readonly allowed: string
   /** Where the name is checked: when the entity is made, or when its table is bound. */
   readonly refusedAt: "Entity.make" | "DynamoClient.make"
+  /** What a read returns of the definition storing `allowed`, where it isn't `data: { ok: 1 }`. */
+  readonly allowedReads?: Record<string, unknown>
   /** The entity's configuration, storing `name` (`attribute`, or `allowed`). */
   readonly entity: (api: Api, name: string) => Record<string, unknown>
   /** The table's TTL attribute, for a case that names it. */
@@ -108,6 +110,21 @@ export const cases: ReadonlyArray<Case> = [
       }),
   },
   {
+    key: "a sparse map a put stores whole",
+    attribute: "data#shadow",
+    allowed: "other",
+    refusedAt: "Entity.make",
+    entity: (api, name) => ({
+      model: counted(
+        api,
+        { aux: Schema.Record(Schema.String, Schema.Number) },
+        { aux: { storedAs: api.DynamoModel.SparseMap(), field: name } },
+      ),
+    }),
+    read: putThenGet({ aux: { y: 2 } }),
+    allowedReads: { data: { ok: 1 }, aux: { y: 2 } },
+  },
+  {
     key: "the TTL of a retained version",
     attribute: "data#expires",
     allowed: "expires",
@@ -155,6 +172,52 @@ export const cases: ReadonlyArray<Case> = [
       Effect.gen(function* () {
         yield* db.entities.Docs.append({ id: "a", seq: 1 }).asEffect()
         return yield* db.entities.Docs.history({ id: "a" }).collect()
+      }),
+  },
+]
+
+/**
+ * Definitions that look like the ones above and store nothing where a reader takes it as an entry:
+ * 1.39.0 read their rows back, and they still load.
+ */
+export const loads: ReadonlyArray<Case> = [
+  {
+    key: "a created timestamp the model declares, named in the prefix and stored outside it",
+    attribute: "safeDate",
+    allowed: "safeDate",
+    refusedAt: "Entity.make",
+    entity: (api, name) => ({
+      model: counted(api, { "data#created": Schema.Date }, { "data#created": { field: name } }),
+      timestamps: { created: "data#created" },
+    }),
+    read: putThenGet(),
+  },
+  {
+    key: "an updated timestamp the model declares, named in the prefix and stored outside it",
+    attribute: "safeDate",
+    allowed: "safeDate",
+    refusedAt: "Entity.make",
+    entity: (api, name) => ({
+      model: counted(api, { "data#updated": Schema.Date }, { "data#updated": { field: name } }),
+      timestamps: { updated: "data#updated" },
+    }),
+    read: putThenGet(),
+  },
+  {
+    // `versioned: { ttl }` without `retain` writes no snapshot, so no TTL attribute.
+    key: "a version TTL on an entity that retains nothing, beside a TTL attribute in the prefix",
+    attribute: "data#expires",
+    allowed: "data#expires",
+    refusedAt: "DynamoClient.make",
+    entity: (api) => ({ model: counted(api), versioned: { ttl: "1 day" } }),
+    ttlAttribute: (name) => name,
+    read: (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Docs.put({ id: "a", data: { ok: 1 } }).asEffect()
+        yield* db.entities.Docs.update({ id: "a" })
+          .set({ data: { more: 2 } })
+          .asEffect()
+        return yield* db.entities.Docs.get({ id: "a" })
       }),
   },
 ]

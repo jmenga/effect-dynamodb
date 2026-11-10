@@ -17,20 +17,35 @@
 import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
 import * as PureEntity from "@effect-dynamodb/schema/Entity.js"
-import { Cause, Effect, Exit } from "effect"
+import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
+import { Cause, Effect, Exit, Schema } from "effect"
 import { afterEach, beforeEach, vi } from "vitest"
 import * as Lib from "../src/index.js"
-import { type Captured, capture, cases, primaryKey } from "./helpers/SparseLibraryAttributes.js"
+import {
+  type Captured,
+  capture,
+  cases,
+  loads,
+  primaryKey,
+} from "./helpers/SparseLibraryAttributes.js"
 
 const fixture = JSON.parse(
   readFileSync(
     new URL("./fixtures/sparse-library-attributes-1.39.0.json", import.meta.url),
     "utf8",
   ),
-) as { readonly cases: Record<string, Captured> }
+) as {
+  readonly cases: Record<string, Captured>
+  readonly loads: Record<string, Captured>
+}
 
 beforeEach(() => {
+  // The record was captured with the clock and the random bytes fixed.
   vi.spyOn(Date, "now").mockReturnValue(1700000000000)
+  vi.spyOn(globalThis.crypto, "getRandomValues").mockImplementation((array) => {
+    ;(array as Uint8Array).fill(7)
+    return array
+  })
 })
 afterEach(() => {
   vi.restoreAllMocks()
@@ -60,6 +75,11 @@ const ON_1_39_0: Record<string, (captured: Captured, attribute: string) => void>
   },
   "a field named in the map's prefix": (captured, attribute) => {
     expect(captured.rows[0]).toHaveProperty([attribute], { N: "7" })
+    expect(captured.read).toEqual({ failed: "ValidationError" })
+  },
+  // The whole map is read as the entry `shadow` of `data`, which holds numbers.
+  "a sparse map a put stores whole": (captured, attribute) => {
+    expect(captured.rows[0]).toHaveProperty([attribute], { M: { y: { N: "2" } } })
     expect(captured.read).toEqual({ failed: "ValidationError" })
   },
   // The snapshot's TTL is read as the entry `expires`.
@@ -126,11 +146,56 @@ describe("EDD-9140: an attribute an entity writes that a row's reader takes as a
           const captured = yield* capture(Lib as never, each, each.allowed)
           expect("value" in captured.read).toBe(true)
           const read = value(captured)
-          const data = Array.isArray(read) ? read[0].data : read.data
-          expect(data).toEqual(each.key === "the TTL of a time series' event" ? {} : { ok: 1 })
+          if (each.allowedReads !== undefined) expect(read).toMatchObject(each.allowedReads)
+          else {
+            const data = Array.isArray(read) ? read[0].data : read.data
+            expect(data).toEqual(each.key === "the TTL of a time series' event" ? {} : { ok: 1 })
+          }
           expect(captured.rows.some((row) => Object.hasOwn(row, each.allowed))).toBe(true)
         }),
       )
     })
   }
+
+  // The names the check sees are the ones stored, and the TTL attribute counts only for an
+  // entity that writes it.
+  for (const each of loads) {
+    // On the live clock, which is fixed as it was when the record was captured.
+    it.live(`${each.key}: loads, and reads back as on 1.39.0`, () =>
+      Effect.gen(function* () {
+        const captured = yield* capture(Lib as never, each, each.attribute)
+        expect(captured).toEqual(fixture.loads[each.key])
+        expect("value" in captured.read).toBe(true)
+        expect(() =>
+          PureEntity.make({
+            entityType: "Doc",
+            primaryKey,
+            ...each.entity(Lib as never, each.attribute),
+          } as never),
+        ).not.toThrow()
+      }),
+    )
+  }
+
+  it("a sparse map's prefix is checked as a name too, though `configure` lets none hold `#`", () => {
+    const maps = { data: { prefix: "data" }, aux: { prefix: "data#shadow" } }
+    expect(() =>
+      refuseReadAsSparseEntry(
+        "Doc",
+        [
+          {
+            attribute: "data#shadow",
+            what: 'the prefix the sparse map "aux" stores its entries under',
+          },
+        ],
+        maps,
+      ),
+    ).toThrow('[EDD-9140] Entity "Doc": sparse map "data"')
+    expect(() =>
+      Lib.DynamoModel.configure(
+        Schema.Struct({ id: Schema.String, aux: Schema.Record(Schema.String, Schema.Number) }),
+        { aux: { storedAs: Lib.DynamoModel.SparseMap({ prefix: "data#shadow" }) } },
+      ),
+    ).toThrow("must not contain '#'")
+  })
 })

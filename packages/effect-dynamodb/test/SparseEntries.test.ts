@@ -190,13 +190,13 @@ const REFUSED: ReadonlyArray<
   ["put of a retained entity", "a key holding '#'", "a#b", "nothing"],
   ["put of a retained entity", "an attribute name over 255 bytes", TOO_LONG, "nothing"],
   ["update .set()", "a key holding '#'", "a#b", "nothing"],
-  ["Transaction.transactWrite of an update .set()", "a key holding '#'", "a#b", "a read"],
+  ["Transaction.transactWrite of an update .set()", "a key holding '#'", "a#b", "nothing"],
   ["upsert", "a key holding '#'", "a#b", "nothing"],
   // A retained entity's update builds the whole item, as a put does, after reading the row.
-  ["update .set() of a retained entity", "a key holding '#'", "a#b", "a read"],
-  ["update .set() of a retained entity", "an attribute name over 255 bytes", TOO_LONG, "a read"],
-  ["upsert of a retained entity", "a key holding '#'", "a#b", "a read"],
-  ["upsert of a retained entity", "an attribute name over 255 bytes", TOO_LONG, "a read"],
+  ["update .set() of a retained entity", "a key holding '#'", "a#b", "nothing"],
+  ["update .set() of a retained entity", "an attribute name over 255 bytes", TOO_LONG, "nothing"],
+  ["upsert of a retained entity", "a key holding '#'", "a#b", "nothing"],
+  ["upsert of a retained entity", "an attribute name over 255 bytes", TOO_LONG, "nothing"],
 ]
 
 describe("a write of an entry refuses the keys it refused on 1.39.0", () => {
@@ -300,6 +300,206 @@ describe("an operation naming a field is judged by the attribute the field is st
       ),
     )
   }
+})
+
+describe("a stored row is read in one order: its sparse entries, then its names", () => {
+  // A field named `data#x`, as the entry `x` of `data` is, and stored as `counter`. The row holds
+  // both: `counter` = 7 and the entry `data#x` = 99.
+  const fields = (name: string) => ({
+    id: Schema.String,
+    note: Schema.String,
+    data: Schema.Record(Schema.String, Schema.Number),
+    [name]: Schema.optionalKey(Schema.Number),
+  })
+  const named = (name: string, config: Record<string, unknown>) => {
+    const Docs = Entity.make({
+      model: DynamoModel.configure(Schema.Struct(fields(name)), {
+        data: { storedAs: DynamoModel.SparseMap() },
+        [name]: { field: "counter" },
+      } as never),
+      entityType: "Doc",
+      primaryKey,
+      ...config,
+    } as never) as any
+    const MainTable = Table.make({ schema, entities: { Docs } } as never) as any
+    return { Docs, MainTable }
+  }
+  const onRow = <A>(
+    name: string,
+    config: Record<string, unknown>,
+    seed: Record<string, unknown>,
+    body: (db: any, table: ReturnType<typeof makeRecordingTable>) => Effect.Effect<A, unknown, any>,
+  ) => {
+    const { Docs, MainTable } = named(name, config)
+    const table = makeRecordingTable()
+    return Effect.gen(function* () {
+      const db: any = yield* DynamoClient.make({
+        entities: { Docs },
+        tables: { MainTable },
+      } as never)
+      yield* db.entities.Docs.put({ id: "a", note: "ok", ...seed }).asEffect()
+      table.take()
+      return yield* body(db, table)
+    }).pipe(
+      Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "entries" }))),
+    ) as Effect.Effect<A, unknown>
+  }
+  const live = (table: ReturnType<typeof makeRecordingTable>): Record<string, any> =>
+    [...table.items.values()].find(
+      (row: any) => row.__edd_e__.S === "Doc" && !row.sk.S.includes("#v#"),
+    ) as Record<string, any>
+  const retained = { versioned: { retain: true } }
+  const both = { data: { safe: 1, x: 99 }, "data#x": 7 }
+
+  // A retained entity's update reads the row and writes it whole. It mapped the names first, so
+  // `counter` became `data#x` and was then taken for the entry: the entry got the field's value
+  // and the field was lost, on 1.39.0 too.
+  for (const transaction of [false, true]) {
+    const where = transaction ? "in a transaction" : "alone"
+    for (const [name, apply, counter, read] of [
+      ["a .set() of another field", (u: any) => u.set({ note: "new" }), { N: "7" }, 7],
+      ["a .set() of another entry", (u: any) => u.set({ data: { z: 5 } }), { N: "7" }, 7],
+      ["a .set() of the field", (u: any) => u.set({ "data#x": 8 }), { N: "8" }, 8],
+      ["an .add() to the field", (u: any) => u.add({ "data#x": 1 }), { N: "8" }, 8],
+      ["a .remove() of the field", (u: any) => u.remove(["data#x"]), undefined, undefined],
+    ] as const) {
+      it.effect(
+        `a retained entity's update keeps the field and the entry apart: ${name}, ${where}`,
+        () =>
+          onRow("data#x", retained, both, (db, table) =>
+            Effect.gen(function* () {
+              const update = apply(db.entities.Docs.update({ id: "a" }))
+              yield* transaction ? Transaction.transactWrite([update]) : update.asEffect()
+              const row = live(table)
+              expect(row.counter).toEqual(counter)
+              expect(row["data#x"]).toEqual({ N: "99" })
+              const got = yield* db.entities.Docs.get({ id: "a" })
+              expect(got["data#x"]).toBe(read)
+              expect(got.data.x).toBe(99)
+              expect(got.data.safe).toBe(1)
+            }),
+          ),
+      )
+    }
+
+    it.effect(`a retained removal of a field named \`data#x#y\` succeeds, ${where}`, () =>
+      onRow("data#x#y", retained, { data: { safe: 1 }, "data#x#y": 7 }, (db, table) =>
+        Effect.gen(function* () {
+          const update = db.entities.Docs.update({ id: "a" }).remove(["data#x#y"])
+          yield* transaction ? Transaction.transactWrite([update]) : update.asEffect()
+          expect(live(table).counter).toBeUndefined()
+          expect(yield* db.entities.Docs.get({ id: "a" })).toMatchObject({ data: { safe: 1 } })
+        }),
+      ),
+    )
+
+    it.effect(
+      `a retained update writes an entry it read back under its own attribute, whatever its key, ${where}`,
+      () =>
+        onRow("counter", retained, { data: { safe: 1 } }, (db, table) =>
+          Effect.gen(function* () {
+            // An entry named by its attribute, under a key a put refuses.
+            yield* db.entities.Docs.update({ id: "a" })
+              .pathSet({ segments: ["data#x#y"], value: 3, isPath: false })
+              .asEffect()
+            table.take()
+            const update = db.entities.Docs.update({ id: "a" }).set({ note: "new" })
+            yield* transaction ? Transaction.transactWrite([update]) : update.asEffect()
+            expect(live(table)["data#x#y"]).toEqual({ N: "3" })
+            expect(yield* db.entities.Docs.get({ id: "a" })).toMatchObject({
+              note: "new",
+              data: { safe: 1, "x#y": 3 },
+            })
+          }),
+        ),
+    )
+  }
+
+  // A record operation naming an entry by its attribute, on an update that reads the row and
+  // writes it whole. It was applied beside the map and overwritten when the map was flattened:
+  // the update reported success and the entry kept its value, on 1.39.0 too. With an entry in the
+  // row under a key a put refuses, 1.39.0 refused the update after its read.
+  for (const transaction of [false, true]) {
+    for (const key of ["views", "x#y"]) {
+      for (const [name, seeded, apply, stored] of [
+        ["add", 9, (u: any, a: string) => u.add({ [a]: 2 }), { N: "11" }],
+        ["subtract", 9, (u: any, a: string) => u.subtract({ [a]: 2 }), { N: "7" }],
+        ["append", [1, 2], (u: any, a: string) => u.append({ [a]: [3] }), [1, 2, 3]],
+        [
+          "deleteFromSet",
+          new Set(["a", "b"]),
+          (u: any, a: string) => u.deleteFromSet({ [a]: new Set(["a"]) }),
+          { SS: ["b"] },
+        ],
+      ] as const) {
+        it.effect(
+          `a retained .${name}() of the entry \`data#${key}\` reaches the entry, ${transaction ? "in a transaction" : "alone"}`,
+          () => {
+            const Docs = Entity.make({
+              model: DynamoModel.configure(
+                Schema.Struct({
+                  id: Schema.String,
+                  data: Schema.Record(Schema.String, Schema.Unknown),
+                }),
+                { data: { storedAs: DynamoModel.SparseMap() } },
+              ),
+              entityType: "Doc",
+              primaryKey,
+              versioned: { retain: true },
+            } as never) as any
+            const MainTable = Table.make({ schema, entities: { Docs } } as never) as any
+            const table = makeRecordingTable()
+            return Effect.gen(function* () {
+              const db: any = yield* DynamoClient.make({
+                entities: { Docs },
+                tables: { MainTable },
+              } as never)
+              yield* db.entities.Docs.put({ id: "a", data: { safe: 1 } }).asEffect()
+              yield* db.entities.Docs.update({ id: "a" })
+                .pathSet({ segments: [`data#${key}`], value: seeded, isPath: false })
+                .asEffect()
+              const update = apply(db.entities.Docs.update({ id: "a" }), `data#${key}`)
+              yield* transaction ? Transaction.transactWrite([update]) : update.asEffect()
+              const row = live(table)[`data#${key}`]
+              expect(
+                Array.isArray(stored) ? row.L.map((entry: any) => Number(entry.N)) : row,
+              ).toEqual(stored)
+              // The version before the update keeps what the entry held then.
+              const before = yield* db.entities.Docs.getVersion({ id: "a" }, 2)
+              expect(before.data[key]).toEqual(seeded)
+            }).pipe(
+              Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "entries" }))),
+            ) as Effect.Effect<void, unknown>
+          },
+        )
+      }
+    }
+  }
+
+  // Everything that reads a stored row by field name reads it the same way. A unique constraint
+  // on the field: the row lacks `counter`, and the entry `data#x` isn't the field's value.
+  it.effect("a unique field the row lacks isn't read from the entry of its name", () =>
+    onRow("data#x", { unique: { code: ["data#x"] } }, { data: { safe: 1, x: 99 } }, (db, table) =>
+      Effect.gen(function* () {
+        const sentinels = () =>
+          [...table.items.values()].filter((row: any) => row.__edd_e__.S.includes("._unique."))
+        expect(sentinels()).toEqual([])
+        // Setting another field, then deleting the row, reserves and releases nothing.
+        yield* db.entities.Docs.update({ id: "a" }).set({ note: "new" }).asEffect()
+        expect(sentinels()).toEqual([])
+        yield* db.entities.Docs.delete({ id: "a" }).asEffect()
+        expect(
+          table.requests.flatMap((request) =>
+            request.command === "TransactWriteItems"
+              ? request.input.TransactItems.flatMap((item: any) =>
+                  item.Delete?.Key.pk.S.includes("_unique") ? [item.Delete.Key] : [],
+                )
+              : [],
+          ),
+        ).toEqual([])
+      }),
+    ),
+  )
 })
 
 describe("which attributes are a sparse map's entries is the reader's to say", () => {

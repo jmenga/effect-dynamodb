@@ -70,7 +70,7 @@ import {
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
-import { sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
+import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -2818,7 +2818,11 @@ const makeImpl = <
       }
     }
     if (name === "deletedAt" && config.softDelete) return `"${name}" is managed by the library`
-    if (writesTtl() && name === ttlAttribute) return `"${name}" is managed by the library`
+    const hasTtl =
+      retainTtl() !== undefined ||
+      softDeleteTtl() !== undefined ||
+      timeSeriesConfig?.ttl !== undefined
+    if (hasTtl && name === ttlAttribute) return `"${name}" is managed by the library`
     return undefined
   }
 
@@ -3708,6 +3712,9 @@ const makeImpl = <
     raw: globalThis.Record<string, unknown>,
   ): globalThis.Record<string, unknown> => {
     const view = { ...raw }
+    // The order every read of a row uses: sparse entries leave the attribute-keyed row first, so
+    // an entry never stands in for a field of its name whose own attribute the row lacks.
+    deserializeSparseFields(view)
     renameFromDynamo(view)
     return view
   }
@@ -4494,11 +4501,17 @@ const makeImpl = <
     return (config.softDelete as { ttl?: Duration.Duration | string }).ttl
   }
 
-  /** Whether a row of this entity can hold the table's TTL attribute: a snapshot, a tombstone or an event. */
-  const writesTtl = (): boolean =>
-    retainTtl() !== undefined ||
-    softDeleteTtl() !== undefined ||
-    timeSeriesConfig?.ttl !== undefined
+  // The TTL each kind of row is written with, or `undefined` when the entity writes none there.
+  // The write of each row asks the same function, so what refuses the table's TTL attribute
+  // (`refuseTableAttributes`) is what writes it.
+  /** A retained snapshot's: `versioned: { ttl }` without `retain` writes no snapshot. */
+  const snapshotTtl = (): Duration.Duration | string | undefined =>
+    isRetainEnabled() ? retainTtl() || undefined : undefined
+  /** A soft-deleted row's. */
+  const tombstoneTtl = (): Duration.Duration | string | undefined =>
+    isSoftDeleteEnabled() ? softDeleteTtl() || undefined : undefined
+  /** A time series' event's. */
+  const eventTtl = (): Duration.Duration | string | undefined => timeSeriesConfig?.ttl || undefined
 
   /**
    * `[EDD-9140]` for what the table's configuration names: the TTL attribute this entity sets on
@@ -4506,13 +4519,18 @@ const makeImpl = <
    * every name the definition supplies; this one is known when the table is bound.
    */
   const refuseTableAttributes = (tc: TableConfig): void => {
-    if (!writesTtl()) return
+    const rows = [
+      ...(snapshotTtl() !== undefined ? ["retained versions"] : []),
+      ...(tombstoneTtl() !== undefined ? ["soft-deleted rows"] : []),
+      ...(eventTtl() !== undefined ? ["time series events"] : []),
+    ]
+    if (rows.length === 0) return
     refuseReadAsSparseEntry(
       entityType,
       [
         {
           attribute: resolveTtlAttributeName(tc),
-          what: "the table's TTL attribute, which the entity sets on rows that expire",
+          what: `the table's TTL attribute, which the entity sets on its ${rows.join(" and ")}`,
         },
       ],
       sparseFields,
@@ -4884,6 +4902,7 @@ const makeImpl = <
           // Packed fields are read by their stored form: the source text is
           // derived from the value, not its JSON string or compressed bytes.
           yield* unpackFields(currentDomain, "update.vector")
+          deserializeSparseFields(currentDomain)
           renameFromDynamo(currentDomain)
           merged = { ...currentDomain, ...merged }
         }
@@ -5714,7 +5733,7 @@ const makeImpl = <
     )
 
     // Add optional TTL
-    const ttl = retainTtl()
+    const ttl = snapshotTtl()
     if (ttl) {
       snapshot[ttlAttrName] = DateTime.toEpochSeconds(now) + normalizeTtlSeconds(ttl)
     }
@@ -7205,6 +7224,50 @@ const makeImpl = <
     })
 
   /**
+   * A payload's sparse entry key its write refuses, in words: decided from the payload alone, so
+   * before anything is read. A write that flattens the whole item (`whole`: a put, and an update
+   * that reads the row and writes it back) refuses the keys the map's writer refuses
+   * (`validateSparseKey`); the row's own entries are written back as they're stored. An update
+   * sent as an expression refuses an empty key and one holding `#`.
+   */
+  const refusedSparseKey = (payload: unknown, whole: boolean): string | undefined => {
+    if (!hasSparseFields || typeof payload !== "object" || payload === null) return undefined
+    for (const [field, sparse] of Object.entries(sparseFields)) {
+      const value = (payload as globalThis.Record<string, unknown>)[field]
+      if (value === null || typeof value !== "object") continue
+      for (const key of Object.keys(value)) {
+        if (whole) {
+          try {
+            validateSparseKey(field, sparse.prefix, key)
+          } catch (e) {
+            return e instanceof Error ? e.message : String(e)
+          }
+        } else if (key.length === 0 || key.includes("#")) {
+          return `Sparse map "${field}": invalid key ${JSON.stringify(key)}`
+        }
+      }
+    }
+    return undefined
+  }
+
+  /** Whether an update reads the row and writes it whole, in a transaction, and not as an expression. */
+  const rewritesWholeItem = (
+    uState: UpdateState,
+    needsBothImages: boolean,
+    checked: {
+      readonly touchesUniqueFields: boolean
+      readonly computedComposites: ReadonlyArray<string>
+      readonly pathOpsPresent: boolean
+    },
+  ): boolean =>
+    (isRetainEnabled() ||
+      checked.touchesUniqueFields ||
+      checked.computedComposites.length > 0 ||
+      needsBothImages ||
+      uState.upsertOver !== undefined) &&
+    !checked.pathOpsPresent
+
+  /**
    * The refusals an update's keys decide, before reading anything: a key its payload composes with
    * no key text or level, and path operations no read-then-write can carry. Returns the primary key
    * and what decides the write's path.
@@ -7307,7 +7370,25 @@ const makeImpl = <
             "`versioned` cannot prove. Drop the path operations, the cascade, or the mode.",
         })
       }
-      return { primaryKey, marshalledKey, touchesUniqueFields, computedComposites, pathOpsPresent }
+      const checked = {
+        primaryKey,
+        marshalledKey,
+        touchesUniqueFields,
+        computedComposites,
+        pathOpsPresent,
+      }
+      const refused = refusedSparseKey(
+        hydratedUpdates,
+        rewritesWholeItem(uState, needsBothImages, checked),
+      )
+      if (refused !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "update.sparse",
+          cause: refused,
+        })
+      }
+      return checked
     })
 
   /** An update from what {@link prepareUpdate} decided: its reads and its write. */
@@ -7360,12 +7441,11 @@ const makeImpl = <
           hydratedUpdates,
         ))
       if (
-        (isRetainEnabled() ||
-          touchesUniqueFields ||
-          computedComposites.length > 0 ||
-          needsBothImages ||
-          uState.upsertOver !== undefined) &&
-        !pathOpsPresent
+        rewritesWholeItem(uState, needsBothImages, {
+          touchesUniqueFields,
+          computedComposites,
+          pathOpsPresent,
+        })
       ) {
         // --- Retain path: read-then-transact ---
         // Read current item (needed to create snapshot of pre-update state)
@@ -7403,11 +7483,12 @@ const makeImpl = <
         const currentDomainItem = {
           ...(currentRaw as globalThis.Record<string, unknown>),
         }
-        renameFromDynamo(currentDomainItem)
-        // Rebuild sparse Map fields from flattened attrs into domain Records.
-        // Done in-place on the renamed domain item so subsequent merge logic
-        // operates on domain shape and re-flattening happens once at the end.
+        // Read as every read path reads a row: sparse entries are taken from the
+        // attribute-keyed row first, then the names are mapped. The other order
+        // took a field named as an entry (`data#x`, stored as `counter`) for the
+        // entry, once the rename had put it under that name.
         deserializeSparseFields(currentDomainItem)
+        renameFromDynamo(currentDomainItem)
         const newItem: globalThis.Record<string, unknown> = {
           ...uState.upsertOver?.fill,
           ...currentDomainItem,
@@ -7465,12 +7546,25 @@ const makeImpl = <
             newItem[field] = {}
           }
         }
+        // Where a record operation's attribute is in the row as read: an operation naming a
+        // sparse map's entry by its attribute (`.add({ "data#views": 1 })`) reaches the entry
+        // in the map, as the same operation sent as an expression does. Applied to a key of
+        // its own, it was overwritten by the entry when the map was flattened: the operation
+        // reported success and changed nothing.
+        const slot = (attr: string): [globalThis.Record<string, unknown>, string] => {
+          const entry = isModelField(attr) ? undefined : sparseEntries.entryOf(attr)
+          if (entry === undefined) return [newItem, attr]
+          const map = { ...((newItem[entry.field] as globalThis.Record<string, unknown>) ?? {}) }
+          newItem[entry.field] = map
+          return [map, entry.key]
+        }
         if (uState.add) {
           for (const [attr, val] of Object.entries(uState.add)) {
             // DynamoDB's ADD: a number adds, a set unions, and a row without the attribute
             // starts from nothing.
-            const held = newItem[attr]
-            newItem[attr] =
+            const [holder, key] = slot(attr)
+            const held = holder[key]
+            holder[key] =
               typeof val === "number"
                 ? ((held as number) ?? 0) + val
                 : new Set<unknown>([...(held instanceof Set ? held : []), ...val])
@@ -7478,12 +7572,14 @@ const makeImpl = <
         }
         if (uState.subtract) {
           for (const [attr, val] of Object.entries(uState.subtract)) {
-            newItem[attr] = ((newItem[attr] as number) ?? 0) - val
+            const [holder, key] = slot(attr)
+            holder[key] = ((holder[key] as number) ?? 0) - val
           }
         }
         if (uState.append) {
           for (const [attr, val] of Object.entries(uState.append)) {
-            const existing = (newItem[attr] as Array<unknown>) ?? []
+            const [holder, key] = slot(attr)
+            const existing = (holder[key] as Array<unknown>) ?? []
             const appended = encodePathValue([attr], val, "elements")
             if (appended.issue !== undefined) {
               return yield* new ValidationError({
@@ -7492,16 +7588,18 @@ const makeImpl = <
                 cause: appended.issue,
               })
             }
-            newItem[attr] = [...existing, ...(appended.encoded as ReadonlyArray<unknown>)]
+            holder[key] = [...existing, ...(appended.encoded as ReadonlyArray<unknown>)]
           }
         }
         if (uState.deleteFromSet) {
           for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
-            if (newItem[attr] instanceof Set && val instanceof Set) {
-              const current = newItem[attr] as Set<unknown>
+            const [holder, key] = slot(attr)
+            if (holder[key] instanceof Set && val instanceof Set) {
+              const current = new Set(holder[key] as Set<unknown>)
               for (const elem of val as Set<unknown>) {
                 current.delete(elem)
               }
+              holder[key] = current
             }
           }
         }
@@ -7677,15 +7775,15 @@ const makeImpl = <
 
         // Convert back to DynamoDB attribute names for storage
         renameToDynamo(newItem)
-        // Flatten sparse Map fields into per-entry top-level attributes.
-        try {
-          serializeSparseFields(newItem)
-        } catch (e) {
-          return yield* new ValidationError({
-            entityType,
-            operation: "update.sparse",
-            cause: e instanceof Error ? e.message : String(e),
-          })
+        // Flatten sparse Map fields into per-entry top-level attributes. The payload's keys were
+        // checked before the read (`checkUpdatePayload`), and the row's own entries go back under
+        // the attributes they were read from, whatever their keys.
+        for (const [field, sparse] of Object.entries(sparseFields)) {
+          const value = newItem[field]
+          delete newItem[field]
+          if (value === null || typeof value !== "object") continue
+          for (const [key, entry] of Object.entries(value))
+            newItem[`${sparse.prefix}#${key}`] = entry
         }
         // Pack only the packed fields this update names: the others still
         // hold the stored value read above (a string or bytes), carried
@@ -9663,7 +9761,7 @@ const makeImpl = <
                 deletedItem.deletedAt = now
 
                 // Add optional TTL
-                const sdTtl = softDeleteTtl()
+                const sdTtl = tombstoneTtl()
                 if (sdTtl) {
                   deletedItem[ttlAttrName] =
                     DateTime.toEpochSeconds(dtNow) + normalizeTtlSeconds(sdTtl)
@@ -10052,6 +10150,16 @@ const makeImpl = <
         client
           .getItem({ TableName: tableName, Key: marshalledKey, ConsistentRead: true })
           .pipe(Effect.map((result) => result.Item))
+      // Either way this writes the whole item: the entry keys a put refuses are refused before
+      // the read.
+      const refusedKey = refusedSparseKey(encodedInput, true)
+      if (refusedKey !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "upsert.sparse",
+          cause: refusedKey,
+        })
+      }
       let current = stored ?? (yield* read())
       let expected = 0
       let lost: ConcurrentModification | undefined
@@ -10637,7 +10745,7 @@ const makeImpl = <
       const tableName = tc.name
       const ttlAttrName = resolveTtlAttributeName(tc)
       const orderByField = timeSeriesConfig.orderBy
-      const ttlDuration = timeSeriesConfig.ttl
+      const ttlDuration = eventTtl()
       const appendInputSchema = schemas.appendInputSchema as Schema.Codec<any>
       // Clock-backed time source for current-item timestamps + event-item TTL.
       const now = yield* DateTime.now

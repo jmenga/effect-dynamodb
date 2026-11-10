@@ -12,7 +12,7 @@
 
 import { readFileSync } from "node:fs"
 import { it } from "@effect/vitest"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Effect, Exit, Layer, Schema } from "effect"
 import { describe, expect } from "vitest"
 import * as Lib from "../src/index.js"
 import { cases, definitions, plain, type World } from "./helpers/SparseEntryWrites.js"
@@ -101,3 +101,90 @@ describeConnected("a write of a sparse map's entry that 1.39.0 stored, on Dynamo
     )
   }
 })
+
+describeConnected(
+  "a retained entity's update of a row holding a field and an entry of one name",
+  () => {
+    // A field named `data#x` and stored as `counter`, beside the entry `x` of the sparse `data`.
+    const Docs = Lib.Entity.make({
+      model: Lib.DynamoModel.configure(
+        Schema.Struct({
+          id: Schema.String,
+          note: Schema.String,
+          data: Schema.Record(Schema.String, Schema.Number),
+          "data#x": Schema.optionalKey(Schema.Number),
+        }),
+        { data: { storedAs: Lib.DynamoModel.SparseMap() }, "data#x": { field: "counter" } },
+      ),
+      entityType: "Doc",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+      versioned: { retain: true },
+    } as never) as any
+    const MainTable = Lib.Table.make({
+      schema: Lib.DynamoSchema.make({ name: "entries", version: 1 }),
+      entities: { Docs },
+    } as never) as any
+
+    for (const transaction of [false, true]) {
+      it.effect(
+        `keeps both, and a record operation on an entry reaches it (${transaction ? "in a transaction" : "alone"})`,
+        () => {
+          const tableName = `sparse-entries-${Date.now()}-${tables++}`
+          const send = (update: any) =>
+            transaction ? Lib.Transaction.transactWrite([update]) : update.asEffect()
+          return Effect.acquireUseRelease(
+            Effect.gen(function* () {
+              const client = yield* Lib.DynamoClient
+              yield* client.createTable({
+                TableName: tableName,
+                BillingMode: "PAY_PER_REQUEST",
+                KeySchema: [
+                  { AttributeName: "pk", KeyType: "HASH" },
+                  { AttributeName: "sk", KeyType: "RANGE" },
+                ],
+                AttributeDefinitions: [
+                  { AttributeName: "pk", AttributeType: "S" },
+                  { AttributeName: "sk", AttributeType: "S" },
+                ],
+              })
+            }),
+            () =>
+              Effect.gen(function* () {
+                const db: any = yield* Lib.DynamoClient.make({
+                  entities: { Docs },
+                  tables: { MainTable },
+                } as never)
+                const docs = db.entities.Docs
+                yield* docs
+                  .put({ id: "a", note: "ok", data: { safe: 1, x: 99 }, "data#x": 7 })
+                  .asEffect()
+                yield* send(docs.update({ id: "a" }).set({ note: "new" }))
+                expect(yield* docs.get({ id: "a" })).toMatchObject({
+                  note: "new",
+                  data: { safe: 1, x: 99 },
+                  "data#x": 7,
+                })
+                yield* send(docs.update({ id: "a" }).add({ "data#safe": 2 }))
+                yield* send(docs.update({ id: "a" }).remove(["data#x"]))
+                const read = yield* docs.get({ id: "a" })
+                expect(read.data).toEqual({ safe: 3, x: 99 })
+                expect(read["data#x"]).toBeUndefined()
+              }),
+            () =>
+              Effect.gen(function* () {
+                const client = yield* Lib.DynamoClient
+                yield* client.deleteTable({ TableName: tableName })
+              }).pipe(Effect.ignore),
+          ).pipe(
+            Effect.provide(
+              Layer.merge(ClientLayer, MainTable.layer({ name: tableName }) as Layer.Layer<never>),
+            ),
+          ) as Effect.Effect<void, unknown>
+        },
+      )
+    }
+  },
+)

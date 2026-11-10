@@ -1605,28 +1605,48 @@ export const buildEntityDefinition = (config: {
   const keyAttributes = writtenKeyAttributes(initialIndexes, vectorIndexes)
   refuseStoredInKeyAttribute(config.entityType, keyAttributes, storedAttributes)
   refuseStoredUnderLibraryAttribute(config.entityType, keyAttributes, storedAttributes)
-  // Every attribute a row of this entity holds under a name the definition supplies. The table's
-  // TTL attribute is the table configuration's to name: `DynamoClient.make` checks it.
+  // Every attribute a row of this entity holds under a name the definition supplies, each by the
+  // name it is stored under. The table's TTL attribute is the table configuration's to name:
+  // `DynamoClient.make` checks it.
+  const storedName = (name: string): string => fieldRenames[name] ?? name
   const softDeletes = config.softDelete === true || typeof config.softDelete === "object"
   refuseReadAsSparseEntry(
     config.entityType,
     [
       ...keyAttributes.map((key) => writtenKey(key)),
-      // A sparse map's own name is no attribute: its entries are.
       ...Object.keys(modelFields)
         .filter((name) => !Object.hasOwn(sparseFields, name))
         .map((name) => ({
-          attribute: fieldRenames[name] ?? name,
+          attribute: storedName(name),
           what: `the attribute the field "${name}" is stored in`,
         })),
+      // A sparse map's entries go under its prefix. Under a `field:` rename a put stores the map
+      // whole in that attribute.
+      ...Object.entries(sparseFields).flatMap(([name, sparse]) => [
+        {
+          attribute: sparse.prefix,
+          what: `the prefix the sparse map "${name}" stores its entries under`,
+        },
+        ...(Object.hasOwn(fieldRenames, name)
+          ? [
+              {
+                attribute: storedName(name),
+                what: `the attribute a put stores the sparse map "${name}" whole in`,
+              },
+            ]
+          : []),
+      ]),
+      // A timestamp or the version a model field also declares is stored where that field is.
       ...(
         [
           [systemFields.createdAt, "its created timestamp"],
           [systemFields.updatedAt, "its updated timestamp"],
           [systemFields.version, "its version"],
         ] as const
-      ).flatMap(([attribute, holds]) =>
-        attribute === null ? [] : [{ attribute, what: `the attribute that holds ${holds}` }],
+      ).flatMap(([name, holds]) =>
+        name === null
+          ? []
+          : [{ attribute: storedName(name), what: `the attribute that holds ${holds}` }],
       ),
       ...(softDeletes
         ? [
