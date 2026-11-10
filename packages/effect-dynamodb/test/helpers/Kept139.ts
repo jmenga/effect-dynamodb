@@ -68,7 +68,10 @@ export const openRecordingTable: OpenTable = (MainTable) =>
     }
   })
 
-/** A value as the fixtures hold it: a non-finite number as `{ number }`, a date as `{ date }`. */
+/**
+ * A value as the fixtures hold it: a non-finite number as `{ number }`, a bigint as `{ bigint }`, a
+ * date as `{ date }`.
+ */
 const plain = (value: unknown): unknown =>
   value === undefined
     ? undefined
@@ -82,6 +85,7 @@ const plain = (value: unknown): unknown =>
           if (typeof encoded === "number" && !Number.isFinite(encoded)) {
             return { number: String(encoded) }
           }
+          if (typeof encoded === "bigint") return { bigint: String(encoded) }
           return encoded
         }),
       )

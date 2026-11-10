@@ -409,9 +409,10 @@ describe.each(SETTINGS)("a value landing on another's old rows, %s", (_direction
 })
 
 describe("a NaN in a key", () => {
-  // `NaN` has no key text a write can compose, under either setting. Only a row 1.36 stored holds it,
-  // through a `NumberFromString` (a `Schema.Number` never reached the table), under 1.36's text,
-  // which isn't changed: there's no text to move it to.
+  // Only a `NumberFromString` holds a `NaN` (a `Schema.Number` never reached the table), under
+  // 1.36's text. With `escapeKeys` off that is still its key, as up to 1.39.0: the row is where the
+  // entity composes it, and nothing moves. With it on `NaN` has no key text, so there's no text to
+  // move the row to, and it's reported.
   const nanWorld = (escapeKeys: boolean) => {
     const schema = DynamoSchema.make({ name: "nanrows", version: 1, escapeKeys })
     const Keyed = Entity.make({
@@ -483,7 +484,7 @@ describe("a NaN in a key", () => {
     it.each([
       ["a plain run", {}],
       ["a repair", { repairIndexKeys: true }],
-    ])("%s reports what it can't place and leaves the rows", (_name, options) => {
+    ])(`%s ${escapeKeys ? "reports what it can't place and" : "finds the rows in place and"} leaves the rows`, (_name, options) => {
       const w = nanWorld(escapeKeys)
       const table = seeded(w)
       return Effect.runPromise(
@@ -494,24 +495,28 @@ describe("a NaN in a key", () => {
             const db: any = yield* w.client
             const before = [...table.items.values()]
             const report = yield* db.tables.MainTable.rekey(options)
-            // The row whose own key holds it is reported, as a row it couldn't move; the row whose
-            // index key does has no difference to judge.
-            expect(report.conflicts).toEqual([
-              {
-                member: "Keyed",
-                kind: "item",
-                reason: "uncomposable",
-                key: {
-                  pk: "$nanrows#v1#keyed#id_a",
-                  sk: "$nanrows#v1#keyed#level_0000000000000nan",
-                },
-                target: undefined,
-                message: expect.stringMatching(/^Its values compose no key: \[EDD-9096\]/),
-              },
-            ])
-            expect(report.byMember.Keyed?.conflicts).toBe(1)
+            // On: the row whose own key holds it is reported, as a row it couldn't move; the row
+            // whose index key does has no difference to judge. Off: both are where they belong.
+            expect(report.conflicts).toEqual(
+              escapeKeys
+                ? [
+                    {
+                      member: "Keyed",
+                      kind: "item",
+                      reason: "uncomposable",
+                      key: {
+                        pk: "$nanrows#v1#keyed#id_a",
+                        sk: "$nanrows#v1#keyed#level_0000000000000nan",
+                      },
+                      target: undefined,
+                      message: expect.stringMatching(/^Its values compose no key: \[EDD-9096\]/),
+                    },
+                  ]
+                : [],
+            )
+            expect(report.byMember.Keyed?.conflicts ?? 0).toBe(escapeKeys ? 1 : 0)
             expect(report.skipped.unrecognizedKey).toBe(0)
-            expect(report.unchanged).toBe(1)
+            expect(report.unchanged).toBe(escapeKeys ? 1 : 2)
             expect(report.moved.item).toBe(0)
             expect(report.indexKeysRewritten).toBe(0)
             expect(report.indexKeys.lagging).toBe(0)
@@ -522,7 +527,7 @@ describe("a NaN in a key", () => {
       )
     })
 
-    it("a write can't compose it", () => {
+    it("a number's own NaN composes no key, whatever the setting", () => {
       const w = nanWorld(escapeKeys)
       expect(() =>
         KeyComposer.composeSk(w.schema, "Indexed", 1, w.Indexed.indexes.byLevel, values),

@@ -108,7 +108,7 @@ describeConnected("values that can't be stored, on DynamoDB", () => {
     })
 
     it.effect(
-      "a row 1.36 stored under NaN's text is scanned, and rekey reports it and leaves it",
+      `a row 1.36 stored under NaN's text is scanned, and rekey ${on ? "reports it and" : "finds it in place and"} leaves it`,
       () => {
         const Readings = Entity.make({
           model: Schema.Struct({ id: Schema.String, level: Schema.NumberFromString }),
@@ -140,17 +140,26 @@ describeConnected("values that can't be stored, on DynamoDB", () => {
             const scanned = yield* db.entities.Readings.scan().collect()
             expect(scanned.map((reading) => Number.isNaN(reading.level))).toEqual([true])
             const report = yield* db.tables.Readers.rekey()
-            // A row it couldn't move, reported as one.
-            expect(report.conflicts).toEqual([
-              {
-                member: "Reading",
-                kind: "item",
-                reason: "uncomposable",
-                key: { pk: row.pk!.S, sk: row.sk!.S },
-                target: undefined,
-                message: expect.stringMatching(/^Its values compose no key: \[EDD-9096\]/),
-              },
-            ])
+            // On, a row it couldn't move, reported as one. Off, the text is still the row's key,
+            // as up to 1.39.0, and the entity reads it by it.
+            expect(report.conflicts).toEqual(
+              on
+                ? [
+                    {
+                      member: "Reading",
+                      kind: "item",
+                      reason: "uncomposable",
+                      key: { pk: row.pk!.S, sk: row.sk!.S },
+                      target: undefined,
+                      message: expect.stringMatching(/^Its values compose no key: \[EDD-9096\]/),
+                    },
+                  ]
+                : [],
+            )
+            if (!on) {
+              const read = yield* db.entities.Readings.get({ id: "a", level: Number.NaN })
+              expect(Number.isNaN(read.level)).toBe(true)
+            }
             expect(report.skipped.unrecognizedKey).toBe(0)
             expect(report.moved.item).toBe(0)
             expect(report.indexKeysRewritten).toBe(0)

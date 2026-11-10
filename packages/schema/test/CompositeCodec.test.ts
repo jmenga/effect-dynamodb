@@ -26,6 +26,7 @@ import {
   storedNumericKinds,
   toCompositeKeyRecord,
 } from "../src/internal/CompositeCodec.js"
+import { STORED_NAN } from "../src/internal/NumericKey.js"
 import { serializeValue } from "../src/KeyComposer.js"
 
 const Model = Schema.Struct({
@@ -46,6 +47,41 @@ const refuse = (attr: string, value: unknown): never => {
 
 describe("CompositeCodec", () => {
   const encode = makeCompositeKeyForm(Model, refuse)
+
+  describe("NaN — a key only where a row can hold it", () => {
+    const form = makeCompositeKeyForm(
+      Schema.Struct({
+        asText: Schema.NumberFromString,
+        asNumber: Schema.Number,
+        asBigIntText: Schema.BigIntFromString,
+      }),
+      refuse,
+    )
+
+    it("a number stored as a string hands its NaN on as STORED_NAN, from either side", () => {
+      expect(form("asText", Number.NaN)).toBe(STORED_NAN)
+      expect(form("asText", "NaN")).toBe(STORED_NAN)
+      // A record already in key form lands on itself.
+      expect(form("asText", STORED_NAN)).toBe(STORED_NAN)
+    })
+
+    it("every other value of it is the number, as it was", () => {
+      expect(form("asText", 42)).toBe(42)
+      expect(form("asText", "42")).toBe(42)
+      expect(form("asText", Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY)
+      expect(form("asText", "-Infinity")).toBe(Number.NEGATIVE_INFINITY)
+    })
+
+    it("a number stored as a number keeps its own NaN, which no key text takes", () => {
+      expect(form("asNumber", Number.NaN)).toBeNaN()
+      expect(form("asNumber", Number.NaN)).not.toBe(STORED_NAN)
+      expect(() => serializeValue(form("asNumber", Number.NaN))).toThrow("[EDD-9096]")
+    })
+
+    it("a bigint stored as a string has no NaN to hand on", () => {
+      expect(() => form("asBigIntText", Number.NaN)).toThrow("[EDD-9050]")
+    })
+  })
 
   describe("case 1 — attribute is not a model field", () => {
     it("passes the value through untouched", () => {

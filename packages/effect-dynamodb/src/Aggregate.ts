@@ -45,6 +45,7 @@ import {
   readBackUnsure,
   readsBackOtherwise,
   refuseInexact,
+  storedNaNKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
@@ -5719,7 +5720,10 @@ const manyEdgeSkComposites = (
       })
     }
 
-    return values
+    // A number its field stores as a string holds its `NaN` in key form, as the root's key does.
+    return values.map((value, i) =>
+      storedNaNKeyForm(fieldAtPath(node.ownFields, declared[i]!), value),
+    )
   })
 
 /**

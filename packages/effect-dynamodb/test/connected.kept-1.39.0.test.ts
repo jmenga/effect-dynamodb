@@ -2,7 +2,7 @@
  * Behaviour published 1.39.0 had, kept, against DynamoDB Local: the connected twin of
  * `Kept139.test.ts`. Each scenario replays its steps and compares them with what 1.39.0 did
  * (`fixtures/*-1.39.0.json`, captured once, never regenerated).
- * Scenarios: `helpers/OptionalShardAppend.ts`.
+ * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -21,6 +21,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
+import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -70,4 +71,8 @@ const openTable: OpenTable = (MainTable) =>
 
 describeConnected("an appendInput that may leave a sharded index's composite out", () => {
   optionalShardAppendSuite(openTable)
+})
+
+describeConnected("a key over a number stored as a string, holding NaN", () => {
+  storedNaNKeySuite(openTable)
 })
