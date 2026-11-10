@@ -975,13 +975,27 @@ interface Written {
   readonly update: boolean
 }
 
-/** The caller's own value of `field`, under `written`. */
+/**
+ * Whether a caller's object holds `field`: as its own property or one its class gives it (a
+ * getter, a prototype's property), as `in` says, but never as a member every object inherits
+ * (`toString`, `constructor`).
+ */
+const holdsField = (holder: object, field: string): boolean => {
+  for (
+    let at: object | null = holder;
+    at !== null && at !== Object.prototype;
+    at = Object.getPrototypeOf(at)
+  ) {
+    if (Object.hasOwn(at, field)) return true
+  }
+  return false
+}
+
+/** The caller's value of `field`, under `written`. */
 const writtenField = (written: Written | undefined, field: string): Written | undefined => {
   if (written === undefined) return undefined
   const holder = written.present ? written.value : undefined
-  // The caller's own property: a field named as a member every object inherits (`toString`)
-  // isn't present because the object has that member.
-  const present = holder !== null && typeof holder === "object" && Object.hasOwn(holder, field)
+  const present = holder !== null && typeof holder === "object" && holdsField(holder, field)
   return {
     present,
     value: present ? (holder as Record<string, unknown>)[field] : undefined,

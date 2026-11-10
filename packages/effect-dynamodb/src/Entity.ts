@@ -7211,13 +7211,14 @@ const makeImpl = <
           )
         : []
       // A payload whose refs are read first has its entry keys judged before that read, by what
-      // is known before it: an update that surely writes the row whole refuses the keys a put
-      // refuses, and any other the keys every update refuses. `checkUpdatePayload` judges the
-      // rest once the refs are in.
+      // is known before it: an update that surely writes the row whole (`rewritesWholeItem`,
+      // which a path op rules out) refuses the keys a put refuses, and any other the keys every
+      // update refuses. `checkUpdatePayload` judges the rest once the refs are in.
       if (refsToHydrate.length > 0) {
         const refusedKey = refusedSparseKey(
           encodedUpdates,
-          isRetainEnabled() || needsBothImages || uState.upsertOver !== undefined,
+          (isRetainEnabled() || needsBothImages || uState.upsertOver !== undefined) &&
+            !hasPathOps(uState),
           everyRowWrites,
         )
         if (refusedKey !== undefined) {
