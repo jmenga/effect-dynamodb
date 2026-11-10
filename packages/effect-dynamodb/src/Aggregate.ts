@@ -979,7 +979,9 @@ interface Written {
 const writtenField = (written: Written | undefined, field: string): Written | undefined => {
   if (written === undefined) return undefined
   const holder = written.present ? written.value : undefined
-  const present = holder !== null && typeof holder === "object" && field in holder
+  // The caller's own property: a field named as a member every object inherits (`toString`)
+  // isn't present because the object has that member.
+  const present = holder !== null && typeof holder === "object" && Object.hasOwn(holder, field)
   return {
     present,
     value: present ? (holder as Record<string, unknown>)[field] : undefined,
@@ -2215,7 +2217,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
       ({ node }) =>
         item.__edd_e__ === node.entityType &&
         Object.entries(node.discriminator ?? {}).every(
-          ([attr, value]) => typeof value === "function" || item[attr] === value,
+          ([attr, value]) =>
+            typeof value === "function" || (Object.hasOwn(item, attr) && item[attr] === value),
         ),
     )
 

@@ -11,10 +11,18 @@
  */
 
 import { readFileSync } from "node:fs"
+import { DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import { Cause, Config, Effect, Exit, Layer, Schema } from "effect"
 import { describe, expect } from "vitest"
 import * as Lib from "../src/index.js"
+import {
+  counted,
+  ENTRY_OPS,
+  primaryKey as entryKey,
+  KEYS,
+  WORLDS,
+} from "./helpers/SparseEntryOps.js"
 import { cases, definitions, plain, type World } from "./helpers/SparseEntryWrites.js"
 
 const ENDPOINT = Effect.runSync(
@@ -185,6 +193,114 @@ describeConnected(
           ) as Effect.Effect<void, unknown>
         },
       )
+    }
+  },
+)
+
+describeConnected(
+  "an entry operation reaches the entry, whatever its key is called, on DynamoDB Local",
+  () => {
+    // Every operation that changes one entry by its attribute's name, on a plain, a retained and a
+    // unique entity, with the entry present and absent, under an ordinary key and under the names
+    // every object inherits. The update that reads the row and writes it whole looked an entry up
+    // on a plain object.
+    const raw = new DynamoDBClient({ region: "us-east-1", endpoint: ENDPOINT, credentials })
+    for (const world of WORLDS) {
+      it.effect(`on a ${world} entity`, () => {
+        const Docs = Lib.Entity.make({
+          entityType: "Doc",
+          primaryKey: entryKey,
+          model: counted(Lib as never),
+          ...(world === "retain" ? { versioned: { retain: true } } : {}),
+          ...(world === "unique" ? { unique: { note: ["note"] } } : {}),
+        } as never) as any
+        const MainTable = Lib.Table.make({
+          schema: Lib.DynamoSchema.make({ name: "ops", version: 1 }),
+          entities: { Docs },
+        } as never) as any
+        const tableName = `sparse-entry-ops-${Date.now()}-${tables++}`
+        return Effect.acquireUseRelease(
+          Effect.gen(function* () {
+            const client = yield* Lib.DynamoClient
+            yield* client.createTable({
+              TableName: tableName,
+              BillingMode: "PAY_PER_REQUEST",
+              KeySchema: [
+                { AttributeName: "pk", KeyType: "HASH" },
+                { AttributeName: "sk", KeyType: "RANGE" },
+              ],
+              AttributeDefinitions: [
+                { AttributeName: "pk", AttributeType: "S" },
+                { AttributeName: "sk", AttributeType: "S" },
+              ],
+            })
+          }),
+          () =>
+            Effect.gen(function* () {
+              const db: any = yield* Lib.DynamoClient.make({
+                entities: { Docs },
+                tables: { MainTable },
+              } as never)
+              let n = 0
+              for (const key of KEYS) {
+                for (const op of ENTRY_OPS) {
+                  for (const present of [true, false]) {
+                    const id = `a${n++}`
+                    const attribute = `data#${key}`
+                    const label = `${op.name} of ${attribute}, ${present ? "present" : "absent"}`
+                    yield* db.entities.Docs.put({ id, note: `note-${id}`, data: {} }).asEffect()
+                    if (present) {
+                      yield* db.entities.Docs.update({ id })
+                        .pathSet({ segments: [attribute], value: op.seedValue, isPath: false })
+                        .asEffect()
+                    }
+                    const base = db.entities.Docs.update({ id })
+                    const exit = yield* Effect.exit(
+                      op
+                        .apply(
+                          world === "unique" && op.name.startsWith(".")
+                            ? base.set({ note: `after-${id}` })
+                            : base,
+                          attribute,
+                        )
+                        .asEffect(),
+                    )
+                    const stored = yield* Effect.promise(() =>
+                      raw.send(
+                        new GetItemCommand({
+                          TableName: tableName,
+                          Key: { pk: { S: `$ops#v1#doc#id_${id}` }, sk: { S: "$ops#v1#doc" } },
+                          ConsistentRead: true,
+                        }),
+                      ),
+                    )
+                    const held: any = stored.Item?.[attribute]
+                    const entry = held?.SS !== undefined ? { SS: [...held.SS].sort() } : held
+                    if (present || "absent" in op) {
+                      expect(
+                        Exit.isFailure(exit)
+                          ? `${label}: ${String(Cause.squash(exit.cause))}`
+                          : "ok",
+                      ).toBe("ok")
+                      expect([label, entry]).toEqual([label, present ? op.present : op.absent])
+                    }
+                    const read = yield* Effect.exit(db.entities.Docs.get({ id }))
+                    expect(Exit.isSuccess(read) ? "read" : `${label}: not read back`).toBe("read")
+                  }
+                }
+              }
+            }),
+          () =>
+            Effect.gen(function* () {
+              const client = yield* Lib.DynamoClient
+              yield* client.deleteTable({ TableName: tableName })
+            }).pipe(Effect.ignore),
+        ).pipe(
+          Effect.provide(
+            Layer.merge(ClientLayer, MainTable.layer({ name: tableName }) as Layer.Layer<never>),
+          ),
+        ) as Effect.Effect<void, unknown>
+      })
     }
   },
 )

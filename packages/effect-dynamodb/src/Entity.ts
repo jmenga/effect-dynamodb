@@ -2818,11 +2818,7 @@ const makeImpl = <
       }
     }
     if (name === "deletedAt" && config.softDelete) return `"${name}" is managed by the library`
-    const hasTtl =
-      retainTtl() !== undefined ||
-      softDeleteTtl() !== undefined ||
-      timeSeriesConfig?.ttl !== undefined
-    if (hasTtl && name === ttlAttribute) return `"${name}" is managed by the library`
+    if (writesTtl() && name === ttlAttribute) return `"${name}" is managed by the library`
     return undefined
   }
 
@@ -4514,16 +4510,24 @@ const makeImpl = <
   const eventTtl = (): Duration.Duration | string | undefined => timeSeriesConfig?.ttl || undefined
 
   /**
+   * The rows this entity writes the table's TTL attribute on, in words: the one place that says
+   * whether it writes that attribute at all. An update naming the attribute is refused, and a
+   * table whose TTL attribute a sparse map would read as an entry is refused at bind, only then.
+   */
+  const ttlRows = (): ReadonlyArray<string> => [
+    ...(snapshotTtl() !== undefined ? ["retained versions"] : []),
+    ...(tombstoneTtl() !== undefined ? ["soft-deleted rows"] : []),
+    ...(eventTtl() !== undefined ? ["time series events"] : []),
+  ]
+  const writesTtl = (): boolean => ttlRows().length > 0
+
+  /**
    * `[EDD-9140]` for what the table's configuration names: the TTL attribute this entity sets on
    * its rows may not be one a row's reader takes as a sparse map's entry. `Entity.make` checks
    * every name the definition supplies; this one is known when the table is bound.
    */
   const refuseTableAttributes = (tc: TableConfig): void => {
-    const rows = [
-      ...(snapshotTtl() !== undefined ? ["retained versions"] : []),
-      ...(tombstoneTtl() !== undefined ? ["soft-deleted rows"] : []),
-      ...(eventTtl() !== undefined ? ["time series events"] : []),
-    ]
+    const rows = ttlRows()
     if (rows.length === 0) return
     refuseReadAsSparseEntry(
       entityType,
@@ -6767,6 +6771,19 @@ const makeImpl = <
             yield* refuseUncomposed(encodedInput, operation)
           }
 
+          // A put writes the whole item, so an entry key its flattening refuses is refused in
+          // every case: before the refs are read, where it reads any.
+          if (hasRefs) {
+            const refusedKey = refusedSparseKey(encodedInput, true)
+            if (refusedKey !== undefined) {
+              return yield* new ValidationError({
+                entityType,
+                operation: `${operation}.sparse`,
+                cause: refusedKey,
+              })
+            }
+          }
+
           // Hydrate refs: replace ID fields with full entity domain data
           const encoded: globalThis.Record<string, unknown> = hasRefs
             ? yield* hydrateRefs(encodedInput as globalThis.Record<string, unknown>)
@@ -7193,6 +7210,24 @@ const makeImpl = <
               (encodedUpdates as globalThis.Record<string, unknown>)[ref.idFieldName] !== undefined,
           )
         : []
+      // A payload whose refs are read first has its entry keys judged before that read, by what
+      // is known before it: an update that surely writes the row whole refuses the keys a put
+      // refuses, and any other the keys every update refuses. `checkUpdatePayload` judges the
+      // rest once the refs are in.
+      if (refsToHydrate.length > 0) {
+        const refusedKey = refusedSparseKey(
+          encodedUpdates,
+          isRetainEnabled() || needsBothImages || uState.upsertOver !== undefined,
+          everyRowWrites,
+        )
+        if (refusedKey !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.sparse",
+            cause: refusedKey,
+          })
+        }
+      }
       const checked =
         refsToHydrate.length === 0
           ? yield* checkUpdatePayload(
@@ -7229,10 +7264,21 @@ const makeImpl = <
    * that reads the row and writes it back) refuses the keys the map's writer refuses
    * (`validateSparseKey`); the row's own entries are written back as they're stored. An update
    * sent as an expression refuses an empty key and one holding `#`.
+   *
+   * Only a value the operation writes whatever the row holds is judged here. An update never
+   * writes an immutable field, and an upsert writes one only into a row that isn't there: with
+   * the row present it succeeds whatever the immutable map's keys are, so nothing refuses it
+   * before the read.
    */
-  const refusedSparseKey = (payload: unknown, whole: boolean): string | undefined => {
+  const refusedSparseKey = (
+    payload: unknown,
+    whole: boolean,
+    /** Whether the operation writes the field's value whatever the row holds. */
+    writes: (field: string) => boolean = () => true,
+  ): string | undefined => {
     if (!hasSparseFields || typeof payload !== "object" || payload === null) return undefined
     for (const [field, sparse] of Object.entries(sparseFields)) {
+      if (!writes(field) || !Object.hasOwn(payload, field)) continue
       const value = (payload as globalThis.Record<string, unknown>)[field]
       if (value === null || typeof value !== "object") continue
       for (const key of Object.keys(value)) {
@@ -7249,6 +7295,9 @@ const makeImpl = <
     }
     return undefined
   }
+
+  /** Whether an update or an upsert writes the field's value whatever the row holds. */
+  const everyRowWrites = (field: string): boolean => !immutableFields.has(field)
 
   /** Whether an update reads the row and writes it whole, in a transaction, and not as an expression. */
   const rewritesWholeItem = (
@@ -7380,6 +7429,7 @@ const makeImpl = <
       const refused = refusedSparseKey(
         hydratedUpdates,
         rewritesWholeItem(uState, needsBothImages, checked),
+        everyRowWrites,
       )
       if (refused !== undefined) {
         return yield* new ValidationError({
@@ -7551,35 +7601,59 @@ const makeImpl = <
         // in the map, as the same operation sent as an expression does. Applied to a key of
         // its own, it was overwritten by the entry when the map was flattened: the operation
         // reported success and changed nothing.
+        //
+        // `attr`, and an entry's key, are names the caller supplies: each is read and written as
+        // the holder's OWN property, never as a member every object inherits. `data#constructor`
+        // on an empty map found `Object`'s constructor, and `2` was added to a function.
         const slot = (attr: string): [globalThis.Record<string, unknown>, string] => {
           const entry = isModelField(attr) ? undefined : sparseEntries.entryOf(attr)
           if (entry === undefined) return [newItem, attr]
-          const map = { ...((newItem[entry.field] as globalThis.Record<string, unknown>) ?? {}) }
+          const map: globalThis.Record<string, unknown> = Object.assign(
+            Object.create(null),
+            newItem[entry.field] as globalThis.Record<string, unknown> | undefined,
+          )
           newItem[entry.field] = map
           return [map, entry.key]
+        }
+        const held = (holder: globalThis.Record<string, unknown>, key: string): unknown =>
+          Object.hasOwn(holder, key) ? holder[key] : undefined
+        const hold = (
+          holder: globalThis.Record<string, unknown>,
+          key: string,
+          value: unknown,
+        ): void => {
+          Object.defineProperty(holder, key, {
+            value,
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          })
         }
         if (uState.add) {
           for (const [attr, val] of Object.entries(uState.add)) {
             // DynamoDB's ADD: a number adds, a set unions, and a row without the attribute
             // starts from nothing.
             const [holder, key] = slot(attr)
-            const held = holder[key]
-            holder[key] =
+            const before = held(holder, key)
+            hold(
+              holder,
+              key,
               typeof val === "number"
-                ? ((held as number) ?? 0) + val
-                : new Set<unknown>([...(held instanceof Set ? held : []), ...val])
+                ? ((before as number) ?? 0) + val
+                : new Set<unknown>([...(before instanceof Set ? before : []), ...val]),
+            )
           }
         }
         if (uState.subtract) {
           for (const [attr, val] of Object.entries(uState.subtract)) {
             const [holder, key] = slot(attr)
-            holder[key] = ((holder[key] as number) ?? 0) - val
+            hold(holder, key, ((held(holder, key) as number) ?? 0) - val)
           }
         }
         if (uState.append) {
           for (const [attr, val] of Object.entries(uState.append)) {
             const [holder, key] = slot(attr)
-            const existing = (holder[key] as Array<unknown>) ?? []
+            const existing = (held(holder, key) as Array<unknown>) ?? []
             const appended = encodePathValue([attr], val, "elements")
             if (appended.issue !== undefined) {
               return yield* new ValidationError({
@@ -7588,18 +7662,19 @@ const makeImpl = <
                 cause: appended.issue,
               })
             }
-            holder[key] = [...existing, ...(appended.encoded as ReadonlyArray<unknown>)]
+            hold(holder, key, [...existing, ...(appended.encoded as ReadonlyArray<unknown>)])
           }
         }
         if (uState.deleteFromSet) {
           for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
             const [holder, key] = slot(attr)
-            if (holder[key] instanceof Set && val instanceof Set) {
-              const current = new Set(holder[key] as Set<unknown>)
+            const before = held(holder, key)
+            if (before instanceof Set && val instanceof Set) {
+              const current = new Set(before as Set<unknown>)
               for (const elem of val as Set<unknown>) {
                 current.delete(elem)
               }
-              holder[key] = current
+              hold(holder, key, current)
             }
           }
         }
@@ -10152,7 +10227,7 @@ const makeImpl = <
           .pipe(Effect.map((result) => result.Item))
       // Either way this writes the whole item: the entry keys a put refuses are refused before
       // the read.
-      const refusedKey = refusedSparseKey(encodedInput, true)
+      const refusedKey = refusedSparseKey(encodedInput, true, everyRowWrites)
       if (refusedKey !== undefined) {
         return yield* new ValidationError({
           entityType,

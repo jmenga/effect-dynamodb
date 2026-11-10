@@ -257,19 +257,21 @@ export const decodeSparseFields = (
   if (Object.keys(sparseFields).length === 0) return
   const { fields, entryOf } = sparseReader(sparseFields)
 
-  // Initialize empty buckets for each sparse field.
-  const buckets: Record<string, Record<string, unknown>> = {}
-  for (const fieldName of fields) buckets[fieldName] = {}
+  // An empty bucket for each sparse field. An entry's key is whatever follows the prefix in the
+  // attribute's name, so a bucket has no prototype: `__proto__` is a key like any other, where
+  // assigning it on a plain object dropped the entry.
+  const buckets = new Map<string, Record<string, unknown>>()
+  for (const fieldName of fields) buckets.set(fieldName, Object.create(null))
 
   // One pass over keys.
   for (const k of Object.keys(raw)) {
     const entry = entryOf(k)
     if (entry === undefined) continue
-    buckets[entry.field]![entry.key] = raw[k]
+    buckets.get(entry.field)![entry.key] = raw[k]
     delete raw[k]
   }
 
   for (const fieldName of fields) {
-    raw[fieldName] = buckets[fieldName]!
+    raw[fieldName] = buckets.get(fieldName)!
   }
 }

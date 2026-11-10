@@ -1608,7 +1608,10 @@ export const buildEntityDefinition = (config: {
   // Every attribute a row of this entity holds under a name the definition supplies, each by the
   // name it is stored under. The table's TTL attribute is the table configuration's to name:
   // `DynamoClient.make` checks it.
-  const storedName = (name: string): string => fieldRenames[name] ?? name
+  // A timestamp's or the version's name is the configuration's: looked up among the renames
+  // the model declares, never among what every object inherits.
+  const storedName = (name: string): string =>
+    Object.hasOwn(fieldRenames, name) ? fieldRenames[name]! : name
   const softDeletes = config.softDelete === true || typeof config.softDelete === "object"
   refuseReadAsSparseEntry(
     config.entityType,
