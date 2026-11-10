@@ -5,7 +5,7 @@
  */
 
 import { Option, Schema, SchemaAST } from "effect"
-import { ConfiguredModelTag } from "../DynamoModel.js"
+import { ConfiguredModelTag, getIdentifierField } from "../DynamoModel.js"
 import type { AggregateEdge, ManyEdge, RefEntity } from "./AggregateEdges.js"
 import type {
   AggregateInputType,
@@ -437,20 +437,15 @@ const own = <A>(record: Readonly<Record<string, A>> | undefined, name: string): 
   record !== undefined && Object.hasOwn(record, name) ? record[name] : undefined
 
 /**
- * What a caller's payload holds under `name`: its own property, or one its class gives it (a
- * getter, a property of a prototype), as 1.39.0 read it. Only a member every object inherits from
- * `Object.prototype` is not held: an edge named `constructor` that the payload doesn't give is not
- * given.
+ * What a caller's payload gives under `name`, read as 1.39.0 read it (`payload[name]`): its own
+ * property, one its class gives it (a getter, a property of a prototype), or one a proxy answers
+ * for. A function is not given: 1.39.0 took a string for an id, a list for a `many` edge and an
+ * object for a sub-aggregate, never a function, so a method of the payload's class named like an id
+ * is no id, and neither is a member every object inherits (`constructor`, `toString`).
  */
 export const given = (payload: object, name: string): unknown => {
-  for (
-    let at: object | null = payload;
-    at !== null && at !== Object.prototype;
-    at = Object.getPrototypeOf(at)
-  ) {
-    if (Object.hasOwn(at, name)) return (payload as Record<string, unknown>)[name]
-  }
-  return undefined
+  const value = (payload as Record<string, unknown>)[name]
+  return typeof value === "function" ? undefined : value
 }
 
 /**
@@ -617,10 +612,32 @@ export const holdsRefId = (
 }
 
 /**
+ * Whether 1.39.0 fetched an element that is the entity by its own key `key` (`lineId` of a `Line`
+ * keyed by `lineId`) and completed. It fetched under the model's identifier (`id` without one), so
+ * only where that is the entity's one key composite; and it took the key out of the element given,
+ * so only where the element doesn't require it. Everywhere else it died composing the key, or
+ * refused the element without its key.
+ */
+const fetchedByOwnKey139 = (
+  fields: Record<string, Schema.Top> | undefined,
+  entity: RefEntity,
+  key: string,
+): boolean => {
+  const declared = own(fields, key)
+  return (
+    refKeyComposite(entity) === key &&
+    (getIdentifierField(entity.model as never)?.name ?? "id") === key &&
+    declared !== undefined &&
+    isFieldOptional(declared)
+  )
+}
+
+/**
  * {@link holdsRefId} for a `many` element given as an object, of the element's schema. An element
  * that is the entity ({@link isEntityElement}), given whole, holds no id in its own key: where the
  * entity is keyed by `${field}Id` (`lineId` of a `Line`), that is the entity's own value, which
- * 1.39.0 took for an id to fetch and failed on.
+ * 1.39.0 took for an id to fetch and failed on. It is left unfetched exactly where 1.39.0 failed:
+ * where 1.39.0 fetched it and completed ({@link fetchedByOwnKey139}), it is fetched.
  */
 export const elementHoldsRef = (
   element: Schema.Top | undefined,
@@ -628,15 +645,15 @@ export const elementHoldsRef = (
   value: Record<string, unknown>,
 ): boolean => {
   const field = deriveEntityFieldName(entity)
-  if (isEntityElement(element, entity) && refKeyComposites(entity).includes(`${field}Id`)) {
+  const fields = element === undefined ? undefined : getSchemaFields(element)
+  if (
+    isEntityElement(element, entity) &&
+    refKeyComposites(entity).includes(`${field}Id`) &&
+    !fetchedByOwnKey139(fields, entity, `${field}Id`)
+  ) {
     return false
   }
-  return holdsRefId(
-    element === undefined ? undefined : getSchemaFields(element),
-    field,
-    entity,
-    value,
-  )
+  return holdsRefId(fields, field, entity, value)
 }
 
 /**

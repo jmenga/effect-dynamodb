@@ -36,7 +36,9 @@ import {
   fixture,
   JUDGED_AS_139,
   json,
+  NINTH,
   NOW_FETCHED,
+  OWN_KEY_WHOLE,
   outcomeOf,
   SHAPES,
   type Shape,
@@ -224,6 +226,7 @@ describeConnected(
       "many, element declares the entity's field a string, given it and a lineId",
       ...SIXTH,
       ...EIGHTH,
+      ...NINTH,
     ]) {
       it.effect(`${label}: writes and reads what 1.39.0 did`, () =>
         Effect.gen(function* () {
@@ -231,6 +234,23 @@ describeConnected(
           expect(outcomeOf(create)).toBe(fixture.shapes[label]!.create)
           expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
           expect(outcomeOf(get)).toBe(fixture.shapes[label]!.get)
+        }),
+      )
+    }
+
+    for (const label of OWN_KEY_WHOLE) {
+      it.effect(`${label}: stored as given`, () =>
+        Effect.gen(function* () {
+          const { create, rows, get } = yield* run(SHAPES[label]!())
+          const lines = [{ lineId: "l", f: 9 }]
+          const sub = label.startsWith("sub-aggregate")
+          expect(Exit.isSuccess(create) && json(create.value)).toBe(
+            json(sub ? { id: "a", part: { lines } } : { id: "a", lines }),
+          )
+          expect(rows.filter((row) => row.__edd_e__?.S === "SheetLine")).toHaveLength(1)
+          expect(Exit.isSuccess(get) && json(get.value)).toBe(
+            json((create as Exit.Success<unknown>).value),
+          )
         }),
       )
     }

@@ -1452,18 +1452,25 @@ const entityWithOwnId = (sub: boolean) => (): Shape => {
  * input, or its sub-aggregate `part`) made by `holder` from its own properties.
  */
 const oneEdgeHeld =
-  (holder: (own: Record<string, unknown>) => Record<string, unknown>, sub: boolean) =>
+  (
+    holder: (own: Record<string, unknown>) => Record<string, unknown>,
+    sub: boolean,
+    optional = false,
+  ) =>
   (): Shape => {
     const { Line, model } = keyedLine(Schema.String, "class")
     const Lines = lines(model, singleKey)
     const edge = () => Aggregate.one({ entityType: "AggLine", entity: Lines } as never)
+    const field = optional ? Schema.optional(Line as Schema.Codec<unknown>) : Line
     return {
       entities: { Lines },
       make: (base) => {
         if (!sub) {
-          return aggregate(Schema.Struct({ id: Schema.String, line: Line }), base, { line: edge() })
+          return aggregate(Schema.Struct({ id: Schema.String, line: field }), base, {
+            line: edge(),
+          })
         }
-        const Part = Schema.Struct({ line: Line })
+        const Part = Schema.Struct({ line: field })
         const Sub = (Aggregate.make as any)(Part, {
           root: { entityType: "Part" },
           edges: { line: edge() },
@@ -1544,6 +1551,125 @@ const reviewedEighth: Record<string, () => Shape> = Object.fromEntries(
   }),
 )
 
+/** A holder of its own properties `own`, its `lineId` answered by a proxy's `get` trap. */
+const byProxy = (own: Record<string, unknown>): Record<string, unknown> =>
+  new Proxy(own, {
+    get: (target, key, receiver) => (key === "lineId" ? "l" : Reflect.get(target, key, receiver)),
+  })
+
+/** A holder of its own properties `own`, its class with a method named `lineId`. */
+const withMethod = (own: Record<string, unknown>): Record<string, unknown> => {
+  class Command {
+    constructor(given: Record<string, unknown>) {
+      Object.assign(this, given)
+    }
+    lineId() {
+      return "l"
+    }
+  }
+  return new Command(own) as unknown as Record<string, unknown>
+}
+const wrapsOptionally = (Line: Schema.Top) =>
+  Schema.Struct({
+    line: Schema.optional(Line as Schema.Codec<unknown>),
+    qty: Schema.Number,
+  }) as Schema.Top
+
+/**
+ * A `many` edge whose element is the entity, keyed by `lineId` (its identifier), which its model (a
+ * struct or a class) declares `key`, given `element` whole, at the root or in a sub-aggregate `part`.
+ */
+const entityKeyedByItsId =
+  (kind: "struct" | "class", key: Schema.Top, element: Record<string, unknown>, sub: boolean) =>
+  (): Shape => {
+    const fields = { lineId: key as never, f: Schema.Number }
+    class LineClass extends Schema.Class<LineClass>("Line")(fields) {}
+    const Line = (kind === "struct" ? Schema.Struct(fields) : LineClass) as unknown as Schema.Top
+    const Lines = lines(
+      DynamoModel.configure(Line as never, { lineId: { identifier: true } } as never),
+      singleKey,
+    )
+    const edge = () =>
+      Aggregate.many({ entityType: "SheetLine", entity: Lines, sk: { composite: ["f"] } } as never)
+    const Part = Schema.Struct({ lines: Schema.Array(Line) })
+    return {
+      entities: { Lines },
+      make: (base) => {
+        if (!sub) {
+          return aggregate(Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) }), base, {
+            lines: edge(),
+          })
+        }
+        const Sub = (Aggregate.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: { lines: edge() },
+        })
+        return aggregate(Schema.Struct({ id: Schema.String, part: Part }), base, {
+          part: Sub.with({ discriminator: { side: 1 } }),
+        })
+      },
+      seed: [["Lines", { lineId: "l", f: 5 }]],
+      input: sub ? { id: "a", part: { lines: [element] } } : { id: "a", lines: [element] },
+    }
+  }
+
+/**
+ * Shapes a ninth review found, each at the root and in a sub-aggregate: an id a proxy's `get` trap
+ * answers for, which 1.39.0 read; a method of the id's name on the payload's class, which 1.39.0
+ * took for no id; and an element that is the entity, keyed by its id's own name (`lineId`), given
+ * whole: 1.39.0 fetched it and completed where its model declares the key optional, and refused it
+ * where the key is required.
+ */
+const reviewedNinth: Record<string, () => Shape> = Object.fromEntries(
+  [false, true].flatMap((sub) => {
+    const at = (label: string) => (sub ? `sub-aggregate, ${label}` : label)
+    return [
+      [at("one, its id answered by a proxy's get trap"), oneEdgeHeld(byProxy, sub)],
+      [at("one, optional, its id answered by a proxy's get trap"), oneEdgeHeld(byProxy, sub, true)],
+      [
+        at("many, element wraps the entity, its id answered by a proxy's get trap"),
+        classSheet(wraps, byProxy({ qty: 1 }), sub),
+      ],
+      [
+        at("one, optional, not given, the input's class with a method of its id's name"),
+        oneEdgeHeld(withMethod, sub, true),
+      ],
+      [
+        at(
+          "many, element wraps the entity optionally, the element's class with a method of its id's name",
+        ),
+        classSheet(wrapsOptionally, withMethod({ qty: 1 }), sub),
+      ],
+      ...(["struct", "class"] as const).flatMap(
+        (kind) =>
+          [
+            [
+              at(`many, element the entity keyed by its optional id (${kind}), given whole`),
+              entityKeyedByItsId(kind, Schema.optional(Schema.String), { lineId: "l", f: 9 }, sub),
+            ],
+            [
+              at(
+                `many, element the entity keyed by its optional id (${kind}), given whole, its id naming no item`,
+              ),
+              entityKeyedByItsId(
+                kind,
+                Schema.optional(Schema.String),
+                { lineId: "nope", f: 9 },
+                sub,
+              ),
+            ],
+            [
+              at(
+                `many, element the entity keyed by its required id (${kind}), with an identifier, given whole`,
+              ),
+              entityKeyedByItsId(kind, Schema.String, { lineId: "l", f: 9 }, sub),
+            ],
+          ] as const,
+      ),
+    ] as const
+  }),
+)
+
 export const SHAPES: Record<string, () => Shape> = {
   "many, element the entity's struct, given whole": () => {
     const Line = lineStruct()
@@ -1594,6 +1720,7 @@ export const SHAPES: Record<string, () => Shape> = {
   ...reviewedFifth,
   ...reviewedSixth,
   ...reviewedEighth,
+  ...reviewedNinth,
 }
 
 export const byKey = (rows: ReadonlyArray<Row>) =>
@@ -1705,3 +1832,13 @@ export const JUDGED_AS_139 = Object.keys(reviewedFifth).filter((label) => !UNION
 export const SIXTH = Object.keys(reviewedSixth).filter((label) => !(label in WRITES_AS))
 /** The eighth review's shapes, each sending the requests 1.39.0 sent, writing and reading what it did. */
 export const EIGHTH = Object.keys(reviewedEighth)
+/**
+ * An element that is the entity, keyed by its id's own name and requiring it, given whole: stored as
+ * given, nothing fetched. 1.39.0 took its key for an id, fetched it, and refused the element without
+ * its key.
+ */
+export const OWN_KEY_WHOLE = Object.keys(reviewedNinth).filter((label) =>
+  label.includes("keyed by its required id"),
+)
+/** The ninth review's other shapes, each sending the requests 1.39.0 sent, writing and reading what it did. */
+export const NINTH = Object.keys(reviewedNinth).filter((label) => !OWN_KEY_WHOLE.includes(label))

@@ -54,7 +54,9 @@ import {
   keyedBy,
   lineClass,
   lines,
+  NINTH,
   NOW_FETCHED,
+  OWN_KEY_WHOLE,
   outcomeOf,
   SHAPES,
   type Shape,
@@ -588,7 +590,7 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
     }),
   )
 
-  for (const label of [...SIXTH, ...EIGHTH]) {
+  for (const label of [...SIXTH, ...EIGHTH, ...NINTH]) {
     it.effect(`${label}: sends, writes and reads what 1.39.0 did`, () =>
       Effect.gen(function* () {
         const { create, requests, rows, get } = yield* run(SHAPES[label]!())
@@ -599,6 +601,29 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
         expect(byKey(rows)).toEqual(byKey(was.rows))
         expect(outcomeOf(get)).toBe(was.get)
       }),
+    )
+  }
+
+  for (const label of OWN_KEY_WHOLE) {
+    it.effect(
+      `${label}: stored as given, nothing fetched (1.39.0 fetched it, then refused it)`,
+      () =>
+        Effect.gen(function* () {
+          const { create, requests, get } = yield* run(SHAPES[label]!())
+          const lines = [{ lineId: "l", f: 9 }]
+          const sub = label.startsWith("sub-aggregate")
+          expect(Exit.isSuccess(create) && json(create.value)).toBe(
+            json(sub ? { id: "a", part: { lines } } : { id: "a", lines }),
+          )
+          expect(requests).toEqual(
+            sub ? ["TransactWriteItems", "TransactWriteItems"] : ["TransactWriteItems"],
+          )
+          expect(Exit.isSuccess(get) && json(get.value)).toBe(
+            json((create as Exit.Success<unknown>).value),
+          )
+          expect(fixture.shapes[label]!.requests).toEqual(["batchGetItem"])
+          expect(fixture.shapes[label]!.create).toBe("failed: ValidationError")
+        }),
     )
   }
 

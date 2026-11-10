@@ -387,6 +387,27 @@ describe("an element that is the entity", () => {
     expect(elementHoldsRef(Keyed, KeyedLines, { id: "x" })).toBe(false)
   })
 
+  it("its own key is fetched only where 1.39.0 fetched it and completed: an optional key", () => {
+    // Keyed by an optional `lineId`, its identifier: 1.39.0 fetched it and took it out of the element.
+    const Optional = Schema.Struct({ lineId: Schema.optional(Schema.String), f: Schema.Number })
+    const keyed = (model: unknown) =>
+      Entity.make({
+        model,
+        entityType: "Line",
+        primaryKey: {
+          pk: { field: "pk", composite: ["lineId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as never) as unknown as RefEntity
+    const OptionalLines = keyed(DynamoModel.configure(Optional, { lineId: { identifier: true } }))
+    expect(isEntityElement(Optional, OptionalLines)).toBe(true)
+    expect(elementHoldsRef(Optional, OptionalLines, { lineId: "l", f: 9 })).toBe(true)
+    // Without an identifier 1.39.0 fetched under `id` and died composing the key: left unfetched.
+    expect(elementHoldsRef(Optional, keyed(Optional), { lineId: "l", f: 9 })).toBe(false)
+    // A required key: 1.39.0 refused the element without it. Left unfetched, stored as given.
+    expect(elementHoldsRef(Line, Lines, { lineId: "l", f: 9 })).toBe(false)
+  })
+
   it("its input: an id of the key composite's type, or the entity whole", () => {
     const input = deriveElementInputSchema(Schema.Array(Row), Rows)!
     const decode = Schema.decodeUnknownExit(input as Schema.Codec<unknown>)
@@ -459,7 +480,31 @@ describe("a `one` edge's id follows the rule a `many` element's does (`holdsRefI
     // So is the entity whole: beside it, an id of another type than a string isn't fetched.
     const inherits = Object.assign(Object.create({ numbered: whole }), { numberedId: 5 })
     expect(holdsRefId(fields, "numbered", NumberedLines, inherits)).toBe(false)
-    // Only a member every object inherits from `Object.prototype` isn't given.
+    // So is one a proxy's `get` trap answers for, which the payload doesn't hold at all.
+    const proxy = new Proxy(
+      {},
+      {
+        get: (target, key, receiver) =>
+          key === "numberedId" ? 5 : Reflect.get(target, key, receiver),
+      },
+    )
+    expect(holdsRefId(fields, "numbered", NumberedLines, proxy)).toBe(true)
+    // A method of the payload's class named like the id is no id, as 1.39.0 took it for none.
+    class WithMethod {
+      numberedId() {
+        return 5
+      }
+    }
+    expect(
+      holdsRefId(
+        fields,
+        "numbered",
+        NumberedLines,
+        new WithMethod() as unknown as Record<string, 5>,
+      ),
+    ).toBe(false)
+    expect(given(new WithMethod(), "numberedId")).toBeUndefined()
+    // Neither is a member every object inherits: each is a function.
     expect(given({ id: "a" }, "constructor")).toBeUndefined()
     expect(given({ id: "a" }, "toString")).toBeUndefined()
     expect(given(Object.create({ toString: "x" }), "toString")).toBe("x")

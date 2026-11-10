@@ -9891,6 +9891,1547 @@
     }
    ],
    "get": "ok {\"id\":\"a\",\"part\":{\"line\":{\"lineId\":\"x\",\"f\":2}}}"
+  },
+  "one, its id answered by a proxy's get trap": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}"
+  },
+  "one, optional, its id answered by a proxy's get trap": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"line\":{\"lineId\":\"l\",\"f\":5}}"
+  },
+  "many, element wraps the entity, its id answered by a proxy's get trap": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000001"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}"
+  },
+  "one, optional, not given, the input's class with a method of its id's name": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\"}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\"}"
+  },
+  "many, element wraps the entity optionally, the element's class with a method of its id's name": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"qty\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000001"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"qty\":1}]}"
+  },
+  "many, element the entity keyed by its optional id (struct), given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"f\":9}]}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000009"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "9"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"f\":9}]}"
+  },
+  "many, element the entity keyed by its optional id (struct), given whole, its id naming no item": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: RefNotFound",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element the entity keyed by its required id (struct), with an identifier, given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element the entity keyed by its optional id (class), given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"lines\":[{\"f\":9}]}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#0000000000000009"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "9"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"lines\":[{\"f\":9}]}"
+  },
+  "many, element the entity keyed by its optional id (class), given whole, its id naming no item": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: RefNotFound",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "many, element the entity keyed by its required id (class), with an identifier, given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "sub-aggregate, one, its id answered by a proxy's get trap": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"line\":{\"lineId\":\"l\",\"f\":5}}}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline#side#0000000000000001"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"line\":{\"lineId\":\"l\",\"f\":5}}}"
+  },
+  "sub-aggregate, one, optional, its id answered by a proxy's get trap": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"line\":{\"lineId\":\"l\",\"f\":5}}}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#aggline#side#0000000000000001"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "AggLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"line\":{\"lineId\":\"l\",\"f\":5}}}"
+  },
+  "sub-aggregate, many, element wraps the entity, its id answered by a proxy's get trap": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#side#0000000000000001#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "line": {
+      "M": {
+       "lineId": {
+        "S": "l"
+       },
+       "f": {
+        "N": "5"
+       }
+      }
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"line\":{\"lineId\":\"l\",\"f\":5},\"qty\":1}]}}"
+  },
+  "sub-aggregate, one, optional, not given, the input's class with a method of its id's name": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{}}"
+  },
+  "sub-aggregate, many, element wraps the entity optionally, the element's class with a method of its id's name": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"qty\":1}]}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#side#0000000000000001#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "qty": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"qty\":1}]}}"
+  },
+  "sub-aggregate, many, element the entity keyed by its optional id (struct), given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"f\":9}]}}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#side#0000000000000001#0000000000000009"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "9"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"f\":9}]}}"
+  },
+  "sub-aggregate, many, element the entity keyed by its optional id (struct), given whole, its id naming no item": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: RefNotFound",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "sub-aggregate, many, element the entity keyed by its required id (struct), with an identifier, given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "sub-aggregate, many, element the entity keyed by its optional id (class), given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"f\":9}]}}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#part#side#0000000000000001"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Part"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#root"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "__edd_e__": {
+      "S": "Root"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#sheetline#side#0000000000000001#0000000000000009"
+     },
+     "side": {
+      "N": "1"
+     },
+     "pk": {
+      "S": "$hydrate#v1#agg#a"
+     },
+     "f": {
+      "N": "9"
+     },
+     "__edd_e__": {
+      "S": "SheetLine"
+     }
+    },
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "ok {\"id\":\"a\",\"part\":{\"lines\":[{\"f\":9}]}}"
+  },
+  "sub-aggregate, many, element the entity keyed by its optional id (class), given whole, its id naming no item": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: RefNotFound",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
+  },
+  "sub-aggregate, many, element the entity keyed by its required id (class), with an identifier, given whole": {
+   "make": "ok",
+   "seeded": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "create": "failed: ValidationError",
+   "requests": [
+    "batchGetItem"
+   ],
+   "rows": [
+    {
+     "sk": {
+      "S": "$hydrate#v1#line"
+     },
+     "lineId": {
+      "S": "l"
+     },
+     "pk": {
+      "S": "$hydrate#v1#line#lineid_l"
+     },
+     "f": {
+      "N": "5"
+     },
+     "__edd_e__": {
+      "S": "Line"
+     }
+    }
+   ],
+   "get": "failed: AggregateAssemblyError"
   }
  }
 }

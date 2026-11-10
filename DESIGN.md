@@ -4046,8 +4046,12 @@ guess at what a field's schema can hold:
   entity whole. Given whole, it holds no ref in its own key: where the entity
   is keyed by `${field}Id` (`lineId` of a `Line`), that is the entity's own
   value (`elementHoldsRef`). Up to 1.39.0 it was taken for a ref because its
-  name was `${field}Id`, and `create` died composing the key. A string in any
-  other field of that name is fetched, as on 1.39.0.
+  name was `${field}Id`, and `create` died composing the key, or refused the
+  element without its key. It is left unfetched exactly where 1.39.0 failed.
+  Where 1.39.0 fetched it and completed, it is fetched: the key is the
+  model's identifier, the entity's one key composite, and optional in the
+  model, so 1.39.0 took it out of the element (`fetchedByOwnKey139`). A string
+  in any other field of that name is fetched, as on 1.39.0.
 - **The element names the field holding the entity** (`entityFieldOf`): a plain
   `Schema.Struct` or `Schema.Class` (no union, transformation, `suspend` or
   declaration at the element) whose field of the entity's name is the entity's
@@ -4091,12 +4095,14 @@ alike (`holdsRefId`):
    1.39.0 fetched none of these.
 
 The id, and the entity given whole, are read off the caller's payload as
-1.39.0 read them (`given`): the payload's own property, or one its class gives
-it (a getter, a property of a prototype). Only a member every object inherits
-from `Object.prototype` is not given, so an edge named `constructor` that the
-payload doesn't give is not given. A definition's fields, which the library
-reads off a schema, are looked up among what the schema declares itself
-(`Object.hasOwn`).
+1.39.0 read them (`given`, `payload[name]`): the payload's own property, one
+its class gives it (a getter, a property of a prototype), or one a proxy
+answers for. A function is not given: 1.39.0 took a string for an id, a list
+for a `many` edge and an object for a sub-aggregate, so a method of the
+payload's class named like an id is no id, and neither is a member every
+object inherits (`constructor`, `toString`). A definition's fields, which the
+library reads off a schema, are looked up among what the schema declares
+itself (`Object.hasOwn`).
 
 A managed timestamp is optional in every element's input.
 
