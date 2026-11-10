@@ -1,0 +1,200 @@
+{
+  "generatedFrom": "effect-dynamodb@1.39.0",
+  "cases": {
+    "created": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dk#v1#dates"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "Dates"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dk#v1#datesiso#1970-01-01t00:00:00.000z"
+          },
+          "lineId": {
+            "S": "l1"
+          },
+          "at": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "DatesIso"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dk#v1#datesmillis#0000000000000005"
+          },
+          "lineId": {
+            "S": "m1"
+          },
+          "at": {
+            "N": "5"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "DatesMillis"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dk#v1#datesnums#0000000000000005"
+          },
+          "lineId": {
+            "S": "n1"
+          },
+          "at": {
+            "N": "5"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "DatesNums"
+          }
+        }
+      ],
+      "read": {
+        "id": "a",
+        "iso": [
+          [
+            "l1",
+            "1970-01-01T00:00:00.000Z",
+            null
+          ]
+        ],
+        "millis": [
+          [
+            "m1",
+            5,
+            null
+          ]
+        ],
+        "nums": [
+          [
+            "n1",
+            5,
+            null
+          ]
+        ]
+      }
+    },
+    "noted": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dk#v1#dates"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "Dates"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dk#v1#datesiso#1970-01-01t00:00:00.000z"
+          },
+          "lineId": {
+            "S": "l1"
+          },
+          "note": {
+            "S": "n"
+          },
+          "at": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "DatesIso"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dk#v1#datesmillis#0000000000000005"
+          },
+          "lineId": {
+            "S": "m1"
+          },
+          "note": {
+            "S": "n"
+          },
+          "at": {
+            "N": "5"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "DatesMillis"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dk#v1#datesnums#0000000000000005"
+          },
+          "lineId": {
+            "S": "n1"
+          },
+          "note": {
+            "S": "n"
+          },
+          "at": {
+            "N": "5"
+          },
+          "pk": {
+            "S": "$dk#v1#dates#a"
+          },
+          "__edd_e__": {
+            "S": "DatesNums"
+          }
+        }
+      ],
+      "read": {
+        "id": "a",
+        "iso": [
+          [
+            "l1",
+            "1970-01-01T00:00:00.000Z",
+            "n"
+          ]
+        ],
+        "millis": [
+          [
+            "m1",
+            5,
+            "n"
+          ]
+        ],
+        "nums": [
+          [
+            "n1",
+            5,
+            "n"
+          ]
+        ]
+      }
+    }
+  }
+}

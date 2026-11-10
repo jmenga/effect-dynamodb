@@ -12,9 +12,10 @@
  * `[EDD-9108]`: one entity using one physical index twice. An item has one key in an index,
  * so the second accessor can't have one of its own.
  *
- * `[EDD-9109]` and `[EDD-9112]`: a value stored in a table key attribute. The library never
+ * `[EDD-9109]` and `[EDD-9112]`: a value stored in a key attribute. The library never
  * sets any part of the primary key: a `Put` carrying it replaces the item's key with the
- * value, and DynamoDB refuses an update that names it.
+ * value, and DynamoDB refuses an update that names it. In a secondary index's key attribute,
+ * the value and the key the library composes there replace each other.
  */
 
 import * as DynamoSchema from "../DynamoSchema.js"
@@ -25,6 +26,7 @@ import {
   isZOrderHalf,
   unshardedView,
 } from "../KeyComposer.js"
+import { sparseReader } from "./SparseKey.js"
 
 interface KeyHalf {
   readonly owner: string
@@ -201,24 +203,184 @@ export const refuseRepeatedIndex = (
   }
 }
 
+/** A key attribute an entity writes, and what it holds ({@link writtenKeyAttributes}). */
+export interface WrittenKeyAttribute {
+  readonly attribute: string
+  /** Which key: the table's, or an index's (`owner`, its `half`). */
+  readonly owner: string
+  readonly half: "pk" | "sk" | "vector"
+  /** `"the table's primary key"`, `index "byTenant"'s sort key`, `vector index "byText"`. */
+  readonly of: string
+}
+
 /**
- * `[EDD-9109]`: `Entity.make` refuses an attribute it would store in a table key attribute: a
- * model field, under a `field:` rename or by its own name, or a system timestamp or version
- * field.
+ * Every key attribute an entity writes: the table's partition and sort key, each secondary
+ * index's (a local one's sort key, a Z-order address, a `refs` cascade index's), and each vector
+ * index's partition and embedding attributes. An attribute two of them share is listed once, as
+ * the table's if it is one of the table's.
  */
-export const refuseStoredInTableKey = (
+export const writtenKeyAttributes = (
+  indexes: Readonly<Record<string, IndexDefinition>>,
+  vectorIndexes: Readonly<
+    Record<string, { readonly vectorField: string; readonly partitionField: string }>
+  > = {},
+): ReadonlyArray<WrittenKeyAttribute> => {
+  const out = new Map<string, WrittenKeyAttribute>()
+  const add = (key: WrittenKeyAttribute): void => {
+    if (!out.has(key.attribute)) out.set(key.attribute, key)
+  }
+  const ordered = Object.entries(indexes).sort(
+    ([a], [b]) => Number(b === "primary") - Number(a === "primary"),
+  )
+  for (const [owner, index] of ordered) {
+    for (const half of ["pk", "sk"] as const) {
+      add({
+        attribute: index[half].field,
+        owner,
+        half,
+        of:
+          owner === "primary"
+            ? "the table's primary key"
+            : describe({ owner, half, index, field: index[half].field }),
+      })
+    }
+  }
+  for (const [owner, vector] of Object.entries(vectorIndexes)) {
+    for (const attribute of [vector.partitionField, vector.vectorField]) {
+      add({ attribute, owner, half: "vector", of: `vector index "${owner}"` })
+    }
+  }
+  return [...out.values()]
+}
+
+/**
+ * `[EDD-9109]`: `Entity.make` refuses an attribute it would store in a key attribute it writes,
+ * the table's or a secondary index's ({@link writtenKeyAttributes}): a model field, under a
+ * `field:` rename or by its own name, or a system timestamp or version field. A model field named
+ * as a key attribute is refused under any rename too: a write composes the keys onto the item
+ * before renaming its fields, so the rename moved the key into the field's attribute, and the row
+ * lost its key. A vector index's attributes, which the library names, are `EDD-9140`'s.
+ */
+export const refuseStoredInKeyAttribute = (
   entityType: string,
-  primary: IndexDefinition,
+  keys: ReadonlyArray<WrittenKeyAttribute>,
   stored: ReadonlyArray<readonly [name: string, attribute: string]>,
 ): void => {
   for (const [name, attribute] of stored) {
-    if (attribute !== primary.pk.field && attribute !== primary.sk.field) continue
+    const at = (named: string) =>
+      keys.find((key) => key.half !== "vector" && key.attribute === named)
+    const key = at(attribute)
+    const renamed = key === undefined ? at(name) : undefined
+    if (key === undefined && renamed === undefined) continue
+    const why =
+      renamed !== undefined
+        ? `is named "${name}", the attribute that holds ` +
+          `${renamed.owner === "primary" ? "part of the table's primary key" : renamed.of}, and ` +
+          `is stored in "${attribute}". A write composes the keys before renaming the fields, ` +
+          `so the rename would move the key into "${attribute}" and leave the row without it.`
+        : key!.owner === "primary"
+          ? `would be stored in "${attribute}", an attribute of the table's primary key. The ` +
+            "library never sets any part of the primary key: a write would replace the item's " +
+            "key with the value."
+          : `would be stored in "${attribute}", the attribute that holds ${key!.of}. The library ` +
+            "writes the key it composes there, so the value and the key would replace each " +
+            "other, and the item would be out of the index or hold another value."
     throw new Error(
-      `[EDD-9109] Entity "${entityType}": "${name}" would be stored in "${attribute}", an ` +
-        "attribute of the table's primary key. The library never sets any part of the primary " +
-        `key: a write would replace the item's key with the value. Store "${name}" under ` +
-        "another attribute with `DynamoModel.configure(model, { field: { field: ... } })`, or " +
-        "name the key attributes something else.",
+      `[EDD-9109] Entity "${entityType}": "${name}" ${why} ` +
+        (renamed !== undefined
+          ? `Name the field something else, or name the key attributes something else.`
+          : `Store "${name}" under another attribute with ` +
+            "`DynamoModel.configure(model, { field: { field: ... } })`, or name the key " +
+            "attributes something else."),
+    )
+  }
+}
+
+/** An attribute an entity writes on its rows, and what it holds ({@link refuseReadAsSparseEntry}). */
+export interface WrittenAttribute {
+  readonly attribute: string
+  /** In words, after "a row's reader takes <attribute>, ": `the attribute the field "n" is stored in`. */
+  readonly what: string
+  /** A key attribute, which a put of the entry it's read as would replace. */
+  readonly key?: boolean
+}
+
+/** A key attribute as {@link refuseReadAsSparseEntry} names it. */
+export const writtenKey = (key: WrittenKeyAttribute): WrittenAttribute => ({
+  attribute: key.attribute,
+  what:
+    key.owner === "primary"
+      ? "an attribute of the table's primary key"
+      : `the attribute that holds ${key.of}`,
+  key: true,
+})
+
+/**
+ * `[EDD-9140]`: an entity may not store, under any name other than as that map's entry, an
+ * attribute the reader of a row takes as an entry of one of its sparse maps (`sparseReader`:
+ * `<prefix>#` and a non-empty key, so never `<prefix>#` itself). The row's reader would move the
+ * attribute into the map: the map reads a phantom entry, what the attribute held is gone from
+ * where it's read, and `clearMap` removes it. `written` is every attribute the entity writes
+ * whose name a definition or a table's configuration supplies; the library's own fixed names hold
+ * no `#`, so none of them can be an entry.
+ */
+export const refuseReadAsSparseEntry = (
+  entityType: string,
+  written: ReadonlyArray<WrittenAttribute>,
+  sparseFields: Readonly<Record<string, { readonly prefix: string }>>,
+): void => {
+  const { entryOf } = sparseReader(sparseFields)
+  for (const { attribute, what, key } of written) {
+    const entry = entryOf(attribute)
+    if (entry === undefined) continue
+    throw new Error(
+      `[EDD-9140] Entity "${entityType}": sparse map "${entry.field}" stores each entry as ` +
+        `"${entry.prefix}#<key>", and a row's reader takes "${attribute}", ${what}, as its ` +
+        `entry "${entry.key}". ` +
+        (key === true
+          ? "Every row would carry a phantom entry, and a put of that entry would replace the " +
+            "key there. Give the map another prefix, or name the key attributes something else."
+          : "Every row holding it would read it as an entry of the map, and not where it " +
+            `belongs. Give the map another prefix, or store it under another attribute.`),
+    )
+  }
+}
+
+/**
+ * `[EDD-9140]`: `Entity.make` refuses an attribute it would store under one the library writes
+ * itself: a model field, under a `field:` rename or by its own name, or a system timestamp or
+ * version field, stored in `__edd_e__`, where every row holds its entity type, or in a vector
+ * index's attribute. The `ownsRows` bind check (`EDD-9130`) takes a model attribute to be any
+ * name but these. An attribute the reader takes as a sparse map's entry is
+ * {@link refuseReadAsSparseEntry}'s.
+ */
+export const refuseStoredUnderLibraryAttribute = (
+  entityType: string,
+  keys: ReadonlyArray<WrittenKeyAttribute>,
+  stored: ReadonlyArray<readonly [name: string, attribute: string]>,
+): void => {
+  for (const [name, attribute] of stored) {
+    // A field named as one of these is refused under any rename too, as `EDD-9109` refuses one
+    // named as a key attribute: the library writes them before renaming the fields.
+    const library = [attribute, name].find(
+      (named) =>
+        named === "__edd_e__" ||
+        keys.some((key) => key.half === "vector" && key.attribute === named),
+    )
+    if (library === undefined) continue
+    const vector = keys.find((key) => key.half === "vector" && key.attribute === library)
+    const holds =
+      vector === undefined
+        ? "the attribute that holds each row's entity type, which every read filters on"
+        : `an attribute of ${vector.of}, which the library writes`
+    throw new Error(
+      library === attribute
+        ? `[EDD-9140] Entity "${entityType}": "${name}" would be stored in "${attribute}", ` +
+            `${holds}. Store "${name}" under another attribute with \`DynamoModel.configure(` +
+            `model, { ${name}: { field: ... } })\`, or name it something else.`
+        : `[EDD-9140] Entity "${entityType}": "${name}" is named "${name}", ${holds}, and is ` +
+            `stored in "${attribute}". The library writes "${name}" before renaming the fields, ` +
+            `so the rename would move its value into "${attribute}". Name the field something else.`,
     )
   }
 }

@@ -1,0 +1,5510 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "scenarios": {
+  "content fallback same": {
+   "created": {
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 500,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "created b get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794158396350-1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$fallback#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794158396350-1",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$fallback#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$fallback#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794158396350-1",
+          "Key": {
+           "pk": {
+            "S": "$fallback#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$fallback#v1#line#0000000000000500"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "remove a get b": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "rekey a dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p%20q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ]
+   },
+   "rekey a get b": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same"
+      }
+     ]
+    }
+   }
+  },
+  "content fallback different": {
+   "created": {
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "different"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 500,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "created b get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "different"
+      }
+     ]
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794158396488-6",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$fallback#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794158396488-6",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$fallback#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$fallback#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794158396488-6",
+          "Key": {
+           "pk": {
+            "S": "$fallback#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$fallback#v1#line#0000000000000500"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "different"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "remove a get b": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "different"
+      }
+     ]
+    }
+   },
+   "rekey a dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "different"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "different"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "f": {
+       "N": "5000"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p%20q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$fallback#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$fallback#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ]
+   },
+   "rekey a get b": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "different"
+      }
+     ]
+    }
+   }
+  },
+  "concurrent replace": {
+   "created": {
+    "rows": [
+     {
+      "sk": {
+       "S": "$concurrent#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "f": {
+       "N": "5"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p",
+     "lines": [
+      {
+       "f": 50,
+       "note": "a"
+      }
+     ]
+    }
+   },
+   "b takes the key": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794158396611-11",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$concurrent#v1#shared#p"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794158396611-11",
+          "Item": {
+           "id": {
+            "S": "p"
+           },
+           "__edd_e__": {
+            "S": "Rootb"
+           },
+           "pk": {
+            "S": "$concurrent#v1#shared#p"
+           },
+           "sk": {
+            "S": "$concurrent#v1#rootb"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "foreign-1794158396611-11",
+          "Item": {
+           "f": {
+            "N": "50"
+           },
+           "note": {
+            "S": "b"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$concurrent#v1#shared#p"
+           },
+           "sk": {
+            "S": "$concurrent#v1#line#0000000000000050"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$concurrent#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p",
+      "lines": [
+       {
+        "f": 50,
+        "note": "b"
+       }
+      ]
+     }
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794158396631-12",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$concurrent#v1#shared#p"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794158396631-12",
+          "Item": {
+           "id": {
+            "S": "p"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$concurrent#v1#shared#p"
+           },
+           "sk": {
+            "S": "$concurrent#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794158396631-12",
+          "Key": {
+           "pk": {
+            "S": "$concurrent#v1#shared#p"
+           },
+           "sk": {
+            "S": "$concurrent#v1#line#0000000000000005"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$concurrent#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "f": {
+       "N": "5"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p",
+      "lines": []
+     }
+    }
+   },
+   "race remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794158396650-13",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$concurrent#v1#shared#p"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794158396650-13",
+          "Item": {
+           "id": {
+            "S": "p"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$concurrent#v1#shared#p"
+           },
+           "sk": {
+            "S": "$concurrent#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794158396650-13",
+          "Key": {
+           "pk": {
+            "S": "$concurrent#v1#shared#p"
+           },
+           "sk": {
+            "S": "$concurrent#v1#line#0000000000000005"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$concurrent#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$concurrent#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$concurrent#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p",
+      "lines": []
+     }
+    }
+   }
+  },
+  "three owners": {
+   "created": {
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%2520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ]
+   },
+   "rekey abc dry run": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%2520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ]
+   },
+   "rekey abc": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%252520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ],
+    "again": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Roota",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "third": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "fourth": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 2,
+      "moved": 0,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootb",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       },
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    }
+   },
+   "rekey acb dry run": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%2520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ]
+   },
+   "rekey acb": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%252520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ],
+    "again": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Roota",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "third": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "fourth": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 2,
+      "moved": 0,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       },
+       {
+        "member": "Rootb",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    }
+   },
+   "rekey bac dry run": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%2520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ]
+   },
+   "rekey bac": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%252520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ],
+    "again": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Roota",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "third": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "fourth": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 2,
+      "moved": 0,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootb",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       },
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    }
+   },
+   "rekey bca dry run": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%2520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ]
+   },
+   "rekey bca": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "GetItem",
+     "TransactWriteItems",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%252520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ],
+    "again": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Roota",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "third": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "fourth": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 2,
+      "moved": 0,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       },
+       {
+        "member": "Rootb",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    }
+   },
+   "rekey cab dry run": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%2520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ]
+   },
+   "rekey cab": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "GetItem",
+     "TransactWriteItems",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%252520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ],
+    "again": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Roota",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "third": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "fourth": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 2,
+      "moved": 0,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       },
+       {
+        "member": "Rootb",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    }
+   },
+   "rekey cba dry run": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%2520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ]
+   },
+   "rekey cba": {
+    "report": {
+     "scanned": 6,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": [
+      {
+       "member": "Roota",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      },
+      {
+       "member": "Rootb",
+       "kind": "aggregate",
+       "reason": "bothKeys",
+       "key": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%20y"
+       },
+       "target": {
+        "pk": "$chain#v1#shared#p",
+        "sk": "$chain#v1#line#x%2520y"
+       },
+       "message": "The row is also stored under its current key: the aggregate is left as it is."
+      }
+     ]
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "Query",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "GetItem",
+     "GetItem"
+    ],
+    "rows": [
+     {
+      "owner": {
+       "S": "a"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x y"
+      },
+      "note": {
+       "S": "a"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "b"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%20y"
+      },
+      "note": {
+       "S": "b"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%20y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "owner": {
+       "S": "c"
+      },
+      "sk": {
+       "S": "$chain#v1#line#x%252520y"
+      },
+      "note": {
+       "S": "c"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "lid": {
+       "S": "x%2520y"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#roota"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootb"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$chain#v1#rootc"
+      },
+      "id": {
+       "S": "p"
+      },
+      "pk": {
+       "S": "$chain#v1#shared#p"
+      },
+      "__edd_e__": {
+       "S": "Rootc"
+      }
+     }
+    ],
+    "again": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Roota",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "third": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 3,
+      "moved": 1,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    },
+    "fourth": {
+     "report": {
+      "scanned": 6,
+      "unchanged": 2,
+      "moved": 0,
+      "indexKeysRewritten": 0,
+      "conflicts": [
+       {
+        "member": "Rootc",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%252520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       },
+       {
+        "member": "Rootb",
+        "kind": "aggregate",
+        "reason": "bothKeys",
+        "key": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%20y"
+        },
+        "target": {
+         "pk": "$chain#v1#shared#p",
+         "sk": "$chain#v1#line#x%2520y"
+        },
+        "message": "The row is also stored under its current key: the aggregate is left as it is."
+       }
+      ]
+     },
+     "rows": [
+      {
+       "owner": {
+        "S": "a"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%20y"
+       },
+       "note": {
+        "S": "a"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "b"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%2520y"
+       },
+       "note": {
+        "S": "b"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%20y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "owner": {
+        "S": "c"
+       },
+       "sk": {
+        "S": "$chain#v1#line#x%252520y"
+       },
+       "note": {
+        "S": "c"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "lid": {
+        "S": "x%2520y"
+       },
+       "__edd_e__": {
+        "S": "Line"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#roota"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Roota"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootb"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootb"
+       }
+      },
+      {
+       "sk": {
+        "S": "$chain#v1#rootc"
+       },
+       "id": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$chain#v1#shared#p"
+       },
+       "__edd_e__": {
+        "S": "Rootc"
+       }
+      }
+     ]
+    }
+   }
+  }
+ }
+}

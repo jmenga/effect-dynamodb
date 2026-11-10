@@ -485,6 +485,59 @@ Container `.check()` refinements are enforced on `create` and `update`, as they 
 A `many` edge with a custom `decompose` that **renames** element fields (`{ noteId, at }` → `{ nid, when }`) is the one exception. Encoders are matched to the element's own field names, so a renamed field is stored as its domain value, and a `DateTime` there is still written as a map. It reads back as a real `DateTime`. To store it in wire form, keep the element's field names in `decompose`, or encode the value yourself before returning it.
 :::
 
+#### What a custom `decompose` is handed
+
+A `many` edge's custom `decompose` is handed a write's value as 1.39.0 handed it, so its rows store, key and read exactly as they did on 1.39.0. The value you gave is read stored form first, once. Where a transformation has one type on both sides, that decodes a value once more: on a field that multiplies by 10 on decode, `create(50)` hands `decompose` 500. Anything else is handed as it is, such as a `Schema.NumberFromString` or a field with no transformation. `update` hands it the state it read as it was read, and the new state as a write's value.
+
+What `decompose` returns is stored as on 1.39.0. Its fields are encoded as every other edge's are, and a sort key composite is read from what it returns. So a `decompose` that encodes such a field itself (`f / 10`) keeps working:
+
+| `decompose` returns | Stored | Sort key text | `get` | After an `update` |
+|---|---|---|---|---|
+| `f / 10`, the field encoded | 5 | 50 | 50 | the same row, unchanged |
+| `f`, the field unchanged | 50 | 500 | 500 | 500 stored under 5000, reads 5000 |
+
+One that hands such a field back unchanged has it decoded once more on every write, as on 1.39.0. Encode the field in `decompose`, as `f / 10` does. Because `update` hands it the state it read as it was read, each `update` rewrites the edge's rows, even one that changes nothing, as on 1.39.0.
+
+That's how 1.x hands `decompose` a value. The next major hands it the edge's decoded value, and a `decompose` that encodes a field itself drops that step then.
+
+On an edge held as a `Schema.Record` without an `entity`, a date field that `decompose` returns in its stored form, such as the ISO text of a `Schema.DateTimeUtcFromString` or the epoch milliseconds of a number decoded to a `Date`, is stored as it is and keyed by it, as on 1.39.0. There a value in neither form is refused with a `ValidationError` (`EDD-9127`), and nothing is written. On an array edge, or one with an `entity`, `decompose` returns a date field's domain value: a value in another form fails the write with a defect, as on 1.39.0.
+
+On 1.39.0 a `many` edge held as a `Schema.Record` stored what `decompose` returned without encoding it. Its fields are now encoded as an array edge's are. A `Schema.NumberFromString` there is stored as its text where 1.39.0 stored the number, under the same key, and reads the same value. A field that multiplies by 10 on decode, returned as `f / 10`, now reads back the value you gave instead of ten times it, and a row 1.39.0 wrote reads as it did.
+
+#### What a custom `assemble` is handed
+
+A `many` edge's `assemble` is handed the rows read, unmarshalled, with packed fields unpacked, under their stored attribute names. Removed from each row: `__edd_e__`, the attributes named `pk` and `sk`, every attribute whose name begins with `gsi` or `lsi`, and the timestamps the library stamps that the edge's model doesn't declare. Everything else stays, including a collection sort-key mirror under another name, and discriminator and context attributes. Nothing is decoded: on a field that multiplies by 10 on decode, it's handed 5 where `get` returns 50. What it returns is decoded with the rest of the aggregate.
+
+#### Which rows are the aggregate's: `ownsRows`
+
+An aggregate's rows are the ones its value keys. `update` deletes the keys the old value decomposes to and the new value doesn't, and `rekey` moves the rows the value decomposes to. A custom `decompose`'s row moves as stored, with only its keys replaced: decomposing the value read back needn't give what the row holds (one renaming a transformed field would store it decoded once more). Neither touches any other row in the partition, as on 1.39.0, because another aggregate or an entity can write rows of the same entity type there, and nothing in a row says which one wrote it. (`delete` has its own rule.)
+
+Some rows the value doesn't key are the aggregate's own stale rows. A `decompose` that encodes its keyed field (`f / 10`) leaves them, because the value read back keys its rows elsewhere. Removing an element leaves its row, and `get` still returns it. Changing the keyed value leaves the old row beside the new one. `rekey` leaves the edge's rows in the old partition. A row your `assemble` drops is another such row.
+
+When nothing else writes rows of the aggregate's entity types into its partition, declare it with `ownsRows: true` on `Aggregate.make`. The aggregate then takes every row of its entity types in its partition for its own.
+
+**`update`** sends the same transactions it sends without the option. After the last one commits, it deletes the rows it read of each edge that changed, where the new value doesn't write their keys.
+- An edge changed when the update writes its transaction and the edge's items differ, compared as the update always compares them: entity types and stored attributes in order, not keys. So an update is a no-op when the stored attributes don't change, even if a key would: a codec that stores every number as 0 makes 50 → 60 a no-op.
+- After an update that changes an edge, that edge's rows are exactly what it decomposes to for the new value, except a row another edge of the same entity type could hold, which is left. So a custom `decompose` that leaves out an element you keep loses that element's row. An edge the update doesn't change keeps its rows.
+- These `Delete`s go in requests of their own, up to 100 at a time. Each is sent on condition that the row is gone or still of the type read. A row another write removed in between is fine, and one replaced by a row of another type is left.
+- If a request is cancelled, the `Delete`s whose condition failed are dropped and the rest are sent once more. Your mutation isn't run again, and nothing is read again.
+- If that fails too, the update fails as it does when a later sub-aggregate's transaction fails. Its transactions have committed, and the rows it didn't delete stay until the next update that changes their edge.
+- An update whose new value decomposes to what the old one did writes nothing.
+
+**`rekey`** moves exactly what it moves without the option, and sends the same requests. Where any other row of its types would go can't be told from what's stored: a codec can store a value its key doesn't show, and a custom `assemble` or `decompose` can hand a row's values to another element. So no such row is moved.
+- When such a row's own partition key changes, `rekey` reports the aggregate as a `failed` conflict naming the row, and moves none of it, since moving the rest would strand that row. Otherwise it leaves the row and counts it under `skipped.unrecognizedKey`.
+- To repair a failed aggregate, run an update that changes the row's edge: it deletes the row. A row another edge of the same entity type could hold isn't deleted, so that update doesn't repair it.
+
+`DynamoClient.make` checks the declaration against every entity and aggregate it can see: those your aggregate's table declares, those you bind, and those of the tables you bind. If one of them can write a row of the aggregate's entity types into its partition, it refuses with `EDD-9130`, naming the member, the entity type and how it writes the row. Which table a row is on is decided for each row the member writes: a read model's outbox items count on the outbox's table, for every projection defined on the read model.
+
+The check counts every attribute a member stores, the library's own included, as the row holds it after the last write. So a unique sentinel's back-pointer, a projection outbox's event type or index key, or another aggregate's collection sort-key copy (on every one of its rows) under the partition key's attribute can put a row in the partition, and an aggregate's timestamp stored under `__edd_e__` can give its rows any type. It reads no schema: a model attribute, another aggregate's context and discriminator attributes, and whatever a custom `decompose` returns, are any name holding any text. So a member whose rows can carry one of your aggregate's entity types is refused unless the library writes the partition key's attribute on those rows after them, with text that can't be your aggregate's partition key: an entity's own table keys, or another aggregate's own partition key. For example, an aggregate with a `Line` edge that assembles off an index under `gpk` and `gsk` is refused beside a plain aggregate storing `Line` rows under `pk` and `sk`, even though that aggregate's model has no `gpk` and decoding drops one passed to it. The check errs toward refusing: with cased keys, `line` collides with `Line`, and `Line#Profile` collides with `Line` under any casing.
+
+Every row an entity writes counts, even when it declares an edge's keys. An entity puts each key value after its field's name (`id_p`) and an aggregate doesn't, so none of an entity's rows is one of the aggregate's own. The check is a safety net, not a proof. A writer this client doesn't bind, in this process or another, isn't seen, and its rows are taken for the aggregate's. Every process that writes the table must bind every member that writes it. The check runs in `DynamoClient.make` only: an aggregate whose operations run without it, given a `DynamoClient` and its table's layer directly, is never checked.
+
+Aggregate updates have no concurrency control. So a concurrent update's row at a key the cleanup deletes can be deleted, as a `Delete` of a key the value decomposes to can be on 1.39.0.
+
+Leave `ownsRows` off when the partition is shared. Without it, stale rows stay, and two aggregates that share a partition and an entity type can still delete each other's rows where their keys collide, as on 1.39.0.
+
 #### What `create` and `update` take
 
 A value you hand to `create` or `update` is a domain value, as it is on an entity: in the input, in `state`, `cursor` and `current`, and in what a mutation returns. It's stored in its wire form and reads back as you gave it. An `update` leaves a field it doesn't change, and one that changes nothing writes nothing. A value that can't be a domain value but is the wire form, such as `"5"` for a `Schema.NumberFromString`, is still taken. Anything else is refused with a `ValidationError`.

@@ -933,8 +933,9 @@ each carrying a handler under the `RekeyHandler` symbol that `Entity.make`,
 is `notLibrary`; one no member claims is `unregistered`. A read model's entity
 also claims its projection row tombstones (`<type>#tombstone`) and outbox
 items (`<type>#outbox`); an outbox on another table is claimed on that table,
-for a read model whose projection registered it (`_projectionOutbox`, set when
-the projection is defined). A row of a member stored under no text its values
+for a read model whose projection registered it (`_projectionOutboxes`, one
+entry per projection defined on the read model, so a second projection doesn't
+hide the first's; under the key attributes of the entry the row holds). A row of a member stored under no text its values
 composed is `unrecognizedKey`. A unit that moves together (an aggregate, a
 stream, a moved row's target) is claimed once per run (`claim`, `once`), so it is
 moved and counted once whichever of its rows the scan reaches first, and a row
@@ -1129,7 +1130,7 @@ again or reports the row (`contended`).
 | Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
 | Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
@@ -1871,7 +1872,7 @@ All three are covered on the composer (`schema/test/KeyComposer.test.ts`), throu
 - The update composer's `sets` and `removes` never hold one (`composeGsiKeysForUpdatePolicyAware`), so every update path has it.
 - Each builder that writes key attributes itself excludes them: the retain path, `upsert`, `append`, `rekey`'s in-place rewrite (`staleIndexKeys`, which guards this before judging a half, as a retry after another writer can compose new text for one), the vector backfill, and aggregate `rekey` (`indexFields`).
 - A key changes only by moving the row: a `Put` under the new key and a `Delete` of the old one, in a transaction.
-- `[EDD-9109]` refuses at `Entity.make` a model attribute, a system timestamp or a version field stored in a table key attribute, by rename (`payload: { field: "pk" }`) or by name. `[EDD-9112]` refuses at `Aggregate.make` a list key or a collection sort key stored in one.
+- `[EDD-9109]` refuses at `Entity.make` a model attribute, a system timestamp or a version field stored in a key attribute the entity writes, by rename (`payload: { field: "pk" }`) or by name: the table's, and since 1.40 each secondary index's (a local index's sort key, a Z-order address and a `refs` cascade index's included), where the value and the key the library composes replaced each other. Also since 1.40, a model attribute named as one of them under any rename: a write composes the keys before it renames the fields, so the rename moved the key into the field's attribute, and the row lost it. `[EDD-9112]` refuses at `Aggregate.make` a list key or a collection sort key stored in one.
 - At run time, `.remove`, `.set`, `.add`, `.subtract`, `.append`, `.deleteFromSet` and the path operations naming a table key attribute by its stored name fail with a `ValidationError` and write nothing, as `.remove` of a primary key composite does (D63).
 
 `test/NoTableKeyWrites.test.ts` records every `UpdateItem`, transactional `Update` and `Put` across inverted, shared `sk`, sharded shared `sk`, local and dedicated definitions, under both flag settings, through every lifecycle, `rekey` and its retry, moves over 1.36 rows, aggregates, streams and the scenarios of the other suites, and fails if an update names `pk` or `sk` or a `Put`'s key isn't the one its values compose. `test/TableKeyAttributes.test.ts` covers each definition position: refused, accepted, and the run-time check.
@@ -1931,9 +1932,15 @@ const PageModel = DynamoModel.configure(Page, {
 
 The `#` delimiter matches the rest of the library's key-composition convention. Keys flow through `ExpressionAttributeNames` aliasing in every read/write path so there is no lexical collision risk with user attributes. **User keys must not contain `#`** — validated at write time with a clear error (no silent escaping).
 
+**The writer's check and the reader's predicate** (`internal/SparseKey.ts`, schema package):
+
+- A write that flattens a whole item runs `validateSparseKey`: a non-empty key without `#`, and an attribute name of 1–255 bytes. That is `put` / `create` (and `Batch.write` / `Transaction.transactWrite` puts), and an update or upsert that reads the row and writes it whole (`rewritesWholeItem`: a `versioned: { retain: true }` entity's, and one that touches a unique field or a computed index composite). Such an update checks the payload's keys, before it reads anything (`refusedSparseKey`: before the read of the row, and before the reads that hydrate a payload's refs, on update, patch, a transaction's update, put, create and upsert), and writes the row's own entries back under the attributes it read them from, whatever their keys: an entry named by its attribute under `x#y` no longer stops every later update of a retained row. A key is refused before the reads only where the operation is refused whatever the row holds (`everyRowWrites`). An immutable map's value is written by an upsert only into a row that isn't there and by an update never, so with the row present an upsert carrying a key a put refuses succeeds, as on 1.39.0, and with the row missing it is refused where the put it becomes refuses it (`test/fixtures/sparse-entry-ops-1.39.0.json`). The byte limit is the library's own. DynamoDB takes an attribute name of up to 64 KB, and 255 bytes only for an index key or an attribute an index projects by name. The other writes check what they checked on 1.39.0, and send the requests they sent: an update's `.set()` and `upsert` refuse an empty key and one holding `#` (`update.sparse`, `upsert.sparse`; an update's, before it reads anything, so before a transaction's reads too), and a record or path operation naming an entry's attribute (`pathSet`, `pathAdd` or `.add()` of `data#x#y`) checks nothing, so it writes the entry the reader reads under `x#y`. Applying the writer's check to them refused writes that stored and read back (an entry under a 256-byte name; `data#x#y`). No write-time check guards a key attribute: `EDD-9140` refuses, at load, any attribute the entity writes that the reader would take as an entry. A record operation names a model field, and its stored attribute decides what it writes: `.add({ "data#x#y": 3 })` on a field named `data#x#y` and stored as `counter` adds to `counter` (`test/fixtures/sparse-entry-writes-1.39.0.json`).
+- A stored row is read in one order everywhere: sparse entries leave the attribute-keyed row first (`deserializeSparseFields`), then names are mapped (`renameFromDynamo`). `decodeRecord` and the history and tombstone readers did; the update that reads a row to write it whole, the read for a vector's source text, and `toDomainView` (key, unique-sentinel and vector-partition composition from a stored row: put, update, delete, restore, purge, `rekey`) mapped names first or only. So a field named as an entry (`data#x`, stored as `counter`) landed on the entry's attribute: a retained entity's `.set()`, `.add()` or `.remove()` of any field wrote the field's value over the entry `x` and dropped `counter`, on 1.39.0 too, and a unique field the row lacked was read from the entry of its name. The same update applied a record operation naming an entry by its attribute (`.add({ "data#views": 1 })`, `.subtract`, `.append`, `.deleteFromSet`) to a key of its own beside the map, which the flattened entry then overwrote: it reported success and changed nothing, on 1.39.0 too. It now reaches the entry, as the operation sent as an expression does, and a set it shrinks is a copy, so the snapshot of the row before the update keeps the whole set. An entry's key, like any name a caller supplies, is read and written as its holder's own property: the map is looked up with `Object.hasOwn` and built with no prototype (`slot`, and `decodeSparseFields`' buckets), so `data#constructor` on an empty map is absent and not `Object`'s constructor, and an entry keyed `__proto__` is kept and read back, where assigning it on a plain object dropped it.
+- Which stored attributes are entries is the reader's to say (`sparseReader`): an attribute is an entry of the field whose `<prefix>#` begins it (the longest such prefix winning) when a key follows the `#`. `<prefix>#` itself is no entry. The row's reader, `clearMap`, `removeEntries`, the refusal of `.remove` / `pathRemove` of an entry, a time-series event item's strip and `EDD-9140` all ask it. So `clearMap` never removes `<prefix>#` (which can be a key attribute), and `removeEntries` takes any key the reader reads, one holding `#` included.
+
 #### Reads — transparent
 
-`get`, `query`, `scan`, batch, and stream paths all rebuild the domain `Record<K, V>` from flattened attributes by walking the marshalled item once and grouping attributes matching `<prefix>#*`. Domain consumers see the field as a normal Record.
+`get`, `query`, `scan`, batch, and stream paths all rebuild the domain `Record<K, V>` from flattened attributes by walking the marshalled item once and grouping the attributes the reader takes as entries. Domain consumers see the field as a normal Record.
 
 #### Writes — record-style (whole-bucket replace)
 
@@ -4177,6 +4184,196 @@ one-type composite keys on its encoded form and `get` finds it.
 decodes to. That's asked after the domain value and before the stored side (`plainForm`), so a set held as a
 list isn't taken for a stored list and transformed again.
 
+**A custom `decompose` is handed a write's value as 1.39.0 handed it.** What a `many` edge's
+`decompose` returns is stored and keyed as given: its fields go through the element's attribute
+encoders, and its `sk.composite` is read off it (through `buildKeyAttrEncoders`, which an edge with no
+entity doesn't have). On 1.39.0 a write's value reached `decompose` read stored form first, so one
+written for it encodes a one-type field itself from a value decoded once more: on a field multiplying by
+10, `f / 10` was handed 500 for `create(50)`, returned 50, which was encoded to 5 and keyed as 50.
+Handed the domain value, the same function returns 5, encoded again to 0.5 and keyed as 5, and every
+`update` compounded it and added a row; an `update` of a 1.39.0 row left it and wrote a second. So on a
+write (`create`, update's new state) `decompose` is handed the caller's own value of the edge, as given
+and before the write decodes it, read stored form first once (`storedFormFirst`: the field's tolerant
+`decodeOnly` substitution, without `domainValues`, only where the field `containsWireTransform` beneath
+its classes, `throughClasses`), and what was read (update's old state, `rekey`) is handed as it was
+read, as on 1.39.0. Never the value the write already decoded: read again, a decoding default (5, read
+as 50) or a stored form the domain side refuses (`"5"` on a union of a number and a string, read as 50)
+is decoded twice, to 500, and a row 1.39.0 wrote collides with the one an update adds. Its rows store,
+key and read exactly as on 1.39.0. A field with two types (`NumberFromString`) or none reads the same
+either way. Two things stay as on 1.39.0: a `decompose` that hands a one-type field back unchanged
+stores it decoded once more on every write (`create(50)` stores 50 under 500 and reads 500), and since
+the old state composes other keys than the new, every `update` of an edge whose `decompose` encodes the
+field rewrites its rows, even one that changes nothing. That is the 1.x contract: `decompose` is handed
+what 1.39.0 handed it. The next major hands it the edge's decoded value, as the rest of a write sees it,
+and a `decompose` that encodes a field itself drops that step then.
+
+**Which rows in its partition are an aggregate's (`ownsRows`).** By default an aggregate's rows are the
+ones its value keys. `update` deletes the keys its old value decomposes to and its new value doesn't,
+and `rekey` moves the rows its value decomposes to, displacement included. Both behave as the base
+does: 1.39.0 with this release's decomposition fixes (#211's, and decision A: a custom `decompose`'s
+result is stored as 1.39.0 stored it). The base isn't 1.39.0 request for request. On 1.39.0, an
+`update` that left an ordinary transformed edge field alone stored it transformed once more (a field
+that multiplies by 10 on decode, stored as 50, was rewritten as 500 under a new key); the base leaves
+it as stored. An `update` is a no-op when its new value's decomposition equals its old value's, compared
+as the base compares them (`sameItems`): each item's entity type and stored attributes, in order, not
+its keys. A field whose codec stores every number as 0 decomposes 50 and 60 alike, so changing one to
+the other is a no-op, whatever key the stored row is under. A no-op writes nothing, with the option or
+without it.
+
+Neither `update` nor `rekey` deletes or moves a row the value doesn't key (`delete` has its own rule):
+a row a custom `decompose` left under a key it no longer composes, or an edge row its `assemble` drops.
+An encoding `decompose`'s rows are such rows: decomposing the value read keys them elsewhere (`f / 10`
+once more: a row stored under 50 reads as 50, which is keyed 5). So an `update` that removes such an
+element sends a `Delete` for a key no row holds and leaves the row, which `get` still returns. One that
+changes the keyed value leaves both rows, and `rekey` leaves such rows under the old partition key,
+unreported. All of this is as on 1.39.0 (`AggregateDecomposeRows.test.ts`,
+`fixtures/aggregate-decompose-reads-1.39.0.json`). They stay because another member may write rows of
+the same entity type into the partition, and nothing in a row says which member wrote it. For the same
+reason, two aggregates that share a partition and an entity type can delete each other's rows where
+their keys collide, as on 1.39.0 (`AggregateSharedPartition.test.ts`,
+`connected.aggregate-shared-partition.test.ts`, and the fixtures `aggregate-shared-partition`,
+`aggregate-ownership`, `aggregate-decompose-rename`, `aggregate-foreign-rows` and
+`aggregate-claimed-rows`, each `-1.39.0.json`).
+
+`ownsRows: true` on `Aggregate.make` declares that every row of the aggregate's entity types in its
+partition is its own: its root's, its edges' and its sub-aggregates' types (`ownedTypes`). Ownership
+rests on that declaration. The bind check below is a safety net for it, not a proof.
+
+**The bind check (`EDD-9130`).** `DynamoClient.make` refuses an aggregate declaring `ownsRows` when
+another member it can see can write a row of one of its types into its partition (`ownershipConflict`).
+The refusal is a defect, as `EDD-9037` is. The check counts every attribute a member writes on a row,
+the library's own included, as the row holds it after the last write of each: an attribute written
+after a key replaces it. It reads no schema: a model attribute is any name holding any text. So a
+member's row can hold the aggregate's `pk.field` unless the library writes that attribute on the row
+after every model attribute. A member can write such a row when one of its rows, on the same physical
+table, can hold both of these:
+- Under the aggregate's `pk.field`, text that can be the aggregate's partition key. Most text the
+  library composes as a key there begins with a head `$<schema>#v<version>#<label>`. It's exactly the
+  head, or it continues the head after `#`. Such text is an entity's primary or secondary partition
+  key, a unique sentinel's key, a vector index's partition, another aggregate's partition key, list key
+  or collection sort key, or the back-pointer to an entity's partition key. Not every key the library
+  writes has such a head: a projection outbox's index keys are `<type>#outbox` and the like, and count
+  as any text. Any other attribute stored under that name can be any text too: a model attribute, a
+  sort key, a timestamp, `deletedAt`, a back-pointer to a sort key, a projection outbox's metadata
+  (`effect`, `source`, `streamId`, `eventType`, its claim) or index keys, or a projection tombstone's
+  markers.
+  - When the aggregate's partition key has composites, composed text can be it when the two heads are
+    equal, or one continues the other after `#`.
+  - When it has none (a singleton), composed text can be it only when it can equal it. An entity's
+    partition key with composites always continues its head with `#`, so it can't equal
+    `$x#v1#line`.
+- Under `__edd_e__`, a type that collides with one of the aggregate's (`typesCollide`). Two types
+  collide when they're the same, or when one's sort key head `$<schema>#v<version>#<type>` overlaps the
+  other's after `#`. Each head is cased as its member's keys are. Under `lowercase` or `uppercase`,
+  `line` collides with `Line`; under `preserve` it doesn't. `Line#Profile` collides with `Line` under
+  every casing. A member that stores another attribute under `__edd_e__` writes any type there, and
+  every type collides with it: an aggregate's timestamp so named, which it writes after its
+  `__edd_e__`. An entity can't: `Entity.make` refuses a model field named or renamed `__edd_e__`, and
+  a timestamp or the version so named (`EDD-9140`).
+
+These two comparisons belong to the bind check only. They never widen the rows the aggregate owns, or
+the rows assembly hands a node; both match `__edd_e__` exactly.
+
+The members it sees are the entities and aggregates the aggregate's table declares, those the client
+binds, and those of every table the client binds. The aggregates checked come from the same list: an
+aggregate the client sees only as a bound table's is checked too, since `rekey` runs its handler. Which table a row is on is decided per row a member
+writes, not per member: a read model's outbox items are on its outbox's table, which can be the
+aggregate's when the entity's own table isn't. A row's table is the same physical table when it is the
+aggregate's table, has its key, or resolves to the same table name. The aggregate itself isn't
+counted. A refusal names a member of a table the client binds as `<table>.<key>`. A member's rows
+are these (`entityWriters`, and an aggregate's `_attributeWriters`):
+- An entity's live rows, version snapshots, soft-delete tombstones and time-series events, under its
+  primary key, and the projection tombstones (`<type>#tombstone`) and outbox items (`<type>#outbox`) a
+  read model writes beside its rows. Every projection defined on the read model counts, each with its
+  own outbox's table and index keys (`_projectionOutboxes`).
+- Its unique sentinels (type `<type>._unique.<name>`, under the sentinel key), with the back-pointers
+  `_entity_pk` and `_entity_sk` naming the owning row.
+- Each secondary index's and vector index's partition attribute, on its live rows. A secondary index
+  half stored in a table key attribute holds the primary key's text there (`EDD-9106`), so it's
+  counted as the primary key.
+- Its model attributes, on its rows and kept on its projection tombstones: any name but `__edd_e__`
+  and its table key attributes, which it writes after them. `EDD-9109` and `EDD-9140` refuse a model
+  attribute stored under those (or under any key attribute it writes), a sparse map's entries included (any attribute a row's reader takes
+  as one, `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). So an entity of a node's type on the
+  same table is refused when the aggregate's partition key attribute isn't one of that entity's table
+  key attributes.
+- None of an entity's rows is a node's row, so all of them count. An entity composes each composite
+  with its field's name (`$x#v1#line#id_p`), which an aggregate never does, and its primary key has at
+  least one composite.
+- An entity whose keys can't be read is taken to write any attribute and any type.
+- Another aggregate's rows: its `pk.field`, `sk` and collection sort-key mirror on every row (the
+  root's mirror is its collection key, every other row's a copy of its `sk`), its list index keys on its
+  root, its timestamps, which it writes last, and its rows' own attributes (model, context and
+  discriminator attributes, or what a custom `decompose` returns): any name but its `pk.field`, `sk`,
+  `__edd_e__` and the mirror, which it writes after them. Its list keys aren't among those: a root row
+  whose list composites are absent has none, so an attribute of that name stays.
+
+**`update` with `ownsRows`.** Its group transactions are exactly the ones it sends without the option.
+After the last of them commits, it deletes the other rows it read of each node that changed, where the
+new value doesn't write their sort key.
+- A node changed when the update writes its group (the base's diff) and the node's items of the old
+  value and of the new one differ by the base's comparison (`sameItems`: types and attributes in order,
+  not keys).
+- A row is a node's by its type and static discriminator (`slotsOf`), as assembly hands rows. A row
+  handed to two nodes is neither's alone: it gets no such `Delete`. No row is deleted twice.
+- The retention contract: with `ownsRows`, after an update changes node N, N's rows are exactly what
+  its decomposition writes for the new value, but for rows handed to another node too, which stay. A
+  custom `decompose` that doesn't write an element it keeps loses that element. The rows of a node that
+  didn't change stay, whatever happened to its group.
+- These `Delete`s go in their own `TransactWriteItems` requests, up to 100 to a request. Each is
+  conditioned `attribute_not_exists(#pk) OR #e = :e`: the row is gone, or still of the type read. A
+  concurrent removal is fine. A row replaced with one of another type is left.
+- When a request is cancelled, the `Delete`s whose condition failed (from the cancellation reasons)
+  are dropped and the rest are resent once. The mutation is never run again, and nothing is read
+  again.
+- A cleanup request that fails is reported the way a later group's failure is
+  (`TransactionCancelled`, or the client's error). By then the update's groups have committed, and the
+  rows it didn't delete stay until the next update that changes their node.
+- A no-op update writes nothing, cleanup included. Nothing more is read, assembled or decomposed.
+
+**`rekey` with `ownsRows`.** It moves exactly what it moves without the option: the rows its value
+decomposes to, displacement included (another aggregate stored where this one goes moves first, and
+only a destination that can't be vacated stops it). Where any other row of its types it reads would go
+can't be told from what's stored, so none is moved: a lossy codec stores `f = 0` under the key a write
+of 50 composed, and a custom `assemble` or `decompose` can hand a row's values to a different element.
+- When such a row's own partition key changes, moving the rest would leave it behind: the aggregate is
+  a `failed` conflict naming the row, and nothing of it moves.
+- Otherwise the row is left where the aggregate reads it, and counted under `skipped.unrecognizedKey`.
+  Another row's key change doesn't fail the aggregate.
+- No other request is sent: with nothing failed, the requests are the ones sent without the option.
+- An aggregate failed this way is repaired by an `update` that changes the row's node, which deletes
+  the row. A row handed to two nodes isn't deleted, so such an update doesn't repair it.
+- The dry run reports the same. Nothing more is read, assembled or decomposed.
+
+**Limits.** A writer the client doesn't see isn't checked: a member only another client binds, in this
+process or another, or a writer outside the library's members. Its rows of the aggregate's types in the
+partition are taken for the aggregate's, so every process that writes the table must bind every member
+that writes it. The check runs in `DynamoClient.make` only: an aggregate whose operations are run
+without it, given a `DynamoClient` and its table's layer directly, is never checked. A row of another type is never the aggregate's: the cleanup's condition leaves one that
+replaced an owned row. Aggregate updates have no concurrency control. So a concurrent update's row at a
+key the cleanup deletes can be deleted, as a value-key `Delete` can be on 1.39.0. A row handed to two
+nodes is never cleaned up. Without `ownsRows`, stale rows stay, and two aggregates sharing a partition
+and an entity type can delete each other's rows where their keys collide, both as on 1.39.0
+(`AggregateOwnsRows.test.ts`).
+
+**A custom `assemble` is handed rows as read, before decoding.** A `many` edge's `assemble` is handed
+the rows read, unmarshalled, with packed attributes unpacked (by their stored form), under their stored
+names. Stripped from each: `__edd_e__`, the attributes named `pk` and `sk`, every attribute whose name
+begins with `gsi` or `lsi`, and the library's timestamps the node's value doesn't declare. Everything
+else stays, the collection sort-key mirror under another name and discriminator and context attributes
+included. Nothing is decoded: a field that multiplies by 10 on decode is handed 5 where `get` returns
+50. What it returns is decoded with the rest of the aggregate.
+
+On a `Schema.Record` edge without an `entity`, a date field's attribute encoder stores a value already
+in the field's stored form as it is (`storedDates`): one its date encodings decode
+(`storedDateForm`), such as the ISO text a `decompose` returns for a `DateTimeUtcFromString`. Its key
+encoder already composed from such a value as given. 1.39.0 gave such an edge no encoders and stored
+its attributes as `decompose` returned them, so such a `decompose` worked there; once keyed edges took
+their element's encoders (#201) it failed `create` with a defect, and every `update` of the rows
+1.39.0 wrote. There a value in neither form is stored as given and reported (`asGiven`), so the write
+refuses it unless it reads back (`EDD-9127`). On an array edge, and on a keyed edge with an `entity`,
+1.39.0 had the encoders and failed `create` with a defect, and still does.
+
 A caller who passed the stored form on 1.39.0 had the only input that read back as meant (`create(5)` on
 that field read 50). It's a valid domain value too, so it can't be told apart or warned about: it now
 stores 0.5 and reads 5, and the guide and the changeset say what such a caller changes.
@@ -6002,7 +6199,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9105` | `Query.ts` (`Query.concurrency`, thrown at the call) | `concurrency` not a positive integer |
 | `EDD-9106` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` and `Table.make`, and the type-level guard for a sharded half where literals show it | Two key halves of one entity stored in one attribute, sharded or not, without the same fields, in the same order and casing, or a sharded partition key with one sharded differently |
 | `EDD-9108` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | One entity uses one physical index twice, even over the same fields |
-| `EDD-9109` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | A model attribute, a system timestamp or a version field is stored in a table key attribute, by rename or by name |
+| `EDD-9109` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredInKeyAttribute`), through `Entity.make` | A model attribute, a system timestamp or a version field is stored in a key attribute the entity writes (`writtenKeyAttributes`: the table's, and since 1.40 each secondary index's), by rename or by name; or, since 1.40, a model attribute is named as one under a rename, which moved the composed key into the field's attribute |
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
 | `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, without what its key needs beside it: the partition key's composites, the other `by` attributes, or (under `preserve`) a sort key composite before it. Every append carrying it would fail with `EDD-9100` |
 | `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites; `Aggregate.make`, pure and operational (`AggregateSchemas.refuseAggregateKeyOverMovingValue`, `refuseManySortKeysOverMovingValue`) | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by`; a stamped `updatedAt` in an aggregate's partition key or a `many` edge's sort key (§7 "Composites the library stamps") |
@@ -6013,8 +6210,10 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
 | `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackOtherwise`, `fieldAtPath`, `storedFieldAtPath`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. A dotted composite is followed through what holds each segment, and a time-series `appendInput`'s own fields are refused as the model's are, as is one declaring the other kind than the model. In the same places, the value of a field whose kinds can't be read at load (`Schema.Unknown`, `Schema.Any`, an opaque declaration, a transform whose stored side is one) that reads back as something else is refused at write with a `ValidationError` naming the field, with nothing written; an aggregate's dotted `many` edge composite is judged at write through the field holding it (`throughFieldJudge`), never by the value at its path alone. A field no key reads may store both (§7 "Both numeric kinds"). |
+| `EDD-9130` | `DynamoClient.ts` (`make`), through `Aggregate.ts` (`ownershipConflict`) | An aggregate declaring `ownsRows` beside another member the client sees that can write a row of one of its entity types into its partition: the message names the aggregate, the member, the type and the channel. A defect from `DynamoClient.make`, as `EDD-9037` is (§7 "Which rows in its partition are an aggregate's"). |
+| `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
 
-Next free code: **`EDD-9129`** (`9110` and `9111` are reserved for #189; `9114`–`9120` are taken on branches in flight; `9107` is retired, don't reuse it), or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: none below `9141` (`9129` and `9131`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

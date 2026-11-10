@@ -143,6 +143,12 @@ interface AggregateConfig<
    * `effect-dynamodb`, which owns the write path that stamps them.
    */
   readonly timestamps?: TimestampsConfig
+  /**
+   * Every row of the aggregate's entity types in its partition is its own. Accepted here for parity
+   * with the operational `Aggregate.make` in `effect-dynamodb`, whose `update` and `rekey` act on
+   * it.
+   */
+  readonly ownsRows?: boolean
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }

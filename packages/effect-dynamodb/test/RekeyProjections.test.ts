@@ -635,3 +635,142 @@ describe.each([
     ),
   )
 })
+
+/**
+ * A read model with two projections, each with its outbox on its own table. The read model keeps
+ * every projection's outbox, so each table's `rekey` moves its own items, the first projection's
+ * included: a second projection defined after it doesn't hide them.
+ */
+const twoOutboxes = (schema: DynamoSchema.DynamoSchema) => {
+  const EventsTable = Table.make({ schema, entities: {} })
+  const Accounts = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "Account",
+    events: [Opened, Added, Closed],
+    streamId: { composite: ["account"] },
+  })
+  const Ledgers = Entity.make({
+    model: Tally,
+    entityType: "Ledger",
+    primaryKey: {
+      pk: { field: "pk", composite: ["shop"] },
+      sk: { field: "sk", composite: ["name"] },
+    },
+  })
+  const ReadTable = Table.make({ schema, entities: { Ledgers } })
+  const FirstTable = Table.make({ schema, entities: {} })
+  const SecondTable = Table.make({ schema, entities: {} })
+  const projection = (table: typeof FirstTable) =>
+    EventStore.projection({
+      stream: Accounts,
+      readModel: Ledgers,
+      key: (id: { readonly account: string }) => ROWS[id.account]!,
+      initial: (id: { readonly account: string }): Tally => ({
+        ...ROWS[id.account]!,
+        total: 0,
+        version: 0,
+        rev: 0,
+      }),
+      evolve: (state, event) =>
+        Effect.succeed(
+          event.data._tag === "Added"
+            ? { ...state, total: state.total + event.data.amount }
+            : state,
+        ),
+      checkpoint: "version",
+      revision: "rev",
+      outbox: {
+        schema: Notice,
+        effects: (event, next) =>
+          event.data._tag === "Added"
+            ? [{ account: event.streamId, total: next?.total ?? -1 }]
+            : [],
+        table,
+      },
+    })
+  const First = projection(FirstTable)
+  const Second = projection(SecondTable)
+  return {
+    schema,
+    EventsTable,
+    ReadTable,
+    FirstTable,
+    SecondTable,
+    Accounts,
+    Ledgers,
+    First,
+    Second,
+  }
+}
+
+const TwoOn = twoOutboxes(DynamoSchema.make({ name: "two", version: 1, escapeKeys: true }))
+const TwoOff = twoOutboxes(DynamoSchema.make({ name: "two", version: 1, escapeKeys: false }))
+type Two = typeof TwoOn
+
+const twoLayer = (w: Two) =>
+  Layer.mergeAll(
+    w.EventsTable.layer({ name: "t" }),
+    w.ReadTable.layer({ name: "t" }),
+    w.FirstTable.layer({ name: "o1" }),
+    w.SecondTable.layer({ name: "o2" }),
+  )
+
+describe.each([
+  ["to on", TwoOff, TwoOn],
+  ["to off", TwoOn, TwoOff],
+] as const)("rekey, two projections' outboxes on two other tables, %s", (_direction, from, to) => {
+  const run = <A, E>(body: (table: RecordingTable) => Effect.Effect<A, E, any>) =>
+    Effect.gen(function* () {
+      const table = makeRecordingTable()
+      return yield* body(table).pipe(
+        Effect.provide(Layer.mergeAll(table.layer, twoLayer(TwoOn), twoLayer(TwoOff))),
+      ) as Effect.Effect<A, E>
+    })
+  const rekeyOf = (w: Two, which: "FirstTable" | "SecondTable") =>
+    Effect.gen(function* () {
+      const db = (yield* DynamoClient.make({
+        entities: { Ledgers: w.Ledgers },
+        tables: { ReadTable: w.ReadTable, FirstTable: w.FirstTable, SecondTable: w.SecondTable },
+      })) as any
+      return yield* db.tables[which].rekey() as Effect.Effect<Table.RekeyReport, unknown, any>
+    })
+  const ledgerKey = (w: Two) =>
+    KeyComposer.composeIndexKeys(
+      w.schema,
+      "Ledger",
+      1,
+      w.Ledgers.indexes.primary,
+      ROWS.moved!,
+    ) as Keys
+
+  it.effect.each([
+    ["the first projection's", "First", "FirstTable", "o1"],
+    ["the second projection's", "Second", "SecondTable", "o2"],
+  ] as const)("%s items move with their table's rekey", ([_name, projection, which, name]) =>
+    run((table) =>
+      Effect.gen(function* () {
+        yield* from.Accounts.append(
+          { account: "moved" },
+          [new Opened(), new Added({ amount: 2 })],
+          0,
+        )
+        yield* from[projection].applyBatch(yield* from.Accounts.read({ account: "moved" }))
+        const old = ledgerKey(from)
+        const now = ledgerKey(to)
+        expect(rowsOf(table, "Ledger#outbox").map(([stored]) => stored)).toEqual([
+          `${old.pk}|${old.sk}#outbox#000000000001#0000`,
+        ])
+        table.take()
+        const report = yield* rekeyOf(to, which)
+        expect(report.byMember.Ledger?.moved).toEqual({ ...ZERO, outbox: 1 })
+        const sent = table.take().filter((r) => r.command === "TransactWriteItems")
+        expect(sent.map((r) => (r.input.TransactItems as Array<any>)[0].Put.TableName)).toEqual([
+          name,
+        ])
+        expect(rowsOf(table, "Ledger#outbox").map(([stored]) => stored)).toEqual([
+          `${now.pk}|${now.sk}#outbox#000000000001#0000`,
+        ])
+      }),
+    ),
+  )
+})

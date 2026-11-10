@@ -164,7 +164,7 @@ import {
 } from "effect"
 import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
-import { bind as aggregateBind } from "./Aggregate.js"
+import { bind as aggregateBind, ownershipConflict } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
 import {
@@ -2395,6 +2395,8 @@ interface EntityLike {
     | undefined
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
+  /** `[EDD-9140]` for the attributes the table's configuration names (its TTL attribute). */
+  readonly _refuseTableAttributes?: ((tableConfig: TableConfig) => void) | undefined
   /** Where a stored row's values key it in an index now (#171). */
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
@@ -2530,6 +2532,15 @@ const makeFromConfig = (config: {
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
+
+    // A table's TTL attribute is named by its configuration, so an entity that sets it is checked
+    // here, where the table is bound: a row's reader may not take it as a sparse map's entry
+    // (`[EDD-9140]`, as `Entity.make` checks every name the definition supplies).
+    for (const rawEntity of Object.values(config.entities)) {
+      const entityLike = rawEntity as unknown as EntityLike
+      const tableConfig = Option.getOrUndefined(Context.getOption(baseCtx, entityLike._tableTag))
+      if (tableConfig !== undefined) entityLike._refuseTableAttributes?.(tableConfig)
+    }
 
     // Dimension agreement between the Embedder and every bound vector index is
     // a construction-time invariant — a mismatch would otherwise surface as a
@@ -3195,6 +3206,72 @@ const makeFromConfig = (config: {
       }
     }
 
+    // An aggregate declaring `ownsRows` takes every row of its types in its partition. Refused when
+    // another member this client can see can write such a row there (DESIGN.md §7 "Which rows in
+    // its partition are an aggregate's"): those its table declares, those the client binds, and
+    // those of every table the client binds, on the same physical table (by table, or by the
+    // name it resolves to here). A writer it doesn't see, here or in another process, isn't checked.
+    const tableNameOf = (table: unknown): string | undefined => {
+      // A table's tag is a function.
+      if (
+        table === null ||
+        (typeof table !== "object" && typeof table !== "function") ||
+        !("key" in table)
+      ) {
+        return undefined
+      }
+      return Option.getOrUndefined(
+        Context.getOption(baseCtx, table as Context.Key<TableConfig, TableConfig>),
+      )?.name
+    }
+    // Every entity the client sees: those it binds, then those of every table it binds, named as a
+    // refusal names them. A member may reach the client only as another bound table's.
+    const visible: ReadonlyArray<readonly [name: string, entity: unknown]> = [
+      ...Object.entries(config.entities),
+      ...Object.entries(config.tables ?? {}).flatMap(([tableKey, table]) =>
+        Object.entries(table.entities).map(
+          ([key, entity]) => [`${tableKey}.${key}`, entity] as const,
+        ),
+      ),
+    ]
+    // And every aggregate it sees, the same way.
+    const visibleAggregates: ReadonlyArray<readonly [name: string, aggregate: unknown]> = [
+      ...Object.entries(config.aggregates ?? {}),
+      ...Object.entries(config.tables ?? {}).flatMap(([tableKey, table]) =>
+        Object.entries(
+          (table as { readonly aggregates?: Record<string, unknown> }).aggregates ?? {},
+        ).map(([key, aggregate]) => [`${tableKey}.${key}`, aggregate] as const),
+      ),
+    ]
+    const visibleMembers = [...visible, ...visibleAggregates].map(([name, member]) => ({
+      name,
+      member,
+    }))
+    // The owners checked are the aggregates it sees, from the same list: `rekey` runs the handler of
+    // a table's aggregate the client doesn't bind itself. Each once, by the first name it has.
+    const checked = new Set<unknown>()
+    for (const [key, aggregate] of visibleAggregates) {
+      if ((aggregate as { readonly _ownsRows?: boolean })._ownsRows !== true) continue
+      if (checked.has(aggregate)) continue
+      checked.add(aggregate)
+      const own = (aggregate as { readonly _tableTag?: { readonly key: string } })._tableTag
+      const ownName = tableNameOf(own)
+      const conflict = ownershipConflict(aggregate, visibleMembers, (table) => {
+        if (table === own) return true
+        const keyOf = (t: unknown) => (t as { readonly key?: unknown } | undefined)?.key
+        if (keyOf(table) !== undefined && keyOf(table) === keyOf(own)) return true
+        return ownName !== undefined && tableNameOf(table) === ownName
+      })
+      if (conflict !== undefined) {
+        throw new Error(
+          `[EDD-9130] Aggregate "${key}" declares \`ownsRows\`, but "${conflict.member}" can write ` +
+            `a row of type "${conflict.type}" into its partition (${conflict.channel}). ` +
+            `\`ownsRows\` would take that row for the aggregate's: leave it off, or keep ` +
+            `"${conflict.member}"'s rows out of the aggregate's partition.`,
+        )
+      }
+    }
+
     // 4. Bind aggregates
     const boundAggregates: Record<string, unknown> = {}
     if (config.aggregates) {
@@ -3227,22 +3304,29 @@ const makeFromConfig = (config: {
           const handler = Rekey.handlerOf(member)
           if (handler !== undefined) handlers.add(handler)
         }
-        // A projection's outbox on this table, of a read model on another (#171).
+        // The outboxes on this table of a read model on another (#171): every projection's, so a
+        // second projection of one read model doesn't hide the first's items.
         const outboxOf = new Set<unknown>()
         for (const entity of [...registered, ...Object.values(config.entities)]) {
-          const outbox = (
+          if (outboxOf.has(entity)) continue
+          outboxOf.add(entity)
+          const outboxes = (
             entity as {
-              readonly _projectionOutbox?: {
-                readonly table: { readonly Tag: { readonly key: string } }
+              readonly _projectionOutboxes?: ReadonlyArray<{
+                readonly table: { readonly Tag: { readonly key: string } } | undefined
                 readonly pk: string
                 readonly sk: string
-              }
+              }>
             }
-          )._projectionOutbox
-          if (outbox === undefined || outbox.table.Tag.key !== tagKey || outboxOf.has(entity)) {
-            continue
+          )._projectionOutboxes
+          // Their key attributes, once each.
+          const layouts = new Map<string, { readonly pk: string; readonly sk: string }>()
+          for (const outbox of outboxes ?? []) {
+            if (outbox.table?.Tag.key !== tagKey) continue
+            layouts.set(`${outbox.pk}\u0000${outbox.sk}`, { pk: outbox.pk, sk: outbox.sk })
           }
-          outboxOf.add(entity)
+          if (layouts.size === 0) continue
+          const keys = [...layouts.values()]
           const readModel = entity as unknown as Pick<
             EntityType,
             "entityType" | "_rekeyProjectionRow"
@@ -3250,8 +3334,14 @@ const makeFromConfig = (config: {
           handlers.add({
             name: readModel.entityType,
             types: [`${readModel.entityType}#outbox`],
+            // A table has one key schema, so its items are under the layout whose attributes they hold.
             row: (row, ctx) =>
-              readModel._rekeyProjectionRow(row, ctx, { pk: outbox.pk, sk: outbox.sk }),
+              readModel._rekeyProjectionRow(
+                row,
+                ctx,
+                keys.find((key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined) ??
+                  keys[0]!,
+              ),
           })
         }
         return provide(Rekey.run({ tableName, members: [...handlers], options }))

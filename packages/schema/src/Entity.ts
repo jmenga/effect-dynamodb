@@ -77,9 +77,13 @@ import type {
 import { refuseUnreadable } from "./internal/SchemaAccessors.js"
 import { isShardSourceError } from "./internal/Shards.js"
 import {
+  refuseReadAsSparseEntry,
   refuseRepeatedIndex,
   refuseSharedKeyAttributeOnEverySchema,
-  refuseStoredInTableKey,
+  refuseStoredInKeyAttribute,
+  refuseStoredUnderLibraryAttribute,
+  writtenKey,
+  writtenKeyAttributes,
 } from "./internal/SharedKeyAttribute.js"
 import {
   type BoundDimension,
@@ -1590,14 +1594,75 @@ export const buildEntityDefinition = (config: {
     if (field) fieldRenames[domainName] = field
   }
   const hasRenames = Object.keys(fieldRenames).length > 0
-  refuseStoredInTableKey(config.entityType, primaryIndex, [
+  const storedAttributes = [
     ...Object.keys(modelFields).map(
       (name) => [name, fieldRenames[name] ?? name] as readonly [string, string],
     ),
     ...[systemFields.createdAt, systemFields.updatedAt, systemFields.version]
       .filter((name) => name !== null)
       .map((name) => [name, name] as readonly [string, string]),
-  ])
+  ]
+  const keyAttributes = writtenKeyAttributes(initialIndexes, vectorIndexes)
+  refuseStoredInKeyAttribute(config.entityType, keyAttributes, storedAttributes)
+  refuseStoredUnderLibraryAttribute(config.entityType, keyAttributes, storedAttributes)
+  // Every attribute a row of this entity holds under a name the definition supplies, each by the
+  // name it is stored under. The table's TTL attribute is the table configuration's to name:
+  // `DynamoClient.make` checks it.
+  // A timestamp's or the version's name is the configuration's: looked up among the renames
+  // the model declares, never among what every object inherits.
+  const storedName = (name: string): string =>
+    Object.hasOwn(fieldRenames, name) ? fieldRenames[name]! : name
+  const softDeletes = config.softDelete === true || typeof config.softDelete === "object"
+  refuseReadAsSparseEntry(
+    config.entityType,
+    [
+      ...keyAttributes.map((key) => writtenKey(key)),
+      ...Object.keys(modelFields)
+        .filter((name) => !Object.hasOwn(sparseFields, name))
+        .map((name) => ({
+          attribute: storedName(name),
+          what: `the attribute the field "${name}" is stored in`,
+        })),
+      // A sparse map's entries go under its prefix. Under a `field:` rename a put stores the map
+      // whole in that attribute.
+      ...Object.entries(sparseFields).flatMap(([name, sparse]) => [
+        {
+          attribute: sparse.prefix,
+          what: `the prefix the sparse map "${name}" stores its entries under`,
+        },
+        ...(Object.hasOwn(fieldRenames, name)
+          ? [
+              {
+                attribute: storedName(name),
+                what: `the attribute a put stores the sparse map "${name}" whole in`,
+              },
+            ]
+          : []),
+      ]),
+      // A timestamp or the version a model field also declares is stored where that field is.
+      ...(
+        [
+          [systemFields.createdAt, "its created timestamp"],
+          [systemFields.updatedAt, "its updated timestamp"],
+          [systemFields.version, "its version"],
+        ] as const
+      ).flatMap(([name, holds]) =>
+        name === null
+          ? []
+          : [{ attribute: storedName(name), what: `the attribute that holds ${holds}` }],
+      ),
+      ...(softDeletes
+        ? [
+            { attribute: "deletedAt", what: "the attribute that holds when a row was deleted" },
+            ...Object.entries(vectorIndexes).map(([name, vector]) => ({
+              attribute: vector.stashField,
+              what: `the attribute a deleted row keeps vector index "${name}"'s embedding in`,
+            })),
+          ]
+        : []),
+    ],
+    sparseFields,
+  )
 
   const renameToDynamo = (item: globalThis.Record<string, unknown>): void => {
     if (!hasRenames) return

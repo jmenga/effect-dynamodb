@@ -631,15 +631,34 @@ describe("SparseMap — removeEntries", () => {
     expect(removedNames.sort()).toEqual(["metrics#2026-01", "metrics#2026-02"])
   })
 
-  it("rejects keys containing '#' with a tagged ValidationError", async () => {
+  it("removes the entry a row's reader reads under a key containing '#'", async () => {
+    mockUpdateItem.mockReset()
+    mockUpdateItem.mockImplementation(() =>
+      Promise.resolve({ Attributes: { pk: { S: "x" }, sk: { S: "x" }, pageId: { S: "p1" } } }),
+    )
+    await Effect.runPromise(
+      Pages.update({ pageId: "p1" })
+        .pipe(Entity.removeEntries("metrics", ["bad#key"]))
+        .pipe(Entity.asRecord, Effect.provide(TestLayers, { local: true })),
+    )
+    const call = mockUpdateItem.mock.calls[0]![0]
+    expect(
+      Object.values(call.ExpressionAttributeNames as Record<string, string>).filter((n) =>
+        n.startsWith("metrics#"),
+      ),
+    ).toEqual(["metrics#bad#key"])
+  })
+
+  it("rejects the empty key, which names no entry, with a tagged ValidationError", async () => {
     mockUpdateItem.mockReset()
     mockUpdateItem.mockImplementation(() => Promise.resolve({ Attributes: {} }))
     const result = await Effect.runPromise(
       Pages.update({ pageId: "p1" })
-        .pipe(Entity.removeEntries("metrics", ["bad#key"]))
+        .pipe(Entity.removeEntries("metrics", [""]))
         .pipe(Entity.asRecord, Effect.flip, Effect.provide(TestLayers, { local: true })),
     )
     expect(result).toBeInstanceOf(ValidationError)
+    expect(mockUpdateItem).not.toHaveBeenCalled()
   })
 
   it("rejects calling removeEntries on a non-sparse field", async () => {

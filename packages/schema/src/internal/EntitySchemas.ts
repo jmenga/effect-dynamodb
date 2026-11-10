@@ -440,24 +440,45 @@ export const isSelfDateSchema = (schema: Schema.Top): boolean => {
  * only, and an `Arrays` / `Objects` node never carries an encoding itself — so a
  * `Schema.Array(DateTimeUtcFromString)` attribute was treated as identity and
  * its `DateTime`s were marshalled as maps.
+ *
+ * `throughClasses` looks through a `Schema.Class`'s own step, onto the struct of its fields, and
+ * walks those: a class whose fields hold none of the above reads back as it was given.
  */
-export const containsWireTransform = (schema: Schema.Top): boolean =>
-  astContainsWireTransform(schema.ast, new Set())
+export const containsWireTransform = (
+  schema: Schema.Top,
+  options?: { readonly throughClasses?: boolean | undefined },
+): boolean => astContainsWireTransform(schema.ast, new Set(), options?.throughClasses === true)
 
-const astContainsWireTransform = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>): boolean => {
+/** A `Schema.Class`'s struct, where its only encoding step is the class's own; undefined otherwise. */
+const classStepStruct = (ast: SchemaAST.AST): SchemaAST.AST | undefined => {
+  if (!SchemaAST.isDeclaration(ast) || ast.encoding?.length !== 1) return undefined
+  const to = ast.encoding[0]!.to
+  return SchemaAST.isObjects(to) && ast.typeParameters[0] === to ? to : undefined
+}
+
+const astContainsWireTransform = (
+  ast: SchemaAST.AST,
+  seen: Set<SchemaAST.AST>,
+  throughClasses: boolean,
+): boolean => {
   if (seen.has(ast)) return false
   seen.add(ast)
-  if (ast.encoding !== undefined) return true
+  if (ast.encoding !== undefined) {
+    const struct = throughClasses ? classStepStruct(ast) : undefined
+    return struct === undefined || astContainsWireTransform(struct, seen, throughClasses)
+  }
   if (SchemaAST.isDeclaration(ast)) {
     const resolved = SchemaAST.resolve(ast) as globalThis.Record<string, unknown> | undefined
     const rep = resolved?.representation as { readonly id?: string } | undefined
     return (
       matchDateRepresentation(resolved) !== undefined ||
       rep?.id === "effect/schema/Redacted" ||
-      ast.typeParameters.some((parameter) => astContainsWireTransform(parameter, seen))
+      ast.typeParameters.some((parameter) =>
+        astContainsWireTransform(parameter, seen, throughClasses),
+      )
     )
   }
-  const walk = (child: SchemaAST.AST) => astContainsWireTransform(child, seen)
+  const walk = (child: SchemaAST.AST) => astContainsWireTransform(child, seen, throughClasses)
   if (SchemaAST.isArrays(ast)) return ast.elements.some(walk) || ast.rest.some(walk)
   if (SchemaAST.isObjects(ast)) {
     return (
@@ -1958,7 +1979,7 @@ const holdsPlainForm = (ast: SchemaAST.AST): boolean =>
  */
 const holdsTransformation = (ast: SchemaAST.AST): boolean =>
   SchemaAST.isSuspend(ast)
-    ? astContainsWireTransform(ast, new Set())
+    ? astContainsWireTransform(ast, new Set(), false)
     : holdsPlainForm(ast) &&
       (ast as SchemaAST.Declaration).typeParameters.some(
         (parameter) => SchemaAST.toType(parameter) !== parameter,
@@ -1981,11 +2002,35 @@ const tolerantLeaf = (
   opts: DeepSubstitutionOptions | undefined,
   read: Schema.Top,
 ): Schema.Top => {
+  const type = SchemaAST.toType(schema.ast)
   return buildTolerantTransform(
     read,
     opts?.domainValues,
-    opts?.plainStateForms ? Schema.make<Schema.Top>(SchemaAST.toType(schema.ast)) : undefined,
+    // A plain state holds a declaration in another form. With nothing beneath the domain side that
+    // is one, the plain form is the domain value: asked first, a value read wire first (an
+    // aggregate's `decompose` input) would be taken as the domain value instead.
+    opts?.plainStateForms && holdsDeclaration(type, new Set())
+      ? Schema.make<Schema.Top>(type)
+      : undefined,
   )
+}
+
+/** Whether a declaration (a set, an `Option`, a class, a date) is anywhere in `ast`. */
+const holdsDeclaration = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST>): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (SchemaAST.isDeclaration(ast)) return true
+  const walk = (child: SchemaAST.AST) => holdsDeclaration(child, seen)
+  if (SchemaAST.isArrays(ast)) return ast.elements.some(walk) || ast.rest.some(walk)
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((ps) => walk(ps.type)) ||
+      ast.indexSignatures.some((is) => walk(is.type))
+    )
+  }
+  if (SchemaAST.isUnion(ast)) return ast.types.some(walk)
+  if (SchemaAST.isSuspend(ast)) return walk(ast.thunk())
+  return false
 }
 
 /**
