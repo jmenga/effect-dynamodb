@@ -184,6 +184,7 @@ import {
   deriveAggregateSchemas,
   deriveEntityFieldName,
   elementHoldsRef,
+  given,
   holdsRefId,
   isEntityElement,
   isFieldOptional,
@@ -4829,13 +4830,6 @@ const idEquivalence = (entity: RefEntity): ((a: unknown, b: unknown) => boolean)
  * by `hydrateAggregateRefs` before anything is fetched. Up to 1.39.0 only a string was taken,
  * so a number or bigint id was dropped, and an optional edge was created without it.
  */
-/**
- * What an input holds under `name` itself. Never a member every object inherits: an edge named
- * `constructor` that the input doesn't give is not given.
- */
-const given = (input: Record<string, unknown>, name: string): unknown =>
-  Object.hasOwn(input, name) ? input[name] : undefined
-
 const collectRefIdsFromEdges = (
   result: RefRequest[],
   input: Record<string, unknown>,

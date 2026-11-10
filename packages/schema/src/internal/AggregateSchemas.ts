@@ -429,12 +429,29 @@ export const refKeyComposite = (entity: RefEntity): string | undefined => {
 }
 
 /**
- * What `record` holds under `name` itself, `undefined` where it holds nothing there. Never a member
- * every object inherits: a field or an edge named `constructor` or `toString` that the record
- * doesn't hold is not one.
+ * What a map the library builds or reads a definition from (a schema's fields) holds under `name`
+ * itself, `undefined` where it holds nothing there. Never a member every object inherits: a field
+ * or an edge named `constructor` or `toString` that the definition doesn't declare is not one.
  */
 const own = <A>(record: Readonly<Record<string, A>> | undefined, name: string): A | undefined =>
   record !== undefined && Object.hasOwn(record, name) ? record[name] : undefined
+
+/**
+ * What a caller's payload holds under `name`: its own property, or one its class gives it (a
+ * getter, a property of a prototype), as 1.39.0 read it. Only a member every object inherits from
+ * `Object.prototype` is not held: an edge named `constructor` that the payload doesn't give is not
+ * given.
+ */
+export const given = (payload: object, name: string): unknown => {
+  for (
+    let at: object | null = payload;
+    at !== null && at !== Object.prototype;
+    at = Object.getPrototypeOf(at)
+  ) {
+    if (Object.hasOwn(at, name)) return (payload as Record<string, unknown>)[name]
+  }
+  return undefined
+}
 
 /**
  * The model field an id of `entity` is a value of (its {@link refKeyComposite}), `undefined` when
@@ -574,10 +591,9 @@ export const entityFieldOf = (
  * the entity's name (`deriveEntityFieldName`). One rule for every edge:
  *
  * 1. `null` and `undefined` give no id.
- * 2. A string is fetched, as on 1.39.0, which replaces a record given whole in `field` with the one
- *    fetched; except where the definition declares `${field}Id` and not `field`, as an element that
- *    is the entity declares its own key (`lineId` on a `Line`): there, 1.39.0 dropped the declared
- *    value and put the record in a field the definition doesn't have.
+ * 2. A string is fetched, exactly as on 1.39.0, whatever the definition declares: it replaces a
+ *    record given whole in `field` with the one fetched, and a `${field}Id` the definition declares
+ *    is taken out of the value, as 1.39.0 took it.
  * 3. Any other id (a number, a bigint, a date: a value of the entity's key composite) is fetched only
  *    where the definition's `field` holds the entity's own model (`holdsEntityModel`), the definition
  *    doesn't declare `${field}Id`, which is then its own data, and `field` isn't given whole: a
@@ -589,30 +605,39 @@ export const holdsRefId = (
   entity: RefEntity,
   value: Record<string, unknown>,
 ): boolean => {
-  const id = own(value, `${field}Id`)
+  const id = given(value, `${field}Id`)
   if (id == null) return false
-  const declaresId = fields !== undefined && Object.hasOwn(fields, `${field}Id`)
-  if (typeof id === "string") return !(declaresId && !Object.hasOwn(fields, field))
+  if (typeof id === "string") return true
   return (
     fields !== undefined &&
-    !declaresId &&
+    !Object.hasOwn(fields, `${field}Id`) &&
     holdsEntityModel(own(fields, field), entity) &&
-    own(value, field) == null
+    given(value, field) == null
   )
 }
 
-/** {@link holdsRefId} for a `many` element given as an object, of the element's schema. */
+/**
+ * {@link holdsRefId} for a `many` element given as an object, of the element's schema. An element
+ * that is the entity ({@link isEntityElement}), given whole, holds no id in its own key: where the
+ * entity is keyed by `${field}Id` (`lineId` of a `Line`), that is the entity's own value, which
+ * 1.39.0 took for an id to fetch and failed on.
+ */
 export const elementHoldsRef = (
   element: Schema.Top | undefined,
   entity: RefEntity,
   value: Record<string, unknown>,
-): boolean =>
-  holdsRefId(
+): boolean => {
+  const field = deriveEntityFieldName(entity)
+  if (isEntityElement(element, entity) && refKeyComposites(entity).includes(`${field}Id`)) {
+    return false
+  }
+  return holdsRefId(
     element === undefined ? undefined : getSchemaFields(element),
-    deriveEntityFieldName(entity),
+    field,
     entity,
     value,
   )
+}
 
 /**
  * The element schema of a `many` edge, read off the parent model's field: the array's element, or a

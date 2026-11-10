@@ -1395,6 +1395,155 @@ const reviewedSixth: Record<string, () => Shape> = Object.fromEntries(
   }),
 )
 
+/** A `many` element declaring the entity's id (`lineId`) and not its field: a struct, and a class. */
+const declaresIdStruct = () =>
+  Schema.Struct({ lineId: Schema.optional(Schema.String), qty: Schema.Number }) as Schema.Top
+const declaresIdClass = () => {
+  class Item extends Schema.Class<Item>("Item")({
+    lineId: Schema.optional(Schema.String),
+    qty: Schema.Number,
+  }) {}
+  return Item as unknown as Schema.Top
+}
+const wraps = (Line: Schema.Top) =>
+  Schema.Struct({ line: Line as Schema.Codec<unknown>, qty: Schema.Number }) as Schema.Top
+
+/**
+ * A `many` edge whose element is the entity, keyed by `id`, with an optional `lineId` beside its key
+ * (the name `create` reads an id of the entity under), at the root or in a sub-aggregate `part`.
+ */
+const entityWithOwnId = (sub: boolean) => (): Shape => {
+  class Line extends Schema.Class<Line>("Line")({
+    id: Schema.String,
+    f: Schema.Number,
+    lineId: Schema.optional(Schema.String),
+  }) {}
+  const Lines = lines(DynamoModel.configure(Line, { id: { identifier: true } }), {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  })
+  const edge = () =>
+    Aggregate.many({ entityType: "SheetLine", entity: Lines, sk: { composite: ["id"] } } as never)
+  const Part = Schema.Struct({ lines: Schema.Array(Line) })
+  const element = { id: "x", f: 9, lineId: "l" }
+  return {
+    entities: { Lines },
+    make: (base) => {
+      if (!sub) {
+        return aggregate(Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) }), base, {
+          lines: edge(),
+        })
+      }
+      const Sub = (Aggregate.make as any)(Part, {
+        root: { entityType: "Part" },
+        edges: { lines: edge() },
+      })
+      return aggregate(Schema.Struct({ id: Schema.String, part: Part }), base, {
+        part: Sub.with({ discriminator: { side: 1 } }),
+      })
+    },
+    seed: [["Lines", { id: "l", f: 5 }]],
+    input: sub ? { id: "a", part: { lines: [element] } } : { id: "a", lines: [element] },
+  }
+}
+
+/**
+ * A `one` edge over `Lines` (string-keyed, a class with an identifier), the holder of its field (the
+ * input, or its sub-aggregate `part`) made by `holder` from its own properties.
+ */
+const oneEdgeHeld =
+  (holder: (own: Record<string, unknown>) => Record<string, unknown>, sub: boolean) =>
+  (): Shape => {
+    const { Line, model } = keyedLine(Schema.String, "class")
+    const Lines = lines(model, singleKey)
+    const edge = () => Aggregate.one({ entityType: "AggLine", entity: Lines } as never)
+    return {
+      entities: { Lines },
+      make: (base) => {
+        if (!sub) {
+          return aggregate(Schema.Struct({ id: Schema.String, line: Line }), base, { line: edge() })
+        }
+        const Part = Schema.Struct({ line: Line })
+        const Sub = (Aggregate.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: { line: edge() },
+        })
+        return aggregate(Schema.Struct({ id: Schema.String, part: Part }), base, {
+          part: Sub.with({ discriminator: { side: 1 } }),
+        })
+      },
+      seed: [["Lines", { lineId: "l", f: 5 }]],
+      input: sub ? { id: "a", part: holder({}) } : holder({ id: "a" }),
+    }
+  }
+
+/** A holder of its own properties `own`, its `lineId` given by a getter of its class. */
+const byGetter = (own: Record<string, unknown>): Record<string, unknown> => {
+  class Command {
+    constructor(given: Record<string, unknown>) {
+      Object.assign(this, given)
+    }
+    get lineId() {
+      return "l"
+    }
+  }
+  return new Command(own) as unknown as Record<string, unknown>
+}
+
+/** A holder of its own properties `own`, `inherited` on its prototype. */
+const inheriting =
+  (inherited: Record<string, unknown>) =>
+  (own: Record<string, unknown>): Record<string, unknown> =>
+    Object.assign(Object.create(inherited), own)
+
+/**
+ * Shapes an eighth review found, each at the root and in a sub-aggregate: a `many` element that
+ * declares the entity's id (`lineId`) and not its field, given a string id, which 1.39.0 fetched
+ * (and failed on, where it names no item); an element that is the entity, with an optional field of
+ * that name beside its key; and an id, or the entity whole, that the input holds through its class
+ * (a getter) or its prototype, which 1.39.0 read.
+ */
+const reviewedEighth: Record<string, () => Shape> = Object.fromEntries(
+  [false, true].flatMap((sub) => {
+    const at = (label: string) => (sub ? `sub-aggregate, ${label}` : label)
+    return [
+      [
+        at("many, element a struct declaring the entity's id and not its field, given a string id"),
+        classSheet(declaresIdStruct, { lineId: "l", qty: 1 }, sub),
+      ],
+      [
+        at(
+          "many, element a struct declaring the entity's id and not its field, given a string id naming no item",
+        ),
+        classSheet(declaresIdStruct, { lineId: "nope", qty: 1 }, sub),
+      ],
+      [
+        at("many, element a class declaring the entity's id and not its field, given a string id"),
+        classSheet(declaresIdClass, { lineId: "l", qty: 1 }, sub),
+      ],
+      [
+        at(
+          "many, element the entity with an optional field of its id's name beside its key, given whole with a string in it",
+        ),
+        entityWithOwnId(sub),
+      ],
+      [
+        at("many, element wraps the entity, its id inherited from the element's prototype"),
+        classSheet(wraps, inheriting({ lineId: "l" })({ qty: 1 }), sub),
+      ],
+      [at("one, its id given by a getter of the input's class"), oneEdgeHeld(byGetter, sub)],
+      [
+        at("one, its id inherited from the input's prototype"),
+        oneEdgeHeld(inheriting({ lineId: "l" }), sub),
+      ],
+      [
+        at("one, the entity whole inherited from the input's prototype"),
+        oneEdgeHeld(inheriting({ line: { lineId: "x", f: 2 } }), sub),
+      ],
+    ] as const
+  }),
+)
+
 export const SHAPES: Record<string, () => Shape> = {
   "many, element the entity's struct, given whole": () => {
     const Line = lineStruct()
@@ -1444,6 +1593,7 @@ export const SHAPES: Record<string, () => Shape> = {
   ...reviewedFourth,
   ...reviewedFifth,
   ...reviewedSixth,
+  ...reviewedEighth,
 }
 
 export const byKey = (rows: ReadonlyArray<Row>) =>
@@ -1550,16 +1700,8 @@ export const UNKEYABLE = {
 export const JUDGED_AS_139 = Object.keys(reviewedFifth).filter((label) => !UNIONS.includes(label))
 /**
  * The sixth review's shapes, each sending the requests 1.39.0 sent and writing and reading what it
- * did, but those {@link WRITES_AS} names and an element declaring the entity's fields again given
- * whole ({@link STORED_AS_GIVEN}).
+ * did, but those {@link WRITES_AS} names.
  */
-export const SIXTH = Object.keys(reviewedSixth).filter(
-  (label) => !(label in WRITES_AS) && !label.endsWith("and fields, given it whole"),
-)
-/**
- * An element of a class declaring the entity's fields again, given whole, whose `lineId` is its own
- * value: stored as given, nothing fetched. 1.39.0 took it for an id, fetched, and failed decoding.
- */
-export const STORED_AS_GIVEN = Object.keys(reviewedSixth).filter((label) =>
-  label.endsWith("and fields, given it whole"),
-)
+export const SIXTH = Object.keys(reviewedSixth).filter((label) => !(label in WRITES_AS))
+/** The eighth review's shapes, each sending the requests 1.39.0 sent, writing and reading what it did. */
+export const EIGHTH = Object.keys(reviewedEighth)

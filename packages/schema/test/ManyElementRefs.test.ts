@@ -17,6 +17,7 @@ import {
   deriveElementInputSchema,
   elementHoldsRef,
   entityFieldOf,
+  given,
   holdsRefId,
   isEntityElement,
 } from "../src/internal/AggregateSchemas.js"
@@ -340,8 +341,12 @@ describe("an element that is the entity", () => {
     // The wrapper names the field holding the entity: its string `lineId` is fetched, as on 1.39.0.
     expect(entityFieldOf(Wrapper, Lines)).toBe("line")
     expect(holdsRef(Wrapper, { lineId: "l", qty: 1 })).toBe(true)
-    // The lookalike declares `lineId`, its own value, and no `line`: nothing is fetched.
-    expect(holdsRef(Lookalike, { lineId: "l", f: 1 })).toBe(false)
+    // The lookalike declares `lineId` and no `line`: its string `lineId` is fetched, as on 1.39.0.
+    expect(holdsRef(Lookalike, { lineId: "l", f: 1 })).toBe(true)
+    // So is an optional one an element declares, which 1.39.0 fetched and took out of the value.
+    const declaresId = Schema.Struct({ lineId: Schema.optional(Schema.String), qty: Schema.Number })
+    expect(holdsRef(declaresId, { lineId: "l", qty: 1 })).toBe(true)
+    expect(holdsRef(declaresId, { qty: 1 })).toBe(false)
     // A copy that changes only annotations, checks or a brand is the entity's model.
     for (const element of [
       Line,
@@ -366,6 +371,20 @@ describe("an element that is the entity", () => {
     expect(holdsRef(Line, { lineId: "l", f: 1 })).toBe(false)
     expect(isEntityElement(Row, Rows)).toBe(true)
     expect(elementHoldsRef(Row, Rows, { lineId: 5, f: 1 })).toBe(false)
+    // An entity keyed by another field, with an optional field of the id's name: a string in it is
+    // fetched, as on 1.39.0. It isn't the entity's own key.
+    class Keyed extends Schema.Class<Keyed>("Line")({
+      id: Schema.String,
+      lineId: Schema.optional(Schema.String),
+    }) {}
+    const KeyedLines = Entity.make({
+      model: DynamoModel.configure(Keyed, { id: { identifier: true } }),
+      entityType: "Line",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    }) as unknown as RefEntity
+    expect(isEntityElement(Keyed, KeyedLines)).toBe(true)
+    expect(elementHoldsRef(Keyed, KeyedLines, { id: "x", lineId: "l" })).toBe(true)
+    expect(elementHoldsRef(Keyed, KeyedLines, { id: "x" })).toBe(false)
   })
 
   it("its input: an id of the key composite's type, or the entity whole", () => {
@@ -417,17 +436,33 @@ describe("a `one` edge's id follows the rule a `many` element's does (`holdsRefI
     expect(holdsRefId(undefined, "numbered", NumberedLines, { numberedId: "5" })).toBe(true)
   })
 
-  it("a field or an id only inherited from every object is neither declared nor given", () => {
+  it("a field every object inherits isn't declared, and an id a class gives its input is given", () => {
     // `constructor` is a member of every object: a model that doesn't declare it holds no entity
     // there, and an edge of that name is no declared field.
     expect(holdsRefId({}, "constructor", NumberedLines, { constructorId: 5 })).toBe(false)
-    // An id the input doesn't hold itself is not given.
     const fields = { numbered: Numbered }
+    // An id on the input's prototype, or one a getter of its class gives, is given, as on 1.39.0.
     expect(holdsRefId(fields, "numbered", NumberedLines, Object.create({ numberedId: 5 }))).toBe(
-      false,
+      true,
     )
-    // A whole record the input only inherits isn't given whole.
+    expect(holdsRefId(fields, "numbered", NumberedLines, Object.create({ numberedId: "5" }))).toBe(
+      true,
+    )
+    class Command {
+      get numberedId() {
+        return 5
+      }
+    }
+    expect(
+      holdsRefId(fields, "numbered", NumberedLines, new Command() as unknown as Record<string, 5>),
+    ).toBe(true)
+    // So is the entity whole: beside it, an id of another type than a string isn't fetched.
     const inherits = Object.assign(Object.create({ numbered: whole }), { numberedId: 5 })
-    expect(holdsRefId(fields, "numbered", NumberedLines, inherits)).toBe(true)
+    expect(holdsRefId(fields, "numbered", NumberedLines, inherits)).toBe(false)
+    // Only a member every object inherits from `Object.prototype` isn't given.
+    expect(given({ id: "a" }, "constructor")).toBeUndefined()
+    expect(given({ id: "a" }, "toString")).toBeUndefined()
+    expect(given(Object.create({ toString: "x" }), "toString")).toBe("x")
+    expect(given(Object.create(null), "id")).toBeUndefined()
   })
 })

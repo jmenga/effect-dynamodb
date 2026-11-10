@@ -32,6 +32,7 @@ import * as Table from "../src/Table.js"
 import {
   byKey,
   CONTROLS,
+  EIGHTH,
   fixture,
   JUDGED_AS_139,
   json,
@@ -40,7 +41,6 @@ import {
   SHAPES,
   type Shape,
   SIXTH,
-  STORED_AS_GIVEN,
   schema,
   UNFETCHABLE,
   UNIONS,
@@ -223,6 +223,7 @@ describeConnected(
       ...JUDGED_AS_139,
       "many, element declares the entity's field a string, given it and a lineId",
       ...SIXTH,
+      ...EIGHTH,
     ]) {
       it.effect(`${label}: writes and reads what 1.39.0 did`, () =>
         Effect.gen(function* () {
@@ -230,23 +231,6 @@ describeConnected(
           expect(outcomeOf(create)).toBe(fixture.shapes[label]!.create)
           expect(byKey(rows)).toEqual(byKey(fixture.shapes[label]!.rows))
           expect(outcomeOf(get)).toBe(fixture.shapes[label]!.get)
-        }),
-      )
-    }
-
-    for (const label of STORED_AS_GIVEN) {
-      it.effect(`${label}: stored as given`, () =>
-        Effect.gen(function* () {
-          const { create, rows, get } = yield* run(SHAPES[label]!())
-          const lines = [{ lineId: "l", f: 5, qty: 1 }]
-          const sub = label.startsWith("sub-aggregate")
-          expect(Exit.isSuccess(create) && json(create.value)).toBe(
-            json(sub ? { id: "a", part: { lines } } : { id: "a", lines }),
-          )
-          expect(rows.filter((row) => row.__edd_e__?.S === "SheetLine")).toHaveLength(1)
-          expect(Exit.isSuccess(get) && json(get.value)).toBe(
-            json((create as Exit.Success<unknown>).value),
-          )
         }),
       )
     }

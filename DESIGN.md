@@ -4043,9 +4043,11 @@ guess at what a field's schema can hold:
   the entity, or declaring its fields again) is another schema, judged as any
   other element. Every question of whether a schema is the entity is asked of
   `isEntityModel`. Its values are an id of the key composite's type, or the
-  entity whole. Given whole, it holds no ref: its key field (`lineId` of a
-  `Line`) is its own value. Up to 1.39.0 it was taken for a ref because its
-  name was `${field}Id`, and `create` died composing the key.
+  entity whole. Given whole, it holds no ref in its own key: where the entity
+  is keyed by `${field}Id` (`lineId` of a `Line`), that is the entity's own
+  value (`elementHoldsRef`). Up to 1.39.0 it was taken for a ref because its
+  name was `${field}Id`, and `create` died composing the key. A string in any
+  other field of that name is fetched, as on 1.39.0.
 - **The element names the field holding the entity** (`entityFieldOf`): a plain
   `Schema.Struct` or `Schema.Class` (no union, transformation, `suspend` or
   declaration at the element) whose field of the entity's name is the entity's
@@ -4078,22 +4080,30 @@ or `ref` edge (`field` the edge's name, read off the model's fields) and a
 alike (`holdsRefId`):
 
 1. `null` and `undefined` give no id.
-2. A string is fetched, as on 1.39.0, which replaces an entity given whole in
-   `field` with the one fetched; except where the definition declares
-   `${field}Id` and not `field`, as an element that is the entity declares its
-   own key: 1.39.0 dropped the declared value there and put the record in a
-   field the definition doesn't have.
+2. A string is fetched, exactly as on 1.39.0, whatever the definition
+   declares: it replaces an entity given whole in `field` with the one
+   fetched, and a `${field}Id` the definition declares is taken out of the
+   value, as 1.39.0 took it.
 3. Any other id is fetched only where `field` holds the entity's own model
    (under `optional` at most), the definition doesn't declare `${field}Id`
    (then it is the definition's own data, stored as given), and `field` isn't
    given whole (then it is stored as given, never replaced or read again).
    1.39.0 fetched none of these.
 
+The id, and the entity given whole, are read off the caller's payload as
+1.39.0 read them (`given`): the payload's own property, or one its class gives
+it (a getter, a property of a prototype). Only a member every object inherits
+from `Object.prototype` is not given, so an edge named `constructor` that the
+payload doesn't give is not given. A definition's fields, which the library
+reads off a schema, are looked up among what the schema declares itself
+(`Object.hasOwn`).
+
 A managed timestamp is optional in every element's input.
 
 The input type (`AggregateTypes`) follows the same rule, read from the
 element's *schema* type, never its domain type, so a union whose members have
-one domain type is still a union. It only adds to 1.39.0's: every element is
+one domain type is still a union. For an entity one id names, it only adds to
+1.39.0's: every element is
 typed as 1.39.0 typed it (a field whose type has an `id: string` by id,
 whatever its name, an element with one as an id), and the id forms are added
 beside that. An element of the entity's model schema type (with fields of its
