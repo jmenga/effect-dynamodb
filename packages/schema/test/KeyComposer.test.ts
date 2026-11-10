@@ -3710,3 +3710,91 @@ describe("composeKnownHalves", () => {
     )
   })
 })
+
+describe("composeKeySpace", () => {
+  const schema = DynamoSchema.make({ name: "a", version: 1, escapeKeys: true })
+  const index = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>, collection?: string) => ({
+    pk: { field: "pk", composite: [...pk] },
+    sk: { field: "sk", composite: [...sk] },
+    ...(collection === undefined ? {} : { collection, type: "clustered" as const }),
+  })
+
+  it("is the text before the first composite's value, its label included", () => {
+    expect(
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop", "x"], ["name"])),
+    ).toEqual({
+      pk: { text: "$a#v1#ledger#shop_", after: [], open: true },
+      sk: { text: "$a#v1#ledger#name_", after: [], open: true },
+    })
+    expect(
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop"], ["name"], "ca")),
+    ).toEqual({
+      pk: { text: "$a#v1#ca#shop_", after: [], open: true },
+      sk: { text: "$a#v1#ca#ledger_1#name_", after: [], open: true },
+    })
+  })
+
+  it("is the whole key for a half with no composite", () => {
+    expect(KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop"], [])).sk).toEqual({
+      text: "$a#v1#ledger",
+      after: [],
+      open: false,
+    })
+  })
+
+  it("goes on past a composite that can't hold the delimiter, to the next label", () => {
+    const closed = (name: string) => name === "n" || name === "m"
+    const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string> = []) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk), closed)
+    // Up to the first composite that can hold it, its label included.
+    expect(space(["n", "shop", "x"]).pk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#shop_"],
+      open: true,
+    })
+    // Every composite walked: the key ends after the last value.
+    expect(space(["n", "m"]).pk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#m_", ""],
+      open: false,
+    })
+    expect(space(["shop"], ["n", "name"]).sk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#name_"],
+      open: true,
+    })
+    const meet = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) =>
+      KeyComposer.keySpacesMeet(space(a).pk, space(b).pk)
+    // The labels after the value differ: no key of one is a key of the other.
+    expect(meet(["n", "idA"], ["n", "idB"])).toBe(false)
+    expect(meet(["n", "m"], ["n", "idB"])).toBe(false)
+    // One ends where the other goes on.
+    expect(meet(["n"], ["n", "idA"])).toBe(false)
+    expect(meet(["n", "m"], ["n", "m", "idA"])).toBe(false)
+    // The same labels: one space, whatever follows the first open value.
+    expect(meet(["n", "idA"], ["n", "idA", "idB"])).toBe(true)
+    expect(meet(["n", "m"], ["n", "m"])).toBe(true)
+    // A label that starts another's: the longer one's rest can be the shorter one's value.
+    expect(meet(["n", "id"], ["n", "id_b"])).toBe(true)
+    // A value that can hold the delimiter can hold the other's next label too.
+    expect(meet(["shop", "idA"], ["shop", "idB"])).toBe(true)
+    expect(meet(["shop"], ["shop", "idB"])).toBe(true)
+  })
+
+  it("meets another when either could start the other", () => {
+    const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk))
+    const meet = (a: ReturnType<typeof space>, b: ReturnType<typeof space>) =>
+      KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
+    // Different first composites: apart.
+    expect(meet(space(["idA"], ["name"]), space(["idB"], ["name"]))).toBe(false)
+    // The same first composite: one space, whatever follows.
+    expect(meet(space(["idA"], ["name"]), space(["idA", "idB"], ["name"]))).toBe(true)
+    // A whole key starting with an open space's text, and two whole keys.
+    const whole = { text: "$a#v1#ledger#shop_x", after: [], open: false }
+    const other = (text: string) => ({ text, after: [], open: false })
+    expect(KeyComposer.keySpacesMeet(space(["shop"], []).pk, whole)).toBe(true)
+    expect(KeyComposer.keySpacesMeet(whole, other("$a#v1#ledger#shop_x"))).toBe(true)
+    expect(KeyComposer.keySpacesMeet(whole, other("$a#v1#ledger#shop_y"))).toBe(false)
+  })
+})

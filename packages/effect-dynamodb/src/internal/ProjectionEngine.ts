@@ -17,6 +17,7 @@
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
+import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   ConcurrentModification,
   type ConditionalCheckFailed,
@@ -26,11 +27,18 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
+  keyFormLiterals,
+  keyFormValueKind,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
+import {
   readingStreamValues,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
+  type Context,
   DateTime,
   Duration as Dur,
   type Duration,
@@ -333,7 +341,204 @@ interface Row {
   readonly createdAt: unknown
 }
 
-/** @internal */
+/** A table's service, as an entity or an outbox names it. */
+type TableTag = Context.Service<TableConfig, TableConfig>
+
+/** A projection's outbox on another table, as its read model records it (#171). */
+type RemoteOutbox = ProjectionOutboxLayout & { readonly table: { readonly Tag: TableTag } }
+
+/**
+ * @internal The outboxes on other tables of the read model's projections (`_projectionOutboxes`,
+ * the entries with a `table`): several projections of one read model may each have one. A local
+ * outbox is on the read model's own table, where its rows are.
+ */
+export const remoteOutboxesOf = (entity: unknown): ReadonlyArray<RemoteOutbox> =>
+  (
+    (entity as { readonly _projectionOutboxes?: ReadonlyArray<ProjectionOutboxLayout> })
+      ._projectionOutboxes ?? []
+  ).filter((outbox): outbox is RemoteOutbox => outbox.table !== undefined)
+
+/**
+ * @internal The physical name of the table `tag` names, the one requests are sent to:
+ * `undefined` when the context doesn't provide it.
+ */
+export const physicalTableName = (tag: TableTag): Effect.Effect<string | undefined> =>
+  Effect.map(Effect.serviceOption(tag), (config) =>
+    Option.isSome(config) ? config.value.name : undefined,
+  )
+
+/**
+ * Whether a composite of `model` can't hold `#` in its key text, by its schema: a number, a bigint
+ * or a boolean, or literals none of which holds one. Numeric key text has no `#`, and no casing or
+ * escaping adds one. Any other field (a string, a field the model doesn't declare) may hold it.
+ */
+const holdsNoDelimiter =
+  (model: unknown) =>
+  (composite: string): boolean => {
+    if (model === undefined || model === null) return false
+    const schema = isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top)
+    const fields = getSchemaFields(schema)
+    if (fields === undefined || !Object.hasOwn(fields, composite)) return false
+    const field = fields[composite]!
+    const kind = keyFormValueKind(field)
+    if (kind === "number" || kind === "bigint" || kind === "boolean") return true
+    const literals = kind === "string" ? keyFormLiterals(field) : undefined
+    return literals?.every((literal) => !String(literal).includes("#")) ?? false
+  }
+
+/** The key spaces of an entity's rows, each half's (`KeyComposer.composeKeySpace`). */
+type KeySpace = { readonly pk: KeyComposer.KeySpace; readonly sk: KeyComposer.KeySpace }
+
+/**
+ * The key space an entity's rows are under: the text its primary key's partition and sort keys
+ * start with, up to the first composite's value and that composite's label included, composed by
+ * the call its writes make (`KeyComposer.composeKeySpace`) — the schema's name and version, the
+ * primary collection (or the entity type), under a collection the entity type and its version, and
+ * the first composite's name. Past a composite whose key text can't hold `#` (`holdsNoDelimiter`)
+ * it goes on to the next label, so read models whose keys part only there are apart. `plain` is the
+ * space of its keys whose values hold no `#`: every composite is walked, to the end of the key.
+ * `undefined` for an entity on no table.
+ */
+const keySpaceOf = (entity: unknown, plain = false): KeySpace | undefined => {
+  const member = entity as {
+    readonly entityType?: string
+    readonly _entityVersion?: number
+    readonly indexes?: { readonly primary?: IndexDefinition }
+    readonly _schema?: DynamoSchema.DynamoSchema
+    readonly model?: unknown
+  }
+  const primary = member.indexes?.primary
+  if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
+    return undefined
+  }
+  try {
+    return KeyComposer.composeKeySpace(
+      member._schema,
+      member.entityType,
+      member._entityVersion ?? 1,
+      primary,
+      plain ? () => true : holdsNoDelimiter(member.model),
+    )
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The key space of a read model's outbox items: its rows' partition keys, and its rows' sort keys
+ * followed by `#outbox#` (`<rowSk>#outbox#<revision>#<n>`), so any text after a whole sort key.
+ */
+const outboxSpaceOf = (space: KeySpace): KeySpace => {
+  const { sk } = space
+  if (sk.open) return space
+  const last = sk.after.length - 1
+  return {
+    pk: space.pk,
+    sk:
+      last < 0
+        ? { text: `${sk.text}#outbox#`, after: [], open: true }
+        : { ...sk, after: [...sk.after.slice(0, last), `${sk.after[last]}#outbox#`], open: true },
+  }
+}
+
+/** Whether a key of one key space can be a key of the other, in both halves. */
+const spacesMeet = (a: KeySpace, b: KeySpace): boolean =>
+  KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
+
+/**
+ * @internal `[EDD-9134]`: among `members` (each named as `site`'s message shows it), a read model
+ * whose projection's outbox is on another table, where another read model in the same key space
+ * has its outbox too. A member's rows on that table aren't looked at: an item's sort key is a
+ * whole row sort key followed by `#outbox#`, so a row's key is an item's only through a value
+ * holding that text, and `rekey` tells the two apart by `__edd_e__`. Tables are compared by the physical name the context resolves (two handles on one table are one
+ * table), and by service when one isn't provided. The problem, or `undefined`.
+ *
+ * Two questions, by `scope`:
+ *
+ * - `"plain"` (where read models are bound: `DynamoClient.make`, `EventStore.processBatch`): can a
+ *   key of one be a key of the other with values that hold no `#`? Then their items overwrite each
+ *   other whenever their values match, in normal operation. Read models whose keys meet only
+ *   through a value holding `#` bind and run, as on 1.39.0.
+ * - a table (`rekey` of it): can a key of one be read back as a key of the other at all, a string
+ *   value holding `#` included? `rekey` reads an item's key back by the key space it names, so it
+ *   couldn't tell whose an item on that table is. Only outboxes on that table are looked at.
+ *
+ * Read models that never meet at a site that sees several at once can't be checked: their key
+ * spaces must be kept apart by whoever defines them.
+ */
+export const sharedOutboxKeySpace = (
+  site: string,
+  members: ReadonlyArray<readonly [name: string, entity: unknown]>,
+  scope: "plain" | { readonly key: string; readonly name: string },
+): Effect.Effect<string | undefined> =>
+  Effect.gen(function* () {
+    const plain = scope === "plain"
+    // Every table a member's outbox is on, by its physical name.
+    const names = new Map<string, string | undefined>()
+    for (const [, entity] of members) {
+      for (const { table } of remoteOutboxesOf(entity)) {
+        if (!names.has(table.Tag.key)) {
+          names.set(table.Tag.key, yield* physicalTableName(table.Tag))
+        }
+      }
+    }
+    const oneTable = (a: TableTag, b: TableTag): boolean => {
+      if (a.key === b.key) return true
+      const name = names.get(a.key)
+      return name !== undefined && name === names.get(b.key)
+    }
+    for (const [name, entity] of members) {
+      {
+        const space = keySpaceOf(entity, plain)
+        if (space === undefined) continue
+        const items = outboxSpaceOf(space)
+        for (const outbox of remoteOutboxesOf(entity)) {
+          const into = outbox.table.Tag
+          if (!plain && into.key !== scope.key && names.get(into.key) !== scope.name) continue
+          for (const [otherName, other] of members) {
+            if (other === entity) continue
+            const otherSpace = keySpaceOf(other, plain)
+            if (otherSpace === undefined) continue
+            if (
+              !remoteOutboxesOf(other).some((o) => oneTable(o.table.Tag, into)) ||
+              !spacesMeet(items, outboxSpaceOf(otherSpace))
+            ) {
+              continue
+            }
+            const physical = names.get(into.key)
+            return (
+              `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
+              `table${physical === undefined ? "" : ` ("${physical}")`}, where ${otherName} ` +
+              "writes its own under the same key space " +
+              `(partition keys starting "${space.pk.text}", sort keys starting ` +
+              `"${space.sk.text}": the same schema name and version, primary collection, ` +
+              "entity type and first composite). " +
+              (plain
+                ? "Their items would overwrite each other whenever their keys match, and rekey " +
+                  "couldn't tell whose an item is. "
+                : "rekey reads an item's key back by its key space, and couldn't tell whose an " +
+                  "item on this table is. ") +
+              "Give one of them its own entity type, collection, schema or key composites."
+            )
+          }
+        }
+      }
+    }
+    return undefined
+  })
+
+/**
+ * @internal `[EDD-9134]` ({@link sharedOutboxKeySpace}) as a defect, from the sites that define
+ * what runs (`DynamoClient.make`, `EventStore.processBatch`), before anything runs.
+ */
+export const refuseSharedOutboxKeySpace = (
+  site: string,
+  members: ReadonlyArray<readonly [name: string, entity: unknown]>,
+): Effect.Effect<void> =>
+  Effect.flatMap(sharedOutboxKeySpace(site, members, "plain"), (problem) =>
+    problem === undefined ? Effect.void : Effect.die(new Error(problem)),
+  )
+
 export const makeEngine = (config: EngineConfig) => {
   const { readModel } = config
   const entityType = readModel.entityType

@@ -976,3 +976,78 @@ describe("a failed aggregate's conflict says what went wrong", () => {
     }).pipe(provide)
   })
 })
+
+/**
+ * An aggregate whose edge rows are also an entity member's type: the entity can't read their keys
+ * back, the aggregate moves them. Each row is counted once, by the aggregate; before, the entity
+ * counted the edges `unrecognizedKey` as well, so the report's totals came to more than `scanned`.
+ */
+describe.each(
+  SETTINGS,
+)("rows one member moves and another can't read back, %s", (_d, escapeKeys) => {
+  const sharedType = (escape: boolean) => {
+    const schema = DynamoSchema.make({ name: "complete", version: 1, escapeKeys: escape })
+    const Stops = Entity.make({
+      model: Stop,
+      entityType: "RouteStop",
+      primaryKey: {
+        pk: { field: "pk", composite: ["label"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const MainTable = Table.make({ schema, entities: { Stops } })
+    const Routes = Aggregate.make(Route, {
+      table: MainTable,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "routes" },
+      root: { entityType: "RouteItem" },
+      edges: {
+        stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
+      },
+    })
+    const client = DynamoClient.make({
+      entities: { Stops },
+      aggregates: { Routes },
+      tables: { MainTable },
+    })
+    return { MainTable, client }
+  }
+
+  it.effect("are counted once, by the member that moves them", () => {
+    const table = tableOf()
+    const written = sharedType(!escapeKeys)
+    const now = sharedType(escapeKeys)
+    return Effect.gen(function* () {
+      const before = yield* written.client
+      yield* before.aggregates.Routes.create({
+        id: "r 1",
+        name: "n",
+        stops: [new Stop({ label: "a b", note: "1" }), new Stop({ label: "c d", note: "2" })],
+      })
+      const db = yield* now.client
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ dryRun: true })
+      const real: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      for (const report of [dry, real]) {
+        expect(report.scanned).toBe(3)
+        // Three rows, three moves.
+        expect(report.moved.aggregate).toBe(3)
+        expect(report.skipped.unrecognizedKey).toBe(0)
+        expect(report.conflicts).toEqual([])
+      }
+      const found = yield* db.aggregates.Routes.get({ id: "r 1" })
+      expect(found.stops.map((stop) => stop.label).sort()).toEqual(["a b", "c d"])
+      const again: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      expect(again.moved.aggregate).toBe(0)
+      expect(again.skipped.unrecognizedKey).toBe(0)
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          table.layer,
+          written.MainTable.layer({ name: "t" }),
+          now.MainTable.layer({ name: "t" }),
+        ),
+      ),
+    )
+  })
+})

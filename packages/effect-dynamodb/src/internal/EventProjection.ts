@@ -53,6 +53,7 @@ import {
   type OutboxMeta,
   type RemoveRow,
   type RowResult,
+  refuseSharedOutboxKeySpace,
   retrySchedule,
   type SkipEvent,
 } from "./ProjectionEngine.js"
@@ -704,6 +705,14 @@ export type EventProjectionTypeId = typeof EventProjectionTypeId
 export const ProjectionRoutes: unique symbol = Symbol.for("effect-dynamodb/EventProjection/Routes")
 
 /**
+ * @internal The read model a projection writes, for the sites that check several projections'
+ * read models together (`EventStore.processBatch`, `[EDD-9134]`).
+ */
+export const ProjectionReadModelKey: unique symbol = Symbol.for(
+  "effect-dynamodb/EventProjection/ReadModel",
+)
+
+/**
  * A change-feed projection: one source stream folded into read-model rows —
  * see {@link projection}. Its operations need `DynamoClient | TableConfig`
  * (the stream's table and the read model's) and `evolve`'s requirements;
@@ -725,6 +734,8 @@ export interface EventProjection<
   /** The source stream. */
   readonly stream: EventStream<A, TStreamIdFields, any, any, any, any, any>
   /** @internal See {@link ProjectionRoutes}. */
+  /** @internal See {@link ProjectionReadModelKey}. */
+  readonly [ProjectionReadModelKey]: unknown
   readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route>
   /** The read model's entity type. */
   readonly entityType: string
@@ -1343,6 +1354,7 @@ export const projection = <
     },
     stream,
     entityType: readModel.entityType,
+    [ProjectionReadModelKey]: readModel,
     [ProjectionRoutes]: (name: string): ReadonlyArray<Route> => [
       {
         name,
@@ -1688,19 +1700,33 @@ export const processBatch: {
     ProjectionRequirementsOf<Projections[keyof Projections]>
   >
 } = (records: ReadonlyArray<unknown>, options: any): any =>
-  Capacity.operation(
-    "EventStore.processBatch",
-    undefined,
-    runBatch(
+  Effect.andThen(
+    // `[EDD-9134]`: the read models of the projections it's handed, before anything runs.
+    Effect.suspend(() =>
+      refuseSharedOutboxKeySpace(
+        "EventStore.processBatch",
+        Object.entries(
+          options.projections as Record<string, { readonly [ProjectionReadModelKey]: unknown }>,
+        ).map(
+          ([name, projection]) =>
+            [`the read model of "${name}"`, projection[ProjectionReadModelKey]] as const,
+        ),
+      ),
+    ),
+    Capacity.operation(
       "EventStore.processBatch",
-      records,
-      options,
-      Object.entries(
-        options.projections as Record<
-          string,
-          { readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route> }
-        >,
-      ).flatMap(([name, projection]) => projection[ProjectionRoutes](name)),
-      Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
+      undefined,
+      runBatch(
+        "EventStore.processBatch",
+        records,
+        options,
+        Object.entries(
+          options.projections as Record<
+            string,
+            { readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route> }
+          >,
+        ).flatMap(([name, projection]) => projection[ProjectionRoutes](name)),
+        Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
+      ),
     ),
   )

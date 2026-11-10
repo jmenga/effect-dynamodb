@@ -2092,6 +2092,120 @@ export const composeSortKeyBeginsWith = (
 export const SORT_KEY_MAX = "\uFFFF"
 
 /**
+ * @internal The keys of one half of an index, as text: `text`, what the composer writes before the
+ * first composite's value, that composite's label included, or the whole key of a half with no
+ * composite. Then, for each leading composite whose value can't hold the key delimiter, that value
+ * and the text written after it (`after`): the next composite's label, or the end of the key. `open`
+ * says any text follows: the value of the first composite that can hold the delimiter, and
+ * everything after it.
+ */
+export interface KeySpace {
+  readonly text: string
+  readonly after: ReadonlyArray<string>
+  readonly open: boolean
+}
+
+/**
+ * @internal The key spaces of an index's partition and sort keys ({@link KeySpace}), as {@link composePk} and
+ * {@link composeSk} write them. Each walked composite's value is composed as U+FFFF, which no
+ * casing or escaping changes and no label holds, and the text is cut there. The walk goes on past a
+ * composite `closed` says can't hold the delimiter (a number, say): its value ends where the next
+ * label starts. It stops at the first that can: a partition key's values aren't escaped, so text
+ * after one can always match another key's. Without `closed`, at the first composite.
+ */
+export const composeKeySpace = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  closed: (composite: string) => boolean = () => false,
+): { readonly pk: KeySpace; readonly sk: KeySpace } => {
+  const half = (
+    composite: ReadonlyArray<string>,
+    compose: (walked: ReadonlyArray<string>, record: Record<string, unknown>) => string,
+  ): KeySpace => {
+    const walked: Array<string> = []
+    let open = false
+    for (const name of composite) {
+      walked.push(name)
+      if (!closed(name)) {
+        open = true
+        break
+      }
+    }
+    if (walked.length === 0) return { text: compose([], {}), after: [], open: false }
+    const record: Record<string, unknown> = Object.create(null)
+    for (const name of walked) record[name] = SORT_KEY_MAX
+    const [text = "", ...rest] = compose(walked, record).split(SORT_KEY_MAX)
+    // The text after an open value isn't the key's: anything follows it.
+    return { text, after: open ? rest.slice(0, -1) : rest, open }
+  }
+  return {
+    pk: half(index.pk.composite, (composite, record) =>
+      composePk(
+        schema,
+        entityType,
+        { ...index, pk: { ...index.pk, composite: [...composite] } },
+        record,
+      ),
+    ),
+    sk: half(index.sk.composite, (composite, record) =>
+      composeSk(
+        schema,
+        entityType,
+        entityVersion,
+        { ...index, sk: { ...index.sk, composite: [...composite] } },
+        record,
+      ),
+    ),
+  }
+}
+
+/**
+ * @internal Whether a key of one {@link KeySpace} can be a key of the other. Each is literal text
+ * with values between: a walked value is any text without the delimiter, and an open space ends in
+ * any text at all. The two are matched text against text, a value taking as much of the other's
+ * text as it can hold.
+ */
+export const keySpacesMeet = (a: KeySpace, b: KeySpace): boolean => {
+  type Token = string | "value" | "rest"
+  const tokens = (space: KeySpace): ReadonlyArray<Token> => {
+    const out: Array<Token> = [...space.text].map((char) => `=${char}`)
+    for (const text of space.after) {
+      out.push("value", ...[...text].map((char) => `=${char}`))
+    }
+    if (space.open) out.push("rest")
+    return out
+  }
+  const ta = tokens(a)
+  const tb = tokens(b)
+  const seen = new Map<number, boolean>()
+  /** Whether what's left of each from `i` and `j` can be the same text. */
+  const meet = (i: number, j: number): boolean => {
+    const key = i * (tb.length + 1) + j
+    const known = seen.get(key)
+    if (known !== undefined) return known
+    const x = ta[i]
+    const y = tb[j]
+    let result: boolean
+    if (x === "rest" || y === "rest") result = true
+    else if (x === undefined && y === undefined) result = true
+    // One has ended: the other's remaining values must all be empty.
+    else if (x === undefined) result = y === "value" && meet(i, j + 1)
+    else if (y === undefined) result = x === "value" && meet(i + 1, j)
+    else if (x === "value") {
+      // The value ends here, or takes the other's next character (never a delimiter).
+      result = meet(i + 1, j) || ((y === "value" || y !== `=${KEY_DELIMITER}`) && meet(i, j + 1))
+    } else if (y === "value") {
+      result = meet(i, j + 1) || (x !== `=${KEY_DELIMITER}` && meet(i + 1, j))
+    } else result = x === y && meet(i + 1, j + 1)
+    seen.set(key, result)
+    return result
+  }
+  return meet(0, 0)
+}
+
+/**
  * The condition selecting a complete sort key prefix on a secondary index, with
  * `escapeKeys: true`: the key itself, where the structural rule truncates a row whose
  * trailing composites are absent (`DESIGN.md §7`), and every key below it. A longer sibling

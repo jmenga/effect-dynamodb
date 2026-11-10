@@ -920,7 +920,10 @@ export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
  *   or it is an outbox item on another table than its read model's, of a
  *   projection not defined where `rekey` runs
  * - `unrecognizedKey` — its member's, but stored neither under the key its
- *   values compose now nor under the one 1.36 composed for them
+ *   values compose now nor under the one 1.36 composed for them. When several
+ *   members claim its `__edd_e__` (read models of one entity type in different
+ *   schemas or primary collections, whose outboxes share a table), none of them
+ *   reads its key back
  * - `rootNotSeen` — a row of an aggregate with no root in its partition, met by
  *   a run that didn't read the whole table (`maxPages` or `resume`). A root at
  *   its old key on a page the run didn't read could still claim it, so nothing

@@ -9,7 +9,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema } from "effect"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -585,6 +585,277 @@ describe.each(DIRECTIONS)("rekey, a projection's rows, %s", (_direction, from, t
       }),
     ),
   )
+
+  it.effect("an outbox on another table moves with the rekey of another handle on it", () =>
+    inTable((table) =>
+      Effect.gen(function* () {
+        const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+        yield* from.Remote.applyBatch(events)
+        // A handle no projection names, on the outbox's table.
+        const Alias = Table.make({ schema: to.schema, entities: {} })
+        const report = yield* Effect.gen(function* () {
+          const db = (yield* DynamoClient.make({
+            entities: { Ledgers: to.Ledgers },
+            tables: { ReadTable: to.ReadTable, Alias },
+          })) as any
+          return yield* db.tables.Alias.rekey({ streams: [to.Accounts] }) as Effect.Effect<
+            Table.RekeyReport,
+            unknown
+          >
+        }).pipe(Effect.provide(Alias.layer({ name: "o" })))
+        expect(report.byMember.Ledger?.moved).toEqual({ ...ZERO, outbox: 1 })
+        const now = keyOf(to, "Ledger", "moved")
+        expect(rowsOf(table, "Ledger#outbox").map(([stored]) => stored)).toEqual([
+          `${now.pk}|${now.sk}#outbox#000000000001#0000`,
+        ])
+      }),
+    ),
+  )
+
+  it.effect("an outbox on another table moves when only the read model's table is bound", () => {
+    // The read model reaches the client only as a member of a table the client binds.
+    const viaTable = (w: World) =>
+      Effect.gen(function* () {
+        const db = (yield* DynamoClient.make({
+          entities: {},
+          tables: { ReadTable: w.ReadTable, OutboxTable: w.OutboxTable },
+        })) as any
+        return yield* db.tables.OutboxTable.rekey({ streams: [w.Accounts] }) as Effect.Effect<
+          Table.RekeyReport,
+          unknown
+        >
+      })
+    const run = (bind: (w: World) => Effect.Effect<Table.RekeyReport, unknown, any>) =>
+      inTable((table) =>
+        Effect.gen(function* () {
+          const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+          yield* from.Remote.applyBatch(events)
+          table.take()
+          const report = yield* bind(to)
+          return { report, sent: table.take(), rows: rowsOf(table, "Ledger#outbox") }
+        }),
+      )
+    return Effect.gen(function* () {
+      const tableOnly = yield* run(viaTable)
+      expect(tableOnly.report.byMember.Ledger?.moved).toEqual({ ...ZERO, outbox: 1 })
+      const now = keyOf(to, "Ledger", "moved")
+      expect(tableOnly.rows.map(([stored]) => stored)).toEqual([
+        `${now.pk}|${now.sk}#outbox#000000000001#0000`,
+      ])
+      // Exactly what a client binding the read model itself reports and sends.
+      const bound = yield* run((w) => rekey(w, { outbox: true }))
+      expect(tableOnly.report).toEqual(bound.report)
+      expect(tableOnly.sent).toEqual(bound.sent)
+      expect(tableOnly.rows).toEqual(bound.rows)
+    })
+  })
+})
+
+/**
+ * Read models only one bound table names, whose projections' outboxes are on two other tables and
+ * on their own, all four tables bound and each rekeyed. Each table is its own store here, so a table's
+ * scan finds only its own rows. Three read models, one projection each; or one read model with the
+ * three projections (`one`), each writing rows of its own.
+ */
+const spread = (schema: DynamoSchema.DynamoSchema, one = false) => {
+  const EventsTable = Table.make({ schema, entities: {} })
+  const Accounts = EventStore.makeStream({
+    table: EventsTable,
+    streamName: "Account",
+    events: [Opened, Added, Closed],
+    streamId: { composite: ["account"] },
+  })
+  const primaryKey = {
+    pk: { field: "pk", composite: ["shop"] },
+    sk: { field: "sk", composite: ["name"] },
+  } as const
+  const Shared = Entity.make({ model: Tally, entityType: "Shared", primaryKey })
+  const First = one ? Shared : Entity.make({ model: Tally, entityType: "First", primaryKey })
+  const Second = one ? Shared : Entity.make({ model: Tally, entityType: "Second", primaryKey })
+  const Own = one ? Shared : Entity.make({ model: Tally, entityType: "Own", primaryKey })
+  const Source = Table.make({ schema, entities: one ? { Shared } : { First, Second, Own } })
+  const O1 = Table.make({ schema, entities: {} })
+  const O2 = Table.make({ schema, entities: {} })
+  /** The row a projection writes for an account: one of its own when they share a read model. */
+  const rowOf = (account: string, tag: string) =>
+    one ? { ...ROWS[account]!, name: `${ROWS[account]!.name} ${tag}` } : ROWS[account]!
+  const project = (readModel: unknown, tag: string, table?: typeof O1) =>
+    EventStore.projection({
+      stream: Accounts,
+      readModel,
+      key: (id: { readonly account: string }) => rowOf(id.account, tag),
+      initial: (id: { readonly account: string }): Tally => ({
+        ...rowOf(id.account, tag),
+        total: 0,
+        version: 0,
+        rev: 0,
+      }),
+      evolve: (state: Tally, event: EventStore.StreamEvent<AccountEvent>) =>
+        Effect.succeed(
+          event.data._tag === "Added"
+            ? { ...state, total: state.total + event.data.amount }
+            : state,
+        ),
+      checkpoint: "version",
+      revision: "rev",
+      outbox: {
+        schema: Notice,
+        effects: (event: EventStore.StreamEvent<AccountEvent>, next: Tally | undefined) =>
+          event.data._tag === "Added"
+            ? [{ account: event.streamId, total: next?.total ?? -1 }]
+            : [],
+        ...(table === undefined
+          ? { index: { name: "outbox", pk: "obpk", sk: "obsk" } }
+          : { table }),
+      },
+    } as never) as EventStore.EventProjection<any, any, any, any, any, any, any, any, any, any>
+  const projections = {
+    First: project(First, "first", O1),
+    Second: project(Second, "second", O2),
+    Own: project(Own, "own"),
+  }
+  const layer = Layer.mergeAll(
+    EventsTable.layer({ name: "events" }),
+    Source.layer({ name: "source" }),
+    O1.layer({ name: "o1" }),
+    O2.layer({ name: "o2" }),
+  )
+  return { Accounts, Source, O1, O2, projections, layer, rowOf }
+}
+
+/** One `DynamoClient` over a store per table name; a transaction's writes go to their own tables. */
+const routed = (tables: Readonly<Record<string, RecordingTable>>): Layer.Layer<DynamoClient> => {
+  const of = (name: string): any => {
+    const table = tables[name]
+    if (table === undefined) throw new Error(`no table "${name}"`)
+    return table.client
+  }
+  const byTable = <A>(entries: Iterable<readonly [string, A]>) => {
+    const groups = new Map<string, Array<A>>()
+    for (const [name, entry] of entries) groups.set(name, [...(groups.get(name) ?? []), entry])
+    return groups
+  }
+  const service = new Proxy(of(Object.keys(tables)[0]!), {
+    get: (target, command) => {
+      const own = target[command]
+      if (typeof own !== "function") return own
+      return (input: any) => {
+        if (command === "transactWriteItems") {
+          const groups = byTable(
+            (input.TransactItems as Array<any>).map((op) => {
+              const write = op.Put ?? op.Update ?? op.Delete ?? op.ConditionCheck
+              return [write.TableName as string, op] as const
+            }),
+          )
+          return Effect.forEach(
+            groups,
+            ([name, ops]) => of(name).transactWriteItems({ ...input, TransactItems: ops }),
+            { discard: true },
+          ).pipe(Effect.as({}))
+        }
+        if (command === "batchWriteItem") {
+          return Effect.forEach(
+            Object.entries(input.RequestItems ?? {}),
+            ([name, requests]) => of(name).batchWriteItem({ RequestItems: { [name]: requests } }),
+            { discard: true },
+          ).pipe(Effect.as({ UnprocessedItems: {} }))
+        }
+        return of(input.TableName)[command](input)
+      }
+    },
+  })
+  return Layer.succeed(DynamoClient, service)
+}
+
+describe.each(DIRECTIONS)("rekey, outboxes on several tables, %s", (direction) => {
+  const [from, to] = direction === "to on" ? [false, true] : [true, false]
+  const cases = [
+    ["of read models only one bound table names", false],
+    ["of one read model only one bound table names, a projection's outbox on each", true],
+  ] as const
+  it.effect.each(cases)(
+    "%s, every table's rekey moves its own outbox items; a rerun moves none",
+    ([, one]) => {
+      const tables = {
+        events: makeRecordingTable(),
+        source: makeRecordingTable({ indexes: { outbox: { pk: "obpk", sk: "obsk" } } }),
+        o1: makeRecordingTable(),
+        o2: makeRecordingTable(),
+      }
+      const written = spread(
+        DynamoSchema.make({ name: "spread", version: 1, escapeKeys: from }),
+        one,
+      )
+      const now = spread(DynamoSchema.make({ name: "spread", version: 1, escapeKeys: to }), one)
+      const outboxes = (name: keyof typeof tables) =>
+        [...tables[name].items.entries()]
+          .filter(([, item]) => item.__edd_e__?.S?.endsWith("#outbox") === true)
+          .map(([stored, item]) => `${item.__edd_e__!.S} ${stored}`)
+      return Effect.gen(function* () {
+        yield* written.Accounts.append(
+          { account: "moved" },
+          [new Opened(), new Added({ amount: 2 })],
+          0,
+        )
+        const events = yield* written.Accounts.read({ account: "moved" })
+        for (const projection of Object.values(written.projections)) {
+          yield* projection.applyBatch(events)
+        }
+        const before = { source: outboxes("source"), o1: outboxes("o1"), o2: outboxes("o2") }
+        expect(before.source).toHaveLength(1)
+        expect(before.o1).toHaveLength(1)
+        expect(before.o2).toHaveLength(1)
+        // The read models reach the client only as members of `Source`.
+        const db = (yield* DynamoClient.make({
+          entities: {},
+          tables: { Source: now.Source, O1: now.O1, O2: now.O2 },
+        })) as any
+        const rekeyAll = Effect.gen(function* () {
+          const reports: Record<string, Table.RekeyReport> = {}
+          for (const name of ["Source", "O1", "O2"]) {
+            reports[name] = yield* db.tables[name].rekey({
+              streams: [now.Accounts],
+            }) as Effect.Effect<Table.RekeyReport, unknown>
+          }
+          return reports
+        })
+        const reports = yield* rekeyAll
+        expect(Object.values(reports).reduce((n, report) => n + report.moved.outbox, 0)).toBe(3)
+        const [own, first, second] = one
+          ? ["Shared", "Shared", "Shared"]
+          : ["Own", "First", "Second"]
+        expect(reports.Source!.byMember[own]?.moved.outbox).toBe(1)
+        expect(reports.O1!.byMember[first]?.moved).toEqual({ ...ZERO, outbox: 1 })
+        expect(reports.O2!.byMember[second]?.moved).toEqual({ ...ZERO, outbox: 1 })
+        for (const report of Object.values(reports)) {
+          expect(report.skipped.unregistered).toBe(0)
+          expect(report.skipped.unrecognizedKey).toBe(0)
+          expect(report.conflicts).toEqual([])
+        }
+        // Each item left its old key.
+        const after = { source: outboxes("source"), o1: outboxes("o1"), o2: outboxes("o2") }
+        expect(after.source).not.toEqual(before.source)
+        expect(after.o1).not.toEqual(before.o1)
+        expect(after.o2).not.toEqual(before.o2)
+        // A rerun moves nothing.
+        const again = yield* rekeyAll
+        expect(Object.values(again).reduce((n, report) => n + report.moved.outbox, 0)).toBe(0)
+        expect({ source: outboxes("source"), o1: outboxes("o1"), o2: outboxes("o2") }).toEqual(
+          after,
+        )
+        // Its own drainer delivers each from its new key.
+        for (const [tag, projection] of Object.entries(now.projections)) {
+          const delivered: Array<number> = []
+          yield* projection.drain(
+            now.rowOf("moved", tag.toLowerCase()),
+            (effect: { readonly total: number }) =>
+              Effect.sync(() => void delivered.push(effect.total)),
+          )
+          expect(delivered).toEqual([2])
+        }
+      }).pipe(Effect.provide(Layer.mergeAll(routed(tables), written.layer, now.layer)))
+    },
+  )
 })
 
 describe.each([
@@ -633,6 +904,728 @@ describe.each([
         expect((yield* rekey(to)).moved).toEqual(ZERO)
       }),
     ),
+  )
+})
+
+/**
+ * A `Ledger` read model in schema `name`, a member of its own table. In primary collection
+ * `collection` when given.
+ */
+const ledgerTable = (name: string, escapeKeys: boolean, collection?: string) => {
+  const Ledgers = Entity.make({
+    model: Tally,
+    entityType: "Ledger",
+    primaryKey: {
+      ...(collection === undefined ? {} : { collection, type: "clustered" as const }),
+      pk: { field: "pk", composite: ["shop"] },
+      sk: { field: "sk", composite: ["name"] },
+    },
+  })
+  const ReadTable = Table.make({
+    schema: DynamoSchema.make({ name, version: 1, escapeKeys }),
+    entities: { Ledgers },
+  })
+  return { Ledgers, ReadTable }
+}
+
+/** A projection of `accounts` into `readModel`, whose outbox is on `outboxTable` when given. */
+const ledgerProjection = (
+  accounts: World["Accounts"],
+  readModel: unknown,
+  outboxTable?: Table.Table<any, any>,
+) =>
+  EventStore.projection({
+    stream: accounts,
+    readModel: readModel as ReturnType<typeof ledgerTable>["Ledgers"],
+    key: (id) => ROWS[id.account]!,
+    initial: (id): Tally => ({ ...ROWS[id.account]!, total: 0, version: 0, rev: 0 }),
+    evolve: (state, event) =>
+      Effect.succeed(
+        event.data._tag === "Added" ? { ...state, total: state.total + event.data.amount } : state,
+      ),
+    checkpoint: "version",
+    revision: "rev",
+    ...(outboxTable === undefined
+      ? {}
+      : {
+          outbox: {
+            schema: Notice,
+            effects: (event: EventStore.StreamEvent<AccountEvent>, next: Tally | undefined) =>
+              event.data._tag === "Added"
+                ? [{ account: event.streamId, total: next?.total ?? -1 }]
+                : [],
+            table: outboxTable,
+          },
+        }),
+  })
+
+/**
+ * A `Ledger` read model in schema `name`, a member of its own table, and its projection of
+ * `accounts`, whose outbox is on `outboxTable` when given. In primary collection `collection` when
+ * given.
+ */
+const ledger = (
+  accounts: World["Accounts"],
+  name: string,
+  escapeKeys: boolean,
+  outboxTable?: Table.Table<any, any>,
+  collection?: string,
+) => {
+  const { Ledgers, ReadTable } = ledgerTable(name, escapeKeys, collection)
+  return { Ledgers, ReadTable, Remote: ledgerProjection(accounts, Ledgers, outboxTable) }
+}
+
+/**
+ * Two `Ledger` read models whose projections' outboxes are on one table: their outbox items have
+ * one entity type, and differ in the key space their keys name. In schemas `a` and `b`, or in one
+ * schema and primary collections `ca` and `cb`.
+ */
+const spaces = (w: World, escapeKeys: boolean, by: "schema" | "collection") => {
+  const OutboxTable = Table.make({
+    schema: DynamoSchema.make({ name: "proj", version: 1, escapeKeys }),
+    entities: {},
+  })
+  return {
+    w,
+    OutboxTable,
+    A: ledger(w.Accounts, "a", escapeKeys, OutboxTable, by === "schema" ? undefined : "ca"),
+    B: ledger(
+      w.Accounts,
+      by === "schema" ? "b" : "a",
+      escapeKeys,
+      OutboxTable,
+      by === "schema" ? undefined : "cb",
+    ),
+  }
+}
+const SpacesOn = spaces(On, true, "schema")
+const SpacesOff = spaces(Off, false, "schema")
+const CollectionsOn = spaces(On, true, "collection")
+const CollectionsOff = spaces(Off, false, "collection")
+type Spaces = typeof SpacesOn
+
+const inSpaces = <A, E>(body: (table: RecordingTable) => Effect.Effect<A, E, any>) =>
+  Effect.gen(function* () {
+    const table = makeRecordingTable()
+    const layers = (s: Spaces) =>
+      Layer.mergeAll(
+        s.w.EventsTable.layer({ name: "t" }),
+        s.A.ReadTable.layer({ name: "t" }),
+        s.B.ReadTable.layer({ name: "t" }),
+        s.OutboxTable.layer({ name: "o" }),
+      )
+    return yield* body(table).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          table.layer,
+          layers(SpacesOn),
+          layers(SpacesOff),
+          layers(CollectionsOn),
+          layers(CollectionsOff),
+        ),
+      ),
+    ) as Effect.Effect<A, E>
+  })
+
+/** The outbox table's `rekey`, from a client binding the read models in `order`. */
+const rekeyOutboxes = (s: Spaces, order: "ab" | "ba", options?: Record<string, unknown>) =>
+  Effect.gen(function* () {
+    const db = (yield* DynamoClient.make({
+      entities:
+        order === "ab" ? { A: s.A.Ledgers, B: s.B.Ledgers } : { B: s.B.Ledgers, A: s.A.Ledgers },
+      tables: { ReadA: s.A.ReadTable, ReadB: s.B.ReadTable, OutboxTable: s.OutboxTable },
+    })) as any
+    return yield* db.tables.OutboxTable.rekey({
+      streams: [s.w.Accounts],
+      ...options,
+    }) as Effect.Effect<Table.RekeyReport, unknown, any>
+  })
+
+const SPACES: ReadonlyArray<readonly [string, Spaces, Spaces]> = [
+  ["schemas, to on", SpacesOff, SpacesOn],
+  ["schemas, to off", SpacesOn, SpacesOff],
+  ["primary collections, to on", CollectionsOff, CollectionsOn],
+  ["primary collections, to off", CollectionsOn, CollectionsOff],
+]
+
+describe.each(SPACES)("rekey, outboxes of two key spaces on one table, %s", (_d, from, to) => {
+  const outboxKey = (s: Spaces, side: "A" | "B") => {
+    const { pk, sk } = KeyComposer.composeIndexKeys(
+      s[side].Ledgers._schema,
+      "Ledger",
+      1,
+      s[side].Ledgers.indexes.primary,
+      ROWS.moved!,
+    ) as Keys
+    return `${pk}|${sk}#outbox#000000000001#0000`
+  }
+
+  it.effect.each(["ab", "ba"] as const)(
+    "each item moves by the read model its key names, whichever is listed first (%s)",
+    (order) =>
+      inSpaces((table) =>
+        Effect.gen(function* () {
+          const events = yield* seed(from.w, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+          yield* from.A.Remote.applyBatch(events)
+          yield* from.B.Remote.applyBatch(events)
+          expect(rowsOf(table, "Ledger#outbox").map(([stored]) => stored)).toEqual(
+            [outboxKey(from, "A"), outboxKey(from, "B")].sort(),
+          )
+          const dry = yield* rekeyOutboxes(to, order, { dryRun: true })
+          const report = yield* rekeyOutboxes(to, order)
+          expect(dry.moved).toEqual(report.moved)
+          expect(report.moved).toEqual({ ...ZERO, outbox: 2 })
+          expect(report.skipped.unrecognizedKey).toBe(0)
+          expect(report.conflicts).toEqual([])
+          expect(rowsOf(table, "Ledger#outbox").map(([stored]) => stored)).toEqual(
+            [outboxKey(to, "A"), outboxKey(to, "B")].sort(),
+          )
+          const again = yield* rekeyOutboxes(to, order)
+          expect(again.moved).toEqual(ZERO)
+          expect(again.byMember.Ledger?.unchanged).toBe(2)
+          expect(again.skipped.unrecognizedKey).toBe(0)
+          // Each reaches its own read model's drainer.
+          for (const side of ["A", "B"] as const) {
+            const delivered: Array<number> = []
+            yield* to[side].Remote.drain(ROWS.moved!, (effect) =>
+              Effect.sync(() => void delivered.push(effect.total)),
+            )
+            expect(delivered).toEqual([2])
+          }
+        }),
+      ),
+  )
+
+  it.effect("an outbox item in neither key space is counted unrecognized, once", () =>
+    inSpaces((table) =>
+      Effect.gen(function* () {
+        table.items.set("$c#v1#ledger#s1|$c#v1#ledger#ab#outbox#1", {
+          pk: { S: "$c#v1#ledger#s1" },
+          sk: { S: "$c#v1#ledger#ab#outbox#1" },
+          __edd_row_pk__: { S: "$c#v1#ledger#s1" },
+          __edd_row_sk__: { S: "$c#v1#ledger#ab" },
+          __edd_e__: { S: "Ledger#outbox" },
+        })
+        const before = new Map(table.items)
+        for (const order of ["ab", "ba"] as const) {
+          const report = yield* rekeyOutboxes(to, order)
+          expect(report.skipped.unrecognizedKey).toBe(1)
+          expect(report.moved).toEqual(ZERO)
+        }
+        expect(table.items).toEqual(before)
+      }),
+    ),
+  )
+})
+
+describe("[EDD-9134] a read model whose outbox is on another table, sharing its key space", () => {
+  /** `DynamoClient.make`'s defect, if any; each table named by its key, or as `names` says. */
+  const make = (
+    entities: Record<string, unknown>,
+    tables: Record<string, Table.Table<any, any>>,
+    names: Record<string, string> = {},
+  ): Effect.Effect<string> =>
+    Effect.gen(function* () {
+      yield* DynamoClient.make({ entities, tables } as any)
+      return "no failure"
+    }).pipe(
+      Effect.catchDefect((defect) => Effect.succeed(String(defect))),
+      Effect.provide(
+        Layer.mergeAll(
+          makeRecordingTable().layer,
+          ...Object.entries(tables).map(([key, t]) => t.layer({ name: names[key] ?? key })),
+        ),
+      ),
+    ) as Effect.Effect<string>
+
+  it.effect("two read models whose outboxes are on one table", () =>
+    Effect.gen(function* () {
+      const OutboxTable = Table.make({ schema: On.schema, entities: {} })
+      const A = ledger(On.Accounts, "a", true, OutboxTable)
+      const B = ledger(On.Accounts, "a", true, OutboxTable)
+      const message = yield* make(
+        { A: A.Ledgers, B: B.Ledgers },
+        { ReadA: A.ReadTable, ReadB: B.ReadTable, OutboxTable },
+      )
+      expect(message).toContain("[EDD-9134]")
+      expect(message).toContain(
+        `"A" writes its projection's outbox items into another table ("OutboxTable")`,
+      )
+      expect(message).toContain(
+        `"B" writes its own under the same key space (partition keys starting ` +
+          `"$a#v1#ledger#shop_", sort keys starting "$a#v1#ledger#name_"`,
+      )
+      // Reaching the client only through their tables.
+      const viaTables = yield* make({}, { ReadA: A.ReadTable, ReadB: B.ReadTable, OutboxTable })
+      expect(viaTables).toContain(`"ReadA.Ledgers" writes its projection's outbox items`)
+    }),
+  )
+
+  it.effect("a read model whose outbox table has a member in its key space binds", () =>
+    Effect.gen(function* () {
+      const Others = Entity.make({
+        model: Tally,
+        entityType: "Ledger",
+        primaryKey: {
+          pk: { field: "pk", composite: ["shop"] },
+          sk: { field: "sk", composite: ["name"] },
+        },
+      })
+      const OutboxTable = Table.make({
+        schema: DynamoSchema.make({ name: "a", version: 1, escapeKeys: true }),
+        entities: { Others },
+      })
+      const A = ledger(On.Accounts, "a", true, OutboxTable)
+      // An outbox item's sort key is a whole row sort key followed by `#outbox#`: a member's
+      // row is at an item's key only through a value holding that text. As on 1.39.0.
+      expect(yield* make({ A: A.Ledgers }, { ReadA: A.ReadTable, OutboxTable })).toBe("no failure")
+    }),
+  )
+
+  it.effect("two handles on one physical table are one table", () =>
+    Effect.gen(function* () {
+      // Each read model's outbox on its own handle; one key space, whatever the escaping.
+      const Outbox1 = Table.make({ schema: On.schema, entities: {} })
+      const Outbox2 = Table.make({ schema: On.schema, entities: {} })
+      const A = ledger(On.Accounts, "a", false, Outbox1)
+      const B = ledger(On.Accounts, "a", true, Outbox2)
+      const tables = { ReadA: A.ReadTable, ReadB: B.ReadTable, Outbox1, Outbox2 }
+      const one = { Outbox1: "outbox", Outbox2: "outbox" }
+      const message = yield* make({ A: A.Ledgers, B: B.Ledgers }, tables, one)
+      expect(message).toContain(
+        `[EDD-9134] DynamoClient.make: "A" writes its projection's outbox items into another ` +
+          `table ("outbox"), where "B" writes its own under the same key space`,
+      )
+      // Reaching the client only through their tables, in either order.
+      expect(
+        yield* make({}, { ReadB: B.ReadTable, ReadA: A.ReadTable, Outbox2, Outbox1 }, one),
+      ).toContain("[EDD-9134]")
+      // On two tables, they aren't refused.
+      expect(yield* make({ A: A.Ledgers, B: B.Ledgers }, tables)).toBe("no failure")
+    }),
+  )
+
+  it.effect("read models in different primary collections are in different key spaces", () =>
+    Effect.gen(function* () {
+      const OutboxTable = Table.make({ schema: On.schema, entities: {} })
+      const A = ledger(On.Accounts, "a", true, OutboxTable, "ca")
+      const B = ledger(On.Accounts, "a", true, OutboxTable, "cb")
+      expect(
+        yield* make(
+          { A: A.Ledgers, B: B.Ledgers },
+          { ReadA: A.ReadTable, ReadB: B.ReadTable, OutboxTable },
+        ),
+      ).toBe("no failure")
+      // One collection: one key space.
+      const C = ledger(On.Accounts, "a", true, OutboxTable, "ca")
+      expect(
+        yield* make(
+          { A: A.Ledgers, C: C.Ledgers },
+          { ReadA: A.ReadTable, ReadC: C.ReadTable, OutboxTable },
+        ),
+      ).toContain(
+        `"C" writes its own under the same key space (partition keys starting "$a#v1#ca#shop_", ` +
+          `sort keys starting "$a#v1#ca#ledger_1#name_"`,
+      )
+      // Not in a collection: another key space.
+      const D = ledger(On.Accounts, "a", true, OutboxTable)
+      expect(
+        yield* make(
+          { A: A.Ledgers, D: D.Ledgers },
+          { ReadA: A.ReadTable, ReadD: D.ReadTable, OutboxTable },
+        ),
+      ).toBe("no failure")
+    }),
+  )
+
+  it.effect("EventStore.processBatch refuses them among the projections it's handed", () => {
+    const OutboxTable = Table.make({ schema: On.schema, entities: {} })
+    const A = ledger(On.Accounts, "a", true, OutboxTable)
+    const B = ledger(On.Accounts, "a", true, OutboxTable)
+    const C = ledger(On.Accounts, "c", true, OutboxTable)
+    const process = (projections: Record<string, (typeof A)["Remote"]>) =>
+      EventStore.processBatch([], { projections, source: "lambda" }).pipe(
+        Effect.as("no failure"),
+        Effect.catchDefect((defect) => Effect.succeed(String(defect))),
+      )
+    return Effect.gen(function* () {
+      const message = yield* process({ a: A.Remote, b: B.Remote })
+      expect(message).toContain(
+        `[EDD-9134] EventStore.processBatch: the read model of "a" writes its projection's ` +
+          `outbox items into another table ("o"), where the read model of "b" writes its own ` +
+          `under the same key space (partition keys starting "$a#v1#ledger#shop_"`,
+      )
+      // The same channel and the same error as DynamoClient.make's refusal of the same pair.
+      const channelOf = <R>(effect: Effect.Effect<unknown, unknown, R>) =>
+        Effect.map(Effect.exit(effect), (exit) =>
+          Exit.isSuccess(exit)
+            ? { channel: "none", error: undefined }
+            : {
+                channel: Cause.hasDies(exit.cause) ? "defect" : "failure",
+                error: Cause.squash(exit.cause),
+              },
+        )
+      const viaMake = yield* channelOf(
+        DynamoClient.make({
+          entities: { A: A.Ledgers, B: B.Ledgers },
+          tables: { ReadA: A.ReadTable, ReadB: B.ReadTable, OutboxTable },
+        } as any),
+      )
+      const viaBatch = yield* channelOf(
+        EventStore.processBatch([], {
+          projections: { a: A.Remote, b: B.Remote },
+          source: "lambda",
+        }),
+      )
+      expect(viaMake.channel).toBe("defect")
+      expect(viaBatch.channel).toBe("defect")
+      expect(Object.getPrototypeOf(viaMake.error)).toBe(Error.prototype)
+      expect(Object.getPrototypeOf(viaBatch.error)).toBe(Error.prototype)
+      expect(String(viaMake.error)).toContain("[EDD-9134] DynamoClient.make:")
+      // A bound projection too.
+      const bound = yield* EventStore.bindProjection(B.Remote)
+      expect(yield* process({ a: A.Remote, b: bound })).toContain("[EDD-9134]")
+      // Another schema; and one read model's projection handed twice.
+      expect(yield* process({ a: A.Remote, c: C.Remote, again: A.Remote })).toBe("no failure")
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          makeRecordingTable().layer,
+          On.EventsTable.layer({ name: "t" }),
+          A.ReadTable.layer({ name: "t" }),
+          B.ReadTable.layer({ name: "t" }),
+          C.ReadTable.layer({ name: "t" }),
+          OutboxTable.layer({ name: "o" }),
+        ),
+      ),
+    )
+  })
+
+  it.effect("EventStore.processBatch compares tables by the names its context gives them", () => {
+    const Outbox1 = Table.make({ schema: On.schema, entities: {} })
+    const Outbox2 = Table.make({ schema: On.schema, entities: {} })
+    const A = ledger(On.Accounts, "a", false, Outbox1)
+    const B = ledger(On.Accounts, "a", true, Outbox2)
+    const process = (first: string, second: string) =>
+      EventStore.processBatch([], {
+        projections: { a: A.Remote, b: B.Remote },
+        source: "lambda",
+      }).pipe(
+        Effect.as("no failure"),
+        Effect.catchDefect((defect) => Effect.succeed(String(defect))),
+        Effect.provide(
+          Layer.mergeAll(
+            makeRecordingTable().layer,
+            On.EventsTable.layer({ name: "t" }),
+            A.ReadTable.layer({ name: "ra" }),
+            B.ReadTable.layer({ name: "rb" }),
+            Outbox1.layer({ name: first }),
+            Outbox2.layer({ name: second }),
+          ),
+        ),
+      )
+    return Effect.gen(function* () {
+      expect(yield* process("o", "o")).toContain(
+        `[EDD-9134] EventStore.processBatch: the read model of "a" writes its projection's ` +
+          `outbox items into another table ("o"), where the read model of "b" writes its own`,
+      )
+      expect(yield* process("o1", "o2")).toBe("no failure")
+    })
+  })
+
+  it.effect("another schema, another entity type, or rows on another table aren't refused", () =>
+    Effect.gen(function* () {
+      const OutboxTable = Table.make({ schema: On.schema, entities: {} })
+      const A = ledger(On.Accounts, "a", true, OutboxTable)
+      // Another schema: the key spaces differ.
+      const B = ledger(On.Accounts, "b", true, OutboxTable)
+      // The same key space, with no outbox, its rows on its own table.
+      const Rows = ledger(On.Accounts, "a", true)
+      // Another schema version.
+      const V2 = (() => {
+        const Ledgers = Entity.make({
+          model: Tally,
+          entityType: "Ledger",
+          primaryKey: {
+            pk: { field: "pk", composite: ["shop"] },
+            sk: { field: "sk", composite: ["name"] },
+          },
+        })
+        return Table.make({
+          schema: DynamoSchema.make({ name: "a", version: 2, escapeKeys: true }),
+          entities: { Ledgers },
+        })
+      })()
+      expect(
+        yield* make(
+          { A: A.Ledgers, B: B.Ledgers, Rows: Rows.Ledgers },
+          { ReadA: A.ReadTable, ReadB: B.ReadTable, Rows: Rows.ReadTable, V2, OutboxTable },
+        ),
+      ).toBe("no failure")
+    }),
+  )
+})
+
+describe.each([
+  ["A unescaped, B escaped", false],
+  ["A escaped, B unescaped", true],
+] as const)("[EDD-9134] projections defined after the client was made, %s", (_d, escaped) => {
+  it.effect("rekey refuses them before sending anything; B's outbox item stays, delivered", () => {
+    const table = makeRecordingTable()
+    // One physical outbox table, a handle each.
+    const Outbox1 = Table.make({ schema: On.schema, entities: {} })
+    const Outbox2 = Table.make({ schema: On.schema, entities: {} })
+    const A = ledgerTable("a", escaped)
+    const B = ledgerTable("a", !escaped)
+    return Effect.gen(function* () {
+      const db = (yield* DynamoClient.make({
+        entities: { A: A.Ledgers, B: B.Ledgers },
+        tables: { ReadA: A.ReadTable, ReadB: B.ReadTable, Outbox1, Outbox2 },
+      })) as any
+      // Defined only now, so `DynamoClient.make` saw no outbox.
+      ledgerProjection(On.Accounts, A.Ledgers, Outbox1)
+      const ToB = ledgerProjection(On.Accounts, B.Ledgers, Outbox2)
+      const events = yield* seed(On, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+      yield* ToB.applyBatch(events)
+      expect(rowsOf(table, "Ledger#outbox")).toHaveLength(1)
+      const before = new Map(table.items)
+      table.take()
+      for (const handle of ["Outbox1", "Outbox2"]) {
+        for (const options of [{ dryRun: true }, {}]) {
+          const exit = yield* Effect.exit(
+            db.tables[handle].rekey({ streams: [On.Accounts], ...options }) as Effect.Effect<
+              Table.RekeyReport,
+              unknown
+            >,
+          )
+          // The run's own failure, on its error channel: never a defect.
+          expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(false)
+          const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+          expect(error).toMatchObject({
+            _tag: "ValidationError",
+            entityType: "Table",
+            operation: "rekey",
+          })
+          expect(String((error as { readonly cause?: unknown }).cause)).toContain(
+            `[EDD-9134] rekey: "A" writes its projection's outbox items into another table ` +
+              `("outbox"), where "B" writes its own under the same key space`,
+          )
+          expect(table.take()).toEqual([])
+        }
+      }
+      expect(table.items).toEqual(before)
+      const delivered: Array<number> = []
+      yield* ToB.drain(ROWS.moved!, (effect) =>
+        Effect.sync(() => void delivered.push(effect.total)),
+      )
+      expect(delivered).toEqual([2])
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          table.layer,
+          On.EventsTable.layer({ name: "t" }),
+          A.ReadTable.layer({ name: "ra" }),
+          B.ReadTable.layer({ name: "rb" }),
+          Outbox1.layer({ name: "outbox" }),
+          Outbox2.layer({ name: "outbox" }),
+        ),
+      ),
+    )
+  })
+})
+
+/** A row keyed by either of two identifiers, after a number when `numbered`. */
+const Keyed = Schema.Struct({
+  n: Schema.Number,
+  idA: Schema.String,
+  idB: Schema.String,
+  name: Schema.String,
+  total: Schema.Number,
+  version: Schema.Number,
+  rev: Schema.Number,
+})
+type Keyed = typeof Keyed.Type
+
+/**
+ * Two `Ledger` read models in one schema whose projections' outboxes are on one table, their
+ * partition keys led by `first` and `second`; the second's followed by `idB` when they're the same.
+ * `numbered` puts the number `n` before them, whose key text can't hold `#`.
+ */
+const keyedSpaces = (
+  w: World,
+  escapeKeys: boolean,
+  first: "idA",
+  second: "idA" | "idB",
+  numbered = false,
+) => {
+  const OutboxTable = Table.make({ schema: w.schema, entities: {} })
+  const side = (lead: "idA" | "idB", tag: string) => {
+    const Ledgers = Entity.make({
+      model: Keyed,
+      entityType: "Ledger",
+      primaryKey: {
+        pk: {
+          field: "pk",
+          composite: [
+            ...(numbered ? (["n"] as const) : []),
+            ...(lead === "idB" || tag === "a" ? ([lead] as const) : ([lead, "idB"] as const)),
+          ],
+        },
+        sk: { field: "sk", composite: ["name"] },
+      },
+    })
+    const ReadTable = Table.make({
+      schema: DynamoSchema.make({ name: "k", version: 1, escapeKeys }),
+      entities: { Ledgers },
+    })
+    const row = (account: string) => ({
+      n: 7,
+      idA: ROWS[account]!.shop,
+      idB: ROWS[account]!.shop,
+      name: ROWS[account]!.name,
+    })
+    const Remote = EventStore.projection({
+      stream: w.Accounts,
+      readModel: Ledgers,
+      key: (id) => row(id.account),
+      initial: (id): Keyed => ({ ...row(id.account), total: 0, version: 0, rev: 0 }),
+      evolve: (state, event) =>
+        Effect.succeed(
+          event.data._tag === "Added"
+            ? { ...state, total: state.total + event.data.amount }
+            : state,
+        ),
+      checkpoint: "version",
+      revision: "rev",
+      outbox: {
+        schema: Notice,
+        effects: (event: EventStore.StreamEvent<AccountEvent>, next: Keyed | undefined) =>
+          event.data._tag === "Added"
+            ? [{ account: event.streamId, total: next?.total ?? -1 }]
+            : [],
+        table: OutboxTable,
+      },
+    })
+    return { Ledgers, ReadTable, Remote, row }
+  }
+  return { w, OutboxTable, A: side(first, "a"), B: side(second, "b") }
+}
+
+describe("[EDD-9134] read models whose key spaces part at their first composite", () => {
+  const layers = (...all: ReadonlyArray<ReturnType<typeof keyedSpaces>>) =>
+    all
+      .flatMap((s) => [
+        s.w.EventsTable.layer({ name: "t" }),
+        s.A.ReadTable.layer({ name: "ra" }),
+        s.B.ReadTable.layer({ name: "rb" }),
+        s.OutboxTable.layer({ name: "o" }),
+      ])
+      .reduce((merged, layer) => Layer.merge(merged, layer)) as Layer.Layer<any, never, never>
+  const clientOf = (s: ReturnType<typeof keyedSpaces>) =>
+    DynamoClient.make({
+      entities: { A: s.A.Ledgers, B: s.B.Ledgers },
+      tables: { ReadA: s.A.ReadTable, ReadB: s.B.ReadTable, OutboxTable: s.OutboxTable },
+    } as any)
+
+  it.effect.each([
+    ["the same composite", false, "$k#v1#ledger#ida_"],
+    ["a number then the same composite", true, "$k#v1#ledger#n_"],
+  ] as const)(
+    "led by %s, they bind and run; rekey of their outbox table refuses them",
+    ([, numbered, starting]) => {
+      const table = makeRecordingTable()
+      const s = keyedSpaces(On, true, "idA", "idA", numbered)
+      return Effect.gen(function* () {
+        // A key of one is a key of the other only through a value holding `#`: as on 1.39.0.
+        const db = (yield* clientOf(s)) as any
+        const events = yield* seed(s.w, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+        yield* s.A.Remote.applyBatch(events)
+        yield* s.B.Remote.applyBatch(events)
+        expect(rowsOf(table, "Ledger#outbox")).toHaveLength(2)
+        const before = new Map(table.items)
+        table.take()
+        // `rekey` reads an item's key back by its key space, and A's reads B's keys too.
+        for (const options of [{ dryRun: true }, {}]) {
+          const exit = yield* Effect.exit(
+            db.tables.OutboxTable.rekey({ streams: [s.w.Accounts], ...options }) as Effect.Effect<
+              Table.RekeyReport,
+              unknown
+            >,
+          )
+          expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(false)
+          const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+          expect(error).toMatchObject({
+            _tag: "ValidationError",
+            entityType: "Table",
+            operation: "rekey",
+          })
+          expect(String((error as { readonly cause?: unknown }).cause)).toContain(
+            `[EDD-9134] rekey: "A" writes its projection's outbox items into another table ` +
+              `("o"), where "B" writes its own under the same key space (partition keys ` +
+              `starting "${starting}", sort keys starting "$k#v1#ledger#name_"`,
+          )
+          expect(table.take()).toEqual([])
+        }
+        expect(table.items).toEqual(before)
+        // The read models' own tables hold no outbox: their `rekey` runs.
+        const own = (yield* db.tables.ReadA.rekey({ streams: [s.w.Accounts] })) as Table.RekeyReport
+        expect(own.conflicts).toEqual([])
+        for (const side of ["A", "B"] as const) {
+          const delivered: Array<number> = []
+          yield* s[side].Remote.drain(s[side].row("moved"), (effect) =>
+            Effect.sync(() => void delivered.push(effect.total)),
+          )
+          expect(delivered).toEqual([2])
+        }
+      }).pipe(Effect.provide(Layer.mergeAll(table.layer, layers(s))))
+    },
+  )
+
+  it.effect.each([
+    ["to on", false, true, false],
+    ["to off", true, false, false],
+    // A number can't hold `#`: the keys part at the label after it.
+    ["after a number, to on", false, true, true],
+    ["after a number, to off", true, false, true],
+  ] as const)(
+    "led by idA and idB, they bind, and rekey moves each by its own (%s)",
+    ([, from, to, numbered]) => {
+      const table = makeRecordingTable()
+      const written = keyedSpaces(from ? On : Off, from, "idA", "idB", numbered)
+      const now = keyedSpaces(to ? On : Off, to, "idA", "idB", numbered)
+      const outboxes = () =>
+        rowsOf(table, "Ledger#outbox")
+          .map(([stored]) => stored)
+          .sort()
+      return Effect.gen(function* () {
+        const events = yield* seed(written.w, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+        yield* written.A.Remote.applyBatch(events)
+        yield* written.B.Remote.applyBatch(events)
+        const before = outboxes()
+        expect(before).toHaveLength(2)
+        const db = (yield* clientOf(now)) as any
+        const report = (yield* db.tables.OutboxTable.rekey({
+          streams: [now.w.Accounts],
+        })) as Table.RekeyReport
+        expect(report.moved).toEqual({ ...ZERO, outbox: 2 })
+        expect(report.skipped.unrecognizedKey).toBe(0)
+        expect(report.conflicts).toEqual([])
+        const after = outboxes()
+        expect(after.filter((key) => before.includes(key))).toEqual([])
+        const again = (yield* db.tables.OutboxTable.rekey({
+          streams: [now.w.Accounts],
+        })) as Table.RekeyReport
+        expect(again.moved).toEqual(ZERO)
+        expect(outboxes()).toEqual(after)
+        for (const side of ["A", "B"] as const) {
+          const delivered: Array<number> = []
+          yield* now[side].Remote.drain(now[side].row("moved"), (effect) =>
+            Effect.sync(() => void delivered.push(effect.total)),
+          )
+          expect(delivered).toEqual([2])
+        }
+      }).pipe(Effect.provide(Layer.mergeAll(table.layer, layers(written, now))))
+    },
   )
 })
 
