@@ -7,7 +7,7 @@
  * and sends nothing: 1.39.0 decided it as the write was built, after whatever the update reads
  * first. Any other failure with nothing written sends what 1.39.0 sent and fails as it failed.
  *
- * The release branch already differs from 1.39.0 in five ways that aren't this comparison's
+ * The release branch already differs from 1.39.0 in four ways that aren't this comparison's
  * subject, each named by a case that has it ({@link Since139}).
  */
 
@@ -78,8 +78,6 @@ export const wrote = (outcome: Outcome): boolean =>
  *
  * - `"reads"`: it reads a row 1.39.0 wrote and then couldn't decode (a field with a decoding
  *   default), so the update succeeds;
- * - `"refuses a copy"`: it refuses a `pathSet` copying into a field that holds a custom
- *   declaration, before sending anything, where 1.39.0 wrote the copy;
  * - `"reads the entry"`: a sparse map's entry keyed `__proto__` is read back as an entry. 1.39.0's
  *   read dropped it, so a value its schema refuses there left a row that still read;
  * - `"names the property"`: a path's segment below the first names the property of that name.
@@ -90,7 +88,7 @@ export const wrote = (outcome: Outcome): boolean =>
  * `ValidationError` whose operation was `decode`; the release branch reports the same failure as
  * operation `update`, saying the update was applied.
  */
-export type Since139 = "reads" | "refuses a copy" | "reads the entry" | "names the property"
+export type Since139 = "reads" | "reads the entry" | "names the property"
 
 /** An update that was written and whose row then didn't decode, in either release's words. */
 const writtenUnreadable = (outcome: Outcome): boolean =>
@@ -108,13 +106,6 @@ const ending = (outcome: Outcome): unknown =>
 
 /** `got` is what 1.39.0 did (`was`), but for the requests it sent before refusing an operand. */
 export const expectAs139 = (got: Outcome, was: Outcome, since?: Since139): void => {
-  if (since === "refuses a copy") {
-    expect(was.ok).toBe(true)
-    expect(got.failure).toMatchObject({ error: "ValidationError", operation: "update" })
-    expect((got.failure as { says: string }).says).toContain("wouldn't read back")
-    expect(got.requests).toEqual([])
-    return
-  }
   if (since === "names the property") {
     // The same requests, but for the property's name.
     expect(wrote(was)).toBe(true)

@@ -148,8 +148,6 @@ describeConnected("an update with an operand, on DynamoDB Local", () => {
             Effect.gen(function* () {
               let refused = 0
               for (const [n, each] of cases.entries()) {
-                // The release branch refuses this copy, where 1.39.0 wrote it.
-                if (each.key.includes("copied from an entry")) continue
                 // It names another property than 1.39.0 did, so the row reads differently.
                 if (each.key.includes("a property named as a renamed field")) continue
                 const was = fixture.cases[each.key]!

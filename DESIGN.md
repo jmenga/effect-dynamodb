@@ -3148,6 +3148,9 @@ the update with a `ValidationError` (`operation` `update.append`,
 `update.pathIfNotExists`) before it reads or sends anything, alone or in a
 `transactWrite`. It used to be decided as the write was built, after the reads
 of an update that reads first, so a failed read was reported in its place.
+A copy (`pathSet` or `pathSubtract` naming another attribute, `isPath`) holds no
+operand: its `value` isn't written, so nothing reads it, encodes it or checks
+that it would store or read back.
 Only the moment changes: the check, its verdict, its error and the bytes of an
 operand it accepts are the ones the write was built with. An update refused for
 a second reason reports the operand, where it reported whichever it met first

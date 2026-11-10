@@ -57,11 +57,9 @@ describe("an update with an operand does what 1.39.0 did, and refuses what it re
         expectAs139(
           got,
           fixture.cases[each.key]!,
-          each.key.includes("copied from an entry")
-            ? "refuses a copy"
-            : each.key.includes("a property named as a renamed field")
-              ? "names the property"
-              : undefined,
+          each.key.includes("a property named as a renamed field")
+            ? "names the property"
+            : undefined,
         )
       }),
     )

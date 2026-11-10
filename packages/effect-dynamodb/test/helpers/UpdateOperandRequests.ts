@@ -527,6 +527,98 @@ export const cases: ReadonlyArray<Case> = [
     apply: copy(["beside", "blob"], ["buckets#a", "blob"]),
     everyVariant: true,
   },
+  // A copy's `value` isn't written, whatever it holds. (The subtraction leaves `meta.n` at -1,
+  // which its check refuses on the read: alone, the row is written and then doesn't decode.)
+  {
+    name: "pathSet of a field copied from another, beside a value DynamoDB can't store",
+    apply: (update) =>
+      update.pathSet({
+        segments: ["meta", "n"],
+        value: Number.NaN,
+        isPath: true,
+        valueSegments: ["beside", "n"],
+      }),
+    everyVariant: true,
+  },
+  {
+    name: "pathSubtract of another field's value",
+    apply: (update) =>
+      update.pathSubtract({
+        segments: ["meta", "n"],
+        value: undefined,
+        isPath: true,
+        valueSegments: ["beside", "n"],
+      }),
+    everyVariant: true,
+  },
+  {
+    name: "pathSubtract of another field's value, beside a value DynamoDB can't store",
+    apply: (update) =>
+      update.pathSubtract({
+        segments: ["meta", "n"],
+        value: Number.NaN,
+        isPath: true,
+        valueSegments: ["beside", "n"],
+      }),
+    everyVariant: true,
+  },
+  // Only `pathSet` and `pathSubtract` copy. The other path operations write their `value`,
+  // whatever else the operation object holds (their types don't declare these two properties).
+  {
+    name: "pathAppend holding a copy's properties writes its value",
+    apply: (update) =>
+      update.pathAppend({
+        segments: ["list"],
+        value: [3],
+        isPath: true,
+        valueSegments: ["beside", "list"],
+      } as never),
+    everyVariant: true,
+  },
+  {
+    name: "pathPrepend holding a copy's properties writes its value",
+    apply: (update) =>
+      update.pathPrepend({
+        segments: ["list"],
+        value: [4],
+        isPath: true,
+        valueSegments: ["beside", "list"],
+      } as never),
+    everyVariant: true,
+  },
+  {
+    name: "pathIfNotExists holding a copy's properties writes its value",
+    apply: (update) =>
+      update.pathIfNotExists({
+        segments: ["meta", "optional"],
+        value: 5,
+        isPath: true,
+        valueSegments: ["beside", "n"],
+      } as never),
+    everyVariant: true,
+  },
+  {
+    name: "refused: pathAppend holding a copy's properties, of elements its schema refuses",
+    apply: (update) =>
+      update.pathAppend({
+        segments: ["list"],
+        value: [-1],
+        isPath: true,
+        valueSegments: ["beside", "list"],
+      } as never),
+    everyVariant: true,
+  },
+  {
+    name: "refused: pathIfNotExists holding a copy's properties, of a value its schema refuses",
+    apply: (update) =>
+      update.pathIfNotExists({
+        segments: ["meta", "optional"],
+        value: -1,
+        isPath: true,
+        valueSegments: ["beside", "n"],
+      } as never),
+    everyVariant: true,
+  },
 ]
 
 /** Each case, on each variant it runs on, alone and in a transaction. */

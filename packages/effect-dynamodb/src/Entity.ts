@@ -2408,6 +2408,15 @@ const makeImpl = <
     const encoded = pathValues.elements(segments, value)
     return { encoded, issue: pathValues.validateElements(segments, encoded) }
   }
+  /**
+   * A `pathSet` or `pathSubtract` that names another attribute in place of a value: it has no
+   * operand of its own. The other path operations always write their `value`, whatever else the
+   * operation object holds.
+   */
+  const isCopy = (op: {
+    readonly isPath?: boolean
+    readonly valueSegments?: ReadonlyArray<string | number> | undefined
+  }): boolean => Boolean(op.isPath && op.valueSegments)
   const hasPathOps = (uState: UpdateState): boolean =>
     [
       uState.pathSets,
@@ -3246,6 +3255,8 @@ const makeImpl = <
     type Operand = {
       readonly segments: ReadonlyArray<string | number>
       readonly value: unknown
+      readonly isPath?: boolean
+      readonly valueSegments?: ReadonlyArray<string | number> | undefined
     }
     const operands: ReadonlyArray<
       readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements"]
@@ -3264,7 +3275,10 @@ const makeImpl = <
       ["pathIfNotExists of", uState.pathIfNotExists, "value"],
     ]
     for (const [op, ops, kind] of operands) {
-      for (const { segments, value } of ops ?? []) {
+      for (const operand of ops ?? []) {
+        // A copy writes another attribute's value: it holds no value of its own to read back.
+        if (op === "pathSet of" && isCopy(operand)) continue
+        const { segments, value } = operand
         if (!readBacks.has(String(segments[0]))) continue
         const { encoded } = encodePathValue(segments, value, kind)
         const read = asRead(encoded)
@@ -3309,6 +3323,8 @@ const makeImpl = <
     type Operand = {
       readonly segments: ReadonlyArray<string | number>
       readonly value: unknown
+      readonly isPath?: boolean
+      readonly valueSegments?: ReadonlyArray<string | number> | undefined
     }
     const pathOps: ReadonlyArray<
       readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements" | undefined]
@@ -3323,6 +3339,8 @@ const makeImpl = <
     ]
     for (const [op, ops, kind] of pathOps) {
       for (const operand of ops ?? []) {
+        // A copy, or a subtraction of another attribute's value, writes no value of its own.
+        if ((op === "pathSet of" || op === "pathSubtract of") && isCopy(operand)) continue
         const value =
           kind === undefined
             ? operand.value
@@ -3374,11 +3392,13 @@ const makeImpl = <
           }>
         | undefined,
       kind: "value" | "elements",
+      /** Whether the operation can copy another attribute's value: only `pathSet`. */
+      copies = false,
     ): ReadonlyArray<unknown> | RefusedOperand => {
       const values: Array<unknown> = []
       for (const op of ops ?? []) {
         // A copy writes another attribute's value: there's nothing to encode.
-        if (op.isPath && op.valueSegments) {
+        if (copies && isCopy(op)) {
           values.push(undefined)
           continue
         }
@@ -3388,7 +3408,7 @@ const makeImpl = <
       }
       return values
     }
-    const pathSets = each("update.pathSet", uState.pathSets, "value")
+    const pathSets = each("update.pathSet", uState.pathSets, "value", true)
     if ("issue" in pathSets) return pathSets
     const pathAppends = each("update.pathAppend", uState.pathAppends, "elements")
     if ("issue" in pathAppends) return pathAppends
