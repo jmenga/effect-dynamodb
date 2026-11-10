@@ -384,7 +384,10 @@ export const isMultiProjection = (u: unknown): u is MultiProjection<any, any, an
  * A projection of several source streams into one read model: each row keeps
  * a checkpoint per contributing source instance (`checkpoints`), and every
  * write is guarded by the row's `revision`, so writers serving different
- * sources serialise. See {@link MultiProjection}.
+ * sources serialise. See {@link MultiProjection}. When a projection on the
+ * read model has `removal`, a checkpoint, checkpoint owner or revision
+ * attribute that this projection also uses in another role throws
+ * `[EDD-9133]`.
  *
  * @example
  * ```ts
@@ -717,6 +720,7 @@ export const multiProjection = <
 
   const catchUp = (key: K): Effect.Effect<Applied, Err, Req> =>
     Effect.gen(function* () {
+      yield* engine.preflight("catchUp")
       const row = yield* engine.readRow(key)
       if (Option.isNone(row)) {
         return appliedOf({
@@ -753,6 +757,7 @@ export const multiProjection = <
     options?: { readonly instances?: RebuildInstances<Sources> | undefined } | undefined,
   ): Effect.Effect<Applied, Err, Req> =>
     Effect.gen(function* () {
+      yield* engine.preflight("rebuild")
       const named =
         options?.instances ??
         (config.sourcesOf === undefined

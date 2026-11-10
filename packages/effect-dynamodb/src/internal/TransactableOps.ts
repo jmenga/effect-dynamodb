@@ -16,6 +16,7 @@ import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
 import type { ConditionInput } from "../Expression.js"
 import { fromAttributeMap, isUnstorableValue, toAttributeMap } from "../Marshaller.js"
+import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import { isRefusedValue } from "./Capacity.js"
 import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
 
@@ -27,26 +28,239 @@ import type { ReturnValuesMode, UpdateState } from "./EntityOps.js"
  */
 export const INCARNATION_TOKEN = "__edd_i__"
 
+/** @internal What an attribute a projection keeps on its read model's rows is for. */
+export type ProjectionRole = "checkpoint" | "checkpoint map" | "checkpoint owner" | "revision"
+
 /**
- * @internal What a projection with `removal` records on its read model (#154):
- * the fields its tombstones keep (checkpoints, owners) and its revision field.
+ * @internal What a projection records on its read model (#154): each attribute its rows hold for
+ * it (domain field names), with its role, in the order its tombstone stores them (its revision
+ * last), and whether its tombstones set the table's TTL attribute (`removal.ttl`). `label` names
+ * the projection in a refusal. A field the projection gives two roles is listed once per role.
  */
-export interface ProjectionTombstones {
-  readonly kept: ReadonlyArray<string>
-  readonly revision: string | undefined
+export interface ProjectionLayout {
+  readonly label: string
+  readonly roles: ReadonlyArray<readonly [field: string, role: ProjectionRole]>
+  readonly ttl: boolean
 }
 
-/** @internal */
-export const projectionTombstonesOf = (entity: object): ProjectionTombstones | undefined =>
-  (entity as { readonly _projectionTombstones?: ProjectionTombstones })._projectionTombstones
+/**
+ * @internal The layout of every projection defined on the read model, one entry per distinct
+ * layout; `undefined` when none is.
+ */
+export const projectionLayoutsOf = (entity: object): ReadonlyArray<ProjectionLayout> | undefined =>
+  (entity as { readonly _projectionLayouts?: ReadonlyArray<ProjectionLayout> })._projectionLayouts
 
 /**
- * @internal `create` over a projection tombstone (#154): read the key, and
- * when it holds the entity's tombstone, carry the projection's kept fields
- * over into `item` (stored names, wire values) — its checkpoints, so a late
- * redelivery is still recognised — with the revision one higher, and return
- * the guard naming that very tombstone. `None` when there is no tombstone:
- * `create`'s own guard applies.
+ * @internal Whether a projection defined on the read model has `removal`: its rows may be
+ * tombstones, which `create` takes the place of (`overTombstone`), so `create` reads first.
+ */
+export const hasProjectionTombstones = (entity: object): boolean =>
+  (entity as { readonly _projectionTombstones?: true })._projectionTombstones === true
+
+/** A domain field's stored attribute name on `entity`. */
+const storedName = (
+  entity: { readonly _renameToDynamo: (item: Record<string, unknown>) => void },
+  field: string,
+): string => {
+  const probe: Record<string, unknown> = { [field]: 1 }
+  entity._renameToDynamo(probe)
+  return Object.keys(probe)[0] ?? field
+}
+
+/**
+ * `[EDD-9133]` among `layouts`: a stored attribute one projection names in two roles. The problem,
+ * or `undefined`. `current` is the layout being defined, named "this projection". Two projections
+ * may name one attribute in different roles: a projection's write takes its own roles first
+ * (`projectionAttributes`), so two that never write one row (rows of disjoint keys) work as on
+ * 1.39.0. Two that share rows and swap names can't be told apart from them, and are as broken as on
+ * 1.39.0.
+ */
+const roleConflict = (
+  entity: {
+    readonly entityType: string
+    readonly _renameToDynamo: (item: Record<string, unknown>) => void
+  },
+  layouts: ReadonlyArray<ProjectionLayout>,
+  current: ProjectionLayout,
+): string | undefined => {
+  type Named = {
+    readonly layout: ProjectionLayout
+    readonly field: string
+    readonly role: ProjectionRole
+  }
+  const whose = (layout: ProjectionLayout) =>
+    layout === current ? "this projection's" : `${layout.label}'s`
+  const as = (field: string, stored: string) =>
+    field === stored ? `"${field}"` : `"${field}" (stored as "${stored}")`
+  for (const layout of layouts) {
+    const first = new Map<string, Named>()
+    for (const [field, role] of layout.roles) {
+      const stored = storedName(entity, field)
+      const held = first.get(stored)
+      if (held === undefined) {
+        first.set(stored, { layout, field, role })
+        continue
+      }
+      if (held.role === role) continue
+      const second = held.field === field ? `its ${role}` : `${as(field, stored)} its ${role}`
+      return (
+        `[EDD-9133] ${current.label}: on read model "${entity.entityType}", ` +
+        `${as(held.field, stored)} is ${whose(held.layout)} ${held.role}, and ${second}. A ` +
+        "projection of the read model has `removal`, and a tombstone carries a checkpoint as it " +
+        "is and raises a revision: an attribute holds one role in a projection. Give each its " +
+        "own field."
+      )
+    }
+  }
+  return undefined
+}
+
+/**
+ * @internal Record a projection's layout on its read model, beside those of the other projections
+ * defined on it, and whether it has `removal`. On a read model one of whose projections has
+ * `removal`, a stored attribute one projection names in two roles is refused (`[EDD-9133]`), before
+ * anything is recorded: its tombstone carries a checkpoint as it is and raises a revision, so the
+ * two would overwrite each other's values. The refusal comes at whichever definition completes the
+ * conflict (the projection's own, or the first `removal`), so the order projections are defined in
+ * doesn't decide it. Without `removal` nothing is refused: rows are never tombstones. Two
+ * projections naming one attribute in different roles are not refused (`roleConflict`). A layout
+ * already there moves to the end rather than being added again, so a projection defined over and
+ * over (in a function, say) doesn't grow the list.
+ */
+export const addProjectionLayout = (
+  entity: {
+    readonly entityType: string
+    readonly _renameToDynamo: (item: Record<string, unknown>) => void
+  },
+  layout: ProjectionLayout,
+  removal: boolean,
+): void => {
+  const holder = entity as {
+    _projectionLayouts?: ReadonlyArray<ProjectionLayout>
+    _projectionTombstones?: true
+  }
+  const same = (other: ProjectionLayout) =>
+    other.ttl === layout.ttl &&
+    other.roles.length === layout.roles.length &&
+    other.roles.every(([field, role], i) => {
+      const [f, r] = layout.roles[i]!
+      return field === f && role === r
+    })
+  const layouts = [...(holder._projectionLayouts ?? []).filter((other) => !same(other)), layout]
+  if (removal || hasProjectionTombstones(entity)) {
+    const problem = roleConflict(entity, layouts, layout)
+    if (problem !== undefined) throw new Error(problem)
+  }
+  holder._projectionLayouts = layouts
+  if (removal) holder._projectionTombstones = true
+}
+
+/** @internal An attribute a projection keeps on the read model's rows, in the role it's taken in. */
+export interface ProjectionAttribute {
+  readonly field: string
+  readonly stored: string
+  readonly role: ProjectionRole
+  /** Whether it is `own`'s. */
+  readonly own: boolean
+}
+
+/**
+ * @internal Every stored attribute the read model's projections keep on a row, once, in the role
+ * it's carried and raised in on a removal path: `own`'s (the writing projection's) roles first, then
+ * each layout's, the one defined last first. So an attribute the writing projection keeps is never
+ * carried or raised in another projection's role, and `create` over a tombstone, which no
+ * projection writes, takes each in the role of the projection defined last that names it. With
+ * attributes in one role each, the role is the same whichever comes first.
+ */
+export const projectionAttributes = (
+  entity: { readonly _renameToDynamo: (item: Record<string, unknown>) => void },
+  own?: ProjectionLayout,
+): ReadonlyArray<ProjectionAttribute> => {
+  const layouts = [...(projectionLayoutsOf(entity) ?? [])].reverse()
+  const ordered = own === undefined ? layouts : [own, ...layouts.filter((l) => l !== own)]
+  const out: Array<ProjectionAttribute> = []
+  const seen = new Set<string>()
+  for (const layout of ordered) {
+    for (const [field, role] of layout.roles) {
+      const stored = storedName(entity, field)
+      if (seen.has(stored)) continue
+      seen.add(stored)
+      out.push({ field, stored, role, own: layout === own })
+    }
+  }
+  return out
+}
+
+/**
+ * @internal The revisions of the read model's projections that a whole-row write on a removal path
+ * (#154) raises: a projection's tombstone, its row written over a tombstone, and `create` over
+ * one. Each revision the row held, one higher, so a write that read it there fails its guard,
+ * whichever projection's it is. A revision the row didn't hold is left absent, as on 1.39.0: these
+ * writes never give a row an attribute it didn't have. `held` gives the row's value of a field
+ * (domain name) stored as `stored`. One entry per stored attribute taken as a revision
+ * (`projectionAttributes`), the writing projection's (`own`) left out: it sets its own.
+ */
+export const nextProjectionRevisions = (
+  entity: { readonly _renameToDynamo: (item: Record<string, unknown>) => void },
+  held: (field: string, stored: string) => unknown,
+  own?: ProjectionLayout,
+): ReadonlyArray<readonly [field: string, stored: string, value: number]> =>
+  projectionAttributes(entity, own).flatMap((a) => {
+    if (a.role !== "revision" || a.own) return []
+    const value = held(a.field, a.stored)
+    return value === undefined ? [] : [[a.field, a.stored, Number(value) + 1] as const]
+  })
+
+/**
+ * @internal Whether the read model's TTL attribute must be checked against the attributes its
+ * projections keep (`projectionTtlConflict`): a projection's tombstones set it (`removal.ttl`).
+ * Only then is the table resolved for it.
+ */
+export const projectionTtlChecked = (entity: object): boolean =>
+  hasProjectionTombstones(entity) &&
+  (projectionLayoutsOf(entity) ?? []).some((layout) => layout.ttl)
+
+/**
+ * @internal `[EDD-9133]` at run time, once the table's TTL attribute is known: an attribute a
+ * projection keeps on the read model's rows that is stored as the TTL attribute, which another's
+ * tombstones set (`removal.ttl`). The problem, or `undefined` when there is none. Like the
+ * definition's refusal, only on a read model one of whose projections has `removal`.
+ */
+export const projectionTtlConflict = (
+  entity: {
+    readonly entityType: string
+    readonly _renameToDynamo: (item: Record<string, unknown>) => void
+  },
+  ttlAttribute: string,
+): string | undefined => {
+  if (!projectionTtlChecked(entity)) return undefined
+  for (const layout of projectionLayoutsOf(entity) ?? []) {
+    for (const [field, role] of layout.roles) {
+      if (storedName(entity, field) === ttlAttribute) {
+        return (
+          `[EDD-9133] "${field}" is a projection's ${role} on read model "${entity.entityType}", ` +
+          `stored as "${ttlAttribute}", the table's TTL attribute, which a projection's ` +
+          "tombstones set (`removal.ttl`). An attribute holds one role: give the " +
+          `${role} its own field.`
+        )
+      }
+    }
+  }
+  return undefined
+}
+
+/**
+ * @internal `create` over a projection tombstone (#154): read the key, and when it holds the
+ * entity's tombstone, carry every attribute a projection's layout names that it holds over into
+ * `item` (stored names, wire values), and return the guard naming that very tombstone. `None` when
+ * there is no tombstone: `create`'s own guard applies. A tombstone holds the checkpoints and
+ * revisions of every projection the row held them for, not only the one that wrote it, and each
+ * attribute is taken in one role (`projectionAttributes`): a checkpoint (or map, or owner) is
+ * carried as it is, so a late redelivery is still recognised, and every revision the tombstone
+ * holds is carried one higher (`nextProjectionRevisions`), so a projection's write that read it
+ * there fails its guard. The table's TTL attribute is never carried, so the row doesn't expire
+ * with the tombstone. The layout defined last comes first, so
+ * with one layout they are carried as before: its checkpoints, then its revision one higher.
  */
 export const overTombstone = (
   entity: {
@@ -60,15 +274,15 @@ export const overTombstone = (
     readonly _renameToDynamo: (item: Record<string, unknown>) => void
   },
   client: Pick<DynamoClientService, "getItem">,
-  tableName: string,
+  table: TableConfig,
   item: Record<string, unknown>,
 ): Effect.Effect<Option.Option<ConditionInput>, DynamoClientError> =>
   Effect.gen(function* () {
-    const layout = projectionTombstonesOf(entity)
-    if (layout === undefined) return Option.none()
+    if (!hasProjectionTombstones(entity)) return Option.none()
+    const layouts = projectionLayoutsOf(entity) ?? []
     const primary = entity.indexes.primary!
     const { Item } = yield* client.getItem({
-      TableName: tableName,
+      TableName: table.name,
       Key: toAttributeMap({
         [primary.pk.field]: item[primary.pk.field],
         [primary.sk.field]: item[primary.sk.field],
@@ -77,22 +291,46 @@ export const overTombstone = (
     })
     if (Item === undefined || !isProjectionTombstone(Item, entity.entityType)) return Option.none()
     const tomb = fromAttributeMap(Item) as Record<string, unknown>
-    const dbName = (field: string) => {
-      const probe: Record<string, unknown> = { [field]: 1 }
-      entity._renameToDynamo(probe)
-      return Object.keys(probe)[0] ?? field
+    const ttl = layouts.some((layout) => layout.ttl) ? resolveTtlAttributeName(table) : undefined
+    // Each checkpoint attribute a layout names, once, in the role the projection defined last that
+    // names it gives it (`projectionAttributes`): the layout defined last first, so the attributes
+    // it names are carried in the order they were with one layout. Then the revisions.
+    // An attribute is the tombstone's own, never a member it inherits.
+    const held = (name: string): unknown => (Object.hasOwn(tomb, name) ? tomb[name] : undefined)
+    for (const { stored: name, role } of projectionAttributes(entity)) {
+      if (role === "revision" || name === ttl || held(name) === undefined) continue
+      item[name] = held(name)
     }
-    for (const field of layout.kept) {
-      const name = dbName(field)
-      if (tomb[name] !== undefined) item[name] = tomb[name]
-    }
-    if (layout.revision !== undefined) {
-      const name = dbName(layout.revision)
-      if (tomb[name] !== undefined) item[name] = Number(tomb[name]) + 1
+    for (const [, name, value] of nextProjectionRevisions(entity, (_, stored) => held(stored))) {
+      if (name !== ttl) item[name] = value
     }
     return Option.some({
       eq: { __edd_e__: `${entity.entityType}#tombstone`, __edd_removed__: tomb.__edd_removed__ },
     } as ConditionInput)
+  })
+
+/**
+ * @internal Flatten `entity`'s sparse-map fields on `item` (stored names) into per-entry
+ * attributes, refusing a key it can't store with a `ValidationError` for `operation`. Every write
+ * of an item goes through it — `Entity.put`, the transactional put and a projection's tombstone —
+ * so each refuses the same key the same way, before sending anything.
+ */
+export const serializeSparseOrFail = (
+  entity: {
+    readonly entityType: string
+    readonly _serializeSparseFields: (item: Record<string, unknown>) => void
+  },
+  item: Record<string, unknown>,
+  operation: string,
+): Effect.Effect<void, ValidationError> =>
+  Effect.try({
+    try: () => entity._serializeSparseFields(item),
+    catch: (e) =>
+      new ValidationError({
+        entityType: entity.entityType,
+        operation,
+        cause: e instanceof Error ? e.message : String(e),
+      }),
   })
 
 /**
@@ -665,17 +903,8 @@ export const validateAndBuildPutItem = (
     // so the snapshot inherited the wrong shape too (#111).
     entity._renameToDynamo(item)
 
-    // Flatten sparse-map fields into per-entry top-level attributes. Throws
-    // on invalid keys; surface as ValidationError at the entity boundary.
-    try {
-      entity._serializeSparseFields(item)
-    } catch (e) {
-      return yield* new ValidationError({
-        entityType: entity.entityType,
-        operation,
-        cause: e instanceof Error ? e.message : String(e),
-      })
-    }
+    // Flatten sparse-map fields into per-entry top-level attributes.
+    yield* serializeSparseOrFail(entity, item, operation)
 
     // Pack `storedAs: DynamoModel.Packed` fields, as `Entity.put` does (#147).
     yield* entity._packFields(item, operation)

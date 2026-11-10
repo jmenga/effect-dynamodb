@@ -753,7 +753,7 @@ export const buildTransactWriteItems = (
         // carrying its checkpoints over, guarded on that tombstone.
         const over =
           op.putKind === "create"
-            ? yield* op.entity._overTombstone(tableName, built.item)
+            ? yield* op.entity._overTombstone(built.item)
             : Option.none<ConditionInput>()
         push(
           {

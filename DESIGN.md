@@ -5779,6 +5779,75 @@ instance).
   TTL is opt-in. Entity `get`, `Batch.get` and `Transaction.transactGet`
   report them as absent. A later event restarts from `initial`. Removal is
   refused for read models with `unique` / `retain` / `softDelete` features.
+  The entity's `create` (single-item and transactional) takes a tombstone's
+  place, carrying its kept fields over with the revision one higher. Every
+  projection records its layout on the read model (`_projectionLayouts`), with
+  or without `removal`: each attribute it keeps on a row (checkpoint,
+  checkpoint map, checkpoint owner, revision) with its role, and whether its
+  tombstones set the TTL attribute. One entry per distinct layout, the one defined last at the end (a layout defined again
+  moves there). Whether `create` reads first is a flag of its own
+  (`_projectionTombstones`: some projection has `removal`), so a read model
+  whose projections have none sends `create`'s put alone, as before.
+  - **One role per attribute in a projection (`EDD-9133`), on a read model
+    whose rows may be tombstones.** When a projection on the read model has
+    `removal`, a stored attribute (compared through the entity's renames, as
+    writes name it) that one projection gives two roles is refused: its
+    tombstone carries a checkpoint as it is and raises a revision, so the two
+    would overwrite each other. The refusal comes at whichever definition
+    completes the conflict, the projection's own or the first `removal`,
+    before anything is recorded, so the order projections are defined in
+    doesn't decide it. Without `removal` nothing is refused. Two projections
+    may keep one attribute in different roles: projections writing disjoint
+    rows (`a#<id>` and `b#<id>`, say) can't be told at definition from
+    projections sharing rows. A projection's write takes its own roles first,
+    and carries and raises another's attributes only where its own don't name
+    them (`projectionAttributes`, by stored name), so on its own rows its
+    attributes keep their roles, as on 1.39.0. `create` over a tombstone,
+    which no projection writes, takes each attribute in the role of the
+    projection defined last that names it. Projections that share rows and
+    swap an attribute's roles are broken, as on 1.39.0, and can't be detected.
+    The table's TTL attribute is known only when a projection runs: one a
+    projection keeps (by its stored name) while a projection's tombstones set
+    it (`removal.ttl`) refuses every projection on the read model with a
+    `ValidationError`. Every entry point that writes a row (`apply`,
+    `applyBatch` and `processBatch` per row, `catchUp`, `rebuild`,
+    single-source and multi-source) runs that check first (`preflight`),
+    before it sends anything, whatever the data. The table is resolved for it
+    only when a projection's tombstones set the TTL attribute. `drain` and
+    `drainPending` write no row and don't run it, so a worker providing only
+    its outbox's table delivers as on 1.39.0. Projections may share an
+    attribute in one role, such as a revision.
+  - **A row several projections feed.** A row that becomes a tombstone keeps
+    the remover's fields and every other layout's checkpoints that the row
+    holds. A projection's write over a tombstone (a row from `initial`, or
+    another tombstone) keeps the other layouts' checkpoints the tombstone
+    holds, whatever `initial` gave them. So no projection loses its checkpoint
+    to another's removal, with or without `removal` of its own: a redelivery is
+    still applied once, and a late removal can't remove a row recreated after
+    it.
+  - **Every revision the row holds is raised on a removal path.** Each
+    whole-row write on one (a projection's tombstone, its row written over a
+    tombstone, and `create` over one) writes every layout's revision the row
+    held one higher (`nextProjectionRevisions`), beside the writing
+    projection's own. A projection's write that read its revision there is
+    guarded on that value, so it fails its guard whichever projection wrote in
+    between, and retries from a fresh read. A revision the row didn't hold
+    stays absent, as on 1.39.0: these writes give a row no attribute it didn't
+    have. So a projection whose revision a row has never held isn't failed by
+    another's write on a removal path: its guard is the attribute's absence,
+    before and after. With one layout this is the projection's own revision,
+    which these writes already set, so nothing sent or stored changes.
+  - **`create` over a tombstone** carries every checkpoint attribute a layout
+    names that the tombstone holds, as it is, and every revision it holds one
+    higher, and never carries the table's TTL attribute. It chooses no layout.
+    The layout defined last comes first, so one layout sends and stores
+    exactly what a single entry did.
+  - **A sparse-map checkpoint field.** Its keys (`<source>#<streamId>`) hold
+    `#`, which a sparse map can't store. A tombstone's write goes through the
+    check the row's write goes through (`serializeSparseOrFail`), so both
+    refuse such a key with a `ValidationError`, after the reads and before
+    anything is written. A write that adds no key (every event skipped, or an
+    instance holding its source's own field) isn't refused.
 - **The outbox** writes effects as items (`<entityType>#outbox`, sort key
   `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
   in the row's transaction. `drain` claims the head item (a conditional update
@@ -6436,9 +6505,10 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9129` | `Aggregate.ts` (`hydrateAggregateRefs`, `refKeyComposite`) | An aggregate `create` is given an id for an edge whose `entity` is keyed by more than one distinct primary-key composite, or none, so no one id names one item to fetch (an attribute in both halves of the key is one composite). A `ValidationError` naming the edge and the key's composites, judged for every edge before anything is fetched or written. Up to 1.39.0 the fetch died composing the key (`Missing composite attribute`). |
 | `EDD-9130` | `DynamoClient.ts` (`make`), through `Aggregate.ts` (`ownershipConflict`) | An aggregate declaring `ownsRows` beside another member the client sees that can write a row of one of its entity types into its partition: the message names the aggregate, the member, the type and the channel. A defect from `DynamoClient.make`, as `EDD-9037` is (§7 "Which rows in its partition are an aggregate's"). |
 | `EDD-9131` | `Aggregate.ts` (`hydrateAggregateRefs`, `refIdValue`) | An aggregate `create` is given an id that is no value of the edge's entity's key composite, neither of its type nor its stored or JSON form (`"5"` for a number key), so it names no item; or an id of its type `put` refuses, as DynamoDB can't store it (`Infinity`, anywhere in a struct, an `Option` or a `Result`) or as it doesn't encode as the composite is stored (an infinity through a digits-only string codec), judged by `put`'s own rule (`Entity._unstorableKey`). A `ValidationError` naming where the id was given, what it was given, the composite and the entity, judged before anything is fetched or written. Up to 1.39.0 a string was fetched under a key no `put` writes (`RefNotFound`), and anything else was dropped. |
+| `EDD-9133` | `internal/TransactableOps.ts` (`addProjectionLayout`, `projectionTtlConflict`), through `internal/ProjectionEngine.ts` (`EventStore.projection` / `multiProjection`, `preflight`) | On a projection read model one of whose projections has `removal`, one stored attribute one projection keeps in two roles: a checkpoint, checkpoint map, checkpoint owner or revision it also uses in another role, compared by stored name. Thrown by the definition that completes the conflict (the projection's own, or the first `removal`), with nothing recorded. Without `removal` nothing is refused, nor are two projections keeping one attribute in different roles. The table's TTL attribute, known only at run time, is checked by every entry point that writes a row (not the drains) before it sends anything: an attribute a projection keeps that is stored as it, while a projection's tombstones set it (`removal.ttl`), fails every projection on the read model with a `ValidationError`. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
 
-Next free code: none below `9141` (`9129` and `9131`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: none below `9141` (`9132` and `9134`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

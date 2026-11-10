@@ -154,6 +154,7 @@ import {
   composeKeysOrFail,
   freshIncarnationToken,
   generateTimestampPrimitive,
+  hasProjectionTombstones,
   INCARNATION_TOKEN,
   isProjectionTombstone,
   KEY_TEXT,
@@ -163,7 +164,7 @@ import {
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
   overTombstone,
-  projectionTombstonesOf,
+  serializeSparseOrFail,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
@@ -972,9 +973,8 @@ export interface Entity<
    * path — see `overTombstone`.
    */
   readonly _overTombstone: (
-    tableName: string,
     item: globalThis.Record<string, unknown>,
-  ) => Effect.Effect<Option.Option<ConditionInput>, DynamoClientError, DynamoClient>
+  ) => Effect.Effect<Option.Option<ConditionInput>, DynamoClientError, DynamoClient | TableConfig>
 
   /**
    * @internal Configure the entity with table schema and tag.
@@ -3683,6 +3683,8 @@ const makeImpl = <
     if (!hasSparseFields) return
     encodeSparseFields(item, sparseFields)
   }
+  /** This entity's sparse fields, for `serializeSparseOrFail`. */
+  const sparseWriter = { entityType, _serializeSparseFields: serializeSparseFields }
 
   /**
    * Rebuild sparse Map fields from flattened top-level attributes.
@@ -6990,7 +6992,7 @@ const makeImpl = <
             hasVectorIndexes ||
             Boolean(systemFields.version) ||
             Object.keys(config.unique ?? {}).length > 0 ||
-            (opts.putKind === "create" && projectionTombstonesOf(self) !== undefined)
+            (opts.putKind === "create" && hasProjectionTombstones(self))
           ) {
             yield* refuseUnstorable(
               { ...(encodedInput as globalThis.Record<string, unknown>), ...opts.withVectors },
@@ -7060,16 +7062,7 @@ const makeImpl = <
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
           // Flatten sparse Map fields into per-entry top-level attributes.
-          // Wrapped to surface key-validation errors as ValidationError.
-          try {
-            serializeSparseFields(item)
-          } catch (e) {
-            return yield* new ValidationError({
-              entityType,
-              operation: `${operation}.sparse`,
-              cause: e instanceof Error ? e.message : String(e),
-            })
-          }
+          yield* serializeSparseOrFail(sparseWriter, item, `${operation}.sparse`)
           // Pack `storedAs: DynamoModel.Packed` fields to their stored form
           // (JSON string, or compressed binary over the threshold) — after
           // renames and sparse flattening, before marshalling, so every size
@@ -7089,7 +7082,7 @@ const makeImpl = <
           // tombstone's place, its checkpoints and revision carried over, on
           // the condition that tombstone is still there.
           if (opts.putKind === "create" && operation !== "upsert" && !guarded) {
-            const over = yield* overTombstone(self, client, tableName, item)
+            const over = yield* overTombstone(self, client, tc, item)
             if (Option.isSome(over)) {
               userCondition = compileCondition(
                 withGuard(over.value, opts.condition) as Expr | ConditionInput,
@@ -15275,10 +15268,10 @@ const makeImpl = <
       KeyText136.markOf(schema, entityType, entityVersion, config.indexes.primary, keyForm(key)),
     [Rekey.RekeyHandler]: rekeyHandler,
     _attachPrototype: attachPrototype,
-    _overTombstone: (tableName: string, item: globalThis.Record<string, unknown>) =>
+    _overTombstone: (item: globalThis.Record<string, unknown>) =>
       Effect.gen(function* () {
         const client = yield* Capacity.client
-        return yield* overTombstone(self, client, tableName, item)
+        return yield* overTombstone(self, client, yield* tableTag, item)
       }),
     _configure: (
       injectedSchema: DynamoSchema.DynamoSchema,
