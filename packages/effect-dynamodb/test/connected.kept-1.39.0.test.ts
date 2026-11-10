@@ -1,0 +1,73 @@
+/**
+ * Behaviour published 1.39.0 had, kept, against DynamoDB Local: the connected twin of
+ * `Kept139.test.ts`. Each scenario replays its steps and compares them with what 1.39.0 did
+ * (`fixtures/*-1.39.0.json`, captured once, never regenerated).
+ * Scenarios: `helpers/OptionalShardAppend.ts`.
+ *
+ * Prerequisites:
+ *   docker run -p 8000:8000 amazon/dynamodb-local
+ *   (or set DYNAMODB_ENDPOINT to another port)
+ */
+
+import {
+  CreateTableCommand,
+  DeleteTableCommand,
+  DynamoDBClient,
+  ScanCommand,
+} from "@aws-sdk/client-dynamodb"
+import { Config, Effect } from "effect"
+import { describe } from "vitest"
+import { DynamoClient } from "../src/DynamoClient.js"
+import * as Table from "../src/Table.js"
+import type { OpenTable, Row } from "./helpers/Kept139.js"
+import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
+
+const ENDPOINT = Effect.runSync(
+  Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
+)
+
+let dynamoAvailable = false
+try {
+  const res = await fetch(ENDPOINT, { method: "POST", signal: AbortSignal.timeout(1000) }).catch(
+    () => null,
+  )
+  dynamoAvailable = res !== null
+} catch {
+  dynamoAvailable = false
+}
+const describeConnected = dynamoAvailable ? describe : describe.skip
+
+const credentials = { accessKeyId: "local", secretAccessKey: "local" }
+const raw = new DynamoDBClient({ region: "us-east-1", endpoint: ENDPOINT, credentials })
+const ClientLayer = DynamoClient.layer({ region: "us-east-1", endpoint: ENDPOINT, credentials })
+
+const send = <A>(make: () => Promise<A>) =>
+  Effect.tryPromise(make).pipe(Effect.orDie) as Effect.Effect<A>
+
+let tables = 0
+const openTable: OpenTable = (MainTable) =>
+  Effect.gen(function* () {
+    const TableName = `kept-139-${Date.now()}-${tables++}`
+    yield* send(() =>
+      raw.send(
+        new CreateTableCommand({
+          TableName,
+          BillingMode: "PAY_PER_REQUEST",
+          ...Table.definition(MainTable),
+        }),
+      ),
+    )
+    return {
+      name: TableName,
+      layer: ClientLayer,
+      rows: Effect.map(
+        send(() => raw.send(new ScanCommand({ TableName, ConsistentRead: true }))),
+        (out) => (out.Items ?? []) as ReadonlyArray<Row>,
+      ),
+      close: Effect.asVoid(send(() => raw.send(new DeleteTableCommand({ TableName })))),
+    }
+  })
+
+describeConnected("an appendInput that may leave a sharded index's composite out", () => {
+  optionalShardAppendSuite(openTable)
+})

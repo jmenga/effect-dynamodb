@@ -47,6 +47,23 @@ export const hasFields = (
 export const isFieldOptional = (fieldSchema: Schema.Top): boolean =>
   SchemaAST.isOptional(fieldSchema.ast)
 
+/** Whether `undefined` or `null` is a value of this type, as far as its unions say. */
+const admitsNoValue = (ast: SchemaAST.AST): boolean =>
+  SchemaAST.isUndefined(ast) ||
+  SchemaAST.isNull(ast) ||
+  SchemaAST.isVoid(ast) ||
+  SchemaAST.isUnknown(ast) ||
+  SchemaAST.isAny(ast) ||
+  (SchemaAST.isSuspend(ast) && admitsNoValue(ast.thunk())) ||
+  (SchemaAST.isUnion(ast) && ast.types.some((member) => admitsNoValue(member)))
+
+/**
+ * Whether every value of a struct holds this field: its key is required, and neither `undefined`
+ * nor `null` is one of its values. An input may leave any other field without a value.
+ */
+export const alwaysHeld = (fieldSchema: Schema.Top): boolean =>
+  !isFieldOptional(fieldSchema) && !admitsNoValue(SchemaAST.toType(fieldSchema.ast))
+
 /**
  * Extract the element schema from a field that is `Schema.Array(T)`,
  * `Schema.NonEmptyArray(T)`, `Schema.optionalKey(Schema.Array(T))`, or

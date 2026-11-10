@@ -2098,6 +2098,71 @@ describe("an appendInput that can't compose a sharded index's key (EDD-9113)", (
     ).not.toThrow()
   })
 
+  // Refused only when no append can compose the key. An input that may leave a composite out
+  // has appends that do, and loaded up to 1.39.0: the one that can't fails with EDD-9100, when made.
+  describe("an input that may leave a composite out", () => {
+    it.each([
+      ["Schema.optional", Schema.optional(Schema.String)],
+      ["Schema.optionalKey", Schema.optionalKey(Schema.String)],
+      ["Schema.UndefinedOr", Schema.UndefinedOr(Schema.String)],
+      ["Schema.NullOr", Schema.NullOr(Schema.String)],
+    ])("`by` under %s loads: an append without it leaves the index alone", (_name, group) => {
+      expect(() => make(index("preserve", ["region", "group"], ["group"]), { group })).not.toThrow()
+    })
+
+    it("an optional composite after a gap loads: an append without it truncates the key", () => {
+      expect(() =>
+        make(index("preserve", ["group", "region", "site"], ["group"]), {
+          tenant: Schema.String,
+          group: Schema.String,
+          site: Schema.optional(Schema.String),
+        }),
+      ).not.toThrow()
+    })
+
+    it("the same composite required leaves the hole on every append: refused", () => {
+      expect(() =>
+        make(index("preserve", ["group", "region", "site"], ["group"]), {
+          tenant: Schema.String,
+          group: Schema.String,
+          site: Schema.String,
+        }),
+      ).toThrow(/\[EDD-9113\].*but not "region"/)
+    })
+
+    it("names only what an append needs: a composite after the last one every append holds isn't", () => {
+      expect(() =>
+        make(index("preserve", ["region", "group", "site"], ["group"]), {
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      ).toThrow(
+        '[EDD-9113] Entity "Reading": timeSeries.appendInput carries "group", which index "byTenant" is sharded by, but not "region".',
+      )
+    })
+
+    it("optional `by` beside the partition composite every append carries: no append composes", () => {
+      // Without `by` the append still names the partition and can't compute its shard; with it,
+      // the sort key has a hole. 1.39.0 failed both with EDD-9100.
+      expect(() =>
+        make(index("preserve", ["region", "group"], ["group"]), {
+          tenant: Schema.String,
+          group: Schema.optional(Schema.String),
+        }),
+      ).toThrow(/\[EDD-9113\].*but not "region"/)
+    })
+
+    it("an optional composite the key needs, beside an optional `by`: one append carries both", () => {
+      expect(() =>
+        make(index("preserve", ["region", "group"], ["group"]), {
+          tenant: Schema.String,
+          region: Schema.optional(Schema.String),
+          group: Schema.optional(Schema.String),
+        }),
+      ).not.toThrow()
+    })
+  })
+
   it("under sparse, a sort key hole takes the row out of the index: nothing to refuse", () => {
     expect(() =>
       make(index("sparse", ["region", "group"], ["group"]), {
