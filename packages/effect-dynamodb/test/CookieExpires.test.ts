@@ -533,26 +533,30 @@ describe("a cookie's expiry reads back as the Date written", () => {
     ),
   )
 
-  it.effect("a row 1.39.0 wrote, its expiry an empty map, reads as a cookie with no expiry", () => {
-    const table = makeRecordingTable()
-    const stored = scenarioOf("entity", "put").requests[0]!.Item as Record<string, AttributeValue>
-    expect(stored.f).toMatchObject({ M: { options: { M: { expires: { M: {} } } } } })
-    table.items.set(`${stored.pk!.S}|${stored.sk!.S}`, stored)
-    return onTable(
-      RowsTable.layer({ name: "t" }),
-      table,
-      Effect.gen(function* () {
-        const db: any = yield* DynamoClient.make({
-          entities: { Rows },
-          tables: { Main: RowsTable },
-        } as never)
-        const got = yield* db.entities.Rows.get({ id: "a" })
-        expect(Object.getPrototypeOf(got.f)).toBe(COOKIE_PROTO)
-        expect(Object.hasOwn(got.f.options, "expires")).toBe(false)
-        expect(got.f.options.path).toBe("/")
-      }),
-    )
-  })
+  it.effect(
+    "a row 1.39.0 wrote, its expiry an empty map, reads back as the map 1.39.0 read",
+    () => {
+      // A cookie made of it would be written back without the expiry the row holds.
+      const table = makeRecordingTable()
+      const stored = scenarioOf("entity", "put").requests[0]!.Item as Record<string, AttributeValue>
+      expect(stored.f).toMatchObject({ M: { options: { M: { expires: { M: {} } } } } })
+      table.items.set(`${stored.pk!.S}|${stored.sk!.S}`, stored)
+      return onTable(
+        RowsTable.layer({ name: "t" }),
+        table,
+        Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: { Rows },
+            tables: { Main: RowsTable },
+          } as never)
+          const got = yield* db.entities.Rows.get({ id: "a" })
+          expect(Object.getPrototypeOf(got.f)).toBe(Object.prototype)
+          expect(got.f).toEqual(fromAttributeValue(stored.f!))
+          expect(got.f.options.expires).toEqual({})
+        }),
+      )
+    },
+  )
 
   it.effect("an aggregate's get, and an update that changes nothing writes nothing", () => {
     const table = makeRecordingTable()

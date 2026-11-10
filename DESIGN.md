@@ -4155,7 +4155,10 @@ and calls no getter, so an item holding none is handled as it always was). Then
 the expiry of each of Effect's cookies (by prototype) as ISO text, where a `Date`
 marshals to an empty map; it finds the source cookie by descriptors, calls no getter,
 and touches nothing else. A typed cookie reads the text back as the `Date`
-(`cookieOptions`); a row 1.39.0 wrote has no expiry.
+(`cookieOptions`). Cookies are held to the write-back check like every kind but a
+date, comparing an expiry as the marshaller writes it (`optionsWriteAs`), so a cookie
+1.39.0 wrote with an expiry (an empty map), one holding properties of its own inside
+it, and a jar keyed other than by its cookies' names stay the map.
 
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values

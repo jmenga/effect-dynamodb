@@ -309,21 +309,21 @@ const expiryOf = (text: string): Date | undefined => {
 }
 
 /**
- * A cookie's options as stored: `expires` is the ISO text of the `Date` written, or, as 1.39.0
- * stored it, the empty map the marshaller makes of a `Date`, which is no expiry. A `maxAge` that's
- * a `Duration` is one again.
+ * A cookie's options as stored: `expires` is the ISO text of the `Date` written, and a `maxAge`
+ * that's a `Duration` is one again. An `expires` that's anything else isn't one this can rebuild:
+ * 1.39.0 stored a `Date` as the empty map the marshaller makes of one, and the cookie it stood for
+ * would be written back without it, so that cookie stays the map it was read as.
  */
 const cookieOptions = (options: unknown): StoredMap | undefined => {
   if (!isMap(options)) return undefined
   const rebuilt: StoredMap = {}
   for (const [key, value] of Object.entries(options)) {
-    if (key === "expires" && typeof value === "string") {
-      const expires = expiryOf(value)
+    if (key === "expires") {
+      const expires = typeof value === "string" ? expiryOf(value) : undefined
       if (expires === undefined) return undefined
       rebuilt[key] = expires
       continue
     }
-    if (key === "expires" && isMap(value) && Object.keys(value).length === 0) continue
     if (key === "maxAge" && markedBy(value, DURATION)) {
       const maxAge = rebuildDuration(value)
       if (maxAge === undefined) return undefined
@@ -560,6 +560,32 @@ const sameNumber = (written: number | bigint, stored: unknown): boolean => {
 }
 
 /**
+ * Whether a cookie's options, written, are what's stored. The marshaller writes the expiry of one
+ * of Effect's cookies as the ISO text of its `Date`, where the `Date`, valid and holding nothing of
+ * its own, would be an empty map; everything else is marshalled as it is.
+ */
+const optionsWriteAs = (options: unknown, stored: unknown): boolean => {
+  if (options === null || typeof options !== "object" || !isPlain(stored)) {
+    return writesAs(options, stored)
+  }
+  const properties = writtenProperties(options)
+  return (
+    properties.length === Object.keys(stored).length &&
+    properties.every(([key, property]) => {
+      if (!Object.hasOwn(stored, key)) return false
+      const dated =
+        key === "expires" &&
+        property instanceof Date &&
+        !Number.isNaN(property.getTime()) &&
+        writtenProperties(property).length === 0
+      return dated
+        ? stored[key] === (property as Date).toISOString()
+        : writesAs(property, stored[key])
+    })
+  )
+}
+
+/**
  * Whether a value, written, is what's stored: the marshaller's walk of it, against what the
  * unmarshaller handed back. Anything this can't say for sure isn't the same.
  */
@@ -590,11 +616,16 @@ const writesAs = (written: unknown, stored: unknown): boolean => {
   }
   if (!isPlain(stored)) return false
   const properties = written instanceof Map ? [...written] : writtenProperties(written)
+  const cookie = Object.getPrototypeOf(written) === COOKIE_PROTO
   return (
     properties.length === Object.keys(stored).length &&
     properties.every(
       ([key, property]) =>
-        typeof key === "string" && Object.hasOwn(stored, key) && writesAs(property, stored[key]),
+        typeof key === "string" &&
+        Object.hasOwn(stored, key) &&
+        (cookie && key === "options"
+          ? optionsWriteAs(property, stored[key])
+          : writesAs(property, stored[key])),
     )
   )
 }
@@ -627,16 +658,16 @@ const carrying = (instance: object, stored: StoredMap): object => {
 
 /**
  * The kinds whose instance is rebuilt only if writing it stores what was read. A date's marker
- * changed between releases and a cookie's expiry is stored otherwise than it's held, so those are
- * rebuilt as they always were.
+ * changed between releases, so a date is rebuilt as it always was. A cookie's expiry is held as a
+ * `Date` and written as its ISO text, which is how {@link optionsWriteAs} compares it.
  */
 const EXACT: { readonly [K in InstanceKind]: boolean } = {
   DateTime: false,
   BigDecimal: true,
   Duration: true,
   TimeZone: true,
-  Cookie: false,
-  Cookies: false,
+  Cookie: true,
+  Cookies: true,
   UrlParams: true,
   SemVer: true,
   SemVerRange: true,
