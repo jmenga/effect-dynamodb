@@ -536,7 +536,7 @@ const asZstdSync = StorageEncoding.valueBytesSync({
 | `StorageEncoding.decodeUnmarshalled(stored)` | one already-unmarshalled stored value (a JSON string, bytes or base64, or a native value) to its wire form |
 | `StorageEncoding.encodeSync` / `decodeSync` / `decodeUnmarshalledSync` | the same, synchronously, for pure code or a hand-rolled loop over many values: pass `{ compressors }` (a registry or a list; none by default) and catch the thrown `ValidationError` |
 
-`measureAppend` takes the append's `additionalItems` too, and measures the request with them in it: adding items changes the request (a lone event's `PutItem` becomes a `TransactWriteItems`), so never add their sizes to a measurement taken without them. Building an additional item can read the table (a put of a versioned or unique-constrained entity reads its item), so with `additionalItems` it needs a `DynamoClient`. Compressed sizes can differ between compressor versions, so leave a margin when you plan on one runtime and write on another.
+`measureAppend` takes the append's `additionalItems` too, and measures the request with them in it: adding items changes the request (a lone event's `PutItem` becomes a `TransactWriteItems`), so never add their sizes to a measurement taken without them. It sends no request. An additional item `append` reads the table to build (a put of a versioned or unique-constrained entity, a `create` over a projection tombstone) has no size without that read, so it fails the measurement with a `ValidationError`. Compressed sizes can differ between compressor versions, so leave a margin when you plan on one runtime and write on another.
 
 ## DynamoDB Streams images
 

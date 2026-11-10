@@ -5124,11 +5124,12 @@ must be object/array-shaped, `[EDD-9073]`). `stream.storedAs` exposes `{ data, s
   `ClientRequestToken` and, when capacity reporting is on, `ReturnConsumedCapacity`; 0 for
   a no-op). It is measured on the request, never summed from parts: adding an item to a
   lone event turns its `PutItem` into a `TransactWriteItems`, another envelope with a
-  token. `measureSnapshot` sizes a snapshot item. Without `additionalItems`,
-  `R = TableConfig` and nothing is read; with them, `R` adds `DynamoClient` and `E`
-  `DynamoClientError`, since building an additional item can read (a guarded put reads
-  its item), and the call is the named operation `EventStream.measureAppend` for
-  consumed-capacity reports. Nothing is written.
+  token. `measureSnapshot` sizes a snapshot item. `R = TableConfig`,
+  `E = ValidationError`, and no request is sent, with or without `additionalItems`: the
+  transaction is built against a client that sends nothing (`Capacity.withoutRequests`).
+  An additional item `append` reads the table to build (a put of a versioned or
+  unique-constrained entity, a `create` over a projection tombstone) has no size without
+  that read, so it fails the measurement with a `ValidationError` naming the read.
 - **Streams.** `decodeStreamImage(image)` returns the read paths' `StreamEvent` for one of
   the stream's event images — DynamoDB JSON (`B` / `BS` as bytes or base64, as Lambda and
   EventBridge Pipes deliver them) or unmarshalled — and `Option.none()` for any other
@@ -5796,7 +5797,7 @@ pre-#147 unions.
 | `EventStream.parseStreamId` | `ValidationError` |
 | `EventStore` multi-source projection `catchUp` / `rebuild` (`applyBatch` / `processBatch` per row) | the sources' `evolve` errors, the read model's errors, `ValidationError`, `ConcurrentModification`, `ProjectionSourceConflict` |
 | `EventStore.batchResponse`, `projection.processBatch`, `EventStore.processBatch` | `StreamRecordIdentifierMissing` (per-row errors are outcome values) |
-| `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` (`measureAppend` with `additionalItems`, which can read to build them: `ValidationError`, `DynamoClientError`) |
+| `EventStore` `measureAppend` / `measureSnapshot` / `decodeStreamImage`, `StorageEncoding.*`, `Entity.decodeMarshalledItem` (no `DynamoClientError`: nothing is read or written) | `ValidationError` |
 
 `.condition()` adds `ConditionalCheckFailed` to an operation that lacks it.
 

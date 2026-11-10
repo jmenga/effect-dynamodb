@@ -19,7 +19,7 @@ import type {
   Capacity as SdkCapacity,
   ConsumedCapacity as SdkConsumedCapacity,
 } from "@aws-sdk/client-dynamodb"
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
 import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
@@ -1050,6 +1050,50 @@ export const instrument = (service: DynamoClientService): DynamoClientService =>
 export const client: Effect.Effect<DynamoClientService, never, DynamoClient> = Effect.suspend(() =>
   Effect.map(Effect.service(DynamoClient), instrument),
 )
+
+/** A data-plane request {@link withoutRequests} refused. */
+export interface RefusedRequest {
+  readonly command: Command
+  readonly input: Record<string, unknown>
+}
+
+/**
+ * Run `effect` with a client that sends nothing, for code that builds a
+ * request only to measure it. Each data-plane request fails locally, is not
+ * counted or reported as a request, and the first one is returned beside the
+ * exit — kept on the side, so it survives however `effect` mapped the failure.
+ */
+export const withoutRequests = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<
+  { readonly exit: Exit.Exit<A, E>; readonly refused: RefusedRequest | undefined },
+  never,
+  Exclude<R, DynamoClient>
+> =>
+  Effect.suspend(() => {
+    let refused: RefusedRequest | undefined
+    const refusing: Record<string, AnyMethod> = {}
+    for (const [method, command] of DATA_PLANE) {
+      refusing[method] = (input) =>
+        Effect.suspend(() => {
+          refused ??= { command, input }
+          return Effect.fail(
+            markNotSent(
+              new DynamoError({ operation: command, cause: "not sent: only measuring a request" }),
+            ),
+          )
+        })
+    }
+    return Effect.exit(effect).pipe(
+      Effect.provideService(DynamoClient, refusing as unknown as DynamoClientService),
+      Effect.provideService(CurrentOperation, SUPPRESSED),
+      Effect.map((exit) => ({ exit, refused })),
+    ) as Effect.Effect<
+      { readonly exit: Exit.Exit<A, E>; readonly refused: RefusedRequest | undefined },
+      never,
+      Exclude<R, DynamoClient>
+    >
+  })
 
 // ---------------------------------------------------------------------------
 // Operation names carried by op builders

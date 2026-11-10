@@ -50,7 +50,14 @@ const OtherNotes = Entity.make({
   primaryKey: { pk: { field: "pk", composite: ["noteId"] }, sk: { field: "sk", composite: [] } },
 })
 
-const MainTable = Table.make({ schema, entities: { Notes, VersionedNotes } })
+const UniqueNotes = Entity.make({
+  model: Note,
+  entityType: "UniqueNote",
+  primaryKey: { pk: { field: "pk", composite: ["noteId"] }, sk: { field: "sk", composite: [] } },
+  unique: { body: ["body"] },
+})
+
+const MainTable = Table.make({ schema, entities: { Notes, VersionedNotes, UniqueNotes } })
 const OtherTable = Table.make({ schema, entities: { OtherNotes } })
 
 /** A table that records every request and refuses a body over 16 MiB, as DynamoDB Local does. */
@@ -541,4 +548,64 @@ describe.each(
       }),
     )
   })
+})
+
+// ---------------------------------------------------------------------------
+// measureAppend sends no request
+// ---------------------------------------------------------------------------
+
+describe("measureAppend sends no request", () => {
+  const events = [new Recorded({ note: "e" })]
+
+  for (const [label, entity] of [
+    ["versioned", VersionedNotes],
+    ["unique-constrained", UniqueNotes],
+  ] as const) {
+    it.effect(
+      `an additional put of a ${label} entity, which append reads to build: refused, unread`,
+      () =>
+        Effect.gen(function* () {
+          const table = strictTable()
+          const reports: Array<unknown> = []
+          const capacity = ConsumedCapacity.layer({
+            onOperation: (report) => Effect.sync(() => void reports.push(report)),
+          })
+          const options = { additionalItems: [entity.put({ noteId: "n1", body: "b" })] }
+          const error = yield* Ledger.measureAppend({ ledgerId: "l1" }, events, 0, options).pipe(
+            on(table, capacity),
+            Effect.flip,
+          )
+          expect(error).toBeInstanceOf(ValidationError)
+          expect(error.operation).toBe("EventStore.measureAppend")
+          expect(String(error.cause)).toContain('append would send GetItem on table "t"')
+          expect(table.requests).toEqual([])
+          expect(reports).toEqual([])
+          // `append` is as it was: it reads the item, then writes.
+          yield* Ledger.append({ ledgerId: "l1" }, events, 0, options).pipe(on(table))
+          expect(table.requests.map((request) => request.command)).toEqual([
+            "GetItem",
+            "TransactWriteItems",
+          ])
+        }),
+    )
+  }
+
+  it.effect("additional items built without a read are measured, and nothing is sent", () =>
+    Effect.gen(function* () {
+      const table = strictTable()
+      const options = {
+        additionalItems: [
+          Notes.put({ noteId: "n1", body: "b" }),
+          Notes.create({ noteId: "n2", body: "c" }),
+          Notes.delete({ noteId: "n3" }),
+        ],
+      }
+      const planned = yield* Ledger.measureAppend({ ledgerId: "l1" }, events, 0, options).pipe(
+        on(table),
+      )
+      expect(table.requests).toEqual([])
+      yield* Ledger.append({ ledgerId: "l1" }, events, 0, options).pipe(on(table))
+      expect(bodies(table, "TransactWriteItems")).toEqual([planned.requestBytes])
+    }),
+  )
 })

@@ -85,10 +85,12 @@ import {
 import { refuseUnreadable } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
+  type Cause,
   Context,
   DateTime,
   type Duration,
   Effect,
+  Exit,
   Function,
   Option,
   Pipeable,
@@ -434,15 +436,15 @@ export interface AppendMeasurement {
 }
 
 /**
- * The options of a {@link EventStream.measureAppend} that reads nothing:
- * those of {@link EventStream.append} without `additionalItems`. With
- * `additionalItems`, `measureAppend` takes {@link AppendOptions} and builds
- * them as `append` does, which can read the table.
+ * The options of {@link EventStream.append} except `additionalItems`.
+ * {@link EventStream.measureAppend} takes {@link AppendOptions}, which these
+ * are assignable to.
  */
 export type MeasureAppendOptions<TMetadata, TState = never> = Omit<
   AppendOptionsBase<TState>,
   "additionalItems"
-> & { readonly additionalItems?: undefined } & AppendMetadataOptions<TMetadata>
+> &
+  AppendMetadataOptions<TMetadata>
 
 export type { LambdaAttributeValue, StreamImage } from "./internal/Packed.js"
 
@@ -2378,33 +2380,23 @@ export interface EventStream<
    * attributes, the sentinel, the inline snapshot), so the numbers are exact
    * for the request `append` would send now with this runtime's compressors.
    *
-   * Nothing is written, and nothing is refused for its size: this is
-   * caller-side planning, not a pre-check. Without `additionalItems` nothing
-   * is read and only `TableConfig` is needed. With them, the request is built
-   * as `append` builds it — the same items, in the same transaction — so an
-   * additional item that reads to be built (a put of a versioned or
-   * unique-constrained entity, a `create` over a projection tombstone) reads
-   * here too, and `DynamoClient` is needed. Fails as `append` would on invalid
-   * options (`ValidationError`), and — with a `CompressorNotRegistered` cause —
-   * when a value crosses its compression threshold without a registered
-   * compressor.
+   * Nothing is read or written, and nothing is refused for its size: this
+   * is caller-side planning, not a pre-check. With `additionalItems` the
+   * request is built as `append` builds it — the same items, in the same
+   * transaction. An additional item `append` reads the table to build (a put
+   * of a versioned or unique-constrained entity, a `create` over a projection
+   * tombstone) has no size without that read, so it fails the measurement
+   * with a `ValidationError` naming the read. Fails as `append` would on
+   * invalid options (`ValidationError`), and — with a
+   * `CompressorNotRegistered` cause — when a value crosses its compression
+   * threshold without a registered compressor.
    */
   measureAppend(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: MeasureAppendOptions<TMetadata, TState> | undefined,
+    options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendMeasurement, ValidationError, TableConfig>
-  measureAppend(
-    streamId: StreamIdInput<TStreamIdFields>,
-    events: ReadonlyArray<TEvent>,
-    expectedVersion: number,
-    options: AppendOptions<TMetadata, TState>,
-  ): Effect.Effect<
-    AppendMeasurement,
-    ValidationError | DynamoClientError,
-    DynamoClient | TableConfig
-  >
 
   /**
    * The item size, in bytes, of the snapshot {@link EventStream.writeSnapshot}
@@ -4469,11 +4461,7 @@ export const makeStream = <
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
     options?: AppendOptions<unknown, unknown> | undefined,
-  ): Effect.Effect<
-    AppendMeasurement,
-    ValidationError | DynamoClientError,
-    DynamoClient | TableConfig
-  > =>
+  ): Effect.Effect<AppendMeasurement, ValidationError, TableConfig> =>
     Effect.gen(function* () {
       const additionalOps = options?.additionalItems
       const headProof = options?.headProof
@@ -4494,14 +4482,30 @@ export const makeStream = <
       }
       // The transaction `append` would send, built by the same code: the
       // stream's items and the items the caller's `additionalItems` build, in
-      // the same places. Without additional items nothing is read.
-      const tx = yield* buildAppendTransaction(
-        parts,
-        additionalOps ?? [],
-        expectedVersion,
-        headProof,
-        proofOp,
+      // the same places. Nothing is sent: an item `append` reads the table to
+      // build has no size without that read, and fails the measurement.
+      const built = yield* Capacity.withoutRequests(
+        buildAppendTransaction(parts, additionalOps ?? [], expectedVersion, headProof, proofOp),
       )
+      if (built.refused !== undefined) {
+        const { command, input } = built.refused
+        return yield* new ValidationError({
+          entityType,
+          operation: "EventStore.measureAppend",
+          cause:
+            `an additional item is built from the stored row: append would send ${command}` +
+            (typeof input.TableName === "string" ? ` on table "${input.TableName}"` : "") +
+            " to build it (a put of a versioned or unique-constrained entity, or a create " +
+            "over a projection tombstone, reads its item). measureAppend sends no request, " +
+            "so this append has no size it can give: measure it without that item and add " +
+            "the item's own size. Nothing was read or written.",
+        })
+      }
+      if (Exit.isFailure(built.exit)) {
+        // No request was refused, so nothing here is a client error.
+        return yield* Effect.failCause(built.exit.cause as Cause.Cause<ValidationError>)
+      }
+      const tx = built.exit.value
       // An append of one event and nothing else is sent as a `PutItem`
       // carrying a write token (#173), measured here with a placeholder token
       // of its length.
@@ -5815,19 +5819,7 @@ export const makeStream = <
     currentVersion: checked(named("currentVersion", currentVersion)),
     readLatest: checked(named("readLatest", readLatest)),
     readIndex: checked(named("readIndex", readIndex)),
-    // With additional items it can read (a guarded put reads its item), so
-    // it is then a named operation for consumed-capacity reports (#174).
-    measureAppend: checked(
-      (
-        streamId: StreamIdInput<TStreamIdFields>,
-        events: ReadonlyArray<TEvent>,
-        expectedVersion: number,
-        options?: AppendOptions<unknown, unknown> | undefined,
-      ) =>
-        options?.additionalItems === undefined
-          ? measureAppend(streamId, events, expectedVersion, options)
-          : named("measureAppend", measureAppend)(streamId, events, expectedVersion, options),
-    ),
+    measureAppend: checked(measureAppend),
     measureSnapshot: checked(measureSnapshot),
     decodeStreamImage: checked(decodeStreamImage),
     query: queryNamespace,
@@ -5993,14 +5985,8 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: MeasureAppendOptions<TMetadata, TState> | undefined,
+    options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendMeasurement, ValidationError, never>
-  measureAppend(
-    streamId: StreamIdInput<TStreamIdFields>,
-    events: ReadonlyArray<TEvent>,
-    expectedVersion: number,
-    options: AppendOptions<TMetadata, TState>,
-  ): Effect.Effect<AppendMeasurement, ValidationError | DynamoClientError, never>
 
   /** See {@link EventStream.measureSnapshot}. */
   measureSnapshot(
@@ -6160,28 +6146,8 @@ export const bind = <
         provide(stream.readIndex(name, streamId, ...options)),
       // The captured context carries a `Compression` registry provided where
       // the stream was bound (#147).
-      measureAppend: ((
-        streamId: StreamIdInput<TStreamIdFields>,
-        events: ReadonlyArray<TEvent>,
-        expectedVersion: number,
-        options?: AppendOptions<TMetadata, TState> | undefined,
-      ) =>
-        provide(
-          stream.measureAppend(
-            streamId,
-            events,
-            expectedVersion,
-            options as AppendOptions<TMetadata, TState>,
-          ),
-        )) as BoundEventStream<
-        TEvent,
-        TStreamIdFields,
-        TMetadata,
-        TState,
-        TIndexName,
-        TIndexProjections,
-        TPartitionedIndexName
-      >["measureAppend"],
+      measureAppend: (streamId, events, expectedVersion, options) =>
+        provide(stream.measureAppend(streamId, events, expectedVersion, options)),
       measureSnapshot: (streamId, state, asOfVersion) =>
         provide(stream.measureSnapshot(streamId, state, asOfVersion)),
       decodeStreamImage: ((image: StreamImage, options?: DecodeStreamImageOptions) =>

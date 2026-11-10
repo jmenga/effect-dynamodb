@@ -353,7 +353,6 @@ describe("a new write path can't go unnoticed", () => {
     "Entity.vectorSearch": "a read",
     "Entity.versions": "a read",
     "EventStream.currentVersion": "a read",
-    "EventStream.measureAppend": "writes nothing: builds the request append would send",
     "EventStream.read": "a read",
     "EventStream.readFrom": "a read",
     "EventStream.readIndex": "a read",
