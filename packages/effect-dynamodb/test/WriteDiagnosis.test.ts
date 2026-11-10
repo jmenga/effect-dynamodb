@@ -13,6 +13,12 @@ import { Effect, Schema } from "effect"
 import { describe, expect, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
 import {
+  batchWriteBodyBytes,
+  REQUEST_MAX_BYTES,
+  transactionBytes,
+  transactWriteBodyBytes,
+} from "../src/internal/ItemSize.js"
+import {
   batchEntries,
   type Diagnosis,
   diagnosedValidationError,
@@ -52,6 +58,9 @@ import {
   ddbTooManyInOperands,
   ddbTooManyOperators,
 } from "./helpers/MockDynamoClient.js"
+import { tooLargeFailure } from "./helpers/RecordingTable.js"
+
+const tooLargeCause = () => tooLargeFailure("TransactWriteItems").cause
 
 // --- Fixtures ---------------------------------------------------------------
 
@@ -439,6 +448,93 @@ describe("WriteDiagnosis (#144)", () => {
         diagnose(rejected(DDB_TOO_MANY_ITEMS), { _tag: "TransactGet", count: 100 }),
       ).toBeUndefined()
     })
+  })
+
+  describe("shape 7a — a request body over 16 MB (HTTP 413)", () => {
+    /** DynamoDB Local's refusal, as the AWS SDK reports it and the client wraps it. */
+    const tooLarge = new DynamoError({ operation: "TransactWriteItems", cause: tooLargeCause() })
+    /** Ten Puts of `chars` NULs: 1 byte each by item size, 6 in the JSON body. */
+    const nulPuts = (chars: number) =>
+      Array.from(
+        { length: 10 },
+        (_, i): TransactWriteItem => ({
+          Put: {
+            TableName: "t",
+            Item: { pk: { S: `p#${i}` }, sk: { S: "s" }, d: { S: "\u0000".repeat(chars) } },
+          },
+        }),
+      )
+
+    it("a transaction within 4 MB by item size but over 16 MB as JSON is named", () => {
+      const items = nulPuts(280_000)
+      const d = expectTag(diagnose(tooLarge, transaction(items)), "RequestTooLarge")
+      expect(d.request).toBe("TransactWriteItems")
+      expect(d.measured).toBe(transactWriteBodyBytes({ TransactItems: items }))
+      expect(d.measured).toBeGreaterThan(REQUEST_MAX_BYTES)
+      expect(d.itemSize).toBe(transactionBytes(items))
+      expect(d.itemSize).toBeLessThan(4_194_304)
+      expect(d.largest).toHaveLength(3)
+      const text = explainDiagnosis(d, "transactWrite")
+      expect(text).toContain("16777216 bytes (16 MB)")
+      expect(text).toContain(`at ${d.measured} bytes`)
+      expect(text).toContain("\\u0000")
+      expect(text).toContain(`the transaction is ${d.itemSize} bytes`)
+      expect(text).toContain("Split the operations into smaller transactions.")
+    })
+
+    it("a batch request's body is rebuilt from its entries, tables and all", () => {
+      const requestItems = {
+        a: Array.from({ length: 13 }, (_, i) => ({
+          PutRequest: { Item: { pk: { S: `p#${i}` }, d: { S: "\u0000".repeat(115_000) } } },
+        })),
+        b: Array.from({ length: 12 }, (_, i) => ({
+          PutRequest: { Item: { pk: { S: `q#${i}` }, d: { S: "\u0000".repeat(115_000) } } },
+        })),
+      }
+      const items = batchEntries(requestItems)
+      const d = expectTag(
+        diagnose(tooLarge, { _tag: "Batch", items, targets: () => targets(items) }),
+        "RequestTooLarge",
+      )
+      expect(d.request).toBe("BatchWriteItem")
+      expect(d.measured).toBe(batchWriteBodyBytes({ RequestItems: requestItems }))
+      expect(explainDiagnosis(d, "batchWrite")).toContain("Write fewer items per request.")
+    })
+
+    it("unconfirmed — a 413 whose request measures within the limit passes through", () => {
+      expect(diagnose(tooLarge, transaction(nulPuts(270_000)))).toBeUndefined()
+      expect(diagnose(tooLarge, transaction([put("a", 100)]))).toBeUndefined()
+      // Reads are not measured.
+      expect(diagnose(tooLarge, { _tag: "TransactGet", count: 1 })).toBeUndefined()
+    })
+
+    it("a ValidationException naming the request size (AWS's documented reason) is confirmed the same way", () => {
+      const aws = rejected("The total request size exceeds 16 MB")
+      expect(diagnose(aws, transaction(nulPuts(280_000)))?._tag).toBe("RequestTooLarge")
+      // Under the limit: not this, and nothing else applies.
+      expect(diagnose(aws, transaction(nulPuts(270_000)))).toBeUndefined()
+    })
+
+    it("diagnoseFailure rewrites a confirmed 413 and leaves an unconfirmed one as it was", () =>
+      Effect.gen(function* () {
+        const rewrite = (diagnosis: Diagnosis, original: unknown) =>
+          diagnosedValidationError(diagnosis, original, {
+            operation: "transactWrite",
+            entityType: "Doc",
+          })
+        const over = yield* Effect.fail(tooLarge).pipe(
+          diagnoseFailure({ sent: () => transaction(nulPuts(280_000)), rewrite }),
+          Effect.flip,
+        )
+        expect(over).toBeInstanceOf(ValidationError)
+        expect((over as ValidationError).entityType).toBe("Doc")
+        expect(((over as ValidationError).cause as Error).cause).toBe(tooLarge)
+        const under = yield* Effect.fail(tooLarge).pipe(
+          diagnoseFailure({ sent: () => transaction(nulPuts(270_000)), rewrite }),
+          Effect.flip,
+        )
+        expect(under).toBe(tooLarge)
+      }).pipe(Effect.runPromise))
   })
 
   describe("pass-through", () => {

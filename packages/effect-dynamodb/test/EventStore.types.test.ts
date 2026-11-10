@@ -44,7 +44,8 @@
  *   `snapshot.storedAs` only a `DynamoModel.Packed` config; error channels
  *   are unchanged (a missing compressor is a `ValidationError` whose cause is
  *   `CompressorNotRegistered`); `measureAppend` / `measureSnapshot` need only
- *   `TableConfig` (nothing on a bound stream) and `decodeStreamImage` nothing,
+ *   `TableConfig` (nothing on a bound stream), with or without
+ *   `additionalItems`, and `decodeStreamImage` nothing,
  *   returning the read paths' `StreamEvent`.
  * - Head proof and `loadState` (#164): an inline `loadState` lambda is
  *   contextually typed by the stream id and the decider's state (the handler's
@@ -1275,8 +1276,21 @@ describe("EventStore packed storage types (#147)", () => {
       expectTypeOf(measured).toEqualTypeOf<
         Effect.Effect<EventStore.AppendMeasurement, ValidationError, Table.TableConfig>
       >()
-      // @ts-expect-error — additionalItems are not measured
-      Packed.measureAppend(key, [], 0, { additionalItems: [] })
+      // With additional items the type is the same: no request is sent.
+      expectTypeOf(
+        Packed.measureAppend(key, [], 0, {
+          additionalItems: [Tallies.put({ counterId: "c-1", total: 1 })],
+        }),
+      ).toEqualTypeOf<typeof measured>()
+      // Options typed as `append`'s, with no additional items: as on 1.39.0.
+      const appendOptions: EventStore.AppendOptions<never> = { headProof: "none" }
+      expectTypeOf(Counter.measureAppend(key, [], 0, appendOptions)).toEqualTypeOf<
+        Effect.Effect<EventStore.AppendMeasurement, ValidationError, Table.TableConfig>
+      >()
+      const measureOptions: EventStore.MeasureAppendOptions<never> = { headProof: "none" }
+      expectTypeOf(Counter.measureAppend(key, [], 0, measureOptions)).toEqualTypeOf<
+        Effect.Effect<EventStore.AppendMeasurement, ValidationError, Table.TableConfig>
+      >()
       expectTypeOf(Packed.measureSnapshot(key, { total: 1 }, 1)).toEqualTypeOf<
         Effect.Effect<number, ValidationError, Table.TableConfig>
       >()
@@ -1293,6 +1307,9 @@ describe("EventStore packed storage types (#147)", () => {
       Effect.gen(function* () {
         const bound = yield* EventStore.bind(Packed)
         expectTypeOf(bound.measureAppend(key, [], 0)).toEqualTypeOf<
+          Effect.Effect<EventStore.AppendMeasurement, ValidationError, never>
+        >()
+        expectTypeOf(bound.measureAppend(key, [], 0, { additionalItems: [] })).toEqualTypeOf<
           Effect.Effect<EventStore.AppendMeasurement, ValidationError, never>
         >()
         expectTypeOf(bound.decodeStreamImage({})).toEqualTypeOf<typeof decoded>()

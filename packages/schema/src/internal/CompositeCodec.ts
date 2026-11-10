@@ -117,7 +117,7 @@ export const makeCompositeKeyForm = (
     const cached = cache.get(attr)
     if (cached !== undefined) return cached
 
-    const field = fields?.[attr]
+    const field = declared(fields, attr)
     // Case 1.
     if (field === undefined) {
       cache.set(attr, null)
@@ -226,7 +226,7 @@ export const makeCompositeKeyForm = (
   const readBacks = new Map<string, ((value: unknown) => unknown) | undefined>()
   const readBack = (attr: string): ((value: unknown) => unknown) | undefined => {
     if (!readBacks.has(attr)) {
-      const field = fields?.[attr]
+      const field = declared(fields, attr)
       readBacks.set(attr, field === undefined ? undefined : storedFormOfDeclaration(field))
     }
     const fn = readBacks.get(attr)
@@ -642,13 +642,24 @@ export const storedFieldAtPath = (
   path: string,
 ): Schema.Top | undefined => followPath(fields, path, (ast) => SchemaAST.toEncoded(ast))
 
+/**
+ * The field a model declares under `name`. Never a member every object
+ * inherits: an attribute named `toString` that the model doesn't declare (a
+ * version or timestamp attribute) is not a field.
+ */
+const declared = (
+  fields: Record<string, Schema.Top> | undefined,
+  name: string,
+): Schema.Top | undefined =>
+  fields !== undefined && Object.hasOwn(fields, name) ? fields[name] : undefined
+
 const followPath = (
   fields: Record<string, Schema.Top> | undefined,
   path: string,
   side: (ast: SchemaAST.AST) => SchemaAST.AST,
 ): Schema.Top | undefined => {
   const [first, ...rest] = path.split(".")
-  const top = fields?.[first!]
+  const top = declared(fields, first!)
   if (top === undefined || rest.length === 0) return top
   let at: ReadonlyArray<SchemaAST.AST> = [side(top.ast)]
   for (const segment of rest) {

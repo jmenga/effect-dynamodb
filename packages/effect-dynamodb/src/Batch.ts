@@ -1,7 +1,8 @@
 /**
  * Batch — BatchGetItem and BatchWriteItem with auto-chunking and retry.
  *
- * DynamoDB limits: BatchGetItem max 100 keys, BatchWriteItem max 25 items.
+ * DynamoDB limits: BatchGetItem max 100 keys, BatchWriteItem max 25 items and
+ * 16 MB of request body.
  * Both can return unprocessed items that must be retried.
  *
  * Accepts Entity operation intermediates directly (EntityGet, EntityPut, EntityDelete).
@@ -12,7 +13,6 @@ import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb
 import {
   DynamoError,
   isAwsTransactionCancelled,
-  TRANSACT_WRITE_ITEMS_LIMIT,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
@@ -22,7 +22,13 @@ import { extractTransactable } from "./Entity.js"
 import type { AnyGet, BoundWriteOp, GetSuccess } from "./internal/BoundCrud.js"
 import * as Capacity from "./internal/Capacity.js"
 import { BASE_DELAY_MS, batchGetRaw, MAX_RETRIES } from "./internal/Hydrate.js"
-import { TRANSACT_WRITE_MAX_BYTES, transactItemBytes } from "./internal/ItemSize.js"
+import {
+  batchWriteShape,
+  batchWriteUnit,
+  packRequests,
+  transactWriteShape,
+  transactWriteUnit,
+} from "./internal/ItemSize.js"
 import {
   batchRejectReason,
   composePrimaryKeyOrFail,
@@ -43,8 +49,6 @@ import {
 } from "./internal/WriteDiagnosis.js"
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import type { TableConfig } from "./Table.js"
-
-const MAX_BATCH_WRITE = 25
 
 /**
  * Optional retry configuration for batch operations.
@@ -167,7 +171,7 @@ const getCore = <const T extends ReadonlyArray<AnyGet>>(
   })
 
 // ---------------------------------------------------------------------------
-// Batch.write — auto-chunk at 25, retry unprocessed
+// Batch.write — split at 25 items and 16 MB, retry unprocessed
 // ---------------------------------------------------------------------------
 
 /**
@@ -187,38 +191,6 @@ type VersionedPut = {
   /** Primary key and every sort-key attribute, to name a rejected item (#144). */
   readonly keyFields: ReadonlyArray<string>
   readonly keys: () => KeyAttributes
-  /** Its exact contribution to a transaction's size (`transactItemBytes`). */
-  readonly bytes: number
-}
-
-/**
- * Versioned puts in caller order, chunked greedily into transactions of at
- * most {@link TRANSACT_WRITE_ITEMS_LIMIT} actions and
- * {@link TRANSACT_WRITE_MAX_BYTES} bytes — DynamoDB's own limits, exactly, by
- * the exact size model. Chunking picks request boundaries; it refuses nothing.
- * One put always fits alone: its item is at most 409,600 bytes, or DynamoDB
- * rejects it as too large.
- */
-const chunkVersionedPuts = (
-  puts: ReadonlyArray<VersionedPut>,
-): ReadonlyArray<ReadonlyArray<VersionedPut>> => {
-  const chunks: Array<Array<VersionedPut>> = []
-  let bytes = 0
-  for (const put of puts) {
-    const last = chunks[chunks.length - 1]
-    if (
-      last === undefined ||
-      last.length >= TRANSACT_WRITE_ITEMS_LIMIT ||
-      bytes + put.bytes > TRANSACT_WRITE_MAX_BYTES
-    ) {
-      chunks.push([put])
-      bytes = put.bytes
-    } else {
-      last.push(put)
-      bytes += put.bytes
-    }
-  }
-  return chunks
 }
 
 /** What a batch had written when its versioned-put chunk `index` failed, as a clause. */
@@ -269,12 +241,15 @@ const committedBeforeRequest = (
 
 /**
  * Batch-write any number of items across entities/tables.
- * Auto-chunks at 25 items per request. Retries unprocessed items
- * with exponential backoff.
+ * Splits the writes into `BatchWriteItem` requests of at most 25 items and
+ * 16,777,216 bytes of request body (the JSON sent, where a control character in
+ * a string takes 6 bytes and a quote 2, though each counts 1 toward an item's
+ * size). Retries unprocessed items with exponential backoff.
  *
  * Puts of a `versioned` entity are sent first, as create-only
- * `TransactWriteItems` (`attribute_not_exists`), chunked at exactly DynamoDB's
- * limits: 100 actions and 4,194,304 bytes by DynamoDB's size accounting. A
+ * `TransactWriteItems` (`attribute_not_exists`), split at exactly DynamoDB's
+ * limits: 100 actions, 4,194,304 bytes by DynamoDB's size accounting, and
+ * 16,777,216 bytes of request body. A
  * batch put cannot continue an existing item's version, so one that would
  * replace an item fails with a `ValidationError` and its chunk writes nothing
  * (the entity's `put` and `Transaction.transactWrite` replace it). Each chunk
@@ -415,9 +390,6 @@ const writeCore = (
             transactItem,
             keyFields,
             keys,
-            // Exact, condition and its name included: what DynamoDB counts
-            // toward the transaction's 4 MB (#144).
-            bytes: transactItemBytes(transactItem),
           })
         } else {
           writeRequests.push({
@@ -466,10 +438,22 @@ const writeCore = (
       }
     }
 
-    // Versioned puts first, as create-only transactions. Each chunk is atomic;
-    // a chunk that would replace an existing item writes nothing and stops the
-    // batch before any later chunk or the plain requests below.
-    const versionedChunks = chunkVersionedPuts(versionedPuts)
+    // What the client sends beside each request's items, counted toward the
+    // request's 16 MB body.
+    const fields = yield* Capacity.requestFields
+
+    // Versioned puts first, as create-only transactions, split at DynamoDB's
+    // limits on one transaction — 100 actions, 4 MB of item size (the
+    // condition and its name included, #144), 16 MB of body. One put always
+    // fits alone: its item is at most 409,600 bytes, or DynamoDB rejects it as
+    // too large. Each chunk is atomic; a chunk that would replace an existing
+    // item writes nothing and stops the batch before any later chunk or the
+    // plain requests below.
+    const versionedChunks = packRequests(
+      versionedPuts,
+      (put) => transactWriteUnit([put.transactItem]),
+      transactWriteShape(fields),
+    )
     for (const [chunkIndex, chunk] of versionedChunks.entries()) {
       const transactItems: Array<TransactWriteItem> = chunk.map((put) => put.transactItem)
       const committed = committedBefore(versionedChunks, chunkIndex)
@@ -565,10 +549,15 @@ const writeCore = (
       }
     }
 
-    // Process in chunks of MAX_BATCH_WRITE.
-    for (let chunkStart = 0; chunkStart < writeRequests.length; chunkStart += MAX_BATCH_WRITE) {
-      const chunk = writeRequests.slice(chunkStart, chunkStart + MAX_BATCH_WRITE)
-
+    // Split at DynamoDB's limits on one BatchWriteItem request: 25 requests and
+    // 16 MB of body. A batch within both is split by its count alone.
+    const chunks = packRequests(
+      writeRequests,
+      (request) => batchWriteUnit(request.tableName, request.request),
+      batchWriteShape(fields),
+    )
+    let chunkStart = 0
+    for (const chunk of chunks) {
       // Group by table name
       let requestItems: Record<string, Array<Record<string, any>>> = {}
       for (const item of chunk) {
@@ -658,5 +647,6 @@ const writeCore = (
         yield* Effect.sleep(`${baseDelayMs * 2 ** (retries - 1)} millis`)
         requestItems = unprocessed
       }
+      chunkStart += chunk.length
     }
   })

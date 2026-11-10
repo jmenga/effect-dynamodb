@@ -1,7 +1,8 @@
 /**
- * An aggregate whose rows together pass 4 MB moves on DynamoDB (connected): `rekey` packs a wave's
- * moves into transactions of at most 100 actions and 4 MB, so DynamoDB accepts each one, where a
- * single transaction of all the lines' moves would be rejected for size.
+ * An aggregate whose rows together pass 4 MB, or 16 MB as the JSON sent, moves on DynamoDB
+ * (connected): `rekey` packs a wave's moves into transactions of at most 100 actions, 4 MB of item
+ * size and 16 MB of request body, so DynamoDB accepts each one, where a single transaction of all
+ * the lines' moves would be rejected for size.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -14,7 +15,12 @@ import { Config, Effect, Schema } from "effect"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
-import { TRANSACT_WRITE_MAX_BYTES, transactionBytes } from "../src/internal/ItemSize.js"
+import {
+  REQUEST_MAX_BYTES,
+  TRANSACT_WRITE_MAX_BYTES,
+  transactionBytes,
+  transactWriteBodyBytes,
+} from "../src/internal/ItemSize.js"
 import * as Table from "../src/Table.js"
 
 const ENDPOINT = Effect.runSync(
@@ -67,17 +73,25 @@ const world = (escapeKeys: boolean) => {
 }
 
 const LINES = 12
-const NOTE = 360_000
 
 let tables = 0
 
-const SETTINGS = [
-  ["to on", true],
-  ["to off", false],
+/**
+ * Each line's note: 360,000 `x` (the lines' moves pass 4 MB of item size together), or 250,000
+ * NULs — one byte of item each but six of JSON, so the moves stay within 4 MB of item size and
+ * pass 16 MB as the request sent.
+ */
+const CASES = [
+  ["to on, over 4 MB of item size", true, "x", 360_000],
+  ["to off, over 4 MB of item size", false, "x", 360_000],
+  ["to on, over 16 MB of request body", true, "\u0000", 250_000],
+  ["to off, over 16 MB of request body", false, "\u0000", 250_000],
 ] as const
 
-describeConnected("an aggregate's rekey over 4 MB, on DynamoDB", () => {
-  it.each(SETTINGS)("%s, its rows move in transactions DynamoDB accepts", (_d, escapeKeys) => {
+describeConnected("an aggregate's rekey over DynamoDB's transaction limits, on DynamoDB", () => {
+  it.each(
+    CASES,
+  )("%s, its rows move in transactions DynamoDB accepts", (_d, escapeKeys, char, NOTE) => {
     const tableName = `rekey-size-${Date.now()}-${tables++}`
     const before = world(!escapeKeys)
     const after = world(escapeKeys)
@@ -125,15 +139,18 @@ describeConnected("an aggregate's rekey over 4 MB, on DynamoDB", () => {
           Key: { pk: row.pk, sk: row.sk },
           UpdateExpression: "SET #n = :n",
           ExpressionAttributeNames: { "#n": "note" },
-          ExpressionAttributeValues: { ":n": { S: "x".repeat(NOTE) } },
+          ExpressionAttributeValues: { ":n": { S: char.repeat(NOTE) } },
         })
       }
-      // The lines' moves would pass 4 MB as one transaction.
+      // The lines' moves would pass 4 MB, or 16 MB of body, as one transaction.
       const stored = yield* scan
       const lineRows = stored.filter((row) => row.__edd_e__?.S === "OrderLine")
-      expect(
-        transactionBytes(lineRows.flatMap((row) => [{ Put: { TableName: tableName, Item: row } }])),
-      ).toBeGreaterThan(TRANSACT_WRITE_MAX_BYTES)
+      const puts = lineRows.map((row) => ({ Put: { TableName: tableName, Item: row } }))
+      if (char === "x") expect(transactionBytes(puts)).toBeGreaterThan(TRANSACT_WRITE_MAX_BYTES)
+      else {
+        expect(transactionBytes(puts)).toBeLessThan(TRANSACT_WRITE_MAX_BYTES)
+        expect(transactWriteBodyBytes({ TransactItems: puts })).toBeGreaterThan(REQUEST_MAX_BYTES)
+      }
 
       const report = yield* Effect.gen(function* () {
         const db = yield* after.client

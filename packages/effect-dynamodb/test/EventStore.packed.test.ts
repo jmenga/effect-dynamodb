@@ -949,22 +949,25 @@ describe("EventStore packed storage — size accounting (#147, R1/R4)", () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
-  it.effect("measureAppend: no-op, invalid options, additionalItems, missing codec", () =>
+  it.effect("measureAppend: no-op, invalid options, empty additionalItems, missing codec", () =>
     Effect.gen(function* () {
       expect(yield* ZstdLedger.measureAppend(id, [], 0)).toEqual({
         events: [],
         sentinel: undefined,
         snapshot: undefined,
         transactionBytes: 0,
+        requestBytes: 0,
       })
       const invalid = yield* ZstdLedger.measureAppend(id, [recorded(1)], 0, {
         eventMetadata: [],
       }).pipe(Effect.flip)
       expect(invalid).toBeInstanceOf(ValidationError)
+      // No additional items is the same request as none given. With them, a
+      // measurement builds them as append does, and may read: it needs a client.
       const additional = yield* ZstdLedger.measureAppend(id, [recorded(1)], 0, {
         additionalItems: [],
-      } as never).pipe(Effect.flip)
-      expect(String((additional as ValidationError).cause)).toContain("additionalItems")
+      }).pipe(Effect.provide(mockDynamoClientLayer()))
+      expect(additional).toEqual(yield* ZstdLedger.measureAppend(id, [recorded(1)], 0))
     }).pipe(Effect.provide(Layer.merge(TableLayer, Codecs))),
   )
 
