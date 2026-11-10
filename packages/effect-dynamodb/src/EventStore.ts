@@ -4497,8 +4497,7 @@ export const makeStream = <
             (typeof input.TableName === "string" ? ` on table "${input.TableName}"` : "") +
             " to build it (a put of a versioned or unique-constrained entity, or a create " +
             "over a projection tombstone, reads its item). measureAppend sends no request, " +
-            "so this append has no size it can give: measure it without that item and add " +
-            "the item's own size. Nothing was read or written.",
+            "so it has no size to give for this append. Nothing was read or written.",
         })
       }
       if (Exit.isFailure(built.exit)) {
