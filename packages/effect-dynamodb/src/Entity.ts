@@ -12932,7 +12932,11 @@ const makeImpl = <
     const rowKeyForm = keyForm(values)
     const rowKeyForm139 = keyForm139(values)
     return Object.keys(rowKeyForm139).some(
-      (attr) => !Object.is(rowKeyForm139[attr], rowKeyForm[attr]),
+      (attr) =>
+        !Object.is(
+          rowKeyForm139[attr],
+          Object.hasOwn(rowKeyForm, attr) ? rowKeyForm[attr] : undefined,
+        ),
     )
       ? [rowKeyForm, rowKeyForm139]
       : [rowKeyForm]
