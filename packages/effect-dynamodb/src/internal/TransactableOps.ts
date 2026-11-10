@@ -610,7 +610,7 @@ export const validateAndBuildPutItem = (
     // accessor could read the transact-written one (#111).
     const composed = { ...(encoded as Record<string, unknown>) }
     for (const field of [sf.createdAt, sf.updatedAt, sf.version]) {
-      if (field) composed[field] = field in stamps ? stamps[field] : item[field]
+      if (field) composed[field] = Object.hasOwn(stamps, field) ? stamps[field] : item[field]
     }
     const composeKeys = (carried: Record<string, unknown>) =>
       composeKeysOrFail(entity.entityType, operation, () =>

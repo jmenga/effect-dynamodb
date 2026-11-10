@@ -8,8 +8,9 @@
 
 import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
@@ -126,4 +127,52 @@ describe(`put requests as ${fixture.generatedFrom} sent them`, () => {
       expect(normalised(scenarios)).toEqual(normalised(fixture.scenarios))
     }),
   )
+})
+
+// A stamp is looked up among the stamps this put generated, never among what
+// every object inherits: a timestamp named `toString` that the caller supplied
+// composes the keys from the caller's date, as on 1.39.0.
+describe("a timestamp named as a member every object inherits", () => {
+  const supplied = DateTime.makeUnsafe("2020-01-02T03:04:05.678Z")
+
+  for (const field of ["toString", "constructor", "valueOf", "hasOwnProperty"]) {
+    const Stamped = Entity.make({
+      model: Schema.Struct({ docId: Schema.String, [field]: DynamoModel.DateString }),
+      entityType: "Inherited",
+      primaryKey: {
+        pk: { field: "pk", composite: ["docId"] },
+        sk: { field: "sk", composite: [field] },
+      },
+      timestamps: { created: field },
+    } as never) as unknown as typeof PlainDocs
+    const StampTable = Table.make({ schema, entities: { Stamped } })
+    const put = (when: DateTime.Utc) => Stamped.put({ docId: "d1", [field]: when } as never)
+
+    for (const [route, write] of [
+      ["Batch.write", (when: DateTime.Utc) => Batch.write([put(when)])],
+      ["Transaction.transactWrite", (when: DateTime.Utc) => Transaction.transactWrite([put(when)])],
+    ] as const) {
+      it.effect(`${field}, ${route}: the sort key is composed from the supplied date`, () =>
+        Effect.gen(function* () {
+          const sortKeys: Array<string> = []
+          const record = (output: unknown) => (input: unknown) =>
+            Effect.sync(() => {
+              const text = JSON.stringify(input)
+              for (const match of text.matchAll(/"sk":\{"S":"([^"]*)"\}/g)) sortKeys.push(match[1]!)
+              return output
+            }) as Effect.Effect<any>
+          const client = mockDynamoClientLayer({
+            batchWriteItem: record({ UnprocessedItems: {} }),
+            transactWriteItems: record({}),
+          } as Partial<DynamoClientService>)
+          yield* write(supplied).pipe(
+            Effect.provide(Layer.mergeAll(client, StampTable.layer({ name: "t" }))),
+          )
+          expect(sortKeys).toHaveLength(1)
+          expect(sortKeys[0]).toContain("2020-01-02t03:04:05.678z")
+          expect(sortKeys[0]).not.toContain("function")
+        }),
+      )
+    }
+  }
 })
