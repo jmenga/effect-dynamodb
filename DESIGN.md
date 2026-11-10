@@ -3075,6 +3075,33 @@ none.
 
 **Implementation strategy.** The builders are thin wrappers. Internally each holds an `EntityOp` (or `EntityDelete`) from the unbound entity plus a pre-resolved `provide` for `DynamoClient + TableConfig`. Every chainable method forwards into the existing `Entity.set/remove/add/condition/…` combinators. On `yield*` (or `.asEffect()`) the builder calls `op._run("record")` (or `op.asEffect()` for deletes) and pipes through `provide` so the final `Effect` has `R = never`.
 
+**A path is stored under its first segment's attribute, and below it as given.**
+A `field:` rename is a top-level attribute's name. Below a field a value is
+stored whole, under the names its own schema has: `put` stores `meta.count` as
+`count` whatever a top-level `count` is renamed to, and a `DynamoModel.ref`'s
+map holds the referenced entity under that entity's own field names, not its
+stored ones. `internal/PathBuilder.ts`'s `storedPath` is the one function that
+says so. `compilePath` names an update's path operations and a condition's
+paths by it (`Entity.condition`, a transaction's op conditions); a filter
+(`renamePaths`, an entity's and a collection's) and a projection
+(`selectRenamed`) map their paths through it too. So all four name the attribute
+`put` stored. Through 1.39.0 `compilePath` renamed every segment: with `count`
+stored as `renamed`, `pathSet(["meta", "count"], 9)` wrote a stray
+`meta.renamed` and left `meta.count` as it was, and a condition on
+`t.meta.count` tested `meta.renamed`, which no row holds, so it failed whatever
+the row held. A filter and a projection already named `meta.count`. A first
+segment holding `#` is still a literal attribute name for a path write and a
+condition (a sparse map's entry). An aggregate's `list` filter compiles with no
+rename at any level, and `.history().where()` is a sort-key condition, so
+neither is affected. A path with no segment below the first spelled as a
+renamed field sends the requests it always sent
+(`test/fixtures/nested-path-requests-1.39.0.json`). A path does not follow a
+nested struct's own key encoding (`Schema.encodeKeys`) on any release: below
+the first segment it names the property as written. Through 1.39.0 one such
+path reached the stored key by coincidence, when the nested struct encoded a
+property to the name a top-level field of the same spelling was renamed to; it
+now names the property, like every other path below a key-encoded struct.
+
 **Path-addressed values are encoded (#133).** `pathSet`, `pathAppend`,
 `pathPrepend`, `pathIfNotExists` and record-based `append` (including the
 versioned-retain path) bypass the update schema, and used to marshal their
