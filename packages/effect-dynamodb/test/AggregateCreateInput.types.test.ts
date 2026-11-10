@@ -2,23 +2,35 @@
  * Type-level tests for what an aggregate's `create` takes (`AggregateCreateInputType`), on the
  * aggregate, on the bound aggregate, and on the typed client's `db.aggregates`.
  *
- * `create` takes the aggregate's own key composites, which its input schema leaves out because a
- * caller supplies them (from a path, say). An edge whose entity one id names takes `${field}Id`, or
- * the entity whole under the field's name, or both, when the id is fetched. A many edge over such
- * an entity takes each element as its id or the entity whole, in any mix, and an element wrapping
- * the entity takes either in the field of the entity's name, where its schema declares that field
- * the entity's own model schema and declares no `${field}Id` of its own. The type sees that name for
- * a `Schema.Struct` model. Every other element (a union, a field of another name or another schema,
- * an element over a `Schema.Class` model) is `unknown`, as 1.39.0's `create` took it: `create`
- * judges it as 1.39.0 did. An id is a value of the key composite's type, or its stored or JSON form
- * where that is another kind of value. A branded id keeps its brand.
- * Every other field takes its domain value, as `Entity.put`'s type asks, though at run time both
- * also take its wire form. The edges match what `create` does at run time
- * (`AggregateRefHydration.test.ts`).
+ * `create`'s type refuses exactly the inputs published 1.39.0's `create` failed on at run time, as
+ * an error or as wrong stored data, and takes everything that worked there: 1.39.0 typed its input
+ * `Record<string, unknown>`, so a refusal must never break code that worked. Each refusal below
+ * names what 1.39.0 did with it, and `AggregateCreateRefusals.test.ts` runs each against the
+ * fixture generated from 1.39.0.
+ *
+ * - An input typed with a string index signature (`Record<string, unknown>`, parsed JSON) is taken
+ *   as it is and judged at run time.
+ * - The aggregate's own key composites, which its input schema leaves out because a caller
+ *   supplies them (from a path, say).
+ * - An edge whose entity one id names takes `${field}Id`, or the entity whole under the field's
+ *   name, or both. Beside the entity whole, a `${field}Id` of another kind than a string is ignored;
+ *   where the model declares `${field}Id`, it is the model's own data.
+ * - A many edge over such an entity takes each element as its id or the entity whole, in any mix,
+ *   and an element wrapping the entity takes either in the field of the entity's name, where its
+ *   schema declares that field the entity's own model schema and declares no `${field}Id` of its
+ *   own, beside the element as 1.39.0's input type typed it. The type sees that name for a
+ *   `Schema.Struct` model. Every other element (a union, a field of another name or another schema,
+ *   an element over a `Schema.Class` model) is `unknown`: `create` judges it as 1.39.0 did.
+ * - An id is a value of the key composite's type, or its stored or JSON form: a branded id's plain
+ *   string included.
+ * - Every other value is its domain value or its stored form, mixed at any depth, a date in any
+ *   form 1.39.0 took (a `DateTime`, a `Date`, a date string, an epoch number; a `Date` field no
+ *   `DateTime`), with keys the schema doesn't declare, which `create` ignores.
  */
 
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { type Effect, Schema, SchemaGetter } from "effect"
+import { DateTime, type Effect, Schema, SchemaGetter } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
@@ -362,6 +374,126 @@ const OtherAggregate = Aggregate.make(OtherRoot, {
 })
 type OtherCreate = Parameters<typeof OtherAggregate.create>[0]
 
+/**
+ * 1.39.0's input forms, over a `Schema.Struct` model with an `id: string` (ref-like to 1.39.0's
+ * input type) whose field name (`idRow`) the type sees, beside the forms added: the entity whole
+ * with its id beside it, and an explicit `undefined` id, on `one` edges and on elements alike.
+ */
+const IdRow = Schema.Struct({ id: Schema.String, f: Schema.Number })
+const IdRows = Entity.make({
+  model: IdRow,
+  entityType: "IdRow",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+const IdTable = Table.make({ schema: AppSchema, entities: { IdRows } })
+class IdRoot extends Schema.Class<IdRoot>("IdRoot")({
+  id: Schema.String,
+  idRow: IdRow,
+  maybeRow: Schema.optionalKey(IdRow),
+  optionalRow: Schema.optional(IdRow),
+  refLike: Schema.Array(
+    Schema.Struct({
+      id: Schema.String,
+      idRow: Schema.optional(IdRow),
+      qty: Schema.optional(Schema.Number),
+    }),
+  ),
+  sheets: Schema.Array(Schema.Struct({ idRow: IdRow, qty: Schema.Number })),
+  maybeSheets: Schema.Array(Schema.Struct({ idRow: Schema.optional(IdRow), qty: Schema.Number })),
+  keySheets: Schema.Array(Schema.Struct({ idRow: Schema.optionalKey(IdRow), qty: Schema.Number })),
+  crew: Schema.Array(Schema.Struct({ captain: IdRow, qty: Schema.Number })),
+  entities: Schema.Array(IdRow),
+}) {}
+const idEdge = (entityType: string) => Aggregate.many({ entityType, entity: IdRows })
+const IdAggregate = Aggregate.make(IdRoot, {
+  table: IdTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "id-root" },
+  root: { entityType: "IdRoot" },
+  edges: {
+    idRow: Aggregate.one({ entityType: "IdRootRow", entity: IdRows }),
+    maybeRow: Aggregate.one({ entityType: "IdRootMaybeRow", entity: IdRows }),
+    optionalRow: Aggregate.one({ entityType: "IdRootOptionalRow", entity: IdRows }),
+    refLike: idEdge("IdRefLike"),
+    sheets: idEdge("IdSheet"),
+    maybeSheets: idEdge("IdMaybeSheet"),
+    keySheets: idEdge("IdKeySheet"),
+    crew: idEdge("IdCrew"),
+    entities: idEdge("IdEntity"),
+  },
+})
+type IdCreate = Parameters<typeof IdAggregate.create>[0]
+
+const idRow = { id: "L", f: 1 }
+
+// Compile-enforced: each of these compiles against published 1.39.0's input type
+// (`Aggregate.Input`), and fails `pnpm check` here if it stops compiling.
+const _idAccepted139: ReadonlyArray<IdCreate> = [
+  {
+    id: "a",
+    idRowId: "L",
+    maybeRowId: "L",
+    refLike: ["L"],
+    sheets: [{ idRowId: "L", qty: 1 }],
+    maybeSheets: [{ idRow, qty: 1 }, { qty: 1 }],
+    keySheets: [{ idRow, qty: 1 }, { qty: 1 }],
+    crew: [{ captainId: "L", qty: 1 }],
+    entities: ["L"],
+  },
+]
+void _idAccepted139
+
+// Compile-enforced: the forms added beside 1.39.0's, which 1.39.0's `create`
+// (`Record<string, unknown>`) took and ran: the entity whole with its id beside it, and an
+// explicit `undefined` id, on `one` edges and on elements alike.
+const _idAdded: ReadonlyArray<IdCreate> = [
+  {
+    id: "a",
+    idRow,
+    idRowId: "L",
+    maybeRow: idRow,
+    maybeRowId: "L",
+    optionalRow: idRow,
+    optionalRowId: "L",
+    refLike: [
+      { id: "x", idRow, qty: 1 },
+      { id: "x", idRowId: "L" },
+    ],
+    sheets: [
+      { idRow, qty: 1 },
+      { idRow, idRowId: "L", qty: 1 },
+      { idRow, idRowId: undefined, qty: 1 },
+    ],
+    maybeSheets: [
+      { idRowId: "L", qty: 1 },
+      { idRow, idRowId: "L", qty: 1 },
+      { idRowId: undefined, qty: 1 },
+    ],
+    keySheets: [
+      { idRowId: "L", qty: 1 },
+      { idRow, idRowId: "L", qty: 1 },
+      { idRowId: undefined, qty: 1 },
+    ],
+    crew: [{ captain: idRow, qty: 1 }],
+    entities: [idRow, "L"],
+  },
+  {
+    id: "a",
+    idRow,
+    idRowId: undefined,
+    maybeRowId: undefined,
+    optionalRowId: undefined,
+    refLike: [],
+    sheets: [],
+    maybeSheets: [],
+    keySheets: [],
+    crew: [],
+    entities: [],
+  },
+]
+void _idAdded
+
 const bound = () => Aggregate.bind(RootAggregate)
 type BoundCreate = Parameters<Effect.Success<ReturnType<typeof bound>>["create"]>[0]
 
@@ -426,10 +558,11 @@ describe("an aggregate's create takes what it takes at run time", () => {
     expectTypeOf({ ...base, dateLineId: "1970-01-01T00:00:00.000Z" }).toExtend<Create>()
   })
 
-  it("keeps a branded id's brand", () => {
-    expectTypeOf<
-      Extract<Create, { readonly brandLineId: unknown }>["brandLineId"]
-    >().toEqualTypeOf<LineId>()
+  it("takes a branded id's plain string, which 1.39.0's create fetched", () => {
+    expectTypeOf<Extract<Create, { readonly brandLineId: unknown }>["brandLineId"]>().toEqualTypeOf<
+      LineId | string
+    >()
+    expectTypeOf({ ...base, brandLineId: "b" }).toExtend<Create>()
   })
 
   it("leaves an optional edge out", () => {
@@ -484,31 +617,190 @@ describe("an aggregate's create takes what it takes at run time", () => {
   })
 })
 
-// Compile-enforced: each of these is a type error, and fails `pnpm check` if it compiles.
-function _refusals(input: Record<string, unknown>): void {
-  const { id: _id, ...withoutKey } = base
-  const { numberLineId: _line, ...withoutLine } = base
-  // @ts-expect-error — the aggregate's key composite is required
-  RootAggregate.create(withoutKey)
-  // @ts-expect-error — a required edge takes its id or the entity whole
-  RootAggregate.create(withoutLine)
-  // @ts-expect-error — a number key takes no string
-  RootAggregate.create({ ...base, numberLineId: "1" })
-  // @ts-expect-error — a branded key takes no plain string
-  RootAggregate.create({ ...base, brandLineId: "b" })
-  // @ts-expect-error — an entity keyed by two attributes is given whole, not by one id
-  RootAggregate.create({ ...base, pairLineId: "p" })
-  // @ts-expect-error — a field takes its domain value, as `Entity.put` does
-  RootAggregate.create({ ...base, count: "3" })
-  // @ts-expect-error — a many edge's element is an id or the entity, not another object
-  RootAggregate.create({ ...base, numberLines: [{ lineId: "x" }] })
-  // @ts-expect-error — a record of unknown values is no input
-  RootAggregate.create(input)
-  // @ts-expect-error — an element naming the entity's field takes it by an id of its key's type
-  RootAggregate.create({ ...base, sheets: [{ numberRowId: "1", qty: 2 }] })
-  // @ts-expect-error — it takes the entity by id or whole, not neither
-  RootAggregate.create({ ...base, sheets: [{ qty: 2 }] })
-  // @ts-expect-error — a class model's element is unknown, but still an element of an array
-  RootAggregate.create({ ...base, classSheets: { numberLine: line, qty: 2 } })
+/**
+ * The fixture generator's input (`AggregateCreateRefusals.test.ts`): every edge given whole, which
+ * 1.39.0 created. Each case below changes one thing in it, so what 1.39.0 did is that change's.
+ */
+const wholeBase = {
+  id: "a",
+  note: "n",
+  count: "3",
+  numberLine: { lineId: 1, f: 5 },
+  codecLine: { lineId: "2", f: 6 },
+  brandLine: { lineId: "b", f: 7 },
+  pairLine: { tenant: "t", lineId: "p", f: 8 },
+  refLine: { lineId: 1, f: 5 },
+  numberLines: [{ lineId: 1, f: 5 }],
+  sheets: [{ numberRow: row, qty: 2 }],
+  maybeSheets: [{ qty: 2 }],
+  classSheets: [{ numberLine: line, qty: 2 }],
+  notes: [{ id: "n1", text: "t" }],
+  team: { name: "A", captain: line },
 }
-void _refusals
+
+/** Fields of each date kind and of a codec, at the root, in a struct and in a many element. */
+class Fields extends Schema.Class<Fields>("Fields")({
+  id: Schema.String,
+  count: Schema.NumberFromString,
+  at: Schema.DateTimeUtcFromString,
+  epoch: DynamoModel.DateEpochMs,
+  utc: Schema.DateTimeUtc,
+  when: Schema.Date,
+  nested: Schema.Struct({ at: Schema.DateTimeUtcFromString, n: Schema.NumberFromString }),
+  tags: Schema.Array(Schema.Struct({ n: Schema.NumberFromString })),
+}) {}
+const FieldsAggregate = Aggregate.make(Fields, {
+  table: MainTable,
+  schema: AppSchema,
+  pk: { field: "pk", composite: ["id"] },
+  collection: { name: "fields" },
+  root: { entityType: "Fields" },
+  edges: { tags: Aggregate.many({ entityType: "FieldsTag", sk: { composite: ["n"] } }) },
+})
+const iso = "2026-01-02T03:04:05.000Z"
+const utc = DateTime.makeUnsafe(iso)
+const ms = Date.parse(iso)
+const fields = {
+  id: "a",
+  count: 3,
+  at: utc,
+  epoch: utc,
+  utc,
+  when: new Date(iso),
+  nested: { at: utc, n: 1 },
+  tags: [{ n: 1 }],
+}
+
+/** A model declaring the `one` edge's `${field}Id` itself: its own data, never an id to fetch. */
+const declaresId = Aggregate.make(
+  Schema.Struct({
+    id: Schema.String,
+    numberLine: NumberLine,
+    numberLineId: Schema.optional(Schema.Number),
+  }),
+  {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "declares-id" },
+    root: { entityType: "DeclaresId" },
+    edges: { numberLine: Aggregate.one({ entityType: "DeclaresIdLine", entity: NumberLines }) },
+  },
+)
+
+// Compile-enforced: `create` takes each of these, each of which worked on published 1.39.0
+// (`AggregateCreateRefusals.test.ts`), or which this release takes and 1.39.0 died on or dropped.
+// Never called: the calls are only compiled.
+function _accepted(
+  record: Record<string, unknown>,
+  parsed: ReturnType<typeof JSON.parse>,
+  open: { readonly [key: string]: unknown },
+): void {
+  // Input typed with a string index signature: taken as it is, judged at run time.
+  RootAggregate.create(record)
+  RootAggregate.create(parsed)
+  RootAggregate.create(open)
+  // 1.39.0: created.
+  RootAggregate.create(wholeBase)
+  RootAggregate.create({ ...wholeBase, count: 3 })
+  RootAggregate.create({ ...wholeBase, pairLineId: 5 })
+  RootAggregate.create({ ...wholeBase, brandLineId: 5 })
+  RootAggregate.create({ ...wholeBase, typo: 1 })
+  RootAggregate.create({ ...wholeBase, sheets: [{ numberRow: row, qty: 2, typo: 1 }] })
+  // 1.39.0: created, storing `NaN` and reading `null`. The type can't tell `"x"` from `"3"`.
+  RootAggregate.create({ ...wholeBase, count: "x" })
+  // 1.39.0 died (no identifier) or dropped the number id; now created.
+  const { numberLine: _n, ...withoutNumberLine } = wholeBase
+  const { brandLine: _b, ...withoutBrandLine } = wholeBase
+  RootAggregate.create({ ...withoutNumberLine, numberLineId: 1 })
+  RootAggregate.create({ ...withoutBrandLine, brandLineId: "b" })
+  RootAggregate.create({ ...wholeBase, sheets: [{ numberRowId: 1, qty: 2 }] })
+  // 1.39.0: created, every date and codec form.
+  FieldsAggregate.create(fields)
+  FieldsAggregate.create({ ...fields, count: "3" })
+  FieldsAggregate.create({ ...fields, at: iso })
+  FieldsAggregate.create({ ...fields, at: new Date(iso) })
+  FieldsAggregate.create({ ...fields, at: ms })
+  FieldsAggregate.create({ ...fields, epoch: ms })
+  FieldsAggregate.create({ ...fields, epoch: new Date(iso) })
+  FieldsAggregate.create({ ...fields, epoch: iso })
+  FieldsAggregate.create({ ...fields, utc: new Date(iso) })
+  FieldsAggregate.create({ ...fields, utc: iso })
+  FieldsAggregate.create({ ...fields, utc: ms })
+  FieldsAggregate.create({ ...fields, when: iso })
+  FieldsAggregate.create({ ...fields, when: ms })
+  FieldsAggregate.create({ ...fields, nested: { at: iso, n: "1" } })
+  FieldsAggregate.create({ ...fields, nested: { at: iso, n: 1 } })
+  FieldsAggregate.create({ ...fields, tags: [{ n: "1" }] })
+  FieldsAggregate.create({ ...fields, typo: 1 })
+  FieldsAggregate.create({ ...fields, tags: [{ n: 1, typo: 1 }] })
+  // 1.39.0: created (#214's fixture). The model's own `numberLineId`, the entity whole beside it.
+  declaresId.create({ id: "a", numberLine: { lineId: 6, f: 99 }, numberLineId: 5 })
+  declaresId.create({ id: "a", numberLine: { lineId: 6, f: 99 } })
+}
+void _accepted
+
+describe("create's type refuses only what 1.39.0's create failed on", () => {
+  // Each refusal names what published 1.39.0 did with the input (the fixture's `create`). The
+  // calls are compiled, never run.
+  it("an input without the aggregate's key composite (1.39.0: ValidationError)", () => {
+    const { id: _id, ...withoutKey } = wholeBase
+    // @ts-expect-error — the aggregate's key composite is required
+    void (() => RootAggregate.create(withoutKey))
+  })
+
+  it("an input without a required one edge, neither id nor whole (1.39.0: ValidationError)", () => {
+    const { numberLine: _line, ...withoutLine } = wholeBase
+    // @ts-expect-error — a required edge takes its id or the entity whole
+    void (() => RootAggregate.create(withoutLine))
+  })
+
+  it("a number-keyed one edge's id as a string (1.39.0: died, Missing composite attribute)", () => {
+    const { numberLine: _line, ...withoutLine } = wholeBase
+    // @ts-expect-error — a number key takes no string
+    void (() => RootAggregate.create({ ...withoutLine, numberLineId: "1" }))
+  })
+
+  it("a string id for an entity keyed by two attributes (1.39.0: died, Missing composite attribute)", () => {
+    const { pairLine: _pair, ...withoutPair } = wholeBase
+    // @ts-expect-error — given whole, not by one id
+    void (() => RootAggregate.create({ ...withoutPair, pairLineId: "p" }))
+    // @ts-expect-error — nor beside the entity whole, where it's fetched
+    void (() => RootAggregate.create({ ...wholeBase, pairLineId: "p" }))
+  })
+
+  it("a field given a value of another type (1.39.0: ValidationError)", () => {
+    // @ts-expect-error — a number field takes no boolean
+    void (() => RootAggregate.create({ ...wholeBase, count: true }))
+  })
+
+  it("a many element that is the entity given another object (1.39.0: ValidationError)", () => {
+    // @ts-expect-error — an id or the entity, not another object
+    void (() => RootAggregate.create({ ...wholeBase, numberLines: [{ lineId: "x" }] }))
+  })
+
+  it("a many element naming the entity's field given a string id of a number key (1.39.0: died, Missing composite attribute)", () => {
+    // @ts-expect-error — an id of its key's type
+    void (() => RootAggregate.create({ ...wholeBase, sheets: [{ numberRowId: "1", qty: 2 }] }))
+  })
+
+  it("a many element without its entity (1.39.0: ValidationError)", () => {
+    // @ts-expect-error — the entity by id or whole, not neither
+    void (() => RootAggregate.create({ ...wholeBase, sheets: [{ qty: 2 }] }))
+  })
+
+  it("a many edge given one element, not a list (1.39.0: ValidationError)", () => {
+    // @ts-expect-error — a class model's element is unknown, but still an element of a list
+    void (() => RootAggregate.create({ ...wholeBase, classSheets: { numberLine: line, qty: 2 } }))
+  })
+
+  it("a Date field given a DateTime (1.39.0: ValidationError)", () => {
+    // @ts-expect-error — a `Date` field takes a `Date`, a date string or an epoch number
+    void (() => FieldsAggregate.create({ ...fields, when: utc }))
+  })
+
+  it("an id the model declares itself, without the entity whole (1.39.0: ValidationError)", () => {
+    // @ts-expect-error — a number the model declares is its data, never fetched
+    void (() => declaresId.create({ id: "a", numberLineId: 5 }))
+  })
+})

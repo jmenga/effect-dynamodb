@@ -649,13 +649,15 @@ The create operation:
 
 Fields other than refs can be given in their domain form as well as their wire form, so the input may carry a `DateTime`, an `Option` or a `Redacted`, including the `Option` a `Schema.OptionFromOptional` makes. These are kept intact while ref IDs are replaced with hydrated data.
 
-`create`'s parameter is typed by what it takes (`Aggregate.AggregateCreateInputType`):
+`create`'s parameter is typed by what it takes (`Aggregate.AggregateCreateInputType`). **The type refuses only inputs that 1.39.0 accepted at compile time but failed on at run time**: an input without a key composite or a required edge, an ID of another type than its key's, one ID for an entity keyed by two attributes, an element in place of a list, a value of another type than its field's. Everything that worked before compiles:
 
+- an input typed with a string index signature (`Record<string, unknown>`, parsed JSON, a value built at run time), which is taken as it is and judged at run time, as before 1.40.0;
 - the aggregate's own key composites, which `inputSchema` and `createSchema` leave out;
-- each other field's domain value, as `Entity.put` types it;
+- each other field's domain value or its wire form, mixed at any depth, and a date as a `DateTime`, a `Date`, a date string or an epoch number (a `Schema.Date` field takes no `DateTime`);
+- keys the model doesn't declare, which `create` ignores;
 - an edge whose entity one ID names, as its ID under `${field}Id`, the entity whole under the field's name, or both. A `many` edge over such an entity takes each element that is the entity as its ID or the entity whole, in any mix. An element whose schema declares the entity's field as the entity's own model, and no `${field}Id` of its own, takes either in that field. Any other element (a union, a transformation, a field of another name or another schema) is typed `unknown`, as before 1.40.0, since `create` takes it as earlier versions did. The type sees the field of the entity's name only for a `Schema.Struct` model, so for a `Schema.Class` model (named by its class) an element wrapping the entity is typed `unknown` too.
 
-An ID is typed as a value of the key attribute's type, or its stored or JSON form where that is another kind of value: `"5"` for a `Schema.NumberFromString` key, an ISO string for a `Date` key. A branded ID keeps its brand. A field's wire form is still taken at run time, but the type asks for the domain value, so decode a request body (with `createSchema`, say) before passing it. Before 1.40.0 the parameter was `Record<string, unknown>`.
+An ID is typed as a value of the key attribute's type, or its stored or JSON form: `"5"` for a `Schema.NumberFromString` key, an ISO string for a `Date` key, the plain string of a branded key. Before 1.40.0 the parameter was `Record<string, unknown>`.
 
 A ref ID is a value of the attribute the referenced entity is keyed by, of that attribute's type: a number for a number key, a `bigint` for a bigint key, a `Date` (or its ISO string) for a date key. Each is fetched by the key the entity's own `put` wrote. An ID of another type (`"5"` for a number key) or one the entity's `put` refuses because DynamoDB can't store it (`Infinity`, alone or inside a struct, `Option` or `Result` ID) fails with a `ValidationError` (`EDD-9131`), and so does an edge whose entity is keyed by more than one attribute (`EDD-9129`): no one ID names one of its items, so give that edge's value whole. Both are checked for every edge before anything is fetched or written.
 

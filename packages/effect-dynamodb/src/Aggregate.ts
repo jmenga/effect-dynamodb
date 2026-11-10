@@ -408,6 +408,20 @@ export type AggregateWriteError =
 export type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
 
 /**
+ * What `create` takes for an input of type `I`. An input typed with a string index signature
+ * (`Record<string, unknown>`, parsed JSON, a value built at run time) is taken as it is and judged
+ * at run time, as 1.39.0's `create` took every input. Any other input (an object literal, a value
+ * of a precise type) is checked against `TCreate`, `create`'s input type, which refuses only what
+ * 1.39.0's `create` failed on at run time. An input `TCreate` takes is taken with keys it doesn't
+ * declare, at any depth, which `create` ignores, as 1.39.0's did: in an object literal too.
+ */
+export type CreateArgument<I, TCreate> = string extends keyof I
+  ? I
+  : [I] extends [TCreate]
+    ? I
+    : TCreate
+
+/**
  * An operational aggregate — returned by `Aggregate.make` with full config.
  * Provides `get`, `create`, `update`, and `delete` for full CRUD lifecycle.
  */
@@ -487,9 +501,12 @@ export interface Aggregate<
    * ({@link AggregateCreateInputType}): the aggregate's key composites and its fields, an edge
    * whose entity one id names given its id (`venueId` instead of `venue: Venue`) or the entity
    * whole. Each id is fetched and hydrated. Items are written via sub-aggregate transaction groups.
+   *
+   * An input typed with a string index signature (`Record<string, unknown>`, parsed JSON) is taken
+   * as it is and judged at run time ({@link CreateArgument}).
    */
-  readonly create: (
-    input: TCreate,
+  readonly create: <const I = TCreate>(
+    input: CreateArgument<I, TCreate>,
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, DynamoClient | TableConfig>
 
   /**
@@ -601,8 +618,8 @@ export interface BoundAggregate<
   >
 
   /** {@link Aggregate.create}, with its services resolved. */
-  readonly create: (
-    input: TCreate,
+  readonly create: <const I = TCreate>(
+    input: CreateArgument<I, TCreate>,
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, never>
 
   readonly update: (
@@ -3395,7 +3412,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
           // 1. Hydrate refs from edges
           const hydrated = yield* hydrateAggregateRefs(
-            input,
+            // What `create`'s type takes (`CreateArgument`) is judged here, at run time.
+            input as Record<string, unknown>,
             config.edges,
             schemaFields,
             aggregateName,

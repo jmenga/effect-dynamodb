@@ -364,8 +364,7 @@ describe("Aggregate timestamps", () => {
         yield* TrackedAggregate.create({
           matchId: "m-9",
           name: "Tracked",
-          // A `Date`, which `create` takes at run time, though its type asks for the domain value.
-          updated: new Date(0) as unknown as DateTime.Utc,
+          updated: new Date(0),
         })
 
         const stored = writtenItems()

@@ -337,6 +337,10 @@ Counting `indexKeys` costs nothing beyond the scan, and so does `repairIndexKeys
 `rekey` moves the rows of the members the client knows. A table shared with a service that registers other entities, aggregates or streams reports their rows as `unregistered`: run `rekey` there too, with a client that knows them.
 </Aside>
 
+## An aggregate's `create` is typed in 1.40
+
+`create`'s type now refuses inputs that 1.39.0 accepted at compile time but failed on at run time. Its parameter was `Record<string, unknown>`, so nothing was checked; it is now derived from the model and the edges ([Aggregates](/effect-dynamodb/guides/aggregates/#create--decompose-and-write)). An input that worked on 1.39.0 still compiles, and an input typed with a string index signature (`Record<string, unknown>`, parsed JSON) is taken as it is and judged at run time, as before.
+
 ## What 1.37.0 and 1.38.0 did to an inverted index
 
 An inverted index over strings is broken in 1.37.0 and 1.38.0: a value with a space, `%` or another character a sort key escapes overwrites a table key, with each attribute holding the text of the half that wrote it last. **1.39.0 fixes it:** both roles build one text under either setting. `rekey` recognises the row those releases left and moves it, an escape in each half included.

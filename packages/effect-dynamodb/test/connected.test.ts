@@ -17384,16 +17384,9 @@ describeConnected("#133 — aggregate DateTimes nested in containers", () => {
       MatchAggregate.create({
         id,
         name: "Match",
-        // Dates as the ISO text a JSON body holds, which `create` takes at run time, though its
-        // type asks for the domain value.
-        ...({
-          startDate: I133_DOB,
-          matchDays: [I133_DOB, I133_DAY2],
-          sessions: [{ number: 1, startTime: I133_DOB }],
-        } as unknown as Pick<
-          Parameters<typeof MatchAggregate.create>[0],
-          "startDate" | "matchDays" | "sessions"
-        >),
+        startDate: I133_DOB,
+        matchDays: [I133_DOB, I133_DAY2],
+        sessions: [{ number: 1, startTime: I133_DOB }],
         team1: {
           teamId: "team-1",
           coachId: "coach-1",

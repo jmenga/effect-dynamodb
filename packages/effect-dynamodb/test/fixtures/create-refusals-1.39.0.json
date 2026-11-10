@@ -1,0 +1,1047 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "cases": {
+  "baseline, every edge whole, count in its stored form": {
+   "create": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "written": 12,
+   "stored": {
+    "note": {
+     "S": "n"
+    },
+    "refLine": {
+     "M": {
+      "lineId": {
+       "N": "1"
+      },
+      "f": {
+       "N": "5"
+      }
+     }
+    },
+    "count": {
+     "S": "3"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}"
+  },
+  "count as its domain value": {
+   "create": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "written": 12,
+   "stored": {
+    "note": {
+     "S": "n"
+    },
+    "refLine": {
+     "M": {
+      "lineId": {
+       "N": "1"
+      },
+      "f": {
+       "N": "5"
+      }
+     }
+    },
+    "count": {
+     "S": "3"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}"
+  },
+  "without the aggregate's key composite": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "without a required one edge, neither id nor whole": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a number-keyed one edge's id as a string": {
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a number-keyed one edge's id as a number": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a branded-key one edge's id as a plain string": {
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a two-attribute-key one edge given one id": {
+   "create": "died: Missing composite attribute \"tenant\" in record",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a two-attribute-key one edge given the entity whole and one id": {
+   "create": "died: Missing composite attribute \"tenant\" in record",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a two-attribute-key one edge given the entity whole and a number beside it": {
+   "create": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "written": 12,
+   "stored": {
+    "note": {
+     "S": "n"
+    },
+    "refLine": {
+     "M": {
+      "lineId": {
+       "N": "1"
+      },
+      "f": {
+       "N": "5"
+      }
+     }
+    },
+    "count": {
+     "S": "3"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}"
+  },
+  "a string-keyed one edge given the entity whole and a number beside it": {
+   "create": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "written": 12,
+   "stored": {
+    "note": {
+     "S": "n"
+    },
+    "refLine": {
+     "M": {
+      "lineId": {
+       "N": "1"
+      },
+      "f": {
+       "N": "5"
+      }
+     }
+    },
+    "count": {
+     "S": "3"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}"
+  },
+  "a field given a value of another type (count a boolean)": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a field in the wrong kind of value (count a non-numeric string)": {
+   "create": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":null,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "written": 12,
+   "stored": {
+    "note": {
+     "S": "n"
+    },
+    "refLine": {
+     "M": {
+      "lineId": {
+       "N": "1"
+      },
+      "f": {
+       "N": "5"
+      }
+     }
+    },
+    "count": {
+     "S": "NaN"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":null,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}"
+  },
+  "a many element that is the entity given another object": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a many element naming the entity's field given a string id of a number key": {
+   "create": "died: Missing composite attribute \"lineId\" in record",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a many element naming the entity's field given a number id": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a many element without its entity": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a many edge given one element, not an array": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "a key the aggregate doesn't declare": {
+   "create": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "written": 12,
+   "stored": {
+    "note": {
+     "S": "n"
+    },
+    "refLine": {
+     "M": {
+      "lineId": {
+       "N": "1"
+      },
+      "f": {
+       "N": "5"
+      }
+     }
+    },
+    "count": {
+     "S": "3"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}"
+  },
+  "a many element's key the element doesn't declare": {
+   "create": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}",
+   "requests": [
+    "transactWriteItems",
+    "transactWriteItems"
+   ],
+   "written": 12,
+   "stored": {
+    "note": {
+     "S": "n"
+    },
+    "refLine": {
+     "M": {
+      "lineId": {
+       "N": "1"
+      },
+      "f": {
+       "N": "5"
+      }
+     }
+    },
+    "count": {
+     "S": "3"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"note\":\"n\",\"count\":3,\"numberLine\":{\"lineId\":1,\"f\":5},\"codecLine\":{\"lineId\":2,\"f\":6},\"brandLine\":{\"lineId\":\"b\",\"f\":7},\"pairLine\":{\"tenant\":\"t\",\"lineId\":\"p\",\"f\":8},\"refLine\":{\"lineId\":1,\"f\":5},\"numberLines\":[{\"lineId\":1,\"f\":5}],\"sheets\":[{\"numberRow\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"maybeSheets\":[{\"qty\":2}],\"classSheets\":[{\"numberLine\":{\"lineId\":1,\"f\":5},\"qty\":2}],\"notes\":[{\"id\":\"n1\",\"text\":\"t\"}],\"team\":{\"name\":\"A\",\"captain\":{\"lineId\":1,\"f\":5}}}"
+  },
+  "fields, every one its domain value": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a NumberFromString given its stored form": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a NumberFromString given a non-numeric string": {
+   "create": "ok {\"id\":\"a\",\"count\":null,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "NaN"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":null,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateTimeUtcFromString given an ISO string": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateTimeUtcFromString given a Date": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateTimeUtcFromString given epoch milliseconds": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateEpochMs given epoch milliseconds": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateEpochMs given a Date": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateEpochMs given an ISO string": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateTimeUtc given a Date": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateTimeUtc given an ISO string": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a Date given an ISO string": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a Date given a DateTime.Utc": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "fields, a Date given epoch milliseconds": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateTimeUtc given epoch milliseconds": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a DateTimeUtcFromString given a non-date string": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "fields, a DateEpochMs given a non-date string": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "fields, a nested struct given stored forms": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a nested struct given one stored form and one domain value": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a many element given its stored form": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, a key the model doesn't declare": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "fields, an element's key the element doesn't declare": {
+   "create": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "at": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "utc": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "count": {
+     "S": "3"
+    },
+    "epoch": {
+     "N": "1767323045000"
+    },
+    "id": {
+     "S": "a"
+    },
+    "when": {
+     "S": "2026-01-02T03:04:05.000Z"
+    },
+    "nested": {
+     "M": {
+      "n": {
+       "S": "1"
+      },
+      "at": {
+       "S": "2026-01-02T03:04:05.000Z"
+      }
+     }
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"count\":3,\"at\":\"2026-01-02T03:04:05.000Z\",\"epoch\":\"2026-01-02T03:04:05.000Z\",\"utc\":\"2026-01-02T03:04:05.000Z\",\"when\":\"2026-01-02T03:04:05.000Z\",\"nested\":{\"at\":\"2026-01-02T03:04:05.000Z\",\"n\":1},\"tags\":[{\"n\":1}]}"
+  },
+  "branded, a one edge's id and a many edge's ids given plain strings, the entity with an identifier": {
+   "create": "ok {\"id\":\"a\",\"brandIdLine\":{\"lineId\":\"b\",\"f\":7},\"brandIdLines\":[{\"lineId\":\"b\",\"f\":7}]}",
+   "requests": [
+    "batchGetItem",
+    "transactWriteItems"
+   ],
+   "written": 3,
+   "stored": {
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"brandIdLine\":{\"lineId\":\"b\",\"f\":7},\"brandIdLines\":[{\"lineId\":\"b\",\"f\":7}]}"
+  }
+ }
+}
