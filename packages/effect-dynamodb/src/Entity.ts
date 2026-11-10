@@ -164,7 +164,6 @@ import {
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
   overTombstone,
-  serializeSparseOrFail,
   UNSENTINELED_DEFAULTS,
 } from "./internal/TransactableOps.js"
 import { planWrite, type TransactPlan } from "./internal/TransactPlan.js"
@@ -3683,8 +3682,6 @@ const makeImpl = <
     if (!hasSparseFields) return
     encodeSparseFields(item, sparseFields)
   }
-  /** This entity's sparse fields, for `serializeSparseOrFail`. */
-  const sparseWriter = { entityType, _serializeSparseFields: serializeSparseFields }
 
   /**
    * Rebuild sparse Map fields from flattened top-level attributes.
@@ -7062,7 +7059,16 @@ const makeImpl = <
           // Rename domain fields to DynamoDB attribute names
           renameToDynamo(item)
           // Flatten sparse Map fields into per-entry top-level attributes.
-          yield* serializeSparseOrFail(sparseWriter, item, `${operation}.sparse`)
+          // Wrapped to surface key-validation errors as ValidationError.
+          try {
+            serializeSparseFields(item)
+          } catch (e) {
+            return yield* new ValidationError({
+              entityType,
+              operation: `${operation}.sparse`,
+              cause: e instanceof Error ? e.message : String(e),
+            })
+          }
           // Pack `storedAs: DynamoModel.Packed` fields to their stored form
           // (JSON string, or compressed binary over the threshold) — after
           // renames and sparse flattening, before marshalling, so every size

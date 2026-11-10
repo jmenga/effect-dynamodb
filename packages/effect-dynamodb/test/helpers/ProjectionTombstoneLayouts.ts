@@ -1,12 +1,11 @@
 /**
  * One read model fed by several projections (#154), each keeping its own checkpoint fields, three
- * of them with `removal` and one without: `create` over a tombstone carries every projection's
- * checkpoints it holds, not those of whichever projection was defined last. A row two of them feed
- * keeps both projections' checkpoints when one removes it, and when a write replaces the tombstone,
- * whether or not the other has `removal`. Each of those writes raises every projection's revision
- * the row holds, and gives a row no revision it didn't hold. A read model whose
- * checkpoint map is a sparse map has its tombstone refused as its row is. The scenarios run against
- * the in-memory tables and against DynamoDB Local; `rowOf` reads a row (or tombstone) back raw.
+ * of them with `removal` and one without: `create` over a tombstone carries the checkpoints (and
+ * the revision, one higher) of the projection that wrote it, not those of whichever projection with
+ * `removal` was defined last. A read model whose checkpoint map is a sparse map has its tombstone
+ * refused as its row is. The scenarios run against the in-memory tables and against DynamoDB
+ * Local; `rowOf` reads a row (or tombstone) back raw. What the removal paths send and store with
+ * several projections is pinned against the published 1.39.0 in `ProjectionTombstoneShared.ts`.
  */
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
@@ -145,8 +144,8 @@ const ByInvoice = EventStore.projection({
   removal: {},
 })
 
-// No `removal`: its checkpoint is kept on the row through the other projections' tombstones.
-const ByPayment = EventStore.projection({
+// No `removal`: it writes no tombstone, so `create` over one never takes its layout.
+export const ByPayment = EventStore.projection({
   stream: Payments,
   readModel: Ledgers,
   key: (id: { readonly paymentId: string }) => ({ id: id.paymentId }),
@@ -282,186 +281,6 @@ export const scenarios = (rowOf: RowOf, run = "") => {
   })
 
   /**
-   * One row fed by the order and invoice projections; the order projection removes it. The
-   * tombstone keeps the invoice projection's checkpoint as well as its own, and raises its
-   * revision, so a redelivery of an invoice event is already applied, and the stream's next event
-   * starts the row from `initial` at that checkpoint. The row it writes keeps the order projection's
-   * checkpoint in turn, and raises its revision, so a late redelivery of the removal is already
-   * applied.
-   */
-  const sharedRow = Effect.gen(function* () {
-    const x1 = id("x1")
-    yield* Invoices.append({ invoiceId: x1 }, [new Placed({ amount: 5 })], 0)
-    const invoices = yield* Invoices.read({ invoiceId: x1 })
-    yield* ByInvoice.applyBatch(invoices)
-    yield* Orders.append({ orderId: x1 }, history, 0)
-    const orders = yield* Orders.read({ orderId: x1 })
-    yield* ByOrder.applyBatch(orders)
-    expect(yield* rowOf(x1)).toMatchObject({
-      __edd_e__: "Ledger#tombstone",
-      orderVersion: 2,
-      orderRev: 1,
-      invoiceVersion: 1,
-      revision: 2,
-    })
-    const redelivered = yield* ByInvoice.apply(invoices[0]!)
-    expect(redelivered.applied).toEqual([])
-    expect(redelivered.alreadyApplied).toHaveLength(1)
-    expect(yield* rowOf(x1)).toMatchObject({ __edd_e__: "Ledger#tombstone", invoiceVersion: 1 })
-
-    yield* Invoices.append({ invoiceId: x1 }, [new Placed({ amount: 7 })], 1)
-    const next = (yield* Invoices.read({ invoiceId: x1 }))[1]!
-    expect((yield* ByInvoice.apply(next)).applied).toHaveLength(1)
-    expect(yield* rowOf(x1)).toMatchObject({
-      __edd_e__: "Ledger",
-      total: 7,
-      invoiceVersion: 2,
-      revision: 3,
-      orderVersion: 2,
-      orderRev: 2,
-    })
-    const late = yield* ByOrder.apply(orders[1]!)
-    expect(late.applied).toEqual([])
-    expect(late.removed).toBe(false)
-    expect(yield* rowOf(x1)).toMatchObject({ __edd_e__: "Ledger", total: 7 })
-  })
-
-  /**
-   * One row fed by the multi-source and order projections; the order projection removes it, then
-   * the entity's `create` takes the tombstone's place. It carries both projections' checkpoints,
-   * and both revisions one higher than the tombstone's, which raised the multi-source one already.
-   */
-  const sharedCreate = Effect.gen(function* () {
-    const x2 = id("x2")
-    yield* Shipments.append({ shipmentId: x2 }, [new Placed({ amount: 2 })], 0)
-    const shipments = yield* Shipments.read({ shipmentId: x2 })
-    yield* ByShipment.applyBatch(tagged(shipments))
-    yield* Orders.append({ orderId: x2 }, history, 0)
-    const orders = yield* Orders.read({ orderId: x2 })
-    yield* ByOrder.applyBatch(orders)
-    expect(yield* rowOf(x2)).toMatchObject({
-      __edd_e__: "Ledger#tombstone",
-      orderVersion: 2,
-      orderRev: 1,
-      checkpoints: { [`shipment#${x2}`]: 1 },
-      revision: 2,
-    })
-    yield* Ledgers.create({ id: x2, total: 3 }).asEffect()
-    expect(yield* rowOf(x2)).toMatchObject({
-      __edd_e__: "Ledger",
-      total: 3,
-      orderVersion: 2,
-      orderRev: 2,
-      checkpoints: { [`shipment#${x2}`]: 1 },
-      revision: 3,
-    })
-    const late = (yield* ByShipment.applyBatch(tagged(shipments))).outcomes[0]!
-    if (late._tag !== "Applied") throw new Error("not applied")
-    expect(late.instances[0]!.applied).toEqual([])
-    expect((yield* ByOrder.apply(orders[1]!)).applied).toEqual([])
-    expect(yield* rowOf(x2)).toMatchObject({ __edd_e__: "Ledger", total: 3 })
-  })
-
-  /**
-   * The order projection removes a row the invoice projection feeds; then the invoice projection
-   * removes it too. Its tombstone, written over the order projection's, keeps the order
-   * projection's checkpoint, and raises its revision.
-   */
-  const sharedTwice = Effect.gen(function* () {
-    const x3 = id("x3")
-    yield* Invoices.append({ invoiceId: x3 }, [new Placed({ amount: 5 })], 0)
-    yield* ByInvoice.applyBatch(yield* Invoices.read({ invoiceId: x3 }))
-    yield* Orders.append({ orderId: x3 }, history, 0)
-    const orders = yield* Orders.read({ orderId: x3 })
-    yield* ByOrder.applyBatch(orders)
-    yield* Invoices.append({ invoiceId: x3 }, [new Cancelled({})], 1)
-    const cancelled = (yield* Invoices.read({ invoiceId: x3 }))[1]!
-    expect((yield* ByInvoice.apply(cancelled)).removed).toBe(true)
-    expect(yield* rowOf(x3)).toMatchObject({
-      __edd_e__: "Ledger#tombstone",
-      invoiceVersion: 2,
-      revision: 3,
-      orderVersion: 2,
-      orderRev: 2,
-    })
-    expect((yield* ByOrder.apply(orders[1]!)).applied).toEqual([])
-  })
-
-  /**
-   * One row fed by the payment projection, which has no `removal`, and the order projection, which
-   * removes it. The tombstone keeps the payment projection's checkpoint, and so does the entity's
-   * `create` over it, each raising its revision, so a redelivery of the payment event is already
-   * applied.
-   */
-  const withoutRemoval = Effect.gen(function* () {
-    const x4 = id("x4")
-    yield* Payments.append({ paymentId: x4 }, [new Placed({ amount: 5 })], 0)
-    const payments = yield* Payments.read({ paymentId: x4 })
-    yield* ByPayment.applyBatch(payments)
-    yield* Orders.append({ orderId: x4 }, history, 0)
-    const orders = yield* Orders.read({ orderId: x4 })
-    yield* ByOrder.applyBatch(orders)
-    expect(yield* rowOf(x4)).toMatchObject({
-      __edd_e__: "Ledger#tombstone",
-      orderVersion: 2,
-      orderRev: 1,
-      paymentVersion: 1,
-      revision: 2,
-    })
-    expect((yield* ByPayment.apply(payments[0]!)).applied).toEqual([])
-    yield* Ledgers.create({ id: x4, total: 3 }).asEffect()
-    expect(yield* rowOf(x4)).toMatchObject({
-      __edd_e__: "Ledger",
-      total: 3,
-      orderVersion: 2,
-      orderRev: 2,
-      paymentVersion: 1,
-      revision: 3,
-    })
-    expect((yield* ByPayment.apply(payments[0]!)).applied).toEqual([])
-    expect((yield* ByOrder.apply(orders[1]!)).applied).toEqual([])
-    expect(yield* rowOf(x4)).toMatchObject({ __edd_e__: "Ledger", total: 3 })
-  })
-
-  /**
-   * The order projection removes a row, and `create` takes the tombstone's place; then the invoice
-   * projection removes the created row. Its tombstone keeps the order projection's checkpoint the
-   * row held, and so does the next `create`, so a late redelivery of the order's removal is already
-   * applied. The first tombstone and the row created over it hold no revision of the invoice
-   * projection, so they get none; its own first write sets it, and every write after raises both.
-   */
-  const removedTwice = Effect.gen(function* () {
-    const x5 = id("x5")
-    yield* Orders.append({ orderId: x5 }, history, 0)
-    const orders = yield* Orders.read({ orderId: x5 })
-    yield* ByOrder.applyBatch(orders)
-    yield* Ledgers.create({ id: x5, total: 1 }).asEffect()
-    expect(yield* rowOf(x5)).not.toHaveProperty("revision")
-    yield* Invoices.append({ invoiceId: x5 }, history, 0)
-    yield* ByInvoice.applyBatch(yield* Invoices.read({ invoiceId: x5 }))
-    expect(yield* rowOf(x5)).toMatchObject({
-      __edd_e__: "Ledger#tombstone",
-      invoiceVersion: 2,
-      revision: 1,
-      orderVersion: 2,
-      orderRev: 3,
-    })
-    yield* Ledgers.create({ id: x5, total: 2 }).asEffect()
-    expect(yield* rowOf(x5)).toMatchObject({
-      __edd_e__: "Ledger",
-      total: 2,
-      invoiceVersion: 2,
-      revision: 2,
-      orderVersion: 2,
-      orderRev: 4,
-    })
-    const late = yield* ByOrder.apply(orders[1]!)
-    expect(late.applied).toEqual([])
-    expect(late.removed).toBe(false)
-    expect(yield* rowOf(x5)).toMatchObject({ __edd_e__: "Ledger", total: 2 })
-  })
-
-  /**
    * A checkpoint map stored as a sparse map: its row write and its tombstone write are refused
    * alike, with nothing written. `sparse` returns the two refusals, each with its stream id named
    * `<id>`.
@@ -498,11 +317,6 @@ export const scenarios = (rowOf: RowOf, run = "") => {
     firstAndLast,
     multiSource,
     transactional,
-    sharedRow,
-    sharedCreate,
-    sharedTwice,
-    withoutRemoval,
-    removedTwice,
     sparse,
   }
 }

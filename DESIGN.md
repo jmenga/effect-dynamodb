@@ -5780,14 +5780,38 @@ instance).
   report them as absent. A later event restarts from `initial`. Removal is
   refused for read models with `unique` / `retain` / `softDelete` features.
   The entity's `create` (single-item and transactional) takes a tombstone's
-  place, carrying its kept fields over with the revision one higher. Every
-  projection records its layout on the read model (`_projectionLayouts`), with
-  or without `removal`: each attribute it keeps on a row (checkpoint,
-  checkpoint map, checkpoint owner, revision) with its role, and whether its
-  tombstones set the TTL attribute. One entry per distinct layout, the one defined last at the end (a layout defined again
-  moves there). Whether `create` reads first is a flag of its own
-  (`_projectionTombstones`: some projection has `removal`), so a read model
-  whose projections have none sends `create`'s put alone, as before.
+  place, carrying the checkpoints of the projection that wrote it over, with
+  its revision one higher. Every projection records its layout on the read
+  model (`_projectionLayouts`), with or without `removal`: each attribute it
+  keeps on a row (checkpoint, checkpoint map, checkpoint owner, revision) with
+  its role, whether it has `removal`, and whether its tombstones set the TTL
+  attribute. One entry per distinct layout, the one defined last at the end
+  (a layout defined again moves there). Whether `create` reads first is a flag
+  of its own (`_projectionTombstones`: some projection has `removal`), so a
+  read model whose projections have none sends `create`'s put alone, as
+  before.
+  - **A tombstone keeps the remover's attributes.** Its checkpoints and
+    revision, nothing of another projection's, and a projection's row written
+    over a tombstone holds what its own state gives it, as on 1.39.0. On a row
+    several projections share, another projection's checkpoint doesn't survive
+    the row's removal, so its redelivery applies again, as on 1.39.0. Whether
+    a field on a row is the writer's own data or another projection's
+    bookkeeping can't be told without a record of which projections wrote the
+    row, which this release doesn't keep.
+  - **`create` over a tombstone** consults the projections with `removal`,
+    the one defined last first: each attribute one of them names that the
+    tombstone holds is carried, a checkpoint (or map, or owner) as it is and a
+    revision one higher, and an attribute two of them name takes the role the
+    one defined last gives it. A tombstone holds its writer's attributes, so
+    those are what's carried, whichever projection with `removal` wrote it.
+    1.39.0 took the layout of the projection with `removal` defined last
+    alone, so over another projection's tombstone it carried nothing, and a
+    late redelivery of the removal applied again and removed the created row.
+    A projection without `removal` writes no tombstone and isn't consulted.
+    When a projection's tombstones set the table's TTL attribute, it is never
+    carried, so the row doesn't expire with the tombstone. Over a tombstone of
+    the projection with `removal` defined last, `create` sends and stores what
+    1.39.0 did (`test/fixtures/projection-tombstones-shared-1.39.0.json`).
   - **One role per attribute in a projection (`EDD-9133`), on a read model
     whose rows may be tombstones.** When a projection on the read model has
     `removal`, a stored attribute (compared through the entity's renames, as
@@ -5799,13 +5823,10 @@ instance).
     doesn't decide it. Without `removal` nothing is refused. Two projections
     may keep one attribute in different roles: projections writing disjoint
     rows (`a#<id>` and `b#<id>`, say) can't be told at definition from
-    projections sharing rows. A projection's write takes its own roles first,
-    and carries and raises another's attributes only where its own don't name
-    them (`projectionAttributes`, by stored name), so on its own rows its
-    attributes keep their roles, as on 1.39.0. `create` over a tombstone,
-    which no projection writes, takes each attribute in the role of the
-    projection defined last that names it. Projections that share rows and
-    swap an attribute's roles are broken, as on 1.39.0, and can't be detected.
+    projections sharing rows, and each projection writes only its own
+    attributes, so on its own rows they keep their roles, as on 1.39.0.
+    Projections that share rows and swap an attribute's roles are broken, as
+    on 1.39.0, and can't be detected.
     The table's TTL attribute is known only when a projection runs: one a
     projection keeps (by its stored name) while a projection's tombstones set
     it (`removal.ttl`) refuses every projection on the read model with a
@@ -5817,37 +5838,13 @@ instance).
     `drainPending` write no row and don't run it, so a worker providing only
     its outbox's table delivers as on 1.39.0. Projections may share an
     attribute in one role, such as a revision.
-  - **A row several projections feed.** A row that becomes a tombstone keeps
-    the remover's fields and every other layout's checkpoints that the row
-    holds. A projection's write over a tombstone (a row from `initial`, or
-    another tombstone) keeps the other layouts' checkpoints the tombstone
-    holds, whatever `initial` gave them. So no projection loses its checkpoint
-    to another's removal, with or without `removal` of its own: a redelivery is
-    still applied once, and a late removal can't remove a row recreated after
-    it.
-  - **Every revision the row holds is raised on a removal path.** Each
-    whole-row write on one (a projection's tombstone, its row written over a
-    tombstone, and `create` over one) writes every layout's revision the row
-    held one higher (`nextProjectionRevisions`), beside the writing
-    projection's own. A projection's write that read its revision there is
-    guarded on that value, so it fails its guard whichever projection wrote in
-    between, and retries from a fresh read. A revision the row didn't hold
-    stays absent, as on 1.39.0: these writes give a row no attribute it didn't
-    have. So a projection whose revision a row has never held isn't failed by
-    another's write on a removal path: its guard is the attribute's absence,
-    before and after. With one layout this is the projection's own revision,
-    which these writes already set, so nothing sent or stored changes.
-  - **`create` over a tombstone** carries every checkpoint attribute a layout
-    names that the tombstone holds, as it is, and every revision it holds one
-    higher, and never carries the table's TTL attribute. It chooses no layout.
-    The layout defined last comes first, so one layout sends and stores
-    exactly what a single entry did.
   - **A sparse-map checkpoint field.** Its keys (`<source>#<streamId>`) hold
-    `#`, which a sparse map can't store. A tombstone's write goes through the
-    check the row's write goes through (`serializeSparseOrFail`), so both
-    refuse such a key with a `ValidationError`, after the reads and before
-    anything is written. A write that adds no key (every event skipped, or an
-    instance holding its source's own field) isn't refused.
+    `#`, which a sparse map can't store. A tombstone's write is checked as the
+    row's write is (`serializeSparseOrFail`, on a copy), so both refuse such a
+    key with a `ValidationError`, after the reads and before anything is
+    written. What's stored is the tombstone as 1.39.0 stored it: a map left
+    empty is kept whole, `{"M":{}}`. A write that adds no key (every event
+    skipped, or an instance holding its source's own field) isn't refused.
 - **The outbox** writes effects as items (`<entityType>#outbox`, sort key
   `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
   in the row's transaction. `drain` claims the head item (a conditional update

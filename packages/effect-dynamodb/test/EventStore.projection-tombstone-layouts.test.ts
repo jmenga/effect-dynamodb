@@ -1,16 +1,15 @@
 /**
  * Several projections on one read model (#154): each records the attributes it keeps on a row,
- * each with its role, and `create` over a tombstone carries every one the tombstone holds — not
- * only those of whichever projection was defined last. A row two projections feed keeps both
- * projections' checkpoints when it becomes a tombstone and when a write replaces one, whether or
- * not the other has `removal`, and every one of those writes raises every projection's revision
- * the row holds, so a write that read it there fails its guard. On a read model one of whose projections has
- * `removal`, a stored attribute one projection keeps in two roles is refused (`EDD-9133`) at the
- * definition that completes the conflict, and the table's TTL attribute kept by a projection before
- * any entry point sends anything. Two projections keeping one attribute in different roles are not
- * refused: each writes it in its own role.
- * A sparse checkpoint map's key is refused by the tombstone's write as by the row's, with nothing
- * written. A read model with one projection sends and stores exactly what the published 1.39.0 did.
+ * each with its role, and `create` over a tombstone carries those of the projection with `removal`
+ * that wrote it, not only those of whichever one was defined last. Every other write on a removal
+ * path (a tombstone, a projection's row written over one) sends and stores what the published
+ * 1.39.0 did, and so does `create` but for the attributes it now carries: both pinned against
+ * captures. On a read model one of whose projections has `removal`, a stored attribute one
+ * projection keeps in two roles is refused (`EDD-9133`) at the definition that completes the
+ * conflict, and the table's TTL attribute kept by a projection before any entry point that writes a
+ * row sends anything. Two projections keeping one attribute in different roles are not refused:
+ * each writes it in its own role. A sparse checkpoint map's key is refused by the tombstone's write
+ * as by the row's, with nothing written.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -21,6 +20,7 @@ import { beforeEach } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import * as Library from "../src/index.js"
 import {
   hasProjectionTombstones,
   projectionLayoutsOf,
@@ -47,6 +47,7 @@ import {
   scenarios,
 } from "./helpers/ProjectionTombstoneLayouts.js"
 import { expectAsFixture, scenario } from "./helpers/ProjectionTombstoneRequests.js"
+import * as Shared from "./helpers/ProjectionTombstoneShared.js"
 
 const TestLayer = Layer.mergeAll(
   InMemoryClient,
@@ -56,17 +57,7 @@ const TestLayer = Layer.mergeAll(
 
 beforeEach(() => resetStore())
 
-const {
-  firstAndLast,
-  multiSource,
-  transactional,
-  sharedRow,
-  sharedCreate,
-  sharedTwice,
-  withoutRemoval,
-  removedTwice,
-  sparse,
-} = scenarios((id) =>
+const { firstAndLast, multiSource, transactional, sparse } = scenarios((id) =>
   Effect.sync(() =>
     [...store.entries()]
       .filter(([key]) => key.startsWith("read|") && key.includes(`#id_${id}|`))
@@ -108,6 +99,7 @@ describe("create over a tombstone, with several projections on the read model", 
           ["checkpoints", "checkpoint map"],
           ["revision", "revision"],
         ],
+        removal: true,
         ttl: false,
       },
       {
@@ -116,6 +108,7 @@ describe("create over a tombstone, with several projections on the read model", 
           ["invoiceVersion", "checkpoint"],
           ["revision", "revision"],
         ],
+        removal: true,
         ttl: false,
       },
       {
@@ -124,6 +117,7 @@ describe("create over a tombstone, with several projections on the read model", 
           ["paymentVersion", "checkpoint"],
           ["revision", "revision"],
         ],
+        removal: false,
         ttl: false,
       },
       {
@@ -132,6 +126,7 @@ describe("create over a tombstone, with several projections on the read model", 
           ["orderVersion", "checkpoint"],
           ["orderRev", "revision"],
         ],
+        removal: true,
         ttl: false,
       },
     ])
@@ -139,27 +134,33 @@ describe("create over a tombstone, with several projections on the read model", 
   })
 })
 
-describe("a row two projections feed", () => {
-  it.effect(
-    "keeps both projections' checkpoints when one removes it, and when the other writes over it",
-    () => sharedRow.pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("create over its tombstone carries both, with both revisions one higher", () =>
-    sharedCreate.pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a tombstone written over another keeps the first projection's fields", () =>
-    sharedTwice.pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("keeps the checkpoints of a projection without removal", () =>
-    withoutRemoval.pipe(Effect.provide(TestLayer)),
-  )
-
-  it.effect("a row created over a tombstone keeps them when another projection removes it", () =>
-    removedTwice.pipe(Effect.provide(TestLayer)),
-  )
+/**
+ * Every scenario of `ProjectionTombstoneShared.ts` sends, stores and returns what the published
+ * 1.39.0 did (its capture), except for what `create` over a tombstone now carries, which each
+ * scenario names: a row two projections share, a tombstone written over another, a projection's
+ * row written over one, writes landing between a projection's read and its write, and two
+ * projections keeping one attribute in different roles.
+ */
+describe("with several projections on a read model, what 1.39.0 sent, stored and returned", () => {
+  for (const [name, scenario] of Object.entries(Shared.scenarios(Library))) {
+    it.effect(name, () =>
+      Effect.gen(function* () {
+        const outcome = yield* Shared.run(
+          Library,
+          scenario,
+          { events: "events", read: "read" },
+          InMemoryClient,
+          (table) =>
+            Effect.sync(() =>
+              [...store.entries()]
+                .filter(([key]) => key.startsWith(`${table}|`))
+                .map(([, item]) => item),
+            ),
+        )
+        Shared.expectAsCaptured(name, scenario, outcome)
+      }),
+    )
+  }
 })
 
 /**
@@ -717,57 +718,6 @@ describe("the table's TTL attribute", () => {
       )
     },
   )
-
-  it.effect("create over a tombstone never carries it onto the row", () => {
-    const { Tallies, TallyTable } = tallies()
-    // The tombstone is written while the read model's only projection is this one.
-    const ByInvoice = EventStore.projection({
-      stream: Invoices,
-      readModel: Tallies,
-      key: invoiceKey,
-      initial: invoiceInitial,
-      evolve: evolveTally,
-      checkpoint: "x",
-      removal: { ttl: "7 days" },
-    })
-    return Effect.gen(function* () {
-      yield* Invoices.append({ invoiceId: "t4" }, [new Placed({ amount: 1 }), new Cancelled({})], 0)
-      yield* ByInvoice.applyBatch(yield* Invoices.read({ invoiceId: "t4" }))
-      const tombstone = () =>
-        [...store.entries()]
-          .filter(([key]) => key.startsWith("tally|"))
-          .map(([, item]) => fromAttributeMap(item) as Record<string, unknown>)
-          .at(0)
-      expect(tombstone()).toMatchObject({
-        __edd_e__: "Tally#tombstone",
-        x: 2,
-        _ttl: expect.any(Number),
-      })
-      // Then a projection keeping its checkpoint in the TTL attribute: refused when it runs.
-      EventStore.projection({
-        stream: Orders,
-        readModel: Tallies,
-        key: orderKey,
-        initial: orderInitial,
-        evolve: evolveTally,
-        checkpoint: "_ttl",
-        revision: "r",
-        removal: {},
-      })
-      yield* Tallies.create({ id: "t4", total: 5 }).asEffect()
-      const created = tombstone()
-      expect(created).toMatchObject({ __edd_e__: "Tally", total: 5, x: 2 })
-      expect(created!._ttl).toBeUndefined()
-    }).pipe(
-      Effect.provide(
-        Layer.mergeAll(
-          InMemoryClient,
-          EventsTable.layer({ name: "events" }),
-          TallyTable.layer({ name: "tally" }),
-        ),
-      ),
-    )
-  })
 })
 
 describe("a read model whose projections have no removal", () => {
@@ -794,6 +744,7 @@ describe("a read model whose projections have no removal", () => {
           ["x", "checkpoint"],
           ["r", "revision"],
         ],
+        removal: false,
         ttl: false,
       },
     ])
@@ -940,74 +891,13 @@ const racing = (retry: number) => {
   return { Races, RaceTable, A, B }
 }
 
-/** The client, running `between.run` once, right after the next read of `table` returns. */
-const interleaving = (
-  table: string,
-  between: { run?: Effect.Effect<unknown, unknown, any> | undefined },
-) =>
-  Layer.effect(
-    DynamoClient,
-    Effect.gen(function* () {
-      const client = yield* DynamoClient
-      return new Proxy(client, {
-        get: (target, prop) => {
-          if (prop !== "getItem") return Reflect.get(target, prop)
-          return (input: { readonly TableName?: string }) =>
-            Effect.tap(target.getItem(input as never), () => {
-              const run = between.run
-              if (run === undefined || input.TableName !== table) return Effect.void
-              between.run = undefined
-              return run
-            })
-        },
-      })
-    }),
-  ).pipe(Layer.provide(InMemoryClient))
-
 const raceRow = () =>
   [...store.entries()]
     .filter(([key]) => key.startsWith("race|"))
     .map(([, item]) => fromAttributeMap(item) as Record<string, unknown>)
     .at(0)
 
-describe("a projection's write that read the row before a write on a removal path", () => {
-  it.effect.each([false, true])(
-    "fails its guard when create replaces the tombstone it read (transaction: %s)",
-    (transaction) => {
-      const { Races, RaceTable, A, B } = racing(0)
-      const between: { run?: Effect.Effect<unknown, unknown, any> } = {}
-      return Effect.gen(function* () {
-        yield* Orders.append(
-          { orderId: "r1" },
-          [new Placed({ amount: 5 }), new Placed({ amount: 7 })],
-          0,
-        )
-        yield* Invoices.append({ invoiceId: "r1" }, [new Cancelled({})], 0)
-        const orders = yield* Orders.read({ orderId: "r1" })
-        yield* A.apply(orders[0]!)
-        yield* B.apply((yield* Invoices.read({ invoiceId: "r1" }))[0]!)
-        // B's tombstone raises A's revision, which the row held, and sets its own.
-        expect(raceRow()).toMatchObject({ __edd_e__: "Race#tombstone", a: 1, ra: 2, b: 1, rb: 1 })
-        between.run = transaction
-          ? Transaction.transactWrite([Races.create({ id: "r1", total: 10 })])
-          : Races.create({ id: "r1", total: 10 }).asEffect()
-        const stale = yield* Effect.exit(A.apply(orders[1]!))
-        expect(between.run).toBeUndefined()
-        expect(Exit.isFailure(stale)).toBe(true)
-        expect(JSON.stringify(stale)).toContain("ConcurrentModification")
-        expect(raceRow()).toMatchObject({ __edd_e__: "Race", total: 10, a: 1, ra: 3, b: 1, rb: 2 })
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            interleaving("race", between),
-            EventsTable.layer({ name: "events" }),
-            RaceTable.layer({ name: "race" }),
-          ),
-        ),
-      )
-    },
-  )
-
+describe("a removal path, on a row another projection never wrote", () => {
   it.effect("a removal gives a row no revision it didn't hold, as on 1.39.0", () => {
     const { Races, RaceTable, B } = racing(0)
     return Effect.gen(function* () {
@@ -1033,53 +923,6 @@ describe("a projection's write that read the row before a write on a removal pat
       ),
     )
   })
-
-  it.effect.each([
-    { other: "writes a row over it", retry: 0 },
-    { other: "writes a row over it", retry: 2 },
-    { other: "removes the row again", retry: 0 },
-    { other: "removes the row again", retry: 2 },
-  ])(
-    "fails its guard when another projection's write replaces the tombstone it read ($other, retry: $retry)",
-    ({ other, retry }) => {
-      const { RaceTable, A, B } = racing(retry)
-      const between: { run?: Effect.Effect<unknown, unknown, any> } = {}
-      return Effect.gen(function* () {
-        yield* Orders.append({ orderId: "r2" }, [new Cancelled({}), new Placed({ amount: 2 })], 0)
-        const removes = other === "removes the row again"
-        yield* Invoices.append(
-          { invoiceId: "r2" },
-          [removes ? new Cancelled({}) : new Placed({ amount: 5 })],
-          0,
-        )
-        const orders = yield* Orders.read({ orderId: "r2" })
-        const invoice = (yield* Invoices.read({ invoiceId: "r2" }))[0]!
-        yield* A.apply(orders[0]!)
-        expect(raceRow()).toMatchObject({ __edd_e__: "Race#tombstone", a: 1, ra: 1 })
-        // A reads its tombstone; B writes before A does.
-        between.run = B.apply(invoice)
-        const late = yield* Effect.exit(A.apply(orders[1]!))
-        expect(between.run).toBeUndefined()
-        if (retry === 0) {
-          expect(Exit.isFailure(late)).toBe(true)
-          expect(JSON.stringify(late)).toContain("ConcurrentModification")
-        } else {
-          expect(Exit.isSuccess(late)).toBe(true)
-        }
-        // B's write stands: its checkpoint is kept, so its event isn't applied again.
-        expect(raceRow()).toMatchObject({ b: 1 })
-        expect((yield* B.apply(invoice)).applied).toEqual([])
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            interleaving("race", between),
-            EventsTable.layer({ name: "events" }),
-            RaceTable.layer({ name: "race" }),
-          ),
-        ),
-      )
-    },
-  )
 })
 
 /**
