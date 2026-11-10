@@ -189,6 +189,24 @@ const makers = {
       root: { entityType: "Fields" },
       edges: { tags: Aggregate.many({ entityType: "FieldsTag", sk: { composite: ["n"] } }) },
     }),
+  DeclaresId: (Base: any) =>
+    Aggregate.make(
+      Schema.Struct({
+        id: Schema.String,
+        numberLine: NumberLine,
+        numberLineId: Schema.optional(Schema.Number),
+      }),
+      {
+        table: Base,
+        schema: AppSchema,
+        ...root,
+        collection: { name: "declares-id" },
+        root: { entityType: "DeclaresId" },
+        edges: {
+          numberLine: Aggregate.one({ entityType: "DeclaresIdLine", entity: entities.NumberLines }),
+        },
+      },
+    ),
   Branded: (Base: any) =>
     Aggregate.make(Branded, {
       table: Base,
@@ -209,6 +227,7 @@ const makers = {
 
 const seed: ReadonlyArray<readonly [keyof typeof entities, Record<string, unknown>]> = [
   ["NumberLines", { lineId: 1, f: 5 }],
+  ["NumberLines", { lineId: 5, f: 1 }],
   ["CodecLines", { lineId: 2, f: 6 }],
   ["BrandLines", { lineId: "b", f: 7 }],
   ["PairLines", { tenant: "t", lineId: "p", f: 8 }],
@@ -346,6 +365,18 @@ const CASES: Record<string, readonly [keyof typeof makers, Record<string, unknow
   "fields, an element's key the element doesn't declare": [
     "Fields",
     { ...fieldsBase, tags: [{ n: 1, typo: 1 }] },
+  ],
+  "declared id, a number the model declares without the entity whole": [
+    "DeclaresId",
+    { id: "a", numberLineId: 5 },
+  ],
+  "declared id, the entity whole and the number the model declares": [
+    "DeclaresId",
+    { id: "a", numberLine: { lineId: 6, f: 99 }, numberLineId: 5 },
+  ],
+  "declared id, the entity whole alone": [
+    "DeclaresId",
+    { id: "a", numberLine: { lineId: 6, f: 99 } },
   ],
   "branded, a one edge's id and a many edge's ids given plain strings, the entity with an identifier":
     ["Branded", { id: "a", brandIdLineId: "b", brandIdLines: ["b"] }],

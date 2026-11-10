@@ -1042,6 +1042,41 @@
     }
    },
    "get": "ok {\"id\":\"a\",\"brandIdLine\":{\"lineId\":\"b\",\"f\":7},\"brandIdLines\":[{\"lineId\":\"b\",\"f\":7}]}"
+  },
+  "declared id, a number the model declares without the entity whole": {
+   "create": "failed: ValidationError",
+   "requests": [],
+   "written": 0,
+   "get": "failed: AggregateAssemblyError"
+  },
+  "declared id, the entity whole and the number the model declares": {
+   "create": "ok {\"id\":\"a\",\"numberLine\":{\"lineId\":6,\"f\":99},\"numberLineId\":5}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "numberLineId": {
+     "N": "5"
+    },
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"numberLine\":{\"lineId\":6,\"f\":99},\"numberLineId\":5}"
+  },
+  "declared id, the entity whole alone": {
+   "create": "ok {\"id\":\"a\",\"numberLine\":{\"lineId\":6,\"f\":99}}",
+   "requests": [
+    "transactWriteItems"
+   ],
+   "written": 2,
+   "stored": {
+    "id": {
+     "S": "a"
+    }
+   },
+   "get": "ok {\"id\":\"a\",\"numberLine\":{\"lineId\":6,\"f\":99}}"
   }
  }
 }
