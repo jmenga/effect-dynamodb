@@ -27,7 +27,7 @@ import {
   packedExprRefusal,
   packedProjectionRefusal,
 } from "./internal/Packed.js"
-import { compilePath } from "./internal/PathBuilder.js"
+import { compilePath, storedPath } from "./internal/PathBuilder.js"
 import {
   canonicalJson,
   compositePlanner,
@@ -1131,7 +1131,7 @@ export const selectRenamed = <A>(
   const heads = [...new Set(paths.map((path) => String(path[0])))]
   return selectProjected(
     self,
-    paths.map((path) => [resolveDbName(String(path[0])), ...path.slice(1)]),
+    paths.map((path) => storedPath(path, resolveDbName)),
     (raw) => {
       const item: Record<string, unknown> = {}
       for (const head of heads) {

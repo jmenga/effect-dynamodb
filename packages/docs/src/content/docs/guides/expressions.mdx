@@ -666,6 +666,8 @@ Products.condition((t, ops) => {
 
 All string segments are automatically aliased through `ExpressionAttributeNames` to handle DynamoDB reserved words.
 
+A `field:` rename from `DynamoModel.configure` names a top-level attribute, so it applies to a path's first segment only. Below it a value is stored whole, under its own property names. With `count` stored as `renamed`, `t.count` is `#renamed`, and `t.meta.count` is `#meta.#count`, which is where `put` stored it. That holds for an update's path operations, a condition, a filter and a projection alike.
+
 ---
 
 ## DynamoDB Expression Mapping Reference
