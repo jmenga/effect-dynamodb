@@ -77,10 +77,12 @@ import type {
 import { refuseUnreadable } from "./internal/SchemaAccessors.js"
 import { isShardSourceError } from "./internal/Shards.js"
 import {
+  refuseReadAsSparseEntry,
   refuseRepeatedIndex,
   refuseSharedKeyAttributeOnEverySchema,
   refuseStoredInKeyAttribute,
   refuseStoredUnderLibraryAttribute,
+  writtenKey,
   writtenKeyAttributes,
 } from "./internal/SharedKeyAttribute.js"
 import {
@@ -1602,10 +1604,40 @@ export const buildEntityDefinition = (config: {
   ]
   const keyAttributes = writtenKeyAttributes(initialIndexes, vectorIndexes)
   refuseStoredInKeyAttribute(config.entityType, keyAttributes, storedAttributes)
-  refuseStoredUnderLibraryAttribute(
+  refuseStoredUnderLibraryAttribute(config.entityType, keyAttributes, storedAttributes)
+  // Every attribute a row of this entity holds under a name the definition supplies. The table's
+  // TTL attribute is the table configuration's to name: `DynamoClient.make` checks it.
+  const softDeletes = config.softDelete === true || typeof config.softDelete === "object"
+  refuseReadAsSparseEntry(
     config.entityType,
-    keyAttributes,
-    storedAttributes,
+    [
+      ...keyAttributes.map((key) => writtenKey(key)),
+      // A sparse map's own name is no attribute: its entries are.
+      ...Object.keys(modelFields)
+        .filter((name) => !Object.hasOwn(sparseFields, name))
+        .map((name) => ({
+          attribute: fieldRenames[name] ?? name,
+          what: `the attribute the field "${name}" is stored in`,
+        })),
+      ...(
+        [
+          [systemFields.createdAt, "its created timestamp"],
+          [systemFields.updatedAt, "its updated timestamp"],
+          [systemFields.version, "its version"],
+        ] as const
+      ).flatMap(([attribute, holds]) =>
+        attribute === null ? [] : [{ attribute, what: `the attribute that holds ${holds}` }],
+      ),
+      ...(softDeletes
+        ? [
+            { attribute: "deletedAt", what: "the attribute that holds when a row was deleted" },
+            ...Object.entries(vectorIndexes).map(([name, vector]) => ({
+              attribute: vector.stashField,
+              what: `the attribute a deleted row keeps vector index "${name}"'s embedding in`,
+            })),
+          ]
+        : []),
+    ],
     sparseFields,
   )
 

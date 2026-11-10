@@ -69,7 +69,8 @@ import {
   rowCanLack,
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
-import { sparseKeyRefusal, sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
+import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
+import { sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -661,6 +662,12 @@ export interface Entity<
 
   /** @internal Normalized vector index definitions keyed by logical name. */
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
+
+  /**
+   * @internal `[EDD-9140]` for the attributes a table's configuration names (its TTL attribute):
+   * throws when a row's reader would take one this entity writes as a sparse map's entry.
+   */
+  readonly _refuseTableAttributes: (tableConfig: TableConfig) => void
 
   /**
    * The domain fields stored packed (`storedAs: DynamoModel.Packed(...)`).
@@ -2811,11 +2818,7 @@ const makeImpl = <
       }
     }
     if (name === "deletedAt" && config.softDelete) return `"${name}" is managed by the library`
-    const hasTtl =
-      retainTtl() !== undefined ||
-      softDeleteTtl() !== undefined ||
-      timeSeriesConfig?.ttl !== undefined
-    if (hasTtl && name === ttlAttribute) return `"${name}" is managed by the library`
+    if (writesTtl() && name === ttlAttribute) return `"${name}" is managed by the library`
     return undefined
   }
 
@@ -2845,17 +2848,6 @@ const makeImpl = <
         if (reason !== undefined) return `${op} of "${name}": ${reason}. Nothing was sent.`
       }
     }
-    // An operation writing a sparse map's entry by its stored name writes it as the map's writer
-    // does: under a key the writer refuses, it's refused, as `put` refuses it.
-    for (const [op, names] of named) {
-      if (op === ".remove()" || op === "pathRemove") continue
-      for (const name of names) {
-        const entry = sparseEntries.entryOf(name)
-        const refused =
-          entry === undefined ? undefined : sparseKeyRefusal(entry.field, entry.prefix, entry.key)
-        if (refused !== undefined) return `${op} of "${name}": ${refused}. Nothing was sent.`
-      }
-    }
     // A sparse map's entries have an operation of their own to clear them. The other
     // path operations address an entry by its stored name, which is how a counter
     // entry is added to, so that name stays open to them.
@@ -2870,7 +2862,9 @@ const makeImpl = <
     ]
     for (const [op, names] of clearedEntries) {
       for (const name of names) {
-        const entry = sparseEntries.entryOf(name)
+        // The attribute the operation removes decides: `.remove()` names a field, removed where
+        // it's stored, and a path's segment holding `#` is the attribute's own name.
+        const entry = sparseEntries.entryOf(op === ".remove()" ? resolveDbName(name) : name)
         if (entry === undefined) continue
         return (
           `${op} of "${name}": "${name}" is an entry of the sparse map "${entry.field}". ` +
@@ -3525,31 +3519,6 @@ const makeImpl = <
   const deserializeSparseFields = (raw: globalThis.Record<string, unknown>): void => {
     if (!hasSparseFields) return
     decodeSparseFields(raw, sparseFields)
-  }
-
-  /**
-   * A payload's sparse map entry under a key the map's writer refuses (`validateSparseKey`, which
-   * `put`'s flattening runs), refused as `<operation>.sparse` before the write reads, embeds or
-   * sends anything. Every write of an entry from a payload runs it.
-   */
-  const refuseSparseEntryKeys = (
-    payload: unknown,
-    operation: string,
-  ): Effect.Effect<void, ValidationError> => {
-    if (!hasSparseFields || typeof payload !== "object" || payload === null) return Effect.void
-    for (const [field, sparse] of Object.entries(sparseFields)) {
-      const value = (payload as globalThis.Record<string, unknown>)[field]
-      if (value === null || typeof value !== "object") continue
-      for (const key of Object.keys(value)) {
-        const refused = sparseKeyRefusal(field, sparse.prefix, key)
-        if (refused !== undefined) {
-          return Effect.fail(
-            new ValidationError({ entityType, operation: `${operation}.sparse`, cause: refused }),
-          )
-        }
-      }
-    }
-    return Effect.void
   }
 
   // ---------------------------------------------------------------------------
@@ -4523,6 +4492,31 @@ const makeImpl = <
   const softDeleteTtl = (): Duration.Duration | string | undefined => {
     if (typeof config.softDelete !== "object" || config.softDelete === null) return undefined
     return (config.softDelete as { ttl?: Duration.Duration | string }).ttl
+  }
+
+  /** Whether a row of this entity can hold the table's TTL attribute: a snapshot, a tombstone or an event. */
+  const writesTtl = (): boolean =>
+    retainTtl() !== undefined ||
+    softDeleteTtl() !== undefined ||
+    timeSeriesConfig?.ttl !== undefined
+
+  /**
+   * `[EDD-9140]` for what the table's configuration names: the TTL attribute this entity sets on
+   * its rows may not be one a row's reader takes as a sparse map's entry. `Entity.make` checks
+   * every name the definition supplies; this one is known when the table is bound.
+   */
+  const refuseTableAttributes = (tc: TableConfig): void => {
+    if (!writesTtl()) return
+    refuseReadAsSparseEntry(
+      entityType,
+      [
+        {
+          attribute: resolveTtlAttributeName(tc),
+          what: "the table's TTL attribute, which the entity sets on rows that expire",
+        },
+      ],
+      sparseFields,
+    )
   }
 
   const preserveUnique = (): boolean => {
@@ -6753,7 +6747,6 @@ const makeImpl = <
             )
             yield* refuseUncomposed(encodedInput, operation)
           }
-          yield* refuseSparseEntryKeys(encodedInput, operation)
 
           // Hydrate refs: replace ID fields with full entity domain data
           const encoded: globalThis.Record<string, unknown> = hasRefs
@@ -7171,7 +7164,6 @@ const makeImpl = <
       if (unstorable !== undefined) {
         return yield* new ValidationError({ entityType, operation: "update", cause: unstorable })
       }
-      yield* refuseSparseEntryKeys(encodedUpdates, "update")
 
       // Refs are hydrated by reading the entities they name: a payload holding any has its keys
       // checked after those reads.
@@ -8332,8 +8324,14 @@ const makeImpl = <
         if (hasSparseFields && attr in sparseFields) {
           if (typeof val !== "object") continue
           const sparse = sparseFields[attr]!
-          // Every key is one the writer takes: `prepareUpdate` refused any other.
           for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
+            if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+              return yield* new ValidationError({
+                entityType,
+                operation: "update.sparse",
+                cause: `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
+              })
+            }
             const nameKey = `#u${counter}`
             names[nameKey] = `${sparse.prefix}#${k}`
             if (hasNoStoredForm(v)) {
@@ -10002,7 +10000,6 @@ const makeImpl = <
         "upsert",
       )) as globalThis.Record<string, unknown>
       yield* refuseUnstorable({ ...encodedInput, ...opts.withVectors }, "upsert")
-      yield* refuseSparseEntryKeys(encodedInput, "upsert")
       yield* composeAllKeys(encodedInput, "upsert")
       yield* refuseUncomposed(encodedInput, "upsert")
       const record = (input ?? {}) as globalThis.Record<string, unknown>
@@ -10180,7 +10177,6 @@ const makeImpl = <
             { ...(encodedInput as globalThis.Record<string, unknown>), ...opts.withVectors },
             "upsert",
           )
-          yield* refuseSparseEntryKeys(encodedInput, "upsert")
           // Clearing a composite clears what a half says, and one write can't tell what's left of
           // it: the update's own rule says, and that needs the stored row.
           if (
@@ -10278,8 +10274,18 @@ const makeImpl = <
             if (hasSparseFields && attr in sparseFields) {
               if (val === null || typeof val !== "object") continue
               const sparse = sparseFields[attr]!
-              // Every key is one the writer takes: refused before anything else otherwise.
               for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
+                try {
+                  if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
+                    throw new Error(`Sparse map "${attr}": invalid key ${JSON.stringify(k)}`)
+                  }
+                } catch (e) {
+                  return yield* new ValidationError({
+                    entityType,
+                    operation: "upsert.sparse",
+                    cause: e instanceof Error ? e.message : String(e),
+                  })
+                }
                 const nameKey = `#u${counter}`
                 names[nameKey] = `${sparse.prefix}#${k}`
                 if (hasNoStoredForm(v)) {
@@ -14762,6 +14768,7 @@ const makeImpl = <
     generatedId: config.generatedId as TGeneratedId,
     vectorIndexes: config.vectorIndexes as TVectorIndexes,
     _vectorIndexes: vectorIndexes,
+    _refuseTableAttributes: refuseTableAttributes,
     _packedFields: Object.keys(packedFields),
     _packFields: packFields,
     _unpackFields: unpackFields,

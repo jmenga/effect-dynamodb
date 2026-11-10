@@ -2395,6 +2395,8 @@ interface EntityLike {
     | undefined
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
+  /** `[EDD-9140]` for the attributes the table's configuration names (its TTL attribute). */
+  readonly _refuseTableAttributes?: ((tableConfig: TableConfig) => void) | undefined
   /** Where a stored row's values key it in an index now (#171). */
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
@@ -2530,6 +2532,15 @@ const makeFromConfig = (config: {
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
+
+    // A table's TTL attribute is named by its configuration, so an entity that sets it is checked
+    // here, where the table is bound: a row's reader may not take it as a sparse map's entry
+    // (`[EDD-9140]`, as `Entity.make` checks every name the definition supplies).
+    for (const rawEntity of Object.values(config.entities)) {
+      const entityLike = rawEntity as unknown as EntityLike
+      const tableConfig = Option.getOrUndefined(Context.getOption(baseCtx, entityLike._tableTag))
+      if (tableConfig !== undefined) entityLike._refuseTableAttributes?.(tableConfig)
+    }
 
     // Dimension agreement between the Embedder and every bound vector index is
     // a construction-time invariant — a mismatch would otherwise surface as a

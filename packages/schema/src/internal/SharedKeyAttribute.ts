@@ -296,21 +296,68 @@ export const refuseStoredInKeyAttribute = (
   }
 }
 
+/** An attribute an entity writes on its rows, and what it holds ({@link refuseReadAsSparseEntry}). */
+export interface WrittenAttribute {
+  readonly attribute: string
+  /** In words, after "a row's reader takes <attribute>, ": `the attribute the field "n" is stored in`. */
+  readonly what: string
+  /** A key attribute, which a put of the entry it's read as would replace. */
+  readonly key?: boolean
+}
+
+/** A key attribute as {@link refuseReadAsSparseEntry} names it. */
+export const writtenKey = (key: WrittenKeyAttribute): WrittenAttribute => ({
+  attribute: key.attribute,
+  what:
+    key.owner === "primary"
+      ? "an attribute of the table's primary key"
+      : `the attribute that holds ${key.of}`,
+  key: true,
+})
+
+/**
+ * `[EDD-9140]`: an entity may not store, under any name other than as that map's entry, an
+ * attribute the reader of a row takes as an entry of one of its sparse maps (`sparseReader`:
+ * `<prefix>#` and a non-empty key, so never `<prefix>#` itself). The row's reader would move the
+ * attribute into the map: the map reads a phantom entry, what the attribute held is gone from
+ * where it's read, and `clearMap` removes it. `written` is every attribute the entity writes
+ * whose name a definition or a table's configuration supplies; the library's own fixed names hold
+ * no `#`, so none of them can be an entry.
+ */
+export const refuseReadAsSparseEntry = (
+  entityType: string,
+  written: ReadonlyArray<WrittenAttribute>,
+  sparseFields: Readonly<Record<string, { readonly prefix: string }>>,
+): void => {
+  const { entryOf } = sparseReader(sparseFields)
+  for (const { attribute, what, key } of written) {
+    const entry = entryOf(attribute)
+    if (entry === undefined) continue
+    throw new Error(
+      `[EDD-9140] Entity "${entityType}": sparse map "${entry.field}" stores each entry as ` +
+        `"${entry.prefix}#<key>", and a row's reader takes "${attribute}", ${what}, as its ` +
+        `entry "${entry.key}". ` +
+        (key === true
+          ? "Every row would carry a phantom entry, and a put of that entry would replace the " +
+            "key there. Give the map another prefix, or name the key attributes something else."
+          : "Every row holding it would read it as an entry of the map, and not where it " +
+            `belongs. Give the map another prefix, or store it under another attribute.`),
+    )
+  }
+}
+
 /**
  * `[EDD-9140]`: `Entity.make` refuses an attribute it would store under one the library writes
  * itself: a model field, under a `field:` rename or by its own name, or a system timestamp or
  * version field, stored in `__edd_e__`, where every row holds its entity type, or in a vector
- * index's attribute; and a key attribute the entity writes ({@link writtenKeyAttributes}) that
- * the reader of a row takes as a sparse map's entry (`sparseReader`: `<prefix>#` and a non-empty
- * key, so never `<prefix>#` itself). So a row's reader, and `clearMap`, never meet a key attribute
- * as an entry. The `ownsRows` bind check (`EDD-9130`) takes a model attribute to be any name but
- * these.
+ * index's attribute. The `ownsRows` bind check (`EDD-9130`) takes a model attribute to be any
+ * name but these. An attribute the reader takes as a sparse map's entry is
+ * {@link refuseReadAsSparseEntry}'s.
  */
 export const refuseStoredUnderLibraryAttribute = (
   entityType: string,
   keys: ReadonlyArray<WrittenKeyAttribute>,
   stored: ReadonlyArray<readonly [name: string, attribute: string]>,
-  sparseFields: Readonly<Record<string, { readonly prefix: string }>>,
 ): void => {
   for (const [name, attribute] of stored) {
     // A field named as one of these is refused under any rename too, as `EDD-9109` refuses one
@@ -334,22 +381,6 @@ export const refuseStoredUnderLibraryAttribute = (
         : `[EDD-9140] Entity "${entityType}": "${name}" is named "${name}", ${holds}, and is ` +
             `stored in "${attribute}". The library writes "${name}" before renaming the fields, ` +
             `so the rename would move its value into "${attribute}". Name the field something else.`,
-    )
-  }
-  const { entryOf } = sparseReader(sparseFields)
-  for (const key of keys) {
-    const entry = entryOf(key.attribute)
-    if (entry === undefined) continue
-    const what =
-      key.owner === "primary"
-        ? "an attribute of the table's primary key"
-        : `the attribute that holds ${key.of}`
-    throw new Error(
-      `[EDD-9140] Entity "${entityType}": sparse map "${entry.field}" stores each entry as ` +
-        `"${entry.prefix}#<key>", and a row's reader takes "${key.attribute}", ${what}, as its ` +
-        `entry "${entry.key}". Every row would carry a phantom entry, and a put of that entry ` +
-        "would replace the key there. Give the map another prefix, or name the key attributes " +
-        "something else.",
     )
   }
 }
