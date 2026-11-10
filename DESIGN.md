@@ -3133,19 +3133,102 @@ unsubstituted and decodes its leaves exactly as `put` stores them, and a path
 value under it is passed through as given so the item stays readable. Known
 limitation: plain dates inside such a class are still stored as maps (also by
 `put` / `.set()`), as on 1.22.0. Only those and paths no schema describes (under
-a dynamic key of an untyped value) are passed through. Each such operand is
-encoded and checked against the schema at its path once, in `prepareUpdate`
-(`encodeOperands`), and written as encoded there: one the schema refuses fails
-the update with a `ValidationError` (`operation` `update.append`,
-`update.pathSet`, `update.pathAppend`, `update.pathPrepend` or
-`update.pathIfNotExists`) before it reads or sends anything, alone or in a
-`transactWrite`. It used to be decided as the write was built, after the reads
-of an update that reads first, so a failed read was reported in its place.
-Only the moment changes: the check, its verdict, its error and the bytes of an
-operand it accepts are the ones the write was built with. An update refused for
-a second reason (a missing item, a stale `expectedVersion`, a sparse map key
-that can't be held) reports the operand, where it reported whichever it met
-first.
+a dynamic key of an untyped value) are passed through. Each such operand's
+stored form is decided in one place, in `prepareUpdate` (`encodeOperands`), and
+written as decided there: one that is refused fails the update with a
+`ValidationError` (`operation` `update.append`, `update.pathSet`,
+`update.pathAppend`, `update.pathPrepend` or `update.pathIfNotExists`) before
+it reads or sends anything, alone or in a `transactWrite`. It used to be
+decided as the write was built, after the reads of an update that reads first,
+so a failed read was reported in its place. Operands and payloads are encoded
+before any read; schema transforms must not depend on the read, and a schema's
+encoder can run more than once for one operand.
+
+**What an operand is written as** (`makePathValueEncoder`'s `encode`). One rule,
+for every operand whose position the library resolves exactly (below). An
+operand at any other position is sent as 1.39.0 sent it, and refused only where
+1.39.0 refused it: it is not checked.
+
+1. Take what 1.39.0 sent: the encoding by the schema the operation's own
+   segments name in the model (a union's first member that has the property,
+   the first list of a union of lists), or the value as given where that names
+   no schema (a path naming a sparse map's entry, a union of lists that isn't
+   optional). What 1.39.0 refused there is refused, before anything is read.
+2. If the row's reader reads that back, it is sent, byte for byte
+   (`test/fixtures/update-operand-requests-1.39.0.json`,
+   `test/fixtures/operand-positions-1.39.0.json`).
+3. Otherwise the operand is encoded by the schema it is read back with, and
+   that is sent if the reader reads it. Where the path is inside a union, or
+   appends to a union of lists, each member encodes it, and it is sent only
+   when every member whose encoding the reader reads stores the same attribute
+   value (`attributeValueEquals` on the marshalled values: two `Set`s holding
+   the same are the same, binary values compare by their bytes in whatever
+   form the marshaller took them, and numbers as numbers).
+4. Otherwise it is refused, with nothing sent.
+
+The reader is the entity's own: the schema a stored row is decoded with
+(`recordSchema`), walked to the operand's position, applied to the value as a
+read returns it (`asRead`).
+
+**Exact, or not at all.** The walk (`positionBelow`, `listElementsAt` in
+`EntitySchemas.ts`, where the list is kept) goes from the field's read schema to
+the position through node kinds it models exactly as the read path decodes
+them, and no other:
+
+- a struct: the property of that name, or a record's value under any string
+  key;
+- a list or tuple: the element at that index;
+- a union: every member, when every member is modelled (a primitive, a
+  literal, `null` or `undefined` holds nothing below it);
+- a suspended schema: what its thunk returns;
+- a `Schema.Class` the library rebuilt for reading (`REBUILT_CLASS`): the
+  struct it is stored as.
+
+Each only without a transformation and without a check of its own on the
+container, either of which can accept or reject on more than the position's
+value. A property's optionality changes nothing. Everything else makes the
+position unknown: a transformed struct or list, `Schema.Option`, a decoding
+default, a set or a map, any other declaration, `Unknown` / `Any`, a record
+whose keys are constrained, a property the schema doesn't declare, a packed
+field (unpacked before its schema sees it), and an append to something that
+isn't a plain list. "Unknown" and "known, and no reader takes the value" are
+different results (`readers: undefined` and a refusal), so a schema shape
+nobody listed is never refused or re-encoded: it is sent as 1.39.0 sent it.
+`test/OperandPositions.test.ts` runs every wrapper against every path
+operation and three operands, against what the published 1.39.0 did.
+
+The reader reads more than the write schema stores: a
+number where a field outside a union stores numeric text, so
+`pathSet(["counts#a"], 2)` on a sparse `Record(String, NumberFromString)` sends
+`{ N: "2" }`, as 1.39.0 did, and reads back 2. A `Date` given for an entry's
+field isn't read back as the empty map 1.39.0 wrote, so it is encoded as `put`
+encodes it: 1.39.0 committed the map in a transaction, and an update alone
+wrote it and then failed decoding the row DynamoDB returned.
+
+The position comes from the walk that names the attribute the operation writes.
+A path operation's every segment is the attribute `compilePath` writes
+(`attributesOfPath`); a record operation's field is the attribute
+`resolveDbName` gives it. The first attribute is read as a sparse map's entry
+by the reader's own rule (`sparseReader`, `internal/SparseKey.ts`) or as the
+field stored under that name, and each one below it as the property of that
+name. So `.append({ "list#x": [2] })` on a field named `list#x` and stored as
+`storedList` is checked as that field, though a path's segment `list#x` names
+the entry `x` of a sparse map whose prefix is `list`. (A rename applies to a
+path's first segment only, so below a field, a segment spelled as a renamed
+field names the property of that spelling, and that property's schema checks
+the operand.) A copy (`pathSet` from another attribute) has no operand, so nothing
+of it is encoded or checked.
+
+**A path into a union.** A path can't tell which member the stored value is. On
+a path the model names, the first member that has the property decides, as on
+1.39.0: a value it refuses is refused, though a later member would take it,
+because the row may hold the first. In a sparse map's entry, a value any
+member's reader reads is sent as given, as on 1.39.0. A value the reader
+doesn't read as 1.39.0 sent it is refused, with nothing sent, when the members
+that take it would store it differently. A path op into a union whose members
+encode the value differently writes it as 1.39.0 did (as given under a sparse
+map's entry, in the first member's form elsewhere), so set the whole value
+instead.
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to
@@ -3515,7 +3598,10 @@ a check's or a planned op's key, what an update decides from its own operands
 its plan reuses) and a nested stream append are refused or built first, and
 reused, so a value a schema refuses, one that reads back otherwise, a key with
 no text or an append op with no events fails the transaction with nothing read,
-wherever the op sits in it. An update whose payload hydrates refs has those
+wherever the op sits in it. Every op's condition is refused there too, by the
+check the op runs alone (`refuseEmptyParts`: an empty part, or a value DynamoDB
+can't store), a planned update's and delete's included, which planning used to
+compile only after the reads (a value DynamoDB can't store was then a defect). An update whose payload hydrates refs has those
 keys checked after the reads that hydrate them, as on its own.
 
 **`Batch.write` of a `versioned` entity.** A `PutRequest` would reset an

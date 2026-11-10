@@ -301,6 +301,20 @@ export const storedPath = (
   segments.map((segment, i) => (i === 0 && typeof segment === "string" ? head(segment) : segment))
 
 /**
+ * The attribute each segment of a path names in the request: the first through `resolveDbName`
+ * (one holding `#` is a literal attribute name, a sparse map's entry `<prefix>#<key>`), and every
+ * segment below as given ({@link storedPath}). The one walk of a path: `compilePath` writes these
+ * names, and an update reads its operand back at them.
+ */
+export const attributesOfPath = (
+  segments: ReadonlyArray<string | number>,
+  resolveDbName?: (name: string) => string,
+): ReadonlyArray<string | number> =>
+  storedPath(segments, (head) =>
+    head.includes("#") || resolveDbName === undefined ? head : resolveDbName(head),
+  )
+
+/**
  * Compile path segments into DynamoDB ExpressionAttributeNames placeholders.
  *
  * @param segments - The path segments (e.g., ["address", "city"])
@@ -321,12 +335,7 @@ export const compilePath = (
   resolveDbName?: (name: string) => string,
 ): string => {
   const parts: Array<string> = []
-  // A first segment containing `#` is a literal attribute name (a sparse-map entry,
-  // `<prefix>#<key>`): the library generated it, and it is emitted as it is.
-  const stored = storedPath(segments, (head) =>
-    head.includes("#") || resolveDbName === undefined ? head : resolveDbName(head),
-  )
-  for (const seg of stored) {
+  for (const seg of attributesOfPath(segments, resolveDbName)) {
     if (typeof seg === "number") {
       // Array index — append directly to previous part
       parts.push(`[${seg}]`)

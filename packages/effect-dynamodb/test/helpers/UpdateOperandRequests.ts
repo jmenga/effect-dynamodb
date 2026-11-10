@@ -1,20 +1,15 @@
 /**
- * Updates with an operand, and what each one does: the requests it sends and how it ends.
+ * Updates whose operands 1.39.0 accepted, and the requests each one sends.
  *
- * `test/fixtures/update-operand-requests-1.39.0.json` holds what the published 1.39.0 did for
+ * `test/fixtures/update-operand-requests-1.39.0.json` holds what the published 1.39.0 sent for
  * every case here, captured by running `capture` against it. `test/UpdateOperandRequests.test.ts`
- * runs the same cases against this source and compares each with it (`helpers/Against139.ts`).
- *
- * The cases: each combinator on a path the model names, on a path naming a sparse map's entry,
- * into a union and as a copy, with an operand 1.39.0 wrote and with one it refused, on four kinds
- * of entity, alone and in a transaction.
+ * runs the same cases against this source and compares the requests whole.
  *
  * The library is taken as a parameter, so one definition serves both.
  */
 
 import { Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
 import { SecureRandom } from "effect/crypto"
-import { failureOf, type Outcome, plain } from "./Against139.js"
 import { makeRecordingTable } from "./RecordingTable.js"
 
 /** The library's public modules, of whichever release is under test. */
@@ -82,7 +77,7 @@ const Rival = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("digits"), value: Schema.NumberFromString }),
   Schema.Struct({ kind: Schema.Literal("tagged"), value: Tagged }),
 ])
-/** `count` is also the name of a renamed model field, so a path's `count` names `renamed` here. */
+/** `count` is also the name of a renamed model field: below a field, a path's `count` is this one. */
 const Tally = Schema.Struct({ count: Schema.NumberFromString, renamed: Schema.Number })
 
 const fields = {
@@ -267,10 +262,9 @@ export interface Case {
   readonly everyVariant?: true
   /** The model the case runs on: the first one, unless it says another. */
   readonly world?: World
-  /** Fields of item `a` to seed differently. */
-  readonly seeded?: Record<string, unknown>
 }
 
+/** Each case's operand is one 1.39.0 wrote and read back. */
 export const cases: ReadonlyArray<Case> = [
   // Paths the model names.
   { name: "append", apply: (update) => update.append({ list: [2] }) },
@@ -331,10 +325,6 @@ export const cases: ReadonlyArray<Case> = [
   {
     name: "entry: pathAppend of values only a union's second member takes",
     apply: append(["shapes#a", "list"], ["new"]),
-  },
-  {
-    name: "entry: pathSet of a property named as a renamed field",
-    apply: set(["tallies#a", "count"], 2),
   },
   {
     name: "entry: pathSet of a whole entry copied from a field",
@@ -429,104 +419,6 @@ export const cases: ReadonlyArray<Case> = [
   },
   { name: "pathAppend to a union of lists", apply: append(["either"], [2]), world: "stored" },
   { name: "pathPrepend to a union of lists", apply: prepend(["either"], [2]), world: "stored" },
-  // An operand the schema at its path refuses: 1.39.0 refused each as it built the write.
-  {
-    name: "refused: append",
-    apply: (update) => update.append({ list: [-1] }),
-    everyVariant: true,
-  },
-  { name: "refused: pathSet", apply: set(["meta", "n"], -1), everyVariant: true },
-  {
-    name: "refused: pathSet of a transformed field",
-    apply: set(["meta", "amount"], true),
-    everyVariant: true,
-  },
-  { name: "refused: pathAppend", apply: append(["list"], [-1]), everyVariant: true },
-  { name: "refused: pathPrepend", apply: prepend(["list"], [-1]), everyVariant: true },
-  {
-    name: "refused: pathIfNotExists",
-    apply: ifNotExists(["meta", "optional"], -1),
-    everyVariant: true,
-  },
-  {
-    name: "refused: a later operand, after ones the schema takes",
-    apply: (update) => append(["list"], [-1])(set(["meta", "n"], 2)(update.append({ list: [3] }))),
-    everyVariant: true,
-  },
-  {
-    name: "refused: pathSet into a union, of a value its first member refuses",
-    apply: set(["shape", "value"], "new"),
-    everyVariant: true,
-  },
-  {
-    name: "refused: pathSet into a union, of a value no member takes",
-    apply: set(["shape", "value"], true),
-    everyVariant: true,
-  },
-  {
-    name: "refused: append to a union of lists, of elements no list takes",
-    apply: (update) => update.append({ either: [true] }),
-    world: "stored",
-  },
-  {
-    name: "refused: append to a field named as an entry, of elements it refuses",
-    apply: (update) => update.append({ "list#x": [true] }),
-    everyVariant: true,
-    world: "named",
-  },
-  // An operand 1.39.0 checked against nothing: it is sent as 1.39.0 sent it, whatever it is.
-  {
-    name: "unchecked: pathSet of a property named as a renamed field",
-    apply: set(["tally", "count"], 2),
-  },
-  {
-    name: "unchecked: entry: pathSet of a value its schema refuses",
-    apply: set(["buckets#a", "n"], -1),
-    everyVariant: true,
-  },
-  {
-    name: "unchecked: entry: pathSet of a value no member of its union takes",
-    apply: set(["shapes#a", "value"], true),
-    everyVariant: true,
-  },
-  {
-    name: "unchecked: entry: pathSet of a number its union's members store as text",
-    apply: set(["rivals#a", "value"], 2),
-    everyVariant: true,
-  },
-  {
-    name: "unchecked: entry: pathSet of a number where the schema stores a set",
-    apply: set(["sets#a", "value"], 2),
-    everyVariant: true,
-    world: "stored",
-  },
-  {
-    name: "unchecked: entry: pathSet of a value nothing reads",
-    apply: set(["counts#a"], true),
-    world: "stored",
-  },
-  {
-    name: "unchecked: pathAppend to a union of lists, of elements no list takes",
-    apply: append(["either"], [true]),
-    world: "stored",
-  },
-  {
-    name: "unchecked: pathAppend to a union of lists, of elements only its second list takes",
-    apply: append(["either"], ["two"]),
-    world: "stored",
-    seeded: { either: ["one"] },
-  },
-  // A copy holds no operand.
-  {
-    name: "pathSet of a field copied from an entry",
-    apply: copy(["beside"], ["buckets#a"]),
-    everyVariant: true,
-  },
-  {
-    name: "pathSet of a field's property copied from an entry's",
-    apply: copy(["beside", "blob"], ["buckets#a", "blob"]),
-    everyVariant: true,
-  },
 ]
 
 /** Each case, on each variant it runs on, alone and in a transaction. */
@@ -536,7 +428,6 @@ export const matrix: ReadonlyArray<{
   readonly transaction: boolean
   readonly world: World
   readonly apply: (update: any) => any
-  readonly seeded: Record<string, unknown>
 }> = cases.flatMap((each) =>
   variants
     .filter((variant) =>
@@ -551,14 +442,22 @@ export const matrix: ReadonlyArray<{
         transaction,
         world: each.world ?? "main",
         apply: each.apply,
-        seeded: each.seeded ?? {},
       })),
     ),
 )
 
-export interface Captured extends Outcome {
+/** JSON as a fixture holds it. */
+export const plain = <A>(value: A): A => JSON.parse(JSON.stringify(value))
+
+export interface Captured {
+  /** Whether the update succeeded: alone, that means the row it returned decoded. */
+  readonly ok: boolean
+  readonly requests: ReadonlyArray<{ readonly command: string; readonly input: unknown }>
   /** The row of item `a` after the update. */
   readonly row: Record<string, any> | undefined
+  /** Whether item `a` reads back afterwards. */
+  readonly reads: boolean
+  readonly error: unknown
 }
 
 /** Seeds items `a` and `b`, applies `apply` to an update of `a`, and returns what was sent. */
@@ -592,13 +491,12 @@ export const capture = (
     const row = [...table.items.values()].find(
       (item) => item.id?.S === "a" && item.sk?.S === "$operands#v1#e",
     )
-    const failure = failureOf(exit)
     return {
       ok: Exit.isSuccess(exit),
-      ...(failure === undefined ? {} : { failure }),
-      reads: Exit.isSuccess(read),
       requests,
       row: row === undefined ? undefined : plain(row),
+      reads: Exit.isSuccess(read),
+      error: Exit.isFailure(exit) ? exit.cause : undefined,
     }
   }).pipe(
     Effect.provide(Main.layer({ name: "t" })),

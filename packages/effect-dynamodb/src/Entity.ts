@@ -69,6 +69,7 @@ import {
   rowCanLack,
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -136,7 +137,12 @@ import {
   unpackRow,
   withRegistry,
 } from "./internal/Packed.js"
-import { compilePath, createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
+import {
+  attributesOfPath,
+  compilePath,
+  createPathBuilder,
+  type PathModel,
+} from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
 import {
@@ -297,6 +303,7 @@ import {
   type DerivedSchemas,
   getSchemaFields,
   makePathValueEncoder,
+  type OperandNaming,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveUniqueFields,
@@ -2381,7 +2388,51 @@ const makeImpl = <
           ] as const
         }),
     ),
+    {
+      // What a stored row is decoded with: the reader of every operand. A packed field is
+      // unpacked before its schema sees it, so what's stored there isn't what that schema reads.
+      fields: Object.fromEntries(
+        Object.entries(getSchemaFields(schemas.recordSchema as unknown as Schema.Top) ?? {}).filter(
+          ([field]) => !Object.hasOwn(data.packedFields, field),
+        ),
+      ),
+      path: (segments, naming) => readPath(segments, naming),
+      asRead,
+      sameStored: (a, b) => {
+        try {
+          return attributeValueEquals(toAttributeValue(a), toAttributeValue(b))
+        } catch {
+          return false
+        }
+      },
+    },
   )
+  /** Which stored attributes are this entity's sparse map entries, as a row's reader takes them. */
+  const sparseEntries = sparseReader(sparseFields)
+  /**
+   * The model path an operand is read back at, read the way a stored row is read. The walk that
+   * names the attribute the write sends decides it: a path operation's every segment is named by
+   * `attributesOfPath` (which `compilePath` writes with), and a record operation's field by
+   * `resolveDbName`. The row's reader takes the first attribute as a sparse map's entry
+   * (`decodeSparseFields`) or as the field stored under its name, and each one below it as the
+   * property of that name. So the value is checked against the schema it is decoded with.
+   */
+  const readPath = (
+    segments: ReadonlyArray<string | number>,
+    naming: OperandNaming = "path",
+  ): ReadonlyArray<string | number> => {
+    const [head, ...rest] =
+      naming === "path"
+        ? attributesOfPath(segments, resolveDbName)
+        : segments.map((segment, i) =>
+            i === 0 && typeof segment === "string" ? resolveDbName(segment) : segment,
+          )
+    if (typeof head !== "string") return segments
+    const entry = sparseEntries.entryOf(head)
+    return entry === undefined
+      ? [fieldOfAttribute(head), ...rest]
+      : [entry.field, entry.key, ...rest]
+  }
   /**
    * Encode a path-addressed update value and check it against the write schema
    * at its path — container checks included (#133). `undefined` issue = valid.
@@ -2390,14 +2441,14 @@ const makeImpl = <
     segments: ReadonlyArray<string | number>,
     value: unknown,
     kind: "value" | "elements",
-  ): { readonly encoded: unknown; readonly issue: unknown } => {
-    if (kind === "value") {
-      const encoded = pathValues.value(segments, value)
-      return { encoded, issue: pathValues.validate(segments, encoded) }
-    }
-    const encoded = pathValues.elements(segments, value)
-    return { encoded, issue: pathValues.validateElements(segments, encoded) }
-  }
+    naming: OperandNaming = "path",
+  ): { readonly encoded: unknown; readonly issue: unknown } =>
+    pathValues.encode(segments, value, kind, naming)
+  /** A path operation that copies another attribute's value: it has no operand of its own. */
+  const isCopy = (op: {
+    readonly isPath?: boolean
+    readonly valueSegments?: ReadonlyArray<string | number> | undefined
+  }): boolean => op.isPath === true && op.valueSegments !== undefined
   const hasPathOps = (uState: UpdateState): boolean =>
     [
       uState.pathSets,
@@ -3240,6 +3291,8 @@ const makeImpl = <
     type Operand = {
       readonly segments: ReadonlyArray<string | number>
       readonly value: unknown
+      readonly isPath?: boolean
+      readonly valueSegments?: ReadonlyArray<string | number> | undefined
     }
     const operands: ReadonlyArray<
       readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements"]
@@ -3258,14 +3311,15 @@ const makeImpl = <
       ["pathIfNotExists of", uState.pathIfNotExists, "value"],
     ]
     for (const [op, ops, kind] of operands) {
-      for (const { segments, value } of ops ?? []) {
-        if (!readBacks.has(String(segments[0]))) continue
-        const { encoded } = encodePathValue(segments, value, kind)
-        const read = asRead(encoded)
-        const issue =
-          kind === "value"
-            ? pathValues.validate(segments, read)
-            : pathValues.validateElements(segments, read)
+      // `.append()` names a field; the path operations name attributes.
+      const naming: OperandNaming = op === ".append() of" ? "field" : "path"
+      for (const operand of ops ?? []) {
+        if (isCopy(operand)) continue
+        const { segments, value } = operand
+        // The field the row's reader reads the value back into (`readPath`).
+        if (!readBacks.has(String(readPath(segments, naming)[0]))) continue
+        const { encoded } = encodePathValue(segments, value, kind, naming)
+        const issue = pathValues.validate(segments, asRead(encoded), kind, naming)
         if (issue !== undefined) return notReadBack(`${op} "${segments.join(".")}"`, issue)
       }
     }
@@ -3285,7 +3339,7 @@ const makeImpl = <
     const appended = Object.fromEntries(
       Object.entries(uState.append ?? {}).map(([field, value]) => [
         field,
-        encodePathValue([field], value, "elements").encoded,
+        encodePathValue([field], value, "elements", "field").encoded,
       ]),
     )
     const records: ReadonlyArray<readonly [string, globalThis.Record<string, unknown>]> = [
@@ -3303,6 +3357,8 @@ const makeImpl = <
     type Operand = {
       readonly segments: ReadonlyArray<string | number>
       readonly value: unknown
+      readonly isPath?: boolean
+      readonly valueSegments?: ReadonlyArray<string | number> | undefined
     }
     const pathOps: ReadonlyArray<
       readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements" | undefined]
@@ -3317,6 +3373,7 @@ const makeImpl = <
     ]
     for (const [op, ops, kind] of pathOps) {
       for (const operand of ops ?? []) {
+        if (isCopy(operand)) continue
         const value =
           kind === undefined
             ? operand.value
@@ -3353,7 +3410,7 @@ const makeImpl = <
     // Keyed by a name the caller supplies: no prototype, so `__proto__` is a key like any other.
     const append: globalThis.Record<string, unknown> = Object.create(null)
     for (const [field, value] of Object.entries(uState.append ?? {})) {
-      const { encoded, issue } = encodePathValue([field], value, "elements")
+      const { encoded, issue } = encodePathValue([field], value, "elements", "field")
       if (issue !== undefined) return { operation: "update.append", issue }
       append[field] = encoded
     }
@@ -3372,7 +3429,7 @@ const makeImpl = <
       const values: Array<unknown> = []
       for (const op of ops ?? []) {
         // A copy writes another attribute's value: there's nothing to encode.
-        if (op.isPath && op.valueSegments) {
+        if (isCopy(op)) {
           values.push(undefined)
           continue
         }
@@ -3460,8 +3517,8 @@ const makeImpl = <
     const record = updates as globalThis.Record<string, unknown>
     const out: Array<AssertedImmutable> = []
     for (const field of immutableFields) {
-      if (record[field] === undefined) continue
-      const encoded = encodePathValue([field], record[field], "value")
+      if (!Object.hasOwn(record, field) || record[field] === undefined) continue
+      const encoded = encodePathValue([field], record[field], "value", "field")
       if (encoded.issue !== undefined) {
         return `.set() of immutable "${field}": ${String(encoded.issue)}`
       }

@@ -1093,6 +1093,12 @@ const isClassSchema = (schema: Schema.Top): boolean =>
   schemaFieldsOf(schema) !== undefined &&
   (schema.ast as { readonly _tag?: string })._tag === "Declaration"
 
+/**
+ * On the declaration a walked `Schema.Class` is rebuilt as (`substituteSchemaDeep`): its stored
+ * form is exactly the struct its one encoding link leads to.
+ */
+const REBUILT_CLASS = Symbol.for("effect-dynamodb/RebuiltClass")
+
 /** The Struct AST a class decodes from — the last link of its encoding chain. */
 const classStructAst = (schema: Schema.Top): SchemaAST.AST | undefined => {
   const encoding = schema.ast.encoding
@@ -2254,7 +2260,9 @@ export const substituteSchemaDeep = (
     const ctor = schema as unknown as new (input: unknown) => unknown
     return subStruct.pipe(
       Schema.decodeTo(
-        Schema.instanceOf(ctor) as unknown as Schema.Codec<any>,
+        // Marked, so a walk of the stored form knows this declaration for what it is: the struct
+        // its encoding leads to, attached to the class's prototype, and nothing else.
+        Schema.instanceOf(ctor).annotate({ [REBUILT_CLASS]: true }) as unknown as Schema.Codec<any>,
         {
           decode: SchemaGetter.transform((value: unknown) =>
             Object.assign(Object.create((ctor as { prototype: object }).prototype), value),
@@ -3073,13 +3081,28 @@ export const resolveUniqueFields = (def: UniqueConstraintDef): ReadonlyArray<str
 // Path-addressed values (#133)
 // ---------------------------------------------------------------------------
 
-/** The schema one path segment addresses inside `schema`, or `undefined`. */
-const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.Top | undefined => {
+/** A record's own entry under a name a caller supplies: never a member every object inherits. */
+const own = <A>(record: globalThis.Record<string, A>, name: string): A | undefined =>
+  Object.hasOwn(record, name) ? record[name] : undefined
+
+/**
+ * Every schema one path segment addresses inside `schema`: one for each member of a union the
+ * segment resolves in, in declared order, and at most one otherwise.
+ */
+const childrenAtSegment = (
+  schema: Schema.Top,
+  segment: string | number,
+): ReadonlyArray<Schema.Top> => {
   const opt = optionalField(schema)
   const inner = opt?.union ?? opt?.inner ?? schema
   const s = inner as unknown as globalThis.Record<string, unknown>
+  const one = (child: Schema.Top | undefined): ReadonlyArray<Schema.Top> =>
+    child === undefined ? [] : [child]
   const fields = schemaFieldsOf(inner)
-  if (fields !== undefined) return typeof segment === "string" ? fields[segment] : undefined
+  // A segment is a name a caller supplies: only a field the schema declares, never a member
+  // every object inherits (`constructor`, `toString`).
+  if (fields !== undefined)
+    return one(typeof segment === "string" ? own(fields, segment) : undefined)
   // An OPAQUE class — `X.check(…)`, `X.annotate(…)`, a `DynamoModel.ref` nested
   // in a ref target — is deliberately NOT followed. Its `.fields` are gone, so
   // the derived read schema keeps it unsubstituted and decodes its leaves
@@ -3089,37 +3112,38 @@ const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.To
   // target model instead (`makePathValueEncoder`'s `refTargets`), whose read
   // schema IS substituted.
   if (SchemaAST.isUnion(inner.ast)) {
-    // `NullOr(Stamp)` and friends: the first member the segment resolves in.
+    // `NullOr(Stamp)` and friends: each member the segment resolves in.
     const members = Array.isArray(s.members) ? (s.members as ReadonlyArray<Schema.Top>) : []
-    for (const member of members) {
-      const child = childAtSegment(member, segment)
-      if (child !== undefined) return child
-    }
-    return undefined
+    return [...new Set(members.flatMap((member) => childrenAtSegment(member, segment)))]
   }
   if (SchemaAST.isArrays(inner.ast)) {
-    if (typeof segment !== "number") return undefined
-    if (isSchemaLike(s.value)) return s.value
-    if (Array.isArray(s.elements)) return s.elements[segment] as Schema.Top | undefined
+    if (typeof segment !== "number") return []
+    if (isSchemaLike(s.value)) return [s.value]
+    if (Array.isArray(s.elements)) return one(s.elements[segment] as Schema.Top | undefined)
     if (isSchemaLike(s.schema) && Array.isArray(s.rest)) {
       const head = (s.schema as unknown as { readonly elements?: ReadonlyArray<Schema.Top> })
         .elements
-      if (head !== undefined && segment < head.length) return head[segment]
-      return s.rest[0] as Schema.Top | undefined
+      if (head !== undefined && segment < head.length) return one(head[segment])
+      return one(s.rest[0] as Schema.Top | undefined)
     }
-    return undefined
+    return []
   }
   if (SchemaAST.isObjects(inner.ast) && typeof segment === "string") {
-    if (isSchemaLike(s.value) && isSchemaLike(s.key)) return s.value
+    if (isSchemaLike(s.value) && isSchemaLike(s.key)) return [s.value]
     if (isSchemaLike(s.schema) && Array.isArray(s.records)) {
-      const declared = schemaFieldsOf(s.schema)?.[segment]
-      if (declared !== undefined) return declared
+      const declaredFields = schemaFieldsOf(s.schema)
+      const declared = declaredFields === undefined ? undefined : own(declaredFields, segment)
+      if (declared !== undefined) return [declared]
       const record = s.records[0] as unknown as { readonly value?: Schema.Top } | undefined
-      return record?.value
+      return one(record?.value)
     }
   }
-  return undefined
+  return []
 }
+
+/** The schema one path segment addresses inside `schema`: in a union, the first member's that has it. */
+const childAtSegment = (schema: Schema.Top, segment: string | number): Schema.Top | undefined =>
+  childrenAtSegment(schema, segment)[0]
 
 /** The element schema of the list a path addresses (for append / prepend). */
 const listElementOf = (schema: Schema.Top): Schema.Top | undefined => {
@@ -3140,6 +3164,21 @@ const listElementOf = (schema: Schema.Top): Schema.Top | undefined => {
   // A rebuilt array with its checks restored has no runtime `.value`; a plain
   // list (no fixed elements) still has its element in the AST's rest.
   return inner.ast.elements.length === 0 ? arrayElementOf(inner) : undefined
+}
+
+/**
+ * The element schema of every list a schema is, or holds as a member of a union, in declared order.
+ * An append's elements belong to one of those lists, and a path can't tell which.
+ */
+const listElementsOf = (schema: Schema.Top): ReadonlyArray<Schema.Top> => {
+  const opt = optionalField(schema)
+  const inner = opt?.union ?? opt?.inner ?? schema
+  if (SchemaAST.isUnion(inner.ast)) {
+    const members = (inner as unknown as { readonly members?: ReadonlyArray<Schema.Top> }).members
+    return [...new Set((members ?? []).flatMap((member) => listElementsOf(member)))]
+  }
+  const element = listElementOf(inner)
+  return element === undefined ? [] : [element]
 }
 
 /** Structural equality over plain values (primitives, arrays, plain objects). */
@@ -3211,6 +3250,167 @@ const isWalkableObject = (value: unknown): value is object =>
   !DateTime.isDateTime(value) &&
   !Redacted.isRedacted(value)
 
+// ---------------------------------------------------------------------------
+// Where a stored value is read: the walk of the read schema
+// ---------------------------------------------------------------------------
+//
+// An operand is checked, and its stored form chosen, only where the walk from its field's read
+// schema to its position resolves exactly what the read path decodes there. The walk passes
+// through the node kinds below and no other. Anything else on the way makes the position
+// UNKNOWN, and an operand at an unknown position is sent as 1.39.0 sent it. So a schema shape
+// nobody listed here can't be refused or re-encoded by mistake: it isn't judged at all.
+//
+// Modelled, each only without an encoding of its own and without a check on the container (a
+// transformation or a filter over the whole container can accept or reject on more than the
+// position's value):
+//
+// - a struct (`Objects`): the property of that name, or the value of its one string-keyed
+//   index signature (a record);
+// - a list or tuple (`Arrays`): the element at that index, or the rest element;
+// - a union (`Union`): every member, when every member is modelled. A member that holds no
+//   value below it (a primitive, a literal, `null`, `undefined`) has no position there;
+// - a suspended schema (`Suspend`): what its thunk returns;
+// - a `Schema.Class` the library rebuilt (`REBUILT_CLASS`): the struct its encoding leads to.
+//
+// A property's optionality, mutability and constructor default (`ast.context`) change nothing a
+// present value is decoded by. At the position itself any schema is exact: it is the read
+// path's own.
+//
+// Unknown: a node with an encoding (a transformed struct or list, `Schema.Option`, a decoding
+// default, a set, a map), a container with a check, any other declaration, `Unknown` / `Any` /
+// `object`, a record whose keys are constrained, a property the schema doesn't declare, a
+// property or key named `__proto__`, and a field the read path transforms before its schema sees
+// it (a packed field).
+
+/** The node kinds that hold no value below them: a path can't go through one. */
+const CHILDLESS: ReadonlySet<string> = new Set([
+  "Null",
+  "Undefined",
+  "Void",
+  "Never",
+  "String",
+  "Number",
+  "Boolean",
+  "BigInt",
+  "Symbol",
+  "UniqueSymbol",
+  "Literal",
+  "Enum",
+  "TemplateLiteral",
+])
+
+/** A container the walk can look into: nothing transforms it, and no check judges it whole. */
+const isTransparent = (ast: SchemaAST.AST): boolean =>
+  ast.encoding === undefined && ast.checks === undefined
+
+/** The struct a rebuilt class is stored as, or `undefined` for any other node. */
+const rebuiltClassStruct = (ast: SchemaAST.AST): SchemaAST.AST | undefined => {
+  if (!SchemaAST.isDeclaration(ast) || ast.checks !== undefined) return undefined
+  if (
+    (ast.annotations as globalThis.Record<symbol, unknown> | undefined)?.[REBUILT_CLASS] !== true
+  ) {
+    return undefined
+  }
+  const encoding = ast.encoding
+  return encoding !== undefined && encoding.length === 1 ? encoding[0]!.to : undefined
+}
+
+/**
+ * The nodes one segment below `ast`, one for each union member that has the position; an empty
+ * list when no value of `ast` holds anything there; `undefined` when the walk doesn't model
+ * `ast` exactly.
+ */
+const positionBelow = (
+  ast: SchemaAST.AST,
+  segment: string | number,
+): ReadonlyArray<SchemaAST.AST> | undefined => {
+  const struct = rebuiltClassStruct(ast)
+  if (struct !== undefined) return positionBelow(struct, segment)
+  if (SchemaAST.isSuspend(ast)) return positionBelow(ast.thunk(), segment)
+  if (ast.encoding !== undefined) return undefined
+  if (CHILDLESS.has(ast._tag)) return []
+  if (ast.checks !== undefined) return undefined
+  if (SchemaAST.isUnion(ast)) {
+    const out: Array<SchemaAST.AST> = []
+    for (const member of ast.types) {
+      const below = positionBelow(member, segment)
+      if (below === undefined) return undefined
+      out.push(...below)
+    }
+    return out
+  }
+  if (SchemaAST.isObjects(ast)) {
+    if (typeof segment !== "string") return []
+    // The read path builds its objects by assignment, which `__proto__` doesn't survive: a
+    // value stored under that name isn't read at all.
+    if (segment === "__proto__") return undefined
+    const property = ast.propertySignatures.find((signature) => signature.name === segment)
+    if (property !== undefined) return [property.type]
+    const [index, ...others] = ast.indexSignatures
+    // A record: any string key holds a value. A constrained key, or several signatures, isn't
+    // modelled; nor is a property the struct doesn't declare.
+    if (index === undefined || others.length > 0) return undefined
+    const key = index.parameter as SchemaAST.AST
+    return key._tag === "String" && isTransparent(key) ? [index.type] : undefined
+  }
+  if (SchemaAST.isArrays(ast)) {
+    if (typeof segment !== "number") return []
+    const element = ast.elements[segment]
+    if (element !== undefined) return [element]
+    return ast.rest.length === 1 ? [ast.rest[0]!] : undefined
+  }
+  return undefined
+}
+
+/** {@link positionBelow} for each of the nodes a path has reached: unknown if any of them is. */
+const positionsBelow = (
+  nodes: ReadonlyArray<SchemaAST.AST>,
+  segment: string | number,
+): ReadonlyArray<SchemaAST.AST> | undefined => {
+  const out: Array<SchemaAST.AST> = []
+  for (const node of nodes) {
+    const below = positionBelow(node, segment)
+    if (below === undefined) return undefined
+    out.push(...below)
+  }
+  return out
+}
+
+/**
+ * The element node of every plain list among `nodes` (through unions and suspended schemas), which
+ * an append's elements are read by; `undefined` when one of them isn't modelled exactly: a list
+ * with a transformation or a check of its own, a tuple, a set.
+ */
+const listElementsAt = (
+  nodes: ReadonlyArray<SchemaAST.AST>,
+): ReadonlyArray<SchemaAST.AST> | undefined => {
+  const out: Array<SchemaAST.AST> = []
+  for (const node of nodes) {
+    if (SchemaAST.isSuspend(node)) {
+      const below = listElementsAt([node.thunk()])
+      if (below === undefined) return undefined
+      out.push(...below)
+    } else if (node.encoding !== undefined) return undefined
+    else if (CHILDLESS.has(node._tag)) continue
+    else if (node.checks !== undefined) return undefined
+    else if (SchemaAST.isUnion(node)) {
+      const below = listElementsAt(node.types)
+      if (below === undefined) return undefined
+      out.push(...below)
+    } else if (SchemaAST.isArrays(node) && node.elements.length === 0 && node.rest.length === 1) {
+      out.push(node.rest[0]!)
+    } else return undefined
+  }
+  return out
+}
+
+/**
+ * How an operand's segments name the attribute it writes: a path operation's through `compilePath`
+ * (a segment holding `#` is the attribute's own name), a record operation's as its field's stored
+ * attribute.
+ */
+export type OperandNaming = "path" | "field"
+
 /**
  * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
  * `pathPrepend`, `pathIfNotExists`) and record-based `append` (#133).
@@ -3239,31 +3439,48 @@ export const makePathValueEncoder = (
    * `.fields`), so a path under it is followed through the target model.
    */
   refTargets: globalThis.Record<string, Schema.Top> = {},
+  reading: {
+    /** The fields of the schema a stored row is decoded with: what reads an operand back. */
+    readonly fields: SchemaFields
+    /**
+     * The model path an operand is read back at. For a path operation, each segment is the
+     * attribute the write names (`compilePath`'s walk); for a record operation, the field's stored
+     * attribute. The head is read as a sparse map's entry, or as the field stored under that name.
+     */
+    readonly path: (
+      segments: ReadonlyArray<string | number>,
+      naming: OperandNaming,
+    ) => ReadonlyArray<string | number>
+    /** What a read gets for a value as it's written. Throws for one that can't be stored. */
+    readonly asRead: (value: unknown) => unknown
+    /** Whether two values are stored as the same attribute value. */
+    readonly sameStored: (a: unknown, b: unknown) => boolean
+  } = {
+    fields: writeFields,
+    path: (segments) => segments,
+    asRead: (value) => value,
+    sameStored: sameValue,
+  },
 ): {
-  readonly value: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
-  readonly elements: (segments: ReadonlyArray<string | number>, value: unknown) => unknown
   /**
-   * The issue an ENCODED path value raises under the write schema at its path
-   * — a broken container check, or a value no form of which is valid — or
-   * `undefined` when it is valid, or when the path has no schema to check.
+   * A path operation's value (`"value"`) or list of elements (`"elements"`) in the form it's
+   * written, and the issue that refuses it. `issue` is `undefined` for a value that is written.
    */
-  readonly validate: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
-  /** `validate` for each element of a list value (append / prepend). */
-  readonly validateElements: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
+  readonly encode: (
+    segments: ReadonlyArray<string | number>,
+    value: unknown,
+    kind: "value" | "elements",
+    naming?: OperandNaming,
+  ) => { readonly encoded: unknown; readonly issue: unknown }
+  /** The issue a value as a read returns it raises where the path is read back. */
+  readonly validate: (
+    segments: ReadonlyArray<string | number>,
+    read: unknown,
+    kind: "value" | "elements",
+    naming?: OperandNaming,
+  ) => unknown
 } => {
   const recordFields = writeFields
-  const cache = new Map<string, ((value: unknown) => unknown) | null>()
-  const encoderFor = (
-    key: string,
-    resolve: () => { readonly original: Schema.Top; readonly stored: Schema.Top } | undefined,
-  ): ((value: unknown) => unknown) | null => {
-    const cached = cache.get(key)
-    if (cached !== undefined) return cached
-    const resolved = resolve()
-    const fn = resolved === undefined ? null : leafAwareEncoder(resolved.original, resolved.stored)
-    cache.set(key, fn)
-    return fn
-  }
   /**
    * Encode through `stored`, passing an ambiguous wire value of a LEAF transform
    * through. An array of such leaves (`Array(StringFromBase64)`) is the one
@@ -3371,91 +3588,260 @@ export const makePathValueEncoder = (
     }
     return out
   }
+  /** A schema a path addresses, and whether it's reached through a later member of an optional union. */
+  type At = { readonly schema: Schema.Top; readonly asDeclared: boolean }
   /**
-   * The model's own schema at a path, before any substitution, and whether the path goes through a
-   * later member of an optional union, which is written as declared ({@link writesFirstMemberOnly}).
+   * Every schema one more segment addresses from `at`. A later member of an optional union is
+   * written as declared ({@link writesFirstMemberOnly}), and so is everything below it.
    */
-  const originalAt = (segments: ReadonlyArray<string | number>) => {
-    const [head, ...rest] = segments
-    if (typeof head !== "string") return undefined
-    let current: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
-    let asDeclared = false
-    for (const segment of rest) {
-      if (current === undefined) return undefined
-      const opt = optionalField(current)
-      if (opt?.union !== undefined && childAtSegment(opt.inner, segment) === undefined) {
-        asDeclared = true
-      }
-      current = childAtSegment(current, segment)
-    }
-    return current === undefined ? undefined : { schema: current, asDeclared }
+  const below = (at: At, segment: string | number): ReadonlyArray<At> => {
+    const opt = optionalField(at.schema)
+    const first =
+      opt?.union === undefined ? undefined : new Set(childrenAtSegment(opt.inner, segment))
+    return childrenAtSegment(at.schema, segment).map((schema) => ({
+      schema,
+      asDeclared: at.asDeclared || (first !== undefined && !first.has(schema)),
+    }))
   }
-  const schemaAt = (segments: ReadonlyArray<string | number>) => {
-    const at = originalAt(segments)
-    if (at === undefined) return undefined
+  const headOf = (segments: ReadonlyArray<string | number>): At | undefined => {
+    const head = segments[0]
+    if (typeof head !== "string") return undefined
+    const schema = own(refTargets, head) ?? own(modelFields, head)
+    return schema === undefined ? undefined : { schema, asDeclared: false }
+  }
+  /** The model's own schema at a path, before any substitution: in a union, the first member's. */
+  const originalAt = (segments: ReadonlyArray<string | number>): At | undefined => {
+    let current = headOf(segments)
+    for (const segment of segments.slice(1)) {
+      if (current === undefined) return undefined
+      current = below(current, segment)[0]
+    }
+    return current
+  }
+  /** The model's own schemas at a path: one for each union member the path resolves in. */
+  const originalsAt = (segments: ReadonlyArray<string | number>): ReadonlyArray<At> => {
+    const head = headOf(segments)
+    let current: ReadonlyArray<At> = head === undefined ? [] : [head]
+    for (const segment of segments.slice(1)) {
+      const next = current.flatMap((at) => below(at, segment))
+      current = next.filter(
+        (at, i) =>
+          next.findIndex((o) => o.schema === at.schema && o.asDeclared === at.asDeclared) === i,
+      )
+    }
+    return current
+  }
+  const storedAt = (segments: ReadonlyArray<string | number>, at: At) => {
     const original = at.schema
-    const head = segments[0] as string
     const stored =
       segments.length === 1
-        ? recordFields[head]
+        ? own(recordFields, segments[0] as string)
         : at.asDeclared
           ? original
           : substituteSchemaDeep(original, { enforceChecks: true })
     return stored === undefined ? undefined : { original, stored }
   }
-  const validators = new Map<string, ((encoded: unknown) => unknown) | null>()
-  const validatorFor = (
-    key: string,
-    resolve: () => Schema.Top | undefined,
-  ): ((encoded: unknown) => unknown) | null => {
-    const cached = validators.get(key)
-    if (cached !== undefined) return cached
-    const schema = resolve()
-    const fn =
-      schema === undefined
-        ? null
-        : (() => {
-            const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
-            return (encoded: unknown): unknown => {
-              const exit = decode(asStored(encoded))
-              return exit._tag === "Success" ? undefined : exit.cause
-            }
-          })()
-    validators.set(key, fn)
-    return fn
+  /** One schema a path's value can be written by: its encoder, and the issue its stored form raises. */
+  type Form = {
+    readonly encode: (value: unknown) => unknown
+    readonly issue: (encoded: unknown) => unknown
   }
-  return {
-    validate: (segments, encoded) => {
-      const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)
-      return fn === null ? undefined : fn(encoded)
-    },
-    validateElements: (segments, encoded) => {
-      if (!Array.isArray(encoded)) return undefined
-      const fn = validatorFor(`e:${JSON.stringify(segments)}`, () => {
-        const list = schemaAt(segments)
-        return list === undefined ? undefined : listElementOf(list.stored)
-      })
-      if (fn === null) return undefined
-      for (const entry of encoded) {
-        const issue = fn(entry)
+  /** A value's issue under `schema`, or each element's for a list of elements. */
+  const issueUnder = (schema: Schema.Top, kind: "value" | "elements") => {
+    const decode = Schema.decodeUnknownExit(schema as Schema.Codec<any>)
+    const one = (stored: unknown): unknown => {
+      const exit = decode(asStored(stored))
+      return exit._tag === "Success" ? undefined : exit.cause
+    }
+    if (kind === "value") return one
+    return (stored: unknown): unknown => {
+      if (!Array.isArray(stored)) return undefined
+      for (const entry of stored) {
+        const issue = one(entry)
         if (issue !== undefined) return issue
       }
       return undefined
+    }
+  }
+  const formOver = (original: Schema.Top, stored: Schema.Top, kind: "value" | "elements"): Form => {
+    const encodeOne = leafAwareEncoder(original, stored)
+    return {
+      encode:
+        kind === "value"
+          ? encodeOne
+          : (value) => (Array.isArray(value) ? value.map((entry) => encodeOne(entry)) : value),
+      issue: issueUnder(stored, kind),
+    }
+  }
+  /** The form every release has written a path by: a list's element is the first list's. */
+  const writtenForm = (
+    segments: ReadonlyArray<string | number>,
+    at: At,
+    kind: "value" | "elements",
+  ): Form | undefined => {
+    const schemas = storedAt(segments, at)
+    if (schemas === undefined) return undefined
+    if (kind === "value") return formOver(schemas.original, schemas.stored, kind)
+    const original = listElementOf(schemas.original)
+    const stored = listElementOf(schemas.stored)
+    return original === undefined || stored === undefined
+      ? undefined
+      : formOver(original, stored, kind)
+  }
+  /** Each form the schema at a path can write a value by: for elements, one for each list it holds. */
+  const formsAt = (
+    segments: ReadonlyArray<string | number>,
+    at: At,
+    kind: "value" | "elements",
+  ): ReadonlyArray<Form> => {
+    const schemas = storedAt(segments, at)
+    if (schemas === undefined) return []
+    if (kind === "value") return [formOver(schemas.original, schemas.stored, kind)]
+    const originals = listElementsOf(schemas.original)
+    const stored = listElementsOf(schemas.stored)
+    return originals.length === stored.length
+      ? originals.map((original, i) => formOver(original, stored[i]!, kind))
+      : []
+  }
+  /**
+   * What a stored row is decoded with at a path, or `undefined` when the walk can't say exactly.
+   * Never an empty list: "no reader takes it" is a value's verdict, and "unknown" is the path's.
+   */
+  const readNodesAt = (
+    segments: ReadonlyArray<string | number>,
+    kind: "value" | "elements",
+  ): ReadonlyArray<Schema.Top> | undefined => {
+    const head = segments[0]
+    const field = typeof head === "string" ? own(reading.fields, head) : undefined
+    if (field === undefined) return undefined
+    let current: ReadonlyArray<SchemaAST.AST> = [field.ast]
+    for (const segment of segments.slice(1)) {
+      const next = positionsBelow(current, segment)
+      if (next === undefined) return undefined
+      current = next
+    }
+    const nodes = kind === "value" ? current : listElementsAt(current)
+    return nodes === undefined || nodes.length === 0
+      ? undefined
+      : nodes.map((node) => Schema.make<Schema.Top>(node))
+  }
+  /**
+   * A reader's own encoding of a value, for a position the model's walk finds no form for (below a
+   * suspended schema): the schema that reads the position back is the one a put encodes it by.
+   */
+  const ownForm = (schema: Schema.Top, kind: "value" | "elements"): Form => {
+    const encode = Schema.encodeUnknownOption(schema as Schema.Codec<any>)
+    const one = (value: unknown): unknown => {
+      const encoded = encode(value)
+      return encoded._tag === "Some" ? encoded.value : value
+    }
+    return {
+      encode:
+        kind === "value"
+          ? one
+          : (value) => (Array.isArray(value) ? value.map((entry) => one(entry)) : value),
+      issue: issueUnder(schema, kind),
+    }
+  }
+  /**
+   * How one operand is put into its stored form.
+   *
+   * `written` is the form the operand's own segments name in the model, taking a union's first
+   * member and a union's first list: what 1.39.0 wrote by, or `undefined` for a path the model
+   * doesn't name (a sparse map's entry) and for a list it didn't find (a union of lists), whose
+   * value it wrote as given. `forms` are the forms the schema where the operand is read back can
+   * write it by, and `readers` what a row's reader decodes it with there, one per union member.
+   */
+  type Plan = {
+    readonly written: Form | undefined
+    readonly forms: ReadonlyArray<Form>
+    /** `undefined`: the position isn't one the walk resolves exactly (see the walk above). */
+    readonly readers: ReadonlyArray<(read: unknown) => unknown> | undefined
+  }
+  const plans = new Map<string, Plan>()
+  const planFor = (
+    segments: ReadonlyArray<string | number>,
+    kind: "value" | "elements",
+    naming: OperandNaming,
+  ): Plan => {
+    const key = `${naming}:${kind}:${JSON.stringify(segments)}`
+    const cached = plans.get(key)
+    if (cached !== undefined) return cached
+    const readSegments = reading.path(segments, naming)
+    const writtenAt = originalAt(segments)
+    const nodes = readNodesAt(readSegments, kind)
+    const forms = originalsAt(readSegments).flatMap((at) => formsAt(readSegments, at, kind))
+    const plan: Plan = {
+      written: writtenAt === undefined ? undefined : writtenForm(segments, writtenAt, kind),
+      forms: forms.length > 0 ? forms : (nodes ?? []).map((node) => ownForm(node, kind)),
+      readers: nodes?.map((node) => issueUnder(node, kind)),
+    }
+    plans.set(key, plan)
+    return plan
+  }
+  /** A value as a read returns it, or nothing for one that can't be stored. */
+  const asRead = (stored: unknown): { readonly read: unknown } | undefined => {
+    try {
+      return { read: reading.asRead(stored) }
+    } catch {
+      return undefined
+    }
+  }
+  /** The first reader's issue with a value as read, unless one of them reads it. */
+  const issueOf = (readers: ReadonlyArray<(read: unknown) => unknown>, read: unknown): unknown => {
+    let first: unknown
+    for (const [i, reader] of readers.entries()) {
+      const issue = reader(read)
+      if (issue === undefined) return undefined
+      if (i === 0) first = issue
+    }
+    return first
+  }
+  return {
+    validate: (segments, read, kind, naming = "path") => {
+      const { written, readers } = planFor(segments, kind, naming)
+      // An unknown position is judged as it was: by the form 1.39.0 wrote it by, if it had one.
+      return readers === undefined ? written?.issue(read) : issueOf(readers, read)
     },
-    value: (segments, value) => {
-      const fn = encoderFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments))
-      return fn === null ? value : fn(value)
-    },
-    elements: (segments, value) => {
-      if (!Array.isArray(value)) return value
-      const fn = encoderFor(`e:${JSON.stringify(segments)}`, () => {
-        const list = schemaAt(segments)
-        if (list === undefined) return undefined
-        const original = listElementOf(list.original)
-        const stored = listElementOf(list.stored)
-        return original === undefined || stored === undefined ? undefined : { original, stored }
-      })
-      return fn === null ? value : value.map((entry) => fn(entry))
+    encode: (segments, value, kind, naming = "path") => {
+      const { written, forms, readers } = planFor(segments, kind, naming)
+      // What 1.39.0 sent, and what it refused, which is refused still.
+      const before = written === undefined ? value : written.encode(value)
+      const refused = written?.issue(before)
+      // Where the walk can't say exactly what reads the operand back, it is sent as it always was.
+      if (refused !== undefined || readers === undefined) return { encoded: before, issue: refused }
+      const reads = (stored: unknown): boolean => {
+        const got = asRead(stored)
+        return got !== undefined && issueOf(readers, got.read) === undefined
+      }
+      // What 1.39.0 sent can't be stored at all: that is the marshalling's to refuse, in its own
+      // words, as it did.
+      const got = asRead(before)
+      if (got === undefined) return { encoded: before, issue: undefined }
+      // The reader reads what 1.39.0 sent: that is sent.
+      if (issueOf(readers, got.read) === undefined) return { encoded: before, issue: undefined }
+      // It doesn't, so the operand is encoded by the schema it's read back with: the one form
+      // every member that writes a value the reader reads agrees on.
+      const taken: Array<unknown> = []
+      let issue: unknown
+      for (const form of forms) {
+        const encoded = form.encode(value)
+        const refusal = form.issue(encoded)
+        if (refusal !== undefined) issue ??= refusal
+        else if (reads(encoded) && !taken.some((other) => reading.sameStored(other, encoded))) {
+          taken.push(encoded)
+        }
+      }
+      if (taken.length === 1) return { encoded: taken[0], issue: undefined }
+      // No member writes a value the reader reads, or they'd store it differently.
+      return {
+        encoded: before,
+        issue:
+          issue ??
+          issueOf(readers, got.read) ??
+          "The value can't be stored: nothing reads it back as given, and the members of the " +
+            "union at its path would store it differently.",
+      }
     },
   }
 }

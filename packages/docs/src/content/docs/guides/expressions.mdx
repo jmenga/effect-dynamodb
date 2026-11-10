@@ -475,7 +475,13 @@ One kind of value is stored exactly as given: a value that is genuinely valid wi
 
 Paths into and under a top-level `DynamoModel.ref` field are encoded through the ref target's model, like any other path: `pathSet` at `["author", "born"]` stores the author's date as an ISO string. Only a path no schema describes, such as one under a dynamic key of an untyped value, is written as given.
 
+A path naming a sparse map's entry by its attribute, such as `["buckets#a", "n"]`, writes a value as given whenever a read returns it: a number given where the entry stores numeric text is stored as a number, as before 1.40. A value a read wouldn't return, such as a `Date`, is encoded as above. A value no form of which a read returns is refused with a `ValidationError`, before anything is sent.
+
+These checks apply where the library can resolve exactly what reads the path's position back: through structs, records, lists, tuples, unions, suspended schemas and `Schema.Class`es. Below anything else, such as a struct or list with a transformation of its own, a `Schema.Option`, a decoding default or a packed field, the value is sent as it was before 1.40, unchecked.
+
 A value set by path into a class that has lost its fields is written as given, in the same form `put` stores it, so the item stays readable. A class loses its fields when it is built with `.check()` or `.annotate()`, or when it is a `DynamoModel.ref` nested inside a ref target. Known limitation: plain dates inside such a class are still stored as maps, as on 1.22.0, and read back as plain objects. That applies to whole-value `put`, `.set()` and `pathSet` of the class too.
+
+A path can't tell which member of a union the stored value is. A path operation into a union whose members encode the value differently writes it as given under a sparse map's entry and in the first member's form elsewhere, so set the whole value instead. It's refused, with nothing sent, when the first member refuses the value, or when the row's reader wouldn't read the value as written and the members would store it differently.
 
 On entities with `versioned: { retain: true }`, path operations were silently ignored before this release: they returned success and wrote nothing. They are now sent to DynamoDB as the same update expression other entities use, in one transaction with the version snapshot, so they follow DynamoDB's own semantics: list indexes refer to the item before the update, overlapping paths and appends to a missing list are rejected, and a rejected update writes no snapshot. `expectedVersion` and `.condition()` apply.
 

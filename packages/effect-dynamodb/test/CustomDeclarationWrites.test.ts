@@ -447,7 +447,7 @@ describe("a new write path can't go unnoticed", () => {
     // the check a transaction's or a batch's put goes through (`_refuseNotReadBack`).
     expect(count(entity, /\brefuseOtherKindRead\(/g)).toBe(2)
     // Path values encode in one place, and an update's operands are judged in one.
-    expect(count(entity, /\bpathValues\.(?:value|elements)\(/g)).toBe(2)
+    expect(count(entity, /\bpathValues\.encode\(/g)).toBe(1)
     expect(count(entity, /\bnotReadBackOperand\(/g)).toBe(1)
   })
 

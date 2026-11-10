@@ -1,23 +1,20 @@
 /**
- * An update with an operand, against DynamoDB Local: every case of
- * `helpers/UpdateOperandRequests.ts` is applied, and ends as the published 1.39.0 ended it
- * (`fixtures/update-operand-requests-1.39.0.json`, whose requests
- * `test/UpdateOperandRequests.test.ts` compares). An operand 1.39.0 wrote is written and the row
- * reads back; an operand it refused is refused with the same error and the stored row is the row
- * that was there.
+ * What an update's path operand is written as, against DynamoDB Local: every case of
+ * `helpers/UpdateOperandRequests.ts` (the operands 1.39.0 accepted, whose requests
+ * `test/UpdateOperandRequests.test.ts` compares with 1.39.0's) is applied and read back, and the
+ * rules for a path into a union, a property named as a renamed field and a copy are checked on the
+ * stored row.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
  *   (or set DYNAMODB_ENDPOINT to another port)
  */
 
-import { readFileSync } from "node:fs"
 import { type AttributeValue, DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
-import { Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Effect, Exit, Layer } from "effect"
 import { describe, expect } from "vitest"
 import * as Lib from "../src/index.js"
-import { failureOf, type Outcome, refusedOperand } from "./helpers/Against139.js"
 import {
   definitions,
   matrix,
@@ -26,10 +23,6 @@ import {
   variants,
   type World,
 } from "./helpers/UpdateOperandRequests.js"
-
-const fixture = JSON.parse(
-  readFileSync(new URL("./fixtures/update-operand-requests-1.39.0.json", import.meta.url), "utf8"),
-) as { readonly cases: Record<string, Outcome> }
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -108,7 +101,6 @@ const onTable = <A>(
 /** Seeds a pair of items of their own, and applies `apply` to an update of the first. */
 const send = (
   db: any,
-  row: (id: string) => Effect.Effect<Row | undefined>,
   n: number,
   transaction: boolean,
   apply: (update: any) => any,
@@ -119,7 +111,6 @@ const send = (
     const [a, b] = [`a${n}`, `b${n}`]
     yield* db.entities.E.put({ ...seed(a, world), ...seeded }).asEffect()
     yield* db.entities.E.put(seed(b, world)).asEffect()
-    const before = yield* row(a)
     const update = (id: string) => db.entities.E.update({ id })
     const exit = yield* Effect.exit(
       Effect.suspend(() => {
@@ -130,10 +121,13 @@ const send = (
       }),
     )
     const read = yield* Effect.exit(db.entities.E.get({ id: a }))
-    return { exit, read, before, after: yield* row(a) }
+    return { id: a, exit, read }
   })
 
-describeConnected("an update with an operand, on DynamoDB Local", () => {
+const set = (segments: ReadonlyArray<string | number>, value: unknown) => (update: any) =>
+  update.pathSet({ segments, value, isPath: false })
+
+describeConnected("an update's path operand, on DynamoDB Local", () => {
   for (const variant of variants) {
     for (const transaction of [false, true]) {
       const where = `${variant}, ${transaction ? "in a transaction" : "alone"}`
@@ -143,31 +137,124 @@ describeConnected("an update with an operand, on DynamoDB Local", () => {
             each.variant === variant && each.transaction === transaction && each.world === world,
         )
         if (cases.length === 0) continue
-        it.effect(`every case ends as 1.39.0 ended it (${where}, the ${world} model)`, () =>
-          onTable(variant, world, ({ db, row }) =>
-            Effect.gen(function* () {
-              let refused = 0
-              for (const [n, each] of cases.entries()) {
-                // The release branch refuses this copy, where 1.39.0 wrote it.
-                if (each.key.includes("copied from an entry")) continue
-                // It names another property than 1.39.0 did, so the row reads differently.
-                if (each.key.includes("a property named as a renamed field")) continue
-                const was = fixture.cases[each.key]!
-                const got = yield* send(db, row, n, transaction, each.apply, each.seeded, world)
-                expect(`${each.key}: ${Exit.isSuccess(got.exit)}`).toBe(`${each.key}: ${was.ok}`)
-                expect(`${each.key}: ${Exit.isSuccess(got.read)}`).toBe(`${each.key}: ${was.reads}`)
-                if (refusedOperand(was)) {
-                  refused++
-                  expect(failureOf(got.exit)).toEqual(was.failure)
-                  // Nothing was written: the row is the row that was there.
-                  expect(got.after).toEqual(got.before)
+        it.effect(
+          `every operand 1.39.0 accepted is written and read back (${where}, the ${world} model)`,
+          () =>
+            onTable(variant, world, ({ db }) =>
+              Effect.gen(function* () {
+                for (const [n, each] of cases.entries()) {
+                  const { exit, read } = yield* send(db, n, transaction, each.apply, {}, world)
+                  expect(
+                    Exit.isFailure(exit)
+                      ? `${each.key}: ${String(Cause.squash(exit.cause))}`
+                      : "ok",
+                  ).toBe("ok")
+                  expect(Exit.isSuccess(read) ? "read" : `${each.key}: not read back`).toBe("read")
                 }
-              }
-              if (world === "main") expect(refused).toBeGreaterThan(0)
-            }),
-          ),
+              }),
+            ),
         )
       }
+
+      it.effect(`an operand the reader reads as given, and a union of lists (${where})`, () =>
+        onTable(variant, "stored", ({ db, row }) =>
+          Effect.gen(function* () {
+            // A number where the entry's schema stores text: sent as given, and read back.
+            const number = yield* send(db, 1, transaction, set(["counts#a"], 2), {}, "stored")
+            expect(Exit.isSuccess(number.exit)).toBe(true)
+            expect((yield* row(number.id))?.["counts#a"]).toEqual({ N: "2" })
+            expect(Exit.isSuccess(number.read) ? (number.read.value as any).counts : "").toEqual({
+              a: 2,
+            })
+
+            // Members that encode `2` to one stored value agree, though each makes a `Set` of its own.
+            const agreed = yield* send(
+              db,
+              2,
+              transaction,
+              set(["sets#a", "value"], 2),
+              {},
+              "stored",
+            )
+            expect(Exit.isSuccess(agreed.exit)).toBe(true)
+            expect((yield* row(agreed.id))?.["sets#a"]?.M?.value).toEqual({ NS: ["2"] })
+            expect(Exit.isSuccess(agreed.read)).toBe(true)
+
+            // Elements neither list of the union takes: refused, the row untouched.
+            const before = yield* Effect.gen(function* () {
+              yield* db.entities.E.put(seed("a3", "stored")).asEffect()
+              return yield* row("a3")
+            })
+            const mixed = yield* send(
+              db,
+              3,
+              transaction,
+              (update) => update.append({ either: [true] }),
+              {},
+              "stored",
+            )
+            expect(Exit.isFailure(mixed.exit)).toBe(true)
+            expect((yield* row(mixed.id))?.either).toEqual(before?.either)
+            expect(Exit.isSuccess(mixed.read)).toBe(true)
+          }),
+        ),
+      )
+
+      it.effect(`a path into a union, a renamed property's name and a copy (${where})`, () =>
+        onTable(variant, "main", ({ db, row }) =>
+          Effect.gen(function* () {
+            // Members that store `2` differently: the entry holds the second, and gets `2` as given.
+            const raw2 = yield* send(db, 1, transaction, set(["codes#a", "value"], 2))
+            expect(Exit.isSuccess(raw2.exit)).toBe(true)
+            expect((yield* row(raw2.id))?.["codes#a"]?.M?.value).toEqual({ N: "2" })
+            expect(Exit.isSuccess(raw2.read)).toBe(true)
+
+            // On a path the model names, a value the first member refuses is refused, as on
+            // 1.39.0: the row holds the first member, and stays as it was.
+            const text = yield* send(db, 2, transaction, set(["shape", "value"], "new"))
+            expect(Exit.isFailure(text.exit)).toBe(true)
+            expect((yield* row(text.id))?.shape?.M?.value).toEqual({ N: "1" })
+            expect(Exit.isSuccess(text.read)).toBe(true)
+
+            // Members that disagree, and neither reads `2` as given: refused, the row untouched.
+            const before = yield* Effect.gen(function* () {
+              yield* db.entities.E.put(seed("a3")).asEffect()
+              return yield* row("a3")
+            })
+            const rival = yield* send(db, 3, transaction, set(["rivals#a", "value"], 2))
+            expect(Exit.isFailure(rival.exit)).toBe(true)
+            if (Exit.isFailure(rival.exit)) {
+              expect((Cause.squash(rival.exit.cause) as any)._tag).toBe("ValidationError")
+            }
+            expect((yield* row(rival.id))?.["rivals#a"]).toEqual(before?.["rivals#a"])
+            expect(Exit.isSuccess(rival.read)).toBe(true)
+
+            // `count` is stored as `renamed`, a top-level attribute's name: below a field, a
+            // path's `count` names the property `count`.
+            const renamed = yield* send(db, 4, transaction, set(["tally", "count"], 2))
+            expect(Exit.isSuccess(renamed.exit)).toBe(true)
+            expect((yield* row(renamed.id))?.tally).toEqual({
+              M: { count: { S: "2" }, renamed: { N: "1" } },
+            })
+            expect(Exit.isSuccess(renamed.read)).toBe(true)
+
+            // A copy holds no operand: the entry gets the field's stored value.
+            const copied = yield* send(db, 5, transaction, (update) =>
+              update.pathSet({
+                segments: ["buckets#a"],
+                value: undefined,
+                isPath: true,
+                valueSegments: ["beside"],
+              }),
+            )
+            expect(Exit.isSuccess(copied.exit)).toBe(true)
+            const stored = yield* row(copied.id)
+            expect(stored?.["buckets#a"]).toEqual(stored?.beside)
+            expect(stored?.["buckets#a"]?.M?.n).toEqual({ N: "2" })
+            expect(Exit.isSuccess(copied.read)).toBe(true)
+          }),
+        ),
+      )
     }
   }
 })
