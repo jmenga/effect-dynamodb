@@ -176,3 +176,51 @@ describe("a timestamp named as a member every object inherits", () => {
     }
   }
 })
+
+// An attribute the model doesn't declare has no field, whatever every object
+// inherits under its name: a version attribute named `toString` is written as
+// 1.39.0 wrote it.
+describe("a version attribute named as a member every object inherits", () => {
+  for (const field of ["toString", "constructor", "hasOwnProperty"]) {
+    const Versioned = Entity.make({
+      model: Schema.Struct({ docId: Schema.String }),
+      entityType: "InheritedVersion",
+      primaryKey: {
+        pk: { field: "pk", composite: ["docId"] },
+        sk: { field: "sk", composite: [] },
+      },
+      versioned: { field },
+    })
+    const VersionTable = Table.make({ schema, entities: { Versioned } })
+
+    for (const [route, write] of [
+      ["Batch.write", () => Batch.write([Versioned.put({ docId: "d1" })])],
+      [
+        "Transaction.transactWrite",
+        () => Transaction.transactWrite([Versioned.put({ docId: "d1" })]),
+      ],
+    ] as const) {
+      it.effect(`${field}, ${route}: the put is sent with version 1`, () =>
+        Effect.gen(function* () {
+          const versions: Array<unknown> = []
+          const client = mockDynamoClientLayer({
+            getItem: () => Effect.succeed({}),
+            transactWriteItems: (input: { TransactItems?: ReadonlyArray<any> }) =>
+              Effect.sync(() => {
+                for (const item of input.TransactItems ?? []) {
+                  const stored = item.Put?.Item
+                  if (stored !== undefined && Object.hasOwn(stored, field))
+                    versions.push(stored[field])
+                }
+                return {}
+              }),
+          } as unknown as Partial<DynamoClientService>)
+          yield* write().pipe(
+            Effect.provide(Layer.mergeAll(client, VersionTable.layer({ name: "t" }))),
+          )
+          expect(versions).toEqual([{ N: "1" }])
+        }),
+      )
+    }
+  }
+})
