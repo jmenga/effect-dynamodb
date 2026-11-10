@@ -13,6 +13,7 @@ import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
 import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import { BigDecimal, Data } from "effect"
+import * as Cookies from "effect/http/Cookies"
 
 const MARSHALL_OPTIONS = { removeUndefinedValues: true, convertClassInstanceToMap: true } as const
 
@@ -220,6 +221,116 @@ const withoutCachedNormals = (value: unknown, open = new Set<object>()): unknown
   }
 }
 
+const COOKIE = "~effect/http/Cookies/Cookie"
+const COOKIE_PROTO: object = Object.getPrototypeOf(Cookies.makeCookieUnsafe("a", "b"))
+
+/** A part marshalling reached that this can't reach without running a getter, or at all. */
+const UNREACHED = Symbol("unreached")
+
+/**
+ * A property as marshalling reads it, own or inherited, but from its descriptor: an accessor is
+ * {@link UNREACHED}, since reading it again would call its getter again.
+ */
+const dataAt = (value: object, key: string): unknown => {
+  for (let at: object | null = value; at !== null; at = Object.getPrototypeOf(at)) {
+    const descriptor = Object.getOwnPropertyDescriptor(at, key)
+    if (descriptor !== undefined) return "value" in descriptor ? descriptor.value : UNREACHED
+  }
+  return UNREACHED
+}
+
+/**
+ * The elements marshalling stores of a list, in order: it leaves out `undefined` and functions, so
+ * the elements after one move up.
+ */
+const storedElements = (list: ReadonlyArray<unknown>): ReadonlyArray<unknown> | undefined => {
+  const stored: Array<unknown> = []
+  for (let index = 0; index < list.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(list, index)
+    if (descriptor === undefined) continue
+    if (!("value" in descriptor)) return undefined
+    const element: unknown = descriptor.value
+    if (element !== undefined && typeof element !== "function") stored.push(element)
+  }
+  return stored
+}
+
+/**
+ * Gives each of Effect's cookies in `source` its expiry, in what marshalling made of it.
+ *
+ * A cookie's `options.expires` is a `Date`, and marshalling stores a `Date` as an empty map: the
+ * expiry was lost. Here it's ISO text instead. Marshalling has already run, exactly as it always
+ * did, and nothing else it made is touched: this only looks through its output for a cookie's
+ * marker, and finds the cookie it came from by descriptors, calling no getter. A cookie is Effect's
+ * own, by its prototype; a map that only looks like one, a cookie behind a getter and an invalid
+ * `Date` are left as marshalled.
+ */
+const datingCookies = (
+  marshalled: Record<string, AttributeValue>,
+  source: unknown,
+): Record<string, AttributeValue> => {
+  const path: Array<string | number> = []
+  const lists = new Map<object, ReadonlyArray<unknown> | undefined>()
+  const elementsOf = (list: ReadonlyArray<unknown>) => {
+    if (!lists.has(list)) lists.set(list, storedElements(list))
+    return lists.get(list)
+  }
+  const sourceAt = (): unknown => {
+    let value: unknown = source
+    for (const step of path) {
+      if (typeof value !== "object" || value === null) return UNREACHED
+      if (typeof step === "number") {
+        const elements = Array.isArray(value) ? elementsOf(value) : undefined
+        if (elements === undefined || step >= elements.length) return UNREACHED
+        value = elements[step]
+      } else if (value instanceof Map) {
+        let found: unknown = UNREACHED
+        for (const [key, entry] of value) if (String(key) === step) found = entry
+        value = found
+      } else {
+        value = dataAt(value, step)
+      }
+    }
+    return value
+  }
+  const date = (map: Record<string, AttributeValue>): void => {
+    const options = Object.hasOwn(map, "options") ? map.options!.M : undefined
+    const expires =
+      options !== undefined && Object.hasOwn(options, "expires") ? options.expires : undefined
+    if (expires?.M === undefined || Object.keys(expires.M).length > 0) return
+    const cookie = sourceAt()
+    if (typeof cookie !== "object" || cookie === null) return
+    if (Object.getPrototypeOf(cookie) !== COOKIE_PROTO) return
+    const given = dataAt(cookie, "options")
+    if (typeof given !== "object" || given === null) return
+    const expiry = dataAt(given, "expires")
+    if (!(expiry instanceof Date)) return
+    if (Number.isNaN(Date.prototype.getTime.call(expiry))) return
+    options!.expires = { S: Date.prototype.toISOString.call(expiry) }
+  }
+  const visit = (attribute: AttributeValue): void => {
+    const map = attribute.M
+    if (map !== undefined) {
+      if (Object.hasOwn(map, COOKIE)) date(map)
+      for (const key of Object.keys(map)) {
+        path.push(key)
+        visit(map[key]!)
+        path.pop()
+      }
+      return
+    }
+    const list = attribute.L
+    if (list === undefined) return
+    for (let index = 0; index < list.length; index++) {
+      path.push(index)
+      visit(list[index]!)
+      path.pop()
+    }
+  }
+  visit({ M: marshalled })
+  return marshalled
+}
+
 /** Whether marshalling refuses a value. */
 const isRefused = (value: unknown): boolean => {
   try {
@@ -267,21 +378,25 @@ const NO_EMPTY_SET =
  * ({@link withoutCachedNormals}). An item holding no such decimal
  * ({@link holdsCachedCycle}, which calls no getter) goes on exactly as before.
  * Whatever is still refused has no attribute to leave out, and throws
- * {@link UnstorableValue}.
+ * {@link UnstorableValue}. What marshalling makes of a cookie is then given the
+ * cookie's expiry ({@link datingCookies}).
  */
 const marshallStorable = (item: Record<string, unknown>): Record<string, AttributeValue> => {
+  let written: Record<string, unknown> = item
+  let marshalled: Record<string, AttributeValue>
   try {
-    return marshall(item, MARSHALL_OPTIONS)
+    marshalled = marshall(item, MARSHALL_OPTIONS)
   } catch {
-    const storable = withoutEmptySets(
+    written = withoutEmptySets(
       holdsCachedCycle(item) ? withoutCachedNormals(item) : item,
     ) as Record<string, unknown>
     try {
-      return marshall(storable, MARSHALL_OPTIONS)
+      marshalled = marshall(written, MARSHALL_OPTIONS)
     } catch (cause) {
-      throw unstorableAt(storable, [], cause instanceof Error ? cause.message : String(cause))
+      throw unstorableAt(written, [], cause instanceof Error ? cause.message : String(cause))
     }
   }
+  return datingCookies(marshalled, written)
 }
 
 /**

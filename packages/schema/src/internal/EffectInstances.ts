@@ -302,14 +302,27 @@ const rebuildTimeZone = (value: unknown): DateTime.TimeZone | undefined =>
 
 const COOKIE_PROTO: object = Object.getPrototypeOf(Cookies.makeCookieUnsafe("a", "b"))
 
+/** An expiry as it's stored, ISO text, back as the `Date` it was written from. */
+const expiryOf = (text: string): Date | undefined => {
+  const date = new Date(text)
+  return Number.isNaN(date.getTime()) || date.toISOString() !== text ? undefined : date
+}
+
 /**
- * A cookie's options as stored: `expires` is a `Date`, which the marshaller stores as an empty map,
- * so one that's an empty map is no expiry; a `maxAge` that's a `Duration` is one again.
+ * A cookie's options as stored: `expires` is the ISO text of the `Date` written, or, as 1.39.0
+ * stored it, the empty map the marshaller makes of a `Date`, which is no expiry. A `maxAge` that's
+ * a `Duration` is one again.
  */
 const cookieOptions = (options: unknown): StoredMap | undefined => {
   if (!isMap(options)) return undefined
   const rebuilt: StoredMap = {}
   for (const [key, value] of Object.entries(options)) {
+    if (key === "expires" && typeof value === "string") {
+      const expires = expiryOf(value)
+      if (expires === undefined) return undefined
+      rebuilt[key] = expires
+      continue
+    }
     if (key === "expires" && isMap(value) && Object.keys(value).length === 0) continue
     if (key === "maxAge" && markedBy(value, DURATION)) {
       const maxAge = rebuildDuration(value)

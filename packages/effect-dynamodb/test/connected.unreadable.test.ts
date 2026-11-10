@@ -37,6 +37,7 @@ import {
   SchemaGetter,
   SemVer,
 } from "effect"
+import * as Cookies from "effect/http/Cookies"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -553,6 +554,51 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
         expect(Equal.equals(read, value)).toBe(true)
       }),
     ),
+  )
+
+  it.effect(
+    "a Schema.Cookie keeps its expiry, and a condition on it doesn't match a row that lost its own",
+    () =>
+      onEntity(Schema.Cookie, (rows, tableName) =>
+        Effect.gen(function* () {
+          const expires = new Date("2030-01-02T03:04:05.678Z")
+          const cookie = () => Cookies.makeCookieUnsafe("a", "b", { path: "/", expires })
+          yield* rows.put({ id: "a", f: cookie() }).asEffect()
+          const [row] = yield* rowsOf(tableName)
+          expect(row?.f?.M?.options?.M?.expires).toEqual({ S: expires.toISOString() })
+          const read = (yield* rows.get({ id: "a" })).f
+          expect(Cookies.isCookie(read)).toBe(true)
+          expect(read.options.expires).toEqual(expires)
+
+          // A condition on the cookie matches the row holding it.
+          yield* rows
+            .update({ id: "a" })
+            .set({ n: 1 })
+            .condition((t: any, { eq }: any) => eq(t.f, cookie()))
+            .asEffect()
+          // As 1.39.0 stored one, its expiry an empty map, it's a cookie with no expiry: the
+          // condition doesn't match it, where 1.39.0's matched it whatever its date had been.
+          yield* Effect.promise(() =>
+            raw.send(
+              new UpdateItemCommand({
+                TableName: tableName,
+                Key: { pk: row!.pk!, sk: row!.sk! },
+                UpdateExpression: "SET #f.#o.#e = :lost",
+                ExpressionAttributeNames: { "#f": "f", "#o": "options", "#e": "expires" },
+                ExpressionAttributeValues: { ":lost": { M: {} } },
+              }),
+            ),
+          )
+          const refused = yield* rows
+            .update({ id: "a" })
+            .set({ n: 2 })
+            .condition((t: any, { eq }: any) => eq(t.f, cookie()))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(refused._tag).toBe("ConditionalCheckFailed")
+          expect("expires" in (yield* rows.get({ id: "a" })).f.options).toBe(false)
+        }),
+      ),
   )
 
   it.effect("a Schema.HashSet: an empty one reads back, a non-empty one is refused at write", () =>
