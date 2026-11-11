@@ -4,7 +4,7 @@
  * named as stored; a segment that is a stored name is kept as it is, even where it's also another
  * property's own name; and from any node whose stored names aren't known, the rest is kept.
  */
-import { Schema, SchemaTransformation } from "effect"
+import { Schema, SchemaGetter, SchemaTransformation } from "effect"
 import { describe, expect, it } from "vitest"
 import { storedSegments } from "../src/internal/SchemaAccessors.js"
 
@@ -101,6 +101,42 @@ const CASES: ReadonlyArray<Case> = [
     ),
     ["amount"],
     ["amount"],
+  ],
+  [
+    "a struct whose step defaults a key its stored struct may leave out: kept",
+    Schema.Struct({ amount: Schema.optionalKey(Schema.Number) }).pipe(
+      Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+        decode: SchemaGetter.transform((value: { readonly amount?: number }) => ({
+          amount: value.amount ?? 0,
+        })),
+        encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+          amount: value.amount,
+        })),
+      }),
+    ),
+    ["amount"],
+    ["amount"],
+  ],
+  [
+    "a struct whose step renames a key it stores optional: kept, the step isn't run",
+    Schema.Struct({ am: Schema.optionalKey(Schema.Number) }).pipe(
+      Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+        decode: SchemaGetter.transform((value: { readonly am?: number }) => ({
+          amount: value.am ?? 0,
+        })),
+        encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+          am: value.amount,
+        })),
+      }),
+    ),
+    ["amount"],
+    ["amount"],
+  ],
+  [
+    "a struct naming a key JavaScript lists first: kept",
+    Schema.Struct({ a: Schema.Number, "0": Schema.Number }).pipe(Schema.encodeKeys({ a: "1" })),
+    ["a"],
+    ["a"],
   ],
 ]
 

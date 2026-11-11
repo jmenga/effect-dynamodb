@@ -833,6 +833,55 @@ describe("pathIsRequired", () => {
       ["City"],
       false,
     ],
+    // A key rename is taken only as `encodeKeys` builds it, by its shape: the model's functions are
+    // never run. A struct another transformation stores is one whose stored names aren't known. One
+    // of `encodeKeys`' shape stores each property's encoded form, so a key it requires is required
+    // whatever its functions do.
+    [
+      "a struct whose transformation defaults a key its stored struct may leave out",
+      Schema.Struct({ amount: Schema.optionalKey(Schema.Number) }).pipe(
+        Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+          decode: SchemaGetter.transform((value: { readonly amount?: number }) => ({
+            amount: value.amount ?? 0,
+          })),
+          encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+            amount: value.amount,
+          })),
+        }),
+      ),
+      ["amount"],
+      false,
+    ],
+    [
+      "a struct whose transformation renames a key it stores optional",
+      Schema.Struct({ am: Schema.optionalKey(Schema.Number) }).pipe(
+        Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+          decode: SchemaGetter.transform((value: { readonly am?: number }) => ({
+            amount: value.am ?? 0,
+          })),
+          encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+            am: value.amount,
+          })),
+        }),
+      ),
+      ["am"],
+      false,
+    ],
+    [
+      "a struct whose transformation has encodeKeys' shape, a key its stored struct requires",
+      Schema.Struct({ am: Schema.Number }).pipe(
+        Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+          decode: SchemaGetter.transform((value: { readonly am: number }) => ({
+            amount: value.am,
+          })),
+          encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+            am: value.amount,
+          })),
+        }),
+      ),
+      ["am"],
+      true,
+    ],
     [
       "below a struct with a decoding default",
       Schema.Struct({

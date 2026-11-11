@@ -1316,105 +1316,67 @@ interface KeyRenames {
 const keyRenamesFound = new WeakMap<SchemaAST.Objects, KeyRenames | null>()
 
 /**
- * The key renames of a struct whose one encoding step only renames its keys, as
- * `Schema.encodeKeys` builds it: properties alone, encoded to a struct of as many by a step of two
- * plain functions. Effect keeps the mapping inside those functions, so they're asked: each
- * property is given a marker of its own, and the step renames keys when what it encodes holds each
- * marker once, under a property of the stored struct, and what it decodes from that holds each
- * back under its own name. `undefined` for anything else: a node whose stored names aren't known.
+ * The key renames of a struct `Schema.encodeKeys` built, seen by its shape alone: the struct's one
+ * encoding step is a transformation of two plain functions, to a bare struct of as many
+ * properties, whose `i`-th property holds `SchemaAST.toEncoded` of the struct's `i`-th (the very
+ * node `encodeKeys` stores, optionality included), under the name it's stored by. `encodeKeys`
+ * builds the stored struct property by property in the struct's own order, so the `i`-th stored
+ * name is the `i`-th property's; a name JavaScript orders first as an array index (`"0"`) could
+ * break that order, so a struct naming one isn't taken.
+ *
+ * Nothing the model wrote is run: the step's functions are never called. A struct of any other
+ * shape (a transformation that defaults, drops or adds a key, stores a key optional the struct
+ * requires, or anything else) is `undefined`, a node whose stored names aren't known, so a path
+ * below it is sent as written and a removal below it isn't judged (#238). A transformation of
+ * exactly that shape is read as the rename it has the shape of: a stored property is then the
+ * encoded form of its own, so a removal of a key the stored struct requires leaves a row no read
+ * decodes, whatever the functions do.
  */
 const keyRenamesOf = (ast: SchemaAST.Objects): KeyRenames | undefined => {
   const found = keyRenamesFound.get(ast)
   if (found !== undefined) return found ?? undefined
-  const renames = probeKeyRenames(ast)
+  const renames = declaredKeyRenames(ast)
   keyRenamesFound.set(ast, renames ?? null)
   return renames
 }
 
-const isMapValue = (value: unknown): value is globalThis.Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value)
+/** A name JavaScript lists before the others, as it does an array index. */
+const INDEX_NAME = /^(?:0|[1-9]\d*)$/
 
-const probeKeyRenames = (ast: SchemaAST.Objects): KeyRenames | undefined => {
+const declaredKeyRenames = (ast: SchemaAST.Objects): KeyRenames | undefined => {
   const [link, ...more] = ast.encoding ?? []
   if (link === undefined || more.length > 0 || ast.indexSignatures.length > 0) return undefined
   const to = link.to
   if (!SchemaAST.isObjects(to) || !bare(to) || to.indexSignatures.length > 0) return undefined
   const step = link.transformation as {
     readonly _tag: string
-    readonly encode?: { readonly _tag?: string; readonly transform?: (input: unknown) => unknown }
-    readonly decode?: { readonly _tag?: string; readonly transform?: (input: unknown) => unknown }
+    readonly encode?: { readonly _tag?: string }
+    readonly decode?: { readonly _tag?: string }
   }
   if (
     step._tag !== "Transformation" ||
     step.encode?._tag !== "Transform" ||
-    step.decode?._tag !== "Transform" ||
-    typeof step.encode.transform !== "function" ||
-    typeof step.decode.transform !== "function"
+    step.decode?._tag !== "Transform"
   ) {
     return undefined
   }
-  const names = ast.propertySignatures.map((property) => property.name)
-  const storedNames = new Set(to.propertySignatures.map((property) => property.name))
-  if (
-    names.length === 0 ||
-    names.length !== storedNames.size ||
-    !names.every((name) => typeof name === "string") ||
-    ![...storedNames].every((name) => typeof name === "string")
-  ) {
-    return undefined
-  }
-  const marked = (keys: ReadonlyArray<string>, mark: (key: string) => object) => {
-    const value: globalThis.Record<string, unknown> = {}
-    for (const key of keys) {
-      Object.defineProperty(value, key, {
-        value: mark(key),
-        enumerable: true,
-        writable: true,
-        configurable: true,
-      })
-    }
-    return value
-  }
-  const markers = new Map((names as ReadonlyArray<string>).map((name) => [name, {}]))
-  const ownerOf = new Map([...markers].map(([name, marker]) => [marker as unknown, name]))
-  let encoded: unknown
-  try {
-    encoded = step.encode.transform(marked(names as ReadonlyArray<string>, (n) => markers.get(n)!))
-  } catch {
-    return undefined
-  }
-  if (!isMapValue(encoded)) return undefined
-  const keys = Reflect.ownKeys(encoded)
-  if (keys.length !== names.length) return undefined
+  const own = ast.propertySignatures
+  const stored = to.propertySignatures
+  if (own.length === 0 || own.length !== stored.length) return undefined
   const storedName = new Map<string, string>()
-  for (const key of keys) {
-    if (typeof key !== "string" || !storedNames.has(key)) return undefined
-    const owner = ownerOf.get(encoded[key])
-    if (owner === undefined || storedName.has(owner)) return undefined
-    storedName.set(owner, key)
-  }
-  // And back: what's stored under each name is read as the property it was written for.
-  const byStored = new Map([...storedName].map(([name, stored]) => [stored, name]))
-  let decoded: unknown
-  try {
-    decoded = step.decode.transform(
-      marked([...byStored.keys()], (s) => markers.get(byStored.get(s)!)!),
-    )
-  } catch {
-    return undefined
-  }
-  if (!isMapValue(decoded) || Reflect.ownKeys(decoded).length !== names.length) return undefined
-  for (const [name, marker] of markers) {
-    if (!Object.hasOwn(decoded, name) || decoded[name] !== marker) return undefined
+  const storedNames = new Set<string>()
+  for (const [i, property] of own.entries()) {
+    const held = stored[i]!
+    if (typeof property.name !== "string" || typeof held.name !== "string") return undefined
+    if (INDEX_NAME.test(property.name) || INDEX_NAME.test(held.name)) return undefined
+    if (held.type !== SchemaAST.toEncoded(property.type)) return undefined
+    if (storedNames.has(held.name)) return undefined
+    storedNames.add(held.name)
+    storedName.set(property.name, held.name)
   }
   return {
     storedName,
-    holding: new Map(
-      ast.propertySignatures.map((property) => [
-        storedName.get(property.name as string)!,
-        property,
-      ]),
-    ),
+    holding: new Map(own.map((property) => [storedName.get(property.name as string)!, property])),
   }
 }
 
