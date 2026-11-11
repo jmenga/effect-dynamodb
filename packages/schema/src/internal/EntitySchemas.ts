@@ -833,17 +833,40 @@ const isTolerantLeaf = (schema: Schema.Top): boolean => {
  *
  * `plainForm` also takes what a mutation's plain state holds for that domain (see `plainStateForms`),
  * asked before the stored side: a set held as a list is a domain value, even where what's stored is a list.
+ *
+ * `domainStored`: for a type side that takes anything (`takesAnything`), a value the transform can't
+ * read as stored is a domain value only where the transform stores it. `Unknown` takes another union
+ * member's value, or a `many` element its ref fetch changed; 1.39.0 read those through the member's
+ * own struct, or refused them.
  */
 const buildTolerantTransform = (
   schema: Schema.Top,
   domainFirst = false,
   plainForm?: Schema.Top,
+  domainStored = false,
 ): Schema.Top => {
   const typeSide = Schema.make<Schema.Top>(SchemaAST.toType(schema.ast))
   const codec = schema as unknown as Schema.Codec<any>
   const decodeWire = Schema.decodeUnknownOption(codec)
-  const validateDomain = Schema.decodeUnknownOption(typeSide as unknown as Schema.Codec<any>)
   const encodeDomain = Schema.encodeUnknownOption(codec)
+  const validateType = Schema.decodeUnknownOption(typeSide as unknown as Schema.Codec<any>)
+  // A transform's `encode` is the caller's own code, written for its domain values only.
+  const stores = (value: unknown): boolean => {
+    try {
+      return encodeDomain(value)._tag === "Some"
+    } catch {
+      return false
+    }
+  }
+  const validateDomain = (value: unknown): Option.Option<unknown> => {
+    const typed = validateType(value)
+    return domainStored &&
+      typed._tag === "Some" &&
+      decodeWire(value)._tag === "None" &&
+      !stores(typed.value)
+      ? Option.none()
+      : typed
+  }
   const bigintDomain = SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
   const decodePlain =
     plainForm === undefined
@@ -1952,6 +1975,15 @@ const acceptingDomainForm = (declaration: Schema.Top): Schema.Top =>
 const acceptingPlainForm = (declaration: Schema.Top): Schema.Top =>
   buildTolerantTransform(declaration, true, declaration)
 
+/**
+ * A type side whose own check takes what isn't the transform's: `Unknown`, `Any`, or a declaration
+ * with nothing inside it (`Schema.declare`, `Schema.instanceOf`).
+ */
+const takesAnything = (type: SchemaAST.AST): boolean =>
+  SchemaAST.isUnknown(type) ||
+  SchemaAST.isAny(type) ||
+  (SchemaAST.isDeclaration(type) && type.typeParameters.length === 0)
+
 /** A tolerant substitute for a field a read makes `read` of. See `buildTolerantTransform`. */
 const tolerantLeaf = (
   schema: Schema.Top,
@@ -1968,6 +2000,8 @@ const tolerantLeaf = (
     opts?.plainStateForms && holdsDeclaration(type, new Set())
       ? Schema.make<Schema.Top>(type)
       : undefined,
+    // 1.39.0's own leaves (stored as a string or a number) take a domain value as they did.
+    !isLeafEncodingTransform(schema) && takesAnything(type),
   )
 }
 
