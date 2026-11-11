@@ -110,6 +110,9 @@ const entity = (retained: boolean) =>
   } as never) as any
 
 const cases: ReadonlyArray<readonly [name: string, apply: (u: any) => any]> = [
+  ["subtract from an attribute the row lacks", (u) => u.subtract({ m: 2 })],
+  ["append to an attribute the row lacks", (u) => u.append({ notes: ["x"] })],
+  ["subtract from a sparse map's entry the row lacks", (u) => u.subtract({ "data#x": 2 })],
   ["append to a string", (u) => u.append({ name: ["x"] })],
   ["subtract from a string", (u) => u.subtract({ name: 2 })],
   ["add a number to a string", (u) => u.add({ name: 2 })],

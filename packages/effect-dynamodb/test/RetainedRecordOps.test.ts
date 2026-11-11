@@ -1,11 +1,12 @@
 /**
  * A retained entity's update applies `.subtract()`, `.append()`, `.add()` and `.deleteFromSet()`
  * to the row it read, where any other entity's update sends them as an expression for DynamoDB to
- * apply (#236). Where DynamoDB refuses the expression (a value of another kind for any of them)
- * the retained update is refused the same way, with DynamoDB's words, after its read and with
- * nothing written. It used to append a string's characters, add a number to a string, and die on
- * the `NaN` a string less a number is. `connected.retained-record-ops.test.ts` holds the two paths
- * side by side on DynamoDB Local.
+ * apply (#236). Where DynamoDB refuses the expression (an attribute the row doesn't hold for
+ * `#f - :v` and `list_append`, a value of another kind for any of them) the retained update is
+ * refused the same way, with DynamoDB's words, after its read and with nothing written. It used
+ * to store `-v` or the operand alone, append a string's characters, add a number to a string,
+ * and die on the `NaN` a string less a number is. `connected.retained-record-ops.test.ts` holds
+ * the two paths side by side on DynamoDB Local.
  */
 
 import { it } from "@effect/vitest"
@@ -44,9 +45,13 @@ const definitions = () => {
   return { E, Main }
 }
 
+const ABSENT = "The provided expression refers to an attribute that does not exist in the item"
 const KIND = "An operand in the update expression has an incorrect data type"
 
 const refused: ReadonlyArray<readonly [name: string, says: string, apply: (u: any) => any]> = [
+  ["subtract from an attribute the row lacks", ABSENT, (u) => u.subtract({ m: 2 })],
+  ["append to an attribute the row lacks", ABSENT, (u) => u.append({ notes: ["x"] })],
+  ["subtract from a sparse map's entry the row lacks", ABSENT, (u) => u.subtract({ "data#x": 2 })],
   ["append to a string", KIND, (u) => u.append({ name: ["x"] })],
   ["subtract from a string", KIND, (u) => u.subtract({ name: 2 })],
   ["add a number to a string", KIND, (u) => u.add({ name: 2 })],

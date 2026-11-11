@@ -8085,29 +8085,27 @@ const makeImpl = <
           }
         }
         // `.subtract()` and `.append()` are `SET #f = #f - :v` and `SET #f = list_append(#f, :v)`
-        // when sent: DynamoDB refuses either on a value of another kind, and writes nothing.
-        // Applied here, they're refused the same way, so a retained entity's update ends as any
-        // other entity's (#236). It used to append to a string its characters.
+        // when sent: DynamoDB refuses either on a row without the attribute, or holding a value
+        // of another kind, and writes nothing. Applied here, they're refused the same way, so a
+        // retained entity's update ends as any other entity's (#236). It used to store `-v` or
+        // the operand alone, and append to a string its characters.
         if (uState.subtract) {
           for (const [attr, val] of Object.entries(uState.subtract)) {
             const [holder, key] = slot(attr)
             const before = held(holder, key)
-            const refused = expressionRefusal(
-              before,
-              before === undefined || typeof before === "number",
-            )
+            const refused = expressionRefusal(before, typeof before === "number")
             if (refused !== undefined) return yield* refused
-            hold(holder, key, ((before as number | undefined) ?? 0) - val)
+            hold(holder, key, (before as number) - val)
           }
         }
         if (uState.append) {
           for (const attr of Object.keys(uState.append)) {
             const [holder, key] = slot(attr)
             const before = held(holder, key)
-            const refused = expressionRefusal(before, before === undefined || Array.isArray(before))
+            const refused = expressionRefusal(before, Array.isArray(before))
             if (refused !== undefined) return yield* refused
             hold(holder, key, [
-              ...((before as Array<unknown> | undefined) ?? []),
+              ...(before as Array<unknown>),
               ...(operands.append[attr] as ReadonlyArray<unknown>),
             ])
           }
