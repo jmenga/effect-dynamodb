@@ -405,7 +405,7 @@ export const retainedEntryRemovalsSuite = (open: OpenTable) => {
                 expect(captured.sent.length).toBe(was.sent.length)
                 expect([...fields]).toEqual(["transactWriteItems.TransactItems.1.Put.Item.sr.M.a"])
                 expect({ ...captured, rows: [], sent: [] }).toEqual({ ...was, rows: [], sent: [] })
-                expect(captured.rows.filter((_, i) => i !== at)).toEqual(
+                expect(captured.rows.filter((_: unknown, i: number) => i !== at)).toEqual(
                   was.rows.filter((_: unknown, i: number) => i !== snapshotOf(was.rows)),
                 )
               }),
