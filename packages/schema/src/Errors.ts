@@ -294,6 +294,12 @@ export type AggregateTransactionOverflowFields = {
    * committed (the root is in the first group), which its `message` says.
    */
   readonly operation?: "create" | "update" | undefined
+  /**
+   * The group's rows under the sort key text published 1.40.0 composed for an `entity:` edge under
+   * `escapeKeys: true`, which the write deletes in its own transaction (#241). Present only when the
+   * group fits without them: `db.tables.<Table>.rekey()` moves them, and the write then fits.
+   */
+  readonly previousKeyText?: number | undefined
   /** DynamoDB's rejection, when the overflow was diagnosed from it. */
   readonly cause?: unknown
 }
@@ -307,14 +313,20 @@ const aggregateTransactionOverflowMessage = (
     `Aggregate "${fields.aggregate}": the transaction of sub-aggregate "${fields.subgraph}" ` +
     `holds ${fields.itemCount} items, over DynamoDB's limit of ${fields.limit} for one ` +
     "transaction, and DynamoDB rejected it."
-  if (committed.length === 0) return `${head} Nothing was written.`
+  const previous =
+    fields.previousKeyText === undefined
+      ? ""
+      : ` The group holds ${fields.previousKeyText} row${fields.previousKeyText === 1 ? "" : "s"} ` +
+        "under the previous key text, which the write deletes in the same transaction; without " +
+        "them it fits. Run `db.tables.<Table>.rekey()` to move them, then write again."
+  if (committed.length === 0) return `${head} Nothing was written.${previous}`
   const already =
     ` Each sub-aggregate is its own transaction, and earlier ones of this write were ` +
     `already committed: ${committed.map((name) => `"${name}"`).join(", ")}.`
   return fields.operation === "create"
     ? `${head}${already} The root may be among them, so a retried create fails its root ` +
         "guard (ConditionalCheckFailed): update or delete the partial aggregate instead."
-    : `${head}${already}`
+    : `${head}${already}${previous}`
 }
 
 /**

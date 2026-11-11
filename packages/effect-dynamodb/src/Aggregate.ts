@@ -311,8 +311,19 @@ interface ResolvedNode {
    * are read from. These are the pre-#133 encoders, kept separate from
    * {@link attrEncoders} so that putting a nested value into its wire form can
    * never change a composed key (see {@link buildKeyAttrEncoders}).
+   *
+   * An `entity:` edge with a declared sort key whose composite the entity's model encodes (#241,
+   * DESIGN.md §11 "An `entity:` edge's sort key"): under `escapeKeys: true` none, so the key is
+   * composed from the element's own values as a plain edge's is; under `false` the entity model's,
+   * as up to 1.40.0.
    */
   readonly keyAttrEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  /**
+   * Such an edge only: the encoders of the composition the other setting reads its sort key with
+   * (the entity model's under `escapeKeys: true`, none under `false`). `update` deletes a row read
+   * under 1.40.0's escaped text with its group's write, and `rekey` looks for a row there too.
+   */
+  readonly otherCompositionEncoders?: Record<string, (value: unknown) => unknown> | undefined
   /**
    * Declared sort-key composites for a `many` edge (`Aggregate.many(..., { sk })`).
    * When present these are authoritative: they replace the ref-identifier
@@ -1760,6 +1771,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       edges: config.edges,
       parentFields: schemaFields,
       resolveRef,
+      escapeKeys: config.schema.escapeKeys === true,
       keyAttributes: [
         config.pk.field,
         ...(config.collection.index === undefined || config.collection.sk === undefined
@@ -2462,18 +2474,24 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
   /**
    * Where a row may be under the partition's old text: at the sort key the other setting composes,
-   * or the current one, where 1.37.0 and 1.38.0 wrote it (its partition key unescaped, its sort key escaped).
-   * Under a partition whose text didn't change, the current sort key is where the row belongs.
+   * at the one the other composition of an `entity:` edge's sort key composes (`skElse`, #241), or
+   * the current one, where 1.37.0 and 1.38.0 wrote it (its partition key unescaped, its sort key
+   * escaped). Under a partition whose text didn't change, the current sort key is where the row
+   * belongs.
    */
   const oldPosition = (
     pk: string,
     pkNow: string,
     skOther: string,
+    skElse: string | undefined,
     sk: string,
     storedAt: ReadonlyMap<string, Record<string, unknown>>,
     otherKind: (pk: string) => string | undefined,
   ): { readonly pk: string; readonly sk: string } => {
     if (storedAt.has(positionOf(pk, skOther))) return { pk, sk: skOther }
+    if (skElse !== undefined && skElse !== sk && storedAt.has(positionOf(pk, skElse))) {
+      return { pk, sk: skElse }
+    }
     if (storedAt.has(positionOf(pk, sk))) return { pk, sk: pk === pkNow ? skOther : sk }
     // A sort key holding a numeric composite's other kind's text. Looked for only for a row at
     // neither key: one at its current key under the other kind's text too would have been read
@@ -2874,6 +2892,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             from ?? pkValue,
             pkValue,
             otherSortKey(config.schema, item, sk),
+            otherCompositionSortKey(config.schema, item),
             sk,
             storedAt,
             (pk) => item.otherKindSortKey?.(sortKeysIn(pk, sk)),
@@ -2975,7 +2994,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const assembledOld = { ...(current as object) } as Record<string, unknown>
       const assembledNew = { ...(decoded as object) } as Record<string, unknown>
 
-      // 4. Decompose both old and new
+      // 4. Decompose both old and new. Two items composing one sort key are judged below, over the
+      //    groups this write sends: rows stored under two keys can compose one now (#241), and a
+      //    group the write leaves alone keeps them.
       const oldGroups = yield* decomposeAggregate(
         assembledOld,
         rootNode,
@@ -2983,6 +3004,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         rootEncoders,
         aggregateName,
         config.schema,
+        undefined,
+        "keep",
       )
       const newGroups = yield* decomposeAggregate(
         assembledNew,
@@ -2992,6 +3015,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         aggregateName,
         config.schema,
         { present: true, value: written, update: true },
+        "keep",
       )
 
       // 5. Diff at the ITEM (primary-key) level, not just the group level.
@@ -3013,6 +3037,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
           break
         }
       }
+      /** Whether the write sends group `name`: the diff below writes exactly these. */
+      const groupChanged = (name: string): boolean => {
+        const oldGroup = oldGroupMap.get(name)
+        const newGroup = newGroupMap.get(name)
+        return (
+          contextChanged ||
+          oldGroup === undefined ||
+          newGroup === undefined ||
+          !deepEqualGroups(oldGroup, newGroup)
+        )
+      }
+      yield* refuseSharedSortKeys(
+        newGroups.flatMap((group) => group.items),
+        config.schema,
+        aggregateName,
+        (item) => groupChanged(item.transactionGroup),
+      )
 
       // 6. Build the full new + old DynamoDB item sets (with composed keys). The
       //    collection SK and list keys are mirror attributes, never the (pk, sk)
@@ -3027,6 +3068,50 @@ const makeAggregate = <TSchema extends Schema.Top>(
         (item.sk as { S?: string } | undefined)?.S ?? ""
 
       const existingCreated = new Map(readExistingCreated(allItems))
+
+      // Under `escapeKeys: true`, the rows read under the sort key text 1.40.0 composed for an
+      // element of an `entity:` edge (#241, DESIGN.md §11 "An `entity:` edge's sort key"), by the
+      // group that writes the element: its write deletes them in the same transaction, and the
+      // element's row keeps what such a row keeps across an update (its `created`, carried as a
+      // row at the element's key would be). A text an element composes now is that element's row.
+      const previousRows = new Map<string, Array<string>>()
+      if (config.schema.escapeKeys === true) {
+        const read = new Map<string, Record<string, unknown>>()
+        for (const item of allItems) {
+          if (typeof item.sk === "string") read.set(item.sk, item)
+        }
+        const composedNow = new Set(oldDynamo.flatMap((group) => group.items.map(skOf)))
+        const movedTo = new Map<string, Array<{ item: DecomposedItem; from: string }>>()
+        oldGroups.forEach((group, g) => {
+          group.items.forEach((item, i) => {
+            const from = otherCompositionSortKey(config.schema, item)
+            if (from === undefined || composedNow.has(from)) return
+            if (read.get(from)?.__edd_e__ !== item.entityType) return
+            const to = skOf(oldDynamo[g]!.items[i]!)
+            previousRows.set(group.name, [...(previousRows.get(group.name) ?? []), from])
+            movedTo.set(to, [...(movedTo.get(to) ?? []), { item, from }])
+          })
+        })
+        for (const [to, moved] of movedTo) {
+          if (existingCreated.has(to)) continue
+          // Two rows read whose values compose one key: the one the new value holds, if one is.
+          const kept =
+            moved.length === 1
+              ? moved
+              : moved.filter(({ item }) =>
+                  newGroups.some((group) =>
+                    group.items.some(
+                      (other) =>
+                        sortKeyOf(config.schema, other) === to &&
+                        deepEqual(other.attributes, item.attributes),
+                    ),
+                  ),
+                )
+          if (kept.length !== 1) continue
+          const created = existingCreated.get(kept[0]!.from)
+          if (created !== undefined) existingCreated.set(to, created)
+        }
+      }
       // Each row's declared `updated` as the mutation found it: if it changed it, it's the caller's.
       const updatedBefore = new Map<string, unknown>()
       if (stampFields?.updatedAt) {
@@ -3083,24 +3168,29 @@ const makeAggregate = <TSchema extends Schema.Top>(
       }> = []
       const groupNames = new Set<string>([...newGroupMap.keys(), ...oldGroupMap.keys()])
       for (const name of groupNames) {
-        const oldGroup = oldGroupMap.get(name)
-        const newGroup = newGroupMap.get(name)
-        const changed =
-          contextChanged ||
-          oldGroup === undefined ||
-          newGroup === undefined ||
-          !deepEqualGroups(oldGroup, newGroup)
-        if (!changed) continue
+        if (!groupChanged(name)) continue
 
         const puts = newItemsByGroup.get(name) ?? []
-        const deletes = (oldItemsByGroup.get(name) ?? [])
-          .filter((item) => !survivingSks.has(skOf(item)))
-          .map((item) => ({
-            [config.pk.field]: item[config.pk.field]!,
-            sk: item.sk!,
-          }))
+        // Each row once: two old items can compose one key (rows stored under two keys, #241).
+        const deleteSks = new Set(
+          (oldItemsByGroup.get(name) ?? [])
+            .map((item) => skOf(item))
+            .filter((sk) => !survivingSks.has(sk)),
+        )
+        // A row read under the text 1.40.0 composed goes in the same transaction (#241).
+        const previous = (previousRows.get(name) ?? []).filter((sk) => !survivingSks.has(sk))
+        for (const sk of previous) deleteSks.add(sk)
+        const deletes = [...deleteSks].map((sk) => ({
+          [config.pk.field]: { S: pkValue } as AttributeValue,
+          sk: { S: sk } as AttributeValue,
+        }))
         if (puts.length === 0 && deletes.length === 0) continue
-        groupWrites.push({ group: name, puts, deletes })
+        groupWrites.push({
+          group: name,
+          puts,
+          deletes,
+          ...(previous.length > 0 && { previous: previous.length }),
+        })
       }
 
       // With `ownsRows`, every row of its types in the partition is the aggregate's (DESIGN.md §7
@@ -4704,10 +4794,13 @@ interface ResolveNodeArgs {
   readonly ownDiscriminator?: Record<string, unknown> | undefined
   readonly attrEncoders?: AttrEncoders | undefined
   readonly keyAttrEncoders?: AttrEncoders | undefined
+  readonly otherCompositionEncoders?: AttrEncoders | undefined
   readonly skComposite?: ReadonlyArray<string> | undefined
   readonly refIdentifierField?: string | undefined
   readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
   readonly dispatch?: ReadonlyArray<string> | undefined
+  /** The schema's `escapeKeys`: an `entity:` edge's sort key composition follows it. */
+  readonly escapeKeys?: boolean | undefined
 }
 
 /**
@@ -4859,6 +4952,17 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           parentField === undefined || arrayElement !== undefined
             ? undefined
             : extractKeyedValue(parentField)
+        // Sort-key composites kept reading the pre-#133 encoding (the entity model's top-level
+        // transforms) through 1.40.0, so no stored key is re-spelled. Under `escapeKeys: true` a
+        // declared sort key is composed from the element's own values, as a plain edge's is (#241):
+        // the entity's encoders ran over the element's field of the same name, whatever that
+        // field is. `rekey` moves the rows; `update` moves a group's when it writes it.
+        const entityKeyEncoders = buildKeyAttrEncoders(entityFields)
+        const recomposed =
+          edge.entity !== undefined &&
+          edge.sk?.composite !== undefined &&
+          edge.sk.composite.some((path) => Object.hasOwn(entityKeyEncoders, path.split(".")[0]!))
+        const escaped = args.escapeKeys === true
         children.push(
           resolveNode({
             fieldName: field,
@@ -4885,9 +4989,10 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
               resolveRef,
               keyedValue !== undefined && edge.entity === undefined,
             ),
-            // Sort-key composites keep reading the pre-#133 encoding (the entity
-            // model's top-level transforms), so no stored key is re-spelled.
-            keyAttrEncoders: buildKeyAttrEncoders(entityFields),
+            keyAttrEncoders: recomposed && escaped ? {} : entityKeyEncoders,
+            ...(recomposed && {
+              otherCompositionEncoders: escaped ? entityKeyEncoders : {},
+            }),
             // Declared sort-key composites, authoritative when present (#103).
             skComposite: edge.sk?.composite,
             refIdentifierField: edge.entity
@@ -4934,6 +5039,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
           // fields; its child edges get their own encoders via recursion.
           attrEncoders: buildAttrEncoders(subFields, resolveRef),
+          escapeKeys: args.escapeKeys,
         })
         children.push(subChildren)
       }
@@ -4965,6 +5071,9 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(args.dispatch !== undefined && { dispatch: args.dispatch }),
     attrEncoders,
     ...(keyAttrEncoders !== undefined && { keyAttrEncoders }),
+    ...(args.otherCompositionEncoders !== undefined && {
+      otherCompositionEncoders: args.otherCompositionEncoders,
+    }),
   }
 }
 
@@ -6049,6 +6158,13 @@ interface DecomposedItem {
    */
   readonly skCompositesOther: () => ReadonlyArray<string>
   /**
+   * An element of an `entity:` edge whose sort key the setting composes from its own values
+   * (`ResolvedNode.otherCompositionEncoders`, #241): the sort key composites of the other
+   * composition — under `escapeKeys: true` the text 1.40.0 composed in this setting, under `false`
+   * the text `escapeKeys: true` composes. `undefined` when the element gives none.
+   */
+  readonly skCompositesOtherComposition?: (() => ReadonlyArray<string> | undefined) | undefined
+  /**
    * A `many` element's sort key with some numeric values as the other kind, in either setting's
    * text, that is one of `targets`: a field that stored both composed each value's own kind's text
    * (`EDD-9128`), and `rekey` looks for a row there too. Found value by value
@@ -6120,6 +6236,12 @@ const decomposeAggregate = (
    * decoded: a custom `decompose` is handed it read as on 1.39.0. Undefined for what was read.
    */
   written?: Written | undefined,
+  /**
+   * `"keep"`: two items composing one sort key aren't refused here. `update` judges that itself
+   * ({@link refuseSharedSortKeys}) over the groups it writes, since rows stored under two keys can
+   * compose one now (#241).
+   */
+  sharedKeys?: "keep" | undefined,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
@@ -6184,32 +6306,7 @@ const decomposeAggregate = (
       )
     }
 
-    // Two items composing the same sort key are two writes to one row. DynamoDB
-    // rejects the whole TransactWriteItems with a ValidationException ("Transaction
-    // request cannot include multiple operations on one item") that names no edge,
-    // and carries no CancellationReasons — so `writeTransactionGroups` cannot
-    // decode it and the collision reaches the caller as an opaque client error.
-    // Catch it here, where the edge that produced it is still known (#103).
-    const seen = new Map<string, DecomposedItem>()
-    for (const item of items) {
-      const sk = composeKey(schema, item.entityType, [...item.skComposites])
-      const prior = seen.get(sk)
-      if (prior !== undefined) {
-        const hint =
-          prior.member === item.member
-            ? ` Give the "${item.member}" edge a declared sort key naming attributes that differ` +
-              ` between its elements: ${item.member}: Aggregate.many({ …, sk: { composite: [...] } }).`
-            : ""
-        return yield* new AggregateDecompositionError({
-          aggregate: aggregateName,
-          member: item.member,
-          reason:
-            `"${prior.member}" and "${item.member}" both compose the sort key "${sk}", ` +
-            `so one would overwrite the other.${hint}`,
-        })
-      }
-      seen.set(sk, item)
-    }
+    if (sharedKeys !== "keep") yield* refuseSharedSortKeys(items, schema, aggregateName)
 
     // Group by transaction
     const groups = new Map<string, DecomposedItem[]>()
@@ -6221,6 +6318,49 @@ const decomposeAggregate = (
 
     return [...groups.entries()].map(([name, groupItems]) => ({ name, items: groupItems }))
   })
+
+/**
+ * Two items composing the same sort key are two writes to one row. DynamoDB rejects the whole
+ * TransactWriteItems with a ValidationException ("Transaction request cannot include multiple
+ * operations on one item") that names no edge, and carries no CancellationReasons — so
+ * `writeTransactionGroups` cannot decode it and the collision reaches the caller as an opaque
+ * client error. Caught where the edge that produced it is still known (#103).
+ *
+ * `written`: the items a write sends; a pair neither of which it sends is left (`update` over rows
+ * stored under two keys that compose one now, #241).
+ */
+const refuseSharedSortKeys = (
+  items: ReadonlyArray<DecomposedItem>,
+  schema: DynamoSchemaModule.DynamoSchema,
+  aggregateName: string,
+  written?: (item: DecomposedItem) => boolean,
+): Effect.Effect<void, AggregateDecompositionError> => {
+  const seen = new Map<string, Array<DecomposedItem>>()
+  for (const item of items) {
+    const sk = composeKey(schema, item.entityType, [...item.skComposites])
+    const prior = (seen.get(sk) ?? []).find(
+      (other) => written === undefined || written(other) || written(item),
+    )
+    if (prior !== undefined) {
+      const hint =
+        prior.member === item.member
+          ? ` Give the "${item.member}" edge a declared sort key naming attributes that differ` +
+            ` between its elements: ${item.member}: Aggregate.many({ …, sk: { composite: [...] } }).`
+          : ""
+      return Effect.fail(
+        new AggregateDecompositionError({
+          aggregate: aggregateName,
+          member: item.member,
+          reason:
+            `"${prior.member}" and "${item.member}" both compose the sort key "${sk}", ` +
+            `so one would overwrite the other.${hint}`,
+        }),
+      )
+    }
+    seen.set(sk, [...(seen.get(sk) ?? []), item])
+  }
+  return Effect.void
+}
 
 /**
  * Merge context values into decomposed item attributes.
@@ -6671,6 +6811,36 @@ const ownDiscriminatorEntries = (node: ResolvedNode): ReadonlyArray<readonly [st
     ? []
     : Object.entries(node.ownDiscriminator).filter(([, v]) => typeof v !== "function")
 
+/** A decomposed row's sort key; `undefined` for one its values can't compose. */
+const sortKeyOf = (
+  schema: DynamoSchemaModule.DynamoSchema,
+  item: DecomposedItem,
+): string | undefined => {
+  try {
+    return composeKey(schema, item.entityType, [...item.skComposites])
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * A decomposed row's sort key under the other composition of an `entity:` edge's sort key
+ * ({@link DecomposedItem.skCompositesOtherComposition}); `undefined` when it has none.
+ */
+const otherCompositionSortKey = (
+  schema: DynamoSchemaModule.DynamoSchema,
+  item: DecomposedItem,
+): string | undefined => {
+  try {
+    const composites = item.skCompositesOtherComposition?.()
+    return composites === undefined
+      ? undefined
+      : composeKey(schema, item.entityType, [...composites])
+  } catch {
+    return undefined
+  }
+}
+
 /** A node's own static discriminator values as {@link DiscriminatorValues}. */
 const ownDiscriminatorValues = (
   node: ResolvedNode,
@@ -6833,6 +7003,19 @@ const decomposeNode = (
 
         const values = yield* manyEdgeSkComposites(node, keyAttrs, aggregateName)
 
+        // The values the other composition reads (#241): what 1.40.0 composed under either
+        // setting, or, under `false`, what `escapeKeys: true` composes. Read only by `update` and
+        // `rekey`, and a value it can't place gives none.
+        const otherEncoders = node.otherCompositionEncoders
+        const otherValues = (): ReadonlyArray<unknown> | undefined => {
+          if (otherEncoders === undefined) return undefined
+          const from = { ...(elem as Record<string, unknown>) }
+          applyNodeAttrEncoders(from, otherEncoders)
+          withContext(from, contextValues.key)
+          return declaredSkComposites(node, from)
+        }
+        const escaped = schema.escapeKeys === true
+
         items.push({
           entityType: node.entityType,
           attributes: attrs,
@@ -6841,10 +7024,29 @@ const decomposeNode = (
             ...parentDiscriminators.current,
             ...values.map((value) => KeyComposer.keyValueText(schema, value, schema.casing)),
           ],
+          // Under `escapeKeys: true` an `entity:` edge's rows in the other setting's text were
+          // composed by 1.40.0's composition: every release composed it under `false`.
           skCompositesOther: () => [
             ...parentDiscriminators.other(),
-            ...values.map((value) => otherKeyText(schema, value)),
+            ...((escaped ? otherValues() : undefined) ?? values).map((value) =>
+              otherKeyText(schema, value),
+            ),
           ],
+          ...(otherEncoders !== undefined && {
+            skCompositesOtherComposition: () => {
+              const other = otherValues()
+              if (other === undefined) return undefined
+              return escaped
+                ? [
+                    ...parentDiscriminators.current,
+                    ...other.map((value) => KeyComposer.keyValueText(schema, value, schema.casing)),
+                  ]
+                : [
+                    ...parentDiscriminators.other(),
+                    ...other.map((value) => otherKeyText(schema, value)),
+                  ]
+            },
+          }),
           otherKindSortKey: (targets) => {
             const slots = values.map((_, i) => String(i))
             const settings: ReadonlyArray<
@@ -6993,6 +7195,23 @@ const manyEdgeSkComposites = (
       storedNaNKeyForm(fieldAtPath(node.ownFields, declared[i]!), value),
     )
   })
+
+/**
+ * A declared sort key's composite values off `attrs`, as {@link manyEdgeSkComposites} reads them;
+ * `undefined` for one it would refuse (missing, null or not a scalar).
+ */
+const declaredSkComposites = (
+  node: ResolvedNode,
+  attrs: Record<string, unknown>,
+): ReadonlyArray<unknown> | undefined => {
+  const declared = node.skComposite
+  if (declared === undefined) return undefined
+  const values = declared.map((path) => readCompositePath(attrs, path))
+  if (values.some((value) => value == null || !isScalarComposite(value))) return undefined
+  return values.map((value, i) =>
+    storedNaNKeyForm(fieldAtPath(node.ownFields, declared[i]!), value),
+  )
+}
 
 /**
  * Extract ref identifier values from an item's attributes for use as SK composites.
@@ -7491,6 +7710,8 @@ type WriteGroups = ReadonlyArray<{
   group: string
   puts: ReadonlyArray<Record<string, AttributeValue>>
   deletes: ReadonlyArray<Record<string, AttributeValue>>
+  /** How many of `deletes` are rows read under the sort key text 1.40.0 composed (#241). */
+  previous?: number | undefined
 }>
 
 /**
@@ -7606,6 +7827,11 @@ function writeTransactionGroups(
               limit: diagnosis.limit,
               committed: already,
               operation: rootGuard !== undefined ? "create" : "update",
+              // Over only because of the rows it moves off 1.40.0's text: `rekey` moves them.
+              ...(group.previous !== undefined &&
+                diagnosis.count - group.previous <= diagnosis.limit && {
+                  previousKeyText: group.previous,
+                }),
               cause: original,
             })
           : diagnosedValidationError(diagnosis, original, {

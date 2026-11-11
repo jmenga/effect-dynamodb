@@ -341,27 +341,38 @@ export const keyedBy =
   }
 
 /** A `many` edge whose element is the class of an entity keyed by `lineId` of `keySchema`, given ids. */
-const idsKeyedBy = (keySchema: Schema.Top, id: unknown, given: unknown) => (): Shape => {
-  class Line extends Schema.Class<Line>("Line")({ lineId: keySchema as never, f: Schema.Number }) {}
-  const Lines = lines(
-    DynamoModel.configure(Line, { lineId: { identifier: true } } as never),
-    singleKey,
-  )
-  const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
-  return {
-    entities: { Lines },
-    make: (base) =>
-      aggregate(Model, base, {
-        lines: Aggregate.many({
-          entityType: "AggLine",
-          entity: Lines,
-          sk: { composite: ["lineId"] },
-        } as never),
-      }),
-    seed: [["Lines", { lineId: id, f: 5 }]],
-    input: { id: "a", lines: [given] },
+const idsKeyedBy =
+  (keySchema: Schema.Top, id: unknown, given: unknown, over?: DynamoSchema.DynamoSchema) =>
+  (): Shape => {
+    class Line extends Schema.Class<Line>("Line")({
+      lineId: keySchema as never,
+      f: Schema.Number,
+    }) {}
+    const Lines = lines(
+      DynamoModel.configure(Line, { lineId: { identifier: true } } as never),
+      singleKey,
+    )
+    const Model = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+    return {
+      entities: { Lines },
+      ...(over !== undefined && { schema: over }),
+      make: (base) =>
+        aggregate(
+          Model,
+          base,
+          {
+            lines: Aggregate.many({
+              entityType: "AggLine",
+              entity: Lines,
+              sk: { composite: ["lineId"] },
+            } as never),
+          },
+          over,
+        ),
+      seed: [["Lines", { lineId: id, f: 5 }]],
+      input: { id: "a", lines: [given] },
+    }
   }
-}
 
 const ISO = "2024-01-02T03:04:05.000Z"
 
@@ -435,10 +446,13 @@ const reviewed: Record<string, () => Shape> = {
   "one, an entity keyed by a number, the edge optional": keyedBy(Schema.Number, 5, 5, true),
   "one, an entity keyed by a bigint, the edge optional": keyedBy(Schema.BigInt, 5n, 5n, true),
   "one, an entity keyed by a string codec": keyedBy(Prefixed, "MiX", "MiX"),
+  // The edge's sort key is the entity's encoded `lineId`: its stored text with `escapeKeys` off,
+  // as 1.39.0 ran it, and its value's text with it on (#241).
   "many, ids of an entity keyed by a NumberFromString, given encoded strings": idsKeyedBy(
     Schema.NumberFromString,
     5,
     "5",
+    unescapedSchema,
   ),
   "many, ids of an entity keyed by a number, given numbers": idsKeyedBy(Schema.Number, 5, 5),
   "many, element declares the entity's field a string, given it and a lineId": () => {
