@@ -38,7 +38,7 @@ import { Effect, Schema, SchemaAST } from "effect"
 import type { CompressionRegistry } from "../Compression.js"
 import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
-import { storedFormOf } from "./StoredForm.js"
+import { storedFormOf, ZONE_MARKER, zoneEntriesWritten } from "./StoredForm.js"
 
 export { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./StoredForm.js"
 
@@ -231,58 +231,83 @@ const isPlainObject = (value: object): boolean => {
   return proto === Object.prototype || proto === null
 }
 
-/** Each of Effect's instances met in a value, with the map it's written as. */
-type Forms = Map<object, object>
+/** Each of Effect's instances met in a value, with what it's written as. */
+type Forms = Map<object, unknown>
+
+/** A named zone's map, holding `resolvedId`, as it's written ({@link zoneEntriesWritten}). */
+const zoneWritten = (value: object, entries: ReadonlyArray<readonly [string, unknown]>) => {
+  const written = zoneEntriesWritten(
+    entries,
+    Object.hasOwn(value, ZONE_MARKER),
+    (entry) => entry,
+    (name) => name,
+  )
+  return written === entries ? undefined : written
+}
 
 /**
- * Refuses what JSON can't hold, and says whether one of Effect's instances is in there, each of
- * which it records in `forms` with the map it's written as ({@link storedFormOf}). That map is
- * checked as any other value is, so what it still holds that JSON can't is refused where it is.
+ * What a value is written as: the value itself where it holds nothing to write otherwise, and a copy
+ * where it does, so `JSON.stringify` reads each property this read, once. Refuses what JSON can't
+ * hold. One of Effect's instances is written as the map a native write stores
+ * ({@link storedFormOf}), which is then written as any other value is, so what it still holds that
+ * JSON can't is refused where it is; a named zone's map holding `resolvedId` as 4.1.2 held it
+ * ({@link zoneEntriesWritten}). `forms` holds each instance met, with what it's written as.
  */
-const check = (value: unknown, path: string, stack: Set<object>, forms: Forms): boolean => {
+const written = (value: unknown, path: string, stack: Set<object>, forms: Forms): unknown => {
   switch (typeof value) {
     case "string":
     case "boolean":
-      return false
+      return value
     case "number":
       if (!Number.isFinite(value)) throw new NotJson(path, describe(value))
-      return false
+      return value
     case "object": {
-      if (value === null) return false
+      if (value === null) return value
       if (stack.has(value)) throw new NotJson(path, "a circular reference")
-      let instances = false
       if (Array.isArray(value)) {
         stack.add(value)
+        let copy: Array<unknown> | undefined
         for (let i = 0; i < value.length; i++) {
-          const element = value[i]
+          const element: unknown = value[i]
           if (element === undefined) throw new NotJson(`${path}[${i}]`, "undefined")
-          if (check(element, `${path}[${i}]`, stack, forms)) instances = true
+          const write = written(element, `${path}[${i}]`, stack, forms)
+          if (copy === undefined && write !== element) copy = value.slice(0, i)
+          copy?.push(write)
         }
         stack.delete(value)
-        return instances
+        return copy ?? value
       }
       if (!isPlainObject(value)) {
-        const form = forms.get(value) ?? storedFormOf(value)
+        if (forms.has(value)) return forms.get(value)
+        const form = storedFormOf(value)
         if (form === undefined) throw new NotJson(path, describe(value))
-        forms.set(value, form)
         stack.add(value)
-        check(form, path, stack, forms)
+        const write = written(form, path, stack, forms)
         stack.delete(value)
-        return true
+        forms.set(value, write)
+        return write
       }
       if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
         throw new NotJson(path, describe(value))
       }
       stack.add(value)
+      const entries: Array<readonly [string, unknown]> = []
+      let changed = false
       for (const key of Object.keys(value)) {
-        const v = (value as Record<string, unknown>)[key]
+        const v: unknown = (value as Record<string, unknown>)[key]
         // Omitted by JSON.stringify, as removeUndefinedValues omits it from a map.
         if (v === undefined) continue
         const at = IDENTIFIER.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`
-        if (check(v, at, stack, forms)) instances = true
+        const write = written(v, at, stack, forms)
+        if (write !== v) changed = true
+        entries.push([key, write])
       }
       stack.delete(value)
-      return instances
+      const zone = zoneWritten(value, entries)
+      if (zone === undefined && !changed) return value
+      const copy: Record<string, unknown> = Object.create(null)
+      for (const [key, write] of zone ?? entries) copy[key] = write
+      return copy
     }
     default:
       throw new NotJson(path, describe(value))
@@ -299,20 +324,12 @@ const check = (value: unknown, path: string, stack: Set<object>, forms: Forms): 
  * look-alikes a read rebuilds (a `Duration`, a `BigDecimal`, a zone, a cookie,
  * an address, ...), an `Option` or a `Result` is written as that map
  * ({@link storedFormOf}), as the map read back from a native row has always
- * been.
+ * been. A named zone's map holding `resolvedId` is written as 4.1.2 held it.
  *
  * @throws an `Error` naming the path (rooted at `root`) and the JS type.
  */
-export const stringifyStrict = (value: unknown, root = "value"): string => {
-  const forms: Forms = new Map()
-  if (!check(value, root, new Set(), forms)) return JSON.stringify(value)
-  // `JSON.stringify` has called `toJSON` by the time a replacer sees a value, so this reads the
-  // holder.
-  return JSON.stringify(value, function (this: Record<string, unknown>, key, written: unknown) {
-    const held = this[key]
-    return typeof held === "object" && held !== null ? (forms.get(held) ?? written) : written
-  })
-}
+export const stringifyStrict = (value: unknown, root = "value"): string =>
+  JSON.stringify(written(value, root, new Set(), new Map()))
 
 // ---------------------------------------------------------------------------
 // Pack / unpack

@@ -8,11 +8,11 @@ import { describe, expect, it } from "@effect/vitest"
 import { DateTime, Effect, Option, Result, Schema } from "effect"
 import * as DynamoModel from "../src/DynamoModel.js"
 import {
-  isKeptAsRead,
-  keepingAsRead,
-  resolvedZoneName,
+  rewrittenZoneId,
   storedFormOf,
+  storedZoneName,
   zonedIsoText,
+  zoneNameOf,
   zonesAsStored,
 } from "../src/internal/StoredForm.js"
 import * as KeyComposer from "../src/KeyComposer.js"
@@ -43,23 +43,23 @@ const madeAs412 = (resolving: string): DateTime.TimeZone => {
 const MARKER = "~effect/DateTime/TimeZone"
 const at = (zone: DateTime.TimeZone) => DateTime.makeZonedUnsafe(0, { timeZone: zone })
 
-describe("resolvedZoneName", () => {
-  it("is the name Intl resolves a 4.1.3 zone to, the name 4.1.2 gave it", () => {
-    expect(resolvedZoneName(madeAs413("Etc/UTC", "UTC"))).toBe("UTC")
-    expect(resolvedZoneName(madeAs413("Europe/London", "Europe/London"))).toBe("Europe/London")
+describe("storedZoneName", () => {
+  it("is a 4.1.3 zone's resolvedId, the name 4.1.2 gave it, and a 4.1.2 zone's id", () => {
+    expect(zoneNameOf(madeAs413("Etc/UTC", "UTC"))).toBe("UTC")
+    expect(zoneNameOf(madeAs413("Europe/London", "Europe/London"))).toBe("Europe/London")
+    expect(zoneNameOf(madeAs412("UTC"))).toBe("UTC")
+    expect(storedZoneName("Etc/UTC", "UTC")).toBe("UTC")
+    expect(storedZoneName("UTC", undefined)).toBe("UTC")
+    expect(storedZoneName(undefined, undefined)).toBeUndefined()
+    expect(zoneNameOf(DateTime.zoneMakeOffset(3_600_000))).toBeUndefined()
   })
 
-  it("is nothing for a zone stored as Effect holds it", () => {
-    expect(resolvedZoneName(madeAs412("UTC"))).toBeUndefined()
-    const map = { id: "UTC", resolvedId: "UTC", format: {}, [MARKER]: MARKER, _tag: "Named" }
-    expect(resolvedZoneName(map)).toBeUndefined()
-    const kept = keepingAsRead(madeAs413("Etc/UTC", "UTC"))
-    expect(isKeptAsRead(kept)).toBe(true)
-    expect(resolvedZoneName(kept)).toBeUndefined()
-    const other = madeAs413("Etc/UTC", "UTC") as unknown as { resolvedId: string }
-    other.resolvedId = "Europe/London"
-    expect(resolvedZoneName(other)).toBeUndefined()
-    expect(resolvedZoneName(DateTime.zoneMakeOffset(3_600_000))).toBeUndefined()
+  it("rewrites only a named zone's map holding resolvedId", () => {
+    expect(rewrittenZoneId("Named", "Etc/UTC", "UTC")).toBe("UTC")
+    expect(rewrittenZoneId("Named", "UTC", "UTC")).toBe("UTC")
+    expect(rewrittenZoneId("Named", "UTC", undefined)).toBeUndefined()
+    expect(rewrittenZoneId("Offset", "Etc/UTC", "UTC")).toBeUndefined()
+    expect(rewrittenZoneId("Named", 1, "UTC")).toBeUndefined()
   })
 
   it("names a zone the installed Effect makes from an alias as 4.1.2 did", () => {
@@ -85,9 +85,11 @@ describe("a 4.1.3 zone's stored forms are 4.1.2's", () => {
     )
   })
 
-  it("a zone read from a map holding resolvedId, packed as read", () => {
-    expect(JSON.stringify(storedFormOf(keepingAsRead(madeAs413("Etc/UTC", "UTC"))))).toBe(
-      `{"format":{},"id":"Etc/UTC","resolvedId":"UTC","${MARKER}":"${MARKER}","_tag":"Named"}`,
+  it("a zone carrying a resolvedId that isn't its id's resolution, under that resolvedId", () => {
+    const other = madeAs413("Etc/UTC", "UTC") as unknown as { resolvedId: string }
+    other.resolvedId = "Europe/London"
+    expect(JSON.stringify(storedFormOf(other as never))).toBe(
+      `{"format":{},"id":"Europe/London","${MARKER}":"${MARKER}","_tag":"Named"}`,
     )
   })
 

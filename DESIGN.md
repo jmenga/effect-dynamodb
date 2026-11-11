@@ -4971,7 +4971,7 @@ A real date then has to be accepted wherever a read date was. Under
 `DynamoModel.Packed`, `stringifyStrict` refused an instance and let the plain
 look-alike through, so a read date packed and a new one was refused; `JSON.stringify`
 would call its `toJSON` and store ISO text, which the declaration refuses on read.
-So `check` accepts a real `DateTime` and `stringifyStrict` stores it as `storedDate`
+So `written` accepts a real `DateTime` and `stringifyStrict` stores it as `storedDate`
 (`internal/StoredForm.ts`): the same keys, in the order DynamoDB Local hands the map back, so what's packed from
 a date a read returned doesn't move by a byte (`fixtures/stream-dates-1.39.0.json`,
 stored by the published 1.39.0, pins this). Real DynamoDB's map order isn't
@@ -5031,7 +5031,8 @@ or a `Result` couldn't be written in a packed struct, a packed `Schema.Unknown`,
 data or a snapshot state, though a native attribute stores each as a map and reads it
 back. `storedFormOf` (`internal/StoredForm.ts`, schema package) is the one function that
 says what packed storage writes for one of Effect's instances, and `stringifyStrict` is
-the one place that calls it, so every packed write takes it: entity fields, aggregate
+the one place that calls it (through `written`, which reads each property of the value
+once and writes what it read), so every packed write takes it: entity fields, aggregate
 edges, event data, snapshots and `StorageEncoding`. It's the map the marshaller stores:
 each enumerable property, its prototype's included, without a function, `undefined` or a
 decimal's cached normalized form (`isCachedNormal`, which `Marshaller.ts` imports from
@@ -5049,7 +5050,7 @@ full), measured against every map 1.39.0 stored for a look-alike, so a real inst
 packs to exactly the bytes 1.40.0 packed for the map a native read hands back for it
 (`fixtures/packed-lookalikes-1.40.0.json`, captured from the published 1.40.0, pins
 both that and every value 1.40.0 packed). A date keeps `storedDate`, which gives the
-same bytes. What JSON can't hold is left in place for `check` to refuse at its path: a
+same bytes. What JSON can't hold is left in place for `written` to refuse at its path: a
 `MacAddress`'s or a TLSA record's bytes, a `BigDecimal` or a `Duration` past 2^53, as
 1.40.0 refused the map of each. A packed look-alike reads back through
 `readingInstances` as the instance, as a native one does, and writing what was read
@@ -5067,9 +5068,9 @@ cycle, which it writes as a fresh decimal (`holdsCachedCycle` reads data descrip
 and calls no getter, so an item holding none is handled as it always was). Then
 `finishingInstances` looks through the marshalled output for a cookie's marker and a
 zone's. It writes the expiry of each of Effect's cookies (by prototype) as ISO text,
-where a `Date` marshals to an empty map, and a named zone's name as Effect 4.1.2 held it
-(below); it finds the source instance by descriptors, calls no getter, and touches
-nothing else. A typed cookie reads the text back as the `Date`
+where a `Date` marshals to an empty map, finding the cookie by descriptors and calling
+no getter; and a named zone's map as Effect 4.1.2 held it (below), decided on the map
+marshalling made. It touches nothing else. A typed cookie reads the text back as the `Date`
 (`cookieOptions`). Cookies are held to the write-back check like every kind but a
 date, comparing an expiry as the marshaller writes it (`optionsWriteAs`), so a cookie
 1.39.0 wrote with an expiry (an empty map), one holding properties of its own inside
@@ -5081,20 +5082,47 @@ became the name it was made from, unless `Intl` resolves that only in another ca
 4.1.2 the `id` was the resolved name and there was no `resolvedId`. So every named
 zone, native or packed, stored one more entry on 4.1.3, and a zone made from an alias
 (`Etc/UTC`, `GMT`, `Asia/Kolkata`, `US/Eastern`) stored another `id`, ISO text and key
-text: a consumer's stored bytes depended on the Effect patch installed. The stored form
-is 4.1.2's whichever Effect is installed. `resolvedZoneName` (`internal/StoredForm.ts`)
-is the one decision: a real zone (its marker inherited, not its own) holding an own
-string `resolvedId` that its own formatter resolves to, and not one kept as read, is
-stored under that name and without `resolvedId`; any other value is untouched, so on
-4.1.2 nothing changes. Every stored form asks it: the marshaller (`finishingInstances`),
-packed storage (`libraryMap`, `storedDate`), the write-back check (`writtenProperties`),
-key text (`zonesAsStored`, for a zone in an `Option`, a `Result` or a zoned date too),
-the ISO text of `DynamoModel.DateTimeZoned` and of a date stored as text
-(`zonedIsoText`), and an aggregate's comparison, where two zones compare by their
-stored form, so setting an equal zone still writes nothing. A map read back holding
-`resolvedId` (written by 1.38.0–1.40.0 on 4.1.3) is rebuilt as a zone kept as read
-(`keepingAsRead`), so writing it stores the bytes read; a zone read from a 4.1.2 map
-stores the 4.1.2 map. Effect's own codecs are left as they are:
+text: a consumer's stored bytes depended on the Effect patch installed. Now one rule
+names a zone and one rule writes it, whichever Effect is installed.
+
+- *The name* is `storedZoneName` (`internal/StoredForm.ts`): a zone's `resolvedId` where
+  it holds one as text, otherwise its `id`. That is the resolved name on either Effect,
+  for a zone made fresh or read back from a map of either form, and it's what 4.1.3's
+  `Equal` compares (`resolvedId` against `resolvedId ?? id`; 4.1.2's compares `id`), so
+  two zones Effect holds equal have one name. Key text (`zonesAsStored`, also for a zone
+  in an `Option`, a `Result` or a zoned date), a unique sentinel (composed from the key
+  form), the ISO text of `DynamoModel.DateTimeZoned` and of a date stored as text
+  (`zonedIsoText`), an aggregate's comparison and every write take it from there. The
+  property test in `ZoneNames.test.ts` builds zones every way (fresh, as each Effect
+  makes one, read back from either map) and holds equal ones to one key text, sentinel
+  and ISO text.
+- *The write* is `rewrittenZoneId` / `zoneEntriesWritten`: a named zone's map holding
+  `resolvedId` is written with `id` under the name and without `resolvedId`, which is
+  what 1.40.0 stored on 4.1.2. It's decided on the entries a write obtained, never by
+  finding the instance they came from: the map the marshaller made (`finishingInstances`),
+  the entries packed storage read (`written` in `PackedCodec.ts`, which reads each
+  property once and writes what it read), a zone's own properties (`libraryMap`,
+  `storedDate`, the write-back check's `writtenProperties`). So it holds for a zone made
+  fresh or read back, as an own property, behind a getter, inside a date, an `Option`,
+  a list, a record or an untyped field, and for a map that only looks like one.
+- *Reads* take both forms, forever. A typed zone's map holding `resolvedId` is rebuilt
+  as the zone `storedZoneName` names (`reviveTimeZone`), on either Effect, and the
+  write-back check compares the instance with the map as it's written again
+  (`asWrittenAgain`). Where no schema types it, either form reads back as the map it is,
+  as a 4.1.2 map always has. So a row holding `resolvedId` keeps it only until the item
+  is next written: a `put` of what `get` returned stores the 4.1.2 form, an aggregate
+  update compares both sides by the name and writes nothing when nothing else changed,
+  and an entity `update` that doesn't touch the field leaves the stored map alone.
+
+The resolved name is what the runtime's `Intl` makes of the name a zone was made from,
+and has been since 1.38.0 on 4.1.2: there `id` was `Intl`'s resolution. So it depends
+on the runtime's time zone data. `Asia/Kolkata` resolves to `Asia/Calcutta` on Node
+24 (ICU 78.3), and `Etc/UTC` to `UTC`; a runtime that canonicalises differently (the
+ECMA-402 change that stops `resolvedOptions().timeZone` canonicalising, which Firefox
+already follows) gives the same zone another name, so another key text, ISO text and
+stored `id`. Rows keyed under one runtime are not found by a key composed under the
+other. This is the runtime's, not the library's, and the library doesn't change it.
+Effect's own codecs are left as they are:
 `Schema.TimeZoneNamedFromString`, `Schema.TimeZoneFromString` and
 `Schema.DateTimeZonedFromString` write a zone made from an alias by the name it was
 made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`). `ZoneNames.test.ts` (both

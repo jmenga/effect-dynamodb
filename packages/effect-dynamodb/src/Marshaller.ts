@@ -18,8 +18,8 @@ import {
   cachesCycle,
   isBigDecimalInstance,
   isCachedNormal,
-  resolvedZoneName,
   ZONE_MARKER,
+  zoneEntriesWritten,
 } from "@effect-dynamodb/schema/internal/StoredForm.js"
 import { Data } from "effect"
 
@@ -231,17 +231,21 @@ const storedElements = (list: ReadonlyArray<unknown>): ReadonlyArray<unknown> | 
 }
 
 /**
- * Gives each of Effect's cookies in `source` its expiry, and each of its named zones its name, in what
+ * Gives each of Effect's cookies in `source` its expiry, and each named zone's map its name, in what
  * marshalling made of them.
  *
  * A cookie's `options.expires` is a `Date`, and marshalling stores a `Date` as an empty map: the
- * expiry was lost. Here it's ISO text instead. A named zone is stored as Effect 4.1.2 held it, under
- * the name `resolvedZoneName` gives it and without the `resolvedId` 4.1.3 added: what 1.40.0 stored
- * on 4.1.2, whichever Effect is installed. Marshalling has already run, exactly as it always did, and
- * nothing else it made is touched: this only looks through its output for a cookie's marker or a
- * zone's, and finds the instance it came from by descriptors, calling no getter. A cookie or a zone
- * is Effect's own, by its prototype; a map that only looks like one, one behind a getter and an
- * invalid `Date` are left as marshalled.
+ * expiry was lost. Here it's ISO text instead: this finds the cookie it came from by descriptors,
+ * calling no getter. A cookie is Effect's own, by its prototype; a map that only looks like one, one
+ * behind a getter and an invalid `Date` are left as marshalled.
+ *
+ * A named zone's map holding `resolvedId`, which Effect 4.1.3 gave a zone, is stored as 4.1.2 held
+ * it, under the name `zoneEntriesWritten` gives it and without `resolvedId`: what 1.40.0 stored on
+ * 4.1.2, whichever Effect is installed, however the zone was reached. That's decided on the map
+ * marshalling made, from the values it obtained, so it holds for a zone made fresh or read back, as
+ * an own property, behind a getter or inside anything.
+ *
+ * Marshalling has already run, exactly as it always did, and nothing else it made is touched.
  */
 const finishingInstances = (
   marshalled: Record<string, AttributeValue>,
@@ -287,12 +291,16 @@ const finishingInstances = (
     options!.expires = { S: Date.prototype.toISOString.call(expiry) }
   }
   const name = (map: Record<string, AttributeValue>): void => {
-    if (!Object.hasOwn(map, "resolvedId") || !Object.hasOwn(map, "id")) return
-    const zone = sourceAt()
-    if (typeof zone !== "object" || zone === null) return
-    const resolved = resolvedZoneName(zone)
-    if (resolved === undefined) return
-    map.id = { S: resolved }
+    if (!Object.hasOwn(map, "resolvedId")) return
+    const entries = Object.entries(map)
+    const written = zoneEntriesWritten(
+      entries,
+      true,
+      (attribute) => attribute.S,
+      (id): AttributeValue => ({ S: id }),
+    )
+    if (written === entries) return
+    map.id = { S: written.find(([key]) => key === "id")![1].S! }
     delete map.resolvedId
   }
   const visit = (attribute: AttributeValue): void => {
