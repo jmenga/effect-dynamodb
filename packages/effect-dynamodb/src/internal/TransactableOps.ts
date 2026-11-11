@@ -349,7 +349,9 @@ export const projectionTtlConflict = (
  *
  * Each value is stored as the row stores any value of the field: a sparse map as its entries (a
  * tombstone holds it whole, as 1.39.0's did), an entry whose key sparse storage can't hold left
- * off, never the whole map (#237).
+ * off, never the whole map; a packed field packed (#237), read first by its stored form, since a
+ * tombstone holds it natively and one written before may hold it packed. A row with nothing
+ * packed carried packs nothing, so its request is unchanged.
  *
  * On a read model whose rows carry the row token (`rowTokened`), or when the tombstone holds one,
  * it also holds the bookkeeping of the other projections that had written the row (#237): those of
@@ -371,13 +373,23 @@ export const overTombstone = (
     }
     readonly _renameToDynamo: (item: Record<string, unknown>) => void
     readonly _serializeSparseFields: (item: Record<string, unknown>) => void
+    readonly _dispatchAttributes: ReadonlyArray<string>
+    readonly _unpackFields: (
+      raw: Record<string, unknown>,
+      operation?: string,
+    ) => Effect.Effect<void, ValidationError>
+    readonly _packFields: (
+      item: Record<string, unknown>,
+      operation: string,
+      only?: ReadonlySet<string>,
+    ) => Effect.Effect<void, ValidationError>
   },
   client: Pick<DynamoClientService, "getItem">,
   table: TableConfig,
   item: Record<string, unknown>,
 ): Effect.Effect<
   Option.Option<{ readonly guard: ConditionInput; readonly term: RawCondition | undefined }>,
-  DynamoClientError
+  DynamoClientError | ValidationError
 > =>
   Effect.gen(function* () {
     if (!hasProjectionTombstones(entity)) return Option.none()
@@ -442,6 +454,16 @@ export const overTombstone = (
           carried.add(name)
         }
       }
+    }
+    // A packed field as the row stores it: read by its stored form, then packed. Only what was
+    // carried: the fields the caller gave are packed already.
+    const stored = entity._dispatchAttributes.filter((name) => carried.has(name))
+    if (stored.length > 0) {
+      const part: Record<string, unknown> = {}
+      for (const name of stored) part[name] = held(name)
+      yield* entity._unpackFields(part, "create")
+      Object.assign(item, part)
+      yield* entity._packFields(item, "create", new Set(stored))
     }
     const read = Item[ROW_TOKEN]
     const term = asReadTerm(entity, Item, taken)

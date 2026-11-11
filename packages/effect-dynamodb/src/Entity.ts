@@ -1125,7 +1125,7 @@ export interface Entity<
     item: globalThis.Record<string, unknown>,
   ) => Effect.Effect<
     Option.Option<{ readonly guard: ConditionInput; readonly term: RawCondition | undefined }>,
-    DynamoClientError,
+    DynamoClientError | ValidationError,
     DynamoClient | TableConfig
   >
 

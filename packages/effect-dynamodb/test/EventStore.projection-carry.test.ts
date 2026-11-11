@@ -18,11 +18,13 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Exit, Layer, Option, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as ZlibCompression from "../src/compression/zlib.js"
+import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as TransactableOps from "../src/internal/TransactableOps.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
 
 class Placed extends Schema.TaggedClass<Placed>()("Placed", { amount: Schema.Number }) {}
@@ -381,6 +383,62 @@ describe("the other projections' bookkeeping, by kind × site × what follows (#
       ]),
     )
   })
+})
+
+/**
+ * `create` over a tombstone stores a packed checkpoint map it carries packed, as the row stores
+ * any value of the field (#237): standalone, bound and in a transaction. 1.40.0 kept only the
+ * remover's bookkeeping on the tombstone, so it carried no such map.
+ */
+describe("create over a tombstone holding another projection's packed map (#237)", () => {
+  for (const kind of ["packed map", "compressed packed map"] as const) {
+    for (const path of ["standalone", "bound", "transaction"] as const) {
+      it.effect(`${kind}, ${path}: stored packed, read back and recognised`, () => {
+        const w = world(kind)
+        return Effect.gen(function* () {
+          yield* Orders.append({ id: "x" }, [new Cancelled({})], 0)
+          yield* Invoices.append({ id: "x" }, [new Placed({ amount: 5 })], 0)
+          const invoices = yield* Invoices.read({ id: "x" })
+          yield* w.applyB(invoices[0]!)
+          yield* w.A.apply((yield* Orders.read({ id: "x" }))[0]!)
+          expect(state()).toBe("tombstone")
+          const input = { id: "x", total: 100 }
+          if (path === "standalone") yield* w.Rows.create(input).asEffect()
+          else if (path === "transaction") yield* Transaction.transactWrite([w.Rows.create(input)])
+          else {
+            const db: any = yield* DynamoClient.make({ entities: { Rows: w.Rows } })
+            yield* db.entities.Rows.create(input)
+          }
+          // Packed, never native `M`: JSON text (compressed only when that's smaller, which a map
+          // this small never is).
+          expect(store.get(ROW)!.map).toEqual({ S: JSON.stringify({ "invoice#x": 1 }) })
+          expect((yield* w.Rows.get({ id: "x" }).asEffect()).map).toEqual({ "invoice#x": 1 })
+          yield* w.applyB(invoices[0]!)
+          expect(state()).toBe(100)
+        }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+      })
+    }
+  }
+
+  it.effect(
+    "a tombstone holding the map packed: read by its stored form, stored packed once",
+    () => {
+      const w = world("packed map")
+      return Effect.gen(function* () {
+        yield* Orders.append({ id: "x" }, [new Cancelled({})], 0)
+        yield* Invoices.append({ id: "x" }, [new Placed({ amount: 5 })], 0)
+        const invoices = yield* Invoices.read({ id: "x" })
+        yield* w.applyB(invoices[0]!)
+        yield* w.A.apply((yield* Orders.read({ id: "x" }))[0]!)
+        const tombstone = store.get(ROW)!
+        store.set(ROW, { ...tombstone, map: { S: JSON.stringify({ "invoice#x": 1 }) } })
+        yield* w.Rows.create({ id: "x", total: 100 }).asEffect()
+        expect(store.get(ROW)!.map).toEqual({ S: JSON.stringify({ "invoice#x": 1 }) })
+        yield* w.applyB(invoices[0]!)
+        expect(state()).toBe(100)
+      }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+    },
+  )
 })
 
 // ---------------------------------------------------------------------------
