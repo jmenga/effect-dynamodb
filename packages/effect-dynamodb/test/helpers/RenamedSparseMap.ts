@@ -261,6 +261,18 @@ export const rowsOf = (rows: ReadonlyArray<Row>) =>
       ),
   )
 
+/**
+ * 1.40.0's rows after an update, but for a version snapshot it emptied: a retained entity's removal
+ * of an entry of a map stored whole emptied the map (`sr`) of the snapshot it read the row from,
+ * which the head keeps as it was written. Only that field of such a row differs.
+ */
+const snapshotsKept = (after: ReadonlyArray<Row>, before: ReadonlyArray<Row>) =>
+  after.map((row) => {
+    const was = before.find((other) => keyOf(other) === keyOf(row))
+    const emptied = JSON.stringify(row.sr) === JSON.stringify({ M: {} })
+    return was !== undefined && row.sk?.S?.includes("#v#") && emptied ? { ...row, sr: was.sr } : row
+  })
+
 /** Run one case on a table of its own: seed `{ id: "a", counts: { a: 1 } }`, then `body`. */
 const runCase = (
   open: OpenTable,
@@ -422,7 +434,7 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
                   // Where 1.40.0 left the map as meant, the same rows (the request now carries the
                   // form's guard, or asks a condition both ways).
                   if (keptRight && was.outcome.ok !== undefined) {
-                    expect(captured.rows).toEqual(was.rows)
+                    expect(captured.rows).toEqual(snapshotsKept(was.rows, got.before))
                   }
                 }
                 // Written where the row holds the map: inside `sr`, or as entries, never beside.
