@@ -3439,7 +3439,18 @@ them on a value of another kind: a string, a set of the other kind, `NULL`), the
 update fails with `DynamoValidationError` (`operation` `TransactWriteItems`,
 DynamoDB's own words) and writes nothing (`expressionRefusal`, #236). It used to
 store `-v` or the operand alone, append a string's characters (a row that no
-longer read), add a number to a string, and die on `NaN`.
+longer read), add a number to a string, and die on `NaN`. Where DynamoDB applies
+one, the result is DynamoDB's (`internal/DynamoArithmetic.ts`): a sum or
+difference is taken exactly on the two numbers' decimal text and given back as a
+read gives the stored result (a `number`, or a `bigint` past
+`Number.MAX_SAFE_INTEGER`), so a bigint field computes on both sides of 2^53 and
+`0.2 + 0.1` stores `0.3`; a number DynamoDB can't hold (39 significant digits) is
+sent as it is, for DynamoDB to refuse. A set's members are compared by value (a
+number and a bigint of one value, two arrays of the same bytes). It used to die
+mixing a bigint with a number read back, store a JavaScript float
+(`0.30000000000000004`), and compare a bigint or binary set's members by
+identity, so a union held a member twice (refused by DynamoDB) and a difference
+removed nothing.
 Path operations combined with a unique-constraint change, or with a computed
 change to an index composite, are rejected with a `ValidationError`: both are
 read-then-write updates that cannot carry path expressions. Record retain

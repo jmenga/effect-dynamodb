@@ -119,6 +119,13 @@ import {
 } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import {
+  isNumeric,
+  memberKind,
+  numberSum,
+  setDifference,
+  setUnion,
+} from "./internal/DynamoArithmetic.js"
+import {
   compileExpr,
   createConditionOps,
   type Expr,
@@ -2448,10 +2455,10 @@ const makeImpl = <
    * expression doesn't take (`fits`): what a retained entity's update, which applies the record operation
    * to the row it read, answers where the same operation sent as an expression would be
    * refused. In DynamoDB's own words, as the `TransactWriteItems` the update sends would be.
-   * `undefined` when the expression applies. A `bigint` is left to the operation as it was.
+   * `undefined` when the expression applies.
    */
   const expressionRefusal = (before: unknown, fits: boolean): DynamoValidationError | undefined =>
-    fits || typeof before === "bigint"
+    fits
       ? undefined
       : new DynamoValidationError({
           operation: "TransactWriteItems",
@@ -2465,12 +2472,15 @@ const makeImpl = <
           ),
         })
 
-  /** Whether `before` is a set of the same kind (string, number, binary) as the set `operand`. */
+  /**
+   * Whether `before` is a set of the same kind (number, string, binary) as the set `operand`. A
+   * number set's members are numbers or bigints, as a read and a bigint field's operand give them.
+   */
   const sameSetKind = (before: unknown, operand: unknown): boolean => {
     if (!(before instanceof Set) || !(operand instanceof Set)) return false
-    const kind = (set: ReadonlySet<unknown>): string | undefined => {
+    const kind = (set: ReadonlySet<unknown>) => {
       const [first] = set
-      return first === undefined ? undefined : first instanceof Uint8Array ? "binary" : typeof first
+      return first === undefined ? undefined : memberKind(first)
     }
     const [was, now] = [kind(before), kind(operand)]
     return was === undefined || now === undefined || was === now
@@ -8065,22 +8075,25 @@ const makeImpl = <
         if (uState.add) {
           for (const [attr, val] of Object.entries(uState.add)) {
             // DynamoDB's ADD: a number adds, a set unions, and a row without the attribute
-            // starts from nothing. A value of another kind is refused, as `ADD` is (#236).
+            // starts from nothing. A value of another kind is refused, as `ADD` is. The sum is
+            // DynamoDB's, exact on a bigint field and a number's fraction alike, and a set's
+            // members are compared by value (`DynamoArithmetic`, #236).
             const [holder, key] = slot(attr)
             const before = held(holder, key)
             const refused = expressionRefusal(
               before,
               before === undefined ||
-                typeof val === "bigint" ||
-                (typeof val === "number" ? typeof before === "number" : sameSetKind(before, val)),
+                (isNumeric(val) ? isNumeric(before) : sameSetKind(before, val)),
             )
             if (refused !== undefined) return yield* refused
             hold(
               holder,
               key,
-              typeof val === "number"
-                ? ((before as number) ?? 0) + val
-                : new Set<unknown>([...(before instanceof Set ? before : []), ...val]),
+              isNumeric(val)
+                ? before === undefined
+                  ? val
+                  : numberSum(before as number | bigint, val, false)
+                : setUnion(before as ReadonlySet<unknown> | undefined, val as ReadonlySet<unknown>),
             )
           }
         }
@@ -8093,9 +8106,9 @@ const makeImpl = <
           for (const [attr, val] of Object.entries(uState.subtract)) {
             const [holder, key] = slot(attr)
             const before = held(holder, key)
-            const refused = expressionRefusal(before, typeof before === "number")
+            const refused = expressionRefusal(before, isNumeric(before) && isNumeric(val))
             if (refused !== undefined) return yield* refused
-            hold(holder, key, (before as number) - val)
+            hold(holder, key, numberSum(before as number | bigint, val as number | bigint, true))
           }
         }
         if (uState.append) {
@@ -8122,11 +8135,7 @@ const makeImpl = <
             )
             if (refused !== undefined) return yield* refused
             if (before instanceof Set && val instanceof Set) {
-              const current = new Set(before as Set<unknown>)
-              for (const elem of val as Set<unknown>) {
-                current.delete(elem)
-              }
-              hold(holder, key, current)
+              hold(holder, key, setDifference(before, val))
             }
           }
         }
