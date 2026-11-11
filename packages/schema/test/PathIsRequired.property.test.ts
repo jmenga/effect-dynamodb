@@ -19,11 +19,13 @@ import {
   type Built,
   build,
   containerAt,
+  fieldsOf,
   generator,
   isMap,
   type Kinds,
   LEAVES,
   pathsOf,
+  property,
   S,
   sample,
   stored,
@@ -97,14 +99,42 @@ const MORE_WRAPPERS: ReadonlyArray<Wrapper> = [
   },
 ]
 
+let renamed = 0
+
+/** Structs whose keys are stored under other names (#238). */
+const RENAMING_WRAPPERS: ReadonlyArray<Wrapper> = [
+  // Keys renamed onto each other's names, either property optional at random (#238).
+  (child, random) => {
+    const [a, b] = [property(child, random), property(child, random)]
+    return {
+      schema: Schema.Struct({ p0: a.schema, p1: b.schema }).pipe(
+        Schema.encodeKeys({ p0: "p1", p1: "p0" }),
+      ),
+      label: `{ p0 (as p1): ${a.label}, p1 (as p0): ${b.label} }`,
+    }
+  },
+  // A struct of renamed keys, some kept, as a class's fields.
+  (child, random) => {
+    const { fields, label } = fieldsOf(child, random, 1, 3)
+    const identifier = `PathIsRequiredRenamed${renamed++}`
+    class Generated extends Schema.Class<Generated>(identifier)(
+      // A class takes a struct whose keys are renamed, though its type names only a bare one.
+      Schema.Struct(fields).pipe(
+        Schema.encodeKeys({ p0: "q0", p2: "q2" } as never),
+      ) as unknown as Schema.Struct<Schema.Struct.Fields>,
+    ) {}
+    return { schema: Generated, label: `class ${label} (p0 as q0, p2 as q2)` }
+  },
+]
+
 /**
  * The shared leaves and wrappers, with these added where this test has always had them (after
- * the leaf `"a"`, and after the `Schema.TaggedStruct` union), so each seed builds the schema it
- * built before the generator was shared.
+ * the leaf `"a"`, after the `Schema.TaggedStruct` union, and before the nullable wrapper), so
+ * each seed builds the schema it built before the generator was shared.
  */
 const KINDS_HERE: Kinds = {
   leaves: inserted(LEAVES, 3, MORE_LEAVES),
-  wrappers: inserted(WRAPPERS, 12, MORE_WRAPPERS),
+  wrappers: inserted(inserted(WRAPPERS, WRAPPERS.length - 1, RENAMING_WRAPPERS), 12, MORE_WRAPPERS),
 }
 
 /** `value` with the path removed as DynamoDB removes it: a list closes up. */

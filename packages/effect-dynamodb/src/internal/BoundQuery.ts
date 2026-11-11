@@ -23,28 +23,63 @@ import * as Query from "../Query.js"
 import * as Capacity from "./Capacity.js"
 import type { ConditionOps, ConditionShorthand, Expr, StoredFormAt } from "./Expr.js"
 import { ExprTag, operandsAsStored, parseSimpleShorthand } from "./Expr.js"
-import { type PackedPath, type Path, type PathBuilder, storedPath } from "./PathBuilder.js"
+import {
+  type PackedPath,
+  type Path,
+  type PathBuilder,
+  type StoredBelow,
+  storedPath,
+} from "./PathBuilder.js"
 
 /**
  * An expression with every attribute path's top-level field renamed to its
- * stored attribute (#133). Values are left alone.
+ * stored attribute (#133), and the segments below it named as `below` names
+ * them (#238). Values are left alone.
  */
-const renamePaths = (node: unknown, resolve: (name: string) => string): unknown => {
-  if (Array.isArray(node)) return node.map((item) => renamePaths(item, resolve))
+const renamePaths = (
+  node: unknown,
+  resolve: (name: string) => string,
+  below?: StoredBelow,
+): unknown => {
+  if (Array.isArray(node)) return node.map((item) => renamePaths(item, resolve, below))
   if (node === null || typeof node !== "object") return node
   const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
   if (record._tag === "value") return node
   if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
     return {
       ...record,
-      segments: storedPath(record.segments as ReadonlyArray<string | number>, resolve),
+      segments: storedPath(record.segments as ReadonlyArray<string | number>, resolve, below),
     }
   }
   // Spread keeps the symbol-keyed Expr brand; string keys are walked.
   const copy: globalThis.Record<string | symbol, unknown> = { ...record }
-  for (const [key, value] of Object.entries(record)) copy[key] = renamePaths(value, resolve)
+  for (const [key, value] of Object.entries(record)) copy[key] = renamePaths(value, resolve, below)
   return copy
 }
+
+/** Every path an expression names, in order, as its segments. */
+const pathsIn = (
+  node: unknown,
+  into: Array<ReadonlyArray<string | number>> = [],
+): Array<ReadonlyArray<string | number>> => {
+  if (Array.isArray(node)) {
+    for (const item of node) pathsIn(item, into)
+    return into
+  }
+  if (node === null || typeof node !== "object") return into
+  const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
+  if (record._tag === "value") return into
+  if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
+    into.push(record.segments as ReadonlyArray<string | number>)
+    return into
+  }
+  for (const value of Object.values(record)) pathsIn(value, into)
+  return into
+}
+
+/** Whether `below` names a segment below a path's first other than as written (#238). */
+const renamedBelow = (path: ReadonlyArray<string | number>, below: StoredBelow | undefined) =>
+  below?.(path).some((segment, i) => segment !== path[i + 1]) === true
 
 // ---------------------------------------------------------------------------
 // Sort key condition ops for the `where` callback
@@ -677,7 +712,9 @@ const fromWholeRow = (
   resolve: (domainName: string) => string,
   projected: Record<string, unknown>,
   raw: Record<string, unknown>,
+  below?: StoredBelow,
 ): Record<string, unknown> => {
+  const storedOf = (path: ReadonlyArray<string | number>) => storedPath(path, resolve, below)
   const maps = paths.filter((path) => namesMap(path, wholeRows.sparseFields))
   const selected = new Set(maps.map((path) => String(path[0])))
   const held: Record<string, unknown> = {}
@@ -685,7 +722,15 @@ const fromWholeRow = (
     const map = wholeRows.mapOf(attribute)
     if (map !== undefined && selected.has(map)) held[attribute] = raw[attribute]
   }
-  const rebuilt = maps.length === 0 ? {} : Query.projectRow(wholeRows.view(held), maps)
+  // A map rebuilt holds its entries as stored: below the map, its paths by stored names (#238).
+  const rebuilt =
+    maps.length === 0
+      ? {}
+      : Query.projectRow(
+          wholeRows.view(held),
+          maps.map((path) => [path[0]!, ...storedOf(path).slice(1)]),
+        )
+  const plans = Query.respellings(paths, storedOf)
   // In the order the paths were selected, as a projected row's names come.
   const item: Record<string, unknown> = {}
   for (const path of paths) {
@@ -693,10 +738,10 @@ const fromWholeRow = (
     if (Object.hasOwn(item, head)) continue
     const [from, name] = namesMap(path, wholeRows.sparseFields)
       ? [rebuilt, head]
-      : [projected, String(storedPath(path, resolve)[0])]
+      : [projected, String(storedOf(path)[0])]
     if (!Object.hasOwn(from, name) || from[name] === undefined) continue
     Object.defineProperty(item, head, {
-      value: from[name],
+      value: Query.respelled(from[name], plans.get(head)),
       enumerable: true,
       writable: true,
       configurable: true,
@@ -731,33 +776,43 @@ export const entityNaming = (
   resolve: ((domainName: string) => string) | undefined,
   storedAt?: StoredFormAt,
   wholeRows?: WholeRows | undefined,
+  below?: StoredBelow | undefined,
 ): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
-  if (resolve === undefined && storedAt === undefined && wholeRows === undefined) return {}
+  if (
+    resolve === undefined &&
+    storedAt === undefined &&
+    wholeRows === undefined &&
+    below === undefined
+  )
+    return {}
   const stored = resolve ?? ((name: string) => name)
   const asStored = (expr: Expr): Expr =>
     storedAt === undefined ? expr : operandsAsStored(expr, storedAt)
   const forms = wholeRows?.entryForms ?? ((expr: Expr) => expr)
   return {
-    ...((resolve !== undefined || storedAt !== undefined) && {
+    ...((resolve !== undefined || storedAt !== undefined || below !== undefined) && {
       renameExpr: (expr: Expr) =>
-        resolve === undefined
+        resolve === undefined && below === undefined
           ? asStored(expr)
-          : (renamePaths(forms(asStored(expr)), resolve) as Expr),
+          : (renamePaths(forms(asStored(expr)), stored, below) as Expr),
     }),
-    ...((resolve !== undefined || wholeRows !== undefined) && {
+    ...((resolve !== undefined || wholeRows !== undefined || below !== undefined) && {
       selectAs: (query, paths, form) => {
         if (wholeRows !== undefined && readsWholeRows(paths, wholeRows.sparseFields)) {
           return Query.selectWhole(
             query,
             paths
               .filter((path) => !namesMap(path, wholeRows.sparseFields))
-              .map((path) => storedPath(path, stored)),
-            (projected, raw) => fromWholeRow(wholeRows, paths, stored, projected, raw),
+              .map((path) => storedPath(path, stored, below)),
+            (projected, raw) => fromWholeRow(wholeRows, paths, stored, projected, raw, below),
           )
         }
-        return resolve !== undefined &&
-          paths.some((path) => typeof path[0] === "string" && resolve(path[0]) !== path[0])
-          ? Query.selectRenamed(query, paths, resolve)
+        return paths.some(
+          (path) =>
+            (typeof path[0] === "string" && stored(path[0]) !== path[0]) ||
+            renamedBelow(path, below),
+        )
+          ? Query.selectRenamed(query, paths, stored, below)
           : plainSelect(query, paths, form)
       },
     }),
@@ -783,6 +838,8 @@ export const collectionNaming = (
     readonly storedAt?: StoredFormAt | undefined
     /** How the member's rows are read whole, when it has a sparse map field (#238). */
     readonly wholeRows?: WholeRows | undefined
+    /** How the member stores the segments below a path's first (#238). */
+    readonly below?: StoredBelow | undefined
   }>,
 ): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
   /**
@@ -800,6 +857,14 @@ export const collectionNaming = (
     }
     return field
   }
+  /** A path below its field, as a member stores it (#238). */
+  const belowOf = (m: (typeof members)[number], path: ReadonlyArray<string | number>) =>
+    JSON.stringify(m.below === undefined ? path.slice(1) : m.below(path))
+  /** Each head's respelling of what a member's projection gives for `paths` (#238). */
+  const respellingsOf = (
+    m: (typeof members)[number],
+    paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  ) => Query.respellings(paths, (path) => storedPath(path, (head) => m.resolve(head), m.below))
   return {
     renameExpr: (expr) => {
       const heads = [...pathHeads(expr)]
@@ -811,7 +876,10 @@ export const collectionNaming = (
       const asStoredBy = members.map((m) =>
         m.storedAt === undefined ? expr : operandsAsStored(expr, m.storedAt),
       )
-      const stored = members.map((m, at) => m.wholeRows?.entryForms(asStoredBy[at]!) ?? asStoredBy[at]!)
+      const stored = members.map(
+        (m, at) => m.wholeRows?.entryForms(asStoredBy[at]!) ?? asStoredBy[at]!,
+      )
+      const paths = pathsIn(expr)
       // Every member reads the same attributes, each operand in the same form: one expression,
       // as before.
       if (
@@ -820,9 +888,10 @@ export const collectionNaming = (
           (m, at) =>
             heads.every((head) => attributeOf(m, head) === attributeOf(first, head)) &&
             sameOperands(stored[at]!, stored[0]!),
-        )
+        ) &&
+        members.every((m) => paths.every((path) => belowOf(m, path) === belowOf(first, path)))
       ) {
-        return renamePaths(stored[0], (head) => attributeOf(first, head)) as Expr
+        return renamePaths(stored[0], (head) => attributeOf(first, head), first.below) as Expr
       }
       // They differ: each member's rows judged by its own attributes and forms.
       return {
@@ -839,7 +908,7 @@ export const collectionNaming = (
                 left: { _tag: "path", segments: ["__edd_e__"] },
                 right: { _tag: "value", value: m.entityType },
               } as Expr,
-              renamePaths(stored[at], (head) => attributeOf(m, head)) as Expr,
+              renamePaths(stored[at], (head) => attributeOf(m, head), m.below) as Expr,
             ],
           }),
         ),
@@ -854,10 +923,19 @@ export const collectionNaming = (
       for (const m of members) {
         for (const path of paths) {
           if (!has(m, String(path[0]))) continue
-          const renamed = storedPath(path, (head) => m.resolve(head))
+          const renamed = storedPath(path, (head) => m.resolve(head), m.below)
           stored.set(JSON.stringify(renamed), renamed)
         }
       }
+      const plans = new Map(
+        members.map((m) => [
+          m.entityType,
+          respellingsOf(
+            m,
+            paths.filter((path) => has(m, String(path[0]))),
+          ),
+        ]),
+      )
       stored.set(JSON.stringify(["__edd_e__"]), ["__edd_e__"])
       const byType = new Map(members.map((m) => [m.entityType, m]))
       // A member's sparse map named: every row is read whole, and each is cut to what its member
@@ -878,7 +956,7 @@ export const collectionNaming = (
           for (const path of paths) {
             if (!has(m, String(path[0]))) continue
             if (m.wholeRows !== undefined && namesMap(path, m.wholeRows.sparseFields)) continue
-            const renamed = storedPath(path, (head) => m.resolve(head))
+            const renamed = storedPath(path, (head) => m.resolve(head), m.below)
             projected.set(JSON.stringify(renamed), renamed)
           }
         }
@@ -889,7 +967,14 @@ export const collectionNaming = (
           if (m.wholeRows !== undefined) {
             return {
               _memberKey: m.entityKey,
-              _decoded: fromWholeRow(m.wholeRows, own, (head) => m.resolve(head), row, raw),
+              _decoded: fromWholeRow(
+                m.wholeRows,
+                own,
+                (head) => m.resolve(head),
+                row,
+                raw,
+                m.below,
+              ),
             }
           }
           // A member without a sparse map: what its projection gave, under its domain names.
@@ -898,7 +983,8 @@ export const collectionNaming = (
             const attribute = m.resolve(head)
             if (!has(m, head) || !Object.hasOwn(row, attribute)) continue
             const value = row[attribute]
-            if (value !== undefined) item[head] = value
+            if (value !== undefined)
+              item[head] = Query.respelled(value, plans.get(m.entityType)?.get(head))
           }
           return { _memberKey: m.entityKey, _decoded: item }
         })
@@ -910,7 +996,9 @@ export const collectionNaming = (
         for (const head of heads) {
           if (!has(m, head)) continue
           const value = raw[m.resolve(head)]
-          if (value !== undefined) item[head] = value
+          if (value !== undefined) {
+            item[head] = Query.respelled(value, plans.get(m.entityType)?.get(head))
+          }
         }
         return { _memberKey: m.entityKey, _decoded: item }
       })

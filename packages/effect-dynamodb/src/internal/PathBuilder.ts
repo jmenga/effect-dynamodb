@@ -321,13 +321,23 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
 // ---------------------------------------------------------------------------
 
 /**
+ * @internal How the segments below a path's first are stored, given the whole path as written
+ * (#238): an entity's own (`Entity._storedBelow`), from its model's schema, by `storedSegments`.
+ */
+export type StoredBelow = (
+  segments: ReadonlyArray<string | number>,
+) => ReadonlyArray<string | number>
+
+/**
  * A path as it is stored: its first segment under the attribute `head` gives it, and every segment
- * below as given.
+ * below as `below` names it (as given, without one).
  *
  * A `field:` rename is a top-level attribute's name. Below it a value is stored whole, under the
  * names its own schema has: `put` stores `meta.count` as `count` whatever a top-level `count` is
- * renamed to. This is the one place that says so, for an update's path operations, a condition, a
- * filter and a projection alike, so each names the attribute `put` stored.
+ * renamed to, and a struct that renames its keys as it's stored (`Schema.encodeKeys`) stores each
+ * under its stored name, which `below` gives (#238). This is the one place that says so, for an
+ * update's path operations, a condition, a filter and a projection alike, so each names the
+ * attribute `put` stored.
  *
  * A first segment `.entry()` built ({@link entryOfPath}) is the entry's attribute, never a field's
  * name: it stays as it is, whatever field a rename stores under another name it spells (#238).
@@ -335,12 +345,16 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
 export const storedPath = (
   segments: ReadonlyArray<string | number>,
   head: (name: string) => string,
+  below?: StoredBelow,
 ): ReadonlyArray<string | number> => {
   const entry = entryOfPath(segments)
+  const [first] = segments
+  if (first === undefined) return segments
   return withEntry(
-    segments.map((segment, i) =>
-      i === 0 && typeof segment === "string" && entry === undefined ? head(segment) : segment,
-    ),
+    [
+      typeof first === "string" && entry === undefined ? head(first) : first,
+      ...(below === undefined ? segments.slice(1) : below(segments)),
+    ],
     entry,
   )
 }
@@ -357,6 +371,7 @@ export const storedPath = (
  *   through it, as a filter's and a projection's do: a model field whose own name holds `#` is
  *   named by its rename. A sparse-map entry's attribute (`<prefix>#<key>`) that `.entry()` built
  *   doesn't, whatever field its name spells.
+ * @param below - Optional names of the segments below the first ({@link StoredBelow}).
  * @returns The expression path string (e.g., "#p0.#p1" or "#p0[2].#p1")
  */
 export const compilePath = (
@@ -365,10 +380,17 @@ export const compilePath = (
   prefix: string,
   counter: { value: number },
   resolveDbName?: (name: string) => string,
+  below?: StoredBelow,
 ): string => {
   const parts: Array<string> = []
   const stored =
-    resolveDbName === undefined ? segments : storedPath(segments, (head) => resolveDbName(head))
+    resolveDbName === undefined && below === undefined
+      ? segments
+      : storedPath(
+          segments,
+          (head) => (resolveDbName === undefined ? head : resolveDbName(head)),
+          below,
+        )
   for (const seg of stored) {
     if (typeof seg === "number") {
       // Array index — append directly to previous part

@@ -45,7 +45,7 @@ export const range = (random: Random, low: number, high: number): ReadonlyArray<
   Array.from({ length: low + Math.floor(random() * (high - low + 1)) }, (_, i) => i)
 
 /** A struct's property: as it is, optional, an optional key, or a key with a decoding default. */
-const property = (child: Child, random: Random): Built => {
+export const property = (child: Child, random: Random): Built => {
   const built = child()
   const roll = random()
   if (roll < 0.2) return { schema: Schema.optional(built.schema), label: `${built.label}?` }
@@ -63,7 +63,7 @@ const property = (child: Child, random: Random): Built => {
   return built
 }
 
-const fieldsOf = (child: Child, random: Random, low: number, high: number) => {
+export const fieldsOf = (child: Child, random: Random, low: number, high: number) => {
   const built = range(random, low, high).map((i) => [`p${i}`, property(child, random)] as const)
   return {
     fields: Object.fromEntries(built.map(([name, field]) => [name, field.schema])),

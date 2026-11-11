@@ -765,10 +765,72 @@ describe("pathIsRequired", () => {
       false,
     ],
     ["a checked struct", Address.check(Schema.makeFilter(() => true)), ["city"], false],
+    // A path reaches the guard by the names it's sent with: a renamed key by its stored name, which
+    // is what the request removes (#238). Its own name isn't stored, so removing it leaves the row.
     [
-      "a struct whose keys are renamed",
+      "a struct whose keys are renamed, a renamed key by its own name",
       Address.pipe(Schema.encodeKeys({ city: "City" })),
       ["city"],
+      false,
+    ],
+    [
+      "a struct whose keys are renamed, a required key by its stored name",
+      Address.pipe(Schema.encodeKeys({ city: "City" })),
+      ["City"],
+      true,
+    ],
+    [
+      "a struct whose keys are renamed, an optional key by its stored name",
+      Address.pipe(Schema.encodeKeys({ zip: "Zip" })),
+      ["Zip"],
+      false,
+    ],
+    [
+      "a key renamed with a decoding default, by its stored name",
+      Schema.Struct({
+        city: Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("c"))),
+      }).pipe(Schema.encodeKeys({ city: "City" })),
+      ["City"],
+      false,
+    ],
+    [
+      "keys renamed onto each other's names: a, which holds the optional b",
+      Schema.Struct({ a: Schema.String, b: Schema.optional(Schema.String) }).pipe(
+        Schema.encodeKeys({ a: "b", b: "a" }),
+      ),
+      ["a"],
+      false,
+    ],
+    [
+      "keys renamed onto each other's names: b, which holds the required a",
+      Schema.Struct({ a: Schema.String, b: Schema.optional(Schema.String) }).pipe(
+        Schema.encodeKeys({ a: "b", b: "a" }),
+      ),
+      ["b"],
+      true,
+    ],
+    [
+      "below a renamed key",
+      Schema.Struct({ a: Address }).pipe(Schema.encodeKeys({ a: "A" })),
+      ["A", "city"],
+      true,
+    ],
+    [
+      "a class over a struct whose keys are renamed",
+      (() => {
+        class Renamed extends Schema.Class<Renamed>("PIRRenamed")(
+          // A class takes a struct whose keys are renamed, though its type names only a bare one.
+          Address.pipe(Schema.encodeKeys({ city: "City" })) as unknown as typeof Address,
+        ) {}
+        return Renamed
+      })(),
+      ["City"],
+      true,
+    ],
+    [
+      "a checked struct whose keys are renamed",
+      Address.pipe(Schema.encodeKeys({ city: "City" })).check(Schema.makeFilter(() => true)),
+      ["City"],
       false,
     ],
     [
@@ -879,6 +941,22 @@ describe("pathIsRequired, against the update's other clauses in the field (#238)
     // makes it 1.40.0's, which didn't model a record keyed by template literals.
     ["a record's other key", records, ["fixed-k", 0], [["open-j"]], true],
     ["the same key's other position", records, ["fixed-k", 0], [["fixed-k", 2]], false],
+    // Below a struct renaming its keys, which 1.40.0 didn't judge: unjudged once another clause
+    // changes what the position's judgement reads (#238).
+    [
+      "a position below a renamed key, alone",
+      Schema.Struct({ p: T2 }).pipe(Schema.encodeKeys({ p: "q" })),
+      ["q", 0],
+      [],
+      true,
+    ],
+    [
+      "a position below a renamed key, beside another position",
+      Schema.Struct({ p: T2 }).pipe(Schema.encodeKeys({ p: "q" })),
+      ["q", 0],
+      [["q", 2]],
+      false,
+    ],
     // A property's judgement reads nothing of the row.
     [
       "a property, beside its sibling",

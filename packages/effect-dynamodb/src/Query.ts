@@ -35,7 +35,7 @@ import {
   packedExprRefusal,
   packedProjectionRefusal,
 } from "./internal/Packed.js"
-import { compilePath, storedPath } from "./internal/PathBuilder.js"
+import { compilePath, type StoredBelow, storedPath } from "./internal/PathBuilder.js"
 import {
   canonicalJson,
   compositePlanner,
@@ -1263,29 +1263,130 @@ export const projectRow = (
 }
 
 /**
+ * How a projected value's names are handed back by {@link respelled}: under each name a selected
+ * path was projected by, the name it was written with and what's below it; a list's elements by
+ * one plan, whatever their positions (a projection closes a list up).
+ */
+type Respelling = {
+  readonly names: Map<string, { written: string; readonly below: Respelling }>
+  element?: Respelling
+}
+
+/**
+ * @internal How the values a select of `paths` projects are handed back by the names each was
+ * selected by (#238): a path whose segments below its field a struct stores under other names
+ * (`Schema.encodeKeys`) is projected by those ({@link storedPath}), and its value is handed back
+ * under the names written. Each of `paths` as written, beside it as stored, below the field. A name
+ * two paths wrote differently is handed back as stored. `undefined` when nothing is renamed: the
+ * values are handed back as they come.
+ */
+export const respelling = (
+  paths: ReadonlyArray<{
+    readonly written: ReadonlyArray<string | number>
+    readonly stored: ReadonlyArray<string | number>
+  }>,
+): Respelling | undefined => {
+  const root: Respelling = { names: new Map() }
+  let renamed = false
+  for (const { written, stored } of paths) {
+    let node = root
+    for (const [i, segment] of stored.entries()) {
+      if (typeof segment === "number") {
+        node.element ??= { names: new Map() }
+        node = node.element
+        continue
+      }
+      const spelled = written[i]
+      const name = typeof spelled === "string" ? spelled : segment
+      if (name !== segment) renamed = true
+      const step = node.names.get(segment)
+      if (step === undefined) {
+        const below: Respelling = { names: new Map() }
+        node.names.set(segment, { written: name, below })
+        node = below
+      } else {
+        if (step.written !== name) step.written = segment
+        node = step.below
+      }
+    }
+  }
+  return renamed ? root : undefined
+}
+
+/** @internal `value`, projected by stored names, handed back as {@link respelling} says. */
+export const respelled = (value: unknown, plan: Respelling | undefined): unknown => {
+  if (plan === undefined) return value
+  if (Array.isArray(value)) {
+    const element = plan.element
+    return element === undefined ? value : value.map((held) => respelled(held, element))
+  }
+  if (!isPlainMap(value) || plan.names.size === 0) return value
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(value)) {
+    const step = plan.names.get(key)
+    Object.defineProperty(out, step?.written ?? key, {
+      value: step === undefined ? value[key] : respelled(value[key], step.below),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+  }
+  return out
+}
+
+/**
+ * @internal Each head's {@link respelling}, for the paths `paths` selected, each stored as
+ * `storedOf` names it.
+ */
+export const respellings = (
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  storedOf: (path: ReadonlyArray<string | number>) => ReadonlyArray<string | number>,
+): ReadonlyMap<string, Respelling> => {
+  const byHead = new Map<
+    string,
+    Array<{
+      readonly written: ReadonlyArray<string | number>
+      readonly stored: ReadonlyArray<string | number>
+    }>
+  >()
+  for (const path of paths) {
+    const head = String(path[0])
+    const held = byHead.get(head) ?? []
+    held.push({ written: path.slice(1), stored: storedOf(path).slice(1) })
+    byHead.set(head, held)
+  }
+  const out = new Map<string, Respelling>()
+  for (const [head, held] of byHead) {
+    const plan = respelling(held)
+    if (plan !== undefined) out.set(head, plan)
+  }
+  return out
+}
+
+/**
  * @internal `select` / `selectPaths` of DOMAIN field names on an entity that
- * stores some under other names (`DynamoModel.configure(..., { field })`): the
- * projection names the stored attributes, and each item is handed back keyed
- * by the domain names asked for (#133).
+ * stores some under other names (`DynamoModel.configure(..., { field })`, or a
+ * struct's `Schema.encodeKeys` below one, #238): the projection names the
+ * stored attributes, and each item is handed back keyed by the domain names
+ * asked for (#133).
  */
 export const selectRenamed = <A>(
   self: Query<A>,
   paths: ReadonlyArray<ReadonlyArray<string | number>>,
   resolveDbName: (domainName: string) => string,
+  below?: StoredBelow,
 ): Query<Record<string, unknown>> => {
   const heads = [...new Set(paths.map((path) => String(path[0])))]
-  return selectProjected(
-    self,
-    paths.map((path) => storedPath(path, resolveDbName)),
-    (raw) => {
-      const item: Record<string, unknown> = {}
-      for (const head of heads) {
-        const value = raw[resolveDbName(head)]
-        if (value !== undefined) item[head] = value
-      }
-      return item
-    },
-  )
+  const storedOf = (path: ReadonlyArray<string | number>) => storedPath(path, resolveDbName, below)
+  const plans = respellings(paths, storedOf)
+  return selectProjected(self, paths.map(storedOf), (raw) => {
+    const item: Record<string, unknown> = {}
+    for (const head of heads) {
+      const value = raw[resolveDbName(head)]
+      if (value !== undefined) item[head] = respelled(value, plans.get(head))
+    }
+    return item
+  })
 }
 
 /**

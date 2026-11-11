@@ -14,6 +14,7 @@ import {
   type Path,
   PathTag,
   type SizeOperand,
+  type StoredBelow,
 } from "./PathBuilder.js"
 
 // ---------------------------------------------------------------------------
@@ -451,6 +452,7 @@ export interface CompileResult {
 export const compileExpr = (
   expr: Expr,
   resolveDbName?: (name: string) => string,
+  below?: StoredBelow,
 ): CompileResult => {
   // Every user-facing entry point refuses these with a `ValidationError`
   // before compiling (#133); reaching here with one is a library bug, and
@@ -466,14 +468,14 @@ export const compileExpr = (
   const compileOperand = (op: Operand): string => {
     switch (op._tag) {
       case "path":
-        return compilePath(op.segments, names, "e", counter, resolveDbName)
+        return compilePath(op.segments, names, "e", counter, resolveDbName, below)
       case "value": {
         const key = `:e${counter.value++}`
         values[key] = toAttributeValue(op.value)
         return key
       }
       case "size":
-        return `size(${compilePath(op.segments, names, "e", counter, resolveDbName)})`
+        return `size(${compilePath(op.segments, names, "e", counter, resolveDbName, below)})`
     }
   }
 

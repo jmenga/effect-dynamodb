@@ -206,7 +206,7 @@ import {
   type PackedAttributeGuard,
   unregisteredCodecError,
 } from "./internal/Packed.js"
-import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
+import { createPathBuilder, type PathModel, type StoredBelow } from "./internal/PathBuilder.js"
 import {
   type OutboxCandidate,
   physicalTableName,
@@ -1378,8 +1378,12 @@ const planZOrderWithin = <A>(args: {
   )
 
   const renameExpr =
-    entityNaming(entityLike._resolveDbName, undefined, wholeRowsOf(entityLike)).renameExpr ??
-    ((expr: Expr) => expr)
+    entityNaming(
+      entityLike._resolveDbName,
+      undefined,
+      wholeRowsOf(entityLike),
+      entityLike._storedBelow,
+    ).renameExpr ?? ((expr: Expr) => expr)
   const filter =
     filters.length === 0
       ? undefined
@@ -2435,6 +2439,8 @@ interface EntityLike {
   /** The sparse map a read takes a stored attribute for, if any (#238). */
   readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
   readonly _entryForms?: ((expr: Expr) => Expr) | undefined
+  /** The segments below a path's first as they're stored (#238). */
+  readonly _storedBelow?: StoredBelow | undefined
   /**
    * The entity's refs: a `${ref}Id` composite is not stored on the item, but
    * the ref it names is, as a map holding the referenced identifier.
@@ -2963,6 +2969,7 @@ const makeFromConfig = (config: {
             entityLike._resolveDbName,
             entityLike._storedFormAt,
             wholeRowsOf(entityLike),
+            entityLike._storedBelow,
           ),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
@@ -2987,6 +2994,7 @@ const makeFromConfig = (config: {
                 entityLike._resolveDbName,
                 entityLike._storedFormAt,
                 wholeRowsOf(entityLike),
+                entityLike._storedBelow,
               ),
               operation,
             }),
@@ -3098,6 +3106,7 @@ const makeFromConfig = (config: {
             entityLike._resolveDbName,
             entityLike._storedFormAt,
             wholeRowsOf(entityLike),
+            entityLike._storedBelow,
           ),
           operation: { name: "Entity.scan", target: entityLike.entityType },
         }
@@ -3258,6 +3267,7 @@ const makeFromConfig = (config: {
               fields: domainFieldsOf(m.entityLike),
               storedAt: m.entityLike._storedFormAt,
               wholeRows: wholeRowsOf(m.entityLike),
+              below: m.entityLike._storedBelow,
             })),
           ),
           operation: { name: "Collection.query", target: collName },

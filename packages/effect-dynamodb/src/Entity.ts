@@ -82,6 +82,7 @@ import {
   pathIsRequired,
   readersAt,
   rowOmits,
+  storedSegments,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { CANT_SAY } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
@@ -185,6 +186,7 @@ import {
   entryOfPath,
   type PathModel,
   storedPath,
+  type StoredBelow,
   withEntry,
 } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
@@ -889,6 +891,12 @@ export interface Entity<
    * `field:` rename stores whole ask the row where it holds the map (#238); any other as given.
    */
   readonly _entryForms: (expr: Expr) => Expr
+
+  /**
+   * @internal The segments below a path's first as they're stored, given the path as written: a
+   * property of a struct that renames its keys as it's stored, by its stored name (#238).
+   */
+  readonly _storedBelow: StoredBelow
 
   /** @internal Entity schema version baked into composed keys. */
   readonly _entityVersion: number
@@ -2196,6 +2204,7 @@ const compileCondition = (
   cond: Expr | ConditionInput | undefined,
   resolveDbNameFn: (name: string) => string,
   storedFormAt: StoredFormAt,
+  below?: StoredBelow,
 ):
   | {
       expression: string
@@ -2205,7 +2214,7 @@ const compileCondition = (
   | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond)
-  return compileExpr(operandsAsStored(expr, storedFormAt), resolveDbNameFn)
+  return compileExpr(operandsAsStored(expr, storedFormAt), resolveDbNameFn, below)
 }
 
 /** Name a get- or delete-shaped op for consumed-capacity reports (its builder carries it). */
@@ -2741,6 +2750,7 @@ const makeImpl = <
       cond === undefined ? undefined : entryForms(operandsAsStored(toExpr(cond), storedFormAt)),
       resolveDbName,
       storedFormAt,
+      storedBelow,
     )
   // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
   // record-based `append`, which bypass the update schema (#133).
@@ -3136,6 +3146,27 @@ const makeImpl = <
 
   const modelFieldSchemas = data.modelFields as globalThis.Record<string, Schema.Top>
   const isModelField = (name: string): boolean => Object.hasOwn(modelFieldSchemas, name)
+  /**
+   * The segments below a path's first as they're stored (#238), given the path as written: each
+   * named through the model's schema below its field ({@link storedSegments}), so a property of a
+   * struct that renames its keys as it's stored is named as stored. Below a sparse map's entry
+   * (one `.entry()` built, or an entry's attribute no field is named as), through the map's own
+   * schema from the entry's key. The one place a path below its field is named, for an update's
+   * path operations, a condition, a filter and a projection alike; anything else as written.
+   */
+  const storedBelow: StoredBelow = (segments) => {
+    const rest = segments.slice(1)
+    const head = segments[0]
+    if (rest.length === 0 || typeof head !== "string") return rest
+    const entry =
+      entryOfPath(segments) ?? (isModelField(head) ? undefined : sparseEntries.entryOf(head))
+    if (entry !== undefined) {
+      return isModelField(entry.field)
+        ? storedSegments(modelFieldSchemas[entry.field]!, [entry.key, ...rest]).slice(1)
+        : rest
+    }
+    return isModelField(head) ? storedSegments(modelFieldSchemas[head]!, rest) : rest
+  }
   const modelFieldStoredIn = (attribute: string): string | undefined =>
     Object.keys(modelFieldSchemas).find((field) => resolveDbName(field) === attribute)
   const fieldOfAttribute = (attribute: string): string => modelFieldStoredIn(attribute) ?? attribute
@@ -4255,8 +4286,10 @@ const makeImpl = <
     row: globalThis.Record<string, AttributeValue>,
     segments: ReadonlyArray<string | number>,
   ): boolean => {
-    const [head, ...below] = storedPath(segments, (name) =>
-      name.includes("#") ? name : resolveDbName(name),
+    const [head, ...below] = storedPath(
+      segments,
+      (name) => (name.includes("#") ? name : resolveDbName(name)),
+      storedBelow,
     )
     if (typeof head !== "string" || !Object.hasOwn(row, head)) return false
     let at: AttributeValue | undefined = row[head]
@@ -4338,7 +4371,7 @@ const makeImpl = <
           ...path,
         ])
         if (
-          pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...segments.slice(1)], {
+          pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...storedBelow(segments)], {
             beside,
             judgedBefore: false,
           })
@@ -4354,8 +4387,9 @@ const makeImpl = <
         continue
       }
       if (derivedFrom(head) !== undefined) continue
+      // Judged by the names the request removes it by (#238).
       const beside = besideOf(index, clauseAt(segments))
-      if (pathIsRequired(modelFieldSchemas[head]!, segments.slice(1), { beside })) {
+      if (pathIsRequired(modelFieldSchemas[head]!, storedBelow(segments), { beside })) {
         return required(segments)
       }
     }
@@ -4398,8 +4432,9 @@ const makeImpl = <
 
   /**
    * Every clause of an update: where it writes or removes ({@link clauseAt},
-   * {@link recordClausesAt}), and the path inside there (`[]` for all of it). A `pathRemove`
-   * carries its index, so a removal's judgement leaves itself out.
+   * {@link recordClausesAt}), and the path inside there (`[]` for all of it), by the names it's
+   * sent with ({@link storedBelow}). A `pathRemove` carries its index, so a removal's judgement
+   * leaves itself out.
    */
   const clausesOf = (
     uState: UpdateState,
@@ -4437,11 +4472,11 @@ const makeImpl = <
       uState.pathDeletes,
     ]) {
       for (const { segments } of ops ?? []) {
-        out.push({ at: clauseAt(segments), path: segments.slice(1) })
+        out.push({ at: clauseAt(segments), path: storedBelow(segments) })
       }
     }
     for (const [removal, segments] of (uState.pathRemoves ?? []).entries()) {
-      out.push({ at: clauseAt(segments), path: segments.slice(1), removal })
+      out.push({ at: clauseAt(segments), path: storedBelow(segments), removal })
     }
     for (const { field, keys } of uState.sparseRemoveEntries ?? []) {
       const prefix = Object.hasOwn(sparseFields, field) ? sparseFields[field]!.prefix : field
@@ -10590,17 +10625,19 @@ const makeImpl = <
       const pathOf = (segments: ReadonlyArray<string | number>, prefix: string): string => {
         const entry = renamedEntryAt(segments)
         if (entry === undefined) {
-          return compilePath(segments, names, prefix, pathCounter, resolveDbName)
+          return compilePath(segments, names, prefix, pathCounter, resolveDbName, storedBelow)
         }
+        // Below the entry, named as stored, through the map's own schema.
+        const rest = storedBelow([entry.field, entry.key, ...entry.rest]).slice(1)
         return entryForm(entry.field) === "whole"
           ? compilePath(
-              [renamedMapAttribute(entry.field)!, entry.key, ...entry.rest],
+              [renamedMapAttribute(entry.field)!, entry.key, ...rest],
               names,
               prefix,
               pathCounter,
             )
           : compilePath(
-              [`${sparseFields[entry.field]!.prefix}#${entry.key}`, ...entry.rest],
+              [`${sparseFields[entry.field]!.prefix}#${entry.key}`, ...rest],
               names,
               prefix,
               pathCounter,
@@ -10809,7 +10846,7 @@ const makeImpl = <
         const fallbackCounter = { value: 0 }
         for (const fallback of operands.fallbacks) {
           condParts.push(
-            `attribute_exists(${compilePath(fallback.segments, names, "fb", fallbackCounter, resolveDbName)})`,
+            `attribute_exists(${compilePath(fallback.segments, names, "fb", fallbackCounter, resolveDbName, storedBelow)})`,
           )
         }
       }
@@ -18862,6 +18899,7 @@ const makeImpl = <
     _toDomainView: toDomainView,
     _sparseMapOf: sparseMapOf,
     _entryForms: entryForms,
+    _storedBelow: storedBelow,
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
@@ -19147,7 +19185,12 @@ export const bind = <
         pathBuilder: createPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
-        ...entityNaming(entity._resolveDbName, entity._storedFormAt, wholeRowsOf(entity)),
+        ...entityNaming(
+          entity._resolveDbName,
+          entity._storedFormAt,
+          wholeRowsOf(entity),
+          entity._storedBelow,
+        ),
         operation: { name: operation, target: entity.entityType },
       }
       return new BoundQueryImpl(
@@ -19518,7 +19561,12 @@ export const bind = <
           provide,
           skFields: orderBy ? [orderBy] : [],
           composeSkCondition,
-          ...entityNaming(entity._resolveDbName, entity._storedFormAt, wholeRowsOf(entity)),
+          ...entityNaming(
+            entity._resolveDbName,
+            entity._storedFormAt,
+            wholeRowsOf(entity),
+            entity._storedBelow,
+          ),
           operation: { name: "Entity.history", target: entity.entityType },
         }
         return new BoundQueryImpl(q, bqConfig)

@@ -1300,6 +1300,283 @@ export const holdsAbsentValue = (
 export const rowCanLack = (field: Schema.Top): boolean =>
   rowOmits(field) || absentReading(field) !== undefined
 
+// ---------------------------------------------------------------------------
+// The names a path's segments are stored under (#238)
+// ---------------------------------------------------------------------------
+
+/**
+ * A struct that renames its keys as it's stored (`Schema.encodeKeys`): each property's stored
+ * name, by its own, and the property each stored name holds.
+ */
+interface KeyRenames {
+  readonly storedName: ReadonlyMap<string, string>
+  readonly holding: ReadonlyMap<string, SchemaAST.PropertySignature>
+}
+
+const keyRenamesFound = new WeakMap<SchemaAST.Objects, KeyRenames | null>()
+
+/**
+ * The key renames of a struct whose one encoding step only renames its keys, as
+ * `Schema.encodeKeys` builds it: properties alone, encoded to a struct of as many by a step of two
+ * plain functions. Effect keeps the mapping inside those functions, so they're asked: each
+ * property is given a marker of its own, and the step renames keys when what it encodes holds each
+ * marker once, under a property of the stored struct, and what it decodes from that holds each
+ * back under its own name. `undefined` for anything else: a node whose stored names aren't known.
+ */
+const keyRenamesOf = (ast: SchemaAST.Objects): KeyRenames | undefined => {
+  const found = keyRenamesFound.get(ast)
+  if (found !== undefined) return found ?? undefined
+  const renames = probeKeyRenames(ast)
+  keyRenamesFound.set(ast, renames ?? null)
+  return renames
+}
+
+const isMapValue = (value: unknown): value is globalThis.Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
+const probeKeyRenames = (ast: SchemaAST.Objects): KeyRenames | undefined => {
+  const [link, ...more] = ast.encoding ?? []
+  if (link === undefined || more.length > 0 || ast.indexSignatures.length > 0) return undefined
+  const to = link.to
+  if (!SchemaAST.isObjects(to) || !bare(to) || to.indexSignatures.length > 0) return undefined
+  const step = link.transformation as {
+    readonly _tag: string
+    readonly encode?: { readonly _tag?: string; readonly transform?: (input: unknown) => unknown }
+    readonly decode?: { readonly _tag?: string; readonly transform?: (input: unknown) => unknown }
+  }
+  if (
+    step._tag !== "Transformation" ||
+    step.encode?._tag !== "Transform" ||
+    step.decode?._tag !== "Transform" ||
+    typeof step.encode.transform !== "function" ||
+    typeof step.decode.transform !== "function"
+  ) {
+    return undefined
+  }
+  const names = ast.propertySignatures.map((property) => property.name)
+  const storedNames = new Set(to.propertySignatures.map((property) => property.name))
+  if (
+    names.length === 0 ||
+    names.length !== storedNames.size ||
+    !names.every((name) => typeof name === "string") ||
+    ![...storedNames].every((name) => typeof name === "string")
+  ) {
+    return undefined
+  }
+  const marked = (keys: ReadonlyArray<string>, mark: (key: string) => object) => {
+    const value: globalThis.Record<string, unknown> = {}
+    for (const key of keys) {
+      Object.defineProperty(value, key, {
+        value: mark(key),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      })
+    }
+    return value
+  }
+  const markers = new Map((names as ReadonlyArray<string>).map((name) => [name, {}]))
+  const ownerOf = new Map([...markers].map(([name, marker]) => [marker as unknown, name]))
+  let encoded: unknown
+  try {
+    encoded = step.encode.transform(marked(names as ReadonlyArray<string>, (n) => markers.get(n)!))
+  } catch {
+    return undefined
+  }
+  if (!isMapValue(encoded)) return undefined
+  const keys = Reflect.ownKeys(encoded)
+  if (keys.length !== names.length) return undefined
+  const storedName = new Map<string, string>()
+  for (const key of keys) {
+    if (typeof key !== "string" || !storedNames.has(key)) return undefined
+    const owner = ownerOf.get(encoded[key])
+    if (owner === undefined || storedName.has(owner)) return undefined
+    storedName.set(owner, key)
+  }
+  // And back: what's stored under each name is read as the property it was written for.
+  const byStored = new Map([...storedName].map(([name, stored]) => [stored, name]))
+  let decoded: unknown
+  try {
+    decoded = step.decode.transform(
+      marked([...byStored.keys()], (s) => markers.get(byStored.get(s)!)!),
+    )
+  } catch {
+    return undefined
+  }
+  if (!isMapValue(decoded) || Reflect.ownKeys(decoded).length !== names.length) return undefined
+  for (const [name, marker] of markers) {
+    if (!Object.hasOwn(decoded, name) || decoded[name] !== marker) return undefined
+  }
+  return {
+    storedName,
+    holding: new Map(
+      ast.propertySignatures.map((property) => [
+        storedName.get(property.name as string)!,
+        property,
+      ]),
+    ),
+  }
+}
+
+/** Where a path segment leads from a node, by the name it's stored under. */
+type NameStep =
+  | {
+      readonly _tag: "Named"
+      readonly stored: string | number
+      readonly next: ReadonlyArray<SchemaAST.AST>
+    }
+  /** The node holds nothing under the segment (a scalar, a struct without it). */
+  | { readonly _tag: "Neutral" }
+  /** The node isn't one this knows the stored names of. */
+  | { readonly _tag: "Unknown" }
+
+const NEUTRAL: NameStep = { _tag: "Neutral" }
+const UNKNOWN: NameStep = { _tag: "Unknown" }
+
+/** The nodes a value read through `ast` is read by: each member of a union, what a suspension holds. */
+const namingNodes = (ast: SchemaAST.AST, into: Array<SchemaAST.AST>, seen: Set<SchemaAST.AST>) => {
+  if (seen.has(ast)) return
+  seen.add(ast)
+  if (SchemaAST.isUnion(ast) && ast.encoding === undefined) {
+    for (const member of ast.types) namingNodes(member, into, seen)
+  } else if (SchemaAST.isSuspend(ast) && ast.encoding === undefined) {
+    namingNodes(ast.thunk(), into, seen)
+  } else {
+    into.push(ast)
+  }
+}
+
+const namingStep = (node: SchemaAST.AST, segment: string | number): NameStep => {
+  if (SchemaAST.isDeclaration(node)) {
+    // A `Schema.Class`: stored as the struct it's encoded to.
+    const [link, ...more] = node.encoding ?? []
+    const step = link?.transformation as
+      | { readonly _tag: string; readonly decode?: { readonly _tag?: string } }
+      | undefined
+    if (
+      link === undefined ||
+      more.length > 0 ||
+      !SchemaAST.isObjects(link.to) ||
+      step?._tag !== "Transformation" ||
+      step.decode?._tag !== "Transform"
+    ) {
+      return UNKNOWN
+    }
+    return namingStep(link.to, segment)
+  }
+  if (SchemaAST.isObjects(node)) {
+    if (node.encoding === undefined) {
+      if (typeof segment !== "string") return NEUTRAL
+      const property = node.propertySignatures.find((signature) => signature.name === segment)
+      if (property !== undefined) return { _tag: "Named", stored: segment, next: [property.type] }
+      const reading: Array<SchemaAST.AST> = []
+      for (const signature of node.indexSignatures) {
+        if (!signatureKey(signature.parameter)) return UNKNOWN
+        if (keyMatches(signature.parameter, segment)) reading.push(signature.type)
+      }
+      return reading.length > 0 ? { _tag: "Named", stored: segment, next: reading } : NEUTRAL
+    }
+    const renames = keyRenamesOf(node)
+    if (renames === undefined) return UNKNOWN
+    if (typeof segment !== "string") return NEUTRAL
+    // A stored name is sent as it is, even one that's also another property's own name.
+    const held = renames.holding.get(segment)
+    if (held !== undefined) return { _tag: "Named", stored: segment, next: [held.type] }
+    const stored = renames.storedName.get(segment)
+    if (stored === undefined) return NEUTRAL
+    const property = node.propertySignatures.find((signature) => signature.name === segment)!
+    return { _tag: "Named", stored, next: [property.type] }
+  }
+  if (SchemaAST.isArrays(node)) {
+    if (node.encoding !== undefined) return UNKNOWN
+    if (typeof segment !== "number") return NEUTRAL
+    if (node.rest.length > 1) return UNKNOWN
+    const element = node.elements[segment] ?? node.rest[0]
+    return element === undefined ? NEUTRAL : { _tag: "Named", stored: segment, next: [element] }
+  }
+  return SCALARS.has(node._tag) || node._tag === "Never" ? NEUTRAL : UNKNOWN
+}
+
+/**
+ * The path below a field as it's stored (#238): each segment that is a property's own name, in a
+ * struct that renames its keys as it's stored (`Schema.encodeKeys`), becomes the name it's stored
+ * under, so a path names what `put` stored and a read takes. This is the one place that says how
+ * a path below a field is named, for an update's path operations, a condition, a filter and a
+ * projection alike.
+ *
+ * A segment that is a name a property is stored under is kept as it is, even where it's also
+ * another property's own name: `encodeKeys({ a: "b", b: "a" })` stores property `b` under `a`, and
+ * the segment `a` names what's stored under `a`, property `b`, as 1.40.0 named it. Every name that
+ * reached a stored attribute before is unchanged.
+ *
+ * The walk follows unions (every member that holds the segment must name it alike), suspensions,
+ * `Schema.Class` structs, records and lists. From a node it doesn't know the stored names of (any
+ * other transformation, a declaration, `Schema.Unknown`), and where a union's members disagree,
+ * the rest of the path is kept as it is, as it was before.
+ */
+export const storedSegments = (
+  field: Schema.Top,
+  segments: ReadonlyArray<string | number>,
+): ReadonlyArray<string | number> => {
+  let ways: ReadonlyArray<SchemaAST.AST> = [field.ast]
+  const out: Array<string | number> = []
+  for (const [i, segment] of segments.entries()) {
+    const nodes: Array<SchemaAST.AST> = []
+    const seen = new Set<SchemaAST.AST>()
+    for (const way of ways) namingNodes(way, nodes, seen)
+    let stored: string | number | undefined
+    const next: Array<SchemaAST.AST> = []
+    for (const node of nodes) {
+      const step = namingStep(node, segment)
+      if (step._tag === "Neutral") continue
+      if (step._tag === "Unknown" || (stored !== undefined && stored !== step.stored)) {
+        return [...out, ...segments.slice(i)]
+      }
+      stored = step.stored
+      next.push(...step.next)
+    }
+    if (stored === undefined) return [...out, ...segments.slice(i)]
+    out.push(stored)
+    ways = next
+  }
+  return out
+}
+
+/**
+ * A struct that renames its keys as it's stored, as the guard models it (#238): a struct of the
+ * same properties under their stored names. Reading one is reading the stored struct, then the
+ * properties renamed, then the struct, which reads a property as this does under its stored name.
+ */
+const renamedViews = new WeakMap<SchemaAST.Objects, SchemaAST.Objects | null>()
+/** The views {@link renamedStruct} built: a way through one is one 1.40.0 didn't judge. */
+const isRenamedView = new WeakSet<SchemaAST.Objects>()
+
+const renamedStruct = (ast: SchemaAST.Objects): SchemaAST.Objects | undefined => {
+  const found = renamedViews.get(ast)
+  if (found !== undefined) return found ?? undefined
+  const renames =
+    ast.checks === undefined &&
+    (ast as { readonly encodingChecks?: unknown }).encodingChecks === undefined
+      ? keyRenamesOf(ast)
+      : undefined
+  const view =
+    renames === undefined
+      ? undefined
+      : new SchemaAST.Objects(
+          ast.propertySignatures.map(
+            (property) =>
+              new SchemaAST.PropertySignature(
+                renames.storedName.get(property.name as string)!,
+                property.type,
+              ),
+          ),
+          [],
+        )
+  if (view !== undefined) isRenamedView.add(view)
+  renamedViews.set(ast, view ?? null)
+  return view
+}
+
 /**
  * A node the removal guard models exactly as a read decodes it. A removal below a field is
  * refused only when the walk from the field to the removed property or position passes through
@@ -1317,10 +1594,16 @@ export const rowCanLack = (field: Schema.Top): boolean =>
  * - a scalar (`null`, `undefined`, a string, number, boolean, bigint or symbol, a literal, a
  *   unique symbol, an enum, a template literal), which holds no path;
  * - a `Schema.Class`, as its struct;
- * - a `Schema.suspend`, as what it suspends, looked at before it's unwrapped.
+ * - a `Schema.suspend`, as what it suspends, looked at before it's unwrapped;
+ * - a struct that renames its keys as it's stored (`Schema.encodeKeys`), as the struct of its
+ *   properties under their stored names ({@link renamedStruct}). A path reaches the guard by the
+ *   names it's sent with ({@link storedSegments}), so it judges what the request removes (#238).
+ *   1.40.0 judged nothing below one, so where another clause of the update changes what a
+ *   position's judgement reads, nothing below one is judged ({@link lengthsAlone}).
  *
- * Each only when it carries no transformation (a decoding default and a key rename are ones) and
- * no check (`checks` or `encodingChecks`). A constructor default takes no part in a read.
+ * Each only when it carries no transformation (a decoding default is one; a key rename is one but
+ * for the struct above) and no check (`checks` or `encodingChecks`). A constructor default takes no
+ * part in a read.
  * Anything else is unknown: `Schema.Unknown`, `Schema.Any`, a declaration, a record keyed by
  * anything else, a struct with an index signature, a tuple with elements after its rest, a
  * transformed or checked node, and any node kind this doesn't know.
@@ -1376,6 +1659,10 @@ const keyMatches = (parameter: SchemaAST.AST, key: string): boolean =>
 /** What the guard models a node as ({@link Modelled}), or `undefined` for one it doesn't. */
 const modelled = (ast: SchemaAST.AST): Modelled | undefined => {
   if (SchemaAST.isDeclaration(ast)) return classStruct(ast)
+  if (SchemaAST.isObjects(ast) && ast.encoding !== undefined) {
+    const view = renamedStruct(ast)
+    return view === undefined ? undefined : { _tag: "Struct", ast: view }
+  }
   if (!bare(ast)) return undefined
   switch (ast._tag) {
     case "Objects": {
@@ -1460,8 +1747,9 @@ type Way = {
   readonly end: End
   readonly structs: ReadonlyArray<SchemaAST.Objects | undefined>
   /**
-   * Whether the way passed a record 1.40.0 didn't model (several index signatures, or a key
-   * that's a template literal), which 1.40.0 judged nothing below ({@link lengthsAlone}).
+   * Whether the way passed a node 1.40.0 didn't model (a record with several index signatures, or
+   * a key that's a template literal; a struct that renames its keys as they're stored), which
+   * 1.40.0 judged nothing below ({@link lengthsAlone}).
    */
   readonly since140?: true
 }
@@ -1498,9 +1786,16 @@ const waysOf = (
     return
   }
   if (node._tag === "Struct" && typeof head === "string") {
+    // A struct renaming its keys as it's stored, which 1.40.0 didn't model (#238).
+    const struct = isRenamedView.has(node.ast) ? true : since140
     const property = node.ast.propertySignatures.find((signature) => signature.name === head)
-    if (property === undefined) ways.push({ end: { _tag: "Unread" }, structs: here, ...mark })
-    else waysOf(property.type, rest, ways, here, new Set(), since140)
+    if (property === undefined) {
+      ways.push({
+        end: { _tag: "Unread" },
+        structs: here,
+        ...(struct === undefined ? {} : { since140: struct }),
+      })
+    } else waysOf(property.type, rest, ways, here, new Set(), struct)
   } else if (node._tag === "Record" && typeof head === "string") {
     // A key every matching signature reads: each is a way, and a value there is one all of them
     // read, so a removal any of them refuses leaves a row the record refuses. Judging them as
@@ -1867,7 +2162,9 @@ export type OperandKind = "value" | "elements"
  * the read's own. Above it, each segment is taken as DynamoDB takes it:
  *
  * - a struct's property, declared on the struct. One it doesn't declare isn't read at all, so any
- *   value there reads, and neither can `__proto__` be judged;
+ *   value there reads, and neither can `__proto__` be judged. A struct that renames its keys as
+ *   it's stored (`Schema.encodeKeys`) reads a property by its stored form first, and can't be said
+ *   exactly;
  * - a record's value, under any key but `__proto__`, for a record of one signature keyed by
  *   `Schema.String` (any other record can't be said exactly);
  * - a list's element. Below the end, an element that is there: the tuple's at that position, or
@@ -1905,6 +2202,10 @@ const readersBelow = (
   }
   if (node._tag === "Struct") {
     if (typeof head !== "string") return true
+    // A struct that renames its keys as it's stored reads each property by its stored form first,
+    // which a reader of the property alone doesn't see (a `catchDecoding` reads what that refuses):
+    // it can't be said exactly, as this walk never said it.
+    if (isRenamedView.has(node.ast)) return false
     const property = node.ast.propertySignatures.find((signature) => signature.name === head)
     return property !== undefined && head !== "__proto__"
       ? readersBelow(property.type, rest, readers)

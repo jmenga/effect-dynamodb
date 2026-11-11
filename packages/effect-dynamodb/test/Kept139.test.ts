@@ -5,8 +5,8 @@
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
- * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts` (the last
- * four against 1.40.0). Connected twin:
+ * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
+ * `helpers/NestedKeyEncodings.ts` (the last five against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -17,6 +17,7 @@ import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import { openRecordingTable } from "./helpers/Kept139.js"
+import { nestedKeyCollectionSuite, nestedKeyEncodingsSuite } from "./helpers/NestedKeyEncodings.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
 import { pathClearSuite } from "./helpers/PathClears.js"
@@ -84,4 +85,12 @@ describe("a pathRemove beside another clause in the same field", () => {
 
 describe("a sparse map a field: rename stores whole", () => {
   renamedSparseMapSuite(openRecordingTable)
+})
+
+describe("a path below a struct that renames its keys as they're stored", () => {
+  nestedKeyEncodingsSuite(openRecordingTable)
+})
+
+describe("a path below a struct that renames its keys, in a collection", () => {
+  nestedKeyCollectionSuite(openRecordingTable)
 })
