@@ -12,10 +12,14 @@
  *   model at that position, or by a reader there);
  * - and refused when there's none, or the readers would store it differently.
  *
- * An operand 1.40.0 stored as a row that reads is never refused or written otherwise.
+ * Only a schema issue is an answer: a reader or encoder that can't finish synchronously (an
+ * asynchronous step, a defect) says nothing of the value, and the operand is sent as 1.40.0 sent
+ * it (`SchemaIssue.issueOf`). An operand 1.40.0 stored as a row that reads is never refused or
+ * written otherwise.
  */
 
 import type { OperandKind } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { CANT_SAY, type CantSay, issueOf } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { Exit, Schema, type SchemaAST } from "effect"
 import { toAttributeValue } from "../Marshaller.js"
 import { asRead } from "./RoundTrip.js"
@@ -23,38 +27,39 @@ import { asRead } from "./RoundTrip.js"
 /** What an operand is written as, and the issue that refuses it (`undefined`: it's written). */
 export type OperandVerdict = { readonly encoded: unknown; readonly issue: unknown }
 
-/** A reader's verdict on a value as a read returns it: `undefined` when it decodes. */
+/**
+ * A reader's verdict on a value as a read returns it: `undefined` when it decodes, the issue when
+ * it refuses it, {@link CANT_SAY} when it can't finish synchronously.
+ */
 type Reader = (read: unknown) => unknown
 
+/** An encoder's form of a value: `undefined` on a schema issue, {@link CANT_SAY} when it can't finish. */
+type Encoder = (value: unknown) => { readonly form: unknown } | CantSay | undefined
+
 const readers = new WeakMap<SchemaAST.AST, Reader>()
-const encoders = new WeakMap<SchemaAST.AST, (value: unknown) => Exit.Exit<unknown, unknown>>()
+const encoders = new WeakMap<SchemaAST.AST, Encoder>()
 
 const readerOf = (ast: SchemaAST.AST): Reader => {
   const known = readers.get(ast)
   if (known !== undefined) return known
   const decode = Schema.decodeUnknownExit(Schema.make<Schema.Codec<unknown>>(ast))
-  const reader: Reader = (read) => {
-    try {
-      const exit = decode(read)
-      return Exit.isSuccess(exit) ? undefined : exit.cause
-    } catch (defect) {
-      return defect
-    }
-  }
+  const reader: Reader = (read) => issueOf(() => decode(read))
   readers.set(ast, reader)
   return reader
 }
 
-const encoderOf = (ast: SchemaAST.AST) => {
+const encoderOf = (ast: SchemaAST.AST): Encoder => {
   const known = encoders.get(ast)
   if (known !== undefined) return known
   const encode = Schema.encodeUnknownExit(Schema.make<Schema.Codec<unknown>>(ast))
-  const encoder = (value: unknown): Exit.Exit<unknown, unknown> => {
-    try {
-      return encode(value)
-    } catch (defect) {
-      return Exit.die(defect)
-    }
+  const encoder: Encoder = (value) => {
+    let exit: Exit.Exit<unknown, unknown> | undefined
+    const issue = issueOf(() => {
+      exit = encode(value)
+      return exit
+    })
+    if (issue === CANT_SAY) return CANT_SAY
+    return exit !== undefined && Exit.isSuccess(exit) ? { form: exit.value } : undefined
   }
   encoders.set(ast, encoder)
   return encoder
@@ -82,41 +87,54 @@ const storedBytes = (stored: unknown): string | undefined => {
 
 /**
  * The issue that refuses a value as read where `readers` read it, `undefined` when one of them
- * reads it. For elements, each element is read by one of them, and a value that isn't a list is
- * DynamoDB's to refuse.
+ * reads it, and {@link CANT_SAY} when none refuses it for certain. For elements, each element is
+ * read by one of them; an element refused for certain refuses the list, and a value that isn't a
+ * list is DynamoDB's to refuse.
  */
-const issueOf = (readers: ReadonlyArray<Reader>, kind: OperandKind, read: unknown): unknown => {
+const verdictOf = (readers: ReadonlyArray<Reader>, kind: OperandKind, read: unknown): unknown => {
   const one = (value: unknown): unknown => {
     let first: unknown
-    for (const [i, reader] of readers.entries()) {
+    let cantSay = false
+    for (const reader of readers) {
       const issue = reader(value)
       if (issue === undefined) return undefined
-      if (i === 0) first = issue
+      if (issue === CANT_SAY) cantSay = true
+      else first ??= issue
     }
-    return first
+    return cantSay ? CANT_SAY : first
   }
   if (kind === "value") return one(read)
   if (!Array.isArray(read)) return undefined
+  let cantSay = false
   for (const element of read) {
     const issue = one(element)
-    if (issue !== undefined) return issue
+    if (issue === CANT_SAY) cantSay = true
+    else if (issue !== undefined) return issue
   }
-  return undefined
+  return cantSay ? CANT_SAY : undefined
 }
 
-/** The caller's operand encoded by one reader: for elements, every element by it. */
-const encodedBy = (ast: SchemaAST.AST, kind: OperandKind, value: unknown): unknown[] => {
+/**
+ * The caller's operand encoded by one reader (for elements, every element by it): none on a
+ * schema issue, {@link CANT_SAY} when the encoder can't finish.
+ */
+const encodedBy = (
+  ast: SchemaAST.AST,
+  kind: OperandKind,
+  value: unknown,
+): ReadonlyArray<unknown> | CantSay => {
   const encode = encoderOf(ast)
   if (kind === "value") {
-    const exit = encode(value)
-    return Exit.isSuccess(exit) ? [exit.value] : []
+    const encoded = encode(value)
+    return encoded === CANT_SAY ? CANT_SAY : encoded === undefined ? [] : [encoded.form]
   }
   if (!Array.isArray(value)) return []
   const out: Array<unknown> = []
   for (const element of value) {
-    const exit = encode(element)
-    if (!Exit.isSuccess(exit)) return []
-    out.push(exit.value)
+    const encoded = encode(element)
+    if (encoded === CANT_SAY) return CANT_SAY
+    if (encoded === undefined) return []
+    out.push(encoded.form)
   }
   return [out]
 }
@@ -124,29 +142,35 @@ const encodedBy = (ast: SchemaAST.AST, kind: OperandKind, value: unknown): unkno
 /**
  * The operand where `positions` read it (see the module comment). `sent` is what 1.40.0 sends,
  * already past every check 1.40.0 made; `modelled` is the operand encoded by the model at the
- * position it's read back at, where that isn't how `sent` was made.
+ * position it's read back at, where that isn't how `sent` was made ({@link CANT_SAY} when that
+ * encoding can't finish).
  */
 export const judgeOperand = (
   positions: ReadonlyArray<SchemaAST.AST>,
   kind: OperandKind,
   value: unknown,
   sent: unknown,
-  modelled: () => ReadonlyArray<unknown>,
+  modelled: () => ReadonlyArray<unknown> | CantSay,
 ): OperandVerdict => {
   const reading = positions.map(readerOf)
   const asSent = readBack(sent)
   // What can't be stored at all is the marshalling's to refuse, in its own words.
   if (asSent === undefined) return { encoded: sent, issue: undefined }
-  const refused = issueOf(reading, kind, asSent.read)
-  if (refused === undefined) return { encoded: sent, issue: undefined }
-  // No row holding what 1.40.0 sent reads. The one stored form the readers read back, if any.
+  const refused = verdictOf(reading, kind, asSent.read)
+  // Read back, or nothing can be said of it: sent as 1.40.0 sent it.
+  if (refused === undefined || refused === CANT_SAY) return { encoded: sent, issue: undefined }
+  // No row holding what 1.40.0 sent reads. The one stored form the readers read back, if any;
+  // where a form can't be computed, there's no telling it's the one, and the operand is refused.
+  const forms = [modelled(), ...positions.map((ast) => encodedBy(ast, kind, value))]
   const taken = new Map<string, unknown>()
   const sentBytes = storedBytes(sent)
-  for (const form of [...modelled(), ...positions.flatMap((ast) => encodedBy(ast, kind, value))]) {
+  for (const form of forms.includes(CANT_SAY)
+    ? []
+    : (forms as Array<ReadonlyArray<unknown>>).flat()) {
     const bytes = storedBytes(form)
     if (bytes === undefined || bytes === sentBytes || taken.has(bytes)) continue
     const read = readBack(form)
-    if (read !== undefined && issueOf(reading, kind, read.read) === undefined)
+    if (read !== undefined && verdictOf(reading, kind, read.read) === undefined)
       taken.set(bytes, form)
   }
   if (taken.size === 1) return { encoded: [...taken.values()][0], issue: undefined }

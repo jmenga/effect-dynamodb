@@ -75,6 +75,7 @@ import {
   readersAt,
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { CANT_SAY } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { sparseKeyRefusal, sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -3511,8 +3512,8 @@ const makeImpl = <
    * Where a row's read takes an operand written at `segments` (#236): the read schema of the field
    * it decodes the attribute as, and the segments below it there. `undefined` where that isn't
    * one field exactly as `decodeRecord` reads it (an attribute that isn't a model field's, a
-   * packed or hidden field, a sparse map written whole, a stored name another field also
-   * claims). A path's first segment holding `#` names an attribute as given (`compilePath`); a
+   * packed or hidden field, a sparse map written whole, an entry of a sparse map stored under a
+   * `field:` rename, a stored name another field also claims). A path's first segment holding `#` names an attribute as given (`compilePath`); a
    * record op's key is resolved as the expression compiles it. A sparse map's entry is read in
    * its field's map under its key, and is encoded by the model at that position (`modelPath`).
    */
@@ -3534,6 +3535,9 @@ const makeImpl = <
     const entry = hasSparseFields ? sparseEntries.entryOf(attribute) : undefined
     if (entry !== undefined) {
       if (Object.hasOwn(data.packedFields, entry.field)) return undefined
+      // A map stored under a `field:` rename is read whole from that attribute, which replaces
+      // the entries a read gathered under `<prefix>#<key>`: no read takes this attribute.
+      if (resolveDbName(entry.field) !== entry.field) return undefined
       const reader = readFieldSchema(entry.field)
       return reader === undefined
         ? undefined
@@ -3571,7 +3575,7 @@ const makeImpl = <
       try {
         return [encodePathValue(modelPath, value, kind).encoded]
       } catch {
-        return []
+        return CANT_SAY
       }
     })
   }

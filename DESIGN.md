@@ -3409,15 +3409,22 @@ resolves it, a record op's as the expression does) and `readersAt`
 node there, one per way through the unions, or each array's element for an
 append. Anything it can't resolve exactly (an `Option`, a transformed or
 checked node above the position, a decoding default, a hidden, packed or
-non-model attribute, an entry keyed `__proto__`, a tuple position whose
-element depends on the list's length) gives no readers, and the operand is sent
-as 1.40.0 sent it. Where it resolves, `judgeOperand` (`internal/OperandReaders.ts`)
+non-model attribute, an entry keyed `__proto__`, an entry of a sparse map stored
+under a `field:` rename, which a read takes whole from that attribute, a tuple
+position whose element depends on the list's length) gives no readers, and the
+operand is sent as 1.40.0 sent it. Where it resolves, `judgeOperand` (`internal/OperandReaders.ts`)
 decides: what 1.40.0 sends is sent when one of the readers reads it back as
 stored, so no operand a row holding it reads is refused or changed; otherwise no
 row holding it reads, and it is written in the one other stored form the readers
 read back (the model's encoding at the position, or a reader's own), or refused
 with a `ValidationError` under the same operation names when there is none, or
-when the union's members would store it differently. `readersAt`'s soundness
+when the union's members would store it differently. Only a schema issue is an
+answer (`SchemaIssue.issueOf`): the check runs a schema synchronously where a
+read runs it as an Effect, so a reader or encoder that can't finish (an
+asynchronous step, a defect) says nothing, and the operand is sent as 1.40.0
+sent it. The write schema's check above follows the same rule, so such a
+schema's operand is sent at every position, encoded where its encoder runs;
+1.39.0 and 1.40.0 died on it at a field, below a struct and in an `.append()`. `readersAt`'s soundness
 (no reader reads the operand ⇒ no row holding it decodes) is property-tested
 with Effect's decoder as the oracle (`ReadersAt.property.test.ts`). An operand
 one of the readers reads may still be wrong for the union member a row holds,
