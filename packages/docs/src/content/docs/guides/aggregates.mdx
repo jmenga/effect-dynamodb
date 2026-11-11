@@ -85,7 +85,7 @@ Ref fields transform across Entity's derived types:
 
 | Type | Ref field shape | Example |
 |------|-----------------|---------|
-| `Entity.Input<E>` | ID field (derived from identifier name + "Id" suffix) | `teamId: string`, `playerId: string` |
+| `Entity.Input<E>` | ID field (derived from identifier name + "Id" suffix), optional where the model declares the ref optional | `teamId: string`, `playerId: string` |
 | `Entity.Record<E>` | Full domain object | `team: Team`, `player: Player` |
 | `Entity.Update<E>` | Optional ID field | `teamId?: string`, `playerId?: string` |
 
@@ -109,13 +109,19 @@ const selection = yield* db.entities.SquadSelections.get({
 
 ### Ref Hydration
 
-On `put` and `update`, Entity automatically:
+On `put`, `upsert` and `update`, Entity automatically:
 1. Extracts the ID from each ref field in the input
 2. Fetches the referenced entity by ID (parallel fetches for multiple refs)
 3. Embeds the entity's core domain data (Schema.Type — no system fields) in the DynamoDB item
 4. Returns `RefNotFound` if any referenced entity doesn't exist
 
 An ID is a value of the referenced entity's key composite, the one attribute its primary key is composed from, and it is fetched under that, as an aggregate edge's ID is. The entity's `identifier` needn't be its key: `teamId` names the team keyed by `id`, even where the team's identifier is `code`. Before 1.41.0 the ID was fetched under the identifier, so a `put` naming such an entity failed with a `ValidationError`. An entity keyed by more than one attribute is fetched under its identifier, as before: that works where the key's other attributes are filled in when the key is encoded (an encoding default), and fails with a `ValidationError` where they aren't.
+
+The ID is a value of the key's own type: `5` for a `Schema.NumberFromString` key, `5n` for a `Schema.BigIntFromString` one, a date for a `DynamoModel.DateEpochSeconds` one. Before 1.41.0 a write naming an entity keyed by such a field failed with a `ValidationError` (`get.decode`).
+
+An index keyed by a ref's ID (a cascade index, or one of your own such as `byPlayer` above) is keyed from the ID given, by every write: `put`, `upsert`, and an `update`, `patch` or `Transaction.transactWrite` update that reassigns the ref with `.set({ playerId })`, through the index's [policy](/effect-dynamodb/guides/index-policy/) like any other composite. Before 1.41.0 an `upsert` wrote no key for such an index, and an update reassigning the ref kept the old key, so a cascade from the newly named entity missed the row. To key the rows earlier versions wrote that way, run `db.tables.<Table>.rekey({ repairIndexKeys: true })`, which rewrites each index key that isn't what a `put` of the row's values writes (with `dryRun: true` it counts them).
+
+A ref the model declares optional (`Schema.optionalKey(Team.pipe(DynamoModel.ref))`, or `Schema.optional(Team).pipe(DynamoModel.ref)`) can be left out: its ID is optional in `put`, `create` and `upsert`, nothing is fetched, and the row stores no ref and no key of an index keyed by its ID, so a cascade skips it. `.remove(["team"])` removes it, and the row leaves that index. `.remove(["teamId"])`, `.set({ teamId: undefined })` and `pathRemove(["team"])` are refused, naming `.remove(["team"])`: the row stores the ref, not its ID, and a path removal doesn't take the row out of that index. A required ref can't be left out or removed: a row without it couldn't be read. Before 1.41.0 every ref's ID was required, and removing a ref was refused.
 
 ```typescript region="ref-not-found" example="guide-aggregates.ts"
   // #region ref-not-found
@@ -918,7 +924,7 @@ After updating the player, the cascade:
 2. Queries the target entity's GSI (whose PK composite includes the player's ID field) to find all items embedding this player
 3. Updates each matching item with the new denormalized player data
 
-The player's ID is read from the update's key, under the attribute a ref ID names (its key composite), so it's the ID each selection's ref was given. Before 1.41.0 it was read under the player's identifier, so a cascade from an entity whose identifier isn't its key updated nothing, and one from an entity keyed by a number queried a partition no `put` wrote.
+The player's ID is read from the update's key, under the attribute a ref ID names (its key composite), so it's the ID each selection's ref was given. Before 1.41.0 it was read under the player's identifier, so a cascade from an entity whose identifier isn't its key updated nothing, and one from an entity keyed by a number queried a partition no `put` wrote. A row an earlier version upserted, or whose ref an earlier update reassigned, holds no key or the old entity's in that index, so a cascade misses it until `rekey({ repairIndexKeys: true })` rewrites its key (see [Ref Hydration](#ref-hydration)).
 
 ### Configuration
 

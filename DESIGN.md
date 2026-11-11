@@ -5103,6 +5103,28 @@ default fills one in), and fails as on 1.40.0 where they don't (`get.decode`,
 (`fixtures/entity-ref-keys-encoding-default-1.40.0.json`). The identifier is
 still required at `Entity.make`, as before.
 
+**Every write keys a ref's indexes from the id given (#241).** `put` composes an
+index keyed by `${field}Id` from the id in its input; `upsert` and `update` /
+`patch` / a planned `transactWrite` update compose from the hydrated payload,
+which holds the ref, not its id, so `withRefIds` puts the given id back beside it
+before the policy-aware composer runs, and `removedSetOf` names a removed ref's id
+in `removedSet`. Up to 1.40.0 an upsert wrote no key for such an index, and an
+update reassigning the ref skipped the half and kept the old key. The id is read as
+a value of the key (`keyValueOf`, the rule `refIdValue` reads an edge's id by), so a
+`NumberFromString` / `BigIntFromString` / `DateEpochSeconds` key is fetched (up to
+1.40.0 `get` refused its stored form, `get.decode`). A stored ref holds its id in the
+referenced entity's stored form, so `storedRefIdOf` reads it back as a value of the
+key, for `putValuesOf` (`rekey`) and `storedKeyForm` (`.within()`): up to 1.40.0 a
+date key stored as epoch milliseconds was read as stored, a bound on it matched no
+row and `repairIndexKeys` rewrote a correct cascade key as epoch text. A cascade
+composes its query from the source's domain id through the target's key form. A ref
+the model declares optional keeps that optionality in the derived schemas, so its id
+may be left out of `put` / `create` / `upsert` (nothing fetched, no ref and no key of
+an index keyed by its id stored) and the ref may be removed by its field
+(`.remove(["team"])`, which takes the row out of that index); a required ref, and any
+`${field}Id`, is still refused by `.remove()`
+(`fixtures/entity-ref-writes-1.40.0.json`, `helpers/EntityRefWrites.ts`).
+
 Every id is judged before anything is fetched. An entity keyed by more than
 one distinct composite, or none, has nothing one id names: `create` fails with
 a `ValidationError` (`EDD-9129`) naming the edge. An id of no type of the key
