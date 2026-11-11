@@ -4,7 +4,7 @@
  * (`fixtures/*-1.39.0.json`, captured once, never regenerated).
  * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`,
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
- * `helpers/OptionalTransformDates.ts`.
+ * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -26,7 +26,9 @@ import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
+import { pathClearSuite } from "./helpers/PathClears.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
+import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -96,3 +98,15 @@ describeConnected(
     optionalTransformDatesSuite(openTable)
   },
 )
+
+describeConnected("an appendInput that may leave out many of a sharded index's composites", () => {
+  wideShardAppendSuite(openTable)
+})
+
+describeConnected("a pathRemove below a union", () => {
+  pathClearSuite("union-clears")(openTable)
+})
+
+describeConnected("a pathRemove of a list position", () => {
+  pathClearSuite("tuple-clears")(openTable)
+})

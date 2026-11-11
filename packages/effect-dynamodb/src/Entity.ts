@@ -373,7 +373,6 @@ export type { IndexDefinition, KeyPart }
 import {
   type AnyRefValue,
   type AppendInputFields,
-  type AppendShardGuard,
   buildEntityDefinition,
   type EntityDefinition,
   type EntityDefinitionConfig,
@@ -2189,9 +2188,7 @@ export const make = <
   readonly softDelete?: TSoftDelete
   readonly unique?: TUnique
   readonly refs?: TRefs & RefsKeyGuard<TModel, TRefs>
-  readonly timeSeries?: TTimeSeries &
-    AppendInputFields<TModel, TTimeSeries> &
-    AppendShardGuard<TGsiIndexes, TTimeSeries>
+  readonly timeSeries?: TTimeSeries & AppendInputFields<TModel, TTimeSeries>
   readonly generatedId?: TGeneratedId
   readonly vectorIndexes?: TVectorIndexes
 }): Entity<

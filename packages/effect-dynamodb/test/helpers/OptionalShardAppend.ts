@@ -1,10 +1,12 @@
 /**
- * A time-series `appendInput` that may leave a sharded index's composite out (`EDD-9113`). The
- * definition is refused at load only when no append the input allows can compose the index's key.
- * One that some append can is loaded, as published 1.39.0 loaded it, and every step does what
- * 1.39.0 did (`fixtures/optional-shard-append-1.39.0.json`): the append that composes is written,
- * and the one that can't fails with `EDD-9100` when it's made. Run on a recording table
- * (`Kept139.test.ts`) and on DynamoDB Local (`connected.kept-1.39.0.test.ts`).
+ * A time-series `appendInput` carrying a sharded index's `by` attribute, which may leave a
+ * composite the key needs out. Published 1.39.0 loaded every definition here, whatever the input
+ * carries, and so does this release: each step does what 1.39.0 did
+ * (`fixtures/optional-shard-append-1.39.0.json`). An append that composes the index's key is
+ * written, and one that can't fails with `EDD-9100` when it's made, nothing written. An optional
+ * key left out and one given as `undefined` compose differently: on a sparse partition key, only
+ * the second leaves the index alone. Run on a recording table (`Kept139.test.ts`) and on DynamoDB
+ * Local (`connected.kept-1.39.0.test.ts`).
  */
 
 import { it } from "@effect/vitest"
@@ -24,9 +26,16 @@ const definitions: Record<
   string,
   {
     readonly sk: ReadonlyArray<string>
+    readonly indexPolicy?: {
+      readonly pk: "sparse" | "preserve"
+      readonly sk: "sparse" | "preserve"
+    }
     readonly appendInput: Record<string, Schema.Top>
-    readonly seed: Record<string, unknown>
+    /** Put before the appends. */
+    readonly seed?: Record<string, unknown>
     readonly appends: ReadonlyArray<Record<string, unknown>>
+    /** Read back after them. */
+    readonly read?: true
   }
 > = {
   "`by` optional, the index's partition composite never carried": {
@@ -60,6 +69,17 @@ const definitions: Record<
       { id: "1", tenant: "t", at: 3, group: "b" },
     ],
   },
+  "`by` optional, the index's partition composite always carried, and sparse": {
+    sk: ["region", "group"],
+    indexPolicy: { pk: "sparse", sk: "preserve" },
+    appendInput: { tenant: Schema.String, group: Schema.optional(Schema.String) },
+    appends: [
+      { id: "1", tenant: "t", at: 1 },
+      { id: "1", tenant: "t", at: 2, group: undefined },
+      { id: "1", tenant: "t", at: 3, group: "b" },
+    ],
+    read: true,
+  },
 }
 
 const seriesOf = (name: string) => {
@@ -79,6 +99,7 @@ const seriesOf = (name: string) => {
     indexes: {
       byTenant: {
         name: "gsi1",
+        ...(definition.indexPolicy === undefined ? {} : { indexPolicy: definition.indexPolicy }),
         pk: { field: "gsi1pk", composite: ["tenant"] },
         sk: { field: "gsi1sk", composite: definition.sk },
         shards: { count: 8, by: ["group"] },
@@ -95,10 +116,6 @@ const seriesOf = (name: string) => {
   } as never) as any
 }
 
-/** Whether 1.39.0 wrote any append of the scenario. */
-const someAppendWritten = (name: string) =>
-  fixture.scenarios[name]!.steps.slice(1).some((step) => "ok" in step.outcome)
-
 /** The scenarios, each a test against a table `open` makes. */
 export const optionalShardAppendSuite = (open: OpenTable) => {
   it("1.39.0 loaded every definition here", () => {
@@ -108,17 +125,6 @@ export const optionalShardAppendSuite = (open: OpenTable) => {
 
   for (const name of Object.keys(definitions)) {
     const expected = fixture.scenarios[name]!.steps
-    if (!someAppendWritten(name)) {
-      it(`${name}: no append was ever written, so it's refused at load`, () => {
-        // Every append 1.39.0 was given failed, the one leaving `by` out included.
-        expect(expected.slice(1).map((step) => step.outcome)).toEqual([
-          { fail: "ValidationError", code: "EDD-9100" },
-          { fail: "ValidationError", code: "EDD-9100" },
-        ])
-        expect(() => seriesOf(name)).toThrow("[EDD-9113]")
-      })
-      continue
-    }
     it.effect(`${name}: loads, and every step does what ${fixture.generatedFrom} did`, () =>
       Effect.gen(function* () {
         const Series = seriesOf(name)
@@ -126,7 +132,8 @@ export const optionalShardAppendSuite = (open: OpenTable) => {
           schema: DynamoSchema.make({ name: "kept", version: 1 }),
           entities: { Series },
         })
-        const { seed, appends } = definitions[name]!
+        const { seed, appends, read } = definitions[name]!
+        const first = seed === undefined ? 0 : 1
         const steps = yield* onTable(
           open,
           fixture.clock,
@@ -134,19 +141,24 @@ export const optionalShardAppendSuite = (open: OpenTable) => {
           { entities: { Series } },
           (db, table) =>
             runSteps(table, [
-              ["put", () => db.entities.Series.put(seed).asEffect()],
+              ...(seed === undefined
+                ? []
+                : [["put", () => db.entities.Series.put(seed).asEffect()] as const]),
               ...appends.map(
                 (input, i) =>
                   [
-                    expected[i + 1]!.step,
+                    expected[first + i]!.step,
                     () => db.entities.Series.append(input).asEffect(),
                   ] as const,
               ),
+              ...(read ? [["get", () => db.entities.Series.get({ id: "1" })] as const] : []),
             ]),
         )
-        // The append that composes is written; the one that can't fails with EDD-9100, when made.
-        expect(steps.map((step) => step.outcome)).toEqual(expected.map((step) => step.outcome))
-        expect(steps.at(-1)!.outcome).toEqual({ fail: "ValidationError", code: "EDD-9100" })
+        // The appends that compose are written; one that can't fails with EDD-9100, when made.
+        expect(steps.map((step) => step.outcome)).toContainEqual({
+          fail: "ValidationError",
+          code: "EDD-9100",
+        })
         expect(steps).toEqual(expected)
       }),
     )
