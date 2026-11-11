@@ -12,8 +12,8 @@
  * `w#k` and `wh.k` for the renamed map); only a select of a whole map reads whole rows. In a
  * collection each member names the entry by its own prefix (`Thirds` stores `counts` under `n`),
  * a member holding the map whole by the map's key (`Fourths`), and a member without the map reads
- * it as absent: `Others` stores its own map `tallies` under the same prefix `c`, and its rows
- * never match.
+ * it as absent: `Others` stores its own map `tallies` under the same prefix `c`, and an `eq` on an
+ * entry never matches its rows while a `notExists` matches every one.
  */
 
 import { it } from "@effect/vitest"
@@ -257,6 +257,16 @@ const collected: ReadonlyArray<Read> = [
       Others: [],
       Thirds: [{ id: "t", group: "g", note: "x", counts: { k: 5 } }],
       Fourths: [{ id: "f", group: "g", note: "x", counts: { k: 5 } }],
+    },
+  ],
+  [
+    "a collection's filter on an entry's absence: a member without the map matches",
+    (db) => ofGroup(db).filter((t: any, { notExists }: any) => notExists(t.counts.entry("k"))),
+    {
+      Docs: [],
+      Others: [{ id: "o", group: "g", note: "x", tallies: { k: 5 } }],
+      Thirds: [],
+      Fourths: [],
     },
   ],
   [

@@ -3948,8 +3948,9 @@ collection each member names the entry by its own prefix, a member that holds
 the map whole by its field (no `storedAs`) by the map's key below the field,
 and a member without the map reads it as a field it lacks: the attribute as
 built, or one no row holds where the member reads that attribute as something
-of its own (a field, or an entry of one of its maps), so its rows never match
-(`entriesFor` in `collectionNaming`, `helpers/EntryInQueries.ts`). A select of
+of its own (a field, or an entry of one of its maps), so every entry reads as
+absent on its rows: `eq` on one never matches them, `notExists` matches every
+one (`entriesFor` in `collectionNaming`, `helpers/EntryInQueries.ts`). A select of
 an entry is the "A `.select()` naming a sparse map field" rule above. An
 aggregate takes no `field:` rename (1.40.0 failed to make one over a
 `DynamoModel.configure` model), and `.history().where()` is a sort-key
