@@ -136,6 +136,7 @@ import {
 } from "./internal/WriteDiagnosis.js"
 import {
   fromAttributeMap,
+  isCachedNormal,
   toAttributeMap,
   toAttributeValue,
   type UnstorableValue,
@@ -4372,8 +4373,9 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
 
   const aObj = a as Record<string, unknown>
   const bObj = b as Record<string, unknown>
-  const aKeys = Object.keys(aObj)
-  const bKeys = Object.keys(bObj)
+  // A decimal's cached normalized form holds itself, and isn't stored: compared, it never ended.
+  const aKeys = Object.keys(aObj).filter((k) => !isCachedNormal(aObj, k))
+  const bKeys = Object.keys(bObj).filter((k) => !isCachedNormal(bObj, k))
   if (aKeys.length !== bKeys.length) return false
   return aKeys.every((k) => deepEqual(aObj[k], bObj[k]))
 }

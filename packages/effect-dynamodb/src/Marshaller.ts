@@ -141,6 +141,14 @@ const cachesCycle = (decimal: BigDecimal.BigDecimal): boolean => {
 }
 
 /**
+ * Whether a property of an object is a decimal's cached `normalized` form, which marshalling doesn't
+ * store ({@link withoutCachedNormals}): what compares two values as stored leaves it out too. Reads
+ * descriptors only, so no getter is called.
+ */
+export const isCachedNormal = (value: object, key: string): boolean =>
+  key === "normalized" && isBigDecimalInstance(value) && cachesCycle(value)
+
+/**
  * The enumerable data properties marshalling walks on an object, its prototypes' included, read
  * from their descriptors. A getter is never called, so what's behind one isn't seen.
  */
