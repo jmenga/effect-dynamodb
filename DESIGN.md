@@ -7505,7 +7505,13 @@ instance).
   every item of the index, so an item another read model's key can make too
   is drained by both drainers, as on 1.40.0. Outbox items are short-lived, so
   those drain away after an upgrade. The others' items are left unclaimed for
-  their drainers. Its requests are the ones 1.40.0 sent. On 1.39.0 and 1.40.0
+  their drainers. The decision is made item by item where an item is claimed
+  (`drainRaw`, under `drain`, `deliver` and `drainPending` alike): read models
+  whose row keys are the same text (`[shop]` with `north#branch_b1` beside
+  `[shop, branch]` with `north` and `b1`, `escapeKeys` off) have their items
+  under one row key, and each drainer passes over the other's at the head of
+  the row, unclaimed, and goes on after it (`ExclusiveStartKey`). Its requests
+  are the ones 1.40.0 sent wherever a row holds only its own items. On 1.39.0 and 1.40.0
   it claimed another read model's head item, failed to decode it with its own
   schema, and left the claim, so that read model's drainer stopped there until
   the claim expired. The tag is additive, part of no key: the published

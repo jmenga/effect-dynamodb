@@ -468,3 +468,187 @@ describe("drainPending, read models whose keys only a value holding `#` can make
     }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
   })
 })
+
+/**
+ * Read models whose ROW keys are the same text (#237): `[shop]` with `north#branch_b1` and
+ * `[shop, branch]` with `north` and `b1`, under `escapeKeys: false`, on separate read tables with
+ * one outbox. Their items sit under one row key, apart only by revision. Each drainer delivers
+ * exactly its own, judged item by item at the head of the row, whichever way it drains (1.39.0
+ * and 1.40.0 delivered both read models' items to the first drainer, or failed decoding the
+ * other's and left it claimed).
+ */
+describe("drain at a row key two read models write", () => {
+  const world = (escapeKeys: boolean, schemas: "same" | "different") => {
+    const schema = DynamoSchema.make({ name: "one", version: 1, escapeKeys })
+    const Outbox = Table.make({ schema, entities: {} })
+    const sidesOf = [
+      { pk: ["shop"], key: { shop: "north#branch_b1", branch: "-" }, revision: 1 },
+      { pk: ["shop", "branch"], key: { shop: "north", branch: "b1" }, revision: 10 },
+    ] as const
+    const sides = sidesOf.map(({ pk, key, revision }, i) => {
+      const Ledgers = Entity.make({
+        model: Schema.Struct({
+          shop: Schema.String,
+          branch: Schema.String,
+          total: Schema.Number,
+          cp: Schema.optional(Schema.Number),
+          rev: Schema.optional(Schema.Number),
+        }),
+        entityType: "Ledger",
+        primaryKey: { pk: { field: "pk", composite: [...pk] }, sk: { field: "sk", composite: [] } },
+      } as any)
+      const ReadTable = Table.make({ schema, entities: { Ledgers } })
+      const effect =
+        i === 0 || schemas === "same"
+          ? Schema.Struct({ total: Schema.Number })
+          : Schema.Struct({ label: Schema.String })
+      const Notifying = EventStore.projection({
+        stream: Orders,
+        readModel: Ledgers,
+        key: () => key,
+        initial: () => ({ ...key, total: 0 }),
+        evolve: (state: any, event: any) =>
+          Effect.succeed({ ...state, total: state.total + event.data.amount }),
+        checkpoint: "cp",
+        revision: { field: "rev", initial: revision },
+        outbox: {
+          schema: effect,
+          effects: (_event: unknown, next: any) =>
+            next === undefined
+              ? []
+              : [
+                  i === 0
+                    ? { total: next.total }
+                    : schemas === "same"
+                      ? { total: next.total + 100 }
+                      : { label: `b${next.total}` },
+                ],
+          table: Outbox,
+          index,
+        },
+      } as any)
+      return { Ledgers, ReadTable, Notifying: Notifying as any, name: `read${i}` }
+    })
+    // One recording table per physical table: the read models' rows are at one key.
+    const tables = new Map<string, ReturnType<typeof makeRecordingTable>>()
+    const tableOf = (name: string) => {
+      const known = tables.get(name)
+      if (known !== undefined) return known
+      const made = makeRecordingTable({ indexes: { outbox: { pk: index.pk, sk: index.sk } } })
+      tables.set(name, made)
+      return made
+    }
+    const client = new Proxy(tableOf("events").client, {
+      get: (_target, operation) => (input: any) => {
+        if (operation === "transactWriteItems") {
+          const groups = new Map<string, Array<unknown>>()
+          for (const item of input.TransactItems) {
+            const name = (Object.values(item)[0] as { readonly TableName: string }).TableName
+            groups.set(name, [...(groups.get(name) ?? []), item])
+          }
+          return Effect.forEach([...groups], ([name, items]) =>
+            (tableOf(name).client as any)[operation]({ ...input, TransactItems: items }),
+          ).pipe(Effect.as({}))
+        }
+        return (tableOf(String(input.TableName)).client as any)[operation](input)
+      },
+    })
+    const table = tableOf("outbox")
+    const layer = Layer.mergeAll(
+      Layer.succeed(DynamoClient, client as any),
+      EventsTable.layer({ name: "events" }),
+      Outbox.layer({ name: "outbox" }),
+      ...sides.map((side) => side.ReadTable.layer({ name: side.name })),
+    )
+    const bound = DynamoClient.make({
+      entities: { A: sides[0]!.Ledgers, B: sides[1]!.Ledgers },
+      tables: { Outbox, R0: sides[0]!.ReadTable, R1: sides[1]!.ReadTable },
+    } as any)
+    const outboxItems = () =>
+      [...table.items.values()].filter((item) => item.__edd_e__?.S === "Ledger#outbox")
+    const events = (id: string) =>
+      Effect.gen(function* () {
+        yield* bound
+        yield* Orders.append({ id }, [new Placed({ amount: 2 })], 0)
+        return yield* Orders.read({ id })
+      })
+    const collect = () => {
+      const seen: Array<unknown> = []
+      return { seen, deliver: (effect: unknown) => Effect.sync(() => void seen.push(effect)) }
+    }
+    return { sides, table, layer, outboxItems, events, collect }
+  }
+  const B_EFFECT = { same: { total: 102 }, different: { label: "b2" } } as const
+
+  for (const schemas of ["same", "different"] as const) {
+    it.effect(`drainPending (effect schemas ${schemas}): each drainer delivers its own`, () => {
+      const w = world(false, schemas)
+      return Effect.gen(function* () {
+        const events = yield* w.events(`pending-${schemas}`)
+        for (const side of w.sides) yield* side.Notifying.applyBatch(events)
+        const items = w.outboxItems()
+        // One row key, two items, each naming its read model.
+        expect(
+          new Set(items.map((item) => `${item.__edd_row_pk__?.S}|${item.__edd_row_sk__?.S}`)),
+        ).toHaveProperty("size", 1)
+        expect(new Set(items.map((item) => item.__edd_rm__?.S))).toHaveProperty("size", 2)
+        const a = w.collect()
+        expect(yield* w.sides[0]!.Notifying.drainPending(a.deliver)).toEqual({
+          delivered: 1,
+          undelivered: [],
+        })
+        expect(a.seen).toEqual([{ total: 2 }])
+        const left = w.outboxItems()
+        expect(left).toHaveLength(1)
+        expect(left[0]!.__edd_claim__).toBeUndefined()
+        const b = w.collect()
+        expect(yield* w.sides[1]!.Notifying.drainPending(b.deliver)).toEqual({
+          delivered: 1,
+          undelivered: [],
+        })
+        expect(b.seen).toEqual([B_EFFECT[schemas]])
+        expect(w.outboxItems()).toEqual([])
+      }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+    })
+
+    it.effect(`drain and deliver (effect schemas ${schemas}): each delivers its own`, () => {
+      const w = world(false, schemas)
+      return Effect.gen(function* () {
+        const events = yield* w.events(`deliver-${schemas}`)
+        // B writes first; A's write then drains its row, where B's item waits for B.
+        yield* w.sides[1]!.Notifying.applyBatch(events)
+        const a = w.collect()
+        const applied = yield* w.sides[0]!.Notifying.applyBatch(events, { deliver: a.deliver })
+        expect(applied.undelivered ?? []).toEqual([])
+        expect(a.seen).toEqual([{ total: 2 }])
+        expect(w.outboxItems()).toHaveLength(1)
+        // The other's item at A's row: passed over, unclaimed, by `drain` too.
+        const again = w.collect()
+        yield* w.sides[0]!.Notifying.drain({ shop: "north#branch_b1", branch: "-" }, again.deliver)
+        expect(again.seen).toEqual([])
+        expect(w.outboxItems()[0]!.__edd_claim__).toBeUndefined()
+        const b = w.collect()
+        yield* w.sides[1]!.Notifying.drain({ shop: "north", branch: "b1" }, b.deliver)
+        expect(b.seen).toEqual([B_EFFECT[schemas]])
+        expect(w.outboxItems()).toEqual([])
+      }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+    })
+  }
+
+  it.effect("a row holding only the drainer's own items: the requests 1.40.0 sent", () => {
+    const w = world(false, "same")
+    return Effect.gen(function* () {
+      const events = yield* w.events("own-only")
+      yield* w.sides[0]!.Notifying.applyBatch(events)
+      w.table.take()
+      yield* w.sides[0]!.Notifying.drainPending(w.collect().deliver)
+      const queries = w.table
+        .take()
+        .filter((request) => request.command === "Query")
+        .map((request) => request.input as Record<string, unknown>)
+      // The index query, then the row's head twice (the item, then nothing): no start key.
+      expect(queries).toHaveLength(3)
+      for (const query of queries) expect(query.ExclusiveStartKey).toBeUndefined()
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+})

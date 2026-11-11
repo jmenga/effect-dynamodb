@@ -1921,6 +1921,11 @@ export const makeEngine = (config: EngineConfig) => {
    * Deliver a row's pending effects in order: claim the head item, deliver it,
    * delete it, repeat. A claim another drainer holds stops the drain; a crash
    * leaves a claim that expires, so the effect is delivered again.
+   *
+   * Each item is judged as it comes to the head (`outboxOwnership`, #237): another read model's
+   * item at this row key (one keyed by `[shop]` with `north#branch_b1` beside one keyed by
+   * `[shop, branch]`) is passed over, unclaimed, for its own drainer, and the query goes on after
+   * it. A row holding only this read model's items sends the requests 1.40.0 sent.
    */
   const drainRaw = <E, R>(
     rowPk: string,
@@ -1932,7 +1937,10 @@ export const makeEngine = (config: EngineConfig) => {
       const client = yield* Capacity.client
       const TableName = yield* outboxTable
       const keys = outboxKeys()
+      const whose = outboxOwnership(readModel)
       let delivered = 0
+      // The last item passed over as another read model's: the query goes on after it.
+      let after: Record<string, AttributeValue> | undefined
       while (true) {
         const page = yield* client.query({
           TableName,
@@ -1941,9 +1949,14 @@ export const makeEngine = (config: EngineConfig) => {
           ExpressionAttributeValues: toAttributeMap({ ":pk": rowPk, ":sk": `${rowSk}#outbox#` }),
           ConsistentRead: true,
           Limit: 1,
+          ...(after === undefined ? {} : { ExclusiveStartKey: after }),
         })
         const head = page.Items?.[0]
         if (head === undefined) return { delivered, undelivered: Option.none() }
+        if (whose(head) === "foreign") {
+          after = { [keys.pk]: head[keys.pk]!, [keys.sk]: head[keys.sk]! }
+          continue
+        }
         const raw = fromAttributeMap(head) as Record<string, unknown>
         const now = DateTime.toEpochMillis(yield* DateTime.now)
         const token = `${now}-${Math.floor((yield* Random.next) * 1e9)}`
@@ -2027,8 +2040,9 @@ export const makeEngine = (config: EngineConfig) => {
 
   /**
    * Every row of this read model with pending effects, through the outbox's sparse index, drained.
-   * The rows of the items another read model's are (`outboxOwnership`) are left to its drainer;
-   * an item written before 1.41.0 at a key both write is drained, as 1.40.0 did.
+   * The items another read model's are (`outboxOwnership`) are left to its drainer, here and at a
+   * row key both write (`drainRaw`); an item written before 1.41.0 at a key both write is drained,
+   * as 1.40.0 did.
    */
   const drainPending = <E, R>(
     deliver: (effect: any, meta: OutboxMeta) => Effect.Effect<void, E, R>,
