@@ -9,8 +9,11 @@ import {
   asReadGuard,
   countOperators,
   EXPRESSION_MAX_OPERATORS,
+  EXPRESSION_MAX_SUBSTITUTION_BYTES,
   expressionFits,
   preferredGuard,
+  substitutionBytes,
+  substitutionsFit,
   wholeRowGuard,
 } from "../src/internal/ExpressionLimits.js"
 import * as Rekey from "../src/internal/Rekey.js"
@@ -28,29 +31,71 @@ const row = (fields: number, extra: Record<string, AttributeValue> = {}) => ({
 describe("wholeRowGuard", () => {
   it("is the guard asReadGuard sent, byte for byte, whenever that one held the whole row", () => {
     const read = row(3, { updatedAt: { S: "t" } })
-    expect(wholeRowGuard(read, "pk", [])).toEqual(asReadGuard(read, "pk", []))
+    expect(wholeRowGuard(read, "pk", [], [], [])).toEqual(asReadGuard(read, "pk", []))
+    expect(wholeRowGuard(read, "pk", ["updatedAt"], [], [])).toEqual(
+      asReadGuard(read, "pk", ["updatedAt"]),
+    )
     const claims = ["claim", "claimedUntil"]
-    expect(wholeRowGuard(read, "pk", claims)).toEqual(asReadGuard(read, "pk", [], claims))
+    expect(wholeRowGuard(read, "pk", [], claims, [])).toEqual(asReadGuard(read, "pk", [], claims))
   })
 
-  it("names each absent attribute once, and never the table key", () => {
-    const guard = wholeRowGuard(row(1), "pk", ["note", "note", "f000", "pk", "sk"])!
+  it("keeps asReadGuard's terms in their order and appends each attribute a write could add", () => {
+    const read = row(1, { updatedAt: { S: "t" } })
+    const guard = wholeRowGuard(
+      read,
+      "pk",
+      ["updatedAt"],
+      [],
+      ["note", "note", "f000", "pk", "sk"],
+    )!
+    const was = asReadGuard(read, "pk", ["updatedAt"])
     expect(guard.ConditionExpression).toBe(
-      "attribute_exists(#gpk) AND attribute_not_exists(#ga0) AND #g0 = :g0 AND #g1 = :g1",
+      `${was.ConditionExpression} AND attribute_not_exists(#gx0)`,
+    )
+    expect(guard.ConditionExpression).toBe(
+      "attribute_exists(#gpk) AND #g0 = :g0 AND #g1 = :g1 AND #g2 = :g2 AND attribute_not_exists(#gx0)",
     )
     expect(guard.ExpressionAttributeNames).toEqual({
       "#gpk": "pk",
-      "#ga0": "note",
-      "#g0": "__edd_e__",
-      "#g1": "f000",
+      "#g0": "updatedAt",
+      "#g1": "__edd_e__",
+      "#g2": "f000",
+      "#gx0": "note",
     })
+    expect(guard.ExpressionAttributeValues).toEqual(was.ExpressionAttributeValues)
   })
 
   it("is undefined for a row too wide to guard whole", () => {
-    expect(wholeRowGuard(row(160), "pk", [])).toBeUndefined()
+    expect(wholeRowGuard(row(160), "pk", [], [], [])).toBeUndefined()
     // The absent attributes count too.
     const absent = Array.from({ length: 160 }, (_, i) => `a${i}`)
-    expect(wholeRowGuard(row(1), "pk", absent)).toBeUndefined()
+    expect(wholeRowGuard(row(1), "pk", [], [], absent)).toBeUndefined()
+  })
+
+  it("is undefined when its names and values are over DynamoDB's 2 MB for one expression", () => {
+    // Long attribute names, which only the attributes a write could add bring past the limit.
+    const long = (i: number) => `${String(i).padStart(3, "0")}${"n".repeat(32_000)}`
+    const extra = Array.from({ length: 70 }, (_, i) => long(i))
+    // Its expression alone fits: 70 more terms.
+    expect(
+      expressionFits(
+        `attribute_exists(#gpk) AND #g0 = :g0 AND #g1 = :g1${extra.map((_, i) => ` AND attribute_not_exists(#gx${i})`).join("")}`,
+      ),
+    ).toBe(true)
+    expect(
+      substitutionBytes(Object.fromEntries(extra.map((name) => [name, name])), {}),
+    ).toBeGreaterThan(EXPRESSION_MAX_SUBSTITUTION_BYTES)
+    expect(wholeRowGuard(row(1), "pk", [], [], extra)).toBeUndefined()
+    expect(wholeRowGuard(row(1), "pk", [], [], extra.slice(0, 10))).toBeDefined()
+  })
+})
+
+describe("substitutionBytes", () => {
+  it("counts each placeholder with its name's bytes or its value's size", () => {
+    expect(substitutionBytes({ "#a": "é" }, { ":v": { S: "abc" } })).toBe(2 + 2 + 2 + 3)
+    expect(
+      substitutionsFit({}, { ":v": { S: "x".repeat(EXPRESSION_MAX_SUBSTITUTION_BYTES) } }),
+    ).toBe(false)
   })
 })
 

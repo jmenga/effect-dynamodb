@@ -5507,7 +5507,7 @@ export const makeStream = <
        * `unprovable` decides: `undefined` when it's reported (`unguardedRows`).
        */
       const guardOfRow = (row: Record<string, AttributeValue>) => {
-        const whole = wholeRowGuard(row, "pk", [])
+        const whole = wholeRowGuard(row, "pk", [], [], [])
         if (whole !== undefined) return whole
         switch (unprovable) {
           case "report":

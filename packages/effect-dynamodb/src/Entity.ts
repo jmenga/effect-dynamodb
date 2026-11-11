@@ -5453,9 +5453,9 @@ const makeImpl = <
             ...new Set([
               ...Object.keys(read),
               ...Object.keys(data.modelFields as object).map(resolveDbName),
-              ...[systemFields.createdAt, systemFields.updatedAt].filter(
-                (f): f is string => typeof f === "string",
-              ),
+              ...[systemFields.createdAt, systemFields.updatedAt]
+                .filter((f): f is string => typeof f === "string")
+                .map(resolveDbName),
               ...gsiKeyFields(),
               ...vectorKeyFields(),
             ]),
@@ -5473,7 +5473,9 @@ const makeImpl = <
     // entries): the strongest guard that fits. Every library write sets
     // `updatedAt`, so with timestamps it alone detects any library update;
     // then as many attributes as fit, those the sentinels derive from first,
-    // then the model's own fields, then the rest.
+    // then the model's own fields, then the rest. `updatedAt` is named by the
+    // attribute it's stored in: a guard on its model name holds on no row.
+    const updatedAttr = systemFields.updatedAt ? resolveDbName(systemFields.updatedAt) : null
     const strongest = () => {
       for (const key of Object.keys(names)) if (key.startsWith("#dg")) delete names[key]
       for (const key of Object.keys(values)) if (key.startsWith(":dg")) delete values[key]
@@ -5483,7 +5485,7 @@ const makeImpl = <
       const modelAttrs = Object.keys(data.modelFields as object).map(resolveDbName)
       const ordered = [
         ...new Set([
-          ...(systemFields.updatedAt ? [systemFields.updatedAt] : []),
+          ...(updatedAttr !== null ? [updatedAttr] : []),
           ...uniqueAttrs,
           ...modelAttrs,
           ...attrs.slice().sort(),
@@ -5503,7 +5505,7 @@ const makeImpl = <
       }
       // `updatedAt` goes first, and every library write of the entity sets it: guarded, held or
       // absent, it proves the row. Without it, nothing guarded is what every write changes.
-      const proves = systemFields.updatedAt !== null && inputs.includes(systemFields.updatedAt)
+      const proves = updatedAttr !== null && inputs.includes(updatedAttr)
       return { expression, names, values, inputs, proves }
     }
     return strongest()
@@ -15160,7 +15162,7 @@ const makeImpl = <
    */
   const valuelessGuard = (read: StoredRow, pkField: string, unprovable: UnprovableRow) => {
     const claims = [OUTBOX_CLAIM, OUTBOX_CLAIMED_UNTIL]
-    const whole = wholeRowGuard(read, pkField, claims)
+    const whole = wholeRowGuard(read, pkField, [], claims, [])
     if (whole !== undefined) return whole
     switch (unprovable) {
       case "report":
