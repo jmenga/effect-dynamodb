@@ -50,10 +50,12 @@ import {
 } from "@effect-dynamodb/schema/Errors.js"
 import {
   compositeKeyFormKind,
+  defaultObjectText,
   keyFormValueKind,
   kindReadingOf,
   makeCompositeKeyForm,
   makeCompositeStoredForm,
+  objectKeyRefusal,
   otherNumericKind,
   type ReadBackText,
   readsBackOtherwise,
@@ -102,6 +104,7 @@ import {
   Exit,
   Option,
   Schema,
+  SchemaAST,
   SchemaIssue,
   Stream,
 } from "effect"
@@ -2381,6 +2384,31 @@ const promoteRefTarget = (def: EntityDefinition): Entity => {
   return runtime
 }
 
+/** The kinds a stored side can be that never hold an object. */
+const PRIMITIVE_TAGS: ReadonlySet<string> = new Set([
+  "String",
+  "Number",
+  "Boolean",
+  "BigInt",
+  "Literal",
+  "TemplateLiteral",
+  "Enum",
+  "Null",
+  "Undefined",
+  "Void",
+  "Never",
+  "Symbol",
+  "UniqueSymbol",
+])
+
+/** Whether a field's stored side can hold an object, which a key would compose (`EDD-9162`). */
+const storesObject = (ast: SchemaAST.AST): boolean => {
+  const encoded = SchemaAST.toEncoded(ast)
+  return encoded._tag === "Union"
+    ? encoded.types.some((member: SchemaAST.AST) => storesObject(member))
+    : !PRIMITIVE_TAGS.has(encoded._tag)
+}
+
 const makeImpl = <
   TModel extends Schema.Top,
   const TEntityType extends string,
@@ -3438,6 +3466,62 @@ const makeImpl = <
   }
 
   /**
+   * The model's fields a key, a unique sentinel, a vector partition or a time-series `orderBy`
+   * composes and whose stored side can hold an object, worked out again when `_injectIndex` adds an
+   * index. Empty for a model keyed by text, numbers and the like, which pays nothing more on a write.
+   */
+  let keyFieldsFor:
+    | { readonly indexes: typeof allIndexes; readonly fields: ReadonlyArray<string> }
+    | undefined
+  const objectKeyFields = (): ReadonlyArray<string> => {
+    if (keyFieldsFor?.indexes === allIndexes) return keyFieldsFor.fields
+    const fields = data.modelFields as globalThis.Record<string, Schema.Top>
+    keyFieldsFor = {
+      indexes: allIndexes,
+      fields: Object.keys(fields).filter(
+        (field) => composedInto(field) !== undefined && storesObject(fields[field]!.ast),
+      ),
+    }
+    return keyFieldsFor.fields
+  }
+
+  /**
+   * Refuses a write composing a key from an object that composes `[object Object]`, which every such
+   * object composes alike (`EDD-9162`). Only a write of the item's own values: a get, a delete, a
+   * query and an update's own key record compose that text as they always did, to reach a row an
+   * earlier release wrote under it.
+   */
+  const refuseObjectKeyText = (
+    encoded: unknown,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    for (const field of objectKeyFields()) {
+      const value = (encoded as globalThis.Record<string, unknown>)[field]
+      if (typeof value !== "object" || value === null) continue
+      let form: unknown
+      try {
+        form = compositeKeyForm(field, value)
+      } catch {
+        continue
+      }
+      const text = compositeTextOf(form)
+      const refused = text === undefined ? undefined : defaultObjectText(form, text)
+      if (refused === undefined) continue
+      return Effect.fail(
+        new ValidationError({
+          entityType,
+          operation,
+          cause: objectKeyRefusal(
+            `Field "${field}" is composed into ${composedInto(field)}`,
+            refused,
+          ),
+        }),
+      )
+    }
+    return Effect.void
+  }
+
+  /**
    * A write's payload, encoded (see `encodeOrDecodeEncode`) and refused if it wouldn't read back.
    * Every write of the entity's own encodes through this.
    */
@@ -3446,7 +3530,11 @@ const makeImpl = <
     input: unknown,
     operation: string,
   ): Effect.Effect<unknown, ValidationError> => {
-    const encoded = encodeOrDecodeEncode(schema, input, entityType, operation)
+    const encoding = encodeOrDecodeEncode(schema, input, entityType, operation)
+    const encoded =
+      objectKeyFields().length === 0
+        ? encoding
+        : encoding.pipe(Effect.tap((value) => refuseObjectKeyText(value, operation)))
     const readBack =
       readBacks.size === 0
         ? encoded
@@ -17613,13 +17701,18 @@ const makeImpl = <
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,
     _fillDecodingDefaults: fillDecodingDefaults,
-    _refuseNotReadBack: (encoded: unknown, operation: string) =>
-      kindReads().model.size === 0
-        ? refuseNotReadBack(encoded, operation)
-        : Effect.andThen(
-            refuseNotReadBack(encoded, operation),
-            refuseOtherKindRead(encoded, operation),
-          ),
+    _refuseNotReadBack: (encoded: unknown, operation: string) => {
+      const readBack =
+        kindReads().model.size === 0
+          ? refuseNotReadBack(encoded, operation)
+          : Effect.andThen(
+              refuseNotReadBack(encoded, operation),
+              refuseOtherKindRead(encoded, operation),
+            )
+      return objectKeyFields().length === 0
+        ? readBack
+        : Effect.andThen(refuseObjectKeyText(encoded, operation), readBack)
+    },
     _unsentineledDefaults: unsentineledDefaults,
     _planPut: planPut,
     _multiItemWriteFeatures: multiItemWriteFeatures(),
