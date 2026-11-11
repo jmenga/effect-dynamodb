@@ -4494,11 +4494,19 @@ configuration that could add one (#98).
 5. **What a row declares is decided per row, as on an entity.** Each node (root,
    sub-aggregate root, `one` edge, `many` element) resolves the stamps against its
    own value's fields (`rowStampsOf`). A date that value declares, under
-   `Schema.optional` as well, is managed: the input doesn't need it, and a supplied
-   value wins, in the row and in any key holding it. A field of that name of another
-   type is the caller's, on that row. Undeclared, the row is stamped and it's stripped
-   from what's read. A root field of that name that isn't a date turns the stamp off
-   for every row, as it always did (`resolveAggregateStamps`).
+   `Schema.optional` as well, is managed: the input doesn't need it, and `create`
+   stamps it whether or not the input holds a value, in the row and in any key holding
+   it. Up to 1.39.0 `create` failed with `Missing key` without one and then stored the
+   stamp in its place, so a value there is a placeholder, never stored
+   (`test/fixtures/aggregate-create-stamps-1.39.0.json`). The exception is also
+   1.39.0's: a date the root declares `Schema.optional` was the caller's then, so
+   `create` stores a value supplied for it, on every row (`createdReplaces` /
+   `updatedReplaces`, read by `fillStamps`); without one it's stamped. An entity's
+   `put` differs: a value supplied for a colliding timestamp field wins there, as it
+   did. A field of that name of another type is the caller's, on that row.
+   Undeclared, the row is stamped and it's stripped from what's read. A root field of
+   that name that isn't a date turns the stamp off for every row, as it always did
+   (`resolveAggregateStamps`).
 6. **What `create` and `update` return is what they stored.** `create` fills the
    declared dates before it validates (`fillStamps`), so the value it returns holds
    them. `update` keeps `createdAt` whatever the mutation did, as an entity's update

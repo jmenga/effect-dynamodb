@@ -1,0 +1,1409 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (with effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local at a clock fixed at 1700000000000 ms: for each aggregate whose rows declare a stamped date, what create returned (a date as {\"date\": epoch ms}) and the table's rows after it, with a value supplied for each such date (the epoch) and with none, then an update changing the name 5 s later. Never regenerate it or edit it to match a later release.",
+ "clock": 1700000000000,
+ "scenarios": {
+  "the root declares an optional `updated`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "updated": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "1970-01-01T00:00:00.000Z"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "updated": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "1970-01-01T00:00:00.000Z"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the root declares optional `createdAt` and `updatedAt`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "a many element declares an optional `updated`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "players": [
+        {
+         "playerId": "p",
+         "updated": {
+          "date": 0
+         }
+        }
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "playerId": {
+        "S": "p"
+       },
+       "sk": {
+        "S": "$kept#v1#player#p"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "players": [
+        {
+         "playerId": "p"
+        }
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "playerId": {
+        "S": "p"
+       },
+       "sk": {
+        "S": "$kept#v1#player#p"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "players": [
+        {
+         "playerId": "p"
+        }
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "playerId": {
+        "S": "p"
+       },
+       "sk": {
+        "S": "$kept#v1#player#p"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "players": [
+        {
+         "playerId": "p"
+        }
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "playerId": {
+        "S": "p"
+       },
+       "sk": {
+        "S": "$kept#v1#player#p"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "a one edge declares an optional `updated`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "venue": {
+        "venueId": "v",
+        "updated": {
+         "date": 0
+        }
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Venue"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#venue"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "venueId": {
+        "S": "v"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "venue": {
+        "venueId": "v"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Venue"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#venue"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       },
+       "venueId": {
+        "S": "v"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "venue": {
+        "venueId": "v"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Venue"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#venue"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "venueId": {
+        "S": "v"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "venue": {
+        "venueId": "v"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Venue"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#venue"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:25.000Z"
+       },
+       "venueId": {
+        "S": "v"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the root declares a required and an optional date": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "createdAt": {
+        "date": 1700000000000
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "createdAt": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "createdAt": {
+        "date": 1700000000000
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "the root declares `updated`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "updated": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "N": "1700000000000"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "updated": {
+        "date": 1700000000000
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "N": "1700000005000"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": []
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "fail": "AggregateAssemblyError",
+      "message": ""
+     },
+     "rows": []
+    }
+   ]
+  },
+  "the root declares `created` and `updated`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "created": {
+        "date": 0
+       },
+       "updated": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "created": {
+        "N": "1700000000000"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "N": "1700000000000"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "created": {
+        "date": 1700000000000
+       },
+       "updated": {
+        "date": 1700000000000
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "created": {
+        "N": "1700000000000"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "N": "1700000005000"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": []
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "fail": "AggregateAssemblyError",
+      "message": ""
+     },
+     "rows": []
+    }
+   ]
+  },
+  "the root declares `createdAt` and `updatedAt`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updatedAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "o",
+       "createdAt": {
+        "date": 1700000000000
+       },
+       "updatedAt": {
+        "date": 1700000000000
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "o"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updatedAt": {
+        "S": "2023-11-14T22:13:25.000Z"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": []
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "fail": "AggregateAssemblyError",
+      "message": ""
+     },
+     "rows": []
+    }
+   ]
+  },
+  "a one edge and a many element declare `updated`": {
+   "a value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "ok": {
+       "id": "m",
+       "name": "n",
+       "venue": {
+        "venueId": "v",
+        "updated": {
+         "date": 0
+        }
+       },
+       "players": [
+        {
+         "playerId": "p",
+         "updated": {
+          "date": 0
+         }
+        }
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "playerId": {
+        "S": "p"
+       },
+       "sk": {
+        "S": "$kept#v1#player#p"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Venue"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#venue"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "venueId": {
+        "S": "v"
+       }
+      }
+     ]
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Match"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "id": {
+        "S": "m"
+       },
+       "name": {
+        "S": "n"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#match"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Player"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "playerId": {
+        "S": "p"
+       },
+       "sk": {
+        "S": "$kept#v1#player#p"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Venue"
+       },
+       "createdAt": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "pk": {
+        "S": "$kept#v1#match#m"
+       },
+       "sk": {
+        "S": "$kept#v1#venue"
+       },
+       "updated": {
+        "S": "2023-11-14T22:13:20.000Z"
+       },
+       "venueId": {
+        "S": "v"
+       }
+      }
+     ]
+    }
+   ],
+   "no value supplied": [
+    {
+     "step": "create",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": []
+    },
+    {
+     "step": "update, 5 s later",
+     "outcome": {
+      "fail": "AggregateAssemblyError",
+      "message": ""
+     },
+     "rows": []
+    }
+   ]
+  }
+ }
+}
