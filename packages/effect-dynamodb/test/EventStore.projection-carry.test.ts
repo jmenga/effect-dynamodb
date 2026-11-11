@@ -15,7 +15,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Exit, Layer, Schema } from "effect"
+import { Effect, Exit, Layer, Option, Schema } from "effect"
 import { beforeEach } from "vitest"
 import * as ZlibCompression from "../src/compression/zlib.js"
 import * as Entity from "../src/Entity.js"
@@ -643,4 +643,170 @@ describe("a write over a live row the other projections have written (#237)", ()
       }).pipe(within(layer))
     },
   )
+})
+
+/**
+ * A write whose domain value names the other projection's field, but whose encoding stores
+ * nothing for it (#237): an `Option.none()`, or an emptied sparse map. What the row stores is what
+ * counts: the data attribute is dropped, so the other projection's bookkeeping goes with it, as on
+ * 1.40.0, and it folds its stream again (B's events are 5 and 7: its part is 12 at the end).
+ */
+describe("a write over a live row that stores nothing for the other's data (#237)", () => {
+  type Kind = "OptionFromOptional" | "OptionFromOptionalKey" | "packed" | "sparse map"
+  const world = (
+    kind: Kind,
+    renamed: boolean,
+    outbox: boolean,
+    aInvoices?: Record<string, number>,
+  ) => {
+    const invoices =
+      kind === "sparse map"
+        ? Schema.Record(Schema.String, Schema.Number)
+        : kind === "packed"
+          ? Schema.OptionFromOptional(Schema.Struct({ amount: Schema.Number }))
+          : (Schema[kind] as (schema: typeof Schema.Number) => Schema.Top)(Schema.Number)
+    const Model = Schema.Struct({
+      id: Schema.String,
+      orders: Schema.Number,
+      invoices,
+      a: Schema.optional(Schema.Number),
+      ra: Schema.optional(Schema.Number),
+      b: Schema.optional(Schema.Number),
+      rb: Schema.optional(Schema.Number),
+    } as any)
+    const model = DynamoModel.configure(
+      Model as any,
+      {
+        ...(kind === "sparse map"
+          ? { invoices: { storedAs: DynamoModel.SparseMap({ prefix: "iv" }) } }
+          : kind === "packed"
+            ? {
+                invoices: {
+                  storedAs: DynamoModel.Packed({ format: "json" }),
+                  ...(renamed && { field: "I" }),
+                },
+              }
+            : renamed
+              ? { invoices: { field: "I" } }
+              : {}),
+        ...(renamed ? { b: { field: "B" }, rb: { field: "RB" } } : {}),
+      } as any,
+    )
+    const Rows = Entity.make({
+      model,
+      entityType: "Row",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    } as any)
+    const ReadTable = Table.make({ schema: AppSchema, entities: { Rows } })
+    const none = kind === "sparse map" ? {} : Option.none()
+    const amountOf = (value: any): number =>
+      kind === "sparse map"
+        ? (value.amount ?? 0)
+        : kind === "packed"
+          ? Option.getOrElse(value, () => ({ amount: 0 })).amount
+          : Option.getOrElse(value, () => 0)
+    const define = (from: typeof Orders, checkpoint: string, revision: string, evolve: any) =>
+      EventStore.projection({
+        stream: from,
+        readModel: Rows,
+        key: (id: { readonly id: string }) => ({ id: id.id }),
+        initial: (id: { readonly id: string }) => ({ id: id.id, orders: 0, invoices: none }),
+        evolve: (state: any, event: any) => Effect.succeed(evolve(state, event)),
+        checkpoint,
+        revision,
+        retry: 0,
+        ...(outbox && { outbox: { schema: Schema.Number, effects: () => [1] } }),
+      } as any) as any
+    // A's state names `invoices`, with nothing in it; B adds to it.
+    const A = define(Orders, "a", "ra", (state: any, event: any) => ({
+      id: state.id,
+      orders: state.orders + event.data.amount,
+      invoices: aInvoices ?? none,
+    }))
+    const B = define(Invoices, "b", "rb", (state: any, event: any) => ({
+      ...state,
+      invoices:
+        kind === "sparse map"
+          ? { amount: amountOf(state.invoices) + event.data.amount }
+          : kind === "packed"
+            ? Option.some({ amount: amountOf(state.invoices) + event.data.amount })
+            : Option.some(amountOf(state.invoices) + event.data.amount),
+    }))
+    const layer = Layer.mergeAll(
+      InMemoryClient,
+      EventsTable.layer({ name: "events" }),
+      ReadTable.layer({ name: "read" }),
+    )
+    const stored = () => fromAttributeMap(store.get(ROW)!) as Record<string, any>
+    const invoicesStored = () => {
+      if (kind === "sparse map") return stored()["iv#amount"]
+      const value = stored()[renamed ? "I" : "invoices"]
+      // A packed field is stored as JSON text.
+      return kind === "packed" && value !== undefined ? JSON.parse(value).amount : value
+    }
+    return { A, B, layer, stored, invoicesStored }
+  }
+
+  for (const kind of [
+    "OptionFromOptional",
+    "OptionFromOptionalKey",
+    "packed",
+    "sparse map",
+  ] as const) {
+    for (const renamed of [false, true]) {
+      for (const outbox of [false, true]) {
+        it.effect(
+          `${kind}${renamed ? ", renamed" : ""}${outbox ? ", in the outbox's transaction" : ""}: B's redelivery applies again, and its part comes back`,
+          () => {
+            const w = world(kind, renamed, outbox)
+            return within(w.layer)(
+              Effect.gen(function* () {
+                yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 })], 0)
+                yield* Invoices.append(
+                  { id: "x" },
+                  [new Placed({ amount: 5 }), new Placed({ amount: 7 })],
+                  0,
+                )
+                const orders = yield* Orders.read({ id: "x" })
+                const invoices = yield* Invoices.read({ id: "x" })
+                yield* w.B.apply(invoices[0]!)
+                expect(w.invoicesStored()).toBe(5)
+                yield* w.A.apply(orders[0]!)
+                // A stored nothing for `invoices`: B's bookkeeping went with it.
+                expect(w.invoicesStored()).toBeUndefined()
+                expect(w.stored()[renamed ? "B" : "b"]).toBeUndefined()
+                expect(w.stored()[renamed ? "RB" : "rb"]).toBeUndefined()
+                const redelivered = yield* w.B.apply(invoices[0]!)
+                expect(redelivered.applied).toHaveLength(1)
+                expect(w.invoicesStored()).toBe(5)
+                yield* w.B.apply(invoices[1]!)
+                expect(w.invoicesStored()).toBe(12)
+                expect(w.stored()).toMatchObject({ orders: 1 })
+              }),
+            )
+          },
+        )
+      }
+    }
+  }
+
+  it.effect("a sparse map holding other entries than the row's: each entry counts", () => {
+    // A's map holds `other`, the row's holds `amount`: `iv#amount` is dropped.
+    const w = world("sparse map", false, false, { other: 3 })
+    return within(w.layer)(
+      Effect.gen(function* () {
+        yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 })], 0)
+        yield* Invoices.append({ id: "x" }, [new Placed({ amount: 5 })], 0)
+        const orders = yield* Orders.read({ id: "x" })
+        const invoices = yield* Invoices.read({ id: "x" })
+        yield* w.B.apply(invoices[0]!)
+        yield* w.A.apply(orders[0]!)
+        expect(w.stored()["iv#other"]).toBe(3)
+        expect(w.stored()["iv#amount"]).toBeUndefined()
+        expect(w.stored().b).toBeUndefined()
+        expect((yield* w.B.apply(invoices[0]!)).applied).toHaveLength(1)
+        expect(w.stored()["iv#amount"]).toBe(5)
+      }),
+    )
+  })
 })

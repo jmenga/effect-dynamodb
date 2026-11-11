@@ -2398,11 +2398,11 @@ export const makeEngine = (config: EngineConfig) => {
         // The bookkeeping of the other projections that have written the row (`carriedOf`), each
         // value as the entity stores it on a row. Over a tombstone it replaces what `initial` gave
         // it. Over a live row a change to it is refused (`[EDD-9144]`), and it fills what the write
-        // left out only when the write keeps every other attribute the row holds (`keepsData`):
-        // one that drops another projection's data drops its checkpoints with it, as 1.40.0 did,
-        // so that projection folds its stream again and puts its data back. A rebuild over a live
-        // row carries none: it drops the other projections' contributions to the state, so they
-        // lose their checkpoints too and apply again.
+        // left out only when the write stores every data attribute the row holds (`keepsData`):
+        // one that drops one drops the others' checkpoints with it, as 1.40.0 did, so they fold
+        // their streams again and put their data back. A rebuild over a live row carries none: it
+        // drops the other projections' contributions to the state, so they lose their checkpoints
+        // too and apply again.
         let item: Record<string, unknown> = mapped
         if (Option.isSome(row) && row.value.tombstone) {
           item = { ...mapped, ...onRow(carriedOf(row)) }
@@ -2415,9 +2415,10 @@ export const makeEngine = (config: EngineConfig) => {
               cause: changed,
             })
           }
-          if (keepsData(row, mapped)) {
+          const carried = onRow(carriedOf(row))
+          if (Object.keys(carried).length > 0 && (yield* keepsData(row, mapped))) {
             item = { ...mapped }
-            for (const [field, value] of Object.entries(onRow(carriedOf(row)))) {
+            for (const [field, value] of Object.entries(carried)) {
               if (item[field] === undefined) item[field] = value
             }
           }
@@ -2585,21 +2586,75 @@ export const makeEngine = (config: EngineConfig) => {
     return [...fields].filter((field) => !bookkeeping.has(dbName(field)))
   }
 
-  /**
-   * Whether a write over the live `row` storing `item` keeps every attribute the row holds that
-   * no projection keeps as bookkeeping (its values may change), so the other projections' data is
-   * still there and their bookkeeping can be carried. The row records no more than who wrote it,
-   * not which data each wrote, so any dropped attribute counts.
-   */
-  const keepsData = (row: Option.Option<Row>, item: Record<string, unknown>): boolean => {
-    const data = dataFields()
-    if (data === undefined || Option.isNone(row)) return false
-    const values = row.value.values
-    return data.every(
-      (field) =>
-        !Object.hasOwn(values, field) || values[field] === undefined || item[field] !== undefined,
-    )
+  /** The prefix of a sparse map stored as `name` (its entries are `<prefix>#<key>`), if it is one. */
+  const sparsePrefixes = new Map<string, string | undefined>()
+  const sparsePrefixOf = (name: string): string | undefined => {
+    if (sparsePrefixes.has(name)) return sparsePrefixes.get(name)
+    const probe: Record<string, unknown> = { [name]: { k: 1 } }
+    let prefix: string | undefined
+    try {
+      readModel._serializeSparseFields(probe)
+      const entry = Object.keys(probe).find((attribute) => attribute.endsWith("#k"))
+      prefix = Object.hasOwn(probe, name) || entry === undefined ? undefined : entry.slice(0, -2)
+    } catch {
+      prefix = undefined
+    }
+    sparsePrefixes.set(name, prefix)
+    return prefix
   }
+
+  /**
+   * The stored attributes of `item` (as stored: renamed, packed, a sparse map as its entries) that
+   * hold the row's data (`data`): a field's stored name, or each entry of a sparse map, as the
+   * entity's reader takes them (`<prefix>#` and a key).
+   */
+  const dataAttributesOf = (
+    item: Record<string, unknown>,
+    data: ReadonlyArray<string>,
+  ): ReadonlyArray<string> => {
+    const out: Array<string> = []
+    for (const field of data) {
+      const name = dbName(field)
+      const prefix = sparsePrefixOf(name)
+      if (prefix === undefined) {
+        if (Object.hasOwn(item, name) && item[name] !== undefined) out.push(name)
+        continue
+      }
+      for (const attribute of Object.keys(item)) {
+        if (attribute.length > prefix.length + 1 && attribute.startsWith(`${prefix}#`)) {
+          out.push(attribute)
+        }
+      }
+    }
+    return out
+  }
+
+  /**
+   * Whether a write over the live `row` storing `item` stores every data attribute the row holds
+   * (#237), judged on what's stored: the row's attributes as read against the item as the entity
+   * will write it (encoded, renamed, as sparse entries, packed: `validateAndBuildPutItem`, the
+   * transaction's own), each sparse entry on its own. Their values may change. The data is every
+   * model field no projection keeps as bookkeeping. A value whose encoding stores nothing (an
+   * `Option.none()`, an emptied sparse map) drops its attributes. The row records who wrote it,
+   * not which data each wrote, so any dropped attribute counts. An item the entity refuses keeps
+   * nothing: the write then fails as it would have.
+   */
+  const keepsData = (
+    row: Option.Option<Row>,
+    item: Record<string, unknown>,
+  ): Effect.Effect<boolean, never, any> =>
+    Effect.gen(function* () {
+      const data = dataFields()
+      if (data === undefined || Option.isNone(row)) return false
+      const held = dataAttributesOf(row.value.item, data)
+      if (held.length === 0) return true
+      const built = yield* Effect.option(
+        validateAndBuildPutItem(readModel as any, item, `${config.label}.write`),
+      )
+      if (Option.isNone(built)) return false
+      const written = built.value.item
+      return held.every((name) => Object.hasOwn(written, name) && written[name] !== undefined)
+    })
 
   /** The fields the library owns, re-applied after `toItem`. */
   const pick = (target: Record<string, unknown>): Record<string, unknown> => {
