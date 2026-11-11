@@ -1,5 +1,5 @@
 /**
- * A discriminator written on an edge's rows stays out of its value on a read, against DynamoDB
+ * What the library writes on an edge's rows beside its value, read as on 1.40.0, against DynamoDB
  * Local. The suite is `helpers/AggregateDiscriminatorRead.ts`; recording-table twin:
  * `AggregateDiscriminatorRead.test.ts`.
  *

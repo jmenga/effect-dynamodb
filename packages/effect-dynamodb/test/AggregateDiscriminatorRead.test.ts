@@ -1,5 +1,5 @@
 /**
- * A discriminator written on an edge's rows stays out of its value on a read, on a recording table.
+ * What the library writes on an edge's rows beside its value, read as on 1.40.0, on a recording table.
  * The suite is `helpers/AggregateDiscriminatorRead.ts`; connected twin:
  * `connected.aggregate-discriminator-read.test.ts`.
  */
