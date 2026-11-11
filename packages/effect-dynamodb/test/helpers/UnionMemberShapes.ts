@@ -4,13 +4,15 @@
  * them: each shape's model, the entity rows seeded first, and its `create` input. The fixture holds
  * what published 1.39.0 sent, stored and returned for each on DynamoDB Local: `create`, `get`, an
  * `update` handing the state back, `get`. `runShape` does the same on any table and reports it in
- * the fixture's form. Shared by `AggregateUnionMembers.test.ts` (a recording table) and its
- * connected twin.
+ * the fixture's form. `createResultFieldShapes` and `renameShapes` are the shapes
+ * `fixtures/aggregate-create-result-1.39.0.json` holds, compared by `compareCreateResult`. Shared by
+ * `AggregateUnionMembers.test.ts` (a recording table) and its connected twin.
  */
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Cause, Effect, Exit, Schema, SchemaGetter } from "effect"
+import { expect } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
@@ -81,13 +83,63 @@ const outcome = (exit: Exit.Exit<unknown, unknown>): Outcome => {
 export const sortedRows = (rows: Iterable<Row>) =>
   json([...rows].sort((a, b) => `${a.pk?.S}|${a.sk?.S}`.localeCompare(`${b.pk?.S}|${b.sk?.S}`)))
 
+/**
+ * An aggregate keyed by `id` whose `lines` (on the root, or in a sub-aggregate `part` with the
+ * discriminator `side: 1`) is a `many` edge of `element`s over the `Line` entity keyed by `id`,
+ * with `Line` `L` seeded, created from `input` and updated with its own state.
+ */
+const manyShape =
+  (schema: DynamoSchema.DynamoSchema) =>
+  (element: (line: Schema.Top) => Schema.Top, input: unknown, sub: boolean) =>
+  (): Shape => {
+    class Line extends Schema.Class<Line>("Line")({ id: Schema.String, f: Schema.Number }) {}
+    const Lines = Entity.make({
+      model: DynamoModel.configure(Line, { id: { identifier: true } }),
+      entityType: "Line",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+    } as never)
+    const El = element(Line) as Schema.Codec<any>
+    const edge = () =>
+      Aggregate.many({ entityType: "Sheet", entity: Lines, sk: { composite: ["qty"] } } as never)
+    const aggregate = (Model: Schema.Top, Base: unknown, edges: unknown) =>
+      (Aggregate.make as any)(Model, {
+        table: Base,
+        schema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "agg" },
+        root: { entityType: "Root" },
+        edges,
+      })
+    return {
+      schema,
+      entities: { Lines },
+      make: (Base) => {
+        if (!sub) {
+          return aggregate(Schema.Struct({ id: Schema.String, lines: Schema.Array(El) }), Base, {
+            lines: edge(),
+          })
+        }
+        const Part = Schema.Struct({ lines: Schema.Array(El) })
+        const Sub = (Aggregate.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: { lines: edge() },
+        })
+        return aggregate(Schema.Struct({ id: Schema.String, part: Part }), Base, {
+          part: Sub.with({ discriminator: { side: 1 } }),
+        })
+      },
+      seed: [["Lines", { id: "L", f: 1 }]],
+      input: sub ? { id: "a", part: { lines: [input] } } : { id: "a", lines: [input] },
+      update: ({ state }) => ({ ...state }),
+    }
+  }
+
 /** A `many` edge's elements: a union, or a struct, over the `Line` entity keyed by `id`. */
 export const elementShapes = (): Record<string, () => Shape> => {
-  const schema = DynamoSchema.make({ name: "union", version: 1 })
-  const lineModel = () => {
-    class Line extends Schema.Class<Line>("Line")({ id: Schema.String, f: Schema.Number }) {}
-    return Line
-  }
+  const build = manyShape(DynamoSchema.make({ name: "union", version: 1 }))
   const copy = SchemaGetter.transform((x: object) => ({ ...x }))
   const toUnknown = (member: Schema.Top) =>
     (member as any).pipe(Schema.decodeTo(Schema.Unknown, { decode: copy, encode: copy } as never))
@@ -103,52 +155,6 @@ export const elementShapes = (): Record<string, () => Shape> => {
     unknown: toUnknown,
     declare: toDeclare,
   }
-  const build =
-    (element: (line: Schema.Top) => Schema.Top, input: unknown, sub: boolean) => (): Shape => {
-      const Line = lineModel()
-      const Lines = Entity.make({
-        model: DynamoModel.configure(Line, { id: { identifier: true } }),
-        entityType: "Line",
-        primaryKey: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: [] },
-        },
-      } as never)
-      const El = element(Line) as Schema.Codec<any>
-      const edge = () =>
-        Aggregate.many({ entityType: "Sheet", entity: Lines, sk: { composite: ["qty"] } } as never)
-      const aggregate = (Model: Schema.Top, Base: unknown, edges: unknown) =>
-        (Aggregate.make as any)(Model, {
-          table: Base,
-          schema,
-          pk: { field: "pk", composite: ["id"] },
-          collection: { name: "agg" },
-          root: { entityType: "Root" },
-          edges,
-        })
-      return {
-        schema,
-        entities: { Lines },
-        make: (Base) => {
-          if (!sub) {
-            return aggregate(Schema.Struct({ id: Schema.String, lines: Schema.Array(El) }), Base, {
-              lines: edge(),
-            })
-          }
-          const Part = Schema.Struct({ lines: Schema.Array(El) })
-          const Sub = (Aggregate.make as any)(Part, {
-            root: { entityType: "Part" },
-            edges: { lines: edge() },
-          })
-          return aggregate(Schema.Struct({ id: Schema.String, part: Part }), Base, {
-            part: Sub.with({ discriminator: { side: 1 } }),
-          })
-        },
-        seed: [["Lines", { id: "L", f: 1 }]],
-        input: sub ? { id: "a", part: { lines: [input] } } : { id: "a", lines: [input] },
-        update: ({ state }) => ({ ...state }),
-      }
-    }
   const out: Record<string, () => Shape> = {}
   for (const sub of [false, true]) {
     const at = (label: string) => (sub ? `sub-aggregate, ${label}` : label)
@@ -271,10 +277,15 @@ export const elementShapes = (): Record<string, () => Shape> => {
 
 /**
  * A field whose schema is a transformation from a struct or a record to `Unknown`, alone, under
- * `NullOr` or `optional`, or a member of a union with a tagged struct, given a value that's neither
- * form, on the root and in a sub-aggregate.
+ * `NullOr` or `optional`, or a member of a union with a tagged struct, on the root and in a
+ * sub-aggregate, given each of `valuesFor(wrapper)`: by default a value that's neither form.
  */
-export const fieldShapes = (): Record<string, () => Shape> => {
+export const fieldShapes = (
+  valuesFor: (wrapper: string) => Record<string, unknown> = () => ({
+    "garbage 5": 5,
+    "garbage object": { b: 1 },
+  }),
+): Record<string, () => Shape> => {
   const schema = DynamoSchema.make({ name: "nbr", version: 1 })
   const kinds: Record<string, () => Schema.Top> = {
     "struct to Unknown": () =>
@@ -302,12 +313,11 @@ export const fieldShapes = (): Record<string, () => Shape> => {
     "union after a tagged struct": (field) =>
       Schema.Union([tagged, field] as never) as unknown as Schema.Top,
   }
-  const values: Record<string, unknown> = { "garbage 5": 5, "garbage object": { b: 1 } }
   const out: Record<string, () => Shape> = {}
   for (const sub of [false, true]) {
     for (const [kname, kind] of Object.entries(kinds)) {
       for (const [wname, wrap] of Object.entries(wrappers)) {
-        for (const [vname, value] of Object.entries(values)) {
+        for (const [vname, value] of Object.entries(valuesFor(wname))) {
           out[`${sub ? "sub-aggregate, " : ""}${kname}, ${wname}, given ${vname}`] = () => {
             const field = wrap(kind()) as Schema.Codec<any>
             return {
@@ -350,6 +360,80 @@ export const fieldShapes = (): Record<string, () => Shape> => {
           }
         }
       }
+    }
+  }
+  return out
+}
+
+/**
+ * The field shapes given their stored form, or a union's tagged struct: 1.39.0 returned the value
+ * `create` was given decoded, and couldn't update most of them.
+ */
+export const createResultFieldShapes = (): Record<string, () => Shape> =>
+  fieldShapes((wrapper) => ({
+    wire: { a: "x" },
+    ...(wrapper.startsWith("union") ? { "the tagged struct": { kind: "own", line: "KEEP" } } : {}),
+  }))
+
+/**
+ * A `many` edge's elements, in a union whose other member renames a field (`line` stored, `text`
+ * held), given the wrapping member whole or the other member's stored form. 1.39.0 stored the
+ * latter as `create` decoded it, `text` and all, and couldn't read it back.
+ */
+export const renameShapes = (): Record<string, () => Shape> => {
+  const build = manyShape(DynamoSchema.make({ name: "ren", version: 1 }))
+  const copy = SchemaGetter.transform((x: object) => ({ ...x }))
+  const rename = {
+    decode: SchemaGetter.transform(({ line, ...rest }: any) => ({ ...rest, text: line })),
+    encode: SchemaGetter.transform(({ text, ...rest }: any) => ({ ...rest, line: text })),
+  }
+  const ref = (Line: Schema.Top) =>
+    Schema.Struct({ kind: Schema.Literal("ref"), qty: Schema.Number, line: Line })
+  const members: Record<string, (Line: Schema.Top) => Schema.Top> = {
+    "wrapping member to Unknown": (Line) =>
+      (ref(Line) as any).pipe(
+        Schema.decodeTo(Schema.Unknown, { decode: copy, encode: copy } as never),
+      ),
+    "wrapping member untransformed": ref,
+  }
+  const own = () =>
+    Schema.Struct({ kind: Schema.Literal("own"), qty: Schema.Number, line: Schema.String })
+  const others: Record<string, () => Schema.Top> = {
+    "renaming to Unknown": () =>
+      (own() as any).pipe(Schema.decodeTo(Schema.Unknown, rename as never)),
+    "renaming to a declaration": () =>
+      (own() as any).pipe(
+        Schema.decodeTo(
+          Schema.declare(
+            (x: unknown): x is { readonly text: string } =>
+              typeof x === "object" && x !== null && typeof (x as any).text === "string",
+          ),
+          rename as never,
+        ),
+      ),
+  }
+  const values: Record<string, unknown> = {
+    "its stored form": { kind: "own", qty: 3, line: "KEEP" },
+    "the wrapping member whole": { kind: "ref", qty: 2, line: { id: "L", f: 7 } },
+  }
+  const out: Record<string, () => Shape> = {}
+  for (const sub of [false, true]) {
+    for (const [member, other, value] of [
+      ["wrapping member to Unknown", "renaming to Unknown", "its stored form"],
+      ["wrapping member untransformed", "renaming to Unknown", "its stored form"],
+      ["wrapping member to Unknown", "renaming to Unknown", "the wrapping member whole"],
+      ["wrapping member to Unknown", "renaming to a declaration", "the wrapping member whole"],
+    ] as const) {
+      out[`${sub ? "sub-aggregate, " : ""}${member}, other member ${other}, given ${value}`] =
+        build(
+          (Line) =>
+            Schema.Union([
+              members[member]!(Line),
+              others[other]!(),
+            ] as never) as unknown as Schema.Top,
+          values[value],
+          sub,
+        )
     }
   }
   return out
@@ -414,31 +498,56 @@ export const judged = (result: Outcome) =>
     ? { ok: JSON.stringify(result.ok) }
     : { failed: result.failed, died: result.died, operation: result.operation }
 
+/** `rows` after an update setting the root's `title` to "t2". */
+const retitled = (rows: ReadonlyArray<unknown>) =>
+  rows.map((row: any) => (row.title === undefined ? row : { ...row, title: { S: "t2" } }))
+
 /**
- * The element shapes whose `create` result differs from 1.39.0's on the release branch for a reason
- * outside this fix: given the wrapping member whole, where that member transforms to `Unknown` or a
- * declaration, `create` returns its `line` as a plain object; 1.39.0 returned the `Line` instance.
- * Everything else about them (requests, rows, `get`, `update`) is 1.39.0's.
+ * A `createResultFieldShapes` or `renameShapes` run against what 1.39.0 did
+ * (`fixtures/aggregate-create-result-1.39.0.json`). `create`, its requests and rows, and `get` are
+ * 1.39.0's, and so is the update where 1.39.0's went through. Where 1.39.0 refused the update, it
+ * goes through and sets the title. A renaming member given its stored form reads back, where 1.39.0
+ * couldn't, with the row's attributes: in their stored order, and a sub-aggregate's
+ * discriminator with them.
  */
-export const createLineUnclassed = (label: string) =>
-  /(^|, )wrapping member (unknown|declare), other member [a-z]+, given the wrapping member whole$/.test(
-    label,
+export const compareCreateResult = (
+  group: "fields" | "renames",
+  label: string,
+  actual: Recorded,
+  expected: Recorded,
+) => {
+  const as139 = (step: "create" | "get" | "update" | "getAfterUpdate") =>
+    expect({ step, ...judged(actual[step]) }).toEqual({ step, ...judged(expected[step]) })
+  as139("create")
+  expect(actual.requests).toEqual(expected.requests)
+  expect(actual.rows).toEqual(expected.rows)
+  if (group === "renames" && label.endsWith("given its stored form")) {
+    expect(actual.updateRequests).toEqual(expected.updateRequests)
+    expect(actual.updateRows).toEqual(expected.updateRows)
+    const element = { kind: "own", qty: 3, text: "KEEP" }
+    const read = label.startsWith("sub-aggregate, ")
+      ? { id: "a", part: { lines: [{ ...element, side: 1 }] } }
+      : { id: "a", lines: [element] }
+    for (const step of ["get", "update", "getAfterUpdate"] as const) {
+      expect({ step, failed: expected[step].failed }).toEqual({ step, failed: "ValidationError" })
+      expect({ step, ok: actual[step].ok }).toEqual({ step, ok: read })
+    }
+    return
+  }
+  as139("get")
+  if (expected.update.ok !== undefined) {
+    as139("update")
+    as139("getAfterUpdate")
+    expect(actual.updateRequests).toEqual(expected.updateRequests)
+    expect(actual.updateRows).toEqual(expected.updateRows)
+    return
+  }
+  const after = { ok: { ...(expected.get.ok as object), title: "t2" } }
+  for (const step of ["update", "getAfterUpdate"] as const) {
+    expect({ step, ...judged(actual[step]) }).toEqual({ step, ...judged(after) })
+  }
+  expect(actual.updateRequests.slice(0, expected.updateRequests.length)).toEqual(
+    expected.updateRequests,
   )
-
-/** A value as JSON, with each class name dropped: an instance compares as its fields. */
-const unclassed = (value: unknown): unknown =>
-  Array.isArray(value)
-    ? value.map(unclassed)
-    : value !== null && typeof value === "object"
-      ? (() => {
-          const entries = Object.entries(value)
-          const only = entries.length === 1 ? entries[0] : undefined
-          return only !== undefined && /^<.*>$/.test(only[0])
-            ? unclassed(only[1])
-            : Object.fromEntries(entries.map(([k, v]) => [k, unclassed(v)]))
-        })()
-      : value
-
-/** `judged`, with each class name dropped from a value. */
-export const judgedUnclassed = (result: Outcome) =>
-  judged(result.ok !== undefined ? { ...result, ok: unclassed(result.ok) } : result)
+  expect(actual.updateRows).toEqual(retitled(expected.rows))
+}
