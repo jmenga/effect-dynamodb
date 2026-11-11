@@ -439,18 +439,21 @@ describe("a new write path can't go unnoticed", () => {
   const ENCODES: Readonly<Record<string, readonly [number, string]>> = {
     "Aggregate.ts": [4, "attribute encoders, feeding rows `refuseNotReadBack` reads"],
     "Entity.ts": [
-      8,
-      "`encodeOrDecodeEncode` (2), two probes that store nothing, a key (2), a ref's stored row, " +
-        "a history bound's key text",
+      6,
+      "two probes that store nothing, a key (2), a ref's stored row, a history bound's key text",
     ],
     "EventStore.ts": [2, "`encodeToWire`, which checks"],
     "StorageEncoding.ts": [4, "a public helper: what's done with its value is the caller's"],
+    "internal/InputForm.ts": [
+      3,
+      "`encodeInput`, the one decision of a write input's form; its callers " +
+        "(`encodeOrDecodeEncode`, `validateAndBuildPutItem`) check",
+    ],
     "internal/OperandReaders.ts": [
       1,
       "an update's operand in another form, kept only where its position's readers read it back",
     ],
     "internal/ProjectionEngine.ts": [1, "the outbox, which checks"],
-    "internal/TransactableOps.ts": [2, "`validateAndBuildPutItem`, which checks"],
   }
 
   it("every encode in the library is accounted for", () => {
@@ -481,6 +484,9 @@ describe("a new write path can't go unnoticed", () => {
 
   it("a transaction's, a batch's and a projection's puts go through the one builder that checks", () => {
     expect(count(source("internal/TransactableOps.ts"), /_refuseNotReadBack\(/g)).toBe(1)
+    // Its input takes its form where an entity's write's does.
+    expect(count(source("internal/TransactableOps.ts"), /\bencodeInput\(/g)).toBe(1)
+    expect(count(source("Entity.ts"), /\bencodeInput\(/g)).toBe(1)
     for (const name of ["Batch.ts", "Transaction.ts", "internal/TransactWriteOps.ts"]) {
       expect(count(source(name), /\binputSchema\b/g)).toBe(0)
     }

@@ -145,6 +145,7 @@ import {
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
+import { encodeInput } from "./internal/InputForm.js"
 import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
   decodeImage,
@@ -639,29 +640,21 @@ const expressionTargets = (
   return targets
 }
 
+/**
+ * A write's input in its stored form (`internal/InputForm.ts`, the one decision of which form an
+ * input is in). A refusal surfaces the domain form's issue: its message is keyed on the caller's
+ * input shape, which is what the user expects to see.
+ */
 const encodeOrDecodeEncode = (
   schema: Schema.Codec<any>,
   input: unknown,
   entityType: string,
   operation: string,
 ): Effect.Effect<unknown, ValidationError> =>
-  Schema.encodeUnknownEffect(schema)(input).pipe(
-    Effect.catch((primaryCause) =>
-      Schema.decodeUnknownEffect(schema)(input).pipe(
-        Effect.flatMap((decoded) => Schema.encodeUnknownEffect(schema)(decoded)),
-        // On fallback failure, surface the original encode error — its
-        // message is keyed on the caller's input shape, which is what the
-        // user expects to see.
-        Effect.catch(() =>
-          Effect.fail(
-            new ValidationError({
-              entityType,
-              operation: `${operation}.decode`,
-              cause: primaryCause,
-            }),
-          ),
-        ),
-      ),
+  encodeInput(schema, input).pipe(
+    Effect.mapError(
+      ({ domain }) =>
+        new ValidationError({ entityType, operation: `${operation}.decode`, cause: domain }),
     ),
   )
 
