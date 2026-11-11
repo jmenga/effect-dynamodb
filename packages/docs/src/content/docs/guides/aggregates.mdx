@@ -385,8 +385,9 @@ That row then works much like an entity:
   the model's own encoding, `Schema.optional` included. A row that doesn't declare the field gets
   the root's form. Up to 1.40.0 a date declared with `Schema.optional` was stored as ISO text
   whatever its encoding, stamps included. Those rows read as they are, and switch to the declared
-  encoding a group at a time: an `update` that changes a group rewrites every row of it in the
-  declared form, keeping the same instants, and an `update` that changes nothing writes nothing.
+  encoding per group, on that group's next changed write, never on a no-op: an `update` that
+  changes a group rewrites every row of it in the declared form, keeping the same instants, and an
+  `update` that changes nothing writes nothing.
   Until a group is next changed, a filter on such a field meets both forms. Key text is unchanged.
 - `create` and `update` return what they stored, and the value is decoded normally on read.
 - On `update`, `createdAt` stays what's stored whatever the mutation did. A mutation that
