@@ -48,7 +48,9 @@ import {
   parseShorthand,
 } from "./Expr.js"
 import {
+  andRaw,
   composePrimaryKeyOrFail,
+  type RawCondition,
   rejectUnsupportedOp,
   resolveTableNames,
   validateAndBuildPutItem,
@@ -769,7 +771,10 @@ export const buildTransactWriteItems = (
         const over =
           op.putKind === "create"
             ? yield* op.entity._overTombstone(built.item)
-            : Option.none<ConditionInput>()
+            : Option.none<{
+                readonly guard: ConditionInput
+                readonly token: RawCondition | undefined
+              }>()
         push(
           {
             Put: {
@@ -777,7 +782,13 @@ export const buildTransactWriteItems = (
               Item: Option.isSome(over) ? toAttributeMap(built.item) : built.marshalled,
               ...conditionFields(
                 Option.isSome(over)
-                  ? compileOpCondition(op.entity, withGuard(over.value, op.callerCondition))
+                  ? andRaw(
+                      compileOpCondition(
+                        op.entity,
+                        withGuard(over.value.guard, op.callerCondition),
+                      ),
+                      over.value.token,
+                    )
                   : op.condition,
               ),
             },

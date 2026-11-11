@@ -7402,14 +7402,49 @@ instance).
   of its own (`_projectionTombstones`: some projection has `removal`), so a
   read model whose projections have none sends `create`'s put alone, as
   before.
-  - **A tombstone keeps the remover's attributes.** Its checkpoints and
-    revision, nothing of another projection's, and a projection's row written
-    over a tombstone holds what its own state gives it, as on 1.39.0. On a row
-    several projections share, another projection's checkpoint doesn't survive
-    the row's removal, so its redelivery applies again, as on 1.39.0. Whether
-    a field on a row is the writer's own data or another projection's
-    bookkeeping can't be told without a record of which projections wrote the
-    row, which this release doesn't keep.
+  - **The row token (#237), on a read model several projections write.** When
+    more than one projection layout is recorded on a read model
+    (`rowTokened`), its rows carry `__edd_rt__`: 128 random bits, then the tags
+    of the layouts that have written the row (`layoutTag`: a hash of the
+    layout's roles, `removal` and TTL, so every program defining the
+    projection gives it the same tag). Every projection write (row, tombstone,
+    rebuild) and `create` over a tombstone writes a fresh one, conditioned on
+    the one it read (`rowTokenTerm`) beside the projection's own revision or
+    checkpoint: a write that read the row before another fails and retries,
+    whichever projection made the other and whatever counters it left alone.
+    A projection's write for a row it read absent proves the key still holds
+    nothing (`attribute_not_exists` on the key and the token) and never takes
+    the place of a tombstone written since (`projectionWrite.expectAbsent`), so
+    it doesn't read the key again for one. 1.39.0 and 1.40.0 guarded a write
+    by the projection's own revision or checkpoint alone, so one projection's
+    write replaced another's that landed after its read.
+    A tombstone keeps the bookkeeping (checkpoints, map, owners, revision) of
+    the other layouts that have written the row, as the row stores it
+    (`carriedOf`), so their redelivered events stay recognised; a write over a
+    tombstone carries it over what `initial` gives; a write over a live row
+    fills in what the state left out (a `toItem` that drops it); `create` over
+    a tombstone carries what it holds, the layouts with `removal` first as
+    before, then the others. 1.39.0 and 1.40.0 kept only the remover's, so
+    another projection's redelivery applied again over the tombstone, bringing
+    the removed row back, and a late removal removed a row written after it. A
+    value the write couldn't store (a 1.39.0 tombstone's sparse map holding a
+    key with `#`) isn't carried. Only layouts the row's token records are
+    consulted, so projections writing disjoint rows never gain each other's
+    attributes, and a row written before (no token) carries nothing. A rebuild
+    over a live row carries none: it drops the other projections'
+    contributions to the state, so without their checkpoints they fold their
+    streams again on their next event, and the row converges, as on 1.40.0
+    (`test/EventStore.projection-row-token.test.ts`).
+    A read model with one layout carries no token: its own revision (raised by
+    every write and by `create` over a tombstone) or checkpoint serialises its
+    writes, and it sends and stores what 1.40.0 did, but for one term: a
+    projection with `removal` and no revision writing over a tombstone it read
+    adds `attribute_exists(__edd_removed__)` (`tombstoneTerm`), since `create`
+    over the tombstone keeps the checkpoint, which alone let 1.39.0's and
+    1.40.0's write replace the created row. The layouts are those this program
+    defines: a program defining one projection of several writes no token,
+    checks none and carries nothing, so every program writing a read model's
+    rows must define all of its projections.
   - **`create` over a tombstone** consults the projections with `removal`,
     the one defined last first: each attribute one of them names that the
     tombstone holds is carried, a checkpoint (or map, or owner) as it is and a
@@ -7419,11 +7454,13 @@ instance).
     1.39.0 took the layout of the projection with `removal` defined last
     alone, so over another projection's tombstone it carried nothing, and a
     late redelivery of the removal applied again and removed the created row.
-    A projection without `removal` writes no tombstone and isn't consulted.
+    A projection without `removal` writes no tombstone and is consulted last,
+    for what the row token had a tombstone keep of it.
     When a projection's tombstones set the table's TTL attribute, it is never
     carried, so the row doesn't expire with the tombstone. Over a tombstone of
     the projection with `removal` defined last, `create` sends and stores what
-    1.39.0 did (`test/fixtures/projection-tombstones-shared-1.39.0.json`).
+    1.39.0 did (`test/fixtures/projection-tombstones-shared-1.39.0.json`), but
+    for the row token and what the tombstone keeps of other layouts (above).
   - **One role per attribute in a projection (`EDD-9133`), on a read model
     whose rows may be tombstones.** When a projection on the read model has
     `removal`, a stored attribute (compared through the entity's renames, as

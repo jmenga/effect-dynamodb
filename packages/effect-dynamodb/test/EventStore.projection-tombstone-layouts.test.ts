@@ -4,7 +4,7 @@
  * that wrote it, not only those of whichever one was defined last. Every other write on a removal
  * path (a tombstone, a projection's row written over one) sends and stores what the published
  * 1.39.0 did, and so does `create` but for the attributes it now carries: both pinned against
- * captures. On a read model one of whose projections has `removal`, a stored attribute one
+ * captures, with what the row token (#237) changes on a read model several projections write. On a read model one of whose projections has `removal`, a stored attribute one
  * projection keeps in two roles is refused (`EDD-9133`) at the definition that completes the
  * conflict, and the table's TTL attribute kept by a projection before any entry point that writes a
  * row sends anything. Two projections keeping one attribute in different roles are not refused:

@@ -5,6 +5,7 @@
  * and put-item construction (validation + key composition + system fields).
  */
 
+import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
@@ -12,6 +13,7 @@ import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/Entit
 import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, type Schema } from "effect"
+import { SecureRandom } from "effect/crypto"
 import type { DynamoClientError, DynamoClientService } from "../DynamoClient.js"
 import type { Entity } from "../Entity.js"
 import type { ConditionInput } from "../Expression.js"
@@ -28,6 +30,82 @@ import { encodeInput } from "./InputForm.js"
  * `__edd_e__` so it cannot collide with a model field; never decoded.
  */
 export const INCARNATION_TOKEN = "__edd_i__"
+
+/**
+ * @internal The row token (#237) on the rows of a read model that `rowTokened` says carry one:
+ * 128 random bits (base64url), then the tags of the projection layouts that have written the row
+ * (`layoutTag`), each `.`-prefixed. Every projection write, tombstone and rebuild write, and
+ * `create` over a tombstone, writes a fresh one, conditioned on the one it read (`rowTokenTerm`):
+ * a write that read the row before another fails, whichever projection made the other and
+ * whatever counters it reset. Named like `__edd_e__`; never decoded.
+ */
+export const ROW_TOKEN = "__edd_rt__"
+
+/**
+ * @internal The tags of the layouts that have written a row, from its row token as read: none
+ * for a row without one.
+ */
+export const rowWriters = (token: AttributeValue | undefined): ReadonlyArray<string> =>
+  token?.S === undefined ? [] : token.S.split(".").slice(1)
+
+/**
+ * @internal Whether a read model's rows carry the row token (`ROW_TOKEN`): more than one
+ * projection layout is recorded on it. Asked when a write is made, so a projection defined later
+ * counts. With one layout, the projection's own revision or checkpoint serialises its writes, and
+ * it sends and stores what 1.40.0 did.
+ */
+export const rowTokened = (entity: object): boolean =>
+  (projectionLayoutsOf(entity)?.length ?? 0) > 1
+
+const tokenRandom = makeDefaultCrypto()
+
+/**
+ * @internal A fresh row token recording `writers` (deduplicated, sorted) after its random part,
+ * from the `SecureRandom` in context, else Web Crypto: no requirement is added.
+ */
+export const freshRowToken = (writers: ReadonlyArray<string>): Effect.Effect<string> =>
+  Effect.serviceOption(SecureRandom.SecureRandom).pipe(
+    Effect.flatMap((random) =>
+      (Option.isSome(random) ? random.value : tokenRandom).randomBytes(16),
+    ),
+    Effect.map((bytes) => {
+      let binary = ""
+      for (const byte of bytes) binary += String.fromCharCode(byte)
+      const random = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+      return [random, ...[...new Set(writers)].sort()].join(".")
+    }),
+  )
+
+/** @internal A condition already in DynamoDB's form. */
+export interface RawCondition {
+  readonly expression: string
+  readonly names: Record<string, string>
+  readonly values: Record<string, AttributeValue>
+}
+
+/**
+ * @internal The term proving a row still holds the token a write read: the stored value as the
+ * read returned it, or its absence.
+ */
+export const rowTokenTerm = (read: AttributeValue | undefined): RawCondition =>
+  read === undefined
+    ? { expression: "attribute_not_exists(#eddRt)", names: { "#eddRt": ROW_TOKEN }, values: {} }
+    : { expression: "#eddRt = :eddRt", names: { "#eddRt": ROW_TOKEN }, values: { ":eddRt": read } }
+
+/** @internal Both conditions, either of which may be absent. Their placeholders must differ. */
+export const andRaw = (
+  a: RawCondition | undefined,
+  b: RawCondition | undefined,
+): RawCondition | undefined =>
+  a === undefined
+    ? b
+    : b === undefined
+      ? a
+      : {
+          expression: `(${a.expression}) AND (${b.expression})`,
+          names: { ...a.names, ...b.names },
+          values: { ...a.values, ...b.values },
+        }
 
 /** @internal What an attribute a projection keeps on its read model's rows is for. */
 export type ProjectionRole = "checkpoint" | "checkpoint map" | "checkpoint owner" | "revision"
@@ -47,8 +125,9 @@ export interface ProjectionLayout {
 }
 
 /**
- * @internal A projection layout's tag: FNV-1a (32-bit, base 36) of its roles, `removal` and `ttl`,
- * so every program defining the projection gives it the same tag.
+ * @internal A projection layout's tag, in outbox items' marks and row tokens: FNV-1a (32-bit, base
+ * 36) of its roles, `removal` and `ttl`, so every program defining the projection gives it the
+ * same tag.
  */
 export const layoutTag = (layout: ProjectionLayout): string => {
   let hash = 0x811c9dc5
@@ -221,6 +300,12 @@ export const projectionTtlConflict = (
  * attribute, it is never carried, so the row doesn't expire with the tombstone: a projection
  * naming it is refused when it writes (`projectionTtlConflict`), and one defined after a tombstone
  * was written would otherwise carry its expiry onto the row.
+ *
+ * On a read model whose rows carry the row token (`rowTokened`), a tombstone also holds the
+ * bookkeeping of the other projections that had written the row (#237): those of projections
+ * without `removal` are carried after, each attribute the others haven't named, in the same way.
+ * The row gets a fresh token, keeping the tombstone's record of its writers, and `token` is the
+ * term naming the tombstone's own (`rowTokenTerm`), so a tombstone written since fails it.
  */
 export const overTombstone = (
   entity: {
@@ -236,7 +321,10 @@ export const overTombstone = (
   client: Pick<DynamoClientService, "getItem">,
   table: TableConfig,
   item: Record<string, unknown>,
-): Effect.Effect<Option.Option<ConditionInput>, DynamoClientError> =>
+): Effect.Effect<
+  Option.Option<{ readonly guard: ConditionInput; readonly token: RawCondition | undefined }>,
+  DynamoClientError
+> =>
   Effect.gen(function* () {
     if (!hasProjectionTombstones(entity)) return Option.none()
     const layouts = projectionLayoutsOf(entity) ?? []
@@ -257,8 +345,11 @@ export const overTombstone = (
     // The projections with `removal`, the one defined last first. Each attribute once, in the role
     // of the first that names it: its checkpoints, then its revision, as with one layout.
     const taken = new Set<string>()
-    for (const layout of [...layouts].reverse()) {
-      if (!layout.removal) continue
+    const ordered = [...layouts].reverse()
+    for (const layout of [
+      ...ordered.filter((layout) => layout.removal),
+      ...ordered.filter((layout) => !layout.removal),
+    ]) {
       const mine = layout.roles
         .map(([field, role]) => [storedName(entity, field), role] as const)
         .filter(([name]) => name !== ttl && !taken.has(name))
@@ -270,9 +361,14 @@ export const overTombstone = (
         if (role === "revision" && held(name) !== undefined) item[name] = Number(held(name)) + 1
       }
     }
+    const tokened = rowTokened(entity)
+    if (tokened) item[ROW_TOKEN] = yield* freshRowToken(rowWriters(Item[ROW_TOKEN]))
     return Option.some({
-      eq: { __edd_e__: `${entity.entityType}#tombstone`, __edd_removed__: tomb.__edd_removed__ },
-    } as ConditionInput)
+      guard: {
+        eq: { __edd_e__: `${entity.entityType}#tombstone`, __edd_removed__: tomb.__edd_removed__ },
+      } as ConditionInput,
+      token: tokened ? rowTokenTerm(Item[ROW_TOKEN]) : undefined,
+    })
   })
 
 /**

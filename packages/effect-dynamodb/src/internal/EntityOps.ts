@@ -13,6 +13,7 @@ import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
+import type { RawCondition } from "./TransactableOps.js"
 
 // ---------------------------------------------------------------------------
 // TypeId symbols
@@ -444,6 +445,23 @@ export interface EntityPutOpts {
    * now — an EventStore projection rewriting a row it read keeps the row's.
    */
   readonly createdAt?: DateTime.Utc | undefined
+  /**
+   * @internal An EventStore projection's write (#237): `attributes` set on the stored item
+   * (stored names, stored values: the row token, and another projection's bookkeeping carried
+   * over a tombstone), `fill` set where the item holds no such attribute (another projection's
+   * bookkeeping the state left out), `condition` ANDed with the op's (the row token as read, or
+   * that the row is still the tombstone read), and `expectAbsent` when the projection read no row
+   * on a read model whose rows carry the token, so `create` never takes the place of a tombstone
+   * written since.
+   */
+  readonly projectionWrite?:
+    | {
+        readonly attributes: Readonly<Record<string, unknown>>
+        readonly fill?: Readonly<Record<string, unknown>> | undefined
+        readonly condition?: RawCondition | undefined
+        readonly expectAbsent?: boolean | undefined
+      }
+    | undefined
 }
 
 /**
