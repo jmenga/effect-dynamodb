@@ -1,0 +1,1308 @@
+{
+  "version": "1.39.0",
+  "captured": "From the published effect-dynamodb@1.39.0 npm package, on DynamoDB Local, by the \"typed\" scenario in test/helpers/OutboxPairRequests.ts, with escapeKeys off and on. Never regenerate it.",
+  "off": {
+    "requests": [
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readA",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_0000000000000007"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readA",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "2"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "rev": {
+                    "N": "1"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "attribute_not_exists(#g)",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "2"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readA",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_0000000000000007"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readA",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "5"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "rev": {
+                    "N": "2"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "#g = :g",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                },
+                "ExpressionAttributeValues": {
+                  ":g": {
+                    "N": "1"
+                  }
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "5"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readB",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_x_q"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readB",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "2"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "rev": {
+                    "N": "1"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "attribute_not_exists(#g)",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "2"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readB",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_x_q"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readB",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "5"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "rev": {
+                    "N": "2"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "#g = :g",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                },
+                "ExpressionAttributeValues": {
+                  ":g": {
+                    "N": "1"
+                  }
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "5"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "items": {
+      "readA": [
+        {
+          "__edd_e__": {
+            "S": "Ledger"
+          },
+          "n": {
+            "N": "7"
+          },
+          "n_x": {
+            "S": "q"
+          },
+          "name": {
+            "S": "acct"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "rev": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "total": {
+            "N": "5"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ],
+      "readB": [
+        {
+          "__edd_e__": {
+            "S": "Ledger"
+          },
+          "n": {
+            "N": "7"
+          },
+          "n_x": {
+            "S": "q"
+          },
+          "name": {
+            "S": "acct"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "rev": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "total": {
+            "N": "5"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ],
+      "outbox": [
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "2"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "2"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ]
+    }
+  },
+  "on": {
+    "requests": [
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readA",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_0000000000000007"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readA",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "2"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "rev": {
+                    "N": "1"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "attribute_not_exists(#g)",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "2"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readA",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_0000000000000007"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readA",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "5"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "rev": {
+                    "N": "2"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "#g = :g",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                },
+                "ExpressionAttributeValues": {
+                  ":g": {
+                    "N": "1"
+                  }
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_0000000000000007"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "5"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readB",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_x_q"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readB",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "2"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "rev": {
+                    "N": "1"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "attribute_not_exists(#g)",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "2"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "1"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "operation": "getItem",
+        "input": {
+          "TableName": "readB",
+          "Key": {
+            "pk": {
+              "S": "$pair#v1#ledger#n_x_q"
+            },
+            "sk": {
+              "S": "$pair#v1#ledger#name_acct"
+            }
+          },
+          "ConsistentRead": true
+        }
+      },
+      {
+        "operation": "transactWriteItems",
+        "input": {
+          "TransactItems": [
+            {
+              "Put": {
+                "TableName": "readB",
+                "Item": {
+                  "n": {
+                    "N": "7"
+                  },
+                  "n_x": {
+                    "S": "q"
+                  },
+                  "name": {
+                    "S": "acct"
+                  },
+                  "total": {
+                    "N": "5"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "rev": {
+                    "N": "2"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger"
+                  },
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  }
+                },
+                "ConditionExpression": "#g = :g",
+                "ExpressionAttributeNames": {
+                  "#g": "rev"
+                },
+                "ExpressionAttributeValues": {
+                  ":g": {
+                    "N": "1"
+                  }
+                }
+              }
+            },
+            {
+              "Put": {
+                "TableName": "outbox",
+                "Item": {
+                  "pk": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "sk": {
+                    "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+                  },
+                  "__edd_e__": {
+                    "S": "Ledger#outbox"
+                  },
+                  "__edd_row_pk__": {
+                    "S": "$pair#v1#ledger#n_x_q"
+                  },
+                  "__edd_row_sk__": {
+                    "S": "$pair#v1#ledger#name_acct"
+                  },
+                  "effect": {
+                    "M": {
+                      "account": {
+                        "S": "acct"
+                      },
+                      "total": {
+                        "N": "5"
+                      }
+                    }
+                  },
+                  "source": {
+                    "S": "projection"
+                  },
+                  "streamId": {
+                    "S": "acct"
+                  },
+                  "version": {
+                    "N": "2"
+                  },
+                  "eventType": {
+                    "S": "Added"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "items": {
+      "readA": [
+        {
+          "__edd_e__": {
+            "S": "Ledger"
+          },
+          "n": {
+            "N": "7"
+          },
+          "n_x": {
+            "S": "q"
+          },
+          "name": {
+            "S": "acct"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "rev": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "total": {
+            "N": "5"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ],
+      "readB": [
+        {
+          "__edd_e__": {
+            "S": "Ledger"
+          },
+          "n": {
+            "N": "7"
+          },
+          "n_x": {
+            "S": "q"
+          },
+          "name": {
+            "S": "acct"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "rev": {
+            "N": "2"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "total": {
+            "N": "5"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ],
+      "outbox": [
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "2"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_0000000000000007"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "2"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "2"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000001#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "1"
+          }
+        },
+        {
+          "__edd_e__": {
+            "S": "Ledger#outbox"
+          },
+          "__edd_row_pk__": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "__edd_row_sk__": {
+            "S": "$pair#v1#ledger#name_acct"
+          },
+          "effect": {
+            "M": {
+              "account": {
+                "S": "acct"
+              },
+              "total": {
+                "N": "5"
+              }
+            }
+          },
+          "eventType": {
+            "S": "Added"
+          },
+          "pk": {
+            "S": "$pair#v1#ledger#n_x_q"
+          },
+          "sk": {
+            "S": "$pair#v1#ledger#name_acct#outbox#000000000002#0000"
+          },
+          "source": {
+            "S": "projection"
+          },
+          "streamId": {
+            "S": "acct"
+          },
+          "version": {
+            "N": "2"
+          }
+        }
+      ]
+    }
+  }
+}

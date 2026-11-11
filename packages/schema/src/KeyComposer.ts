@@ -2092,16 +2092,41 @@ export const composeSortKeyBeginsWith = (
 export const SORT_KEY_MAX = "\uFFFF"
 
 /**
+ * @internal What a composite's values can be in a key, for {@link composeKeySpace}: `"open"`, any
+ * text, the key delimiter included (the walk stops there); `"text"`, any text without the
+ * delimiter; `"number"`, a number's or a bigint's key text; or exactly the key text of `values`
+ * (a literal union, `true` and `false`).
+ */
+export type CompositeValues =
+  | "open"
+  | "text"
+  | "number"
+  | { readonly values: ReadonlyArray<unknown> }
+
+/**
+ * @internal A walked composite's value in a {@link KeySpace}: any text without the delimiter, the
+ * empty text included (`text`); a number's or a bigint's key text under any setting (`number`:
+ * digits and `-+.:;)*`, never the delimiter, and of letters only `e` and those of `Infinity`, as
+ * 1.36's text spells them, in any casing; it starts with a digit, `-`, `:` or `;`); or one of
+ * `texts`.
+ */
+export type KeyValueText =
+  | { readonly kind: "text" }
+  | { readonly kind: "number" }
+  | { readonly kind: "oneOf"; readonly texts: ReadonlyArray<string> }
+
+/**
  * @internal The keys of one half of an index, as text: `text`, what the composer writes before the
  * first composite's value, that composite's label included, or the whole key of a half with no
- * composite. Then, for each leading composite whose value can't hold the key delimiter, that value
- * and the text written after it (`after`): the next composite's label, or the end of the key. `open`
- * says any text follows: the value of the first composite that can hold the delimiter, and
- * everything after it.
+ * composite. Then, for each leading composite whose value can't hold the key delimiter, what that
+ * value can be (`values`, one per entry of `after`; `text` when absent) and the text written after
+ * it (`after`): the next composite's label, or the end of the key. `open` says any text follows:
+ * the value of the first composite that can hold the delimiter, and everything after it.
  */
 export interface KeySpace {
   readonly text: string
   readonly after: ReadonlyArray<string>
+  readonly values?: ReadonlyArray<KeyValueText>
   readonly open: boolean
 }
 
@@ -2109,36 +2134,68 @@ export interface KeySpace {
  * @internal The key spaces of an index's partition and sort keys ({@link KeySpace}), as {@link composePk} and
  * {@link composeSk} write them. Each walked composite's value is composed as U+FFFF, which no
  * casing or escaping changes and no label holds, and the text is cut there. The walk goes on past a
- * composite `closed` says can't hold the delimiter (a number, say): its value ends where the next
- * label starts. It stops at the first that can: a partition key's values aren't escaped, so text
- * after one can always match another key's. Without `closed`, at the first composite.
+ * composite whose values `valuesOf` says can't hold the delimiter: its value ends where the next
+ * label starts. It stops at the first that can (`"open"`): a partition key's values aren't
+ * escaped, so text after one can always match another key's. Without `valuesOf`, at the first
+ * composite. A composite limited to `values` is their key text under the schema's setting, or
+ * with `everyForm` under every setting a row can have been written under (`escapeKeys` on, off,
+ * and the 1.37 numeric text): the fixed text is the same under all of them.
  */
 export const composeKeySpace = (
   schema: DynamoSchema.DynamoSchema,
   entityType: string,
   entityVersion: number,
   index: IndexDefinition,
-  closed: (composite: string) => boolean = () => false,
+  valuesOf: (composite: string) => CompositeValues = () => "open",
+  options?: { readonly everyForm?: boolean | undefined } | undefined,
 ): { readonly pk: KeySpace; readonly sk: KeySpace } => {
+  const casing = index.casing ?? schema.casing
+  const forms: ReadonlyArray<DynamoSchema.DynamoSchema> =
+    options?.everyForm === true
+      ? [
+          { ...schema, escapeKeys: true },
+          { ...schema, escapeKeys: false },
+          { ...schema, escapeKeys: false, numericKeyText: true },
+        ]
+      : [schema]
+  const valueText = (values: Exclude<CompositeValues, "open">): KeyValueText => {
+    if (values === "text") return { kind: "text" }
+    if (values === "number") return { kind: "number" }
+    const texts = new Set<string>()
+    for (const value of values.values) {
+      for (const form of forms) {
+        try {
+          // The composer cases the whole key again, which leaves cased text as it is.
+          texts.add(applyCasing(keyValueText(form, value, casing), casing))
+        } catch {
+          // A value no key can hold (`NaN`) is no key's.
+        }
+      }
+    }
+    return { kind: "oneOf", texts: [...texts] }
+  }
   const half = (
     composite: ReadonlyArray<string>,
     compose: (walked: ReadonlyArray<string>, record: Record<string, unknown>) => string,
   ): KeySpace => {
     const walked: Array<string> = []
+    const values: Array<KeyValueText> = []
     let open = false
     for (const name of composite) {
       walked.push(name)
-      if (!closed(name)) {
+      const of = valuesOf(name)
+      if (of === "open") {
         open = true
         break
       }
+      values.push(valueText(of))
     }
-    if (walked.length === 0) return { text: compose([], {}), after: [], open: false }
+    if (walked.length === 0) return { text: compose([], {}), after: [], values: [], open: false }
     const record: Record<string, unknown> = Object.create(null)
     for (const name of walked) record[name] = SORT_KEY_MAX
     const [text = "", ...rest] = compose(walked, record).split(SORT_KEY_MAX)
     // The text after an open value isn't the key's: anything follows it.
-    return { text, after: open ? rest.slice(0, -1) : rest, open }
+    return { text, after: open ? rest.slice(0, -1) : rest, values, open }
   }
   return {
     pk: half(index.pk.composite, (composite, record) =>
@@ -2161,48 +2218,109 @@ export const composeKeySpace = (
   }
 }
 
+/** A set of characters, or every character but those (`negated`). */
+interface CharClass {
+  readonly chars: string
+  readonly negated: boolean
+}
+
+const ANY_CHARACTER: CharClass = { chars: "", negated: true }
+const NOT_DELIMITER: CharClass = { chars: KEY_DELIMITER, negated: true }
+/** The first character of a number's or a bigint's key text, under any setting. */
+const NUMBER_FIRST: CharClass = { chars: "0123456789-:;", negated: false }
+/** Any other character of it: `NumericKey`'s, and 1.36's (`1e+21`, `Infinity`), in any casing. */
+const NUMBER_REST: CharClass = { chars: "0123456789-+.:;)*eEiInNfFtTyY", negated: false }
+
+/** Whether some character is in both. */
+const classesMeet = (a: CharClass, b: CharClass): boolean => {
+  if (a.negated && b.negated) return true
+  if (!a.negated && !b.negated) return [...a.chars].some((char) => b.chars.includes(char))
+  const [set, not] = a.negated ? [b, a] : [a, b]
+  return [...set.chars].some((char) => !not.chars.includes(char))
+}
+
+/**
+ * The keys of a {@link KeySpace} as an automaton: `edges[state]` are the moves on one character,
+ * `empty[state]` those on none. It starts at state 0 and accepts at `accept`.
+ */
+const keyAutomaton = (
+  space: KeySpace,
+): {
+  readonly edges: ReadonlyArray<ReadonlyArray<readonly [CharClass, number]>>
+  readonly empty: ReadonlyArray<ReadonlyArray<number>>
+  readonly accept: number
+} => {
+  const edges: Array<Array<readonly [CharClass, number]>> = []
+  const empty: Array<Array<number>> = []
+  const state = (): number => {
+    edges.push([])
+    empty.push([])
+    return edges.length - 1
+  }
+  let at = state()
+  /** The characters of `text`, one by one, from `from`: the state after them. */
+  const spell = (from: number, text: string): number => {
+    let to = from
+    for (const char of text) {
+      const next = state()
+      edges[to]!.push([{ chars: char, negated: false }, next])
+      to = next
+    }
+    return to
+  }
+  at = spell(at, space.text)
+  space.after.forEach((text, i) => {
+    const value = space.values?.[i] ?? { kind: "text" }
+    const end = state()
+    if (value.kind === "text") {
+      const loop = state()
+      empty[at]!.push(loop)
+      edges[loop]!.push([NOT_DELIMITER, loop])
+      empty[loop]!.push(end)
+    } else if (value.kind === "number") {
+      const digits = state()
+      edges[at]!.push([NUMBER_FIRST, digits])
+      edges[digits]!.push([NUMBER_REST, digits])
+      empty[digits]!.push(end)
+    } else {
+      for (const option of value.texts) empty[spell(at, option)]!.push(end)
+    }
+    at = spell(end, text)
+  })
+  if (space.open) edges[at]!.push([ANY_CHARACTER, at])
+  return { edges, empty, accept: at }
+}
+
 /**
  * @internal Whether a key of one {@link KeySpace} can be a key of the other. Each is literal text
- * with values between: a walked value is any text without the delimiter, and an open space ends in
- * any text at all. The two are matched text against text, a value taking as much of the other's
- * text as it can hold.
+ * with values between, each value what its {@link KeyValueText} allows, and an open space ends in
+ * any text at all. The two are read character against character, together, until both can end.
  */
 export const keySpacesMeet = (a: KeySpace, b: KeySpace): boolean => {
-  type Token = string | "value" | "rest"
-  const tokens = (space: KeySpace): ReadonlyArray<Token> => {
-    const out: Array<Token> = [...space.text].map((char) => `=${char}`)
-    for (const text of space.after) {
-      out.push("value", ...[...text].map((char) => `=${char}`))
+  const x = keyAutomaton(a)
+  const y = keyAutomaton(b)
+  const width = y.edges.length
+  const seen = new Set<number>()
+  const queue: Array<readonly [number, number]> = []
+  const visit = (i: number, j: number) => {
+    const key = i * width + j
+    if (seen.has(key)) return
+    seen.add(key)
+    queue.push([i, j])
+  }
+  visit(0, 0)
+  for (let k = 0; k < queue.length; k++) {
+    const [i, j] = queue[k]!
+    if (i === x.accept && j === y.accept) return true
+    for (const to of x.empty[i]!) visit(to, j)
+    for (const to of y.empty[j]!) visit(i, to)
+    for (const [left, toLeft] of x.edges[i]!) {
+      for (const [right, toRight] of y.edges[j]!) {
+        if (classesMeet(left, right)) visit(toLeft, toRight)
+      }
     }
-    if (space.open) out.push("rest")
-    return out
   }
-  const ta = tokens(a)
-  const tb = tokens(b)
-  const seen = new Map<number, boolean>()
-  /** Whether what's left of each from `i` and `j` can be the same text. */
-  const meet = (i: number, j: number): boolean => {
-    const key = i * (tb.length + 1) + j
-    const known = seen.get(key)
-    if (known !== undefined) return known
-    const x = ta[i]
-    const y = tb[j]
-    let result: boolean
-    if (x === "rest" || y === "rest") result = true
-    else if (x === undefined && y === undefined) result = true
-    // One has ended: the other's remaining values must all be empty.
-    else if (x === undefined) result = y === "value" && meet(i, j + 1)
-    else if (y === undefined) result = x === "value" && meet(i + 1, j)
-    else if (x === "value") {
-      // The value ends here, or takes the other's next character (never a delimiter).
-      result = meet(i + 1, j) || ((y === "value" || y !== `=${KEY_DELIMITER}`) && meet(i, j + 1))
-    } else if (y === "value") {
-      result = meet(i, j + 1) || (x !== `=${KEY_DELIMITER}` && meet(i + 1, j))
-    } else result = x === y && meet(i + 1, j + 1)
-    seen.set(key, result)
-    return result
-  }
-  return meet(0, 0)
+  return false
 }
 
 /**

@@ -1,12 +1,18 @@
 /**
  * Two read models of one entity type in one schema, each with a projection whose outbox is on one
- * shared table. Both partition keys are led by `shop`, and the second's goes on with `branch`, so a
- * key of one is a key of the other only through a value holding `#`. A client binds them, and each
- * projection applies its stream's events: the requests naming the read models' tables and the
- * outbox's, in order.
+ * shared table. A client binds them, and each projection applies its stream's events: the requests
+ * naming the read models' tables and the outbox's, in order. Two layouts:
  *
- * `fixtures/outbox-pair-1.39.0.json` holds what the published 1.39.0 sent and stored for this
- * scenario, against DynamoDB Local. Never regenerate it from this repo.
+ * - `"prefix"`: both partition keys are led by `shop`, and the second's goes on with `branch`, so a
+ *   key of one is a key of the other only through a value holding `#`.
+ *   `fixtures/outbox-pair-1.39.0.json` holds what the published 1.39.0 sent and stored for it.
+ * - `"typed"`: the first partition key is the number `n`, the second the string `n_x`: `n_` is
+ *   followed by a number's text in one and by `x_` in the other, so no key of one is a key of the
+ *   other. `fixtures/outbox-typed-pair-1.39.0.json` holds what the published 1.39.0 sent and stored
+ *   for it, with `escapeKeys` off and on.
+ *
+ * Both fixtures were captured from the published 1.39.0 against DynamoDB Local. Never regenerate
+ * them from this repo.
  *
  * The scenario takes the library as an argument, so the same code ran against the published 1.39.0
  * to make the fixture as runs against this repo's source to compare with it.
@@ -51,8 +57,17 @@ const normalize = (input: unknown, tables: Tables) => {
  * projections over `client` (a layer of `DynamoClient`) and returns every request naming a read
  * model's table or the outbox's, in order.
  */
-export const scenario = (lib: Library, tables: Tables) => {
-  const AppSchema = lib.DynamoSchema.make({ name: "pair", version: 1 })
+export const scenario = (
+  lib: Library,
+  tables: Tables,
+  layout: "prefix" | "typed" = "prefix",
+  escapeKeys = false,
+) => {
+  const AppSchema = lib.DynamoSchema.make({
+    name: "pair",
+    version: 1,
+    ...(escapeKeys ? { escapeKeys: true } : {}),
+  })
 
   class Added extends Schema.TaggedClass<Added>()("Added", { amount: Schema.Number }) {}
 
@@ -64,15 +79,25 @@ export const scenario = (lib: Library, tables: Tables) => {
     streamId: { composite: ["account"] },
   })
 
-  const Row = Schema.Struct({
-    shop: Schema.String,
-    branch: Schema.String,
-    name: Schema.String,
-    total: Schema.Number,
-    version: Schema.Number,
-    rev: Schema.Number,
-  })
-  type Row = typeof Row.Type
+  const Row =
+    layout === "prefix"
+      ? Schema.Struct({
+          shop: Schema.String,
+          branch: Schema.String,
+          name: Schema.String,
+          total: Schema.Number,
+          version: Schema.Number,
+          rev: Schema.Number,
+        })
+      : Schema.Struct({
+          n: Schema.Number,
+          n_x: Schema.String,
+          name: Schema.String,
+          total: Schema.Number,
+          version: Schema.Number,
+          rev: Schema.Number,
+        })
+  type Row = { readonly total: number } & Record<string, unknown>
   const OutboxTable = lib.Table.make({ schema: AppSchema, entities: {} })
   const side = (pk: ReadonlyArray<string>) => {
     const Ledgers = lib.Entity.make({
@@ -84,7 +109,10 @@ export const scenario = (lib: Library, tables: Tables) => {
       },
     })
     const ReadTable = lib.Table.make({ schema: AppSchema, entities: { Ledgers } })
-    const row = (account: string) => ({ shop: "north", branch: "b1", name: account })
+    const row = (account: string) =>
+      layout === "prefix"
+        ? { shop: "north", branch: "b1", name: account }
+        : { n: 7, n_x: "q", name: account }
     const Projection = lib.EventStore.projection({
       stream: Accounts,
       readModel: Ledgers,
@@ -109,8 +137,8 @@ export const scenario = (lib: Library, tables: Tables) => {
     })
     return { Ledgers, ReadTable, Projection }
   }
-  const A = side(["shop"])
-  const B = side(["shop", "branch"])
+  const A = side(layout === "prefix" ? ["shop"] : ["n"])
+  const B = side(layout === "prefix" ? ["shop", "branch"] : ["n_x"])
 
   const sent: Array<Sent> = []
   const named = [tables.readA, tables.readB, tables.outbox].map((name) => JSON.stringify(name))

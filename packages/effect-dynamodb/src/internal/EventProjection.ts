@@ -733,9 +733,9 @@ export interface EventProjection<
   readonly [EventProjectionTypeId]: EventProjectionTypeId
   /** The source stream. */
   readonly stream: EventStream<A, TStreamIdFields, any, any, any, any, any>
-  /** @internal See {@link ProjectionRoutes}. */
   /** @internal See {@link ProjectionReadModelKey}. */
   readonly [ProjectionReadModelKey]: unknown
+  /** @internal See {@link ProjectionRoutes}. */
   readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route>
   /** The read model's entity type. */
   readonly entityType: string

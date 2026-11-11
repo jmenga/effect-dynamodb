@@ -58,6 +58,7 @@ import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
+import { handlerOf } from "./Rekey.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
   addProjectionLayout,
@@ -368,22 +369,30 @@ export const physicalTableName = (tag: TableTag): Effect.Effect<string | undefin
   )
 
 /**
- * Whether a composite of `model` can't hold `#` in its key text, by its schema: a number, a bigint
- * or a boolean, or literals none of which holds one. Numeric key text has no `#`, and no casing or
- * escaping adds one. Any other field (a string, a field the model doesn't declare) may hold it.
+ * What a composite of `model` can be in a key (`KeyComposer.CompositeValues`), by its schema, as
+ * one side sees it:
+ *
+ * - `"written"`, the keys its rows are written under: the key text of its literals (a literal
+ *   union), of `true` and `false` (a boolean), or a number's or bigint's key text; any other field
+ *   (a string, a field the model doesn't declare) may hold any text, `#` included.
+ * - `"read"`, the keys `rekey`'s reader takes as its rows' (`KeyText136.readIndexKeys`): a number,
+ *   a bigint or a boolean only as text its value composes again, and a literal composite as any
+ *   text, which it reads as a string.
  */
-const holdsNoDelimiter =
-  (model: unknown) =>
-  (composite: string): boolean => {
-    if (model === undefined || model === null) return false
+const compositeValues =
+  (model: unknown, side: "written" | "read") =>
+  (composite: string): KeyComposer.CompositeValues => {
+    if (model === undefined || model === null) return "open"
     const schema = isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top)
     const fields = getSchemaFields(schema)
-    if (fields === undefined || !Object.hasOwn(fields, composite)) return false
+    if (fields === undefined || !Object.hasOwn(fields, composite)) return "open"
     const field = fields[composite]!
+    const literals = keyFormLiterals(field)
+    if (side === "written" && literals !== undefined) return { values: literals }
     const kind = keyFormValueKind(field)
-    if (kind === "number" || kind === "bigint" || kind === "boolean") return true
-    const literals = kind === "string" ? keyFormLiterals(field) : undefined
-    return literals?.every((literal) => !String(literal).includes("#")) ?? false
+    if (kind === "number" || kind === "bigint") return "number"
+    if (kind === "boolean") return { values: [true, false] }
+    return "open"
   }
 
 /** The key spaces of an entity's rows, each half's (`KeyComposer.composeKeySpace`). */
@@ -391,15 +400,19 @@ type KeySpace = { readonly pk: KeyComposer.KeySpace; readonly sk: KeyComposer.Ke
 
 /**
  * The key space an entity's rows are under: the text its primary key's partition and sort keys
- * start with, up to the first composite's value and that composite's label included, composed by
- * the call its writes make (`KeyComposer.composeKeySpace`) — the schema's name and version, the
- * primary collection (or the entity type), under a collection the entity type and its version, and
- * the first composite's name. Past a composite whose key text can't hold `#` (`holdsNoDelimiter`)
- * it goes on to the next label, so read models whose keys part only there are apart. `plain` is the
- * space of its keys whose values hold no `#`: every composite is walked, to the end of the key.
+ * start with, the composites' labels, and what each composite's value can be, composed by the call
+ * its writes make (`KeyComposer.composeKeySpace`): the schema's name and version, the primary
+ * collection (or the entity type), under a collection the entity type and its version, and each
+ * composite's name. Each value is what its type can compose (`compositeValues`), by `view`:
+ *
+ * - `"plain"`, the keys its rows are written under with values that hold no `#`: every composite is
+ *   walked, to the end of the key, under the schema's setting.
+ * - `"written"` and `"read"`, the keys `rekey` meets on its table, under any setting: the walk
+ *   stops at the first composite whose value may hold `#` (`"open"`), and anything follows it.
+ *
  * `undefined` for an entity on no table.
  */
-const keySpaceOf = (entity: unknown, plain = false): KeySpace | undefined => {
+const keySpaceOf = (entity: unknown, view: "plain" | "written" | "read"): KeySpace | undefined => {
   const member = entity as {
     readonly entityType?: string
     readonly _entityVersion?: number
@@ -411,13 +424,20 @@ const keySpaceOf = (entity: unknown, plain = false): KeySpace | undefined => {
   if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
     return undefined
   }
+  const values = compositeValues(member.model, view === "read" ? "read" : "written")
   try {
     return KeyComposer.composeKeySpace(
       member._schema,
       member.entityType,
       member._entityVersion ?? 1,
       primary,
-      plain ? () => true : holdsNoDelimiter(member.model),
+      view === "plain"
+        ? (composite) => {
+            const of = values(composite)
+            return of === "open" ? "text" : of
+          }
+        : values,
+      { everyForm: view !== "plain" },
     )
   } catch {
     return undefined
@@ -436,7 +456,7 @@ const outboxSpaceOf = (space: KeySpace): KeySpace => {
     pk: space.pk,
     sk:
       last < 0
-        ? { text: `${sk.text}#outbox#`, after: [], open: true }
+        ? { text: `${sk.text}#outbox#`, after: [], values: [], open: true }
         : { ...sk, after: [...sk.after.slice(0, last), `${sk.after[last]}#outbox#`], open: true },
   }
 }
@@ -446,22 +466,98 @@ const spacesMeet = (a: KeySpace, b: KeySpace): boolean =>
   KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
 
 /**
+ * Whether the outbox items of one entity can be read by `rekey` as the other's, either way round:
+ * the keys one's are written under (`"written"`) against the keys the other's reader takes
+ * (`"read"`).
+ */
+const readAsEachOther = (a: unknown, b: unknown): boolean => {
+  const meet = (writer: unknown, reader: unknown) => {
+    const written = keySpaceOf(writer, "written")
+    const read = keySpaceOf(reader, "read")
+    return (
+      written !== undefined &&
+      read !== undefined &&
+      spacesMeet(outboxSpaceOf(written), outboxSpaceOf(read))
+    )
+  }
+  return meet(a, b) || meet(b, a)
+}
+
+/**
+ * Whether two entities compose every key the same way: one schema (name, version, casing,
+ * `escapeKeys`), entity type and version, primary key composites, casing and collection, and each
+ * composite of one type. Then either one's reader moves a row as the other's would.
+ */
+const sameKeys = (a: unknown, b: unknown): boolean => {
+  type Member = {
+    readonly entityType?: string
+    readonly _entityVersion?: number
+    readonly indexes?: { readonly primary?: IndexDefinition }
+    readonly _schema?: DynamoSchema.DynamoSchema
+    readonly model?: unknown
+  }
+  const x = a as Member
+  const y = b as Member
+  const px = x.indexes?.primary
+  const py = y.indexes?.primary
+  const sx = x._schema
+  const sy = y._schema
+  if (px === undefined || py === undefined || sx === undefined || sy === undefined) return false
+  const fieldsOf = (model: unknown) =>
+    model === undefined || model === null
+      ? undefined
+      : getSchemaFields(
+          isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top),
+        )
+  const fx = fieldsOf(x.model)
+  const fy = fieldsOf(y.model)
+  const typeOf = (fields: ReturnType<typeof getSchemaFields>, composite: string) => {
+    if (fields === undefined || !Object.hasOwn(fields, composite)) return undefined
+    const field = fields[composite]!
+    return JSON.stringify([keyFormValueKind(field), keyFormLiterals(field)])
+  }
+  const same = (u: ReadonlyArray<string>, v: ReadonlyArray<string>) =>
+    u.length === v.length && u.every((name, i) => name === v[i])
+  return (
+    x.entityType === y.entityType &&
+    (x._entityVersion ?? 1) === (y._entityVersion ?? 1) &&
+    sx.name === sy.name &&
+    sx.version === sy.version &&
+    sx.casing === sy.casing &&
+    (sx.escapeKeys === true) === (sy.escapeKeys === true) &&
+    same(px.pk.composite, py.pk.composite) &&
+    same(px.sk.composite, py.sk.composite) &&
+    px.casing === py.casing &&
+    JSON.stringify(px.collection) === JSON.stringify(py.collection) &&
+    px.type === py.type &&
+    [...px.pk.composite, ...px.sk.composite].every((composite) => {
+      const t = typeOf(fx, composite)
+      return t !== undefined && t === typeOf(fy, composite)
+    })
+  )
+}
+
+/**
  * @internal `[EDD-9134]`: among `members` (each named as `site`'s message shows it), a read model
  * whose projection's outbox is on another table, where another read model in the same key space
- * has its outbox too. A member's rows on that table aren't looked at: an item's sort key is a
- * whole row sort key followed by `#outbox#`, so a row's key is an item's only through a value
- * holding that text, and `rekey` tells the two apart by `__edd_e__`. Tables are compared by the physical name the context resolves (two handles on one table are one
- * table), and by service when one isn't provided. The problem, or `undefined`.
+ * has its outbox too. Tables are compared by the physical name the context resolves (two handles
+ * on one table are one table), and by service when one isn't provided. The problem, or `undefined`.
  *
  * Two questions, by `scope`:
  *
  * - `"plain"` (where read models are bound: `DynamoClient.make`, `EventStore.processBatch`): can a
- *   key of one be a key of the other with values that hold no `#`? Then their items overwrite each
- *   other whenever their values match, in normal operation. Read models whose keys meet only
- *   through a value holding `#` bind and run, as on 1.39.0.
- * - a table (`rekey` of it): can a key of one be read back as a key of the other at all, a string
- *   value holding `#` included? `rekey` reads an item's key back by the key space it names, so it
- *   couldn't tell whose an item on that table is. Only outboxes on that table are looked at.
+ *   key of one be a key of the other with values that hold no `#`, each value what its type can
+ *   compose? Then their items overwrite each other whenever their values match, in normal
+ *   operation. Read models whose keys meet only through a value holding `#` bind and run, as on
+ *   1.39.0, as do two whose keys part where a value of one can't hold the other's text (a number
+ *   beside a label).
+ * - a table (`rekey` of it): can `rekey` read an item of one as the other's at all, a string value
+ *   holding `#` included, and a literal composite read as any text, as its reader reads it? Then it
+ *   couldn't tell whose an item on that table is. Only outboxes on that table are looked at. The
+ *   table's own members (`scope.members`) are looked at too: an entity claims the outbox items of
+ *   its entity type on its table (its own projections' outbox there), so one that can read a read
+ *   model's items as its own would move them by its key. One whose keys are composed exactly as
+ *   the read model's (`sameKeys`) moves them where the read model would, and isn't refused.
  *
  * Read models that never meet at a site that sees several at once can't be checked: their key
  * spaces must be kept apart by whoever defines them.
@@ -469,7 +565,14 @@ const spacesMeet = (a: KeySpace, b: KeySpace): boolean =>
 export const sharedOutboxKeySpace = (
   site: string,
   members: ReadonlyArray<readonly [name: string, entity: unknown]>,
-  scope: "plain" | { readonly key: string; readonly name: string },
+  scope:
+    | "plain"
+    | {
+        readonly key: string
+        readonly name: string
+        /** The table's members, each named as the message shows it. */
+        readonly members: ReadonlyArray<readonly [name: string, member: unknown]>
+      },
 ): Effect.Effect<string | undefined> =>
   Effect.gen(function* () {
     const plain = scope === "plain"
@@ -487,45 +590,65 @@ export const sharedOutboxKeySpace = (
       const name = names.get(a.key)
       return name !== undefined && name === names.get(b.key)
     }
+    const startOf = (space: KeySpace) =>
+      `(partition keys starting "${space.pk.text}", sort keys starting "${space.sk.text}": the ` +
+      "same schema name and version, primary collection, entity type and first composite)"
     for (const [name, entity] of members) {
-      {
-        const space = keySpaceOf(entity, plain)
-        if (space === undefined) continue
-        const items = outboxSpaceOf(space)
-        for (const outbox of remoteOutboxesOf(entity)) {
-          const into = outbox.table.Tag
-          if (!plain && into.key !== scope.key && names.get(into.key) !== scope.name) continue
-          for (const [otherName, other] of members) {
-            if (other === entity) continue
-            const otherSpace = keySpaceOf(other, plain)
-            if (otherSpace === undefined) continue
+      const space = keySpaceOf(entity, plain ? "plain" : "written")
+      if (space === undefined) continue
+      for (const outbox of remoteOutboxesOf(entity)) {
+        const into = outbox.table.Tag
+        if (!plain && into.key !== scope.key && names.get(into.key) !== scope.name) continue
+        const physical = names.get(into.key)
+        for (const [otherName, other] of members) {
+          if (other === entity) continue
+          if (!remoteOutboxesOf(other).some((o) => oneTable(o.table.Tag, into))) continue
+          if (plain) {
+            const otherSpace = keySpaceOf(other, "plain")
             if (
-              !remoteOutboxesOf(other).some((o) => oneTable(o.table.Tag, into)) ||
-              !spacesMeet(items, outboxSpaceOf(otherSpace))
+              otherSpace === undefined ||
+              !spacesMeet(outboxSpaceOf(space), outboxSpaceOf(otherSpace))
             ) {
               continue
             }
-            const physical = names.get(into.key)
-            return (
-              `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
-              `table${physical === undefined ? "" : ` ("${physical}")`}, where ${otherName} ` +
-              "writes its own under the same key space " +
-              `(partition keys starting "${space.pk.text}", sort keys starting ` +
-              `"${space.sk.text}": the same schema name and version, primary collection, ` +
-              "entity type and first composite). " +
-              (plain
-                ? "Their items would overwrite each other whenever their keys match, and rekey " +
-                  "couldn't tell whose an item is. "
-                : "rekey reads an item's key back by its key space, and couldn't tell whose an " +
-                  "item on this table is. ") +
-              "Give one of them its own entity type, collection, schema or key composites."
-            )
+          } else if (!readAsEachOther(entity, other)) continue
+          return (
+            `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
+            `table${physical === undefined ? "" : ` ("${physical}")`}, where ${otherName} ` +
+            `writes its own under the same key space ${startOf(space)}. ` +
+            (plain
+              ? "Their items would overwrite each other whenever their keys match, and rekey " +
+                "couldn't tell whose an item is. "
+              : "rekey reads an item's key back by its key space, and couldn't tell whose an " +
+                "item on this table is. ") +
+            "Give one of them its own entity type, collection, schema or key composites."
+          )
+        }
+        if (plain) continue
+        // The members of the table being rekeyed that claim this read model's outbox items.
+        for (const [memberName, member] of scope.members) {
+          if (member === entity) continue
+          const claims = handlerOf(member)?.types.includes(`${readModelType(entity)}#outbox`)
+          if (claims !== true || sameKeys(member, entity) || !readAsEachOther(entity, member)) {
+            continue
           }
+          return (
+            `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
+            `table${physical === undefined ? "" : ` ("${physical}")`}, whose member ` +
+            `${memberName} claims the outbox items of its entity type there under the same key ` +
+            `space ${startOf(space)}, and composes its keys differently. rekey reads an item's ` +
+            "key back by its key space, and couldn't tell whose an item on this table is. Give " +
+            "one of them its own entity type, collection, schema or key composites."
+          )
         }
       }
     }
     return undefined
   })
+
+/** An entity's type, as its rows' `__edd_e__` names it. */
+const readModelType = (entity: unknown): string | undefined =>
+  (entity as { readonly entityType?: string }).entityType
 
 /**
  * @internal `[EDD-9134]` ({@link sharedOutboxKeySpace}) as a defect, from the sites that define

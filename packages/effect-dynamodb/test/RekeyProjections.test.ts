@@ -1767,3 +1767,349 @@ describe.each([
     ),
   )
 })
+
+/**
+ * A recording table per physical table, each request answered by the table it names (a
+ * transaction's items by theirs, in turn), so a table's `rekey` scans its own rows only.
+ */
+const routedTables = () => {
+  const byName = new Map<string, RecordingTable>()
+  const named = (name: string): RecordingTable => {
+    const known = byName.get(name)
+    if (known !== undefined) return known
+    const made = makeRecordingTable()
+    byName.set(name, made)
+    return made
+  }
+  const first = named("t")
+  const client = new Proxy(first.client, {
+    get: (target, operation) => {
+      const value = (target as any)[operation]
+      if (typeof value !== "function") return value
+      return (input: any) => {
+        if (operation === "transactWriteItems" || operation === "transactGetItems") {
+          const groups = new Map<string, Array<unknown>>()
+          for (const item of input.TransactItems) {
+            const name = (Object.values(item)[0] as { readonly TableName: string }).TableName
+            groups.set(name, [...(groups.get(name) ?? []), item])
+          }
+          return Effect.forEach([...groups], ([name, items]) =>
+            (named(name).client as any)[operation]({ ...input, TransactItems: items }),
+          ).pipe(Effect.map((answers) => answers[0] ?? {}))
+        }
+        const name = input.TableName ?? Object.keys(input.RequestItems ?? {})[0] ?? "t"
+        return (named(String(name)).client as any)[operation](input)
+      }
+    },
+  })
+  return {
+    layer: Layer.succeed(DynamoClient, client),
+    /** The requests sent to any table since the last call, and forget them. */
+    take: () => [...byName.values()].flatMap((table) => table.take()),
+    /** Every table's items, by table. */
+    snapshot: () =>
+      new Map([...byName].map(([name, table]) => [name, new Map(table.items)] as const)),
+    /** The rows of `type` on table `name`. */
+    rows: (name: string, type: string) => rowsOf(named(name), type),
+  }
+}
+type RoutedTables = ReturnType<typeof routedTables>
+
+/** A row of every composite the pairs below are keyed by. */
+const Pair = Schema.Struct({
+  n: Schema.Number,
+  n_x: Schema.String,
+  kind: Schema.Literals(["a", "b"]),
+  shop: Schema.String,
+  branch: Schema.String,
+  idA: Schema.String,
+  idB: Schema.String,
+  name: Schema.String,
+  total: Schema.Number,
+  version: Schema.Number,
+  rev: Schema.Number,
+})
+type Pair = typeof Pair.Type
+type PairKey = keyof typeof Pair.fields
+
+/** The row each pair's read models write, its name changed by escaping. */
+const PAIR_ROW = {
+  n: 7,
+  n_x: "q",
+  kind: "a",
+  shop: "north",
+  branch: "b1",
+  idA: "x",
+  idB: "y",
+  name: "a b",
+} as const
+
+/**
+ * One side of a pair: a `Ledger` read model keyed by `pk` (and `name`), on a table of its own or a
+ * member of the outbox table (`member`), whose projection has its outbox on the outbox table
+ * (`"remote"`), on its own table (`"local"`), or has none (`"none"`).
+ */
+interface PairSide {
+  readonly pk: ReadonlyArray<PairKey>
+  readonly member?: boolean
+  readonly outbox?: "remote" | "local" | "none"
+}
+
+/** `sides` in schema `pair` under `w`'s setting, with one outbox table, `O`, named `o`. */
+const pairs = (w: World, sides: ReadonlyArray<PairSide>) => {
+  const schema = DynamoSchema.make({ name: "pair", version: 1, escapeKeys: w === On })
+  const built = sides.map((side) => ({
+    side,
+    Ledgers: Entity.make({
+      model: Pair,
+      entityType: "Ledger",
+      primaryKey: {
+        pk: { field: "pk", composite: [...side.pk] },
+        sk: { field: "sk", composite: ["name"] },
+      },
+    }),
+  }))
+  const O = Table.make({
+    schema,
+    entities: Object.fromEntries(
+      built.flatMap(({ side, Ledgers }, i) => (side.member ? [[`M${i}`, Ledgers]] : [])),
+    ),
+  })
+  const read = built.map(({ side, Ledgers }, i) =>
+    side.member ? undefined : Table.make({ schema, entities: { [`L${i}`]: Ledgers } }),
+  )
+  const projections = built.map(({ side, Ledgers }) =>
+    (side.outbox ?? "remote") === "none"
+      ? undefined
+      : EventStore.projection({
+          stream: w.Accounts,
+          readModel: Ledgers as unknown as Entity.Entity<any, any, any, any, any>,
+          key: () => PAIR_ROW,
+          initial: (): Pair => ({ ...PAIR_ROW, total: 0, version: 0, rev: 0 }),
+          evolve: (state: Pair, event: EventStore.StreamEvent<AccountEvent>) =>
+            Effect.succeed(
+              event.data._tag === "Added"
+                ? { ...state, total: state.total + event.data.amount }
+                : state,
+            ),
+          checkpoint: "version",
+          revision: "rev",
+          outbox: {
+            schema: Notice,
+            effects: (event: EventStore.StreamEvent<AccountEvent>, next: Pair | undefined) =>
+              event.data._tag === "Added"
+                ? [{ account: event.streamId, total: next?.total ?? -1 }]
+                : [],
+            ...(side.outbox === "local" ? {} : { table: O }),
+          },
+        } as any),
+  )
+  const layer = Layer.mergeAll(
+    w.EventsTable.layer({ name: "t" }),
+    O.layer({ name: "o" }),
+    ...read.flatMap((table, i) => (table === undefined ? [] : [table.layer({ name: `r${i}` })])),
+  )
+  /** A client binding the read models in `order` (by index) and every table. */
+  const client = (order: ReadonlyArray<number> = sides.map((_, i) => i), viaTables = false) =>
+    DynamoClient.make({
+      entities: viaTables
+        ? {}
+        : Object.fromEntries(order.map((i) => [String.fromCharCode(65 + i), built[i]!.Ledgers])),
+      tables: Object.fromEntries([
+        ["O", O],
+        ...order.flatMap((i) => (read[i] === undefined ? [] : [[`R${i}`, read[i]!]])),
+      ]),
+    } as any) as Effect.Effect<any, never, any>
+  return { w, O, built, projections, layer, client }
+}
+type Pairs = ReturnType<typeof pairs>
+
+/** `side`'s projection applies `moved`'s events; `drained` is what its drainer delivers. */
+const applyPair = (s: Pairs, side: number, events: ReadonlyArray<unknown>) =>
+  (s.projections[side] as any).applyBatch(events) as Effect.Effect<unknown>
+const drained = (s: Pairs, side: number) =>
+  Effect.gen(function* () {
+    const delivered: Array<number> = []
+    yield* (s.projections[side] as any).drain(PAIR_ROW, (effect: { readonly total: number }) =>
+      Effect.sync(() => void delivered.push(effect.total)),
+    ) as Effect.Effect<unknown>
+    return delivered
+  })
+
+/** `O.rekey`'s failure, as a `ValidationError`'s cause, after checking it sent nothing. */
+const refusedRekey = (
+  tables: RoutedTables,
+  s: Pairs,
+  order?: ReadonlyArray<number>,
+): Effect.Effect<ReadonlyArray<string>, unknown, any> =>
+  Effect.gen(function* () {
+    const db = yield* s.client(order)
+    const causes: Array<string> = []
+    const before = tables.snapshot()
+    tables.take()
+    for (const options of [{ dryRun: true }, {}]) {
+      const exit = yield* Effect.exit(
+        db.tables.O.rekey({ streams: [s.w.Accounts], ...options }) as Effect.Effect<
+          Table.RekeyReport,
+          unknown
+        >,
+      )
+      // The run's own failure, on its error channel: never a defect.
+      expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(false)
+      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
+      expect(error).toMatchObject({
+        _tag: "ValidationError",
+        entityType: "Table",
+        operation: "rekey",
+      })
+      causes.push(String((error as { readonly cause?: unknown }).cause))
+      expect(tables.take()).toEqual([])
+    }
+    expect(tables.snapshot()).toEqual(before)
+    return causes
+  })
+
+describe("[EDD-9134] a number composite beside a label its key text can't spell", () => {
+  // A is keyed by the number `n` (`n_0000000000000007`), B by the string `n_x` (`n_x_q`): a
+  // number's key text holds no `x`, so no key of one is a key of the other. 1.39.0 bound them.
+  const sides: ReadonlyArray<PairSide> = [{ pk: ["n"] }, { pk: ["n_x"] }]
+
+  it.effect.each(DIRECTIONS)(
+    "they bind, apply, process and drain, each its own, and rekey moves each by its own (%s)",
+    ([, from, to]) => {
+      const tables = routedTables()
+      const written = pairs(from, sides)
+      const now = pairs(to, sides)
+      return Effect.gen(function* () {
+        for (const s of [written, now]) {
+          yield* s.client()
+          yield* s.client(undefined, true)
+          yield* EventStore.processBatch([], {
+            projections: { a: s.projections[0] as any, b: s.projections[1] as any },
+            source: "lambda",
+          })
+        }
+        const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+        yield* applyPair(written, 0, events)
+        yield* applyPair(written, 1, events)
+        expect(tables.rows("o", "Ledger#outbox")).toHaveLength(2)
+        const db = yield* now.client()
+        const report = (yield* db.tables.O.rekey({
+          streams: [to.Accounts],
+        })) as Table.RekeyReport
+        expect(report.moved).toEqual({ ...ZERO, outbox: 2 })
+        expect(report.skipped.unrecognizedKey).toBe(0)
+        expect(report.conflicts).toEqual([])
+        expect(yield* drained(now, 0)).toEqual([2])
+        expect(yield* drained(now, 1)).toEqual([2])
+      }).pipe(
+        Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+      ) as Effect.Effect<void, unknown>
+    },
+  )
+})
+
+describe.each(DIRECTIONS)("[EDD-9134] a member of the outbox's table, %s", (_d, from, to) => {
+  // M is a member of the outbox table, keyed by `shop`; R's projection writes its outbox there,
+  // keyed by `shop` and `branch`. M claims the outbox items of its entity type on its table, and
+  // reads R's key `shop_north#branch_b1` as `shop` = `north#branch_b1`.
+  it.effect.each([
+    ["no projection", "none"],
+    ["a projection with its outbox on its own table", "local"],
+  ] as const)(
+    "M with %s: rekey of the outbox table refuses it before sending anything",
+    ([, outbox]) => {
+      const tables = routedTables()
+      const sides: ReadonlyArray<PairSide> = [
+        { pk: ["shop"], member: true, outbox },
+        { pk: ["shop", "branch"] },
+      ]
+      const written = pairs(from, sides)
+      const now = pairs(to, sides)
+      return Effect.gen(function* () {
+        const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+        if (outbox === "local") yield* applyPair(written, 0, events)
+        yield* applyPair(written, 1, events)
+        // Bound as on 1.39.0: only `rekey` reads an item's key back.
+        yield* written.client()
+        for (const order of [
+          [0, 1],
+          [1, 0],
+        ]) {
+          const causes = yield* refusedRekey(tables, now, order)
+          for (const cause of causes) {
+            expect(cause).toContain(
+              `[EDD-9134] rekey: "B" writes its projection's outbox items into another table ` +
+                `("o"), whose member "A" claims the outbox items of its entity type there under ` +
+                `the same key space (partition keys starting "$pair#v1#ledger#shop_"`,
+            )
+          }
+        }
+        // R's item is where it was, delivered by R's drainer under the setting it was written.
+        expect(yield* drained(written, 1)).toEqual([2])
+      }).pipe(
+        Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+      ) as Effect.Effect<void, unknown>
+    },
+  )
+
+  it.effect("a member composing its keys as the read model does moves its items there", () => {
+    const tables = routedTables()
+    const sides: ReadonlyArray<PairSide> = [
+      { pk: ["shop", "branch"], member: true, outbox: "none" },
+      { pk: ["shop", "branch"] },
+    ]
+    const written = pairs(from, sides)
+    const now = pairs(to, sides)
+    return Effect.gen(function* () {
+      const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+      yield* applyPair(written, 1, events)
+      const db = yield* now.client()
+      const report = (yield* db.tables.O.rekey({ streams: [to.Accounts] })) as Table.RekeyReport
+      expect(report.moved).toEqual({ ...ZERO, outbox: 1 })
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(yield* drained(now, 1)).toEqual([2])
+    }).pipe(
+      Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+    ) as Effect.Effect<void, unknown>
+  })
+})
+
+describe.each(
+  DIRECTIONS,
+)("[EDD-9134] read models led by a literal composite, %s", (_d, from, to) => {
+  // `kind` is `a` or `b`, and each read model writes `kind_a`. rekey's reader reads a literal as
+  // any text, as it reads a string, so A's reads B's `kind_a#idb_y#ida_x` as `kind` =
+  // `a#idb_y`, `idA` = `x`; and B's reads A's `kind_a#ida_x` when `x` holds `#idb_`.
+  it.effect.each([
+    ["one going on with the other's composites", ["kind", "idA"], ["kind", "idB", "idA"]],
+    ["each going on with its own composite", ["kind", "idA"], ["kind", "idB"]],
+  ] as const)("%s: they bind and run; rekey of their outbox table refuses them", ([, a, b]) => {
+    const tables = routedTables()
+    const sides: ReadonlyArray<PairSide> = [{ pk: a }, { pk: b }]
+    const written = pairs(from, sides)
+    const now = pairs(to, sides)
+    return Effect.gen(function* () {
+      // Their keys are apart for the values a literal can take: bound as on 1.39.0.
+      yield* written.client()
+      const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+      yield* applyPair(written, 0, events)
+      yield* applyPair(written, 1, events)
+      expect(tables.rows("o", "Ledger#outbox")).toHaveLength(2)
+      for (const order of [
+        [0, 1],
+        [1, 0],
+      ]) {
+        const causes = yield* refusedRekey(tables, now, order)
+        for (const cause of causes) {
+          expect(cause).toContain("[EDD-9134] rekey: ")
+          expect(cause).toContain(`(partition keys starting "$pair#v1#ledger#kind_"`)
+        }
+      }
+      expect(yield* drained(written, 0)).toEqual([2])
+      expect(yield* drained(written, 1)).toEqual([2])
+    }).pipe(
+      Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+    ) as Effect.Effect<void, unknown>
+  })
+})

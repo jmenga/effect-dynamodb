@@ -303,9 +303,9 @@ const MultiProjectionTypeId: unique symbol = Symbol.for("effect-dynamodb/MultiPr
 export interface MultiProjection<S, K, Sources extends Record<string, AnySource>, Err, R, O = never>
   extends Pipeable.Pipeable {
   readonly [MultiProjectionTypeId]: typeof MultiProjectionTypeId
-  /** @internal */
   /** @internal See {@link ProjectionReadModelKey}. */
   readonly [ProjectionReadModelKey]: unknown
+  /** @internal */
   readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route>
   readonly entityType: string
   readonly sources: Sources

@@ -3312,24 +3312,33 @@ const makeFromConfig = (config: {
               (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key ===
               tagKey
             const handlers = new Set<Rekey.RekeyMember>()
-            for (const member of [
+            const tableMembers = [
               ...registered,
               ...Object.values(config.entities).filter(onTable),
               ...Object.values(config.aggregates ?? {}).filter(onTable),
-              ...(options?.streams ?? []),
-            ]) {
+            ]
+            for (const member of [...tableMembers, ...(options?.streams ?? [])]) {
               const handler = Rekey.handlerOf(member)
               if (handler !== undefined) handlers.add(handler)
             }
             // The read models whose outboxes are on this table are checked before anything is
             // sent: `rekey` reads an item's key back by its key space, so two whose keys could be
             // read as each other's are refused here, where `DynamoClient.make` refuses only those
-            // whose items would overwrite each other in normal operation. Projections are defined
+            // whose items would overwrite each other in normal operation, and so is a member of
+            // this table that would read a read model's items as its own. Projections are defined
             // when the program runs them, so one defined after the client was made has its outbox
             // recorded only now. A run's refusal is the run's `ValidationError`.
             const shared = yield* sharedOutboxKeySpace("rekey", named, {
               key: tagKey,
               name: tableName,
+              members: [...new Set(tableMembers)].map(
+                (member) =>
+                  [
+                    named.find(([, entity]) => entity === member)?.[0] ??
+                      `"${(member as { readonly entityType?: string }).entityType}"`,
+                    member,
+                  ] as const,
+              ),
             })
             if (shared !== undefined) {
               return yield* new ValidationError({
