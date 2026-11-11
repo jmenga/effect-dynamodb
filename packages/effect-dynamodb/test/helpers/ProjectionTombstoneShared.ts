@@ -1172,13 +1172,17 @@ const ROW_TOKEN = "__edd_rt__"
 /** A condition naming the row token read, after the write's own. */
 const TOKEN_TERM = /^\((.*)\) AND \((?:attribute_not_exists\(#eddRt\)|#eddRt = :eddRt)\)$/s
 
-/** A `Put`'s item and condition without the row token. */
+/**
+ * A `Put`'s item and condition without the row token, and without the request for the item as
+ * stored that a write naming the token makes (to name what changed when it fails).
+ */
 const putWithoutRowToken = (put: Record<string, any> | undefined) => {
   if (put === undefined) return
   if (put.Item !== undefined) delete put.Item[ROW_TOKEN]
   const condition = TOKEN_TERM.exec(put.ConditionExpression ?? "")
   if (condition === null) return
   put.ConditionExpression = condition[1]
+  delete put.ReturnValuesOnConditionCheckFailure
   delete put.ExpressionAttributeNames["#eddRt"]
   if (put.ExpressionAttributeValues === undefined) return
   delete put.ExpressionAttributeValues[":eddRt"]
@@ -1187,7 +1191,8 @@ const putWithoutRowToken = (put: Record<string, any> | undefined) => {
 
 /**
  * `outcome` without the row token (#237): 128 random bits, left out of the stored items and the
- * requests' items, and the term naming the one read left out of their conditions. What the token
+ * requests' items, and the term naming the one read (and the request for the item as stored that
+ * comes with it) left out of their conditions. What the token
  * holds and how a write names it is pinned in `EventStore.projection-row-token.test.ts`.
  */
 const withoutRowToken = (outcome: Outcome): Outcome => {

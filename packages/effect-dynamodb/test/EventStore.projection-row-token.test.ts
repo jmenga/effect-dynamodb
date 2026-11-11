@@ -5,15 +5,18 @@
  * before another fails and retries. A tombstone, and a write over one, carry the bookkeeping of the
  * other projections that have written the row, and an attribute holding two meanings on such a row
  * is refused (`EDD-9144`). A read model with one projection layout carries no token: without
- * `removal` it sends and stores what 1.40.0 did, and with `removal` and no revision its write over a
- * tombstone it read names the tombstone, so it can't replace a row `create` wrote there. With
- * `removal`, a projection's write for a row it read absent never replaces a tombstone written since.
+ * `removal` it sends and stores what 1.40.0 did; with `removal` and no revision its write over a
+ * tombstone it read names the tombstone, so it can't replace a row `create` wrote there; and
+ * `create` over its tombstone names the values it read there, so it can't replace one written since
+ * in the same millisecond. With `removal`, a projection's write for a row it read absent never
+ * replaces a tombstone written since. A program defining one of the read model's projections
+ * conditions its write on a row token the row holds.
  */
 
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Exit, Layer, Schema } from "effect"
-import { beforeEach } from "vitest"
+import { beforeEach, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
@@ -121,6 +124,10 @@ const setup = (a: Layout, b: Layout | undefined, options?: { readonly key?: "a" 
   return { Rows, A, B: B!, layer, row, between }
 }
 
+/** The error `exit` failed with. */
+const failureOf = (exit: Exit.Exit<unknown, unknown>): unknown =>
+  Exit.isFailure(exit) ? (exit.cause as any).reasons?.[0]?.error : undefined
+
 /** `item` without its row token. */
 const untokened = (item: Record<string, unknown> | undefined) => {
   if (item === undefined) return undefined
@@ -193,7 +200,10 @@ describe("a row two projections write (#237 §1)", () => {
         // 1.39.0 and 1.40.0: A's write, guarded by its own revision, replaced B's (total 3, no `b`).
         const exit = yield* Effect.exit(A.apply(orders[1]!))
         expect(Exit.isFailure(exit)).toBe(true)
-        expect(String(exit)).toContain("ConcurrentModification")
+        expect(failureOf(exit)).toMatchObject({
+          _tag: "ConcurrentModification",
+          attributes: ["__edd_rt__"],
+        })
         expect(untokened(row("x"))).toMatchObject({ total: 6, a: 1, b: 1 })
         yield* A.apply(orders[1]!)
         expect(untokened(row("x"))).toMatchObject({ total: 8, a: 2, b: 1 })
@@ -216,7 +226,10 @@ describe("a row two projections write (#237 §1)", () => {
         between(B.apply((yield* Invoices.read({ id: "x" }))[0]!))
         // 1.39.0 and 1.40.0: A's write, guarded by `a = 1`, replaced B's tombstone with a live row.
         const exit = yield* Effect.exit(A.apply(orders[1]!))
-        expect(String(exit)).toContain("ConcurrentModification")
+        expect(failureOf(exit)).toMatchObject({
+          _tag: "ConcurrentModification",
+          attributes: ["__edd_rt__"],
+        })
         expect(untokened(row("x"))).toMatchObject({ __edd_e__: "Row#tombstone", a: 1, b: 1 })
       }).pipe(Effect.provide(layer))
     },
@@ -340,7 +353,10 @@ describe("a read model with one projection layout", () => {
       const next = (yield* Orders.read({ id: "x" }))[2]!
       // 1.39.0 and 1.40.0: A's write, guarded by `a = 2`, replaced the created row.
       const exit = yield* Effect.exit(A.apply(next))
-      expect(String(exit)).toContain("ConcurrentModification")
+      expect(failureOf(exit)).toMatchObject({
+        _tag: "ConcurrentModification",
+        attributes: ["a", "__edd_removed__"],
+      })
       expect(untokened(row("x"))).toMatchObject({ total: 10, a: 2 })
     }).pipe(Effect.provide(layer))
   })
@@ -358,12 +374,46 @@ describe("a read model with one projection layout", () => {
       // 1.39.0 and 1.40.0: `create` replaced the tombstone with the row at event 1, keeping the
       // tombstone's checkpoint 2, so the removal was lost and its redelivery was `alreadyApplied`.
       const exit = yield* Effect.exit(A.apply(orders[0]!))
-      expect(String(exit)).toContain("ConcurrentModification")
+      expect(failureOf(exit)).toMatchObject({
+        _tag: "ConcurrentModification",
+        attributes: ["ra"],
+      })
       expect(row("x")).toMatchObject({ __edd_e__: "Row#tombstone", a: 2 })
       const again = yield* A.apply(orders[0]!)
       expect(again.alreadyApplied).toHaveLength(1)
       expect(row("x")?.__edd_e__).toBe("Row#tombstone")
     }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("`create` over a tombstone fails when one written since holds other values", () => {
+    // Every removal stamp is one instant here (the test clock's, and `Date`'s held at it), as two
+    // removals in one millisecond are: the stamp alone doesn't tell the tombstones apart.
+    const { Rows, A, layer, row, between } = setup({ checkpoint: "a", removal: true }, undefined)
+    vi.useFakeTimers({ toFake: ["Date"], now: 0 })
+    return Effect.gen(function* () {
+      yield* Orders.append(
+        { id: "x" },
+        [
+          new Placed({ amount: 1 }),
+          new Cancelled({}),
+          new Placed({ amount: 4 }),
+          new Cancelled({}),
+        ],
+        0,
+      )
+      const orders = yield* Orders.read({ id: "x" })
+      yield* A.apply(orders[0]!)
+      yield* A.apply(orders[1]!)
+      // After `create` reads the tombstone, A brings the row back and removes it again.
+      between(A.applyBatch([orders[2]!, orders[3]!]))
+      // 1.39.0 and 1.40.0 (and a guard naming the stamp alone): `create` replaced the second
+      // tombstone, keeping the first's checkpoint 2, so events 3 and 4 were applied again.
+      const exit = yield* Effect.exit(Rows.create({ id: "x", total: 10 }).asEffect())
+      expect(String(exit)).toContain("ConditionalCheckFailed")
+      expect(row("x")).toMatchObject({ __edd_e__: "Row#tombstone", a: 4 })
+      expect(row("x")?.__edd_removed__).toBe("1970-01-01T00:00:00.000Z")
+      expect((yield* A.apply(orders[2]!)).alreadyApplied).toHaveLength(1)
+    }).pipe(Effect.provide(layer), Effect.ensuring(Effect.sync(() => vi.useRealTimers())))
   })
 
   it.effect("without removal, sends what 1.40.0 did: no row token", () => {
@@ -373,6 +423,76 @@ describe("a read model with one projection layout", () => {
       yield* A.apply((yield* Orders.read({ id: "x" }))[0]!)
       expect(row("x")).not.toHaveProperty("__edd_rt__")
     }).pipe(Effect.provide(layer))
+  })
+})
+
+describe("a program defining one of the read model's projections (#237)", () => {
+  /** A program defining A alone over the same table: one projection layout. */
+  const lone = () => {
+    const Rows = Entity.make({
+      model: Row,
+      entityType: "Row",
+      primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    })
+    const A = EventStore.projection({
+      stream: Orders,
+      readModel: Rows,
+      key: (id: { readonly id: string }) => ({ id: id.id }),
+      initial: (id: { readonly id: string }): Row => ({ id: id.id, total: 0 }),
+      evolve,
+      checkpoint: "a",
+      revision: "ra",
+      retry: 0,
+    })
+    const layer = Layer.mergeAll(
+      InMemoryClient,
+      EventsTable.layer({ name: "events" }),
+      Table.make({ schema: AppSchema, entities: { Rows } }).layer({ name: "read" }),
+    )
+    return { A, layer }
+  }
+
+  it.effect("conditions its write on the row token it read, and keeps the other's tag", () => {
+    const { B, layer, row, between } = setup(
+      { checkpoint: "a", revision: "ra" },
+      { checkpoint: "b", revision: "rb" },
+    )
+    const alone = lone()
+    return Effect.gen(function* () {
+      yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 }), new Placed({ amount: 2 })], 0)
+      yield* Invoices.append({ id: "x" }, [new Placed({ amount: 5 }), new Placed({ amount: 7 })], 0)
+      const orders = yield* Orders.read({ id: "x" })
+      const invoices = yield* Invoices.read({ id: "x" })
+      yield* B.apply(invoices[0]!)
+      const tokened = String(row("x")?.__edd_rt__)
+      // B's next write lands between the lone program's read and its write.
+      between(B.apply(invoices[1]!))
+      // 1.40.0: A's write, guarded by its own revision, replaced B's (total 6, B's 7 lost).
+      const exit = yield* Effect.exit(alone.A.apply(orders[0]!).pipe(Effect.provide(alone.layer)))
+      expect(failureOf(exit)).toMatchObject({
+        _tag: "ConcurrentModification",
+        attributes: ["__edd_rt__"],
+      })
+      expect(untokened(row("x"))).toMatchObject({ total: 12, b: 2 })
+      yield* alone.A.apply(orders[0]!).pipe(Effect.provide(alone.layer))
+      expect(untokened(row("x"))).toMatchObject({ total: 13, a: 1, b: 2 })
+      // B's tag stays on the token: the program defining both still sees B's bookkeeping there.
+      expect(String(row("x")?.__edd_rt__).split(".").slice(1)).toEqual(
+        expect.arrayContaining(tokened.split(".").slice(1)),
+      )
+      // Nothing wedges: each program's next write lands.
+      yield* alone.A.apply(orders[1]!).pipe(Effect.provide(alone.layer))
+      expect(untokened(row("x"))).toMatchObject({ total: 15, a: 2, b: 2 })
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("writes no row token on a row that holds none, as 1.40.0 did", () => {
+    const alone = lone()
+    return Effect.gen(function* () {
+      yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 })], 0)
+      yield* alone.A.apply((yield* Orders.read({ id: "x" }))[0]!)
+      expect(store.get("read|$token#v1#row#id_x|$token#v1#row")).not.toHaveProperty("__edd_rt__")
+    }).pipe(Effect.provide(alone.layer))
   })
 })
 

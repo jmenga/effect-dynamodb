@@ -1,0 +1,605 @@
+{
+  "version": "1.40.0",
+  "cells": {
+    "scalar checkpoint / live → live / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint / live → live / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "scalar checkpoint / live → live / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint / live → live / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint / live → live / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "scalar checkpoint / live → tombstone / redelivery": {
+      "step": "ok",
+      "afterThen": 5,
+      "afterRedelivery": 5
+    },
+    "scalar checkpoint / live → tombstone / next event": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "scalar checkpoint / live → tombstone / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint / live → tombstone / create": {
+      "step": "ok",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "scalar checkpoint / live → tombstone / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "scalar checkpoint / tombstone → created row / redelivery": {
+      "step": "ok",
+      "afterThen": 105,
+      "afterRedelivery": 105
+    },
+    "scalar checkpoint / tombstone → created row / next event": {
+      "step": "ok",
+      "afterThen": 112,
+      "afterRedelivery": 112
+    },
+    "scalar checkpoint / tombstone → created row / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint / tombstone → created row / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "scalar checkpoint / tombstone → created row / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "scalar checkpoint / rebuild / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint / rebuild / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "scalar checkpoint / rebuild / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint / rebuild / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 1,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint / rebuild / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "scalar checkpoint and revision / live → live / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint and revision / live → live / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "scalar checkpoint and revision / live → live / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint and revision / live → live / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint and revision / live → live / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "scalar checkpoint and revision / live → tombstone / redelivery": {
+      "step": "ok",
+      "afterThen": 5,
+      "afterRedelivery": 5
+    },
+    "scalar checkpoint and revision / live → tombstone / next event": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "scalar checkpoint and revision / live → tombstone / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint and revision / live → tombstone / create": {
+      "step": "ok",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "scalar checkpoint and revision / live → tombstone / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "scalar checkpoint and revision / tombstone → created row / redelivery": {
+      "step": "ok",
+      "afterThen": 105,
+      "afterRedelivery": 105
+    },
+    "scalar checkpoint and revision / tombstone → created row / next event": {
+      "step": "ok",
+      "afterThen": 112,
+      "afterRedelivery": 112
+    },
+    "scalar checkpoint and revision / tombstone → created row / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint and revision / tombstone → created row / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "scalar checkpoint and revision / tombstone → created row / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "scalar checkpoint and revision / rebuild / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint and revision / rebuild / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "scalar checkpoint and revision / rebuild / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "scalar checkpoint and revision / rebuild / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 1,
+      "afterRedelivery": 6
+    },
+    "scalar checkpoint and revision / rebuild / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "owner slot / live → live / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "owner slot / live → live / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "owner slot / live → live / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "owner slot / live → live / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "owner slot / live → live / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "owner slot / live → tombstone / redelivery": {
+      "step": "ok",
+      "afterThen": 5,
+      "afterRedelivery": 5
+    },
+    "owner slot / live → tombstone / next event": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "owner slot / live → tombstone / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "owner slot / live → tombstone / create": {
+      "step": "ok",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "owner slot / live → tombstone / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "owner slot / tombstone → created row / redelivery": {
+      "step": "ok",
+      "afterThen": 105,
+      "afterRedelivery": 105
+    },
+    "owner slot / tombstone → created row / next event": {
+      "step": "ok",
+      "afterThen": 112,
+      "afterRedelivery": 112
+    },
+    "owner slot / tombstone → created row / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "owner slot / tombstone → created row / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "owner slot / tombstone → created row / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "owner slot / rebuild / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "owner slot / rebuild / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "owner slot / rebuild / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "owner slot / rebuild / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 1,
+      "afterRedelivery": 6
+    },
+    "owner slot / rebuild / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "native map / live → live / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "native map / live → live / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "native map / live → live / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "native map / live → live / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "native map / live → live / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "native map / live → tombstone / redelivery": {
+      "step": "ok",
+      "afterThen": 5,
+      "afterRedelivery": 5
+    },
+    "native map / live → tombstone / next event": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "native map / live → tombstone / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "native map / live → tombstone / create": {
+      "step": "ok",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "native map / live → tombstone / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "native map / tombstone → created row / redelivery": {
+      "step": "ok",
+      "afterThen": 105,
+      "afterRedelivery": 105
+    },
+    "native map / tombstone → created row / next event": {
+      "step": "ok",
+      "afterThen": 112,
+      "afterRedelivery": 112
+    },
+    "native map / tombstone → created row / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "native map / tombstone → created row / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "native map / tombstone → created row / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "native map / rebuild / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "native map / rebuild / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "native map / rebuild / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "native map / rebuild / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 1,
+      "afterRedelivery": 6
+    },
+    "native map / rebuild / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "packed map / live → live / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "packed map / live → live / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "packed map / live → live / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "packed map / live → live / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "packed map / live → live / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "packed map / live → tombstone / redelivery": {
+      "step": "ok",
+      "afterThen": 5,
+      "afterRedelivery": 5
+    },
+    "packed map / live → tombstone / next event": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "packed map / live → tombstone / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "packed map / live → tombstone / create": {
+      "step": "ok",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "packed map / live → tombstone / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "packed map / tombstone → created row / redelivery": {
+      "step": "ok",
+      "afterThen": 105,
+      "afterRedelivery": 105
+    },
+    "packed map / tombstone → created row / next event": {
+      "step": "ok",
+      "afterThen": 112,
+      "afterRedelivery": 112
+    },
+    "packed map / tombstone → created row / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "packed map / tombstone → created row / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "packed map / tombstone → created row / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "packed map / rebuild / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "packed map / rebuild / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "packed map / rebuild / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "packed map / rebuild / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 1,
+      "afterRedelivery": 6
+    },
+    "packed map / rebuild / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "compressed packed map / live → live / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "compressed packed map / live → live / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "compressed packed map / live → live / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "compressed packed map / live → live / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "compressed packed map / live → live / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    },
+    "compressed packed map / live → tombstone / redelivery": {
+      "step": "ok",
+      "afterThen": 5,
+      "afterRedelivery": 5
+    },
+    "compressed packed map / live → tombstone / next event": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "compressed packed map / live → tombstone / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "compressed packed map / live → tombstone / create": {
+      "step": "ok",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "compressed packed map / live → tombstone / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "compressed packed map / tombstone → created row / redelivery": {
+      "step": "ok",
+      "afterThen": 105,
+      "afterRedelivery": 105
+    },
+    "compressed packed map / tombstone → created row / next event": {
+      "step": "ok",
+      "afterThen": 112,
+      "afterRedelivery": 112
+    },
+    "compressed packed map / tombstone → created row / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "compressed packed map / tombstone → created row / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 100,
+      "afterRedelivery": 105
+    },
+    "compressed packed map / tombstone → created row / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 12
+    },
+    "compressed packed map / rebuild / redelivery": {
+      "step": "ok",
+      "afterThen": 6,
+      "afterRedelivery": 6
+    },
+    "compressed packed map / rebuild / next event": {
+      "step": "ok",
+      "afterThen": 13,
+      "afterRedelivery": 13
+    },
+    "compressed packed map / rebuild / removal": {
+      "step": "ok",
+      "afterThen": "tombstone",
+      "afterRedelivery": "tombstone"
+    },
+    "compressed packed map / rebuild / create": {
+      "step": "ConditionalCheckFailed",
+      "afterThen": 1,
+      "afterRedelivery": 6
+    },
+    "compressed packed map / rebuild / rebuild": {
+      "step": "ok",
+      "afterThen": 12,
+      "afterRedelivery": 13
+    }
+  }
+}
