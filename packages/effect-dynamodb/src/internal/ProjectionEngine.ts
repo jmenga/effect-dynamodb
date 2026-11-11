@@ -62,11 +62,11 @@ import { decodeMarshalledItem } from "../Entity.js"
 import type { StreamEvent } from "../EventStore.js"
 import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
 import type * as Query from "../Query.js"
-import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
+import { type RekeyAmbiguity, resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
-import { handlerOf } from "./Rekey.js"
+import { handlerOf, type RekeyMember, type RekeyTally } from "./Rekey.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
   addProjectionLayout,
@@ -398,27 +398,21 @@ const dateEncodingOf = (
 }
 
 /**
- * What a composite of `model` can be in a key (`KeyComposer.CompositeValues`), by its schema, as
- * one side sees it:
- *
- * - `"written"`, the keys its rows are written under: the key text of its literals (a literal
- *   union), of `true` and `false` (a boolean), a number's or bigint's key text, or a date's the
- *   library encodes (`dateEncodingOf`: an epoch's number, or ISO text); any other field (a string,
- *   a date with a codec of its own, a field the model doesn't declare) may hold any text, `#`
- *   included.
- * - `"read"`, the keys `rekey`'s reader takes as its rows' (`KeyText136.readIndexKeys`): a number,
- *   a bigint or a boolean only as text its value composes again, and a literal composite as any
- *   text, which it reads as a string.
+ * What a composite of `model` can be in the keys its rows are written under
+ * (`KeyComposer.CompositeValues`), by its schema: the key text of its literals (a literal union), of
+ * `true` and `false` (a boolean), a number's or bigint's key text, or, with `dates`, a date's the
+ * library encodes (`dateEncodingOf`: an epoch's number, or ISO text); any other field (a string, a
+ * date with a codec of its own, a field the model doesn't declare) may hold any text, `#` included.
  */
 const compositeValues =
-  (model: unknown, side: "written" | "read", dates = true) =>
+  (model: unknown, dates = true) =>
   (composite: string): KeyComposer.CompositeValues => {
     if (model === undefined || model === null) return "open"
     const schema = isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top)
     const fields = getSchemaFields(schema)
     if (fields === undefined || !Object.hasOwn(fields, composite)) return "open"
     const field = fields[composite]!
-    if (side === "written" && dates) {
+    if (dates) {
       const configured = isConfiguredModel(model) ? model.attributes : undefined
       const date = dateEncodingOf(
         field,
@@ -435,7 +429,7 @@ const compositeValues =
       }
     }
     const literals = keyFormLiterals(field)
-    if (side === "written" && literals !== undefined) return { values: literals }
+    if (literals !== undefined) return { values: literals }
     const kind = keyFormValueKind(field)
     if (kind === "number" || kind === "bigint") return "number"
     if (kind === "boolean") return { values: [true, false] }
@@ -455,8 +449,6 @@ type KeySpace = { readonly pk: KeyComposer.KeySpace; readonly sk: KeyComposer.Ke
  * - `"plain"`, the keys its rows are written under with values that hold no `#`: every composite is
  *   walked, to the end of the key, under the schema's setting. `"plain140"` is the same, a date
  *   taken as any text without `#`, as 1.40.0 took it.
- * - `"written"` and `"read"`, the keys `rekey` meets on its table, under any setting: the walk
- *   stops at the first composite whose value may hold `#` (`"open"`), and anything follows it.
  * - `"owned"`, exactly the keys its rows can be written under, under any setting: every composite
  *   is walked, to the end of the key, a value that may hold `#` as any text.
  *
@@ -464,7 +456,7 @@ type KeySpace = { readonly pk: KeyComposer.KeySpace; readonly sk: KeyComposer.Ke
  */
 const keySpaceOf = (
   entity: unknown,
-  view: "plain" | "plain140" | "written" | "read" | "owned",
+  view: "plain" | "plain140" | "owned",
 ): KeySpace | undefined => {
   const member = entity as {
     readonly entityType?: string
@@ -477,11 +469,7 @@ const keySpaceOf = (
   if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
     return undefined
   }
-  const values = compositeValues(
-    member.model,
-    view === "read" ? "read" : "written",
-    view !== "plain140",
-  )
+  const values = compositeValues(member.model, view !== "plain140")
   const plain = view === "plain" || view === "plain140"
   try {
     return KeyComposer.composeKeySpace(
@@ -495,7 +483,7 @@ const keySpaceOf = (
             return of === "open" ? "text" : of
           }
         : values,
-      { everyForm: !plain, walkOpen: view === "owned" },
+      { everyForm: !plain, walkOpen: !plain },
     )
   } catch {
     return undefined
@@ -540,24 +528,6 @@ const overwriteEachOther = (a: unknown, b: unknown): boolean => {
   }
   if (meet("plain")) return true
   return meet("plain140") && meet("owned")
-}
-
-/**
- * Whether the outbox items of one entity can be read by `rekey` as the other's, either way round:
- * the keys one's are written under (`"written"`) against the keys the other's reader takes
- * (`"read"`).
- */
-const readAsEachOther = (a: unknown, b: unknown): boolean => {
-  const meet = (writer: unknown, reader: unknown) => {
-    const written = keySpaceOf(writer, "written")
-    const read = keySpaceOf(reader, "read")
-    return (
-      written !== undefined &&
-      read !== undefined &&
-      spacesMeet(outboxSpaceOf(written), outboxSpaceOf(read))
-    )
-  }
-  return meet(a, b) || meet(b, a)
 }
 
 /**
@@ -625,21 +595,23 @@ const sameKeys = (a: unknown, b: unknown): boolean => {
  * has its outbox too. Tables are compared by the physical name the context resolves (two handles
  * on one table are one table), and by service when one isn't provided. The problem, or `undefined`.
  *
- * Two questions, by `scope`:
+ * One question ({@link overwriteEachOther}): can a key of one be a key of the other with values
+ * that hold no `#`, each value what its type can compose? Then their items overwrite each other
+ * whenever their values match, in normal operation, and no one can tell whose an item is. Read
+ * models whose keys meet only through a value holding `#` bind and run, as on 1.39.0, as do two
+ * whose keys part where a value of one can't hold the other's text (a number beside a label):
+ * `drainPending` and `rekey` tell their items apart item by item ({@link outboxOwnership},
+ * {@link rekeyOutboxMember}). It is asked where, by `scope`:
  *
- * - `"plain"` (where read models are bound: `DynamoClient.make`, `EventStore.processBatch`): can a
- *   key of one be a key of the other with values that hold no `#`, each value what its type can
- *   compose? Then their items overwrite each other whenever their values match, in normal
- *   operation. Read models whose keys meet only through a value holding `#` bind and run, as on
- *   1.39.0, as do two whose keys part where a value of one can't hold the other's text (a number
- *   beside a label).
- * - a table (`rekey` of it): can `rekey` read an item of one as the other's at all, a string value
- *   holding `#` included, and a literal composite read as any text, as its reader reads it? Then it
- *   couldn't tell whose an item on that table is. Only outboxes on that table are looked at. The
- *   table's own members (`scope.members`) are looked at too: an entity claims the outbox items of
- *   its entity type on its table (its own projections' outbox there), so one that can read a read
- *   model's items as its own would move them by its key. One whose keys are composed exactly as
+ * - `"plain"`: where read models are bound (`DynamoClient.make`, `EventStore.processBatch`).
+ * - a table (`rekey` of it), for projections defined since the client was made, whose outboxes
+ *   are recorded only when they are: only outboxes on that table are looked at. The table's own
+ *   members (`scope.members`) are looked at too: an entity claims the outbox items of its entity
+ *   type on its table (its own projections' outbox there). One whose keys are composed exactly as
  *   the read model's (`sameKeys`) moves them where the read model would, and isn't refused.
+ *
+ * 1.40.0 asked `rekey` more: whether its reader could read an item of one as the other's at all, a
+ * value holding `#` included. Those pairs aren't refused from 1.41.0: `rekey` decides each item.
  *
  * Read models that never meet at a site that sees several at once can't be checked: their key
  * spaces must be kept apart by whoever defines them. Neither can a member that is no read model (a
@@ -678,7 +650,7 @@ export const sharedOutboxKeySpace = (
       `(partition keys starting "${space.pk.text}", sort keys starting "${space.sk.text}": the ` +
       "same schema name and version, primary collection, entity type and first composite)"
     for (const [name, entity] of members) {
-      const space = keySpaceOf(entity, plain ? "plain" : "written")
+      const space = keySpaceOf(entity, "plain")
       if (space === undefined) continue
       for (const outbox of remoteOutboxesOf(entity)) {
         const into = outbox.table.Tag
@@ -687,18 +659,13 @@ export const sharedOutboxKeySpace = (
         for (const [otherName, other] of members) {
           if (other === entity) continue
           if (!remoteOutboxesOf(other).some((o) => oneTable(o.table.Tag, into))) continue
-          if (plain) {
-            if (!overwriteEachOther(entity, other)) continue
-          } else if (!readAsEachOther(entity, other)) continue
+          if (!overwriteEachOther(entity, other)) continue
           return (
             `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
             `table${physical === undefined ? "" : ` ("${physical}")`}, where ${otherName} ` +
             `writes its own under the same key space ${startOf(space)}. ` +
-            (plain
-              ? "Their items would overwrite each other whenever their keys match, and rekey " +
-                "couldn't tell whose an item is. "
-              : "rekey reads an item's key back by its key space, and couldn't tell whose an " +
-                "item on this table is. ") +
+            "Their items would overwrite each other whenever their keys match, and rekey " +
+            "couldn't tell whose an item is. " +
             "Give one of them its own entity type, collection, schema or key composites."
           )
         }
@@ -707,16 +674,16 @@ export const sharedOutboxKeySpace = (
         for (const [memberName, member] of scope.members) {
           if (member === entity) continue
           const claims = handlerOf(member)?.types.includes(`${readModelType(entity)}#outbox`)
-          if (claims !== true || sameKeys(member, entity) || !readAsEachOther(entity, member)) {
+          if (claims !== true || sameKeys(member, entity) || !overwriteEachOther(entity, member)) {
             continue
           }
           return (
             `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
             `table${physical === undefined ? "" : ` ("${physical}")`}, whose member ` +
-            `${memberName} claims the outbox items of its entity type there under the same key ` +
-            `space ${startOf(space)}, and composes its keys differently. rekey reads an item's ` +
-            "key back by its key space, and couldn't tell whose an item on this table is. Give " +
-            "one of them its own entity type, collection, schema or key composites."
+            `${memberName} writes the outbox items of its entity type there under the same key ` +
+            `space ${startOf(space)}, and composes its keys differently. Their items would ` +
+            "overwrite each other whenever their keys match, and rekey couldn't tell whose an " +
+            "item is. Give one of them its own entity type, collection, schema or key composites."
           )
         }
       }
@@ -806,6 +773,166 @@ export const outboxOwnership = (
   ownershipOf.set(readModel, decide)
   return decide
 }
+
+/**
+ * @internal A read model `rekey` asks about the outbox items of its entity type on the table it
+ * runs on: one whose projection's outbox is there, or a member of the table (its own projections'
+ * outbox items, on its own table).
+ */
+export interface OutboxCandidate {
+  readonly readModel: {
+    readonly entityType: string
+    readonly _tableTag: TableTag
+    readonly indexes: { readonly primary?: IndexDefinition | undefined }
+    readonly _rekeyProjectionRow: (
+      row: Record<string, AttributeValue>,
+      ctx: Parameters<RekeyMember["row"]>[1],
+      keys?: { readonly pk: string; readonly sk: string } | undefined,
+    ) => ReturnType<RekeyMember["row"]>
+    readonly _valuelessMove: (
+      row: Record<string, AttributeValue>,
+      keys: { readonly pk: string; readonly sk: string },
+    ) =>
+      | "current"
+      | {
+          readonly to: Record<string, string>
+          readonly rowTo: { readonly pk: string; readonly sk: string }
+        }
+      | undefined
+    readonly _ownsRow: (row: Record<string, AttributeValue>) => boolean
+  }
+  /** The item's table key attributes: those of the layout whose attributes it holds. */
+  readonly keys: (row: Record<string, AttributeValue>) => {
+    readonly pk: string
+    readonly sk: string
+  }
+}
+
+/**
+ * @internal `rekey`'s one member for the outbox items of `entityType` on a table (#237): it decides
+ * whose an item is among `candidates` (registration order), and that read model moves it.
+ *
+ * - The item names its read model (`OUTBOX_READ_MODEL`), or its row's key is a key only some of
+ *   them write: {@link outboxOwnership}, the one decision `drainPending` makes too. Those that can
+ *   have written it and read its key back are its possible owners. None: `unregistered` when it
+ *   names a read model none of them is, else `unrecognizedKey`.
+ * - One, or several moving it to one key (or each finding it current): the first moves it, with
+ *   no extra read.
+ * - Otherwise, an item written before 1.41.0 at a key more than one writes, which they'd move
+ *   apart: the row it names is read from each one's table (strongly consistent), at that key and
+ *   at the key that read model would move it to. It is the read model's whose own row is there
+ *   (`_ownsRow`: its values compose that key) when exactly one finds one and none finds a row
+ *   tombstone. Otherwise it's left where it is, `ambiguousOwner` with the reason
+ *   ({@link RekeyAmbiguity}), and a rerun reads and leaves it again.
+ */
+export const rekeyOutboxMember = (
+  entityType: string,
+  candidates: ReadonlyArray<OutboxCandidate>,
+): RekeyMember => ({
+  name: entityType,
+  types: [`${entityType}#outbox`],
+  exclusive: true,
+  row: (row, ctx) =>
+    Effect.gen(function* () {
+      const marked = row[OUTBOX_READ_MODEL]?.S
+      const owners = candidates.flatMap((candidate) => {
+        if (outboxOwnership(candidate.readModel)(row) === "foreign") return []
+        const keys = candidate.keys(row)
+        const plan = candidate.readModel._valuelessMove(row, keys)
+        return plan === undefined ? [] : [{ candidate, keys, plan }]
+      })
+      if (owners.length === 0) {
+        const named =
+          marked !== undefined && !candidates.some((c) => readModelTag(c.readModel) === marked)
+        return { skipped: { [named ? "unregistered" : "unrecognizedKey"]: 1 } } as RekeyTally
+      }
+      const first = owners[0]!
+      const where = (plan: (typeof owners)[number]["plan"]) =>
+        plan === "current" ? "current" : JSON.stringify(plan.to)
+      if (owners.every((owner) => where(owner.plan) === where(first.plan))) {
+        return yield* first.candidate.readModel._rekeyProjectionRow(row, ctx, first.keys)
+      }
+      // Written before 1.41.0 at a key more than one of them writes, and they'd move it apart.
+      const stored = {
+        [first.keys.pk]: row[first.keys.pk]?.S,
+        [first.keys.sk]: row[first.keys.sk]?.S,
+      }
+      const rowAt = { pk: row[ROW_PK]?.S ?? "", sk: row[ROW_SK]?.S ?? "" }
+      const client = yield* Capacity.client
+      const reads = new Map<string, Record<string, AttributeValue> | undefined>()
+      const found: Array<"own" | "tombstone" | "none" | "unprovided"> = []
+      for (const { candidate, plan } of owners) {
+        const { readModel } = candidate
+        const primary = readModel.indexes.primary
+        const tableName = yield* physicalTableName(readModel._tableTag)
+        if (tableName === undefined || primary === undefined) {
+          found.push("unprovided")
+          continue
+        }
+        // Where the row is, then where it would be: a move of it in between is seen at the second.
+        const at =
+          plan !== "current" && (plan.rowTo.pk !== rowAt.pk || plan.rowTo.sk !== rowAt.sk)
+            ? [rowAt, plan.rowTo]
+            : [rowAt]
+        let result: "own" | "tombstone" | "none" = "none"
+        for (const key of at) {
+          const id = JSON.stringify([tableName, primary.pk.field, key.pk, primary.sk.field, key.sk])
+          if (!reads.has(id)) {
+            const { Item } = yield* client.getItem({
+              TableName: tableName,
+              Key: toAttributeMap({ [primary.pk.field]: key.pk, [primary.sk.field]: key.sk }),
+              ConsistentRead: true,
+            })
+            reads.set(id, Item)
+          }
+          const there = reads.get(id)
+          const type = there?.__edd_e__?.S
+          if (there === undefined) continue
+          if (type === `${entityType}#tombstone`) result = "tombstone"
+          else if (type === entityType && readModel._ownsRow(there) && result === "none") {
+            result = "own"
+          }
+        }
+        found.push(result)
+      }
+      const own = found.flatMap((result, i) => (result === "own" ? [owners[i]!] : []))
+      if (found.every((result) => result !== "tombstone" && result !== "unprovided")) {
+        if (own.length === 1) {
+          const { candidate, keys } = own[0]!
+          return yield* candidate.readModel._rekeyProjectionRow(row, ctx, keys)
+        }
+      }
+      const targets = [
+        ...new Map(
+          owners.map(({ plan }) => {
+            const target = plan === "current" ? stored : plan.to
+            return [JSON.stringify(target), target] as const
+          }),
+        ).values(),
+      ]
+      const rowText = `the row it names (${JSON.stringify(rowAt.pk)}, ${JSON.stringify(rowAt.sk)})`
+      const gone = own.length === 0 && found.every((result) => result === "none")
+      const ambiguity: RekeyAmbiguity = {
+        member: entityType,
+        key: stored,
+        targets,
+        reason: gone ? "rowGone" : "unsettled",
+        message:
+          `${owners.length} read models of entity type "${entityType}" whose outboxes share this ` +
+          "table can each have written it, and would move it to different keys; it was written " +
+          "before 1.41.0, so it doesn't name its read model. " +
+          (gone
+            ? `None of them has ${rowText}, at that key or where it would move it.`
+            : found.includes("unprovided")
+              ? `The table of one of them isn't provided where rekey runs, so ${rowText} can't be read there.`
+              : found.includes("tombstone")
+                ? `A row tombstone is at ${rowText}: it holds no values to say whose it is.`
+                : `More than one of them has a row of its own at ${rowText}.`) +
+          " It's left where it is.",
+      }
+      return { skipped: { ambiguousOwner: 1 }, ambiguous: [ambiguity] } as RekeyTally
+    }),
+})
 
 /**
  * @internal `[EDD-9134]` ({@link sharedOutboxKeySpace}) as a defect, from the sites that define

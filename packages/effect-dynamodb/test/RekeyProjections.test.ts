@@ -1603,11 +1603,13 @@ describe("[EDD-9134] read models whose key spaces part at their first composite"
     } as any)
 
   it.effect.each([
-    ["the same composite", false, "$k#v1#ledger#ida_"],
-    ["a number then the same composite", true, "$k#v1#ledger#n_"],
+    ["the same composite", "names its read model", false],
+    ["the same composite", "names none (1.40.0's)", false],
+    ["a number then the same composite", "names its read model", true],
+    ["a number then the same composite", "names none (1.40.0's)", true],
   ] as const)(
-    "led by %s, they bind and run; rekey of their outbox table refuses them",
-    ([, numbered, starting]) => {
+    "led by %s, they bind and run, and rekey of their outbox table tells their items apart: an item that %s",
+    ([, names, numbered]) => {
       const table = makeRecordingTable()
       const s = keyedSpaces(On, true, "idA", "idA", numbered)
       return Effect.gen(function* () {
@@ -1617,29 +1619,24 @@ describe("[EDD-9134] read models whose key spaces part at their first composite"
         yield* s.A.Remote.applyBatch(events)
         yield* s.B.Remote.applyBatch(events)
         expect(rowsOf(table, "Ledger#outbox")).toHaveLength(2)
+        if (names.startsWith("names none")) {
+          for (const item of table.items.values()) delete item.__edd_rm__
+        }
         const before = new Map(table.items)
         table.take()
-        // `rekey` reads an item's key back by its key space, and A's reads B's keys too.
+        // 1.40.0 refused them: its reader, A's, reads B's key `ida_x#idb_x` as `idA` = `x#idb_x`.
+        // A's item is no key B writes. B's is a key A writes unescaped, but it is written escaped,
+        // where A's would hold `%23`: A's reader doesn't read it. Each is current: no row is read.
         for (const options of [{ dryRun: true }, {}]) {
-          const exit = yield* Effect.exit(
-            db.tables.OutboxTable.rekey({ streams: [s.w.Accounts], ...options }) as Effect.Effect<
-              Table.RekeyReport,
-              unknown
-            >,
-          )
-          expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(false)
-          const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
-          expect(error).toMatchObject({
-            _tag: "ValidationError",
-            entityType: "Table",
-            operation: "rekey",
-          })
-          expect(String((error as { readonly cause?: unknown }).cause)).toContain(
-            `[EDD-9134] rekey: "A" writes its projection's outbox items into another table ` +
-              `("o"), where "B" writes its own under the same key space (partition keys ` +
-              `starting "${starting}", sort keys starting "$k#v1#ledger#name_"`,
-          )
-          expect(table.take()).toEqual([])
+          const report = (yield* db.tables.OutboxTable.rekey({
+            streams: [s.w.Accounts],
+            ...options,
+          })) as Table.RekeyReport
+          expect(report.unchanged).toBe(2)
+          expect(report.moved).toEqual(ZERO)
+          expect(report.skipped.unrecognizedKey).toBe(0)
+          expect(report.ambiguous).toEqual([])
+          expect(table.take().map((request) => request.command)).toEqual(["Scan"])
         }
         expect(table.items).toEqual(before)
         // The read models' own tables hold no outbox: their `rekey` runs.
@@ -1879,6 +1876,8 @@ const routedTables = () => {
   })
   return {
     layer: Layer.succeed(DynamoClient, client),
+    /** The recording table named `name`. */
+    table: named,
     /** The requests sent to any table since the last call, and forget them. */
     take: () => [...byName.values()].flatMap((table) => table.take()),
     /** Every table's items, by table. */
@@ -1926,6 +1925,12 @@ const PAIR_ROW = {
  */
 interface PairSide {
   readonly pk: ReadonlyArray<PairKey>
+  /** The sort key's composites: `name` when absent. */
+  readonly sk?: ReadonlyArray<PairKey>
+  /** The row its projection writes, when not the pair's. */
+  readonly row?: Record<string, unknown>
+  /** Its projection removes the row on `Closed`, leaving a row tombstone. */
+  readonly removal?: boolean
   readonly member?: boolean
   readonly outbox?: "remote" | "local" | "none"
   /** `Pair`, or a model with its fields of other types. */
@@ -1949,10 +1954,14 @@ const pairs = (
       entityType: "Ledger",
       primaryKey: {
         pk: { field: "pk", composite: [...side.pk] },
-        sk: { field: "sk", composite: ["name"] },
+        sk: {
+          field: "sk",
+          composite: [...((side.sk ?? ["name"]) as readonly [PairKey, ...Array<PairKey>])],
+        },
       },
     }),
   }))
+  const rows = sides.map((side) => side.row ?? row)
   const O = Table.make({
     schema,
     entities: Object.fromEntries(
@@ -1962,22 +1971,25 @@ const pairs = (
   const read = built.map(({ side, Ledgers }, i) =>
     side.member ? undefined : Table.make({ schema, entities: { [`L${i}`]: Ledgers } }),
   )
-  const projections = built.map(({ side, Ledgers }) =>
+  const projections = built.map(({ side, Ledgers }, i) =>
     (side.outbox ?? "remote") === "none"
       ? undefined
       : EventStore.projection({
           stream: w.Accounts,
           readModel: Ledgers as unknown as Entity.Entity<any, any, any, any, any>,
-          key: () => row,
-          initial: (): Pair => ({ ...(row as typeof PAIR_ROW), total: 0, version: 0, rev: 0 }),
+          key: () => rows[i]!,
+          initial: (): Pair => ({ ...(rows[i] as typeof PAIR_ROW), total: 0, version: 0, rev: 0 }),
           evolve: (state: Pair, event: EventStore.StreamEvent<AccountEvent>) =>
             Effect.succeed(
-              event.data._tag === "Added"
-                ? { ...state, total: state.total + event.data.amount }
-                : state,
+              side.removal === true && event.data._tag === "Closed"
+                ? EventStore.removeRow
+                : event.data._tag === "Added"
+                  ? { ...state, total: state.total + event.data.amount }
+                  : state,
             ),
           checkpoint: "version",
           revision: "rev",
+          ...(side.removal === true && { removal: {} }),
           outbox: {
             schema: Notice,
             effects: (event: EventStore.StreamEvent<AccountEvent>, next: Pair | undefined) =>
@@ -2004,7 +2016,7 @@ const pairs = (
         ...order.flatMap((i) => (read[i] === undefined ? [] : [[`R${i}`, read[i]!]])),
       ]),
     } as any) as Effect.Effect<any, never, any>
-  return { w, O, built, projections, layer, client, row }
+  return { w, O, built, projections, layer, client, row, rows }
 }
 type Pairs = ReturnType<typeof pairs>
 
@@ -2014,43 +2026,10 @@ const applyPair = (s: Pairs, side: number, events: ReadonlyArray<unknown>) =>
 const drained = (s: Pairs, side: number) =>
   Effect.gen(function* () {
     const delivered: Array<number> = []
-    yield* (s.projections[side] as any).drain(s.row, (effect: { readonly total: number }) =>
+    yield* (s.projections[side] as any).drain(s.rows[side], (effect: { readonly total: number }) =>
       Effect.sync(() => void delivered.push(effect.total)),
     ) as Effect.Effect<unknown>
     return delivered
-  })
-
-/** `O.rekey`'s failure, as a `ValidationError`'s cause, after checking it sent nothing. */
-const refusedRekey = (
-  tables: RoutedTables,
-  s: Pairs,
-  order?: ReadonlyArray<number>,
-): Effect.Effect<ReadonlyArray<string>, unknown, any> =>
-  Effect.gen(function* () {
-    const db = yield* s.client(order)
-    const causes: Array<string> = []
-    const before = tables.snapshot()
-    tables.take()
-    for (const options of [{ dryRun: true }, {}]) {
-      const exit = yield* Effect.exit(
-        db.tables.O.rekey({ streams: [s.w.Accounts], ...options }) as Effect.Effect<
-          Table.RekeyReport,
-          unknown
-        >,
-      )
-      // The run's own failure, on its error channel: never a defect.
-      expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(false)
-      const error = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined
-      expect(error).toMatchObject({
-        _tag: "ValidationError",
-        entityType: "Table",
-        operation: "rekey",
-      })
-      causes.push(String((error as { readonly cause?: unknown }).cause))
-      expect(tables.take()).toEqual([])
-    }
-    expect(tables.snapshot()).toEqual(before)
-    return causes
   })
 
 describe("[EDD-9134] a number composite beside a label its key text can't spell", () => {
@@ -2276,16 +2255,18 @@ describe("[EDD-9134] a date composite beside a label its key text can't spell", 
   )
 })
 
-describe.each(DIRECTIONS)("[EDD-9134] a member of the outbox's table, %s", (_d, from, to) => {
+describe.each(DIRECTIONS)("a member of the outbox's table, %s", (_d, from, to) => {
   // M is a member of the outbox table, keyed by `shop`; R's projection writes its outbox there,
-  // keyed by `shop` and `branch`. M claims the outbox items of its entity type on its table, and
-  // reads R's key `shop_north#branch_b1` as `shop` = `north#branch_b1`.
+  // keyed by `shop` and `branch`. M claims the outbox items of its entity type on its table, and its
+  // keys hold R's key `shop_north#branch_b1`, as `shop` = `north#branch_b1`. 1.40.0 refused them.
   it.effect.each([
-    ["no projection", "none"],
-    ["a projection with its outbox on its own table", "local"],
+    ["no projection", "names its read model", "none"],
+    ["no projection", "names none (1.40.0's)", "none"],
+    ["a projection with its outbox on its own table", "names its read model", "local"],
+    ["a projection with its outbox on its own table", "names none (1.40.0's)", "local"],
   ] as const)(
-    "M with %s: rekey of the outbox table refuses it before sending anything",
-    ([, outbox]) => {
+    "M with %s: rekey of the outbox table moves R's item where R reads it: an item that %s",
+    ([, names, outbox]) => {
       const tables = routedTables()
       const sides: ReadonlyArray<PairSide> = [
         { pk: ["shop"], member: true, outbox },
@@ -2297,23 +2278,45 @@ describe.each(DIRECTIONS)("[EDD-9134] a member of the outbox's table, %s", (_d, 
         const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
         if (outbox === "local") yield* applyPair(written, 0, events)
         yield* applyPair(written, 1, events)
-        // Bound as on 1.39.0: only `rekey` reads an item's key back.
+        if (names.startsWith("names none")) {
+          for (const item of tables.table("o").items.values()) delete item.__edd_rm__
+        }
         yield* written.client()
+        // M's own item, and M's row: no key of R's. R's item: unescaped, M writes its key too, as
+        // `shop` = `north#branch_b1`, and would move it to `shop_north%23branch_b1`, where R's
+        // stays: when it names no read model, R's row is read, and settles it. Escaped, M's
+        // reader doesn't read it, its `#` no value's.
+        const reads = names.startsWith("names none") && from === Off ? ["r1", "r1"] : []
+        const moved = outbox === "local" ? { ...ZERO, item: 1, outbox: 2 } : { ...ZERO, outbox: 1 }
         for (const order of [
           [0, 1],
           [1, 0],
         ]) {
-          const causes = yield* refusedRekey(tables, now, order)
-          for (const cause of causes) {
-            expect(cause).toContain(
-              `[EDD-9134] rekey: "B" writes its projection's outbox items into another table ` +
-                `("o"), whose member "A" claims the outbox items of its entity type there under ` +
-                `the same key space (partition keys starting "$pair#v1#ledger#shop_"`,
-            )
-          }
+          const db = yield* now.client(order)
+          tables.take()
+          const report = (yield* db.tables.O.rekey({
+            streams: [to.Accounts],
+            dryRun: true,
+          })) as Table.RekeyReport
+          expect(report.moved).toEqual(moved)
+          expect(report.ambiguous).toEqual([])
+          expect(
+            tables
+              .take()
+              .filter((r) => r.command === "GetItem" && r.input.TableName !== "o")
+              .map((r) => r.input.TableName),
+          ).toEqual(reads)
         }
-        // R's item is where it was, delivered by R's drainer under the setting it was written.
-        expect(yield* drained(written, 1)).toEqual([2])
+        const db = yield* now.client()
+        const report = (yield* db.tables.O.rekey({ streams: [to.Accounts] })) as Table.RekeyReport
+        expect(report.moved).toEqual(moved)
+        expect(report.skipped.unrecognizedKey).toBe(0)
+        expect(report.conflicts).toEqual([])
+        expect(
+          ((yield* db.tables.O.rekey({ streams: [to.Accounts] })) as Table.RekeyReport).moved,
+        ).toEqual(ZERO)
+        expect(yield* drained(now, 1)).toEqual([2])
+        if (outbox === "local") expect(yield* drained(now, 0)).toEqual([2])
       }).pipe(
         Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
       ) as Effect.Effect<void, unknown>
@@ -2387,39 +2390,386 @@ describe.each(DIRECTIONS)("[EDD-9134] a member of the outbox's table, %s", (_d, 
   })
 })
 
-describe.each(
-  DIRECTIONS,
-)("[EDD-9134] read models led by a literal composite, %s", (_d, from, to) => {
+describe.each(DIRECTIONS)("read models led by a literal composite, %s", (_d, from, to) => {
   // `kind` is `a` or `b`, and each read model writes `kind_a`. rekey's reader reads a literal as
   // any text, as it reads a string, so A's reads B's `kind_a#idb_y#ida_x` as `kind` =
-  // `a#idb_y`, `idA` = `x`; and B's reads A's `kind_a#ida_x` when `x` holds `#idb_`.
+  // `a#idb_y`, `idA` = `x`; and B's reads A's `kind_a#ida_x` when `x` holds `#idb_`. 1.40.0
+  // refused them. But a literal's key text is one of its values: neither writes the other's keys.
   it.effect.each([
-    ["one going on with the other's composites", ["kind", "idA"], ["kind", "idB", "idA"]],
-    ["each going on with its own composite", ["kind", "idA"], ["kind", "idB"]],
-  ] as const)("%s: they bind and run; rekey of their outbox table refuses them", ([, a, b]) => {
+    [
+      "one going on with the other's composites",
+      "names its read model",
+      ["kind", "idA"],
+      ["kind", "idB", "idA"],
+    ],
+    [
+      "one going on with the other's composites",
+      "names none (1.40.0's)",
+      ["kind", "idA"],
+      ["kind", "idB", "idA"],
+    ],
+    [
+      "each going on with its own composite",
+      "names its read model",
+      ["kind", "idA"],
+      ["kind", "idB"],
+    ],
+    [
+      "each going on with its own composite",
+      "names none (1.40.0's)",
+      ["kind", "idA"],
+      ["kind", "idB"],
+    ],
+  ] as const)(
+    "%s: they bind and run; rekey of their outbox table moves each item by its own: an item that %s",
+    ([, names, a, b]) => {
+      const old = names.startsWith("names none")
+      const tables = routedTables()
+      const sides: ReadonlyArray<PairSide> = [{ pk: a }, { pk: b }]
+      const written = pairs(from, sides)
+      const now = pairs(to, sides)
+      return Effect.gen(function* () {
+        // Their keys are apart for the values a literal can take: bound as on 1.39.0.
+        yield* written.client()
+        const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+        yield* applyPair(written, 0, events)
+        yield* applyPair(written, 1, events)
+        expect(tables.rows("o", "Ledger#outbox")).toHaveLength(2)
+        if (old) for (const item of tables.table("o").items.values()) delete item.__edd_rm__
+        for (const order of [
+          [0, 1],
+          [1, 0],
+        ]) {
+          const db = yield* now.client(order)
+          tables.take()
+          const report = (yield* db.tables.O.rekey({
+            streams: [to.Accounts],
+            dryRun: true,
+          })) as Table.RekeyReport
+          expect(report.moved).toEqual({ ...ZERO, outbox: 2 })
+          expect(report.ambiguous).toEqual([])
+          expect(
+            tables.take().filter((r) => r.command === "GetItem" && r.input.TableName !== "o"),
+          ).toEqual([])
+        }
+        const db = yield* now.client()
+        const report = (yield* db.tables.O.rekey({ streams: [to.Accounts] })) as Table.RekeyReport
+        expect(report.moved).toEqual({ ...ZERO, outbox: 2 })
+        expect(report.conflicts).toEqual([])
+        expect(yield* drained(now, 0)).toEqual([2])
+        expect(yield* drained(now, 1)).toEqual([2])
+      }).pipe(
+        Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+      ) as Effect.Effect<void, unknown>
+    },
+  )
+})
+
+describe("rekey decides whose an outbox item is, item by item (#237)", () => {
+  // A is keyed by `shop`, B by `shop` and `branch`, in their sort keys, each on a table of its own
+  // with its projection's outbox on `O`. Under `escapeKeys: false`, A's `shop` = `north#branch_b1`
+  // is written `shop_north#branch_b1`, as B's `north` and `b1` are: either can have written an item
+  // there. With escaping on, A's belongs at `shop_north%23branch_b1` and B's stays.
+  const A_ROW = { ...PAIR_ROW, idA: "xa", shop: "north#branch_b1" }
+  const B_ROW = { ...PAIR_ROW, idA: "xb" }
+  const sides = (
+    a: Record<string, unknown> = A_ROW,
+    b: Record<string, unknown> = B_ROW,
+    removal = false,
+  ): ReadonlyArray<PairSide> => [
+    { pk: ["idA"], sk: ["shop"], row: a, removal },
+    { pk: ["idA"], sk: ["shop", "branch"], row: b },
+  ]
+  /** The outbox items as 1.40.0 wrote them: naming no read model. */
+  const unmark = (tables: RoutedTables) => {
+    for (const item of tables.table("o").items.values()) delete item.__edd_rm__
+  }
+  /** Every table's items: a table only read is no change. */
+  const held = (tables: RoutedTables) =>
+    new Map([...tables.snapshot()].filter(([, items]) => items.size > 0))
+  const outboxKeys = (tables: RoutedTables) =>
+    tables
+      .rows("o", "Ledger#outbox")
+      .map(([stored]) => stored)
+      .sort()
+  /** The read-model rows read: `GetItem`s of a read model's table. */
+  const rowReads = (tables: RoutedTables) =>
+    tables
+      .take()
+      .filter((request) => request.command === "GetItem" && request.input.TableName !== "o")
+      .map((request) => String(request.input.TableName))
+  const run = (s: Pairs, options: Record<string, unknown> = {}, order?: ReadonlyArray<number>) =>
+    Effect.gen(function* () {
+      const db = yield* s.client(order)
+      return (yield* db.tables.O.rekey({
+        streams: [s.w.Accounts],
+        ...options,
+      })) as Table.RekeyReport
+    })
+  const events = (w: World, closed = false) =>
+    seed(w, "moved", [new Opened(), new Added({ amount: 2 }), ...(closed ? [new Closed()] : [])], 0)
+
+  it.effect.each([
+    ["names its read model", false],
+    ["names none (1.40.0's)", true],
+  ] as const)("an item that %s moves by its own, reading a row only when it has to", ([, old]) => {
     const tables = routedTables()
-    const sides: ReadonlyArray<PairSide> = [{ pk: a }, { pk: b }]
-    const written = pairs(from, sides)
-    const now = pairs(to, sides)
+    const written = pairs(Off, sides())
+    const now = pairs(On, sides())
     return Effect.gen(function* () {
-      // Their keys are apart for the values a literal can take: bound as on 1.39.0.
-      yield* written.client()
-      const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
-      yield* applyPair(written, 0, events)
-      yield* applyPair(written, 1, events)
-      expect(tables.rows("o", "Ledger#outbox")).toHaveLength(2)
+      const seeded = yield* events(Off)
+      yield* applyPair(written, 0, seeded)
+      yield* applyPair(written, 1, seeded)
+      if (old) unmark(tables)
+      const before = outboxKeys(tables)
+      expect(before).toEqual([
+        "$pair#v1#ledger#ida_xa|$pair#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000",
+        "$pair#v1#ledger#ida_xb|$pair#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000",
+      ])
+      tables.take()
+      for (const options of [{ dryRun: true }, {}]) {
+        const report = yield* run(now, options)
+        // A's moves; B's is where it belongs.
+        expect(report.moved).toEqual({ ...ZERO, outbox: 1 })
+        expect(report.unchanged).toBe(1)
+        expect(report.skipped.ambiguousOwner).toBe(0)
+        expect(report.ambiguous).toEqual([])
+        expect(report.conflicts).toEqual([])
+        // An item naming its read model reads no row. One that doesn't, at a key both write, has
+        // its row read from each one's table, where it is and where that read model moves it.
+        expect(rowReads(tables).sort()).toEqual(old ? ["r0", "r0", "r0", "r0", "r1", "r1"] : [])
+      }
+      const after = outboxKeys(tables)
+      expect(after).toEqual([
+        "$pair#v1#ledger#ida_xa|$pair#v1#ledger#shop_north%23branch_b1#outbox#000000000001#0000",
+        "$pair#v1#ledger#ida_xb|$pair#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000",
+      ])
+      // A second run moves nothing.
+      const again = yield* run(now)
+      expect(again.moved).toEqual(ZERO)
+      expect(again.unchanged).toBe(2)
+      expect(outboxKeys(tables)).toEqual(after)
+      expect(yield* drained(now, 0)).toEqual([2])
+      expect(yield* drained(now, 1)).toEqual([2])
+    }).pipe(
+      Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+    ) as Effect.Effect<void, unknown>
+  })
+
+  it.effect.each([
+    ["both have a row there", "unsettled", "More than one of them has a row of its own at ROW."],
+    [
+      "neither has the row",
+      "rowGone",
+      "None of them has ROW, at that key or where it would move it.",
+    ],
+    [
+      "a row tombstone is there",
+      "unsettled",
+      "A row tombstone is at ROW: it holds no values to say whose it is.",
+    ],
+  ] as const)(
+    "an item naming no read model whose row doesn't settle it is left, and counted (%s)",
+    ([title, reason, message]) => {
+      const tables = routedTables()
+      const tombstone = title.includes("tombstone")
+      // One row key for both: the item is the last one written there.
+      const s = sides(A_ROW, { ...B_ROW, idA: "xa" }, tombstone)
+      const written = pairs(Off, s)
+      const now = pairs(On, s)
+      return Effect.gen(function* () {
+        const seeded = yield* events(Off, tombstone)
+        yield* applyPair(written, 0, seeded)
+        if (title.startsWith("both")) yield* applyPair(written, 1, seeded)
+        unmark(tables)
+        if (title.startsWith("neither")) tables.table("r0").items.clear()
+        expect(tables.rows("r0", tombstone ? "Ledger#tombstone" : "Ledger")).toHaveLength(
+          title.startsWith("neither") ? 0 : 1,
+        )
+        const before = held(tables)
+        const item = "$pair#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000"
+        expect(outboxKeys(tables)).toEqual([`$pair#v1#ledger#ida_xa|${item}`])
+        for (const options of [{ dryRun: true }, {}, {}]) {
+          const report = yield* run(now, options)
+          expect(report.moved).toEqual(ZERO)
+          expect(report.unchanged).toBe(0)
+          expect(report.skipped).toEqual({
+            notLibrary: 0,
+            unregistered: 0,
+            unrecognizedKey: 0,
+            rootNotSeen: 0,
+            ambiguousOwner: 1,
+          })
+          expect(report.byMember.Ledger?.moved).toEqual(ZERO)
+          expect(report.ambiguous).toEqual([
+            {
+              member: "Ledger",
+              key: { pk: "$pair#v1#ledger#ida_xa", sk: item },
+              targets: [
+                {
+                  pk: "$pair#v1#ledger#ida_xa",
+                  sk: "$pair#v1#ledger#shop_north%23branch_b1#outbox#000000000001#0000",
+                },
+                { pk: "$pair#v1#ledger#ida_xa", sk: item },
+              ],
+              reason,
+              message:
+                '2 read models of entity type "Ledger" whose outboxes share this table can each ' +
+                "have written it, and would move it to different keys; it was written before " +
+                "1.41.0, so it doesn't name its read model. " +
+                message.replace(
+                  "ROW",
+                  'the row it names ("$pair#v1#ledger#ida_xa", "$pair#v1#ledger#shop_north#branch_b1")',
+                ) +
+                " It's left where it is.",
+            },
+          ])
+          // Left where it is, and nothing written: a rerun leaves it again.
+          expect(held(tables)).toEqual(before)
+        }
+      }).pipe(
+        Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+      ) as Effect.Effect<void, unknown>
+    },
+  )
+
+  it.effect("an item whose read model's row has moved already is found where it moved", () => {
+    const tables = routedTables()
+    const written = pairs(Off, sides())
+    const now = pairs(On, sides())
+    return Effect.gen(function* () {
+      const seeded = yield* events(Off)
+      yield* applyPair(written, 0, seeded)
+      unmark(tables)
+      // A's own table first: its row moves to `shop_north%23branch_b1`.
+      const db = yield* now.client()
+      const rows = (yield* db.tables.R0.rekey({ streams: [On.Accounts] })) as Table.RekeyReport
+      expect(rows.moved).toEqual({ ...ZERO, item: 1 })
+      tables.take()
+      const report = yield* run(now)
+      expect(report.moved).toEqual({ ...ZERO, outbox: 1 })
+      expect(report.ambiguous).toEqual([])
+      expect(rowReads(tables).sort()).toEqual(["r0", "r0", "r1"])
+      expect(yield* drained(now, 0)).toEqual([2])
+    }).pipe(
+      Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+    ) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("an item naming a read model none of them is is unregistered", () => {
+    const tables = routedTables()
+    const written = pairs(Off, sides())
+    const now = pairs(On, sides())
+    return Effect.gen(function* () {
+      yield* applyPair(written, 0, yield* events(Off))
+      for (const item of tables.table("o").items.values()) item.__edd_rm__ = { S: "elsewhere" }
+      const before = tables.snapshot()
+      const report = yield* run(now)
+      expect(report.moved).toEqual(ZERO)
+      expect(report.skipped.unregistered).toBe(1)
+      expect(report.ambiguous).toEqual([])
+      expect(tables.snapshot()).toEqual(before)
+    }).pipe(
+      Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+    ) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("written escaped, each item is only one's to write: none reads a row", () => {
+    const tables = routedTables()
+    const written = pairs(On, sides())
+    const now = pairs(Off, sides())
+    return Effect.gen(function* () {
+      const seeded = yield* events(On)
+      yield* applyPair(written, 0, seeded)
+      yield* applyPair(written, 1, seeded)
+      unmark(tables)
+      expect(outboxKeys(tables)).toEqual([
+        "$pair#v1#ledger#ida_xa|$pair#v1#ledger#shop_north%23branch_b1#outbox#000000000001#0000",
+        "$pair#v1#ledger#ida_xb|$pair#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000",
+      ])
+      tables.take()
+      for (const options of [{ dryRun: true }, {}]) {
+        const report = yield* run(now, options)
+        expect(report.moved).toEqual({ ...ZERO, outbox: 1 })
+        expect(report.unchanged).toBe(1)
+        expect(report.ambiguous).toEqual([])
+        expect(rowReads(tables)).toEqual([])
+      }
+      expect(outboxKeys(tables)).toEqual([
+        "$pair#v1#ledger#ida_xa|$pair#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000",
+        "$pair#v1#ledger#ida_xb|$pair#v1#ledger#shop_north#branch_b1#outbox#000000000001#0000",
+      ])
+      expect(yield* drained(now, 0)).toEqual([2])
+      expect(yield* drained(now, 1)).toEqual([2])
+    }).pipe(
+      Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+    ) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("a member of the outbox's table is asked too, and its own items move by it", () => {
+    const tables = routedTables()
+    // M is a member of `O`, its projection's outbox on its own table; R's outbox is on `O` too.
+    const s: ReadonlyArray<PairSide> = [
+      { pk: ["idA"], sk: ["shop"], row: A_ROW, member: true, outbox: "local" },
+      { pk: ["idA"], sk: ["shop", "branch"], row: B_ROW },
+    ]
+    const written = pairs(Off, s)
+    const now = pairs(On, s)
+    return Effect.gen(function* () {
+      const seeded = yield* events(Off)
+      yield* applyPair(written, 0, seeded)
+      yield* applyPair(written, 1, seeded)
+      unmark(tables)
+      tables.take()
       for (const order of [
         [0, 1],
         [1, 0],
       ]) {
-        const causes = yield* refusedRekey(tables, now, order)
-        for (const cause of causes) {
-          expect(cause).toContain("[EDD-9134] rekey: ")
-          expect(cause).toContain(`(partition keys starting "$pair#v1#ledger#kind_"`)
-        }
+        const report = yield* run(now, { dryRun: true }, order)
+        // M's item, and M's row (a member of `O`, rekeyed with it); R's item is where it belongs.
+        expect(report.moved).toEqual({ ...ZERO, item: 1, outbox: 1 })
+        expect(report.ambiguous).toEqual([])
       }
-      expect(yield* drained(written, 0)).toEqual([2])
-      expect(yield* drained(written, 1)).toEqual([2])
+      const report = yield* run(now)
+      expect(report.moved).toEqual({ ...ZERO, item: 1, outbox: 1 })
+      expect(report.unchanged).toBe(1)
+      expect((yield* run(now)).moved).toEqual(ZERO)
+      expect(yield* drained(now, 0)).toEqual([2])
+      expect(yield* drained(now, 1)).toEqual([2])
+    }).pipe(
+      Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+    ) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("a run resumed from its token decides as one run does", () => {
+    const tables = routedTables()
+    const written = pairs(Off, sides())
+    const now = pairs(On, sides())
+    return Effect.gen(function* () {
+      const seeded = yield* events(Off)
+      yield* applyPair(written, 0, seeded)
+      yield* applyPair(written, 1, seeded)
+      unmark(tables)
+      const moved: Array<number> = []
+      const unchanged: Array<number> = []
+      let resume: string | undefined
+      do {
+        const report = yield* run(now, {
+          pageSize: 1,
+          maxPages: 1,
+          ...(resume !== undefined && { resume }),
+        })
+        moved.push(report.moved.outbox)
+        unchanged.push(report.unchanged)
+        expect(report.ambiguous).toEqual([])
+        resume = report.resume._tag === "Some" ? report.resume.value : undefined
+      } while (resume !== undefined)
+      expect(moved.reduce((a, b) => a + b)).toBe(1)
+      // B's, and A's met again where it moved, after its old key.
+      expect(unchanged.reduce((a, b) => a + b)).toBe(2)
+      expect(moved.length).toBeGreaterThan(2)
+      expect(yield* drained(now, 0)).toEqual([2])
+      expect(yield* drained(now, 1)).toEqual([2])
     }).pipe(
       Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
     ) as Effect.Effect<void, unknown>

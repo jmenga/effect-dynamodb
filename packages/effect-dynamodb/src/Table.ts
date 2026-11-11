@@ -924,15 +924,52 @@ export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
  *   sentinel of a constraint the entity doesn't declare, or one not under the
  *   schema's own key prefix, is counted here too (a sentinel of a declared
  *   constraint that no row holds is in {@link RekeyReport.reservations}). When several
- *   members claim its `__edd_e__` (read models of one entity type in different
- *   schemas or primary collections, whose outboxes share a table), none of them
- *   reads its key back
+ *   members claim its `__edd_e__` (read models of one entity type whose outboxes
+ *   share a table), it names none of them, and its row's key is no key any of
+ *   them writes
  * - `rootNotSeen` — a row of an aggregate with no root in its partition, met by
  *   a run that didn't read the whole table (`maxPages` or `resume`). A root at
  *   its old key on a page the run didn't read could still claim it, so nothing
  *   is said of it. A run over the whole table judges it: a dry run will do
+ * - `ambiguousOwner` — a projection's outbox item that more than one read model
+ *   of its entity type sharing its table could have written, which they would
+ *   move to different keys, and whose read-model row doesn't say whose it is:
+ *   each one is in {@link RekeyReport.ambiguous}, with the reason
  */
-export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" | "rootNotSeen"
+export type RekeySkipReason =
+  | "notLibrary"
+  | "unregistered"
+  | "unrecognizedKey"
+  | "rootNotSeen"
+  | "ambiguousOwner"
+
+/**
+ * A projection's outbox item `rekey` left where it is because it can't tell whose it is. Read
+ * models of one entity type whose outboxes share a table can write one key: a value holding `#`
+ * spells a longer key's text (`shop` = `x#branch_y` beside `shop` = `x`, `branch` = `y`). From
+ * 1.41.0 an item names its read model (`__edd_rm__`), and that decides. An item written before
+ * names none: it is the read model's whose rows' keys it can be, when only one can have written
+ * it, and moves as any other when every one that can would move it to one key. Otherwise the row
+ * it names (`__edd_row_pk__`, `__edd_row_sk__`) is read from each one's table, at that key and at
+ * the key that read model would move it to: the item is the read model's whose own row is there
+ * (its values compose that key), when exactly one finds one and none finds a tombstone. Otherwise
+ * it's left, and a rerun leaves it again:
+ *
+ * - `rowGone` — no read model has that row
+ * - `unsettled` — the row doesn't say whose the item is: a tombstone is there, which holds no
+ *   values, or more than one read model finds a row of its own, or a read model's table isn't
+ *   provided where `rekey` runs
+ */
+export interface RekeyAmbiguity {
+  /** The entity type of the read models that can have written it. */
+  readonly member: string
+  /** The item's primary key, as stored. */
+  readonly key: Readonly<Record<string, unknown>>
+  /** Where each of them would move it: its key as stored for one that finds it current. */
+  readonly targets: ReadonlyArray<Readonly<Record<string, unknown>>>
+  readonly reason: "rowGone" | "unsettled"
+  readonly message: string
+}
 
 /**
  * A row `rekey` did not move, and why. A row is moved only where nothing is
@@ -1182,6 +1219,11 @@ export interface RekeyReport {
   readonly conflicts: ReadonlyArray<RekeyConflict>
   /** Rows no member owns, by reason. */
   readonly skipped: { readonly [R in RekeySkipReason]: number }
+  /**
+   * The outbox items counted in `skipped.ambiguousOwner`, each with why it was left: see
+   * {@link RekeyAmbiguity}.
+   */
+  readonly ambiguous: ReadonlyArray<RekeyAmbiguity>
   /** Per entity type, aggregate and stream name. */
   readonly byMember: Readonly<Record<string, RekeyMemberReport>>
   /** What the run consumed — always measured, whatever `ConsumedCapacity` reporting is set to. */

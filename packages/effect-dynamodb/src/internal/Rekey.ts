@@ -40,6 +40,7 @@ import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { Context, Deferred, Effect, Option } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "../DynamoClient.js"
 import type {
+  RekeyAmbiguity,
   RekeyConflict,
   RekeyCountName,
   RekeyCounts,
@@ -238,6 +239,8 @@ export interface RekeyTally {
    * its current key by this run): the row isn't `unchanged`, though this call wrote nothing.
    */
   readonly worked?: boolean | undefined
+  /** The outbox items counted in `skipped.ambiguousOwner`. */
+  readonly ambiguous?: ReadonlyArray<RekeyAmbiguity> | undefined
 }
 
 /** A tally saying only that the member couldn't read the row's key back. */
@@ -257,6 +260,12 @@ export interface RekeyMember {
   readonly typePrefixes?: ReadonlyArray<string> | undefined
   /** The table's key attributes, by which the run tells the keys its writes touch apart. */
   readonly key?: { readonly pk: string; readonly sk: string } | undefined
+  /**
+   * The rows of its `types` are its alone: no other member claiming them is asked. A projection's
+   * outbox items, which read models of one entity type share, are judged by one member that asks
+   * each of them ({@link ProjectionEngine.rekeyOutboxMember}).
+   */
+  readonly exclusive?: boolean | undefined
   /** Handle one scanned row; `undefined` when it is not the member's after all. */
   readonly row: (
     row: Item,
@@ -328,6 +337,7 @@ const SKIP_REASONS: ReadonlyArray<RekeySkipReason> = [
   "unregistered",
   "unrecognizedKey",
   "rootNotSeen",
+  "ambiguousOwner",
 ]
 
 type MutableCounts = { -readonly [K in RekeyRowKind]: number }
@@ -507,7 +517,9 @@ class Totals {
     unregistered: 0,
     unrecognizedKey: 0,
     rootNotSeen: 0,
+    ambiguousOwner: 0,
   }
+  ambiguous: Array<RekeyAmbiguity> = []
   byMember = new Map<string, MutableMember>()
 
   private memberOf(member: string): MutableMember {
@@ -577,6 +589,7 @@ class Totals {
       }
     }
     for (const reason of SKIP_REASONS) this.skipped[reason] += tally.skipped?.[reason] ?? 0
+    for (const ambiguity of tally.ambiguous ?? []) this.ambiguous.push(ambiguity)
   }
 
   report(
@@ -626,6 +639,10 @@ class Totals {
       guardGaps: { ...this.guardGaps, rows: firstGuardGapRows(this.guardGapRows) },
       conflicts,
       skipped: { ...this.skipped },
+      ambiguous: this.ambiguous
+        .map((ambiguity) => ({ ambiguity, order: [ambiguity.member, stableText(ambiguity.key)] }))
+        .sort((a, b) => compareOrders(a.order, b.order))
+        .map(({ ambiguity }) => ambiguity),
       byMember,
       capacity,
       journal: {
@@ -1841,10 +1858,12 @@ export const run = (args: {
             totals.add(undefined, { skipped: { notLibrary: 1 } })
             return
           }
-          const candidates = [
+          const claiming = [
             ...(byType.get(type) ?? []),
             ...prefixed.filter((p) => type.startsWith(p.prefix)).map((p) => p.member),
           ]
+          const exclusive = claiming.filter((member) => member.exclusive === true)
+          const candidates = exclusive.length > 0 ? exclusive : claiming
           // A member that can't read the row's key back (`unrecognizedKey`) isn't its owner: the
           // key names another member's key space. The search goes on, so the order members are
           // listed in doesn't choose one, and the row is counted unrecognized only when no member
@@ -1926,6 +1945,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
   const skipped: Partial<Record<RekeySkipReason, number>> = {}
   const conflicts: Array<RekeyConflict> = []
   const reservations: Array<RekeyReservation> = []
+  const ambiguous: Array<RekeyAmbiguity> = []
   const indexKeys: Partial<MutableIndexKeys> = {}
   const guardGaps: Partial<MutableGuardGaps> = {}
   const guardGapRows: Array<RekeyGuardGapRow> = []
@@ -1959,6 +1979,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     for (const conflict of tally.conflicts ?? []) conflicts.push(conflict)
     for (const entry of tally.reservations ?? []) reservations.push(entry)
     for (const row of tally.guardGapRows ?? []) guardGapRows.push(row)
+    for (const ambiguity of tally.ambiguous ?? []) ambiguous.push(ambiguity)
   }
   return {
     ...(unchanged > 0 && { unchanged }),
@@ -1973,5 +1994,6 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     ...(conflicts.length > 0 && { conflicts }),
     ...(Object.keys(skipped).length > 0 && { skipped }),
     ...(worked && { worked }),
+    ...(ambiguous.length > 0 && { ambiguous }),
   }
 }
