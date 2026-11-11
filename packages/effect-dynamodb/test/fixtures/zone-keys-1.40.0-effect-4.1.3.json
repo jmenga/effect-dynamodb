@@ -1,0 +1,1709 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0 + effect@4.1.3",
+ "note": "Captured once from the published effect-dynamodb 1.40.0 and @effect-dynamodb/schema 1.40.0 build running on effect 4.1.3 (not 4.1.2), on DynamoDB Local (Node 24, ICU 78.3, tz 2026c). Never regenerate it.",
+ "describes": "One table on DynamoSchema { name: zones, version: 1 }, model { id: String, at: DateTimeZonedFromString, tz: TimeZoneNamedFromString, tzf: TimeZoneFromString, note?: String }, entities Soft (pk [id, tz], sk [at], softDelete: true), Retained (pk [id], sk [at], versioned retain), Unique (unique byTz [tz], byAt [at]), Indexed (gsi1 pk [tzf], sk [at]), Series (sk [tz], timeSeries orderBy at), Instant (model { id, zd: DateTimeZoned, note? }, sk [zd], unique byZd [zd]) and the aggregate Roots (pk [id, tz], collection roots, root entityType Root). For each zone n of Etc/UTC, Asia/Kolkata, europe/london, US/Pacific, America/New_York, at t0 = epoch 0 in it: Soft a<n> put and deleted (a tombstone), Soft b<n> put, Retained r<n> put and updated (note x), Unique u<n>, Indexed i<n>, Instant z<n> put, Series s<n> put then appended at t0 + 1 min and t0 + 2 min, Roots g<n> created (note one). rows is the table scanned afterwards, sorted by pk|sk; results each step's outcome and what 1.40.0 found again on effect 4.1.3.",
+ "results": {
+  "Etc/UTC": {
+   "softPutA": "ok",
+   "softDeleteA": "ok",
+   "softPutB": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "seriesPut": "ok",
+   "seriesAppend1": "ok",
+   "seriesAppend2": "ok",
+   "instantPut": "ok",
+   "instantGet": "ok",
+   "rootCreate": "ok",
+   "softGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "Asia/Kolkata": {
+   "softPutA": "ok",
+   "softDeleteA": "ok",
+   "softPutB": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "seriesPut": "ok",
+   "seriesAppend1": "ok",
+   "seriesAppend2": "ok",
+   "instantPut": "ok",
+   "instantGet": "ok",
+   "rootCreate": "ok",
+   "softGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "europe/london": {
+   "softPutA": "ok",
+   "softDeleteA": "ok",
+   "softPutB": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "seriesPut": "ok",
+   "seriesAppend1": "ok",
+   "seriesAppend2": "ok",
+   "instantPut": "ok",
+   "instantGet": "ok",
+   "rootCreate": "ok",
+   "softGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "US/Pacific": {
+   "softPutA": "ok",
+   "softDeleteA": "ok",
+   "softPutB": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "seriesPut": "ok",
+   "seriesAppend1": "ok",
+   "seriesAppend2": "ok",
+   "instantPut": "ok",
+   "instantGet": "ok",
+   "rootCreate": "ok",
+   "softGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "America/New_York": {
+   "softPutA": "ok",
+   "softDeleteA": "ok",
+   "softPutB": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "seriesPut": "ok",
+   "seriesAppend1": "ok",
+   "seriesAppend2": "ok",
+   "instantPut": "ok",
+   "instantGet": "ok",
+   "rootCreate": "ok",
+   "softGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  }
+ },
+ "rows": [
+  {
+   "tzf": {
+    "S": "Etc/UTC"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "gsi1sk": {
+    "S": "$zones#v1#indexed#at_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$zones#v1#indexed#tzf_etc/utc"
+   },
+   "sk": {
+    "S": "$zones#v1#indexed"
+   },
+   "id": {
+    "S": "i0"
+   },
+   "pk": {
+    "S": "$zones#v1#indexed#id_i0"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Asia/Kolkata"
+   },
+   "at": {
+    "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+   },
+   "gsi1sk": {
+    "S": "$zones#v1#indexed#at_1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$zones#v1#indexed#tzf_asia/kolkata"
+   },
+   "sk": {
+    "S": "$zones#v1#indexed"
+   },
+   "id": {
+    "S": "i1"
+   },
+   "pk": {
+    "S": "$zones#v1#indexed#id_i1"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Europe/London"
+   },
+   "at": {
+    "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+   },
+   "gsi1sk": {
+    "S": "$zones#v1#indexed#at_1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$zones#v1#indexed#tzf_europe/london"
+   },
+   "sk": {
+    "S": "$zones#v1#indexed"
+   },
+   "id": {
+    "S": "i2"
+   },
+   "pk": {
+    "S": "$zones#v1#indexed#id_i2"
+   }
+  },
+  {
+   "tzf": {
+    "S": "US/Pacific"
+   },
+   "at": {
+    "S": "1969-12-31T16:00:00.000-08:00[US/Pacific]"
+   },
+   "gsi1sk": {
+    "S": "$zones#v1#indexed#at_1969-12-31t16:00:00.000-08:00[us/pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$zones#v1#indexed#tzf_us/pacific"
+   },
+   "sk": {
+    "S": "$zones#v1#indexed"
+   },
+   "id": {
+    "S": "i3"
+   },
+   "pk": {
+    "S": "$zones#v1#indexed#id_i3"
+   }
+  },
+  {
+   "tzf": {
+    "S": "America/New_York"
+   },
+   "at": {
+    "S": "1969-12-31T19:00:00.000-05:00[America/New_York]"
+   },
+   "gsi1sk": {
+    "S": "$zones#v1#indexed#at_1969-12-31t19:00:00.000-05:00[america/new_york]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$zones#v1#indexed#tzf_america/new_york"
+   },
+   "sk": {
+    "S": "$zones#v1#indexed"
+   },
+   "id": {
+    "S": "i4"
+   },
+   "pk": {
+    "S": "$zones#v1#indexed#id_i4"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant.byzd"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#instant#zd_1969-12-31t16:00:00.000-08:00[us/pacific]"
+   },
+   "pk": {
+    "S": "$zones#v1#instant.byzd#1969-12-31t16:00:00.000-08:00[us/pacific]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#instant#id_z3"
+   },
+   "__edd_e__": {
+    "S": "Instant._unique.byZd"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant.byzd"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#instant#zd_1969-12-31t19:00:00.000-05:00[america/new_york]"
+   },
+   "pk": {
+    "S": "$zones#v1#instant.byzd#1969-12-31t19:00:00.000-05:00[america/new_york]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#instant#id_z4"
+   },
+   "__edd_e__": {
+    "S": "Instant._unique.byZd"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant.byzd"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#instant#zd_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "pk": {
+    "S": "$zones#v1#instant.byzd#1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#instant#id_z0"
+   },
+   "__edd_e__": {
+    "S": "Instant._unique.byZd"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant.byzd"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#instant#zd_1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "pk": {
+    "S": "$zones#v1#instant.byzd#1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#instant#id_z2"
+   },
+   "__edd_e__": {
+    "S": "Instant._unique.byZd"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant.byzd"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#instant#zd_1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "pk": {
+    "S": "$zones#v1#instant.byzd#1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#instant#id_z1"
+   },
+   "__edd_e__": {
+    "S": "Instant._unique.byZd"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant#zd_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "zd": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "id": {
+    "S": "z0"
+   },
+   "pk": {
+    "S": "$zones#v1#instant#id_z0"
+   },
+   "__edd_e__": {
+    "S": "Instant"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant#zd_1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "zd": {
+    "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+   },
+   "id": {
+    "S": "z1"
+   },
+   "pk": {
+    "S": "$zones#v1#instant#id_z1"
+   },
+   "__edd_e__": {
+    "S": "Instant"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant#zd_1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "zd": {
+    "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+   },
+   "id": {
+    "S": "z2"
+   },
+   "pk": {
+    "S": "$zones#v1#instant#id_z2"
+   },
+   "__edd_e__": {
+    "S": "Instant"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant#zd_1969-12-31t16:00:00.000-08:00[us/pacific]"
+   },
+   "zd": {
+    "S": "1969-12-31T16:00:00.000-08:00[US/Pacific]"
+   },
+   "id": {
+    "S": "z3"
+   },
+   "pk": {
+    "S": "$zones#v1#instant#id_z3"
+   },
+   "__edd_e__": {
+    "S": "Instant"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#instant#zd_1969-12-31t19:00:00.000-05:00[america/new_york]"
+   },
+   "zd": {
+    "S": "1969-12-31T19:00:00.000-05:00[America/New_York]"
+   },
+   "id": {
+    "S": "z4"
+   },
+   "pk": {
+    "S": "$zones#v1#instant#id_z4"
+   },
+   "__edd_e__": {
+    "S": "Instant"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "tzf": {
+    "S": "Etc/UTC"
+   },
+   "__edd_i__": {
+    "S": "b50e0986-1085-4501-a818-05906e1b6a30"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#at_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "id": {
+    "S": "r0"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r0"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Etc/UTC"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "__edd_i__": {
+    "S": "b50e0986-1085-4501-a818-05906e1b6a30"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#v#at_1970-01-01t00:00:00.000+00:00[etc/utc]#0000001"
+   },
+   "id": {
+    "S": "r0"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r0"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "tzf": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_i__": {
+    "S": "b88bd8da-c2ca-465c-afec-c0429684ed35"
+   },
+   "at": {
+    "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#at_1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "id": {
+    "S": "r1"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r1"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Asia/Kolkata"
+   },
+   "at": {
+    "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+   },
+   "__edd_i__": {
+    "S": "b88bd8da-c2ca-465c-afec-c0429684ed35"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#v#at_1970-01-01t05:30:00.000+05:30[asia/kolkata]#0000001"
+   },
+   "id": {
+    "S": "r1"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r1"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "tzf": {
+    "S": "Europe/London"
+   },
+   "__edd_i__": {
+    "S": "7e1666fd-e8c8-480c-a8c8-ad5fdf8117cc"
+   },
+   "at": {
+    "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#at_1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "id": {
+    "S": "r2"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r2"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Europe/London"
+   },
+   "at": {
+    "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+   },
+   "__edd_i__": {
+    "S": "7e1666fd-e8c8-480c-a8c8-ad5fdf8117cc"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#v#at_1970-01-01t01:00:00.000+01:00[europe/london]#0000001"
+   },
+   "id": {
+    "S": "r2"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r2"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "tzf": {
+    "S": "US/Pacific"
+   },
+   "__edd_i__": {
+    "S": "ee3e0812-d764-411c-826b-58bd97d248c6"
+   },
+   "at": {
+    "S": "1969-12-31T16:00:00.000-08:00[US/Pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#at_1969-12-31t16:00:00.000-08:00[us/pacific]"
+   },
+   "id": {
+    "S": "r3"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r3"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "tzf": {
+    "S": "US/Pacific"
+   },
+   "at": {
+    "S": "1969-12-31T16:00:00.000-08:00[US/Pacific]"
+   },
+   "__edd_i__": {
+    "S": "ee3e0812-d764-411c-826b-58bd97d248c6"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#v#at_1969-12-31t16:00:00.000-08:00[us/pacific]#0000001"
+   },
+   "id": {
+    "S": "r3"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r3"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "tzf": {
+    "S": "America/New_York"
+   },
+   "__edd_i__": {
+    "S": "9aa0dc6c-cdda-4eff-ac66-637e9c86ab49"
+   },
+   "at": {
+    "S": "1969-12-31T19:00:00.000-05:00[America/New_York]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#at_1969-12-31t19:00:00.000-05:00[america/new_york]"
+   },
+   "id": {
+    "S": "r4"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r4"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "tzf": {
+    "S": "America/New_York"
+   },
+   "at": {
+    "S": "1969-12-31T19:00:00.000-05:00[America/New_York]"
+   },
+   "__edd_i__": {
+    "S": "9aa0dc6c-cdda-4eff-ac66-637e9c86ab49"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$zones#v1#retained#v#at_1969-12-31t19:00:00.000-05:00[america/new_york]#0000001"
+   },
+   "id": {
+    "S": "r4"
+   },
+   "pk": {
+    "S": "$zones#v1#retained#id_r4"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g0"
+   },
+   "pk": {
+    "S": "$zones#v1#roots#g0#etc/utc"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g1"
+   },
+   "pk": {
+    "S": "$zones#v1#roots#g1#asia/kolkata"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g2"
+   },
+   "pk": {
+    "S": "$zones#v1#roots#g2#europe/london"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g3"
+   },
+   "pk": {
+    "S": "$zones#v1#roots#g3#us/pacific"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g4"
+   },
+   "pk": {
+    "S": "$zones#v1#roots#g4#america/new_york"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "tzf": {
+    "S": "Etc/UTC"
+   },
+   "at": {
+    "S": "1970-01-01T00:02:00.000+00:00[Etc/UTC]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_etc/utc"
+   },
+   "id": {
+    "S": "s0"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s0"
+   }
+  },
+  {
+   "note": {
+    "S": "one"
+   },
+   "at": {
+    "S": "1970-01-01T00:01:00.000+00:00[Etc/UTC]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_etc/utc#e#1970-01-01t00:01:00.000+00:00[etc/utc]"
+   },
+   "id": {
+    "S": "s0"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s0"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "at": {
+    "S": "1970-01-01T00:02:00.000+00:00[Etc/UTC]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_etc/utc#e#1970-01-01t00:02:00.000+00:00[etc/utc]"
+   },
+   "id": {
+    "S": "s0"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s0"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "tzf": {
+    "S": "Asia/Kolkata"
+   },
+   "at": {
+    "S": "1970-01-01T05:32:00.000+05:30[Asia/Kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_asia/kolkata"
+   },
+   "id": {
+    "S": "s1"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s1"
+   }
+  },
+  {
+   "note": {
+    "S": "one"
+   },
+   "at": {
+    "S": "1970-01-01T05:31:00.000+05:30[Asia/Kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_asia/kolkata#e#1970-01-01t05:31:00.000+05:30[asia/kolkata]"
+   },
+   "id": {
+    "S": "s1"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s1"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "at": {
+    "S": "1970-01-01T05:32:00.000+05:30[Asia/Kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_asia/kolkata#e#1970-01-01t05:32:00.000+05:30[asia/kolkata]"
+   },
+   "id": {
+    "S": "s1"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s1"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "tzf": {
+    "S": "Europe/London"
+   },
+   "at": {
+    "S": "1970-01-01T01:02:00.000+01:00[Europe/London]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_europe/london"
+   },
+   "id": {
+    "S": "s2"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s2"
+   }
+  },
+  {
+   "note": {
+    "S": "one"
+   },
+   "at": {
+    "S": "1970-01-01T01:01:00.000+01:00[Europe/London]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_europe/london#e#1970-01-01t01:01:00.000+01:00[europe/london]"
+   },
+   "id": {
+    "S": "s2"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s2"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "at": {
+    "S": "1970-01-01T01:02:00.000+01:00[Europe/London]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_europe/london#e#1970-01-01t01:02:00.000+01:00[europe/london]"
+   },
+   "id": {
+    "S": "s2"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s2"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "tzf": {
+    "S": "US/Pacific"
+   },
+   "at": {
+    "S": "1969-12-31T16:02:00.000-08:00[US/Pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_us/pacific"
+   },
+   "id": {
+    "S": "s3"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s3"
+   }
+  },
+  {
+   "note": {
+    "S": "one"
+   },
+   "at": {
+    "S": "1969-12-31T16:01:00.000-08:00[US/Pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_us/pacific#e#1969-12-31t16:01:00.000-08:00[us/pacific]"
+   },
+   "id": {
+    "S": "s3"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s3"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "at": {
+    "S": "1969-12-31T16:02:00.000-08:00[US/Pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_us/pacific#e#1969-12-31t16:02:00.000-08:00[us/pacific]"
+   },
+   "id": {
+    "S": "s3"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s3"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "tzf": {
+    "S": "America/New_York"
+   },
+   "at": {
+    "S": "1969-12-31T19:02:00.000-05:00[America/New_York]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_america/new_york"
+   },
+   "id": {
+    "S": "s4"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s4"
+   }
+  },
+  {
+   "note": {
+    "S": "one"
+   },
+   "at": {
+    "S": "1969-12-31T19:01:00.000-05:00[America/New_York]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_america/new_york#e#1969-12-31t19:01:00.000-05:00[america/new_york]"
+   },
+   "id": {
+    "S": "s4"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s4"
+   }
+  },
+  {
+   "note": {
+    "S": "two"
+   },
+   "at": {
+    "S": "1969-12-31T19:02:00.000-05:00[America/New_York]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Series"
+   },
+   "sk": {
+    "S": "$zones#v1#series#tz_america/new_york#e#1969-12-31t19:02:00.000-05:00[america/new_york]"
+   },
+   "id": {
+    "S": "s4"
+   },
+   "pk": {
+    "S": "$zones#v1#series#id_s4"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Etc/UTC"
+   },
+   "deletedAt": {
+    "S": "2026-11-11T21:47:03.934Z"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#deleted#at_1970-01-01t00:00:00.000+00:00[etc/utc]#2026-11-11T21:47:03.934Z"
+   },
+   "id": {
+    "S": "a0"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_a0#tz_etc/utc"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Asia/Kolkata"
+   },
+   "deletedAt": {
+    "S": "2026-11-11T21:47:04.235Z"
+   },
+   "at": {
+    "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#deleted#at_1970-01-01t05:30:00.000+05:30[asia/kolkata]#2026-11-11T21:47:04.235Z"
+   },
+   "id": {
+    "S": "a1"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_a1#tz_asia/kolkata"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Europe/London"
+   },
+   "deletedAt": {
+    "S": "2026-11-11T21:47:04.425Z"
+   },
+   "at": {
+    "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#deleted#at_1970-01-01t01:00:00.000+01:00[europe/london]#2026-11-11T21:47:04.425Z"
+   },
+   "id": {
+    "S": "a2"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_a2#tz_europe/london"
+   }
+  },
+  {
+   "tzf": {
+    "S": "US/Pacific"
+   },
+   "deletedAt": {
+    "S": "2026-11-11T21:47:04.639Z"
+   },
+   "at": {
+    "S": "1969-12-31T16:00:00.000-08:00[US/Pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#deleted#at_1969-12-31t16:00:00.000-08:00[us/pacific]#2026-11-11T21:47:04.639Z"
+   },
+   "id": {
+    "S": "a3"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_a3#tz_us/pacific"
+   }
+  },
+  {
+   "tzf": {
+    "S": "America/New_York"
+   },
+   "deletedAt": {
+    "S": "2026-11-11T21:47:04.803Z"
+   },
+   "at": {
+    "S": "1969-12-31T19:00:00.000-05:00[America/New_York]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#deleted#at_1969-12-31t19:00:00.000-05:00[america/new_york]#2026-11-11T21:47:04.803Z"
+   },
+   "id": {
+    "S": "a4"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_a4#tz_america/new_york"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Etc/UTC"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#at_1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "id": {
+    "S": "b0"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_b0#tz_etc/utc"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Asia/Kolkata"
+   },
+   "at": {
+    "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#at_1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "id": {
+    "S": "b1"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_b1#tz_asia/kolkata"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Europe/London"
+   },
+   "at": {
+    "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#at_1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "id": {
+    "S": "b2"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_b2#tz_europe/london"
+   }
+  },
+  {
+   "tzf": {
+    "S": "US/Pacific"
+   },
+   "at": {
+    "S": "1969-12-31T16:00:00.000-08:00[US/Pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#at_1969-12-31t16:00:00.000-08:00[us/pacific]"
+   },
+   "id": {
+    "S": "b3"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_b3#tz_us/pacific"
+   }
+  },
+  {
+   "tzf": {
+    "S": "America/New_York"
+   },
+   "at": {
+    "S": "1969-12-31T19:00:00.000-05:00[America/New_York]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Soft"
+   },
+   "sk": {
+    "S": "$zones#v1#soft#at_1969-12-31t19:00:00.000-05:00[america/new_york]"
+   },
+   "id": {
+    "S": "b4"
+   },
+   "pk": {
+    "S": "$zones#v1#soft#id_b4#tz_america/new_york"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.byat"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.byat#1969-12-31t16:00:00.000-08:00[us/pacific]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u3"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byAt"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.byat"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.byat#1969-12-31t19:00:00.000-05:00[america/new_york]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u4"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byAt"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.byat"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.byat#1970-01-01t00:00:00.000+00:00[etc/utc]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u0"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byAt"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.byat"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.byat#1970-01-01t01:00:00.000+01:00[europe/london]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u2"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byAt"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.byat"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.byat#1970-01-01t05:30:00.000+05:30[asia/kolkata]"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u1"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byAt"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.bytz#america/new_york"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u4"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.bytz#asia/kolkata"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u1"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.bytz#etc/utc"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u0"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.bytz#europe/london"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u2"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$zones#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$zones#v1#unique"
+   },
+   "pk": {
+    "S": "$zones#v1#unique.bytz#us/pacific"
+   },
+   "_entity_pk": {
+    "S": "$zones#v1#unique#id_u3"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Etc/UTC"
+   },
+   "at": {
+    "S": "1970-01-01T00:00:00.000+00:00[Etc/UTC]"
+   },
+   "tz": {
+    "S": "Etc/UTC"
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   },
+   "sk": {
+    "S": "$zones#v1#unique"
+   },
+   "id": {
+    "S": "u0"
+   },
+   "pk": {
+    "S": "$zones#v1#unique#id_u0"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Asia/Kolkata"
+   },
+   "at": {
+    "S": "1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"
+   },
+   "tz": {
+    "S": "Asia/Kolkata"
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   },
+   "sk": {
+    "S": "$zones#v1#unique"
+   },
+   "id": {
+    "S": "u1"
+   },
+   "pk": {
+    "S": "$zones#v1#unique#id_u1"
+   }
+  },
+  {
+   "tzf": {
+    "S": "Europe/London"
+   },
+   "at": {
+    "S": "1970-01-01T01:00:00.000+01:00[Europe/London]"
+   },
+   "tz": {
+    "S": "Europe/London"
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   },
+   "sk": {
+    "S": "$zones#v1#unique"
+   },
+   "id": {
+    "S": "u2"
+   },
+   "pk": {
+    "S": "$zones#v1#unique#id_u2"
+   }
+  },
+  {
+   "tzf": {
+    "S": "US/Pacific"
+   },
+   "at": {
+    "S": "1969-12-31T16:00:00.000-08:00[US/Pacific]"
+   },
+   "tz": {
+    "S": "US/Pacific"
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   },
+   "sk": {
+    "S": "$zones#v1#unique"
+   },
+   "id": {
+    "S": "u3"
+   },
+   "pk": {
+    "S": "$zones#v1#unique#id_u3"
+   }
+  },
+  {
+   "tzf": {
+    "S": "America/New_York"
+   },
+   "at": {
+    "S": "1969-12-31T19:00:00.000-05:00[America/New_York]"
+   },
+   "tz": {
+    "S": "America/New_York"
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   },
+   "sk": {
+    "S": "$zones#v1#unique"
+   },
+   "id": {
+    "S": "u4"
+   },
+   "pk": {
+    "S": "$zones#v1#unique#id_u4"
+   }
+  }
+ ]
+}

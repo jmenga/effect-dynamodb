@@ -74,6 +74,7 @@ import {
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { isZoneInstance, zoneEntriesWritten } from "@effect-dynamodb/schema/internal/StoredForm.js"
+import { givenZoneReading } from "@effect-dynamodb/schema/internal/ZoneKeyText.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
   type Context,
@@ -3572,27 +3573,35 @@ const makeAggregate = <TSchema extends Schema.Top>(
     row: Record<string, AttributeValue>,
     key: Record<string, unknown>,
     pk: string,
-  ): boolean =>
-    [
+  ): boolean => {
+    const record = keyRecord(key)
+    // Its zones under the names they were given, as 1.38.0 to 1.40.0 keyed them on Effect 4.1.3: a
+    // rekey-only reading (`givenZoneReading`).
+    const given = givenZoneReading(record, fromAttributeMap(row) as Record<string, unknown>)
+    const readings = given === undefined ? [record] : [record, given]
+    return [
       config.schema,
       KeyText136.schema136(config.schema),
       KeyText136.schema137(config.schema),
       KeyText136.schemaEscaped(config.schema),
-    ].some(
-      (under) =>
-        kindReadingOf(
-          keyRecord(key),
-          config.pk.composite,
-          (field) => row[field]?.N,
-          ({ record }) =>
-            composeCollectionKey(
-              config.schema,
-              config.collection.name,
-              KeyComposer.extractKeyComposites(under, {}, config.pk.composite, record),
-            ),
-          pk,
-        ) !== undefined,
+    ].some((under) =>
+      readings.some(
+        (reading) =>
+          kindReadingOf(
+            reading,
+            config.pk.composite,
+            (field) => row[field]?.N,
+            ({ record }) =>
+              composeCollectionKey(
+                config.schema,
+                config.collection.name,
+                KeyComposer.extractKeyComposites(under, {}, config.pk.composite, record),
+              ),
+            pk,
+          ) !== undefined,
+      ),
     )
+  }
 
   /**
    * The root of another aggregate at `pk`, stored there under text its values no longer compose:

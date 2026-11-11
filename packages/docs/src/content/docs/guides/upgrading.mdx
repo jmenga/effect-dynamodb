@@ -84,6 +84,23 @@ Unique-constraint sentinels, and a projection's row tombstones and outbox items,
 
 **One `rekey` pass handles both changes.** Turning `escapeKeys` on in the same release moves each row straight to the escaped text of the value it stores.
 
+## Rows keyed by a zone's given name (Effect 4.1.3)
+
+**If you ran 1.38.0, 1.39.0 or 1.40.0 with `effect` 4.1.3, and a key or a unique constraint holds a zoned date or a named zone whose id the runtime resolves to a different id (an alias such as `Etc/UTC`, `GMT` or `US/Pacific`, or a renamed zone such as `Asia/Kolkata`), those rows are keyed by the name the zone was given, and 1.41.0 keys it by the name the runtime resolves it to, the key 1.40.0 composed on `effect` 4.1.2. Until `rekey` moves them, such a row is not found: `get` and the index accessors miss it, a `delete` by key reports success and leaves it (one that reads the item first, on an entity with a unique constraint or soft delete, reports `ItemNotFound`), and the unique value it holds isn't enforced. Run `db.tables.<Table>.rekey({ repairIndexKeys: true })` before the table serves traffic on 1.41.0: it moves those rows, their snapshots, tombstones, time-series events, unique sentinels and aggregate rows, and rewrites their index keys. The resolved name is what the runtime's `Intl` makes of a zone's name, as it has been since 1.38.0, so it depends on the runtime's time zone data: a runtime that resolves a zone to another name keys it under another text.**
+
+Effect 4.1.3 keeps the name a zone was made from as its `id` (`Etc/UTC`), where 4.1.2 held the name `Intl` resolves it to (`UTC`), and those releases composed a zone's key text from its `id`. So it applies to a zone reached through `Schema.DateTimeZoned`, `DynamoModel.DateTimeZoned`, `Schema.DateTimeZonedFromString`, `Schema.TimeZoneNamedFromString` or `Schema.TimeZoneFromString`, and on 1.38.0 and 1.39.0 `Schema.TimeZoneNamed` itself. A zone given in another case (`europe/london`) is named as `Intl` names it on 4.1.3 too, and a zone with no other name (`America/New_York`) is the same on both: neither row moves. Rows written on `effect` 4.1.2 are already where 1.41.0 looks.
+
+`rekey` reads each row's stored values with every zone under the name it was given, recognises the key that composes as an earlier place of the row, and moves it to its key now, with the usual guards, dry run, report and resume:
+
+- live items' table keys, and an aggregate's partition with its rows;
+- version snapshots, soft-delete tombstones and time-series events;
+- unique-constraint sentinels;
+- index keys, rewritten in place with `repairIndexKeys: true`.
+
+A projection's row tombstones and outbox items hold no values, so `rekey` can't tell which name their key gave a zone, and leaves them. An event stream's keys hold only its stream id, which is text, so no zone is keyed there.
+
+The name a zone is keyed under is the one the runtime's `Intl` resolves it to, and has been since 1.38.0: `Asia/Kolkata` resolves to `Asia/Calcutta` on Node 24, and `Etc/UTC` to `UTC`. So it depends on the runtime's time zone data. A runtime that resolves a zone to another name (a newer ICU, or one that follows the ECMA-402 change to stop canonicalising, as Firefox does) keys the same zone under another text, and a row keyed under one isn't found by a key composed under the other. Keep the runtimes that read and write a table on one time zone data release, and check it when you upgrade the runtime.
+
 ## Turning `escapeKeys` on over existing data
 
 1. **Set `escapeKeys: true`** in a build, and deploy it everywhere without serving traffic from it yet.

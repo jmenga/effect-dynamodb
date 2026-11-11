@@ -79,6 +79,7 @@ import {
 import { CANT_SAY } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { sparseKeyRefusal, sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
+import { givenZoneReading } from "@effect-dynamodb/schema/internal/ZoneKeyText.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -4362,6 +4363,20 @@ const makeImpl = <
   const keyForm = (record: globalThis.Record<string, unknown>) =>
     toCompositeKeyRecord(compositeKeyForm, record)
 
+  /** The first of two forms of a value that takes it: `first`'s, else `second`'s. */
+  const eitherForm = (
+    first: ((value: unknown) => unknown) | undefined,
+    second: ((value: unknown) => unknown) | undefined,
+  ): ((value: unknown) => unknown) | undefined =>
+    first === undefined
+      ? second
+      : second === undefined
+        ? first
+        : (value) => {
+            const taken = first(value)
+            return taken === undefined ? second(value) : taken
+          }
+
   /**
    * A unique field's value as `put` stored it, from a row read back: sentinels are composed from
    * the Encoded value, which for a field stored as `N` the unmarshaller may hand back as the other
@@ -4379,7 +4394,7 @@ const makeImpl = <
           field,
           fieldSchema === undefined
             ? undefined
-            : (storedNumericForm(fieldSchema) ?? storedZoneText(fieldSchema)),
+            : eitherForm(storedNumericForm(fieldSchema), storedZoneText(fieldSchema)),
         )
       }
       return forms.get(field)?.(value)
@@ -4404,7 +4419,7 @@ const makeImpl = <
           field,
           fieldSchema === undefined
             ? undefined
-            : (storedFormOfRead(fieldSchema) ?? storedZoneText(fieldSchema)),
+            : eitherForm(storedFormOfRead(fieldSchema), storedZoneText(fieldSchema)),
         )
       }
       return forms.get(field)?.(value)
@@ -13595,15 +13610,17 @@ const makeImpl = <
   const bytesText = (bytes: Uint8Array): string => String.fromCharCode(...bytes)
 
   /**
-   * A row's values in the key form, then in 1.39.0's where that differs (`keyForm139`): the
-   * records each key text a row may be stored under is composed from.
+   * A row's values in the key form, then in 1.39.0's where that differs (`keyForm139`), then with
+   * each zone under the name it was given where a value names one so (`givenZoneReading`: the text
+   * 1.38.0 to 1.40.0 composed on Effect 4.1.3): the records each key text a row may be stored under
+   * is composed from.
    */
   const rowKeyForms = (
     values: globalThis.Record<string, unknown>,
   ): ReadonlyArray<globalThis.Record<string, unknown>> => {
     const rowKeyForm = keyForm(values)
     const rowKeyForm139 = keyForm139(values)
-    return Object.keys(rowKeyForm139).some(
+    const readings = Object.keys(rowKeyForm139).some(
       (attr) =>
         !Object.is(
           rowKeyForm139[attr],
@@ -13612,6 +13629,8 @@ const makeImpl = <
     )
       ? [rowKeyForm, rowKeyForm139]
       : [rowKeyForm]
+    const given = givenZoneReading(rowKeyForm, values, readsKey)
+    return given === undefined ? readings : [...readings, given]
   }
 
   type RowTargets = {
@@ -15130,6 +15149,29 @@ const makeImpl = <
     return lifted
   }
 
+  /**
+   * A unique constraint's values with each zone under the name it was given, where a value names
+   * one so (`givenZoneReading`): the values 1.38.0 to 1.40.0 composed its sentinel from on Effect
+   * 4.1.3, as text, so `asOther` holds them (composed as given). `undefined` when none does.
+   */
+  const givenSentinelValues = (
+    constraintDef: UniqueConstraintDef,
+    source: globalThis.Record<string, unknown>,
+  ):
+    | { readonly record: globalThis.Record<string, unknown>; readonly asOther: ReadonlySet<string> }
+    | undefined => {
+    const lifted = liftedSentinelValues(constraintDef, source)
+    const fields = resolveUniqueFields(constraintDef)
+    const values: globalThis.Record<string, unknown> = {}
+    for (const field of fields) values[field] = lifted[field]
+    const given = givenZoneReading(values, source)
+    if (given === undefined) return undefined
+    return {
+      record: { ...lifted, ...given },
+      asOther: new Set(fields.filter((field) => given[field] !== values[field])),
+    }
+  }
+
   /** The sentinel texts a unique sentinel's key is looked for under: each setting's. */
   const sentinelTexts = (): ReadonlyArray<DynamoSchema.DynamoSchema> => [
     KeyText136.schema136(schema),
@@ -15245,6 +15287,22 @@ const makeImpl = <
       return keys
     }
     const first = keysOf(readings)
+    // Its zones under the names they were given: a rekey-only reading (`givenSentinelValues`).
+    const given = givenSentinelValues(constraintDef, source)
+    if (given !== undefined) {
+      for (const under of sentinelTexts()) {
+        const key = sentinelKeyUnder(
+          under,
+          constraintName,
+          constraintDef,
+          given.record,
+          given.asOther,
+        )
+        if (key === undefined || seen.has(`${key.pk}\u0000${key.sk}`)) continue
+        seen.add(`${key.pk}\u0000${key.sk}`)
+        first.push(key)
+      }
+    }
     const mixes = () => {
       const named = new Set(readings.map((asOther) => [...asOther].sort().join("\u0000")))
       const others: Array<ReadonlySet<string>> = []
@@ -15274,6 +15332,8 @@ const makeImpl = <
     const lifted = liftedSentinelValues(constraintDef, source)
     const fields = otherKinds ? resolveUniqueFields(constraintDef) : []
     const text = JSON.stringify([key.pk, key.sk])
+    // Its zones as given are other key text, never the current one.
+    const given = currentTextOnly ? undefined : givenSentinelValues(constraintDef, source)
     return (currentTextOnly ? [schema] : [schema, ...sentinelTexts()]).some(
       (under) =>
         kindReading(
@@ -15285,7 +15345,18 @@ const makeImpl = <
             return at === undefined ? undefined : keySegments(at.pk, at.sk)
           },
           text,
-        ) !== undefined,
+        ) !== undefined ||
+        (given !== undefined &&
+          (() => {
+            const at = sentinelKeyUnder(
+              under,
+              constraintName,
+              constraintDef,
+              given.record,
+              given.asOther,
+            )
+            return at !== undefined && sameSentinelKey(at, key)
+          })()),
     )
   }
 

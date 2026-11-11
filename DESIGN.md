@@ -5141,6 +5141,31 @@ given an alias zone made on the installed Effect, to one key text per position (
 key, index key, unique sentinel, event key, `history().where()`), with the attribute's
 text per version.
 
+**Rows keyed by a zone's given name (`rekey`, 1.41.0).** 1.38.0 to 1.40.0 composed a
+zone's key text from its `id`, so on Effect 4.1.3 they keyed an alias or a renamed zone
+by the name it was given (`…[asia/kolkata]`, `timezone.named(etc/utc)`), where every
+key now composes the resolved name, the text 1.40.0 composed on 4.1.2. Normal operation
+never looks there (no fallback read). `rekey` alone does: `givenZoneReading`
+(`internal/ZoneKeyText.ts`) takes a row's key-form record and its stored values, finds
+each value naming a zone by another name (a zone's text a codec stored, the zone in a
+zoned date's ISO text, a zone's map holding `resolvedId` beside the `id` it was given),
+and gives the record with that value's key text under the given name. It joins the
+readings `rowKeyForms` gives, so an entity row's table key (item, snapshot, tombstone,
+time-series event) and its index keys (`staleIndexKeys`, rewritten with
+`repairIndexKeys`) are recognised under it; `givenSentinelValues` gives a unique
+sentinel's old key from it (`otherSentinelKeys`, `sentinelHeldAt`); and an aggregate's
+`holdsPartition` takes it as a reading of the root's partition. A row naming no zone
+another way gets no extra reading, so its run costs nothing more; a row the head itself
+wrote on 4.1.3 through a codec (its attribute holds `Etc/UTC`, its keys `utc`) gets one,
+which finds nothing to move. A projection's row tombstones and outbox items hold no
+values, so their key can't be read this way, and they're left. An event stream's keys
+hold its stream id, which is text, so they hold no zone. Pinned by
+`ZoneKeyRekey.test.ts` on rows published 1.40.0 wrote on 4.1.3
+(`zone-keys-1.40.0-effect-4.1.3.json`: codecs, a zoned date stored as text, unique
+sentinels, snapshots, tombstones, events, an index, an aggregate) and 1.39.0 wrote on
+4.1.3 (`named-zone-keys-1.39.0-effect-4.1.3.json`: a zone itself), with a case-only
+zone and a zone of one name that don't move.
+
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
 can. `holdsCustomDeclaration` finds a declaration with no `representation` id (and

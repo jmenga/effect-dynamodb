@@ -1,0 +1,1259 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0 + effect@4.1.3",
+ "note": "Captured once from the published effect-dynamodb 1.39.0 and @effect-dynamodb/schema 1.39.0 build running on effect 4.1.3 (not 4.1.2), on DynamoDB Local (Node 24, ICU 78.3, tz 2026c). Never regenerate it.",
+ "describes": "A named zone itself as a key composite, which 1.38.0 and 1.39.0 keyed and 1.40.0 refused. One table on DynamoSchema { name: named, version: 1 }, model { id: String, tz: TimeZoneNamed, note?: String }, entities Keyed (sk [tz]), Unique (unique byTz [tz]), Indexed (gsi1 pk [tz]), Retained (sk [tz], versioned retain) and the aggregate Roots (pk [id, tz], collection roots, root entityType Root). For each zone n of Etc/UTC, Asia/Kolkata, europe/london, US/Pacific, America/New_York: Keyed k<n>, Unique u<n>, Indexed i<n> put, Retained r<n> put and updated (note x), Roots g<n> created (note one). rows is the table scanned afterwards, sorted by pk|sk; results each step's outcome and what 1.39.0 found again on effect 4.1.3.",
+ "results": {
+  "Etc/UTC": {
+   "keyedPut": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "rootCreate": "ok",
+   "keyedGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "Asia/Kolkata": {
+   "keyedPut": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "rootCreate": "ok",
+   "keyedGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "europe/london": {
+   "keyedPut": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "rootCreate": "ok",
+   "keyedGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "US/Pacific": {
+   "keyedPut": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "rootCreate": "ok",
+   "keyedGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  },
+  "America/New_York": {
+   "keyedPut": "ok",
+   "uniquePut": "ok",
+   "indexedPut": "ok",
+   "retainedPut": "ok",
+   "retainedUpdate": "ok",
+   "rootCreate": "ok",
+   "keyedGet": "ok",
+   "indexedQuery": 1,
+   "rootGet": "ok"
+  }
+ },
+ "rows": [
+  {
+   "gsi1sk": {
+    "S": "$named#v1#indexed"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Etc/UTC"
+     },
+     "resolvedId": {
+      "S": "UTC"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$named#v1#indexed#tz_timezone.named(etc/utc)"
+   },
+   "sk": {
+    "S": "$named#v1#indexed"
+   },
+   "id": {
+    "S": "i0"
+   },
+   "pk": {
+    "S": "$named#v1#indexed#id_i0"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$named#v1#indexed"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Asia/Kolkata"
+     },
+     "resolvedId": {
+      "S": "Asia/Calcutta"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$named#v1#indexed#tz_timezone.named(asia/kolkata)"
+   },
+   "sk": {
+    "S": "$named#v1#indexed"
+   },
+   "id": {
+    "S": "i1"
+   },
+   "pk": {
+    "S": "$named#v1#indexed#id_i1"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$named#v1#indexed"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Europe/London"
+     },
+     "resolvedId": {
+      "S": "Europe/London"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$named#v1#indexed#tz_timezone.named(europe/london)"
+   },
+   "sk": {
+    "S": "$named#v1#indexed"
+   },
+   "id": {
+    "S": "i2"
+   },
+   "pk": {
+    "S": "$named#v1#indexed#id_i2"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$named#v1#indexed"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "US/Pacific"
+     },
+     "resolvedId": {
+      "S": "America/Los_Angeles"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$named#v1#indexed#tz_timezone.named(us/pacific)"
+   },
+   "sk": {
+    "S": "$named#v1#indexed"
+   },
+   "id": {
+    "S": "i3"
+   },
+   "pk": {
+    "S": "$named#v1#indexed#id_i3"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$named#v1#indexed"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "America/New_York"
+     },
+     "resolvedId": {
+      "S": "America/New_York"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Indexed"
+   },
+   "gsi1pk": {
+    "S": "$named#v1#indexed#tz_timezone.named(america/new_york)"
+   },
+   "sk": {
+    "S": "$named#v1#indexed"
+   },
+   "id": {
+    "S": "i4"
+   },
+   "pk": {
+    "S": "$named#v1#indexed#id_i4"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#keyed#tz_timezone.named(etc/utc)"
+   },
+   "id": {
+    "S": "k0"
+   },
+   "pk": {
+    "S": "$named#v1#keyed#id_k0"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Etc/UTC"
+     },
+     "resolvedId": {
+      "S": "UTC"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Keyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#keyed#tz_timezone.named(asia/kolkata)"
+   },
+   "id": {
+    "S": "k1"
+   },
+   "pk": {
+    "S": "$named#v1#keyed#id_k1"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Asia/Kolkata"
+     },
+     "resolvedId": {
+      "S": "Asia/Calcutta"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Keyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#keyed#tz_timezone.named(europe/london)"
+   },
+   "id": {
+    "S": "k2"
+   },
+   "pk": {
+    "S": "$named#v1#keyed#id_k2"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Europe/London"
+     },
+     "resolvedId": {
+      "S": "Europe/London"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Keyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#keyed#tz_timezone.named(us/pacific)"
+   },
+   "id": {
+    "S": "k3"
+   },
+   "pk": {
+    "S": "$named#v1#keyed#id_k3"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "US/Pacific"
+     },
+     "resolvedId": {
+      "S": "America/Los_Angeles"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Keyed"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#keyed#tz_timezone.named(america/new_york)"
+   },
+   "id": {
+    "S": "k4"
+   },
+   "pk": {
+    "S": "$named#v1#keyed#id_k4"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "America/New_York"
+     },
+     "resolvedId": {
+      "S": "America/New_York"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Keyed"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "__edd_i__": {
+    "S": "f495075e-5316-49c6-85a9-72ef927d84a9"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Etc/UTC"
+     },
+     "resolvedId": {
+      "S": "UTC"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#tz_timezone.named(etc/utc)"
+   },
+   "id": {
+    "S": "r0"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r0"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "f495075e-5316-49c6-85a9-72ef927d84a9"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Etc/UTC"
+     },
+     "resolvedId": {
+      "S": "UTC"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#v#tz_timezone.named(etc/utc)#0000001"
+   },
+   "id": {
+    "S": "r0"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r0"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "__edd_i__": {
+    "S": "1af3b040-fdb8-4461-be09-728d1b8bd9c1"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Asia/Kolkata"
+     },
+     "resolvedId": {
+      "S": "Asia/Calcutta"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#tz_timezone.named(asia/kolkata)"
+   },
+   "id": {
+    "S": "r1"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r1"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "1af3b040-fdb8-4461-be09-728d1b8bd9c1"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Asia/Kolkata"
+     },
+     "resolvedId": {
+      "S": "Asia/Calcutta"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#v#tz_timezone.named(asia/kolkata)#0000001"
+   },
+   "id": {
+    "S": "r1"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r1"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "__edd_i__": {
+    "S": "e3b2118e-779e-4d7d-877f-2b9b6e817449"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Europe/London"
+     },
+     "resolvedId": {
+      "S": "Europe/London"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#tz_timezone.named(europe/london)"
+   },
+   "id": {
+    "S": "r2"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r2"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "e3b2118e-779e-4d7d-877f-2b9b6e817449"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Europe/London"
+     },
+     "resolvedId": {
+      "S": "Europe/London"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#v#tz_timezone.named(europe/london)#0000001"
+   },
+   "id": {
+    "S": "r2"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r2"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "__edd_i__": {
+    "S": "a19c6a4b-39f5-437b-b9f9-c5402433d46e"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "US/Pacific"
+     },
+     "resolvedId": {
+      "S": "America/Los_Angeles"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#tz_timezone.named(us/pacific)"
+   },
+   "id": {
+    "S": "r3"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r3"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "a19c6a4b-39f5-437b-b9f9-c5402433d46e"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "US/Pacific"
+     },
+     "resolvedId": {
+      "S": "America/Los_Angeles"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#v#tz_timezone.named(us/pacific)#0000001"
+   },
+   "id": {
+    "S": "r3"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r3"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "note": {
+    "S": "x"
+   },
+   "__edd_i__": {
+    "S": "8113659c-e418-4de4-b94b-1337cff4b854"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "America/New_York"
+     },
+     "resolvedId": {
+      "S": "America/New_York"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#tz_timezone.named(america/new_york)"
+   },
+   "id": {
+    "S": "r4"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r4"
+   },
+   "version": {
+    "N": "2"
+   }
+  },
+  {
+   "__edd_i__": {
+    "S": "8113659c-e418-4de4-b94b-1337cff4b854"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "America/New_York"
+     },
+     "resolvedId": {
+      "S": "America/New_York"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Retained"
+   },
+   "sk": {
+    "S": "$named#v1#retained#v#tz_timezone.named(america/new_york)#0000001"
+   },
+   "id": {
+    "S": "r4"
+   },
+   "pk": {
+    "S": "$named#v1#retained#id_r4"
+   },
+   "version": {
+    "N": "1"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g0"
+   },
+   "pk": {
+    "S": "$named#v1#roots#g0#timezone.named(etc/utc)"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Etc/UTC"
+     },
+     "resolvedId": {
+      "S": "UTC"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g1"
+   },
+   "pk": {
+    "S": "$named#v1#roots#g1#timezone.named(asia/kolkata)"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Asia/Kolkata"
+     },
+     "resolvedId": {
+      "S": "Asia/Calcutta"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g2"
+   },
+   "pk": {
+    "S": "$named#v1#roots#g2#timezone.named(europe/london)"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Europe/London"
+     },
+     "resolvedId": {
+      "S": "Europe/London"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g3"
+   },
+   "pk": {
+    "S": "$named#v1#roots#g3#timezone.named(us/pacific)"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "US/Pacific"
+     },
+     "resolvedId": {
+      "S": "America/Los_Angeles"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#root"
+   },
+   "note": {
+    "S": "one"
+   },
+   "id": {
+    "S": "g4"
+   },
+   "pk": {
+    "S": "$named#v1#roots#g4#timezone.named(america/new_york)"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "America/New_York"
+     },
+     "resolvedId": {
+      "S": "America/New_York"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Root"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$named#v1#unique"
+   },
+   "pk": {
+    "S": "$named#v1#unique.bytz#timezone.named(america/new_york)"
+   },
+   "_entity_pk": {
+    "S": "$named#v1#unique#id_u4"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$named#v1#unique"
+   },
+   "pk": {
+    "S": "$named#v1#unique.bytz#timezone.named(asia/kolkata)"
+   },
+   "_entity_pk": {
+    "S": "$named#v1#unique#id_u1"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$named#v1#unique"
+   },
+   "pk": {
+    "S": "$named#v1#unique.bytz#timezone.named(etc/utc)"
+   },
+   "_entity_pk": {
+    "S": "$named#v1#unique#id_u0"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$named#v1#unique"
+   },
+   "pk": {
+    "S": "$named#v1#unique.bytz#timezone.named(europe/london)"
+   },
+   "_entity_pk": {
+    "S": "$named#v1#unique#id_u2"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique.bytz"
+   },
+   "_entity_sk": {
+    "S": "$named#v1#unique"
+   },
+   "pk": {
+    "S": "$named#v1#unique.bytz#timezone.named(us/pacific)"
+   },
+   "_entity_pk": {
+    "S": "$named#v1#unique#id_u3"
+   },
+   "__edd_e__": {
+    "S": "Unique._unique.byTz"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique"
+   },
+   "id": {
+    "S": "u0"
+   },
+   "pk": {
+    "S": "$named#v1#unique#id_u0"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Etc/UTC"
+     },
+     "resolvedId": {
+      "S": "UTC"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique"
+   },
+   "id": {
+    "S": "u1"
+   },
+   "pk": {
+    "S": "$named#v1#unique#id_u1"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Asia/Kolkata"
+     },
+     "resolvedId": {
+      "S": "Asia/Calcutta"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique"
+   },
+   "id": {
+    "S": "u2"
+   },
+   "pk": {
+    "S": "$named#v1#unique#id_u2"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "Europe/London"
+     },
+     "resolvedId": {
+      "S": "Europe/London"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique"
+   },
+   "id": {
+    "S": "u3"
+   },
+   "pk": {
+    "S": "$named#v1#unique#id_u3"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "US/Pacific"
+     },
+     "resolvedId": {
+      "S": "America/Los_Angeles"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   }
+  },
+  {
+   "sk": {
+    "S": "$named#v1#unique"
+   },
+   "id": {
+    "S": "u4"
+   },
+   "pk": {
+    "S": "$named#v1#unique#id_u4"
+   },
+   "tz": {
+    "M": {
+     "format": {
+      "M": {}
+     },
+     "id": {
+      "S": "America/New_York"
+     },
+     "resolvedId": {
+      "S": "America/New_York"
+     },
+     "~effect/DateTime/TimeZone": {
+      "S": "~effect/DateTime/TimeZone"
+     },
+     "_tag": {
+      "S": "Named"
+     }
+    }
+   },
+   "__edd_e__": {
+    "S": "Unique"
+   }
+  }
+ ]
+}
