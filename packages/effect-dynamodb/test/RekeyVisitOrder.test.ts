@@ -210,10 +210,10 @@ describe.each([
             // m3's stays where it is.
             expect(runs.real.reservations).toMatchObject(
               mode === "release"
-                ? { orphaned: 2, released: 2, skipped: 0, undecided: 0 }
+                ? { orphaned: 2, released: 2, skipped: 0, raced: 0, undecided: 0 }
                 : mode === "report"
-                  ? { orphaned: 2, released: 0, skipped: 0, undecided: 0 }
-                  : { orphaned: 0, released: 0, skipped: 0, undecided: 0 },
+                  ? { orphaned: 2, released: 0, skipped: 0, raced: 0, undecided: 0 }
+                  : { orphaned: 0, released: 0, skipped: 0, raced: 0, undecided: 0 },
             )
             expect(runs.real.skipped.unrecognizedKey).toBe(mode === "leave" ? 2 : 0)
             expect(runs.real.conflicts.map((conflict) => conflict.reason)).toEqual(

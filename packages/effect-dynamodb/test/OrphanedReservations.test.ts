@@ -59,6 +59,7 @@ describe("the sentinel as it is now", () => {
         orphaned: 0,
         released: 0,
         skipped: 0,
+        raced: 0,
         undecided: 0,
         entries: [],
       })

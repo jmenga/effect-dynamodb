@@ -364,13 +364,21 @@ const zeroReservations = (): MutableReservations => ({
   orphaned: 0,
   released: 0,
   skipped: 0,
+  raced: 0,
   undecided: 0,
 })
 
-/** Count a reservation by its outcome: `orphaned` counts every one found ({@link RekeyReservationCounts}). */
+/**
+ * Count a reservation by its outcome: `orphaned` counts every one found and still orphaned when
+ * released or left ({@link RekeyReservationCounts}).
+ */
 const countReservation = (into: MutableReservations, entry: RekeyReservation): void => {
   if (entry.outcome === "undecided") {
     into.undecided += 1
+    return
+  }
+  if (entry.outcome === "raced") {
+    into.raced += 1
     return
   }
   into.orphaned += 1

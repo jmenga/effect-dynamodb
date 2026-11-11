@@ -138,7 +138,7 @@ The report counts:
 | `indexKeysRewritten` | Items at their current table key whose index keys or vector partitions held other text, rewritten in place |
 | `sentinelsMoved` | Unique-constraint sentinels moved to their current keys |
 | `indexKeys` | Index keys of an item at its current table key that aren't what its values compose: `missing`, `truncated`, `lagging` and `ambiguous`, on every run, and `repaired` and `skipped` with `repairIndexKeys` (see [Repairing index keys](#repairing-index-keys)) |
-| `reservations` | Unique-constraint sentinels no row holds, with the `reservations` option: `orphaned` and `undecided`, and `released` and `skipped` with `releaseOrphanedReservations`, with an entry for each (see [Releasing orphaned reservations](#releasing-orphaned-reservations)). Without the option, every count is 0 |
+| `reservations` | Unique-constraint sentinels no row holds, with the `reservations` option: `orphaned` and `undecided`, and `released`, `skipped` and `raced` with `releaseOrphanedReservations`, with an entry for each (see [Releasing orphaned reservations](#releasing-orphaned-reservations)). Without the option, every count is 0 |
 | `guardGaps` | Rows moved, with writes going on, under a guard that can miss a write: `stamp`, `sparse` and `strongest` (see [Writes during a run](#writes-during-a-run)) |
 | `conflicts` | Rows left where they are, and why, each listed once per run (see [Conflicts](#conflicts)) |
 | `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs, or whose read model the client doesn't know), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)), `rootNotSeen` (an aggregate row with no root in its partition, met by a run that didn't read the whole table; a run over the whole table judges it) |
@@ -339,7 +339,7 @@ const orphans = yield* db.tables.MainTable.rekey({
   reservations: true,
   streams: [Calibrations],
 })
-// orphans.reservations → { orphaned: 1, released: 0, skipped: 0, undecided: 0, entries: [...] }
+// orphans.reservations → { orphaned: 1, released: 0, skipped: 0, raced: 0, undecided: 0, entries: [...] }
 // orphans.reservations.entries[0].message → "The row it names doesn't exist."
 // Releasing them is a maintenance step: stop every writer to the table first, then
 // dry run, then run.
@@ -349,7 +349,7 @@ const releases = yield* db.tables.MainTable.rekey({
   writesStopped: true,
   streams: [Calibrations],
 })
-// releases.reservations → { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: [...] }
+// releases.reservations → { orphaned: 1, released: 1, skipped: 0, raced: 0, undecided: 0, entries: [...] }
 const released = yield* db.tables.MainTable.rekey({
   releaseOrphanedReservations: true,
   writesStopped: true,
@@ -370,10 +370,11 @@ A move whose unique value's current key holds a reservation no row holds is the 
 | `undecided` | Names no item, names a row of another type, or names one whose values compose no sentinel key | **Leaves it** |
 | `released` | | Deleted, or in a dry run would be |
 | `skipped` | | Left to a write that changed it or its item, twice |
+| `raced` | | Left: a write claimed it, gave its item the value, or deleted it, before the release |
 
-`orphaned` counts every one found, so it includes those `released` and `skipped`. Only a sentinel of a constraint the entity declares, under the schema's own key prefix, is judged. Another application's sentinels on a shared table, or another schema's, are left alone and counted in `skipped.unrecognizedKey`.
+`orphaned` counts every one found and still orphaned when released or left, so it includes those `released` and `skipped`, and not those `raced`. Only a sentinel of a constraint the entity declares, under the schema's own key prefix, is judged. Another application's sentinels on a shared table, or another schema's, are left alone and counted in `skipped.unrecognizedKey`.
 
-**A claim always wins**, even if a writer breaks the promise `writesStopped` makes. Each release is one transaction: the sentinel's delete, conditioned on it still naming the item `rekey` read it naming (and still carrying the same expiry, for a constraint with a `ttl`), and a check that the item is still absent, or still holds the values `rekey` read. If a write claims the value, or gives the item back its value, first, `rekey` reads the sentinel again, judges it again and tries once more; one held by then is left and still reported, and one lost a second time is counted in `skipped`.
+**A claim always wins**, even if a writer breaks the promise `writesStopped` makes. Each release is one transaction: the sentinel's delete, conditioned on it still naming the item `rekey` read it naming (and still carrying the same expiry, for a constraint with a `ttl`), and a check that the item is still absent, or still holds the values `rekey` read. If a write claims the value, or gives the item back its value, first, `rekey` reads the sentinel again, judges it again and tries once more; one held by then, or deleted, is left and counted in `raced`, and one lost a second time is counted in `skipped`.
 
 ## Cost
 

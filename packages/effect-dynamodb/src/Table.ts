@@ -1033,14 +1033,16 @@ export interface RekeyGuardGaps {
  * ({@link RekeyReservation}):
  *
  * - `orphaned` — no row holds it, and it was left: the run didn't ask for
- *   {@link RekeyOptions.releaseOrphanedReservations}, or a write claimed it or its row before the
- *   release
+ *   {@link RekeyOptions.releaseOrphanedReservations}
  * - `released` — deleted, or with `dryRun`, would be
  * - `skipped` — left to a write that changed it or its row between the read and the release, twice
+ * - `raced` — no row held it when read, but a write got there before the release: it claimed the
+ *   sentinel, gave the row it names its value, or deleted it. Read again, it is held or gone, so it
+ *   was left, and it isn't counted `orphaned`
  * - `undecided` — left, since nothing says whether a row holds it: it names no row, it names a row
  *   of another type, or that row's values compose no sentinel key
  */
-export type RekeyReservationOutcome = "orphaned" | "released" | "skipped" | "undecided"
+export type RekeyReservationOutcome = "orphaned" | "released" | "skipped" | "raced" | "undecided"
 
 /**
  * A unique sentinel of a known entity and constraint that no row holds, or that `rekey` couldn't
@@ -1065,15 +1067,17 @@ export interface RekeyReservation {
 /**
  * Unique sentinels no row holds, and ones `rekey` couldn't judge, counted only with
  * {@link RekeyOptions.reservations} (or `releaseOrphanedReservations`): without, every count is 0,
- * and such a sentinel is counted in `skipped.unrecognizedKey`, as 1.40.0 counted it. `released`
- * and `skipped` are counted only with {@link RekeyOptions.releaseOrphanedReservations}. `orphaned`
- * counts every one found, so it includes those `released` and `skipped`. Each sentinel is judged
- * once a run, however the run reaches it.
+ * and such a sentinel is counted in `skipped.unrecognizedKey`, as 1.40.0 counted it. `released`,
+ * `skipped` and `raced` are counted only with {@link RekeyOptions.releaseOrphanedReservations}.
+ * `orphaned` counts every one found and still orphaned when released or left, so it includes those
+ * `released` and `skipped`, and not those `raced`. Each sentinel is judged once a run, however the
+ * run reaches it.
  */
 export interface RekeyReservationCounts {
   readonly orphaned: number
   readonly released: number
   readonly skipped: number
+  readonly raced: number
   readonly undecided: number
 }
 

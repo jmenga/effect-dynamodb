@@ -190,7 +190,7 @@ const failsWith = (effect: Effect.Effect<unknown, unknown>) =>
       : ((exit.cause.reasons.find((r: any) => r._tag === "Fail") as any)?.error?._tag ?? "died"),
   )
 
-const ZERO = { orphaned: 0, released: 0, skipped: 0, undecided: 0 }
+const ZERO = { orphaned: 0, released: 0, skipped: 0, raced: 0, undecided: 0 }
 
 const rekey = (db: any, options: Table.RekeyOptions = {}) =>
   db.tables.MainTable.rekey(options) as Effect.Effect<Table.RekeyReport, unknown>
@@ -604,12 +604,40 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
           })
           const report = yield* rekey(db, RELEASE)
           expect(writes).toBe(1)
-          expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1 })
-          expect(report.reservations.entries[0]!.outcome).toBe("orphaned")
-          expect(report.reservations.entries[0]!.message).toContain("claimed it")
+          // As it is now, a row holds it: not orphaned, and never counted so.
+          expect(report.reservations).toMatchObject({ ...ZERO, raced: 1 })
+          expect(report.reservations.entries[0]!.outcome).toBe("raced")
+          expect(report.reservations.entries[0]!.message).toContain(
+            "A write claimed it, or gave the row it names its value, before the release",
+          )
           expect(
             (yield* table.rows()).find((row) => pk(row) === sentinelKey("account", 5).pk),
           ).toEqual(claimed)
+        }),
+      )
+    },
+  ),
+  ...bothSettings(
+    "a reservation a write deletes before the release is raced, not orphaned",
+    (h, on) => {
+      const w = world(on)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          yield* table.seed(orphanOf5)
+          const db = yield* w.client
+          let writes = 0
+          table.beforeTransact(() => {
+            writes++
+            return writes === 1 ? table.remove(orphanOf5) : Effect.void
+          })
+          const report = yield* rekey(db, RELEASE)
+          expect(writes).toBe(1)
+          expect(report.reservations).toMatchObject({ ...ZERO, raced: 1 })
+          expect(report.reservations.entries[0]!.outcome).toBe("raced")
+          expect(report.reservations.entries[0]!.message).toContain(
+            "A write deleted it before the release",
+          )
+          expect(has(yield* table.rows(), sentinelKey("account", 5))).toBe(false)
         }),
       )
     },
@@ -630,7 +658,7 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
           })
           const report = yield* rekey(db, RELEASE)
           expect(writes).toBe(1)
-          expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1 })
+          expect(report.reservations).toMatchObject({ ...ZERO, raced: 1 })
           expect(has(yield* table.rows(), sentinelKey("account", 5))).toBe(true)
         }),
       )
@@ -650,7 +678,7 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
         })
         const report = yield* rekey(db, RELEASE)
         expect(writes).toBe(1)
-        expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1 })
+        expect(report.reservations).toMatchObject({ ...ZERO, raced: 1 })
         expect(has(yield* table.rows(), sentinelKey("renamed", 7))).toBe(true)
       }),
     )

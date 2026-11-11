@@ -15679,9 +15679,11 @@ const makeImpl = <
           }
           if (rejudged?._tag !== "orphaned") {
             return report(
-              "orphaned",
+              "raced",
               judged.owner,
-              `${judged.message} A write claimed it, or released it, before the release, so it was left.`,
+              again === undefined
+                ? `${judged.message} A write deleted it before the release.`
+                : `${judged.message} A write claimed it, or gave the row it names its value, before the release, so it was left.`,
             )
           }
           sentinel = again!

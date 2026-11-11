@@ -213,6 +213,7 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
           orphaned: 0,
           released: 0,
           skipped: 0,
+          raced: 0,
           undecided: 0,
         })
         expect(rekeyOutcome(plain.dry)).toEqual(rekeyOutcome(plain.real))
@@ -222,6 +223,7 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
           orphaned: 1,
           released: 0,
           skipped: 0,
+          raced: 0,
           undecided: 0,
         })
         expect(real.reservations.entries.map((entry) => entry.outcome)).toEqual(["orphaned"])
@@ -257,6 +259,7 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         orphaned: 1,
         released: 0,
         skipped: 0,
+        raced: 0,
         undecided: 0,
       })
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))

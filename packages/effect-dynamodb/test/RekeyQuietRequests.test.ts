@@ -112,6 +112,7 @@ describe("rekey over unique sentinels whose keys were used again sends 1.40.0's 
             orphaned: 0,
             released: 0,
             skipped: 0,
+            raced: 0,
             undecided: 0,
             entries: [],
           })
@@ -135,6 +136,7 @@ describe("rekey over unique sentinels whose keys were used again sends 1.40.0's 
           orphaned,
           released: 0,
           skipped: 0,
+          raced: 0,
           undecided: 0,
         })
         expect(report.skipped.unrecognizedKey).toBe(0)

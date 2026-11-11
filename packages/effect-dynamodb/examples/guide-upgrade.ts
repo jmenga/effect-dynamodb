@@ -331,7 +331,7 @@ const program = Effect.gen(function* () {
     reservations: true,
     streams: [Calibrations],
   })
-  // orphans.reservations → { orphaned: 1, released: 0, skipped: 0, undecided: 0, entries: [...] }
+  // orphans.reservations → { orphaned: 1, released: 0, skipped: 0, raced: 0, undecided: 0, entries: [...] }
   // orphans.reservations.entries[0].message → "The row it names doesn't exist."
 
   // Releasing them is a maintenance step: stop every writer to the table first, then
@@ -342,7 +342,7 @@ const program = Effect.gen(function* () {
     writesStopped: true,
     streams: [Calibrations],
   })
-  // releases.reservations → { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: [...] }
+  // releases.reservations → { orphaned: 1, released: 1, skipped: 0, raced: 0, undecided: 0, entries: [...] }
 
   const released = yield* db.tables.MainTable.rekey({
     releaseOrphanedReservations: true,
@@ -353,7 +353,7 @@ const program = Effect.gen(function* () {
   // #endregion
   assertEq(
     { ...orphans.reservations, entries: orphans.reservations.entries.length },
-    { orphaned: 1, released: 0, skipped: 0, undecided: 0, entries: 1 },
+    { orphaned: 1, released: 0, skipped: 0, raced: 0, undecided: 0, entries: 1 },
     "what the report says",
   )
   assertEq(
@@ -363,7 +363,7 @@ const program = Effect.gen(function* () {
   )
   assertEq(
     { ...releases.reservations, entries: releases.reservations.entries.length },
-    { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: 1 },
+    { orphaned: 1, released: 1, skipped: 0, raced: 0, undecided: 0, entries: 1 },
     "what the dry run says",
   )
   assertEq(released.reservations, releases.reservations, "the run agrees")

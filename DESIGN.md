@@ -1506,7 +1506,8 @@ claim in between, a TTL'd reservation expired and taken again included, is never
 `ConditionCheck` on the row it names: absent, or its `__edd_e__`, the constraint's stored attributes (renames
 honoured) and `__edd_d__` as read or absent (`ownerCheck`), so a write making that row hold the value wins. On a
 cancelled transaction it reads the sentinel once, judges again and tries once more, then counts it `skipped`;
-one held by then is left as `orphaned`. `orphaned` counts every one found, `released` and `skipped` included. A
+one held or deleted by then is left and counted `raced`, not `orphaned`: as it is now, no row is missing it.
+`orphaned` counts every one found and still orphaned when released or left, `released` and `skipped` included. A
 dry run plans the release as it plans a move, counts it `released` and writes nothing; a move whose key it frees
 is planned after it. A sentinel of an undeclared constraint, or under another prefix (another schema's, or
 another application's on a shared table), is never judged.
