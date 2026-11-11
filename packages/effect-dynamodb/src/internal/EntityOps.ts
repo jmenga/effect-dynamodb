@@ -107,7 +107,7 @@ export interface CascadeTarget {
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierField: string
+    readonly keyField: string
     readonly refEntityType: string
   }>
 }

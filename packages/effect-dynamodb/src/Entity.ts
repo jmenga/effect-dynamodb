@@ -20,7 +20,6 @@ import {
   type ExtractIdentifier,
   type ExtractPackedFields,
   type ExtractUnremovableFields,
-  getIdentifierField,
   getSparseFields,
   isConfiguredModel,
   isRefField,
@@ -48,6 +47,8 @@ import {
   UpdateAppliedButUnreadable,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import type { RefEntity } from "@effect-dynamodb/schema/internal/AggregateEdges.js"
+import { refIdAttribute } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import {
   compositeKeyFormKind,
   keyFormValueKind,
@@ -836,7 +837,8 @@ export interface Entity<
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierField: string
+    /** The attribute of the referenced entity an id names (`refIdAttribute`). */
+    readonly keyField: string
     readonly refEntityType: string
   }>
 
@@ -2334,8 +2336,11 @@ export const make = <
 interface ResolvedRef {
   readonly fieldName: string
   readonly idFieldName: string
-  readonly identifierField: string
-  readonly identifierSchema: Schema.Top
+  /** The attribute of the referenced entity an id names (`refIdAttribute`). */
+  readonly keyField: string
+  readonly keySchema: Schema.Top
+  /** Whether `keyField` is its one key composite: false for an entity keyed by more than one. */
+  readonly keyed: boolean
   readonly refEntity: Entity
   readonly refEntityType: string
 }
@@ -7430,12 +7435,31 @@ const makeImpl = <
       const refsToProcess = refs ?? resolvedRefs
       if (refsToProcess.length === 0) return decoded
 
+      // An entity keyed by more than one composite: no one id names one of its items. Up to
+      // 1.40.0 it was fetched under its identifier, which no key composes from alone, and failed
+      // (`get.decode`, `Missing key`) or died. Refused before anything is fetched.
+      const unkeyed = refsToProcess.find((ref) => !ref.keyed)
+      if (unkeyed !== undefined) {
+        return yield* new ValidationError({
+          entityType,
+          operation: "hydrateRefs",
+          cause: new Error(
+            `[EDD-9158] Entity "${entityType}": ref "${unkeyed.fieldName}" names entity ` +
+              `"${unkeyed.refEntityType}", whose primary key is composed from more than one ` +
+              `attribute, so no "${unkeyed.idFieldName}" names one item to fetch. Key that entity ` +
+              `by one attribute to reference it. Nothing was fetched or written.`,
+          ),
+        })
+      }
+
       // Fetch all refs in parallel
       const hydrated = { ...decoded }
       const fetchEffects = refsToProcess.map((ref) => {
         const id = decoded[ref.idFieldName] as string
         return Effect.gen(function* () {
-          const keyInput = { [ref.identifierField]: id }
+          // Fetched under the key composite the id is a value of, as an aggregate edge's id is
+          // (#214, #241): the referenced entity's identifier needn't be its key.
+          const keyInput = { [ref.keyField]: id }
           // Use asModel to convert EntityGet to Effect<ModelType>
           const getEffect = asModel(ref.refEntity.get(keyInput) as EntityGet<any, any, any, any>)
           const model = yield* getEffect.pipe(
@@ -7522,11 +7546,17 @@ const makeImpl = <
     return fallback
   }
 
-  /** Cached source entity identifier field name (e.g., "playerId") */
-  const sourceIdentifierField = (() => {
-    const idField = getIdentifierField(config.model as Schema.Top)
-    return idField?.name
-  })()
+  /**
+   * The attribute of this entity a ref to it names (`refIdAttribute`, its key composite), read off
+   * an update's key as the id a cascade from it is keyed by: the id each target's ref was given and
+   * keyed by (#241). Up to 1.40.0 its identifier, absent from the key where that is another field,
+   * so such a cascade updated nothing.
+   */
+  const sourceIdentifierField = refIdAttribute({
+    model: config.model,
+    indexes: config.indexes,
+    entityType,
+  } as unknown as RefEntity)
 
   /**
    * Execute cascade updates after a source entity update completes.
@@ -7535,9 +7565,11 @@ const makeImpl = <
   const executeCascade = (
     cascadeConfig: CascadeConfig,
     sourceDomainData: globalThis.Record<string, unknown>,
-    sourceIdValue: string,
+    /** The source's id as its update's key holds it: what each target's ref id was given as. */
+    sourceId: unknown,
   ): Effect.Effect<void, CascadePartialFailure | DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
+      const sourceIdValue = String(sourceId)
       const { targets, filter, mode } = cascadeConfig
       const sourceEntityType = entityType
       const client = yield* Capacity.client
@@ -7604,7 +7636,10 @@ const makeImpl = <
           targetSchema,
           target.entityType,
           cascadeIdx.indexDef,
-          keyFormFor(target, { [matchingRef.idFieldName]: sourceIdValue }),
+          // The id as the key holds it, not its text: a number key's `5` composes the key `put`
+          // wrote (`teamid_0000000000000005`), where `"5"` composed `teamid_5` and found nothing,
+          // up to 1.40.0.
+          keyFormFor(target, { [matchingRef.idFieldName]: sourceId }),
         ).partitions
 
         // Build query parameters
@@ -9526,7 +9561,7 @@ const makeImpl = <
               ? (encodedKey as globalThis.Record<string, unknown>)[sourceIdentifierField]
               : undefined
           if (sourceId != null) {
-            yield* executeCascade(uState.cascade, domainData, String(sourceId))
+            yield* executeCascade(uState.cascade, domainData, sourceId)
           }
         }
 
@@ -10222,7 +10257,7 @@ const makeImpl = <
             decodeAs(fromAttributeMap(image) as globalThis.Record<string, unknown>, image, "model"),
             "stored",
           )
-          yield* executeCascade(uState.cascade, { ...(domainData as object) }, String(sourceId))
+          yield* executeCascade(uState.cascade, { ...(domainData as object) }, sourceId)
         })
 
       if (retainSnapshot !== undefined) {
@@ -14616,7 +14651,7 @@ const makeImpl = <
     const withIds = { ...values }
     for (const ref of resolvedRefs) {
       const id = (values[ref.fieldName] as globalThis.Record<string, unknown> | undefined)?.[
-        ref.identifierField
+        ref.keyField
       ]
       if (id !== undefined) withIds[ref.idFieldName] = id
     }

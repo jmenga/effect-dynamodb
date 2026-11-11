@@ -38,6 +38,7 @@ import {
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
+import { refIdAttribute, refIdField, refKeyComposite } from "./internal/AggregateSchemas.js"
 import { bothKindsKeyRefusal, keyFormValueKind } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
@@ -509,8 +510,12 @@ export type AppendInputFields<TModel extends Schema.Top, TTimeSeries> = TTimeSer
 interface ResolvedRef {
   readonly fieldName: string
   readonly idFieldName: string
-  readonly identifierField: string
-  readonly identifierSchema: Schema.Top
+  /** The attribute of the referenced entity a `${field}Id` names (`refIdAttribute`). */
+  readonly keyField: string
+  /** The schema a `${field}Id` is taken as: `keyField`'s own field. */
+  readonly keySchema: Schema.Top
+  /** Whether `keyField` is the referenced entity's one key composite, so an id names one item. */
+  readonly keyed: boolean
   readonly refEntity: EntityDefinition
   readonly refEntityType: string
 }
@@ -651,7 +656,7 @@ export interface EntityDefinition<
   readonly _resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierField: string
+    readonly keyField: string
     readonly refEntityType: string
   }>
 
@@ -1281,11 +1286,19 @@ export const buildEntityDefinition = (config: {
           )
         }
 
+        // An id names the referenced entity's one key composite, as an aggregate edge's id does
+        // (#214, #241): it's fetched, and read back, under that. An entity keyed by more than one
+        // composite has none, so no id names one of its items: `put` refuses it (`EDD-9158`), and
+        // what's read back is read under its identifier, as before.
+        const keyComposite = refKeyComposite(refEntity)
+        const keyField = refIdAttribute(refEntity)!
         return {
           fieldName,
           idFieldName: `${fieldName}Id`,
-          identifierField: idField.name,
-          identifierSchema: idField.schema,
+          keyField,
+          keySchema:
+            keyField === idField.name ? idField.schema : (refIdField(refEntity) ?? idField.schema),
+          keyed: keyComposite !== undefined,
           refEntity,
           refEntityType: refEntity.entityType,
         }
@@ -1885,7 +1898,7 @@ const makeDefinitionImpl = (config: {
     _resolvedRefs: data.resolvedRefs.map((r) => ({
       fieldName: r.fieldName,
       idFieldName: r.idFieldName,
-      identifierField: r.identifierField,
+      keyField: r.keyField,
       refEntityType: r.refEntityType,
     })),
     _attachPrototype: attachPrototype,

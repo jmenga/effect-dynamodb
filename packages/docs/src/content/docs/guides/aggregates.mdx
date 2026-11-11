@@ -115,6 +115,8 @@ On `put` and `update`, Entity automatically:
 3. Embeds the entity's core domain data (Schema.Type — no system fields) in the DynamoDB item
 4. Returns `RefNotFound` if any referenced entity doesn't exist
 
+An ID is a value of the referenced entity's key composite, the one attribute its primary key is composed from, and it is fetched under that, as an aggregate edge's ID is. The entity's `identifier` needn't be its key: `teamId` names the team keyed by `id`, even where the team's identifier is `code`. Before 1.41.0 the ID was fetched under the identifier, so a `put` naming such an entity failed with a `ValidationError`. An entity keyed by more than one attribute can't be named by one ID: a `put` or `update` giving one fails with a `ValidationError` (`EDD-9158`) before anything is fetched or written.
+
 ```typescript region="ref-not-found" example="guide-aggregates.ts"
   // #region ref-not-found
   // RefNotFound when a ref doesn't resolve
@@ -909,6 +911,8 @@ After updating the player, the cascade:
 1. Identifies all ref fields on `SquadSelections` that reference `Players`
 2. Queries the target entity's GSI (whose PK composite includes the player's ID field) to find all items embedding this player
 3. Updates each matching item with the new denormalized player data
+
+The player's ID is read from the update's key, under the attribute a ref ID names (its key composite), so it's the ID each selection's ref was given. Before 1.41.0 it was read under the player's identifier, so a cascade from an entity whose identifier isn't its key updated nothing, and one from an entity keyed by a number queried a partition no `put` wrote.
 
 ### Configuration
 

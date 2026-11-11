@@ -2815,7 +2815,7 @@ export const buildDerivedSchemas = (
   resolvedRefs: ReadonlyArray<{
     readonly fieldName: string
     readonly idFieldName: string
-    readonly identifierSchema: Schema.Top
+    readonly keySchema: Schema.Top
     readonly refEntity?: { readonly model: Schema.Top } | undefined
   }> = [],
   immutableFields: ReadonlySet<string> = new Set(),
@@ -2945,7 +2945,7 @@ export const buildDerivedSchemas = (
       if (adjusted !== null) acc[key] = adjusted
     }
     for (const ref of resolvedRefs) {
-      acc[ref.idFieldName] = ref.identifierSchema
+      acc[ref.idFieldName] = ref.keySchema
     }
     return acc
   }
@@ -2964,7 +2964,7 @@ export const buildDerivedSchemas = (
   // Add ID fields for each ref (skip if the ref field is an omitted field)
   for (const ref of resolvedRefs) {
     if (createOmitFields.has(ref.fieldName)) continue
-    createFieldsAcc[ref.idFieldName] = ref.identifierSchema
+    createFieldsAcc[ref.idFieldName] = ref.keySchema
   }
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
@@ -2996,7 +2996,7 @@ export const buildDerivedSchemas = (
     for (const ref of resolvedRefs) {
       if (pkComposites.has(ref.fieldName)) continue
       if (immutableFields.has(ref.fieldName)) continue
-      acc[ref.idFieldName] = Schema.optionalKey(ref.identifierSchema as Schema.Top)
+      acc[ref.idFieldName] = Schema.optionalKey(ref.keySchema as Schema.Top)
     }
     return acc
   }

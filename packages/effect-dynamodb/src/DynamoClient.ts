@@ -508,7 +508,7 @@ const storedKeyForm = (
   return {
     attribute,
     read: (row) => {
-      const value = ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.identifierField]
+      const value = ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.keyField]
       if (value === undefined) return undefined
       const stored = value.S ?? value.N
       if (typeNumeric && stored !== undefined) return args.compositeKeyForm(field, stored)
@@ -2414,7 +2414,7 @@ interface EntityLike {
     | ReadonlyArray<{
         readonly fieldName: string
         readonly idFieldName: string
-        readonly identifierField: string
+        readonly keyField: string
       }>
     | undefined
   readonly _schema: DynamoSchema.DynamoSchema

@@ -429,6 +429,16 @@ export const refKeyComposite = (entity: RefEntity): string | undefined => {
 }
 
 /**
+ * The attribute of `entity` an entity-level ref id (`Entity.make({ refs })`'s `${field}Id`) names:
+ * its {@link refKeyComposite}, as an aggregate edge's id (#214, #241). It's fetched under that, read
+ * back from the stored ref under that (`putValuesOf`, a row check), and a cascade from `entity` is
+ * keyed by it. An entity keyed by more than one composite has none, so no id names one of its items
+ * (`put` refuses one, `EDD-9158`): its identifier, as up to 1.40.0. `undefined` with neither.
+ */
+export const refIdAttribute = (entity: RefEntity): string | undefined =>
+  refKeyComposite(entity) ?? getIdentifierField(entity.model as Schema.Top)?.name
+
+/**
  * What a map the library builds or reads a definition from (a schema's fields) holds under `name`
  * itself, `undefined` where it holds nothing there. Never a member every object inherits: a field
  * or an edge named `constructor` or `toString` that the definition doesn't declare is not one.
