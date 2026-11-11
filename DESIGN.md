@@ -7438,20 +7438,36 @@ instance).
     kind of bookkeeping, at each site, then a redelivery, the next event, a
     removal, `create` and a rebuild, against 1.40.0's outcomes).
     A write over a live row carries the others' bookkeeping into what it left
-    out only when it keeps every attribute of the row's data (`keepsData`: by
-    attribute name, the values may change; the data is every model field no
-    projection keeps as bookkeeping). One that drops any data attribute the
-    row held writes as 1.40.0 did: the others' bookkeeping and tags go with
-    it, so they fold their streams again on their next or redelivered event
-    and put their part back. Carrying their checkpoints there would say
-    "applied" over data that is gone, for good. Which projection wrote which
-    data attribute is not recorded (the token records who wrote the row, not
-    what each wrote, and no attribute is added for it), so a write that drops
-    only its own optional field drops the others' bookkeeping too: never
-    worse than 1.40.0, and a write keeping a field both add to no longer
-    counts it twice (1.40.0 did). A rebuild over a live row carries none: it
-    drops the other projections' contributions to the state, so they fold
-    again, and the row converges, as on 1.40.0.
+    out only when it stores every data attribute the row holds (`keepsData`;
+    the data is every model field no projection keeps as bookkeeping). That is
+    judged on what's stored: the row's attributes as read against the item as
+    the entity will write it (encoded, renamed, packed, a sparse map as its
+    entries, each entry on its own), so an `Option.none()` or an emptied
+    sparse map drops what the row held. The rule: each event is applied once,
+    in the order processed, and a write that keeps an attribute keeps the
+    checkpoints of the projections that wrote the row, whatever value it gives
+    the attribute. It has two consequences. A value overwritten stays
+    overwritten: a projection that resets another's field to its initial
+    value keeps the other's checkpoints, so the other goes on from that value
+    (B applies 5, A resets the row with B's field at 0, then B's next event, 7,
+    gives 7, and its redelivered 5 is `alreadyApplied` and leaves 0; 1.40.0
+    dropped B's checkpoints there, since A's state held none, so B folded its
+    stream again: 12, and 5). An attribute removed drops the others'
+    bookkeeping and tags, as on 1.40.0, so they start over: they fold their
+    streams again on their next or redelivered event and put their part back.
+    Carrying their checkpoints there would say "applied" over data that is
+    gone, for good.
+    Which projection wrote which data attribute is not recorded (the token
+    records who wrote the row, not what each wrote, and no attribute is added
+    for it), so a write that removes only its own optional field drops the
+    others' bookkeeping too, and a field both add to then counts the others'
+    events twice, as on 1.40.0 (B 5, A 1 with a note, A 2 without it, B 7:
+    20, where each event once is 15). A write that stores every data
+    attribute the row holds keeps their checkpoints, so such a field is not
+    counted twice there (1.40.0 counted it twice: 18, where each event once
+    is 13). A rebuild over a live row carries none: it drops the other
+    projections' contributions to the state, so they fold again, and the row
+    converges, as on 1.40.0.
     A row read without a token on a read model whose rows carry one was last
     written by a process still on 1.40.0 (a rolling deployment), or before the
     token. The write over it is conditioned on the token's absence and on
@@ -7492,11 +7508,14 @@ instance).
     since, and its fresh token keeps the tags of layouts it doesn't define.
     On a row read without one it conditions its write as 1.40.0 did, on its
     own checkpoint or revision alone, so another program's write landed since
-    can be replaced, as on 1.40.0 (it can't tell the read model has other
-    projections, and adding a term there would change every single-projection
-    read model's writes). It carries no bookkeeping of layouts it doesn't
-    define. So every program writing a read model's rows must define all of
-    its projections.
+    can be replaced, as on 1.40.0. It can't tell the read model has other
+    projections. Two options were not taken: a term on every write over a row
+    without a token (it would change every single-projection read model's
+    writes), and an explicit declaration on the read model that its rows are
+    shared, making a single-layout program write the token (new API surface;
+    defining all of a read model's projections already does it). It carries
+    no bookkeeping of layouts it doesn't define. So every program writing a
+    read model's rows must define all of its projections.
   - **`create` over a tombstone** consults the projections with `removal`,
     the one defined last first: each attribute one of them names that the
     tombstone holds is carried, a checkpoint (or map, or owner) as it is and a

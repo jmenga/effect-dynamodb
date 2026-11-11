@@ -601,8 +601,81 @@ describe("a write over a live row the other projections have written (#237)", ()
     }).pipe(within(layer))
   })
 
+  /**
+   * The intended outcome when A's write overwrites B's data (#237): A's `evolve` resets the row to
+   * its initial state on `Cancelled`, every data attribute there by name, B's `invoices` at 0. The
+   * rule: each event is applied once, in the order processed, and a write that keeps an attribute
+   * keeps the checkpoints of the projections that wrote the row, whatever value it gives it. So
+   * the overwritten value stays overwritten: B goes on from 0. 1.40.0 dropped B's checkpoint (A's
+   * state held none), so B folded its stream again: 12 after its next event (here 7), 5 after the
+   * redelivery (here 0, `alreadyApplied`).
+   */
+  for (const revisions of [true, false]) {
+    for (const then of ["next", "redelivered"] as const) {
+      it.effect(
+        `that resets the other's data to its initial value keeps it so${revisions ? "" : ", without revisions"}: B's ${then} event`,
+        () => {
+          const { projections, layer, row } = free(
+            [
+              Orders,
+              {
+                evolve: (state, event) =>
+                  event.data._tag === "Cancelled"
+                    ? { id: state.id, orders: 0, invoices: 0 }
+                    : {
+                        ...state,
+                        orders: (state.orders ?? 0) + event.data.amount,
+                        invoices: state.invoices ?? 0,
+                      },
+                checkpoint: "a",
+                ...(revisions && { revision: "ra" as const }),
+              },
+            ],
+            [
+              Invoices,
+              {
+                evolve: (state, event) => ({
+                  ...state,
+                  orders: state.orders ?? 0,
+                  invoices: (state.invoices ?? 0) + (event.data as Placed).amount,
+                }),
+                checkpoint: "b",
+                ...(revisions && { revision: "rb" as const }),
+              },
+            ],
+          )
+          const [A, B] = projections
+          return Effect.gen(function* () {
+            yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 }), new Cancelled({})], 0)
+            yield* Invoices.append(
+              { id: "x" },
+              [new Placed({ amount: 5 }), new Placed({ amount: 7 })],
+              0,
+            )
+            const orders = yield* Orders.read({ id: "x" })
+            const invoices = yield* Invoices.read({ id: "x" })
+            yield* A.apply(orders[0]!)
+            yield* B.apply(invoices[0]!)
+            expect(row()).toMatchObject({ orders: 1, invoices: 5, a: 1, b: 1 })
+            yield* A.apply(orders[1]!)
+            expect(row()).toMatchObject({ orders: 0, invoices: 0, a: 2, b: 1 })
+            const result = yield* B.apply(then === "next" ? invoices[1]! : invoices[0]!)
+            if (then === "next") {
+              expect(result.applied).toHaveLength(1)
+              expect(row()).toMatchObject({ orders: 0, invoices: 7, a: 2, b: 2 })
+            } else {
+              expect(result.applied).toHaveLength(0)
+              expect(result.alreadyApplied).toHaveLength(1)
+              expect(row()).toMatchObject({ orders: 0, invoices: 0, a: 2, b: 1 })
+            }
+          }).pipe(within(layer))
+        },
+      )
+    }
+  }
+
   it.effect(
-    "that drops only its own optional field drops the other's bookkeeping, as 1.40.0 did",
+    "that drops only its own optional field drops the other's bookkeeping, as 1.40.0 did: a field both add to counts the other's events twice",
     () => {
       // A's first write sets `note`, its second leaves it out. The row records who wrote it, not
       // which data each wrote, so the dropped `note` counts as dropped data.
@@ -636,8 +709,10 @@ describe("a write over a live row the other projections have written (#237)", ()
         expect(row()).toMatchObject({ total: 6, note: "first", b: 1, rb: 1 })
         yield* A.apply(orders[1]!)
         expect(row()).toEqual({ __edd_e__: "Row", id: "x", total: 8, a: 2, ra: 2 })
-        // B folds both its events again: 8 + 5 + 7, as with 1.40.0 (which dropped `b` and `rb` at
-        // A's first write already).
+        // B folds both its events again: 8 + 5 + 7 = 20, where each event once is 15 (B's 5
+        // counted twice), as with 1.40.0 (which dropped `b` and `rb` at A's first write already).
+        // The documented way round it: give an optional field on a shared row an empty value
+        // rather than removing it, or keep shared totals on a row one projection owns.
         yield* B.apply(invoices[1]!)
         expect(row()).toMatchObject({ total: 20, a: 2, b: 2 })
       }).pipe(within(layer))
