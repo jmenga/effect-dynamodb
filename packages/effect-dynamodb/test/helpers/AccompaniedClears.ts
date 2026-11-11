@@ -10,10 +10,10 @@
  * `f.kind = "b"` beside the removal of `f.p[0]`, which leaves `{ kind: "b", p: ["second"] }`.
  * A property's judgement reads nothing of the row, so no other clause changes it.
  *
- * `fixtures/accompanied-clears-1.40.0.json` holds what the published 1.40.0 did, standalone, in
- * a transaction, on a retained entity (and there in a transaction) and with a unique constraint.
- * The head does the same, except where 1.40.0 stored a row no read decodes, or sent what DynamoDB
- * refused: those it refuses before sending.
+ * `fixtures/accompanied-clears-1.40.0.json` holds what the published 1.40.0 did, every request
+ * whole, standalone, in a transaction, on a retained entity (and there in a transaction) and with
+ * a unique constraint. The head does the same, except where 1.40.0 stored a row no read decodes,
+ * or sent what DynamoDB refused: those it refuses before sending, nothing read.
  */
 
 import { readFileSync } from "node:fs"
@@ -26,6 +26,8 @@ import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
+import { wholeOf } from "./RenamedSparseMapWrites.js"
+import { differingPaths } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: unknown
@@ -208,31 +210,6 @@ const normal = (value: unknown): any =>
         : held,
   )
 
-const PARTS = [
-  "UpdateExpression",
-  "ConditionExpression",
-  "ExpressionAttributeNames",
-  "ExpressionAttributeValues",
-  "Item",
-] as const
-const partsOf = (input: Record<string, unknown>) =>
-  Object.fromEntries(PARTS.filter((part) => input[part] !== undefined).map((p) => [p, input[p]]))
-
-/** The expression parts of a write, a transaction's per item. */
-const sentOf = (request: unknown): unknown => {
-  const [command, input] = Object.entries(request as Record<string, Record<string, any>>)[0]!
-  if (command === "getItem" || command === "query") return undefined
-  return normal(
-    input.TransactItems !== undefined
-      ? {
-          [command]: (input.TransactItems as ReadonlyArray<Record<string, any>>).map((item) =>
-            Object.fromEntries(Object.entries(item).map(([kind, body]) => [kind, partsOf(body)])),
-          ),
-        }
-      : { [command]: partsOf(input) },
-  )
-}
-
 const outcomeOf = (exit: Exit.Exit<unknown, unknown>): unknown => {
   if (Exit.isSuccess(exit)) return { ok: normal(exit.value) }
   const squashed = Cause.squash(exit.cause) as any
@@ -317,10 +294,7 @@ export const accompaniedClearsSuite = (open: OpenTable) => {
                         : update.asEffect()
                     }),
                   )
-                  const sent = log.flatMap((request) => {
-                    const parts = sentOf(request)
-                    return parts === undefined ? [] : [parts]
-                  })
+                  const sent = log.map((request) => wholeOf(request, table.name))
                   const read = yield* Effect.exit(db.entities.Doc.get({ id: "one" }))
                   return {
                     seeded: normal(seeded),
@@ -354,6 +328,11 @@ export const accompaniedClearsSuite = (open: OpenTable) => {
             expect(got.captured.sent).toEqual([])
             expect(got.captured.rows).toEqual(got.before)
             expect(got.captured.read).toEqual({ ok: got.seeded })
+            // Named: what differs from 1.40.0's case is its outcome, its requests, its read, and in
+            // the row the attributes 1.40.0's update wrote; everything else is 1.40.0's.
+            for (const path of differingPaths(was, got.captured)) {
+              expect(path).toMatch(/^(outcome|sent|read)(\.|\[|$)|^rows\[0\]\.(f|m#k|version)\./)
+            }
           }),
       )
     }

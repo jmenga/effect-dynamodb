@@ -1,6 +1,6 @@
 {
  "generatedFrom": "effect-dynamodb@1.40.0",
- "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Doc: { id, f } (and email under a unique constraint where the name says so), f as the name says, a sparse map stored under the prefix m; put with f holding what the name says, then one update holding a pathRemove the removal guard judges and another clause writing or removing in the same field, standalone or as the name says (in a transaction, on an entity with versioned: { retain: true }, with a unique constraint). For each, its outcome, the expression parts of each write it sent (a transaction's per item), every row of the table after it, and what get read back; UUIDs and timestamps are replaced by <token> and <time>. Never regenerate it: it is the record of what 1.40.0 did.",
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Doc: { id, f } (and email under a unique constraint where the name says so), f as the name says, a sparse map stored under the prefix m; put with f holding what the name says, then one update holding a pathRemove the removal guard judges and another clause writing or removing in the same field, standalone or as the name says (in a transaction, on an entity with versioned: { retain: true }, with a unique constraint). For each, its outcome, every request it sent, whole and in order (reads included), every row of the table after it, and what get read back; the table's name is replaced by <table>, UUIDs and timestamps by <token> and <time>. Never regenerate it: it is the record of what 1.40.0 did.",
  "cases": {
   "f: Union([{ kind: \"b\", p: [string] }, { kind: \"a\", p: [string, string] }]), holding {\"kind\":\"a\",\"p\":[\"first\",\"second\"]}: pathSet f.kind = b, pathRemove f.p[0]": {
    "outcome": {
@@ -17,8 +17,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "kind",
@@ -30,7 +38,10 @@
        ":ps2": {
         "S": "b"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -82,26 +93,52 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "f",
-         "#ps1": "kind",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps2": {
-          "S": "b"
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "f",
+          "#ps1": "kind",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps2": {
+           "S": "b"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -161,95 +198,136 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "kind",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "b"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "p": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           },
-           "kind": {
-            "S": "a"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "kind",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "b"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "p": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "kind": {
+             "S": "a"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -344,95 +422,122 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "kind",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "b"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "p": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           },
-           "kind": {
-            "S": "a"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "kind",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "b"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "p": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "kind": {
+             "S": "a"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -537,8 +642,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "kind",
@@ -550,7 +663,10 @@
        ":ps2": {
         "S": "b"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -632,8 +748,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "kind",
@@ -645,7 +769,10 @@
        ":ps2": {
         "S": "b"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -697,26 +824,52 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "f",
-         "#ps1": "kind",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps2": {
-          "S": "b"
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "f",
+          "#ps1": "kind",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps2": {
+           "S": "b"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -776,95 +929,136 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "kind",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "b"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "p": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           },
-           "kind": {
-            "S": "a"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "kind",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "b"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "p": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "kind": {
+             "S": "a"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -959,95 +1153,122 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "kind",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "b"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "p": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           },
-           "kind": {
-            "S": "a"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "kind",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "b"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "p": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "kind": {
+             "S": "a"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -1152,8 +1373,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "kind",
@@ -1165,7 +1394,10 @@
        ":ps2": {
         "S": "b"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -1617,8 +1849,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "p",
@@ -1630,7 +1870,10 @@
        ":ps2": {
         "S": "third"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -1686,26 +1929,52 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "f",
-         "#ps1": "p",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps2": {
-          "S": "third"
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "f",
+          "#ps1": "p",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps2": {
+           "S": "third"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -1770,95 +2039,136 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "p",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "third"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "p": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           },
-           "kind": {
-            "S": "a"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "p",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "third"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "p": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "kind": {
+             "S": "a"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -1957,95 +2267,122 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "p",
-         "#pr3": "f",
-         "#pr4": "p",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "third"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "p": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           },
-           "kind": {
-            "S": "a"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "p",
+          "#pr3": "f",
+          "#pr4": "p",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "third"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "p": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "kind": {
+             "S": "a"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -2155,8 +2492,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "p",
@@ -2168,7 +2513,10 @@
        ":ps2": {
         "S": "third"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -2247,8 +2595,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0[1] = :ps1 REMOVE #pr2[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#pr2": "f",
@@ -2258,7 +2614,10 @@
        ":ps1": {
         "N": "2"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -2295,24 +2654,50 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0[1] = :ps1 REMOVE #pr2[0]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "f",
-         "#pr2": "f",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps1": {
-          "N": "2"
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0[1] = :ps1 REMOVE #pr2[0]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "f",
+          "#pr2": "f",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps1": {
+           "N": "2"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -2349,86 +2734,127 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[1] = :ps1 REMOVE #pr2[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#pr2": "f",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps1": {
-          "N": "2"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
          },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[1] = :ps1 REMOVE #pr2[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#pr2": "f",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "f": {
-          "L": [
-           {
-            "S": "first"
-           },
-           {
-            "N": "1"
-           }
-          ]
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps1": {
+           "N": "2"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "L": [
+            {
+             "S": "first"
+            },
+            {
+             "N": "1"
+            }
+           ]
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "id": {
-          "S": "one"
-         },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
-         },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -2500,86 +2926,113 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[1] = :ps1 REMOVE #pr2[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#pr2": "f",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps1": {
-          "N": "2"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
          },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[1] = :ps1 REMOVE #pr2[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#pr2": "f",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "f": {
-          "L": [
-           {
-            "S": "first"
-           },
-           {
-            "N": "1"
-           }
-          ]
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps1": {
+           "N": "2"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "L": [
+            {
+             "S": "first"
+            },
+            {
+             "N": "1"
+            }
+           ]
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "id": {
-          "S": "one"
-         },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
-         },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -2653,8 +3106,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0[1] = :ps1 REMOVE #pr2[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#pr2": "f",
@@ -2664,7 +3125,10 @@
        ":ps1": {
         "N": "2"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -2723,13 +3187,24 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "REMOVE #pr0[0], #pr1[1]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#pr0": "f",
        "#pr1": "f",
        "#exists": "pk"
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -2762,19 +3237,45 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "REMOVE #pr0[0], #pr1[1]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#pr0": "f",
-         "#pr1": "f",
-         "#exists": "pk"
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "REMOVE #pr0[0], #pr1[1]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#pr0": "f",
+          "#pr1": "f",
+          "#exists": "pk"
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -2807,83 +3308,124 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[0], #pr1[1]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#pr0": "f",
-         "#pr1": "f",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
          },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[0], #pr1[1]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#pr0": "f",
+          "#pr1": "f",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "f": {
-          "L": [
-           {
-            "S": "first"
-           },
-           {
-            "N": "1"
-           }
-          ]
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "L": [
+            {
+             "S": "first"
+            },
+            {
+             "N": "1"
+            }
+           ]
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "id": {
-          "S": "one"
-         },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
-         },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -2951,83 +3493,110 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[0], #pr1[1]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#pr0": "f",
-         "#pr1": "f",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
          },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[0], #pr1[1]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#pr0": "f",
+          "#pr1": "f",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "f": {
-          "L": [
-           {
-            "S": "first"
-           },
-           {
-            "N": "1"
-           }
-          ]
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "L": [
+            {
+             "S": "first"
+            },
+            {
+             "N": "1"
+            }
+           ]
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "id": {
-          "S": "one"
-         },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
-         },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -3097,13 +3666,24 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "REMOVE #pr0[0], #pr1[1]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#pr0": "f",
        "#pr1": "f",
        "#exists": "pk"
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -3775,8 +4355,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "fixed-k",
@@ -3788,7 +4376,10 @@
        ":ps2": {
         "S": "third"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -3840,26 +4431,52 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "f",
-         "#ps1": "fixed-k",
-         "#pr3": "f",
-         "#pr4": "fixed-k",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps2": {
-          "S": "third"
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "f",
+          "#ps1": "fixed-k",
+          "#pr3": "f",
+          "#pr4": "fixed-k",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps2": {
+           "S": "third"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -3919,92 +4536,133 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "fixed-k",
-         "#pr3": "f",
-         "#pr4": "fixed-k",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "third"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "fixed-k": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "fixed-k",
+          "#pr3": "f",
+          "#pr4": "fixed-k",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "third"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "fixed-k": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -4096,92 +4754,119 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "fixed-k",
-         "#pr3": "f",
-         "#pr4": "fixed-k",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "third"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "fixed-k": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "fixed-k",
+          "#pr3": "f",
+          "#pr4": "fixed-k",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "third"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "fixed-k": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -4283,8 +4968,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1[2] = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "fixed-k",
@@ -4296,7 +4989,10 @@
        ":ps2": {
         "S": "third"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -4371,8 +5067,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "open-j",
@@ -4388,7 +5092,10 @@
          }
         ]
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -4436,30 +5143,56 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "f",
-         "#ps1": "open-j",
-         "#pr3": "f",
-         "#pr4": "fixed-k",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps2": {
-          "L": [
-           {
-            "S": "x"
-           }
-          ]
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "f",
+          "#ps1": "open-j",
+          "#pr3": "f",
+          "#pr4": "fixed-k",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps2": {
+           "L": [
+            {
+             "S": "x"
+            }
+           ]
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -4507,96 +5240,137 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "open-j",
-         "#pr3": "f",
-         "#pr4": "fixed-k",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "L": [
-           {
-            "S": "x"
-           }
-          ]
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "fixed-k": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "open-j",
+          "#pr3": "f",
+          "#pr4": "fixed-k",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "L": [
+            {
+             "S": "x"
+            }
+           ]
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "fixed-k": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -4683,96 +5457,123 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "f",
-         "#ps1": "open-j",
-         "#pr3": "f",
-         "#pr4": "fixed-k",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "L": [
-           {
-            "S": "x"
-           }
-          ]
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "f": {
-          "M": {
-           "fixed-k": {
-            "L": [
-             {
-              "S": "first"
-             },
-             {
-              "S": "second"
-             }
-            ]
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "f",
+          "#ps1": "open-j",
+          "#pr3": "f",
+          "#pr4": "fixed-k",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "L": [
+            {
+             "S": "x"
+            }
+           ]
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "f": {
+           "M": {
+            "fixed-k": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -4861,8 +5662,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "f",
        "#ps1": "open-j",
@@ -4878,7 +5687,10 @@
          }
         ]
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -5565,8 +6377,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0[2] = :ps1 REMOVE #pr2[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "m#k",
        "#pr2": "m#k",
@@ -5576,7 +6396,10 @@
        ":ps1": {
         "S": "third"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -5624,24 +6447,50 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0[2] = :ps1 REMOVE #pr2[0]",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "m#k",
-         "#pr2": "m#k",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps1": {
-          "S": "third"
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0[2] = :ps1 REMOVE #pr2[0]",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "m#k",
+          "#pr2": "m#k",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps1": {
+           "S": "third"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -5697,86 +6546,127 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[2] = :ps1 REMOVE #pr2[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "m#k",
-         "#pr2": "m#k",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps1": {
-          "S": "third"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
          },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[2] = :ps1 REMOVE #pr2[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "m#k",
+          "#pr2": "m#k",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "m#k": {
-          "L": [
-           {
-            "S": "first"
-           },
-           {
-            "S": "second"
-           }
-          ]
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps1": {
+           "S": "third"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "m#k": {
+           "L": [
+            {
+             "S": "first"
+            },
+            {
+             "S": "second"
+            }
+           ]
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "id": {
-          "S": "one"
-         },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
-         },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -5860,86 +6750,113 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[2] = :ps1 REMOVE #pr2[0]",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "m#k",
-         "#pr2": "m#k",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps1": {
-          "S": "third"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
          },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0[2] = :ps1 REMOVE #pr2[0]",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "m#k",
+          "#pr2": "m#k",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "m#k": {
-          "L": [
-           {
-            "S": "first"
-           },
-           {
-            "S": "second"
-           }
-          ]
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps1": {
+           "S": "third"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "m#k": {
+           "L": [
+            {
+             "S": "first"
+            },
+            {
+             "S": "second"
+            }
+           ]
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "id": {
-          "S": "one"
-         },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
-         },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -6033,8 +6950,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0[2] = :ps1 REMOVE #pr2[0]",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "m#k",
        "#pr2": "m#k",
@@ -6044,7 +6969,10 @@
        ":ps1": {
         "S": "third"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -6115,8 +7043,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "m#k",
        "#ps1": "y",
@@ -6128,7 +7064,10 @@
        ":ps2": {
         "S": "new"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -6165,26 +7104,52 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#ps0": "m#k",
-         "#ps1": "y",
-         "#pr3": "m#k",
-         "#pr4": "x",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":ps2": {
-          "S": "new"
-         }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#ps0": "m#k",
+          "#ps1": "y",
+          "#pr3": "m#k",
+          "#pr4": "x",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":ps2": {
+           "S": "new"
+          }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -6221,88 +7186,129 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "m#k",
-         "#ps1": "y",
-         "#pr3": "m#k",
-         "#pr4": "x",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "new"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "m#k": {
-          "M": {
-           "x": {
-            "N": "1"
-           },
-           "y": {
-            "S": "kept"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "m#k",
+          "#ps1": "y",
+          "#pr3": "m#k",
+          "#pr4": "x",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "new"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "m#k": {
+           "M": {
+            "x": {
+             "N": "1"
+            },
+            "y": {
+             "S": "kept"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
+    },
+    {
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
     }
    ],
    "rows": [
@@ -6374,88 +7380,115 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "version",
-         "#ps0": "m#k",
-         "#ps1": "y",
-         "#pr3": "m#k",
-         "#pr4": "x",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":ps2": {
-          "S": "new"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "m#k": {
-          "M": {
-           "x": {
-            "N": "1"
-           },
-           "y": {
-            "S": "kept"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc, #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
+         "ExpressionAttributeNames": {
+          "#u0": "version",
+          "#ps0": "m#k",
+          "#ps1": "y",
+          "#pr3": "m#k",
+          "#pr4": "x",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":ps2": {
+           "S": "new"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "m#k": {
+           "M": {
+            "x": {
+             "N": "1"
+            },
+            "y": {
+             "S": "kept"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -6529,8 +7562,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #ps0.#ps1 = :ps2 REMOVE #pr3.#pr4",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#ps0": "m#k",
        "#ps1": "y",
@@ -6542,7 +7583,10 @@
        ":ps2": {
         "S": "new"
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -6601,8 +7645,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #u0 = :u0 REMOVE #pr0.#pr1",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#u0": "m#k",
        "#pr0": "m#k",
@@ -6620,7 +7672,10 @@
          }
         }
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
@@ -6669,32 +7724,58 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = :u0 REMOVE #pr0.#pr1",
-        "ConditionExpression": "attribute_exists(#exists)",
-        "ExpressionAttributeNames": {
-         "#u0": "m#k",
-         "#pr0": "m#k",
-         "#pr1": "x",
-         "#exists": "pk"
-        },
-        "ExpressionAttributeValues": {
-         ":u0": {
-          "M": {
-           "x": {
-            "N": "2"
-           },
-           "y": {
-            "S": "new"
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
+          }
+         },
+         "UpdateExpression": "SET #u0 = :u0 REMOVE #pr0.#pr1",
+         "ConditionExpression": "attribute_exists(#exists)",
+         "ExpressionAttributeNames": {
+          "#u0": "m#k",
+          "#pr0": "m#k",
+          "#pr1": "x",
+          "#exists": "pk"
+         },
+         "ExpressionAttributeValues": {
+          ":u0": {
+           "M": {
+            "x": {
+             "N": "2"
+            },
+            "y": {
+             "S": "new"
+            }
            }
           }
-         }
+         },
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -6742,94 +7823,121 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc REMOVE #pr0.#pr1",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "m#k",
-         "#u1": "version",
-         "#pr0": "m#k",
-         "#pr1": "x",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":u0": {
-          "M": {
-           "x": {
-            "N": "2"
-           },
-           "y": {
-            "S": "new"
-           }
-          }
-         },
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "m#k": {
-          "M": {
-           "x": {
-            "N": "1"
-           },
-           "y": {
-            "S": "kept"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc REMOVE #pr0.#pr1",
+         "ExpressionAttributeNames": {
+          "#u0": "m#k",
+          "#u1": "version",
+          "#pr0": "m#k",
+          "#pr1": "x",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":u0": {
+           "M": {
+            "x": {
+             "N": "2"
+            },
+            "y": {
+             "S": "new"
+            }
+           }
+          },
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "m#k": {
+           "M": {
+            "x": {
+             "N": "1"
+            },
+            "y": {
+             "S": "kept"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -6914,94 +8022,121 @@
    },
    "sent": [
     {
-     "transactWriteItems": [
-      {
-       "Update": {
-        "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc REMOVE #pr0.#pr1",
-        "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
-        "ExpressionAttributeNames": {
-         "#u0": "m#k",
-         "#u1": "version",
-         "#pr0": "m#k",
-         "#pr1": "x",
-         "#retainVer": "version",
-         "#inc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":u0": {
-          "M": {
-           "x": {
-            "N": "2"
-           },
-           "y": {
-            "S": "new"
-           }
-          }
-         },
-         ":vzero": {
-          "N": "0"
-         },
-         ":vinc": {
-          "N": "1"
-         },
-         ":retainVer": {
-          "N": "1"
-         },
-         ":inc": {
-          "S": "<token>"
-         }
-        }
+     "getItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
        }
       },
-      {
-       "Put": {
-        "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
-        "ExpressionAttributeNames": {
-         "#snap": "pk",
-         "#snapVer": "version",
-         "#snapInc": "__edd_i__"
-        },
-        "ExpressionAttributeValues": {
-         ":snapVer": {
-          "N": "1"
-         },
-         ":snapInc": {
-          "S": "<token>"
-         }
-        },
-        "Item": {
-         "__edd_i__": {
-          "S": "<token>"
-         },
-         "m#k": {
-          "M": {
-           "x": {
-            "N": "1"
-           },
-           "y": {
-            "S": "kept"
-           }
+      "ConsistentRead": true
+     }
+    },
+    {
+     "transactWriteItems": {
+      "TransactItems": [
+       {
+        "Update": {
+         "TableName": "<table>",
+         "Key": {
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "sk": {
+           "S": "$kept#v1#doc"
           }
          },
-         "__edd_e__": {
-          "S": "Doc"
+         "UpdateExpression": "SET #u0 = :u0, #u1 = if_not_exists(#u1, :vzero) + :vinc REMOVE #pr0.#pr1",
+         "ExpressionAttributeNames": {
+          "#u0": "m#k",
+          "#u1": "version",
+          "#pr0": "m#k",
+          "#pr1": "x",
+          "#retainVer": "version",
+          "#inc": "__edd_i__"
          },
-         "sk": {
-          "S": "$kept#v1#doc#v#0000001"
+         "ExpressionAttributeValues": {
+          ":u0": {
+           "M": {
+            "x": {
+             "N": "2"
+            },
+            "y": {
+             "S": "new"
+            }
+           }
+          },
+          ":vzero": {
+           "N": "0"
+          },
+          ":vinc": {
+           "N": "1"
+          },
+          ":retainVer": {
+           "N": "1"
+          },
+          ":inc": {
+           "S": "<token>"
+          }
          },
-         "id": {
-          "S": "one"
+         "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+         "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+        }
+       },
+       {
+        "Put": {
+         "TableName": "<table>",
+         "Item": {
+          "__edd_i__": {
+           "S": "<token>"
+          },
+          "m#k": {
+           "M": {
+            "x": {
+             "N": "1"
+            },
+            "y": {
+             "S": "kept"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Doc"
+          },
+          "sk": {
+           "S": "$kept#v1#doc#v#0000001"
+          },
+          "id": {
+           "S": "one"
+          },
+          "pk": {
+           "S": "$kept#v1#doc#id_one"
+          },
+          "version": {
+           "N": "1"
+          }
          },
-         "pk": {
-          "S": "$kept#v1#doc#id_one"
+         "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+         "ExpressionAttributeNames": {
+          "#snap": "pk",
+          "#snapVer": "version",
+          "#snapInc": "__edd_i__"
          },
-         "version": {
-          "N": "1"
+         "ExpressionAttributeValues": {
+          ":snapVer": {
+           "N": "1"
+          },
+          ":snapInc": {
+           "S": "<token>"
+          }
          }
         }
        }
-      }
-     ]
+      ]
+     }
     }
    ],
    "rows": [
@@ -7087,8 +8222,16 @@
    "sent": [
     {
      "updateItem": {
+      "TableName": "<table>",
+      "Key": {
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
       "UpdateExpression": "SET #u0 = :u0 REMOVE #pr0.#pr1",
-      "ConditionExpression": "attribute_exists(#exists)",
       "ExpressionAttributeNames": {
        "#u0": "m#k",
        "#pr0": "m#k",
@@ -7106,7 +8249,10 @@
          }
         }
        }
-      }
+      },
+      "ConditionExpression": "attribute_exists(#exists)",
+      "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+      "ReturnValues": "ALL_NEW"
      }
     }
    ],
