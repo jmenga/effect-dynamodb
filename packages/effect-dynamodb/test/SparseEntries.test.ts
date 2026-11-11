@@ -269,23 +269,29 @@ describe("an operation naming a field is judged by the attribute the field is st
     ) as Effect.Effect<A, unknown>
   }
 
-  it.effect(".remove() of the field removes `counter`: it isn't an entry", () =>
-    onRow((db, table) =>
-      Effect.gen(function* () {
-        yield* db.entities.Docs.update({ id: "a" }).remove(["data#x#y"]).asEffect()
-        const [update] = table.requests
-        expect(update!.input.UpdateExpression).toMatch(/^REMOVE #\w+$/)
-        expect(Object.values(update!.input.ExpressionAttributeNames)).toContain("counter")
-        expect(yield* db.entities.Docs.get({ id: "a" })).toEqual({ id: "a", data: { ok: 1 } })
-      }),
-    ),
-  )
+  // A path names a model field by its rename, a first segment holding `#` included, as a filter
+  // and a projection do (#238): `pathRemove(["data#x#y"])` names the field, not the entry `x#y`.
+  // 1.40.0 refused it as an entry; 1.39.0 removed the entry and left `counter` as it was.
+  for (const [name, remove] of [
+    [".remove()", (update: any) => update.remove(["data#x#y"])],
+    ["pathRemove", (update: any) => update.pathRemove(["data#x#y"])],
+  ] as const) {
+    it.effect(`${name} of the field removes \`counter\`: it isn't an entry`, () =>
+      onRow((db, table) =>
+        Effect.gen(function* () {
+          yield* remove(db.entities.Docs.update({ id: "a" })).asEffect()
+          const [update] = table.requests
+          expect(update!.input.UpdateExpression).toMatch(/^REMOVE #\w+$/)
+          expect(Object.values(update!.input.ExpressionAttributeNames)).toContain("counter")
+          expect(yield* db.entities.Docs.get({ id: "a" })).toEqual({ id: "a", data: { ok: 1 } })
+        }),
+      ),
+    )
+  }
 
   for (const [name, remove] of [
     [".remove() of an entry's attribute", (update: any) => update.remove(["data#ok"])],
     ["pathRemove of an entry's attribute", (update: any) => update.pathRemove(["data#ok"])],
-    // A path's segment holding `#` is the attribute's own name: this names the entry `x#y`.
-    ["pathRemove of the attribute the field is named as", (u: any) => u.pathRemove(["data#x#y"])],
   ] as const) {
     it.effect(`${name} is refused, pointing at removeEntries, sending nothing`, () =>
       onRow((db, table) =>

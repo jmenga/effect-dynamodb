@@ -3,13 +3,14 @@
  * compares them with what 1.39.0 did (`fixtures/*-1.39.0.json`, captured once, never regenerated).
  * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`,
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
- * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`. Connected twin:
- * `connected.kept-1.39.0.test.ts`.
+ * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
+ * `helpers/HashFieldNames.ts`. Connected twin: `connected.kept-1.39.0.test.ts`.
  */
 
 import { describe } from "vitest"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
+import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import { openRecordingTable } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
@@ -51,4 +52,8 @@ describe("a pathRemove of a list position", () => {
 
 describe("a pathRemove below a sparse map's entry", () => {
   pathClearSuite("sparse-entry-clears")(openRecordingTable)
+})
+
+describe("a path naming a renamed field whose name holds '#', or a sparse map's entry", () => {
+  hashFieldNamesSuite(openRecordingTable, { projects: false })
 })

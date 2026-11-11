@@ -4,7 +4,8 @@
  * (`fixtures/*-1.39.0.json`, captured once, never regenerated).
  * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`,
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
- * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`.
+ * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
+ * `helpers/HashFieldNames.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -23,6 +24,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
+import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
@@ -114,3 +116,10 @@ describeConnected("a pathRemove of a list position", () => {
 describeConnected("a pathRemove below a sparse map's entry", () => {
   pathClearSuite("sparse-entry-clears")(openTable)
 })
+
+describeConnected(
+  "a path naming a renamed field whose name holds '#', or a sparse map's entry",
+  () => {
+    hashFieldNamesSuite(openTable, { projects: true })
+  },
+)

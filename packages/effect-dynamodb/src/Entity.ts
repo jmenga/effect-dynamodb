@@ -3241,9 +3241,9 @@ const makeImpl = <
     ]
     for (const [op, names] of clearedEntries) {
       for (const name of names) {
-        // The attribute the operation removes decides: `.remove()` names a field, removed where
-        // it's stored, and a path's segment holding `#` is the attribute's own name.
-        const entry = sparseEntries.entryOf(op === ".remove()" ? resolveDbName(name) : name)
+        // The attribute the operation removes decides: each names a field, removed where it's
+        // stored (`compilePath`), and an entry's attribute names no field, so it is its own.
+        const entry = sparseEntries.entryOf(resolveDbName(name))
         if (entry === undefined) continue
         return (
           `${op} of "${name}": "${name}" is an entry of the sparse map "${entry.field}". ` +

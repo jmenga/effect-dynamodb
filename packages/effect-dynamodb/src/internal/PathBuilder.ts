@@ -201,9 +201,9 @@ export const isPath = (value: unknown): value is Path =>
  * @param segments - Initial segments (default: [])
  * @param resolveDbName - Optional function to resolve domain names to DynamoDB
  *   attribute names. It names a path's first segment only (`storedPath`): a
- *   segment below it is stored under its own name. Segments containing `#` are treated as raw literal
- *   attribute names and bypass `resolveDbName` (this is how sparse-map entry
- *   segments survive through compilation as a single placeholder).
+ *   segment below it is stored under its own name. A sparse-map entry's segment
+ *   (`<prefix>#<key>`) names no model field, so it resolves to itself and
+ *   compiles as one placeholder.
  * @param sparseFields - Optional map of sparse-map field names to their
  *   prefix configuration. When the proxy walks into a sparse field at the
  *   first level, the next access is expected to be `.entry(key)`, which
@@ -308,9 +308,10 @@ export const storedPath = (
  * @param prefix - Placeholder prefix (e.g., "p" for paths, "e" for expressions)
  * @param counter - Mutable counter object for unique placeholder generation
  * @param resolveDbName - Optional function to resolve the path's top-level field to its
- *   DynamoDB attribute name ({@link storedPath}). **A first segment containing `#` bypasses
- *   `resolveDbName`** — it is already a literal DynamoDB attribute name (used by sparse-map
- *   entry segments shaped `<prefix>#<key>`).
+ *   DynamoDB attribute name ({@link storedPath}). Every first segment goes through it, as a
+ *   filter's and a projection's do: a model field whose own name holds `#` is named by its
+ *   rename, and a sparse-map entry's attribute (`<prefix>#<key>`), which names no model field,
+ *   resolves to itself.
  * @returns The expression path string (e.g., "#p0.#p1" or "#p0[2].#p1")
  */
 export const compilePath = (
@@ -321,11 +322,8 @@ export const compilePath = (
   resolveDbName?: (name: string) => string,
 ): string => {
   const parts: Array<string> = []
-  // A first segment containing `#` is a literal attribute name (a sparse-map entry,
-  // `<prefix>#<key>`): the library generated it, and it is emitted as it is.
-  const stored = storedPath(segments, (head) =>
-    head.includes("#") || resolveDbName === undefined ? head : resolveDbName(head),
-  )
+  const stored =
+    resolveDbName === undefined ? segments : storedPath(segments, (head) => resolveDbName(head))
   for (const seg of stored) {
     if (typeof seg === "number") {
       // Array index — append directly to previous part
