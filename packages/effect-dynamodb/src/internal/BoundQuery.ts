@@ -625,32 +625,79 @@ const pathHeads = (node: unknown, into: Set<string> = new Set()): Set<string> =>
 }
 
 /**
+ * @internal How an entity's rows are read whole for a select (#238): its sparse map fields, which
+ * no projection can name, and a stored row as a read sees it (`toDomainView`: the maps rebuilt,
+ * then each renamed field under its domain name).
+ */
+export interface WholeRows {
+  readonly sparseFields: ReadonlyArray<string>
+  readonly view: (raw: Record<string, unknown>) => Record<string, unknown>
+}
+
+/** @internal An entity's {@link WholeRows}, or `undefined` when it has no sparse map field. */
+export const wholeRowsOf = (entity: {
+  readonly _sparseFieldNames?: ReadonlyArray<string> | undefined
+  readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
+}): WholeRows | undefined =>
+  entity._sparseFieldNames === undefined ||
+  entity._sparseFieldNames.length === 0 ||
+  entity._toDomainView === undefined
+    ? undefined
+    : { sparseFields: entity._sparseFieldNames, view: entity._toDomainView }
+
+/**
+ * @internal Whether a select of `paths` reads whole rows (#238): one of them names a sparse map
+ * field, stored one attribute per entry, which a `ProjectionExpression` can't name. A path naming
+ * the item itself is left to the projection, which DynamoDB refuses.
+ */
+const readsWholeRows = (
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+  sparseFields: ReadonlyArray<string>,
+): boolean =>
+  paths.every((path) => path.length > 0) &&
+  paths.some((path) => typeof path[0] === "string" && sparseFields.includes(path[0]))
+
+/**
  * @internal An entity's naming (#133): filters and selects name the stored
  * attribute of each renamed field. A select of no renamed field stays the
  * plain projection, so an entity without renames sends what it always sent.
  * With `storedAt`, a filter's operand that is one of Effect's instances is
  * sent in the form the attribute holds (`operandsAsStored`, #242), judged by
- * the domain path before it's renamed.
+ * the domain path before it's renamed. A select naming a sparse map field
+ * reads whole rows and trims each to what it selected, as the read rebuilds it
+ * ({@link WholeRows}, #238).
  */
 export const entityNaming = (
   resolve: ((domainName: string) => string) | undefined,
   storedAt?: StoredFormAt,
-): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> =>
-  resolve === undefined
-    ? storedAt === undefined
-      ? {}
-      : { renameExpr: (expr) => operandsAsStored(expr, storedAt) }
-    : {
-        renameExpr: (expr) =>
-          renamePaths(
-            storedAt === undefined ? expr : operandsAsStored(expr, storedAt),
-            resolve,
-          ) as Expr,
-        selectAs: (query, paths, form) =>
+  wholeRows?: WholeRows | undefined,
+): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
+  if (resolve === undefined && storedAt === undefined && wholeRows === undefined) return {}
+  const stored = resolve ?? ((name: string) => name)
+  const asStored = (expr: Expr): Expr =>
+    storedAt === undefined ? expr : operandsAsStored(expr, storedAt)
+  return {
+    ...((resolve !== undefined || storedAt !== undefined) && {
+      renameExpr: (expr: Expr) =>
+        resolve === undefined ? asStored(expr) : (renamePaths(asStored(expr), resolve) as Expr),
+    }),
+    ...((resolve !== undefined || wholeRows !== undefined) && {
+      selectAs: (query, paths, form) => {
+        if (wholeRows !== undefined && readsWholeRows(paths, wholeRows.sparseFields)) {
+          return Query.selectWhole(
+            query,
+            paths.map((path) => storedPath(path, stored)),
+            (raw) => Query.projectRow(wholeRows.view(raw), paths),
+          )
+        }
+        return resolve !== undefined &&
           paths.some((path) => typeof path[0] === "string" && resolve(path[0]) !== path[0])
-            ? Query.selectRenamed(query, paths, resolve)
-            : plainSelect(query, paths, form),
-      }
+          ? Query.selectRenamed(query, paths, resolve)
+          : plainSelect(query, paths, form)
+      },
+    }),
+  }
+}
 
 /**
  * @internal A collection's naming (#133). Its members may store one domain
@@ -669,6 +716,8 @@ export const collectionNaming = (
     readonly fields?: ReadonlySet<string> | undefined
     /** What a write of a value at a path of the member's stores (#242): see {@link entityNaming}. */
     readonly storedAt?: StoredFormAt | undefined
+    /** How the member's rows are read whole, when it has a sparse map field (#238). */
+    readonly wholeRows?: WholeRows | undefined
   }>,
 ): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
   /**
@@ -742,6 +791,43 @@ export const collectionNaming = (
       }
       stored.set(JSON.stringify(["__edd_e__"]), ["__edd_e__"])
       const byType = new Map(members.map((m) => [m.entityType, m]))
+      // A member's sparse map named: every row is read whole, and each is trimmed to what its
+      // member has of the paths, as that member's read rebuilds it (#238).
+      if (
+        members.some(
+          (m) =>
+            m.wholeRows !== undefined &&
+            readsWholeRows(
+              paths.filter((path) => has(m, String(path[0]))),
+              m.wholeRows.sparseFields,
+            ),
+        )
+      ) {
+        return Query.selectWhole(query, [...stored.values()], (raw) => {
+          const m = byType.get(raw.__edd_e__ as string)
+          if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }
+          const own = paths.filter((path) => has(m, String(path[0])))
+          if (m.wholeRows !== undefined) {
+            return {
+              _memberKey: m.entityKey,
+              _decoded: Query.projectRow(m.wholeRows.view(raw), own),
+            }
+          }
+          // A member without a sparse map: what its projection gave, under its domain names.
+          const projected = Query.projectRow(
+            raw,
+            own.map((path) => storedPath(path, (head) => m.resolve(head))),
+          )
+          const item: Record<string, unknown> = {}
+          for (const head of heads) {
+            const attribute = m.resolve(head)
+            if (!has(m, head) || !Object.hasOwn(projected, attribute)) continue
+            const value = projected[attribute]
+            if (value !== undefined) item[head] = value
+          }
+          return { _memberKey: m.entityKey, _decoded: item }
+        })
+      }
       return Query.selectProjected(query, [...stored.values()], (raw) => {
         const m = byType.get(raw.__edd_e__ as string)
         if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }

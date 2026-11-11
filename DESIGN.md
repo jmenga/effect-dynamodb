@@ -2639,6 +2639,8 @@ The `#` delimiter matches the rest of the library's key-composition convention. 
 
 `get`, `query`, `scan`, batch, and stream paths all rebuild the domain `Record<K, V>` from flattened attributes by walking the marshalled item once and grouping the attributes the reader takes as entries. Domain consumers see the field as a normal Record.
 
+A `.select()` naming a sparse map field reads whole rows (#238). A `ProjectionExpression` can't name attributes by prefix, so through 1.40.0 the select projected the field's own name, which no row holds, and the map came back absent, on an entity's queries and scans, its `versions`, `deleted.list` and `history`, and a collection alike. Such a select now sends its request without a projection (the request is otherwise the one it sent), and each row is rebuilt as a read rebuilds it (`toDomainView`: entries into the map, then renames) and trimmed to the paths selected as a projection would trim it (`Query.projectRow`: each path under the maps and lists holding it, a list keeping the selected positions in order, nothing for a path the row doesn't hold). In a collection, each row is rebuilt by its own member, and a member without a sparse map is trimmed to what its projection gave. One function decides it (`readsWholeRows` in `internal/BoundQuery.ts`): a select naming no sparse map field sends the projection it always sent (`test/fixtures/select-sparse-maps-1.39.0.json`, `helpers/SelectSparseMaps.ts`). The read costs what an unprojected read of those rows costs. A client-side predicate after it is refused as after any select (`EDD-9054`).
+
 #### Writes — record-style (whole-bucket replace)
 
 ```ts

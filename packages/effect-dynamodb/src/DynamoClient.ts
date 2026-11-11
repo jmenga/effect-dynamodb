@@ -180,6 +180,7 @@ import {
   entityNaming,
   type RawSortKeyCondition,
   type WithinOptions,
+  wholeRowsOf,
 } from "./internal/BoundQuery.js"
 import {
   type BoundVectorQuery,
@@ -2425,6 +2426,10 @@ interface EntityLike {
   readonly _resolveDbName?: ((domainName: string) => string) | undefined
   /** What a write of a value at a path stores: a filter's operand is sent in it (#242). */
   readonly _storedFormAt?: StoredFormAt | undefined
+  /** The fields stored as sparse maps, which a `.select()` naming one reads whole rows for (#238). */
+  readonly _sparseFieldNames?: ReadonlyArray<string> | undefined
+  /** A stored row as every read sees it: sparse maps rebuilt, renamed fields under their names. */
+  readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
   /**
    * The entity's refs: a `${ref}Id` composite is not stored on the item, but
    * the ref it names is, as a map holding the referenced identifier.
@@ -2949,7 +2954,11 @@ const makeFromConfig = (config: {
                   }),
               }),
           skFields: accessorDef.sk.composite,
-          ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
+          ...entityNaming(
+            entityLike._resolveDbName,
+            entityLike._storedFormAt,
+            wholeRowsOf(entityLike),
+          ),
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
         return new BoundQueryImpl(pinnedQuery, bqConfig)
@@ -2969,7 +2978,11 @@ const makeFromConfig = (config: {
               pathBuilder: createPathBuilder(),
               conditionOps: createConditionOps(),
               provide,
-              ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
+              ...entityNaming(
+                entityLike._resolveDbName,
+                entityLike._storedFormAt,
+                wholeRowsOf(entityLike),
+              ),
               operation,
             }),
         )
@@ -3076,7 +3089,11 @@ const makeFromConfig = (config: {
           pathBuilder,
           conditionOps,
           provide,
-          ...entityNaming(entityLike._resolveDbName, entityLike._storedFormAt),
+          ...entityNaming(
+            entityLike._resolveDbName,
+            entityLike._storedFormAt,
+            wholeRowsOf(entityLike),
+          ),
           operation: { name: "Entity.scan", target: entityLike.entityType },
         }
         return new BoundQueryImpl(scanQuery, bqConfig)
@@ -3235,6 +3252,7 @@ const makeFromConfig = (config: {
               resolve: m.entityLike._resolveDbName ?? ((name: string) => name),
               fields: domainFieldsOf(m.entityLike),
               storedAt: m.entityLike._storedFormAt,
+              wholeRows: wholeRowsOf(m.entityLike),
             })),
           ),
           operation: { name: "Collection.query", target: collName },

@@ -228,4 +228,4 @@ yield* db.entities.Pages.update({ pageId: "p-1" })
 
 - **Sidecar keys-set** for single-op atomic clear — defer until clearing is shown to be a hot path.
 - **Deeper sparse nesting** (sparse-of-sparse) — keeps wire format symmetric and decode simple.
-- **Wildcard projections** (`metrics#*` in `ProjectionExpression`) — DynamoDB does not support this.
+- **Wildcard projections** (`metrics#*` in `ProjectionExpression`) — DynamoDB does not support this. A `.select()` naming a sparse map field reads whole rows instead, and hands back the map rebuilt and trimmed to what was selected, so it reads what an unprojected query of those rows reads.

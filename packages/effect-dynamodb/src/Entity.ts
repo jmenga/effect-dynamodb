@@ -131,6 +131,7 @@ import {
   BoundQueryImpl,
   entityNaming,
   type RawSortKeyCondition,
+  wholeRowsOf,
 } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import {
@@ -859,6 +860,20 @@ export interface Entity<
    * is put in this form (`operandsAsStored`).
    */
   readonly _storedFormAt: StoredFormAt
+
+  /**
+   * @internal The fields stored as sparse maps, one attribute per entry: a `.select()` naming one
+   * reads whole rows, since no projection can name them (#238).
+   */
+  readonly _sparseFieldNames: ReadonlyArray<string>
+
+  /**
+   * @internal A stored row as every read sees it, as a copy: its sparse maps rebuilt, then each
+   * renamed field under its domain name (`toDomainView`).
+   */
+  readonly _toDomainView: (
+    raw: globalThis.Record<string, unknown>,
+  ) => globalThis.Record<string, unknown>
 
   /** @internal Entity schema version baked into composed keys. */
   readonly _entityVersion: number
@@ -18450,6 +18465,8 @@ const makeImpl = <
     /** @internal Domain field name → stored attribute name (`storedAs` renames). */
     _resolveDbName: resolveDbName,
     _storedFormAt: storedFormAt,
+    _sparseFieldNames: Object.keys(sparseFields),
+    _toDomainView: toDomainView,
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
@@ -18735,7 +18752,7 @@ export const bind = <
         pathBuilder: createPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
-        ...entityNaming(entity._resolveDbName, entity._storedFormAt),
+        ...entityNaming(entity._resolveDbName, entity._storedFormAt, wholeRowsOf(entity)),
         operation: { name: operation, target: entity.entityType },
       }
       return new BoundQueryImpl(
@@ -19106,7 +19123,7 @@ export const bind = <
           provide,
           skFields: orderBy ? [orderBy] : [],
           composeSkCondition,
-          ...entityNaming(entity._resolveDbName, entity._storedFormAt),
+          ...entityNaming(entity._resolveDbName, entity._storedFormAt, wholeRowsOf(entity)),
           operation: { name: "Entity.history", target: entity.entityType },
         }
         return new BoundQueryImpl(q, bqConfig)

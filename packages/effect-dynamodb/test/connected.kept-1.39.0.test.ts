@@ -5,7 +5,7 @@
  * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`,
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
- * `helpers/HashFieldNames.ts`.
+ * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -29,6 +29,7 @@ import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
 import { pathClearSuite } from "./helpers/PathClears.js"
+import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
 import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
 
@@ -123,3 +124,7 @@ describeConnected(
     hashFieldNamesSuite(openTable, { projects: true })
   },
 )
+
+describeConnected("a select naming a sparse map field", () => {
+  selectSparseMapsSuite(openTable, { dynamodb: true })
+})

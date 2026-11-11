@@ -253,6 +253,12 @@ interface QueryState {
   readonly isScan: boolean
   readonly projection: ReadonlyArray<string> | undefined
   readonly projectionPaths: ReadonlyArray<ReadonlyArray<string | number>> | undefined
+  /**
+   * @internal A select read from whole rows ({@link selectWhole}): no projection is sent, and the
+   * decoder trims each row to the paths selected. Set so {@link filterBy} refuses it as it refuses
+   * any select (EDD-9054).
+   */
+  readonly selectsWholeRows?: boolean | undefined
   readonly decoder: (raw: Record<string, unknown>) => Effect.Effect<unknown, ValidationError>
   /**
    * How a raw row ({@link select} / {@link selectPaths}) is handed back: the
@@ -1139,6 +1145,112 @@ export const selectProjected = <A>(
 }
 
 /**
+ * @internal A select no `ProjectionExpression` can express (#238): a sparse map is stored one
+ * attribute per entry (`<prefix>#<key>`), and a projection can't name attributes by prefix. The
+ * rows are read whole, and `decode` rebuilds each one as a read does and trims it to what was
+ * selected ({@link projectRow}). `storedPaths` are the selected paths under their stored names:
+ * a path inside a packed attribute is refused as a projection's is, and the raw-row hook runs only
+ * where a projection of them would run it.
+ */
+export const selectWhole = <A>(
+  self: Query<A>,
+  storedPaths: ReadonlyArray<ReadonlyArray<string | number>>,
+  decode: (raw: Record<string, unknown>) => unknown,
+): Query<Record<string, unknown>> => {
+  if (self._state.predicates.length > 0) {
+    throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
+  }
+  refusePackedProjection(self._state, storedPaths)
+  const rawRow = rawRowDecoder(projectedRawRow(self._state.rawRow, storedPaths))
+  return new QueryImpl<Record<string, unknown>>({
+    ...self._state,
+    projection: undefined,
+    projectionPaths: undefined,
+    selectsWholeRows: true,
+    decoder: (raw) =>
+      Effect.map(
+        rawRow(raw),
+        (row) => decode(row as Record<string, unknown>) as Record<string, unknown>,
+      ),
+  })
+}
+
+/** Whether a value is a map a path's name segment can step into: a plain object. */
+const isPlainMap = (value: unknown): value is Record<string, unknown> => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
+
+/** A map or list being built by {@link projectRow}: its selected members, by name or position. */
+type Projected = {
+  readonly list: boolean
+  readonly members: Map<string | number, Projected | { readonly value: unknown }>
+}
+
+/** Put `value` at `path` in `root`, unless a value selected whole above it holds it already. */
+const place = (root: Projected, path: ReadonlyArray<string | number>, value: unknown): void => {
+  let at = root
+  for (let i = 0; i < path.length - 1; i++) {
+    const member = at.members.get(path[i]!)
+    if (member !== undefined && !("members" in member)) return
+    const next = member ?? { list: typeof path[i + 1] === "number", members: new Map() }
+    at.members.set(path[i]!, next)
+    at = next
+  }
+  at.members.set(path[path.length - 1]!, { value })
+}
+
+/**
+ * @internal What a `ProjectionExpression` of `paths` returns of `row`, worked out on the row
+ * itself (#238): each path's value, under the maps and lists that hold it, a list keeping the
+ * positions selected in position order; nothing for a path the row doesn't hold (a name on
+ * anything but a map, a position on anything but a list, or past its end). A path inside one
+ * selected whole is held by it.
+ */
+export const projectRow = (
+  row: Record<string, unknown>,
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): Record<string, unknown> => {
+  const root: Projected = { list: false, members: new Map() }
+  for (const path of paths) {
+    let value: unknown = row
+    let held = path.length > 0
+    for (const segment of path) {
+      if (typeof segment === "number") {
+        held = Array.isArray(value) && segment >= 0 && segment < value.length
+        if (held) value = (value as ReadonlyArray<unknown>)[segment]
+      } else {
+        held = isPlainMap(value) && Object.hasOwn(value, segment)
+        if (held) value = (value as Record<string, unknown>)[segment]
+      }
+      if (!held) break
+    }
+    if (held) place(root, path, value)
+  }
+  const built = (node: Projected): unknown => {
+    const valueOf = (member: Projected | { readonly value: unknown }) =>
+      "members" in member ? built(member) : member.value
+    if (node.list) {
+      return [...node.members.entries()]
+        .sort(([a], [b]) => (a as number) - (b as number))
+        .map(([, member]) => valueOf(member))
+    }
+    const map: Record<string, unknown> = {}
+    for (const [name, member] of node.members) {
+      Object.defineProperty(map, name, {
+        value: valueOf(member),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      })
+    }
+    return map
+  }
+  return built(root) as Record<string, unknown>
+}
+
+/**
  * @internal `select` / `selectPaths` of DOMAIN field names on an entity that
  * stores some under other names (`DynamoModel.configure(..., { field })`): the
  * projection names the stored attributes, and each item is handed back keyed
@@ -1247,7 +1359,11 @@ export const filterBy: {
   <A>(predicate: (item: A) => boolean): (self: Query<A>) => Query<A>
   <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A>
 } = Function.dual(2, <A>(self: Query<A>, predicate: (item: A) => boolean): Query<A> => {
-  if (self._state.projection !== undefined || self._state.projectionPaths !== undefined) {
+  if (
+    self._state.projection !== undefined ||
+    self._state.projectionPaths !== undefined ||
+    self._state.selectsWholeRows === true
+  ) {
     throw new Error(rejectPredicateWithProjection("filterBy() after select()"))
   }
   return new QueryImpl<A>({
