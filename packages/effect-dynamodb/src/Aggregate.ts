@@ -77,6 +77,7 @@ import {
   holdsCustomDeclaration,
   holdsUntyped,
   refuseUnreadable,
+  storedBelowFields,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import { isZoneInstance, zoneEntriesWritten } from "@effect-dynamodb/schema/internal/StoredForm.js"
@@ -103,6 +104,7 @@ import {
 import * as Batch from "./Batch.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
+import { entityNaming } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
 import { decodeKeyCursor, encodeKeyCursor } from "./internal/Cursor.js"
 import { digest } from "./internal/Digest.js"
@@ -115,7 +117,6 @@ import {
   type Expr,
   emptyPartProblem,
   isEmptyExpr,
-  operandsAsStored,
   parseSimpleShorthand,
   type StoredFormAt,
 } from "./internal/Expr.js"
@@ -127,7 +128,7 @@ import {
 } from "./internal/ExpressionLimits.js"
 import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
-import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
+import { createPathBuilder, type PathBuilder, type StoredBelow } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
 import { asRead, notReadBack, notStoredForm, readBackRefusal } from "./internal/RoundTrip.js"
 import {
@@ -5495,6 +5496,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             options?.filter,
             aggregateName,
             rootStoredFormAt,
+            storedBelowFields(schemaFields),
           )
 
           // Attribute names that make up a resume key on the list index: the index
@@ -9463,12 +9465,14 @@ const DELETE_BASE_DELAY_MS = 100
  * empty part directly under `and` is left out, and one anywhere else — or an
  * `or()` with no parts — is refused with a `ValidationError` before anything
  * is sent. An `isIn` with no values is sent, and DynamoDB's rejection of its
- * `IN ()` diagnosed (#144).
+ * `IN ()` diagnosed (#144). Each path is named as an entity query's filter names it (#238): below
+ * a field, a struct that renames its keys as it's stored is named by its stored names (`below`).
  */
 const compileListFilter = <Model>(
   filter: ListFilter<Model> | undefined,
   aggregateName: string,
   storedAt: StoredFormAt,
+  below: StoredBelow,
 ): Effect.Effect<CompileResult | undefined, ValidationError> => {
   if (filter === undefined) return Effect.succeed(undefined)
   const expr =
@@ -9488,10 +9492,10 @@ const compileListFilter = <Model>(
       }),
     )
   }
-  // Its operands in the form the root row holds (#242).
-  return Effect.succeed(
-    isEmptyExpr(expr) ? undefined : compileExpr(operandsAsStored(expr, storedAt)),
-  )
+  // Its operands in the form the root row holds (#242), named as an entity query's filter names
+  // them (#238).
+  const named = entityNaming(undefined, storedAt, undefined, below).renameExpr?.(expr) ?? expr
+  return Effect.succeed(isEmptyExpr(expr) ? undefined : compileExpr(named))
 }
 
 // ---------------------------------------------------------------------------

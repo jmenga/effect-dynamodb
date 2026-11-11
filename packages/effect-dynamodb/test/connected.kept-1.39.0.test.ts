@@ -26,6 +26,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
+import { aggregateListFiltersSuite } from "./helpers/AggregateListFilters.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { clearWritesSuite, retainedEntryRemovalsSuite } from "./helpers/ClearWrites.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
@@ -199,5 +200,12 @@ describeConnected(
   "a sparse map entry in a query's, a scan's and a collection's filter and select",
   () => {
     entryInQueriesSuite(openTable)
+  },
+)
+
+describeConnected(
+  "an aggregate list filter below a struct that renames its keys as they're stored",
+  () => {
+    aggregateListFiltersSuite(openTable)
   },
 )

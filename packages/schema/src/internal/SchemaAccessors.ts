@@ -1505,6 +1505,25 @@ export const storedSegments = (
 }
 
 /**
+ * The segments below a path's first, as a model of these fields stores them (#238): through the
+ * schema of the field the first segment names ({@link storedSegments}), as written below a name
+ * that is no field. The one way a model's path below its field is named: an entity's (beside its
+ * sparse maps' entries) and an aggregate's root rows' alike.
+ */
+export const storedBelowFields =
+  (fields: Readonly<Record<string, Schema.Top>> | undefined) =>
+  (segments: ReadonlyArray<string | number>): ReadonlyArray<string | number> => {
+    const head = segments[0]
+    const rest = segments.slice(1)
+    return rest.length > 0 &&
+      typeof head === "string" &&
+      fields !== undefined &&
+      Object.hasOwn(fields, head)
+      ? storedSegments(fields[head]!, rest)
+      : rest
+  }
+
+/**
  * A struct that renames its keys as it's stored, as the guard models it (#238): a struct of the
  * same properties under their stored names. Reading one is reading the stored struct, then the
  * properties renamed, then the struct, which reads a property as this does under its stored name.

@@ -13,6 +13,7 @@
 import { describe } from "vitest"
 import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
+import { aggregateListFiltersSuite } from "./helpers/AggregateListFilters.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { clearWritesSuite, retainedEntryRemovalsSuite } from "./helpers/ClearWrites.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
@@ -129,4 +130,8 @@ describe("a path below a struct that renames its keys, in a collection", () => {
 
 describe("a sparse map entry in a query's, a scan's and a collection's filter and select", () => {
   entryInQueriesSuite(openRecordingTable)
+})
+
+describe("an aggregate list filter below a struct that renames its keys as they're stored", () => {
+  aggregateListFiltersSuite(openRecordingTable)
 })

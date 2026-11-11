@@ -844,7 +844,7 @@ The first argument selects the partition (and, with contiguous SK composites, a 
 |--------|---------|
 | `limit` | At most _n_ **aggregates**. Accumulates across as many requests as it takes — not DynamoDB's `Limit`, which bounds rows examined |
 | `pageSize` | DynamoDB's `Limit` — rows examined per request. A contract on round trips, not on what comes back |
-| `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()`, and the same empty-part rules: an empty filter is none, and an empty part under `or()` / `not()`, an `or()` with no parts, or an operand that is `t` itself fails with a `ValidationError` before sending. An `isIn` with no values is sent; DynamoDB rejects its `IN ()`, and `list` fails with a `ValidationError` (`operation: "list.filter"`) naming it |
+| `filter` | `FilterExpression` on the root-item query. Same callback and shorthand forms as `BoundQuery.filter()`, and the same empty-part rules: an empty filter is none, and an empty part under `or()` / `not()`, an `or()` with no parts, or an operand that is `t` itself fails with a `ValidationError` before sending. An `isIn` with no values is sent; DynamoDB rejects its `IN ()`, and `list` fails with a `ValidationError` (`operation: "list.filter"`) naming it. A path is named as a query's filter names it: below a struct that renames its keys as they're stored (`Schema.encodeKeys`), `t.meta.amount` names the stored `meta.am` |
 | `reverse` | Walk the list index descending |
 | `cursor` | Resume after the last aggregate the previous call returned |
 

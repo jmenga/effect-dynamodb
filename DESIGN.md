@@ -3951,18 +3951,21 @@ built, or one no row holds where the member reads that attribute as something
 of its own (a field, or an entry of one of its maps), so its rows never match
 (`entriesFor` in `collectionNaming`, `helpers/EntryInQueries.ts`). A select of
 an entry is the "A `.select()` naming a sparse map field" rule above. An
-aggregate's `list` filter compiles with no
-rename at any level, and `.history().where()` is a sort-key condition, so
-neither is affected. A path with no segment below the first spelled as a
+aggregate takes no `field:` rename (1.40.0 failed to make one over a
+`DynamoModel.configure` model), and `.history().where()` is a sort-key
+condition, so neither is affected. A path with no segment below the first spelled as a
 renamed field sends the requests it always sent
 (`test/fixtures/nested-path-requests-1.39.0.json`).
 
 **Below the first segment, a path follows a struct's own key encoding
 (`Schema.encodeKeys`) since #238.** One walk says what each segment is stored
 as (`storedSegments` in the schema package's `internal/SchemaAccessors.ts`,
-reached through `Entity._storedBelow` and `storedPath`), so a path write, a
-condition (an entity's, a transaction's), a filter (an entity's and a
-collection's) and a projection name the same attributes. A segment that is a
+below a model's field by `storedBelowFields`, reached through
+`Entity._storedBelow` and `storedPath`), so a path write, a condition (an
+entity's, a transaction's), a filter (an entity's, a collection's and an
+aggregate `list`'s, which names its root's paths by the root schema's fields
+through the bound-query naming, `entityNaming`) and a projection name the same
+attributes. A segment that is a
 property's own name at its node, stored under another, is sent as the stored
 name: on `meta` encoding `amount` as `am`, `pathSet(["meta", "amount"])` and
 `t.meta.amount` name `meta.am`, the attribute `put` stores and a read takes, and
@@ -3988,7 +3991,11 @@ spelling wrote a stray attribute no read sees (`meta.amount` beside
 select of it came back without the value. The stored spelling sends what it
 sent (`test/fixtures/nested-key-encodings-1.40.0.json`,
 `helpers/NestedKeyEncodings.ts`, plain, retained and in a transaction, on the
-recording table and DynamoDB Local). Through 1.39.0 `compilePath` renamed every
+recording table and DynamoDB Local). An aggregate `list` filter spelled by a
+property's own name matched no root row through 1.40.0 (under `not`, every
+one), and now sends what its stored spelling sent; a filter on a root that
+renames nothing sends what it sent (`test/fixtures/aggregate-list-filters-1.40.0.json`,
+`helpers/AggregateListFilters.ts`). Through 1.39.0 `compilePath` renamed every
 segment by the top-level renames, so one such path reached the stored key by
 coincidence, when the struct encoded a property to the name a top-level field
 of the same spelling was renamed to. A `pathRemove` below a key-renamed struct

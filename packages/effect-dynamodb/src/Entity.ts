@@ -82,7 +82,7 @@ import {
   pathIsRequired,
   readersAt,
   rowOmits,
-  storedSegments,
+  storedBelowFields,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { CANT_SAY } from "@effect-dynamodb/schema/internal/SchemaIssue.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
@@ -3227,10 +3227,11 @@ const makeImpl = <
 
   const modelFieldSchemas = data.modelFields as globalThis.Record<string, Schema.Top>
   const isModelField = (name: string): boolean => Object.hasOwn(modelFieldSchemas, name)
+  const modelBelow = storedBelowFields(modelFieldSchemas)
   /**
    * The segments below a path's first as they're stored (#238), given the path as written: each
-   * named through the model's schema below its field ({@link storedSegments}), so a property of a
-   * struct that renames its keys as it's stored is named as stored. Below a sparse map's entry
+   * named through the model's schema below its field ({@link storedBelowFields}), so a property of
+   * a struct that renames its keys as it's stored is named as stored. Below a sparse map's entry
    * (one `.entry()` built, or an entry's attribute no field is named as), through the map's own
    * schema from the entry's key. The one place a path below its field is named, for an update's
    * path operations, a condition, a filter and a projection alike; anything else as written.
@@ -3241,12 +3242,8 @@ const makeImpl = <
     if (rest.length === 0 || typeof head !== "string") return rest
     const entry =
       entryOfPath(segments) ?? (isModelField(head) ? undefined : sparseEntries.entryOf(head))
-    if (entry !== undefined) {
-      return isModelField(entry.field)
-        ? storedSegments(modelFieldSchemas[entry.field]!, [entry.key, ...rest]).slice(1)
-        : rest
-    }
-    return isModelField(head) ? storedSegments(modelFieldSchemas[head]!, rest) : rest
+    if (entry !== undefined) return modelBelow([entry.field, entry.key, ...rest]).slice(1)
+    return modelBelow(segments)
   }
   const modelFieldStoredIn = (attribute: string): string | undefined =>
     Object.keys(modelFieldSchemas).find((field) => resolveDbName(field) === attribute)
