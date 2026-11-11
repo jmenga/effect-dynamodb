@@ -273,15 +273,41 @@ export const aggregateStampFormsSuite = (open: OpenTable) => {
               }
             }
           }
-          // What `get` returns is the instant stored.
-          const [, , got] = steps as readonly [Step, Step, Step]
-          const row = got.rows.find((r) => r.__edd_e__?.S === declaring)!
-          const value = declaredIn(position, (got.outcome as { readonly ok: unknown }).ok)
-          for (const field of ["created", "updated"]) {
-            if (row[field] === undefined) continue
-            expect(value[field], field).toEqual({ date: instantOf(row[field]!, declared) })
+          // What `create` and `get` return is the instant stored.
+          for (const step of [steps[0]!, steps[2]!]) {
+            const row = step.rows.find((r) => r.__edd_e__?.S === declaring)!
+            const value = declaredIn(position, (step.outcome as { readonly ok: unknown }).ok)
+            for (const field of ["created", "updated"]) {
+              if (row[field] === undefined) continue
+              expect(value[field], `${step.step}: ${field}`).toEqual({
+                date: instantOf(row[field]!, declared),
+              })
+            }
           }
         }),
     )
+    if (position !== "root") continue
+    const [create, update] = captured as readonly [Step, Step, Step]
+    // A date the root declares, required or `Schema.optionalKey`, is the library's: 1.39.0 stamped it
+    // over a value passed, in its own encoding, on every row, and `update` re-stamped `updated`. One
+    // it declares `Schema.optional` was the caller's: 1.39.0 stored a value passed for it, and stamped
+    // no row (`AggregateCreateStamps.ts` has what changed there).
+    if (wrap !== "optional" && "ok" in create.outcome) {
+      it.effect(`${name}: create and update store what ${fixture.generatedFrom} stored`, () =>
+        Effect.gen(function* () {
+          const steps: ReadonlyArray<Step> = yield* replay(open, build(position, date, supplied))
+          expect(steps[0]!.rows).toEqual(create.rows)
+          expect(steps[1]!.rows).toEqual(update.rows)
+        }),
+      )
+    } else if (wrap === "optional" && supplied === "a value supplied") {
+      it.effect(`${name}: create stores the value passed, as ${fixture.generatedFrom} did`, () =>
+        Effect.gen(function* () {
+          const steps: ReadonlyArray<Step> = yield* replay(open, build(position, date, supplied))
+          const root = (rows: ReadonlyArray<Row>) => rows.find((r) => r.__edd_e__?.S === "Match")
+          expect(root(steps[0]!.rows)).toEqual(root(create.rows))
+        }),
+      )
+    }
   }
 }

@@ -55,6 +55,7 @@ import {
   type DeepSubstitutionOptions,
   matchDateRepresentation,
   optionalField,
+  resolveSystemFields,
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
@@ -1583,17 +1584,25 @@ const makeAggregate = <TSchema extends Schema.Top>(
     name !== null && fields?.[name] !== undefined && !isFieldOptional(fields[name])
   // On `create`, a stamp replaces a value the input holds, as on 1.39.0, except under a date the root
   // declares `Schema.optional`: 1.39.0 left that field the caller's and stored a value passed for it.
-  const createdReplaces =
-    !timestampFields.createdAtCollision || requiredIn(schemaFields, timestampFields.createdAt)
-  const updatedReplaces =
-    !timestampFields.updatedAtCollision || requiredIn(schemaFields, timestampFields.updatedAt)
+  // That is 1.39.0's verdict, the resolver's over the root's fields as declared: `Schema.optional`'s
+  // union isn't a date there, while a required date and a `Schema.optionalKey` one are the library's.
+  const asDeclared = resolveSystemFields(
+    config.timestamps,
+    undefined,
+    undefined,
+    schemaFields,
+    {},
+    `Aggregate "${aggregateName}"`,
+  )
+  const createdReplaces = !timestampFields.createdAtCollision || asDeclared.createdAtCollision
+  const updatedReplaces = !timestampFields.updatedAtCollision || asDeclared.updatedAtCollision
 
   /**
    * What the rows of a value with these fields do with each timestamp, as an entity's do: a date the
    * value declares is the library's, under the field's encoding, and `create` stamps it over what the
-   * input holds unless the root declares it optional ({@link fillStamps}), where an `update` takes a
-   * value the mutation changed; any other field of that name is the caller's and the row isn't
-   * stamped. Undeclared, the row is stamped.
+   * input holds unless the root declares it `Schema.optional` ({@link fillStamps}), where an `update`
+   * takes a value the mutation changed; any other field of that name is the caller's and the row
+   * isn't stamped. Undeclared, the row is stamped.
    */
   const rowStampsOf = (fields: Record<string, Schema.Top> | undefined): RowStamps | undefined => {
     if (stampFields === undefined) return undefined
@@ -6199,9 +6208,10 @@ const fillRows = (
 
 /**
  * `value` with the dates its rows declare, walking the graph. `"declared"` (`create`) stamps every one
- * the input lacks, and one it holds unless the root declares that date optional (`replaces`): up to
- * 1.39.0 the input had to hold a date the root required, which the stamp then replaced, so a value
- * there is a placeholder, and one the root declares optional was the caller's to store. `"required"`
+ * the input lacks, and one it holds unless the root declares that date `Schema.optional` (`replaces`):
+ * up to 1.39.0 the input had to hold a date the root required, which the stamp then replaced, so a
+ * value there is a placeholder; 1.39.0 stamped one the root declares `Schema.optionalKey` over a value
+ * passed, and one it declares `Schema.optional` was the caller's to store. `"required"`
  * (`update`) fills only one the mutated state lacks and a schema requires; one it doesn't require a
  * rewrite stamps anyway: a mutation that changes nothing still has nothing to write. A value with
  * nothing to add comes back as it is.
