@@ -282,6 +282,11 @@ interface ResolvedNode {
   readonly cardinality: "root" | "one" | "many"
   readonly discriminator?: Record<string, unknown>
   readonly ownDiscriminator?: Record<string, unknown>
+  /**
+   * An edge's discriminator attributes its value can't hold ({@link discriminatorsBeside}): every
+   * row of the edge carries them, and a read takes them off the row before handing the value back.
+   */
+  readonly discriminatorsBeside?: ReadonlySet<string> | undefined
   readonly children: ReadonlyArray<ResolvedNode>
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
@@ -4640,6 +4645,7 @@ interface ResolveNodeArgs {
   /** The aggregate's ref resolver, shared with its `decodeSchema`. */
   readonly resolveRef?: RefResolver | undefined
   readonly discriminator?: Record<string, unknown> | undefined
+  readonly discriminatorsBeside?: ReadonlySet<string> | undefined
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   readonly decomposeInput?: ((written: Written) => Option.Option<unknown>) | undefined
@@ -4761,6 +4767,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             edges: {},
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
+            discriminatorsBeside: discriminatorsBeside(mergedDisc, parentField),
             ownFields: valueFields,
             valueSchema:
               modelOf(edge.entity?.model) ??
@@ -4805,6 +4812,10 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             cardinality: "many",
             edges: {},
             discriminator,
+            discriminatorsBeside: discriminatorsBeside(
+              discriminator,
+              manyElementSchema(parentFields, field),
+            ),
             assemble: edge.assemble,
             decompose: edge.decompose,
             decomposeInput:
@@ -4886,6 +4897,9 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     // Absent optionals stay absent under `exactOptionalPropertyTypes`.
     ...(discriminator !== undefined && { discriminator }),
     ...(ownDiscriminator !== undefined && { ownDiscriminator }),
+    ...(args.discriminatorsBeside !== undefined && {
+      discriminatorsBeside: args.discriminatorsBeside,
+    }),
     children,
     ...(assemble !== undefined && { assemble }),
     ...(decompose !== undefined && { decompose }),
@@ -5254,19 +5268,18 @@ const assembleNode = (
 
       // Return the item (stripped of DynamoDB metadata)
       const item = matchingItems[0]!
-      return stripMetadata(item, stampsToStrip(node, systemAttrs))
+      return stripMetadata(item, besideValue(node, systemAttrs))
     }
 
-    // Many edge: collect all matching items
-    const stripped = matchingItems.map((item) =>
-      stripMetadata(item, stampsToStrip(node, systemAttrs)),
-    )
-
+    // Many edge: collect all matching items. A custom `assemble` is handed each row with its
+    // discriminator attributes, as the aggregates guide says.
     if (node.assemble) {
-      return node.assemble(stripped)
+      return node.assemble(
+        matchingItems.map((item) => stripMetadata(item, stampsToStrip(node, systemAttrs))),
+      )
     }
 
-    return stripped
+    return matchingItems.map((item) => stripMetadata(item, besideValue(node, systemAttrs)))
   })
 
 // ---------------------------------------------------------------------------
@@ -5284,6 +5297,71 @@ const stampsToStrip = (
   if (own === undefined) return systemAttrs
   const kept = [...systemAttrs].filter((name) => !(name in own))
   return kept.length === systemAttrs.size ? systemAttrs : new Set(kept)
+}
+
+/**
+ * The attributes of an edge's row a read takes off before handing back its value: the timestamps
+ * it doesn't declare ({@link stampsToStrip}) and the discriminators it can't hold
+ * ({@link discriminatorsBeside}).
+ */
+const besideValue = (node: ResolvedNode, systemAttrs: ReadonlySet<string>): ReadonlySet<string> => {
+  const stamps = stampsToStrip(node, systemAttrs)
+  const beside = node.discriminatorsBeside
+  return beside === undefined ? stamps : new Set([...stamps, ...beside])
+}
+
+/**
+ * The static discriminator attributes the library writes on every row of an edge whose value
+ * (`value`, the edge's field or a `many` edge's element) can't hold them (#241). Each is stored
+ * beside the value, and a read takes it off again: the value is what the caller gave. A value that
+ * can hold one keeps it on a read, as before: a struct or class declaring a field of that name (on
+ * either side of a transformation, in any union member), or a record. Decoding through a struct
+ * drops an attribute it doesn't declare anyway, so this matters to a value that keeps what it's
+ * given: `Schema.Unknown`, a declaration, or a union member falling back to one.
+ */
+const discriminatorsBeside = (
+  discriminator: Record<string, unknown> | undefined,
+  value: Schema.Top | undefined,
+): ReadonlySet<string> | undefined => {
+  if (discriminator === undefined || value === undefined) return undefined
+  const held = namesHeld(value.ast)
+  if (held === "any") return undefined
+  const beside = Object.entries(discriminator)
+    .filter(([name, given]) => typeof given !== "function" && !held.has(name))
+    .map(([name]) => name)
+  return beside.length === 0 ? undefined : new Set(beside)
+}
+
+/**
+ * The property names a value of `ast` can hold: a struct's fields (a class's, a union member's, on
+ * the encoded and the decoded side of each transformation), or `"any"` for one with an index
+ * signature (a record).
+ */
+const namesHeld = (ast: SchemaAST.AST): ReadonlySet<string> | "any" => {
+  const names = new Set<string>()
+  const seen = new Set<SchemaAST.AST>()
+  const anyName = (node: SchemaAST.AST): boolean => {
+    if (seen.has(node)) return false
+    seen.add(node)
+    if ((node.encoding ?? []).some((link) => anyName(link.to))) return true
+    switch (node._tag) {
+      case "Objects":
+        if (node.indexSignatures.length > 0) return true
+        for (const property of node.propertySignatures) {
+          if (typeof property.name === "string") names.add(property.name)
+        }
+        return false
+      case "Union":
+        return node.types.some(anyName)
+      case "Declaration":
+        return node.typeParameters.some(anyName)
+      case "Suspend":
+        return anyName(node.thunk())
+      default:
+        return false
+    }
+  }
+  return anyName(ast) ? "any" : names
 }
 
 const stripMetadata = (
