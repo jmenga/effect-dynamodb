@@ -4,11 +4,11 @@
  * Extracted from Entity.ts for decomposition. Not part of the public API.
  */
 
-import type { ReturnValue } from "@aws-sdk/client-dynamodb"
+import type { AttributeValue, ReturnValue } from "@aws-sdk/client-dynamodb"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
-import { type DateTime, Effect, Pipeable, Utils } from "effect"
+import { type DateTime, Effect, Pipeable, type Schema, Utils } from "effect"
 import type { ConditionInput } from "../Expression.js"
 import { type Expr, ExprTag, emptyPartProblem, toExpr } from "../internal/Expr.js"
 import type { TableConfig } from "../Table.js"
@@ -109,7 +109,18 @@ export interface CascadeTarget {
     readonly idFieldName: string
     readonly keyField: string
     readonly refEntityType: string
+    /** The referenced entity: its `modelSchema` encodes what the ref stores (`refDataOf`). */
+    readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
   }>
+  /** A whole field as a SET writes it: its stored attribute and stored form (`Entity._setOf`). */
+  readonly _setOf: (
+    field: string,
+    wire: unknown,
+    operation: string,
+  ) => Effect.Effect<
+    { readonly attribute: string; readonly value: AttributeValue },
+    ValidationError
+  >
 }
 
 /** @internal */

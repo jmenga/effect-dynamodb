@@ -840,6 +840,8 @@ export interface Entity<
     /** The attribute of the referenced entity an id names (`refIdAttribute`). */
     readonly keyField: string
     readonly refEntityType: string
+    /** The referenced entity: its `modelSchema` encodes what the ref stores (`refDataOf`). */
+    readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
   }>
 
   /** @internal Full decode pipeline: unpack + sparse + rename + schema decode. Used by Batch/Aggregate. */
@@ -913,6 +915,18 @@ export interface Entity<
    * differently-shaped item depending on which API wrote it.
    */
   readonly _renameToDynamo: (item: globalThis.Record<string, unknown>) => void
+  /**
+   * @internal A whole field as an `UpdateItem` SET writes it: the attribute it's stored in and its
+   * stored form (packed where the field is). A cascade writes a target's ref through it (#241).
+   */
+  readonly _setOf: (
+    field: string,
+    wire: unknown,
+    operation: string,
+  ) => Effect.Effect<
+    { readonly attribute: string; readonly value: AttributeValue },
+    ValidationError
+  >
   /** @internal The model field a stored attribute holds, for a message naming it. */
   readonly _fieldOfAttribute: (attribute: string) => string
 
@@ -2345,6 +2359,25 @@ interface ResolvedRef {
 
 /** @internal A definition that has had its operations attached (has `.get`). */
 const isOperational = (e: { readonly get?: unknown }): boolean => typeof e.get === "function"
+
+/**
+ * @internal What a ref stores of the item it names: the referenced entity's domain item encoded
+ * through that entity's `modelSchema`, so transform fields are in their wire form (a
+ * `Schema.Redacted` its string, a date its declared encoding, a `NumberFromString` its string),
+ * marshal-safe and decoded exactly once by the referencing entity (issue #72). Put-time hydration
+ * and a cascade from the referenced entity both store it, through this one function (#241): up to
+ * 1.40.0 a cascade marshalled the domain item as it was, so a `Schema.Redacted` was stored as an
+ * empty map (the row then failed every read) and a date as its `DateTime`'s internals.
+ */
+const refDataOf = (
+  refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } },
+  model: unknown,
+  entityType: string,
+  operation: string,
+): Effect.Effect<unknown, ValidationError> =>
+  Schema.encodeUnknownEffect(refEntity.schemas.modelSchema as Schema.Codec<any>)(model).pipe(
+    Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
+  )
 
 /** @internal Copy the schema + table tag a definition received via `_configure`
  * (Table.make injects them at table-definition time) onto a promoted entity. */
@@ -4288,6 +4321,28 @@ const makeImpl = <
         attribute,
       ),
     )
+
+  /**
+   * A whole field as an `UpdateItem` SET writes it: the attribute it's stored in (`resolveDbName`,
+   * the naming every write uses) and its stored form, packed where the field is (#147). `update`,
+   * `upsert` and a cascade into one of this entity's refs each write a field through it (#241).
+   */
+  const setOf = (
+    field: string,
+    wire: unknown,
+    operation: string,
+  ): Effect.Effect<
+    { readonly attribute: string; readonly value: AttributeValue },
+    ValidationError
+  > => {
+    const attribute = resolveDbName(field)
+    return Object.hasOwn(packedFields, field)
+      ? Effect.map(packAttribute(attribute, wire, operation), (value) => ({
+          attribute,
+          value: value!,
+        }))
+      : Effect.succeed({ attribute, value: toAttributeValue(wire) })
+  }
 
   /**
    * Read, in place, the dispatch-eligible attributes of a stored-name row by
@@ -7456,26 +7511,9 @@ const makeImpl = <
             ),
           )
           // `asModel` returns the DECODED domain value (transform fields lifted to
-          // their domain form, e.g. `Schema.DateTimeUtcFromString` → `DateTime`).
-          // The parent decodes this nested ref field via the ref target's ORIGINAL
-          // `Schema.Class` (`substituteSchemas` does not recurse into nested
-          // classes), whose Encoded side is the wire primitive. Re-encode through
-          // the ref's substituted `modelSchema` so the spliced value is wire-form:
-          // marshall-safe for `toAttributeMap` AND decoded exactly once by the
-          // parent (issue #72 — without this, a put marshalls a `DateTime` and the
-          // return decode fails "Expected string, got DateTime.Utc").
-          const wire = yield* Schema.encodeUnknownEffect(
-            ref.refEntity.schemas.modelSchema as Schema.Codec<any>,
-          )(model).pipe(
-            Effect.mapError(
-              (cause) =>
-                new ValidationError({
-                  entityType,
-                  operation: "hydrateRefs.encode",
-                  cause,
-                }),
-            ),
-          )
+          // their domain form, e.g. `Schema.DateTimeUtcFromString` → `DateTime`): stored
+          // as `refDataOf` encodes it, as a cascade stores it (issue #72, #241).
+          const wire = yield* refDataOf(ref.refEntity, model, entityType, "hydrateRefs.encode")
           return { fieldName: ref.fieldName, idFieldName: ref.idFieldName, data: wire }
         })
       })
@@ -7563,7 +7601,8 @@ const makeImpl = <
         readonly key: globalThis.Record<string, AttributeValue>
         /** The target table's primary-key attributes, `[pk.field, sk.field]`. */
         readonly keyFields: readonly [string, string]
-        readonly refFieldName: string
+        /** The attribute the target stores its ref in. */
+        readonly refAttribute: string
         readonly refData: AttributeValue
       }> = []
 
@@ -7600,6 +7639,29 @@ const makeImpl = <
             ],
           })
         }
+
+        // What the target's ref stores of the source, as a put naming it stores it (`refDataOf`),
+        // in the attribute the target stores the ref in, in its stored form (`_setOf`). Up to
+        // 1.40.0 the domain item was marshalled as it was, under the ref's model field name: a
+        // renamed ref (`field:`) got a second attribute and kept its stale value (#241).
+        const refSet = yield* refDataOf(
+          matchingRef.refEntity,
+          sourceDomainData,
+          sourceEntityType,
+          "cascade.encode",
+        ).pipe(
+          Effect.flatMap((wire) => target._setOf(matchingRef.fieldName, wire, "cascade")),
+          Effect.mapError(
+            (error) =>
+              new CascadePartialFailure({
+                sourceEntity: sourceEntityType,
+                sourceId: sourceIdValue,
+                succeeded: 0,
+                failed: 0,
+                errors: [error],
+              }),
+          ),
+        )
 
         // Resolve target table name
         const { name: targetTableName } = yield* target._tableTag
@@ -7668,8 +7730,8 @@ const makeImpl = <
                 tableName: targetTableName,
                 key: { [keyFields[0]]: item[keyFields[0]]!, [keyFields[1]]: item[keyFields[1]]! },
                 keyFields,
-                refFieldName: matchingRef.fieldName,
-                refData: toAttributeValue(sourceDomainData),
+                refAttribute: refSet.attribute,
+                refData: refSet.value,
               })
             }
 
@@ -7691,7 +7753,7 @@ const makeImpl = <
             TableName: op.tableName,
             Key: op.key,
             UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refFieldName },
+            ExpressionAttributeNames: { "#ref": op.refAttribute },
             ExpressionAttributeValues: { ":refData": op.refData },
           },
         }))
@@ -7741,7 +7803,7 @@ const makeImpl = <
             TableName: op.tableName,
             Key: op.key,
             UpdateExpression: "SET #ref = :refData",
-            ExpressionAttributeNames: { "#ref": op.refFieldName },
+            ExpressionAttributeNames: { "#ref": op.refAttribute },
             ExpressionAttributeValues: { ":refData": op.refData },
           }
           return client.updateItem(update).pipe(
@@ -9756,13 +9818,10 @@ const makeImpl = <
 
         const nameKey = `#u${counter}`
         const valKey = `:u${counter}`
-        const storedName = resolveDbName(attr)
-        names[nameKey] = storedName
         // A packed field is written whole, as its stored form (#147).
-        values[valKey] =
-          attr in packedFields
-            ? (yield* packAttribute(storedName, val, "update"))!
-            : toAttributeValue(val)
+        const set = yield* setOf(attr, val, "update")
+        names[nameKey] = set.attribute
+        values[valKey] = set.value
         setClauses.push(`${nameKey} = ${valKey}`)
         counter++
       }
@@ -11753,13 +11812,10 @@ const makeImpl = <
 
             const nameKey = `#u${counter}`
             const valKey = `:u${counter}`
-            const storedName = resolveDbName(attr)
-            names[nameKey] = storedName
             // A packed field is written whole, as its stored form (#147).
-            values[valKey] =
-              attr in packedFields
-                ? (yield* packAttribute(storedName, val, "upsert"))!
-                : toAttributeValue(val)
+            const set = yield* setOf(attr, val, "upsert")
+            names[nameKey] = set.attribute
+            values[valKey] = set.value
 
             placeholders.set(attr, [nameKey, valKey])
             // Immutable fields use if_not_exists — only set on first create
@@ -18239,6 +18295,7 @@ const makeImpl = <
     _domainKeyForm: domainKeyForm,
     _unstorableKey: unstorableKey,
     _renameToDynamo: renameToDynamo,
+    _setOf: setOf,
     _fieldOfAttribute: fieldOfAttribute,
     _incarnationToken: stampsIncarnation,
     _versionCorruption: versionCorruption,

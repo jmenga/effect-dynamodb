@@ -5083,8 +5083,16 @@ referenced entity reads its id off the update's key under it, as the key holds i
 composed `teamid_5`, a partition no `put` writes, on 1.39.0 and 1.40.0 alike). Up to
 1.40.0 all of these named the entity's identifier, so a ref to an entity whose
 identifier is another field than its key failed `put` (`get.decode`,
-`Missing key`), and a cascade from it updated nothing. For an entity whose
-identifier is its key, nothing sent or stored changes
+`Missing key`), and a cascade from it updated nothing. A cascade stores what a
+`put` naming the entity stores: the item encoded through the referenced entity's
+`modelSchema` (`refDataOf`, the one function `hydrateRefs` uses too), written to
+the attribute the target stores its ref in, in its stored form (`Entity._setOf`,
+the function `update` and `upsert` write every field through). Up to 1.40.0 it
+marshalled the domain item under the ref's field name, so a `Schema.Redacted`
+became an empty map (the row then died on every read), a date its `DateTime`'s
+internals, and a renamed ref got a second attribute while keeping its stale copy
+(`fixtures/entity-ref-cascade-1.40.0.json`, `helpers/EntityRefCascade.ts`). For an
+entity whose identifier is its key, nothing a `put` sends or stores changes
 (`fixtures/entity-ref-keys-1.39.0.json`, `EntityRefKeys.test.ts`,
 `connected.entity-ref-keys.test.ts`). An entity keyed by more than one composite
 has no key composite: everything reads under its identifier, as before, so a
