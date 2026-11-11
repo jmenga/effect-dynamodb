@@ -35,6 +35,7 @@
 
 import { Equal, Option, Schema, SchemaAST } from "effect"
 import { substituteSchemaDeep } from "./EntitySchemas.js"
+import { readingKeyInstances } from "./InstanceReads.js"
 import { isStoredNaN, KeyValueError, STORED_NAN } from "./NumericKey.js"
 import {
   getSchemaFields,
@@ -324,11 +325,15 @@ const holdsDeclaration = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set
 /**
  * A field's decode as an entity's read decodes a row's value (`legacyReads`): what the marshaller
  * changed is taken back first, a stored bigint read back as a number lifted wherever it sits (in a
- * list, a struct, a declaration's value).
+ * list, a struct, a declaration's value), and each of Effect's look-alike declarations (a
+ * `Duration`, a zone, a date in an `Option`, ...) comes back as the instance a read hands back
+ * (`readingKeyInstances`), so a key composed again from the row is the text `put` composed for it.
  */
 const readDecodeOf = (field: Schema.Top): ((value: unknown) => Option.Option<unknown>) =>
   Schema.decodeUnknownOption(
-    substituteSchemaDeep(field, { legacyReads: true }) as unknown as Schema.Codec<unknown, unknown>,
+    readingKeyInstances(
+      substituteSchemaDeep(field, { legacyReads: true }),
+    ) as unknown as Schema.Codec<unknown, unknown>,
   )
 
 /**

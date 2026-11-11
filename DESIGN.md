@@ -1829,10 +1829,24 @@ reads it, decoded through the field and encoded again
 (`storedFormOfDeclaration`, in the key form and in `storedFormOfRead`), before
 its text is composed, and composes `some(5)` again. An object is judged by that
 text alone: one whose field decodes the map to the value written is stored, as
-on 1.39.0, and one whose field takes the map as it is (`Schema.Duration`,
-`[object Object]` for `1000 millis`) is refused. 1.39.0 composed the map's own
-text: a `restore` put the item back under `[object object]`, where `get` didn't
-find it, and a delete left its unique-constraint sentinel behind. A list or
+on 1.39.0, and one whose field takes the map as it is composes `[object Object]`
+and is refused. Effect's look-alike declarations (`Schema.Duration`,
+`Schema.BigDecimal`, the time zones, `Schema.UrlParams`, `Schema.SemVer` /
+`Schema.SemVerRange`, the network and DNS record types, a `DateTime` in a
+`Schema.Option` or a `Schema.Result`; "Effect's look-alike declarations on a
+read") take the map as it is, so 1.40.0 refused them all; since 1.41.0 the read
+decode of a key composite rebuilds them as a read does (`readingKeyInstances`,
+`internal/InstanceReads.ts`), so the text composed from a row is `put`'s,
+`1000 millis` for `1000 millis`, and they are stored, under the text 1.39.0
+composed from the value given (`fixtures/lookalike-keys-1.39.0.json`). A
+`BigDecimal` is keyed by `BigDecimal(1.5)`, where 1.39.0 died composing it.
+`Schema.Cookie` and `Schema.Cookies` stay the map in a key and stay refused: a
+cookie's key text is its whole printed form, options and all. 1.39.0 composed
+the map's own text: a `restore` put the item back under `[object object]`,
+where `get` didn't find it, and a delete left its unique-constraint sentinel
+behind. A row 1.39.0's (or 1.40.0's) `restore` left under `[object object]` is
+under a key no value composes; `rekey` leaves it and counts it as
+`unrecognizedKey`. A list or
 struct of `Schema.BigInt` beneath a step (a decoding default, a transformation)
 comes back holding numbers, `[5]` for `[5n]`, which the field refuses; every
 entity read lifts them back (`legacyReads`), and the key form does the same

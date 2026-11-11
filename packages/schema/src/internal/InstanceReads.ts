@@ -16,7 +16,12 @@
  * is returned as it is, the same object, and costs nothing on a read.
  */
 import { Schema, SchemaAST } from "effect"
-import { isReadingDeclaration, readDeclarationOf, readingDeclaration } from "./EffectInstances.js"
+import {
+  type InstanceKind,
+  isReadingDeclaration,
+  readDeclarationOf,
+  readingDeclaration,
+} from "./EffectInstances.js"
 
 type AST = SchemaAST.AST
 
@@ -135,39 +140,57 @@ export const reaching = (test: (ast: AST) => boolean) => {
   }
 }
 
-/** Whether a node holds one of Effect's look-alike declarations anywhere, not yet read. */
-const holds = reaching((ast) => readDeclarationOf(ast) !== undefined && !isReadingDeclaration(ast))
-
-const memo = new WeakMap<AST, AST>()
-
-/** A node with each of Effect's look-alike declarations in it read back as the instance. */
-const reading = (ast: AST): AST => {
-  const known = memo.get(ast)
-  if (known !== undefined) return known
-  const kind = readDeclarationOf(ast)
-  const built =
-    kind !== undefined
-      ? isReadingDeclaration(ast)
-        ? ast
-        : rebuiltChildren(readingDeclaration(ast as SchemaAST.Declaration, kind), reading)
-      : holds(ast)
-        ? rebuiltChildren(ast, reading)
-        : ast
-  memo.set(ast, built)
-  return built
+/**
+ * A read of each of Effect's look-alike declarations of the kinds `takes` names back as a real
+ * instance, memoised per schema; one reader per rule, so each is built once.
+ */
+const readerOf = (takes: (kind: InstanceKind) => boolean) => {
+  const kindOf = (ast: AST): InstanceKind | undefined => {
+    const kind = readDeclarationOf(ast)
+    return kind !== undefined && takes(kind) ? kind : undefined
+  }
+  /** Whether a node holds one of these declarations anywhere, not yet read. */
+  const holds = reaching((ast) => kindOf(ast) !== undefined && !isReadingDeclaration(ast))
+  const memo = new WeakMap<AST, AST>()
+  /** A node with each of these declarations in it read back as the instance. */
+  const reading = (ast: AST): AST => {
+    const known = memo.get(ast)
+    if (known !== undefined) return known
+    const kind = kindOf(ast)
+    const built =
+      kind !== undefined
+        ? isReadingDeclaration(ast)
+          ? ast
+          : rebuiltChildren(readingDeclaration(ast as SchemaAST.Declaration, kind), reading)
+        : holds(ast)
+          ? rebuiltChildren(ast, reading)
+          : ast
+    memo.set(ast, built)
+    return built
+  }
+  const schemas = new WeakMap<Schema.Top, Schema.Top>()
+  return <S extends Schema.Top>(schema: S): S => {
+    const known = schemas.get(schema)
+    if (known !== undefined) return known as S
+    const ast = reading(schema.ast)
+    const read = ast === schema.ast ? schema : (Schema.make<Schema.Top>(ast) as unknown as S)
+    schemas.set(schema, read)
+    return read
+  }
 }
-
-const schemas = new WeakMap<Schema.Top, Schema.Top>()
 
 /**
  * A read schema with each of Effect's look-alike declarations in it read back as a real instance
  * ({@link readingDeclaration}). The schema itself, the same object, when it holds none.
  */
-export const readingInstances = <S extends Schema.Top>(schema: S): S => {
-  const known = schemas.get(schema)
-  if (known !== undefined) return known as S
-  const ast = reading(schema.ast)
-  const read = ast === schema.ast ? schema : (Schema.make<Schema.Top>(ast) as unknown as S)
-  schemas.set(schema, read)
-  return read
-}
+export const readingInstances: <S extends Schema.Top>(schema: S) => S = readerOf(() => true)
+
+/**
+ * {@link readingInstances} for composing a key from a value read back: every kind but a cookie and
+ * a jar of them, which stay the map they're read back as, so a key composite holding one composes
+ * `[object Object]` from a row and is refused at write as it was (`EDD-9128`). A cookie's key text
+ * is its whole printed form, options and all.
+ */
+export const readingKeyInstances: <S extends Schema.Top>(schema: S) => S = readerOf(
+  (kind) => kind !== "Cookie" && kind !== "Cookies",
+)

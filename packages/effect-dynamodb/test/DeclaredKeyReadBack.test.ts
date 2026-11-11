@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Duration, Effect, Exit, Option, Schema } from "effect"
+import { Duration, Effect, Option, Schema } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -137,23 +137,29 @@ describe("a key composite holding a declaration's value, read back as a plain ma
     })
   }
 
-  // `Schema.Duration` takes the map read back as it is, so a key composed again from the row
-  // would hold its text, `[object Object]`, and not `1000 millis`.
-  it.effect("Schema.Duration: refused, as the map it reads back as composes other key text", () =>
+  // `Schema.Duration` took the map read back as it is, so a key composed again from the row held its
+  // text, `[object Object]`, and 1.40.0 refused the composite (EDD-9128). A row read back now hands
+  // the field back as the `Duration` written, whose key text is `put`'s (#242): accepted, and
+  // `restore` and a sentinel's release use the key `put` wrote (`LookalikeKeys.test.ts` has every
+  // look-alike type against 1.39.0's rows).
+  it.effect("Schema.Duration: accepted, as it reads back as the Duration put composed from", () =>
     on(Schema.Duration, [], (db, rows) =>
       Effect.gen(function* () {
         const f = Duration.millis(1000)
-        for (const exit of [
-          yield* Effect.exit(db.entities.Soft.put({ id: "a", f }).asEffect()),
-          yield* Effect.exit(db.entities.Unique.put({ id: "b", f }).asEffect()),
-        ]) {
-          expect(Exit.isFailure(exit)).toBe(true)
-          const text = JSON.stringify(exit)
-          expect(text).toContain("ValidationError")
-          expect(text).toContain("EDD-9128")
-          expect(text).toContain(`Field \\"f\\"`)
-        }
-        expect(rows()).toEqual([])
+        yield* db.entities.Soft.put({ id: "a", f }).asEffect()
+        yield* db.entities.Unique.put({ id: "b", f }).asEffect()
+        expect(keysOf(rows())).toEqual([
+          "$declared#v1#soft#id_a|$declared#v1#soft#f_1000 millis",
+          "$declared#v1#unique#id_b|$declared#v1#unique",
+          "$declared#v1#unique.byf#1000 millis|$declared#v1#unique.byf",
+        ])
+        yield* db.entities.Soft.delete({ id: "a", f }).asEffect()
+        yield* db.entities.Soft.restore({ id: "a", f })
+        expect(keysOf(typed(rows(), "Soft"))).toEqual([
+          "$declared#v1#soft#id_a|$declared#v1#soft#f_1000 millis",
+        ])
+        yield* db.entities.Unique.delete({ id: "b" }).asEffect()
+        expect(typed(rows(), "Unique")).toEqual([])
       }),
     ),
   )
