@@ -7494,6 +7494,28 @@ const makeImpl = <
   // ---------------------------------------------------------------------------
 
   /**
+   * A write's values as its index keys are composed from them (#241): hydration stores a ref
+   * (`team`) in place of its id (`teamId`), and an index keyed by the id (a cascade index) is
+   * composed from the id given, as `put` composes it. Up to 1.40.0 `upsert` and `update` composed
+   * from the hydrated values alone, so an upsert wrote no key for such an index and an update
+   * reassigning the ref kept its old one.
+   */
+  const withRefIds = (
+    hydrated: globalThis.Record<string, unknown>,
+    given: unknown,
+  ): globalThis.Record<string, unknown> => {
+    if (!hasRefs) return hydrated
+    const ids = given as globalThis.Record<string, unknown>
+    let keyed = hydrated
+    for (const ref of resolvedRefs) {
+      if (!Object.hasOwn(ids, ref.idFieldName) || ids[ref.idFieldName] === undefined) continue
+      if (keyed === hydrated) keyed = { ...hydrated }
+      keyed[ref.idFieldName] = ids[ref.idFieldName]
+    }
+    return keyed
+  }
+
+  /**
    * Hydrate ref fields by fetching referenced entities by ID and embedding
    * their core domain data. Returns a new object with ref fields populated.
    *
@@ -8613,7 +8635,7 @@ const makeImpl = <
           entityType,
           entityVersion,
           allIndexes,
-          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+          keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
           keyForm(encodedKey as globalThis.Record<string, unknown>),
           // The branches below know more: the retain path reads the whole item
           // first, so a shard it can compute is not refused here (#183).
@@ -9041,7 +9063,7 @@ const makeImpl = <
             entityType,
             entityVersion,
             allIndexes,
-            keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+            keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
             keyForm(newItem),
             {
               ...(retainRemovedSet === undefined ? {} : { removedSet: retainRemovedSet }),
@@ -9962,7 +9984,7 @@ const makeImpl = <
           entityType,
           entityVersion,
           allIndexes,
-          keyForm(hydratedUpdates as globalThis.Record<string, unknown>),
+          keyForm(withRefIds(hydratedUpdates, encodedUpdates)),
           keyForm(encodedKey as globalThis.Record<string, unknown>),
           {
             ...(removedSet === undefined ? {} : { removedSet }),
@@ -11759,7 +11781,7 @@ const makeImpl = <
           // One request sends every key the input composes: each is the upsert's own.
           const allKeys = yield* upsertKeys(
             stamped,
-            yield* composeAllKeys(stamped, "upsert", ownSchema()),
+            yield* composeAllKeys(withRefIds(stamped, encodedInput), "upsert", ownSchema()),
           )
           yield* refuseUncomposed(encodedInput, "upsert")
           const keyPlan = upsertKeyPlan(allKeys, item, suppliedCreatedAt !== undefined)
