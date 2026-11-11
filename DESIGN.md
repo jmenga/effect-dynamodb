@@ -2513,14 +2513,16 @@ DynamoModel.DateTimeZoned           // Wire: ISO string with offset/zone ↔ Dom
 When wire format ≠ storage format, use `storedAs` with a target schema:
 
 ```typescript
-// Wire: ISO string, DynamoDB: epoch seconds (for TTL)
-DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
+// A model field: a DateTime.Utc stored as epoch seconds (for TTL)
+Schema.DateTimeUtc.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
 
-// Wire: epoch ms, DynamoDB: ISO string
-DynamoModel.DateEpochMs.pipe(DynamoModel.storedAs(DynamoModel.DateString))
+// A timestamp's `schema`: wire ISO string, DynamoDB epoch seconds
+DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds))
 ```
 
-**Type safety:** `storedAs` constrains the storage schema to have the same domain type (`A`) as the field schema. Incompatible combinations are rejected at compile time.
+A date transform model field owns its wire form: `Entity.make` refuses one whose `storedAs` names the other wire kind, and under `Schema.optional` the transform's own form is stored (#232).
+
+**Type safety:** `storedAs` constrains the storage schema to have the same domain type (`A`) as the field schema. Incompatible combinations are rejected at compile time; none of them would be stored as asked (a `DateTime.Zoned` forced to an epoch through a cast is refused by `Entity.make`, kept in its ISO form under `Schema.optional`, or refused at the write). `A` is `storedAs`'s first type parameter, so `storedAs<DateTime.Utc>(DateEpochSeconds)` compiles as it always did. Inferred, the schema returned also carries the storage schema's encoded type (`DynamoModel.StoredAs<W>`, an optional type-only property, so it and the field schema are each assignable to the other's type); given `A` alone, or a storage schema typed `Schema.Schema<A>`, it is the field schema's own type (#236, `test/StoredAsSignature.types.test.ts`).
 
 ### Auto-Detecting Epoch Schema
 
