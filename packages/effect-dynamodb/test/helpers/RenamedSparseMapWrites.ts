@@ -10,9 +10,10 @@
  * condition, and answers its refusal on such a row with a `ValidationError` (`EDD-9150`), nothing
  * written, where the rest of the condition holds on the row; where it doesn't, the upsert fails on
  * the caller's condition, as 1.40.0 did. On a row holding entries, or no row, the guard holds and the upsert does what 1.40.0
- * did. An upsert writing no entry (`counts: {}`), and every upsert of an entity whose sparse map
- * isn't renamed, is sent as 1.40.0 sent it. `fixtures/renamed-sparse-map-upserts-1.40.0.json`
- * holds what the published 1.40.0 did in each case.
+ * did. An upsert writing no entry (`counts: {}`, or no `counts` at all where the model's map is an
+ * `optionalKey`), and every upsert of an entity whose sparse map isn't renamed, is sent as 1.40.0
+ * sent it. `fixtures/renamed-sparse-map-upserts-1.40.0.json` holds what the published 1.40.0 did in
+ * each case, every request whole: a guarded upsert's differs only in the guard (`GUARD`).
  *
  * A copy's source (`pathSet` / `pathSubtract` with `isPath`) writes nothing, so it carries no guard.
  * Spelled as the entry's attribute (`["counts#a"]`) it names that attribute, as 1.40.0 did. Spelled
@@ -34,7 +35,8 @@ import { createPathBuilder } from "../../src/internal/PathBuilder.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
-import { normal, outcomeOf, rowsOf, sentOf } from "./RenamedSparseMap.js"
+import { normal, outcomeOf, rowsOf } from "./RenamedSparseMap.js"
+import { expectDiffersOnly } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: any
@@ -63,6 +65,10 @@ const definitions = () => {
   const unrenamed = DynamoModel.configure(Schema.Struct(fields), {
     counts: { storedAs: DynamoModel.SparseMap() },
   } as never)
+  const optional = DynamoModel.configure(
+    Schema.Struct({ ...fields, counts: Schema.optionalKey(fields.counts) }),
+    { counts: { storedAs: DynamoModel.SparseMap(), field: "sr" } } as never,
+  )
   return {
     Plain: Entity.make({ model: renamed, entityType: "Plain", primaryKey } as never),
     Stamped: Entity.make({
@@ -72,6 +78,7 @@ const definitions = () => {
       timestamps: true,
     } as never),
     Unrenamed: Entity.make({ model: unrenamed, entityType: "Unrenamed", primaryKey } as never),
+    Optional: Entity.make({ model: optional, entityType: "Optional", primaryKey } as never),
   } as Record<string, any>
 }
 
@@ -98,7 +105,7 @@ const runCase = (
         const readBefore = outcomeOf(yield* Effect.exit(db.entities[entity].get({ id: "a" })))
         log.length = 0
         const exit = yield* Effect.exit(Effect.suspend(() => body(db)))
-        const sent = log.map(sentOf)
+        const sent = log.map((request) => wholeOf(request, table.name))
         const read = yield* Effect.exit(db.entities[entity].get({ id: "a" }))
         return {
           before,
@@ -147,7 +154,22 @@ const upserts: ReadonlyArray<
   ],
 ]
 
-/** 1.40.0's request with the form guard beside its own condition. */
+/** Upserts that leave the map out, on `Optional`, whose map is an `optionalKey`. */
+const omitted: ReadonlyArray<
+  readonly [label: string, body: (db: any, entity: string) => any, entries: boolean]
+> = [
+  ["upsert({}), counts omitted", (db, e) => db.entities[e].upsert({ id: "a" }), false],
+  [
+    "upsert({ note: 'n' }), counts omitted",
+    (db, e) => db.entities[e].upsert({ id: "a", note: "n" }),
+    false,
+  ],
+]
+
+/**
+ * 1.40.0's request with the form guard beside its own condition, and the row a refusal returns
+ * (`ReturnValuesOnConditionCheckFailure`), which the caller's own verdict is judged on first.
+ */
 const guarded = (was: any) => {
   const update = was.updateItem
   return {
@@ -158,15 +180,25 @@ const guarded = (was: any) => {
           ? "attribute_not_exists(#fm0)"
           : `${update.ConditionExpression} AND attribute_not_exists(#fm0)`,
       ExpressionAttributeNames: { ...update.ExpressionAttributeNames, "#fm0": "sr" },
+      ReturnValuesOnConditionCheckFailure: "ALL_OLD",
     },
   }
 }
 
+/** The fields the guard changes in a guarded upsert's one request. */
+const GUARD = [
+  "[0].updateItem.ConditionExpression",
+  "[0].updateItem.ExpressionAttributeNames.#fm0",
+  "[0].updateItem.ReturnValuesOnConditionCheckFailure",
+]
+
 export const renamedSparseMapUpsertsSuite = (open: OpenTable) => {
-  for (const entity of ["Plain", "Stamped", "Unrenamed"]) {
+  for (const entity of ["Plain", "Stamped", "Unrenamed", "Optional"]) {
     for (const seed of ["put", "upsert", "none"] as const) {
       const on = seed === "none" ? `${entity}, no row` : `${entity}, a row ${seed} created`
-      for (const [label, body, entries] of upserts) {
+      for (const [label, body, entries] of entity === "Optional"
+        ? [...upserts, ...omitted]
+        : upserts) {
         const name = `${on}: ${label}`
         const was = upsertFixture.cases[name]!
         const renamed = entity !== "Unrenamed"
@@ -187,6 +219,7 @@ export const renamedSparseMapUpsertsSuite = (open: OpenTable) => {
                 return
               }
               expect(captured.sent).toEqual(was.sent.map(guarded))
+              expectDiffersOnly(was.sent, captured.sent, GUARD)
               if (!refused) {
                 expect(captured.outcome).toEqual(was.outcome)
                 expect(captured.rows).toEqual(was.rows)
