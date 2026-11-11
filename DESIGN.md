@@ -3989,7 +3989,9 @@ named by its own walk, joined by `__edd_e__` where the members differ. Through
 1.40.0 a path named the property as written below its first segment: a domain
 spelling wrote a stray attribute no read sees (`meta.amount` beside
 `meta.am`), a condition or filter on it failed whatever the row held, and a
-select of it came back without the value. The stored spelling sends what it
+select of it came back without the value. Such a stray stays on the row,
+unread; `.set({ meta })` writes the struct whole and drops it (pinned in
+`helpers/NestedKeyEncodings.ts`). The stored spelling sends what it
 sent (`test/fixtures/nested-key-encodings-1.40.0.json`,
 `helpers/NestedKeyEncodings.ts`, plain, retained and in a transaction, on the
 recording table and DynamoDB Local). An aggregate `list` filter spelled by a

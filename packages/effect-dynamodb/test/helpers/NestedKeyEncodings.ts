@@ -409,6 +409,54 @@ export const nestedKeyEncodingsSuite = (open: OpenTable) => {
       }),
     )
   }
+  // A stray `meta.amount`, as 1.40.0's `pathSet(["meta", "amount"])` stored it beside `meta.am`: no
+  // read sees it, and a path by either spelling now names `meta.am`. `.set({ meta })` writes the
+  // struct whole, as it always did, so the stray goes with it.
+  for (const entity of ["Plain", "Retained"] as const) {
+    it.effect(`${entity}: a stray meta.amount, cleared by .set({ meta })`, () =>
+      Effect.gen(function* () {
+        const got = yield* onTable(open, 0, MainTable, { entities }, (db, table) =>
+          Effect.gen(function* () {
+            yield* db.entities[entity].put(SEED).asEffect()
+            const raw = yield* Lib.DynamoClient
+            yield* raw.updateItem({
+              TableName: table.name,
+              Key: {
+                pk: { S: `$nk#v1#${entity.toLowerCase()}#id_a` },
+                sk: { S: `$nk#v1#${entity.toLowerCase()}` },
+              },
+              UpdateExpression: "SET #m.#a = :v",
+              ExpressionAttributeNames: { "#m": "meta", "#a": "amount" },
+              ExpressionAttributeValues: { ":v": { N: "11" } },
+            })
+            const stray = rowOf(yield* table.rows, entity)?.meta
+            const readStray = yield* db.entities[entity].get({ id: "a" })
+            yield* db.entities[entity]
+              .update({ id: "a" })
+              .set({ meta: { amount: 6, note: "n" } })
+              .asEffect()
+            return {
+              stray,
+              readStray: readStray.meta,
+              cleared: rowOf(yield* table.rows, entity)?.meta,
+              read: (yield* db.entities[entity].get({ id: "a" })).meta,
+            }
+          }),
+        )
+        expect(got.stray).toEqual({
+          M: {
+            am: { N: "5" },
+            amount: { N: "11" },
+            note: { S: "n" },
+            tg: { L: [{ S: "t" }] },
+          },
+        })
+        expect(got.readStray).toEqual({ amount: 5, note: "n", tags: ["t"] })
+        expect(got.cleared).toEqual({ M: { am: { N: "6" }, note: { S: "n" } } })
+        expect(got.read).toEqual({ amount: 6, note: "n" })
+      }),
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
