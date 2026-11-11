@@ -1377,7 +1377,9 @@ const planZOrderWithin = <A>(args: {
     (part) => part.hash === undefined && prefixValues.has(part.field),
   )
 
-  const renameExpr = entityNaming(entityLike._resolveDbName).renameExpr ?? ((expr: Expr) => expr)
+  const renameExpr =
+    entityNaming(entityLike._resolveDbName, undefined, wholeRowsOf(entityLike)).renameExpr ??
+    ((expr: Expr) => expr)
   const filter =
     filters.length === 0
       ? undefined
@@ -2432,6 +2434,7 @@ interface EntityLike {
   readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
   /** The sparse map a read takes a stored attribute for, if any (#238). */
   readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
+  readonly _entryForms?: ((expr: Expr) => Expr) | undefined
   /**
    * The entity's refs: a `${ref}Id` composite is not stored on the item, but
    * the ref it names is, as a map holding the referenced identifier.

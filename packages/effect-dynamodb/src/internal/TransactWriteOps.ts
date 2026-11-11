@@ -195,9 +195,10 @@ const compileOpCondition = (
 ): ExpressionResult | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond as Record<string, unknown>)
-  // Its operands in the form the attribute holds, as the entity's own write sends them (#242).
+  // Its operands in the form the attribute holds, as the entity's own write sends them (#242), and
+  // an entry of a sparse map a `field:` rename stores whole asked where the row holds it (#238).
   return compileExpr(
-    operandsAsStored(expr, entity._storedFormAt),
+    entity._entryForms(operandsAsStored(expr, entity._storedFormAt)),
     entity._resolveDbName,
   ) as ExpressionResult
 }

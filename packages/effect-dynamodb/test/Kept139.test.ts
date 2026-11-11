@@ -5,7 +5,8 @@
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
- * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts` (the last three against 1.40.0). Connected twin:
+ * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts` (the last
+ * four against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -19,6 +20,7 @@ import { openRecordingTable } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
 import { pathClearSuite } from "./helpers/PathClears.js"
+import { renamedSparseMapSuite } from "./helpers/RenamedSparseMap.js"
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
@@ -78,4 +80,8 @@ describe("a select naming a sparse map beside other paths", () => {
 
 describe("a pathRemove beside another clause in the same field", () => {
   accompaniedClearsSuite(openRecordingTable)
+})
+
+describe("a sparse map a field: rename stores whole", () => {
+  renamedSparseMapSuite(openRecordingTable)
 })

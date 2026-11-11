@@ -634,6 +634,11 @@ export interface WholeRows {
   readonly sparseFields: ReadonlyArray<string>
   readonly mapOf: (attribute: string) => string | undefined
   readonly view: (raw: Record<string, unknown>) => Record<string, unknown>
+  /**
+   * A filter (domain-named) whose conditions on an entry of a sparse map a `field:` rename stores
+   * whole ask the row where it holds the map, as a condition does (`Entity._entryForms`).
+   */
+  readonly entryForms: (expr: Expr) => Expr
 }
 
 /** @internal An entity's {@link WholeRows}, or `undefined` when it has no sparse map field. */
@@ -641,6 +646,7 @@ export const wholeRowsOf = (entity: {
   readonly _sparseFieldNames?: ReadonlyArray<string> | undefined
   readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
   readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
+  readonly _entryForms?: ((expr: Expr) => Expr) | undefined
 }): WholeRows | undefined =>
   entity._sparseFieldNames === undefined ||
   entity._sparseFieldNames.length === 0 ||
@@ -651,6 +657,7 @@ export const wholeRowsOf = (entity: {
         sparseFields: entity._sparseFieldNames,
         mapOf: entity._sparseMapOf,
         view: entity._toDomainView,
+        entryForms: entity._entryForms ?? ((expr) => expr),
       }
 
 /** @internal Whether a selected path names one of `sparseFields` (its first segment, as a field). */
@@ -729,10 +736,13 @@ export const entityNaming = (
   const stored = resolve ?? ((name: string) => name)
   const asStored = (expr: Expr): Expr =>
     storedAt === undefined ? expr : operandsAsStored(expr, storedAt)
+  const forms = wholeRows?.entryForms ?? ((expr: Expr) => expr)
   return {
     ...((resolve !== undefined || storedAt !== undefined) && {
       renameExpr: (expr: Expr) =>
-        resolve === undefined ? asStored(expr) : (renamePaths(asStored(expr), resolve) as Expr),
+        resolve === undefined
+          ? asStored(expr)
+          : (renamePaths(forms(asStored(expr)), resolve) as Expr),
     }),
     ...((resolve !== undefined || wholeRows !== undefined) && {
       selectAs: (query, paths, form) => {
@@ -795,13 +805,17 @@ export const collectionNaming = (
       const heads = [...pathHeads(expr)]
       const first = members[0]
       if (first === undefined) return expr
-      // Each member's operands in the form its attributes hold (#242).
-      const stored = members.map((m) =>
+      // Each member's operands in the form its attributes hold (#242), then its conditions on an
+      // entry of a sparse map a `field:` rename stores whole asking its rows where they hold the
+      // map (#238).
+      const asStoredBy = members.map((m) =>
         m.storedAt === undefined ? expr : operandsAsStored(expr, m.storedAt),
       )
+      const stored = members.map((m, at) => m.wholeRows?.entryForms(asStoredBy[at]!) ?? asStoredBy[at]!)
       // Every member reads the same attributes, each operand in the same form: one expression,
       // as before.
       if (
+        members.every((_, at) => stored[at] === asStoredBy[at]) &&
         members.every(
           (m, at) =>
             heads.every((head) => attributeOf(m, head) === attributeOf(first, head)) &&

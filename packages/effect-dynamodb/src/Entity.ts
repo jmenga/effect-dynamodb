@@ -152,6 +152,7 @@ import {
   parseShorthand,
   parseSimpleShorthand,
   type StoredFormAt,
+  splitByForms,
   toExpr,
 } from "./internal/Expr.js"
 import {
@@ -184,6 +185,7 @@ import {
   entryOfPath,
   type PathModel,
   storedPath,
+  withEntry,
 } from "./internal/PathBuilder.js"
 import { KEY_MAX, KEY_TOP, keyJustBelow } from "./internal/RangePlanner.js"
 import * as Rekey from "./internal/Rekey.js"
@@ -881,6 +883,12 @@ export interface Entity<
    * (`<prefix>#<key>`), or the attribute a `field:` rename stores a map under whole.
    */
   readonly _sparseMapOf: (attribute: string) => string | undefined
+
+  /**
+   * @internal A condition or filter (domain-named) whose conditions on an entry of a sparse map a
+   * `field:` rename stores whole ask the row where it holds the map (#238); any other as given.
+   */
+  readonly _entryForms: (expr: Expr) => Expr
 
   /** @internal Entity schema version baked into composed keys. */
   readonly _entityVersion: number
@@ -2643,6 +2651,97 @@ const makeImpl = <
   /** The sparse map a read takes a stored attribute for: an entry's, or one stored whole. */
   const sparseMapOf = (attribute: string): string | undefined =>
     sparseRenames.get(attribute) ?? sparseEntries.entryOf(attribute)?.field
+  /**
+   * The attribute a `field:` rename stores sparse map `field` under whole, or `undefined` for a map
+   * stored only as one attribute per entry (#238). A row holds such a map whole where `put` wrote
+   * it, and as entries where an update or a plain entity's `upsert` did; a read takes the whole map
+   * whenever the row holds it.
+   */
+  const renamedMapAttribute = (field: string): string | undefined =>
+    Object.hasOwn(sparseFields, field) && Object.hasOwn(data.fieldRenames, field)
+      ? data.fieldRenames[field]
+      : undefined
+  /**
+   * The entry of a sparse map a `field:` rename stores whole that a path names, with the segments
+   * below it (#238): one `.entry()` built, an entry's attribute (`counts#a`) where no model field is
+   * named so, or the map's field with a key below it (`t.counts.a`). The one place that says which
+   * paths such an entry is named by, for an update's writes and for conditions and filters.
+   */
+  const renamedEntryAt = (
+    segments: ReadonlyArray<string | number>,
+  ):
+    | {
+        readonly field: string
+        readonly key: string
+        readonly rest: ReadonlyArray<string | number>
+      }
+    | undefined => {
+    if (sparseRenames.size === 0) return undefined
+    const built = entryOfPath(segments)
+    const head = segments[0]
+    if (built !== undefined) {
+      return renamedMapAttribute(built.field) === undefined
+        ? undefined
+        : { field: built.field, key: built.key, rest: segments.slice(1) }
+    }
+    if (typeof head !== "string") return undefined
+    if (renamedMapAttribute(head) !== undefined) {
+      const key = segments[1]
+      return typeof key === "string" ? { field: head, key, rest: segments.slice(2) } : undefined
+    }
+    if (Object.hasOwn(modelFieldSchemas, head)) return undefined
+    const entry = sparseEntries.entryOf(head)
+    return entry === undefined || renamedMapAttribute(entry.field) === undefined
+      ? undefined
+      : { field: entry.field, key: entry.key, rest: segments.slice(1) }
+  }
+  /**
+   * A condition or filter whose conditions on an entry of a sparse map a `field:` rename stores
+   * whole ask the row where it holds the map (#238): inside the map's attribute when the row holds
+   * it, as the entry's own attribute when it doesn't (`splitByForms`). Any other is returned as it
+   * is, so an entity without such a map sends what it always sent.
+   */
+  const entryForms = (expr: Expr): Expr =>
+    sparseRenames.size === 0
+      ? expr
+      : splitByForms(expr, (segments) => {
+          const entry = renamedEntryAt(segments)
+          if (entry === undefined) return undefined
+          const prefix = sparseFields[entry.field]!.prefix
+          return {
+            holder: [entry.field],
+            whole: [entry.field, entry.key, ...entry.rest],
+            entries: withEntry([`${prefix}#${entry.key}`, ...entry.rest], {
+              field: entry.field,
+              key: entry.key,
+            }),
+          }
+        })
+  /**
+   * Why an update that wrote the entries of renamed sparse map `field` as their own attributes,
+   * without reading the row, was refused: the row holds the map whole, where `put` stores it, and
+   * a read takes that in their place (#238).
+   */
+  const renamedMapRefusal = (field: string): string => {
+    const attribute = renamedMapAttribute(field)!
+    return (
+      `Sparse map "${field}" is stored whole under "${attribute}" on this row, as put stores ` +
+      `it, and this update writes its entries as attributes of their own without reading the ` +
+      `row: a read would take "${attribute}" in their place. Nothing was written. Send the ` +
+      `update in a transaction (Transaction.transactWrite), which reads the row and writes the ` +
+      `entries inside "${attribute}", or put the item whole. [EDD-9150]`
+    )
+  }
+  /**
+   * {@link compileCondition}, its operands in the form the attribute holds (#242), asking an entry
+   * of a renamed sparse map where the row holds it.
+   */
+  const compileOwnCondition = (cond: Expr | ConditionInput | undefined) =>
+    compileCondition(
+      cond === undefined ? undefined : entryForms(operandsAsStored(toExpr(cond), storedFormAt)),
+      resolveDbName,
+      storedFormAt,
+    )
   // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
   // record-based `append`, which bypass the update schema (#133).
   const pathValues = makePathValueEncoder(
@@ -8340,7 +8439,7 @@ const makeImpl = <
             opts.condition,
           )
           let userCondition = andRaw(
-            condition ? compileCondition(condition, resolveDbName, storedFormAt) : undefined,
+            condition ? compileOwnCondition(condition) : undefined,
             projected?.condition,
           )
 
@@ -8357,10 +8456,8 @@ const makeImpl = <
             const over = yield* overTombstone(self, client, tc, item)
             if (Option.isSome(over)) {
               userCondition = andRaw(
-                compileCondition(
+                compileOwnCondition(
                   withGuard(over.value.guard, opts.condition) as Expr | ConditionInput,
-                  resolveDbName,
-                  storedFormAt,
                 ),
                 over.value.term,
               )
@@ -9003,8 +9100,10 @@ const makeImpl = <
     prepared: Effect.Success<ReturnType<typeof prepareUpdate>>,
     mode: DecodeMode,
     /**
-     * The item as already read — consistently — by the caller (`upsert`).
-     * Used instead of reading it again: the write is guarded on it either way.
+     * The item as already read — consistently — by the caller (`upsert`, a transaction's plan).
+     * Used instead of reading it again: the write is guarded on it either way. An update that
+     * reads no row is handed it only to write a renamed sparse map's entries where it holds the
+     * map (#238).
      */
     preRead?: globalThis.Record<string, AttributeValue>,
   ) =>
@@ -9603,7 +9702,7 @@ const makeImpl = <
             }
           }
         }
-        const uc = userCond ? compileCondition(userCond, resolveDbName, storedFormAt) : undefined
+        const uc = userCond ? compileOwnCondition(userCond) : undefined
         if (uc) {
           condParts.push(`(${uc.expression})`)
           Object.assign(writeNames, uc.names)
@@ -10062,6 +10161,7 @@ const makeImpl = <
       // it, or fail — without sending a write that needs the item: an op that
       // read its row missing writes nothing that requires it, which is what
       // `transactWrite`'s planner relies on.
+      let packedRead: globalThis.Record<string, AttributeValue> | undefined
       if (plainWrite && immutables.some((asserted) => asserted.packed)) {
         const stored = yield* readCurrent(tableName, marshalledKey)
         if (stored.Item === undefined) {
@@ -10079,6 +10179,119 @@ const makeImpl = <
         }
         const fallback = fallbackRefusal(operands.fallbacks, stored.Item, evExpected)
         if (fallback !== undefined) return yield* fallback
+        packedRead = stored.Item
+      }
+      // `.removeEntries()` and `.clearMap()` name sparse maps, and `.removeEntries()` the keys a
+      // read reads as their entries: refused before anything is read.
+      for (const op of uState.sparseRemoveEntries ?? []) {
+        if (!hasSparseFields || !(op.field in sparseFields)) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.removeEntries",
+            cause: `field "${op.field}" is not configured as a sparse map`,
+          })
+        }
+        const sparse = sparseFields[op.field]!
+        for (const k of op.keys) {
+          // An entry the reader reads under `k`: never `<prefix>#` itself.
+          if (
+            typeof k !== "string" ||
+            sparseEntries.entryOf(`${sparse.prefix}#${k}`)?.field !== op.field
+          ) {
+            return yield* new ValidationError({
+              entityType,
+              operation: "update.removeEntries",
+              cause:
+                `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}: no stored ` +
+                "attribute is read as its entry under it",
+            })
+          }
+        }
+      }
+      for (const field of uState.sparseClearFields ?? []) {
+        if (!hasSparseFields || !(field in sparseFields)) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.clearMap",
+            cause: `field "${field}" is not configured as a sparse map`,
+          })
+        }
+      }
+      // Sparse-map .clearMap — Get-then-Update helper. Reads the current
+      // item with a consistent read to discover which `<prefix>#*` attrs
+      // exist, then folds the resulting REMOVEs into this same UpdateItem
+      // (below). On a versioned entity the update is conditioned on the version that
+      // read found (`casRead`), so a writer adding a bucket in between makes
+      // it fail rather than survive the clear; a stale `expectedVersion` is
+      // refused before anything is sent. Non-versioned entities are
+      // best-effort (a concurrent writer can add a new bucket between the read
+      // and the update — that bucket survives).
+      let clearRead: globalThis.Record<string, AttributeValue> | undefined
+      if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
+        // Read once for all clearMap fields combined.
+        const clearGetResult = yield* client.getItem({
+          TableName: tableName,
+          Key: marshalledKey,
+          ConsistentRead: true,
+        })
+        clearRead = clearGetResult.Item
+        if (clearGetResult.Item) {
+          if (systemFields.version && casRead === undefined && retainSnapshot === undefined) {
+            yield* checkVersion(clearGetResult.Item, "update")
+            const clearedRaw = fromAttributeMap(clearGetResult.Item) as globalThis.Record<
+              string,
+              unknown
+            >
+            const version = (clearedRaw[systemFields.version] as number | undefined) ?? 0
+            if (evExpected !== undefined && version !== evExpected) {
+              return yield* new OptimisticLockError({
+                entityType,
+                key: encodedKey,
+                expectedVersion: evExpected,
+                actualVersion: version,
+              })
+            }
+            casRead = { raw: clearGetResult.Item, version }
+          }
+          const fallback = fallbackRefusal(operands.fallbacks, clearGetResult.Item)
+          if (fallback !== undefined) return yield* fallback
+        }
+        // If the item doesn't exist, clearMap is a no-op — and the
+        // subsequent UpdateItem's existence condition reports it.
+      }
+      // The row as this update holds it: read above (a retained or versioned read, a packed
+      // immutable's, `clearMap`'s), or handed to it (a transaction's plan). An entry of a sparse map
+      // a `field:` rename stores whole is written where that row holds the map (#238).
+      const held = preRead ?? retainSnapshot?.raw ?? casRead?.raw ?? packedRead ?? clearRead
+      /**
+       * Where this update writes the entries of sparse map `field` (#238): `undefined` for a map
+       * stored only as entries, written as they always were; for one a `field:` rename stores whole,
+       * `"whole"` (inside its attribute) when the row this update holds holds the attribute, else
+       * `"entries"` (each entry its own attribute). Each map written either way is guarded on the
+       * row holding it so ({@link formGuards}), so the entry lands only where a read takes it.
+       */
+      const formGuards = new Map<string, "whole" | "entries">()
+      const formConditions: Array<string> = []
+      const entryForm = (field: string): "whole" | "entries" | undefined => {
+        const attribute = renamedMapAttribute(field)
+        if (attribute === undefined) return undefined
+        const form = held !== undefined && Object.hasOwn(held, attribute) ? "whole" : "entries"
+        formGuards.set(field, form)
+        return form
+      }
+      const mapCounter = { value: 0 }
+      /** The path of an entry held inside its map's attribute, with the segments below it. */
+      const wholeEntryPath = (field: string, key: string, rest: ReadonlyArray<string | number>) =>
+        compilePath([renamedMapAttribute(field)!, key, ...rest], names, "m", mapCounter)
+      /**
+       * The expression path of an attribute a record operation names (`.add({ "counts#a": 1 })`):
+       * inside its map's attribute for an entry of a renamed map the row holds whole, else
+       * `undefined` (the attribute, as before).
+       */
+      const recordEntryPath = (attr: string): string | undefined => {
+        const entry = renamedEntryAt([attr])
+        if (entry === undefined || entryForm(entry.field) !== "whole") return undefined
+        return wholeEntryPath(entry.field, entry.key, entry.rest)
       }
       // Build UpdateExpression
       const setClauses: Array<string> = []
@@ -10126,13 +10339,27 @@ const makeImpl = <
         if (hasSparseFields && attr in sparseFields) {
           if (typeof val !== "object") continue
           const sparse = sparseFields[attr]!
-          for (const [k, v] of Object.entries(val as globalThis.Record<string, unknown>)) {
+          const entries = Object.entries(val as globalThis.Record<string, unknown>)
+          const form = entries.length > 0 ? entryForm(attr) : undefined
+          for (const [k, v] of entries) {
             if (typeof k !== "string" || k.length === 0 || k.includes("#")) {
               return yield* new ValidationError({
                 entityType,
                 operation: "update.sparse",
                 cause: `Sparse map "${attr}": invalid key ${JSON.stringify(k)}`,
               })
+            }
+            if (form === "whole") {
+              const path = wholeEntryPath(attr, k, [])
+              if (hasNoStoredForm(v)) {
+                entryClears.push(path)
+                continue
+              }
+              const valKey = `:u${counter}`
+              values[valKey] = toAttributeValue(v)
+              setClauses.push(`${path} = ${valKey}`)
+              counter++
+              continue
             }
             const nameKey = `#u${counter}`
             names[nameKey] = `${sparse.prefix}#${k}`
@@ -10199,9 +10426,10 @@ const makeImpl = <
         for (const [attr, val] of Object.entries(uState.subtract)) {
           const nameKey = `#u${counter}`
           const valKey = `:u${counter}`
-          names[nameKey] = resolveDbName(attr)
+          const path = recordEntryPath(attr) ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(val)
-          setClauses.push(`${nameKey} = ${nameKey} - ${valKey}`)
+          setClauses.push(`${path} = ${path} - ${valKey}`)
           counter++
         }
       }
@@ -10211,9 +10439,10 @@ const makeImpl = <
         for (const attr of Object.keys(uState.append)) {
           const nameKey = `#u${counter}`
           const valKey = `:u${counter}`
-          names[nameKey] = resolveDbName(attr)
+          const path = recordEntryPath(attr) ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(operands.append[attr])
-          setClauses.push(`${nameKey} = list_append(${nameKey}, ${valKey})`)
+          setClauses.push(`${path} = list_append(${path}, ${valKey})`)
           counter++
         }
       }
@@ -10330,9 +10559,12 @@ const makeImpl = <
         for (const attr of Object.keys(uState.add)) {
           const nameKey = `#a${addClauses.length}`
           const valKey = `:a${addClauses.length}`
-          names[nameKey] = resolveDbName(attr)
+          // An entry held inside its map's attribute is added to there: DynamoDB's ADD takes a
+          // document path, and starts an absent entry from nothing, as it does an attribute.
+          const path = recordEntryPath(attr) ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(operands.add[attr])
-          addClauses.push(`${nameKey} ${valKey}`)
+          addClauses.push(`${path} ${valKey}`)
         }
       }
 
@@ -10341,21 +10573,46 @@ const makeImpl = <
         for (const attr of Object.keys(uState.deleteFromSet)) {
           const nameKey = `#d${deleteClauses.length}`
           const valKey = `:d${deleteClauses.length}`
-          names[nameKey] = resolveDbName(attr)
+          const path = recordEntryPath(attr) ?? nameKey
+          if (path === nameKey) names[nameKey] = resolveDbName(attr)
           values[valKey] = toAttributeValue(operands.deleteFromSet[attr])
-          deleteClauses.push(`${nameKey} ${valKey}`)
+          deleteClauses.push(`${path} ${valKey}`)
         }
       }
 
       // Path-based operations (from typed callback API)
       const pathCounter = { value: 0 }
+      /**
+       * A path operation's path, compiled. An entry of a sparse map a `field:` rename stores whole
+       * is where the row this update holds holds the map ({@link entryForm}): inside its attribute,
+       * or as the entry's own (#238). Any other path as before.
+       */
+      const pathOf = (segments: ReadonlyArray<string | number>, prefix: string): string => {
+        const entry = renamedEntryAt(segments)
+        if (entry === undefined) {
+          return compilePath(segments, names, prefix, pathCounter, resolveDbName)
+        }
+        return entryForm(entry.field) === "whole"
+          ? compilePath(
+              [renamedMapAttribute(entry.field)!, entry.key, ...entry.rest],
+              names,
+              prefix,
+              pathCounter,
+            )
+          : compilePath(
+              [`${sparseFields[entry.field]!.prefix}#${entry.key}`, ...entry.rest],
+              names,
+              prefix,
+              pathCounter,
+            )
+      }
 
       // Path SET operations
       if (uState.pathSets) {
         for (const [i, op] of uState.pathSets.entries()) {
-          const pathExpr = compilePath(op.segments, names, "ps", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "ps")
           if (op.isPath && op.valueSegments) {
-            const srcExpr = compilePath(op.valueSegments, names, "ps", pathCounter, resolveDbName)
+            const srcExpr = pathOf(op.valueSegments, "ps")
             setClauses.push(`${pathExpr} = ${srcExpr}`)
           } else {
             const valKey = `:ps${pathCounter.value++}`
@@ -10368,9 +10625,9 @@ const makeImpl = <
       // Path SUBTRACT operations
       if (uState.pathSubtracts) {
         for (const op of uState.pathSubtracts) {
-          const pathExpr = compilePath(op.segments, names, "psb", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "psb")
           if (op.isPath && op.valueSegments) {
-            const srcExpr = compilePath(op.valueSegments, names, "psb", pathCounter, resolveDbName)
+            const srcExpr = pathOf(op.valueSegments, "psb")
             setClauses.push(`${pathExpr} = ${pathExpr} - ${srcExpr}`)
           } else {
             const valKey = `:psb${pathCounter.value++}`
@@ -10383,7 +10640,7 @@ const makeImpl = <
       // Path APPEND operations
       if (uState.pathAppends) {
         for (const [i, op] of uState.pathAppends.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pa")
           const valKey = `:pa${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathAppends[i])
           setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
@@ -10393,7 +10650,7 @@ const makeImpl = <
       // Path PREPEND operations
       if (uState.pathPrepends) {
         for (const [i, op] of uState.pathPrepends.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pp")
           const valKey = `:pp${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathPrepends[i])
           setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
@@ -10403,7 +10660,7 @@ const makeImpl = <
       // Path if_not_exists operations
       if (uState.pathIfNotExists) {
         for (const [i, op] of uState.pathIfNotExists.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pi")
           const valKey = `:pi${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathIfNotExists[i])
           setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
@@ -10413,7 +10670,7 @@ const makeImpl = <
       // Path REMOVE operations
       if (uState.pathRemoves) {
         for (const segments of uState.pathRemoves) {
-          const pathExpr = compilePath(segments, names, "pr", pathCounter, resolveDbName)
+          const pathExpr = pathOf(segments, "pr")
           removeClauses.push(pathExpr)
         }
       }
@@ -10421,7 +10678,7 @@ const makeImpl = <
       // Path ADD operations
       if (uState.pathAdds) {
         for (const [index, op] of uState.pathAdds.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pad", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pad")
           const valKey = `:pad${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathAdds[index])
           addClauses.push(`${pathExpr} ${valKey}`)
@@ -10431,106 +10688,56 @@ const makeImpl = <
       // Path DELETE operations
       if (uState.pathDeletes) {
         for (const [index, op] of uState.pathDeletes.entries()) {
-          const pathExpr = compilePath(op.segments, names, "pd", pathCounter, resolveDbName)
+          const pathExpr = pathOf(op.segments, "pd")
           const valKey = `:pd${pathCounter.value++}`
           values[valKey] = toAttributeValue(operands.pathDeletes[index])
           deleteClauses.push(`${pathExpr} ${valKey}`)
         }
       }
 
-      // Sparse-map .removeEntries — explicit REMOVE on `<prefix>#<key>`.
-      // Each key emits one REMOVE clause through ExpressionAttributeNames
-      // (the literal "#" survives via compilePath's raw-segment escape).
-      if (uState.sparseRemoveEntries) {
-        for (const op of uState.sparseRemoveEntries) {
-          if (!hasSparseFields || !(op.field in sparseFields)) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.removeEntries",
-              cause: `field "${op.field}" is not configured as a sparse map`,
-            })
+      // Sparse-map .removeEntries — explicit REMOVE on `<prefix>#<key>`, its
+      // map and keys refused above. Each key emits one REMOVE clause through
+      // ExpressionAttributeNames (the literal "#" survives via compilePath's
+      // raw-segment escape); an entry of a renamed map the row holds whole is
+      // removed from inside it (#238).
+      for (const op of uState.sparseRemoveEntries ?? []) {
+        const sparse = sparseFields[op.field]!
+        const form = op.keys.length > 0 ? entryForm(op.field) : undefined
+        for (const k of op.keys) {
+          if (form === "whole") {
+            removeClauses.push(wholeEntryPath(op.field, k, []))
+            continue
           }
-          const sparse = sparseFields[op.field]!
-          for (const k of op.keys) {
-            // An entry the reader reads under `k`: never `<prefix>#` itself.
-            if (
-              typeof k !== "string" ||
-              sparseEntries.entryOf(`${sparse.prefix}#${k}`)?.field !== op.field
-            ) {
-              return yield* new ValidationError({
-                entityType,
-                operation: "update.removeEntries",
-                cause:
-                  `Sparse map "${op.field}": invalid key ${JSON.stringify(k)}: no stored ` +
-                  "attribute is read as its entry under it",
-              })
+          const nameKey = `#sr${removeClauses.length}`
+          names[nameKey] = `${sparse.prefix}#${k}`
+          removeClauses.push(nameKey)
+        }
+      }
+
+      // Sparse-map .clearMap: REMOVE exactly the attributes the read above
+      // found the reader takes as the map's entries — and, for a map a
+      // `field:` rename stores whole, the attribute it holds it in (#238).
+      if (clearRead !== undefined) {
+        const clearItemKeys = Object.keys(clearRead)
+        for (const field of uState.sparseClearFields ?? []) {
+          for (const attrName of clearItemKeys) {
+            if (sparseMapOf(attrName) === field) {
+              const nameKey = `#sc${removeClauses.length}`
+              names[nameKey] = attrName
+              removeClauses.push(nameKey)
             }
-            const nameKey = `#sr${removeClauses.length}`
-            names[nameKey] = `${sparse.prefix}#${k}`
-            removeClauses.push(nameKey)
           }
         }
       }
 
-      // Sparse-map .clearMap — Get-then-Update helper. Reads the current
-      // item with a consistent read to discover which `<prefix>#*` attrs
-      // exist, then folds the resulting REMOVEs into this same UpdateItem.
-      // On a versioned entity the update is conditioned on the version that
-      // read found (`casRead`), so a writer adding a bucket in between makes
-      // it fail rather than survive the clear; a stale `expectedVersion` is
-      // refused before anything is sent. Non-versioned entities are
-      // best-effort (a concurrent writer can add a new bucket between the read
-      // and the update — that bucket survives).
-      if (uState.sparseClearFields && uState.sparseClearFields.length > 0) {
-        for (const field of uState.sparseClearFields) {
-          if (!hasSparseFields || !(field in sparseFields)) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.clearMap",
-              cause: `field "${field}" is not configured as a sparse map`,
-            })
-          }
-        }
-        // Read once for all clearMap fields combined.
-        const clearGetResult = yield* client.getItem({
-          TableName: tableName,
-          Key: marshalledKey,
-          ConsistentRead: true,
-        })
-        if (clearGetResult.Item) {
-          if (systemFields.version && casRead === undefined && retainSnapshot === undefined) {
-            yield* checkVersion(clearGetResult.Item, "update")
-            const clearedRaw = fromAttributeMap(clearGetResult.Item) as globalThis.Record<
-              string,
-              unknown
-            >
-            const version = (clearedRaw[systemFields.version] as number | undefined) ?? 0
-            if (evExpected !== undefined && version !== evExpected) {
-              return yield* new OptimisticLockError({
-                entityType,
-                key: encodedKey,
-                expectedVersion: evExpected,
-                actualVersion: version,
-              })
-            }
-            casRead = { raw: clearGetResult.Item, version }
-          }
-          const fallback = fallbackRefusal(operands.fallbacks, clearGetResult.Item)
-          if (fallback !== undefined) return yield* fallback
-          const clearItemKeys = Object.keys(clearGetResult.Item)
-          for (const field of uState.sparseClearFields) {
-            // Exactly the attributes the reader takes as the map's entries.
-            for (const attrName of clearItemKeys) {
-              if (sparseEntries.entryOf(attrName)?.field === field) {
-                const nameKey = `#sc${removeClauses.length}`
-                names[nameKey] = attrName
-                removeClauses.push(nameKey)
-              }
-            }
-          }
-        }
-        // If the item doesn't exist, clearMap is a no-op — and the
-        // subsequent UpdateItem's existence condition reports it.
+      // Each renamed map whose entries this update writes, guarded on the row holding it the way
+      // they were written (#238): a write made without reading the row is refused, and one made
+      // from a read is refused if the row changed form since.
+      for (const [i, [field, form]] of [...formGuards].entries()) {
+        names[`#fm${i}`] = renamedMapAttribute(field)!
+        formConditions.push(
+          form === "whole" ? `attribute_exists(#fm${i})` : `attribute_not_exists(#fm${i})`,
+        )
       }
 
       // A legacy retain item gets its incarnation token with this write.
@@ -10580,7 +10787,7 @@ const makeImpl = <
       // A plain write already requires the item (`attribute_exists(#exists)`
       // below), so `patch`'s own exists guard would only repeat it.
       const sentCond = plainWrite ? uState.condition : userCond
-      const uc = sentCond ? compileCondition(sentCond, resolveDbName, storedFormAt) : undefined
+      const uc = sentCond ? compileOwnCondition(sentCond) : undefined
       if (uc) {
         condParts.push(`(${uc.expression})`)
         Object.assign(names, uc.names)
@@ -10606,6 +10813,7 @@ const makeImpl = <
           )
         }
       }
+      condParts.push(...formConditions)
       if (casRead !== undefined && systemFields.version) {
         condParts.push(versionIs(casRead.version, names, values, "#casVer", ":casVer"))
         const incarnation = incarnationGuard(casRead.raw, names, values)
@@ -10614,6 +10822,17 @@ const makeImpl = <
       // Sent as built: a condition over DynamoDB's expression limits is
       // DynamoDB's to reject, and is diagnosed naming the caller's part (#144).
       const conditionExpression = condParts.length > 0 ? condParts.join(" AND ") : undefined
+      /**
+       * The renamed sparse map whose entries this update wrote as their own attributes, without
+       * reading the row, to a stored row that holds it whole — what its guard refused (#238).
+       */
+      const storedWholeMap = (stored: globalThis.Record<string, unknown> | undefined) =>
+        stored === undefined
+          ? undefined
+          : [...formGuards].find(
+              ([field, form]) =>
+                form === "entries" && Object.hasOwn(stored, renamedMapAttribute(field)!),
+            )?.[0]
 
       // The top-level attributes this update writes — what `updatedOld` /
       // `updatedNew` return.
@@ -10788,6 +11007,14 @@ const makeImpl = <
                   )
                 : undefined
               if (fallback !== undefined) return fallback
+              const wholeMap = held === undefined ? storedWholeMap(stored) : undefined
+              if (wholeMap !== undefined) {
+                return new ValidationError({
+                  entityType,
+                  operation: "update",
+                  cause: renamedMapRefusal(wholeMap),
+                })
+              }
               return conditionRejection(
                 encodedKey as globalThis.Record<string, unknown>,
                 stored,
@@ -10846,11 +11073,13 @@ const makeImpl = <
     requested: UpdateState,
     /** What {@link prepareUpdate} decided of `requested`, when the caller already ran it. */
     prepared?: Effect.Success<ReturnType<typeof prepareUpdate>>,
+    /** The row as the caller read it, consistently (a transaction's plan): see {@link runPreparedUpdate}. */
+    held?: globalThis.Record<string, AttributeValue>,
   ) => {
     const run = () =>
       prepared === undefined
-        ? runUpdate(key, mode, requested)
-        : runPreparedUpdate(key, prepared, mode)
+        ? runUpdate(key, mode, requested, held)
+        : runPreparedUpdate(key, prepared, mode, held)
     return run().pipe(
       Effect.catchIf(
         (e): e is MissingForCreate => e instanceof MissingForCreate,
@@ -10923,8 +11152,11 @@ const makeImpl = <
     operation: string,
     /** The key, through `encodeKey`. */
     encodedKey: globalThis.Record<string, unknown>,
-    /** The op itself — a factory, because a missing row means running it again. */
-    op: () => Effect.Effect<unknown, E, R>,
+    /**
+     * The op itself — a factory, because a missing row means running it again. Handed the row
+     * when this reads it for the op: see below.
+     */
+    op: (held?: globalThis.Record<string, AttributeValue>) => Effect.Effect<unknown, E, R>,
     request: {
       readonly payload: globalThis.Record<string, unknown>
       /** Values `.add()` / `.subtract()` change by, for the reported reservation. */
@@ -10944,8 +11176,10 @@ const makeImpl = <
     Effect.gen(function* () {
       const primaryKey = composePrimaryKey(encodedKey)
       const ownKey = toAttributeMap(primaryKey)
-      const plan = (rowMissing?: { readonly rowMissing: true }) =>
-        planWrite(operation, op(), ownKey, rowMissing)
+      const plan = (
+        rowMissing?: { readonly rowMissing: true },
+        held?: globalThis.Record<string, AttributeValue>,
+      ) => planWrite(operation, op(held), ownKey, rowMissing)
       const recorded = yield* plan()
       let { items, ownRow } = recorded
       // An op that wrote without reading its row relies on its write's own
@@ -10982,6 +11216,12 @@ const makeImpl = <
           }
           const refused = request.refuse?.(read.Item)
           if (refused !== undefined) return yield* refused
+          // An entry of a sparse map a `field:` rename stores whole is written where the row
+          // holds the map, so the op is planned again holding the row, when it holds one whole:
+          // the op made no read, so this one sends nothing (#238).
+          if ([...sparseRenames.keys()].some((attribute) => Object.hasOwn(read.Item!, attribute))) {
+            ;({ items } = yield* plan(undefined, read.Item))
+          }
         }
       }
       const pkField = config.indexes.primary.pk.field
@@ -11165,7 +11405,7 @@ const makeImpl = <
     planned(
       "transactWrite.update",
       prepared.encodedKey,
-      () => updateOrCreate(key, "native", uState, prepared),
+      (held) => updateOrCreate(key, "native", uState, prepared, held),
       {
         payload: (uState.updates ?? {}) as globalThis.Record<string, unknown>,
         deltas: {
@@ -11236,9 +11476,7 @@ const makeImpl = <
             opts.condition,
           )
           const userCondition =
-            condition && !existenceOnly
-              ? compileCondition(condition, resolveDbName, storedFormAt)
-              : undefined
+            condition && !existenceOnly ? compileOwnCondition(condition) : undefined
           /**
            * What the delete returns: with `returnValues("allOld")`, the item it
            * removed — the one read (every read-first delete is guarded on it) or
@@ -12276,9 +12514,7 @@ const makeImpl = <
             names["#intInc"] = INCARNATION_TOKEN
             condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
           }
-          const uc = opts.condition
-            ? compileCondition(opts.condition, resolveDbName, storedFormAt)
-            : undefined
+          const uc = opts.condition ? compileOwnCondition(opts.condition) : undefined
           if (uc) {
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
@@ -12847,10 +13083,7 @@ const makeImpl = <
       const newObValue = serialisedInput[orderByField]
       // The user's condition is ANDed after the CAS, its names and values
       // after the CAS's, as 1.36 sent them.
-      const uc =
-        userCondition !== undefined
-          ? compileCondition(userCondition, resolveDbName, storedFormAt)
-          : undefined
+      const uc = userCondition !== undefined ? compileOwnCondition(userCondition) : undefined
       const expressionOf = (clauses: ReadonlyArray<string>) =>
         [
           ...(clauses.length > 0 ? [`SET ${clauses.join(", ")}`] : []),
@@ -18628,6 +18861,7 @@ const makeImpl = <
     _sparseFieldNames: Object.keys(sparseFields),
     _toDomainView: toDomainView,
     _sparseMapOf: sparseMapOf,
+    _entryForms: entryForms,
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,

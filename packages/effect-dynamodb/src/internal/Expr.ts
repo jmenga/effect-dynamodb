@@ -670,6 +670,104 @@ const namesNoAttribute = (operand: Operand): boolean =>
 const emptySetOperands = (expr: Expr): ReadonlyArray<Operand> =>
   expr._tag === "eq" || expr._tag === "ne" ? [] : comparedOperands(expr)
 
+/**
+ * The two places a row can hold what one path names (#238): `whole` where the row holds the
+ * attribute `holder` names, `entries` where it doesn't. Both paths, and `holder`, as a path the
+ * expression names (a field's domain name first).
+ */
+export interface PathForms {
+  readonly holder: ReadonlyArray<string | number>
+  readonly whole: ReadonlyArray<string | number>
+  readonly entries: ReadonlyArray<string | number>
+}
+
+/** An expression with each operand replaced by `f` of it. */
+const mapOperands = (expr: Expr, f: (operand: Operand) => Operand): Expr => {
+  switch (expr._tag) {
+    case "eq":
+    case "ne":
+    case "lt":
+    case "lte":
+    case "gt":
+    case "gte":
+      return { ...expr, left: f(expr.left), right: f(expr.right) }
+    case "between":
+      return { ...expr, operand: f(expr.operand), low: f(expr.low), high: f(expr.high) }
+    case "in":
+      return { ...expr, operand: f(expr.operand), values: expr.values.map(f) }
+    case "exists":
+    case "notExists":
+    case "type":
+      return { ...expr, operand: f(expr.operand) }
+    case "beginsWith":
+      return { ...expr, operand: f(expr.operand), prefix: f(expr.prefix) }
+    case "contains":
+      return { ...expr, operand: f(expr.operand), value: f(expr.value) }
+    case "and":
+    case "or":
+    case "not":
+      return expr
+  }
+}
+
+/**
+ * An expression with each condition naming a path a row can hold in two places ({@link PathForms})
+ * asked of both, each beside the test that tells which one the row holds (#238):
+ * `(attribute_exists(sr) AND sr.a = :v) OR (attribute_not_exists(sr) AND counts#a = :v)`. A row
+ * holds one of the two, so the condition is the one the caller wrote, asked where that row holds
+ * the value, and `not()` of it the negation. A condition naming no such path is returned as it is.
+ */
+export const splitByForms = (
+  expr: Expr,
+  formsOf: (segments: ReadonlyArray<string | number>) => PathForms | undefined,
+): Expr => {
+  switch (expr._tag) {
+    // Unchanged, the same expression: a caller can tell it names no such path.
+    case "and":
+    case "or": {
+      const exprs = expr.exprs.map((part) => splitByForms(part, formsOf))
+      return exprs.every((part, i) => part === expr.exprs[i]) ? expr : { ...expr, exprs }
+    }
+    case "not": {
+      const inner = splitByForms(expr.expr, formsOf)
+      return inner === expr.expr ? expr : { ...expr, expr: inner }
+    }
+    default: {
+      const holders = new Map<string, ReadonlyArray<string | number>>()
+      for (const operand of namedOperands(expr)) {
+        if (operand._tag === "value") continue
+        const forms = formsOf(operand.segments)
+        if (forms !== undefined) holders.set(JSON.stringify(forms.holder), forms.holder)
+      }
+      if (holders.size === 0) return expr
+      // Every way the row can hold them: each holder present (whole) or absent (entries).
+      const keys = [...holders.keys()]
+      const branches: Array<Expr> = []
+      for (let mask = 0; mask < 2 ** keys.length; mask++) {
+        const whole = (key: string) => (mask & (1 << keys.indexOf(key))) === 0
+        const tests = keys.map(
+          (key): Expr => ({
+            [ExprTag]: ExprTag,
+            _tag: whole(key) ? "exists" : "notExists",
+            operand: { _tag: "path", segments: holders.get(key)! },
+          }),
+        )
+        const asked = mapOperands(expr, (operand) => {
+          if (operand._tag === "value") return operand
+          const forms = formsOf(operand.segments)
+          if (forms === undefined) return operand
+          return {
+            ...operand,
+            segments: whole(JSON.stringify(forms.holder)) ? forms.whole : forms.entries,
+          }
+        })
+        branches.push({ [ExprTag]: ExprTag, _tag: "and", exprs: [...tests, asked] })
+      }
+      return { [ExprTag]: ExprTag, _tag: "or", exprs: branches }
+    }
+  }
+}
+
 /** A condition or filter as an `Expr`: shorthand records are parsed. */
 export const toExpr = (cond: Expr | ConditionInput): Expr =>
   isExpr(cond) ? cond : parseShorthand(cond)
