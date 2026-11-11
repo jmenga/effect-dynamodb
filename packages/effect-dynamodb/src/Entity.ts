@@ -2339,8 +2339,6 @@ interface ResolvedRef {
   /** The attribute of the referenced entity an id names (`refIdAttribute`). */
   readonly keyField: string
   readonly keySchema: Schema.Top
-  /** Whether `keyField` is its one key composite: false for an entity keyed by more than one. */
-  readonly keyed: boolean
   readonly refEntity: Entity
   readonly refEntityType: string
 }
@@ -7434,23 +7432,6 @@ const makeImpl = <
     Effect.gen(function* () {
       const refsToProcess = refs ?? resolvedRefs
       if (refsToProcess.length === 0) return decoded
-
-      // An entity keyed by more than one composite: no one id names one of its items. Up to
-      // 1.40.0 it was fetched under its identifier, which no key composes from alone, and failed
-      // (`get.decode`, `Missing key`) or died. Refused before anything is fetched.
-      const unkeyed = refsToProcess.find((ref) => !ref.keyed)
-      if (unkeyed !== undefined) {
-        return yield* new ValidationError({
-          entityType,
-          operation: "hydrateRefs",
-          cause: new Error(
-            `[EDD-9158] Entity "${entityType}": ref "${unkeyed.fieldName}" names entity ` +
-              `"${unkeyed.refEntityType}", whose primary key is composed from more than one ` +
-              `attribute, so no "${unkeyed.idFieldName}" names one item to fetch. Key that entity ` +
-              `by one attribute to reference it. Nothing was fetched or written.`,
-          ),
-        })
-      }
 
       // Fetch all refs in parallel
       const hydrated = { ...decoded }

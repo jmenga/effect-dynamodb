@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Exit, Schema } from "effect"
+import { Effect, Exit, Schema, SchemaGetter } from "effect"
 import { describe, expect, it } from "vitest"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
@@ -40,6 +40,14 @@ type Recorded = {
 
 const published = JSON.parse(
   readFileSync(new URL("../fixtures/entity-ref-keys-1.39.0.json", import.meta.url), "utf8"),
+) as { readonly generatedFrom: string; readonly shapes: Record<string, Recorded> }
+
+/** An entity keyed by two composites, one with an encoding default: published 1.40.0's (and 1.39.0's). */
+const published140 = JSON.parse(
+  readFileSync(
+    new URL("../fixtures/entity-ref-keys-encoding-default-1.40.0.json", import.meta.url),
+    "utf8",
+  ),
 ) as { readonly generatedFrom: string; readonly shapes: Record<string, Recorded> }
 
 /** The secondary indexes every table here has. */
@@ -125,6 +133,30 @@ const shapes = {
       seed: { org: "o", code: "TIG", name: "Tigers" },
       teamId: "TIG" as unknown,
       key: { org: "o", code: "TIG" } as Record<string, unknown>,
+    }
+  },
+  "keyed by two composites, one with an encoding default": () => {
+    // `org` is filled in when a key is encoded without it, so `get({ id })` composes the key.
+    const org = Schema.String.pipe(
+      Schema.decodeTo(Schema.optionalKey(Schema.String), {
+        decode: SchemaGetter.passthrough(),
+        encode: SchemaGetter.withDefault(Effect.succeed("acme")),
+      }),
+    )
+    const Team = Schema.Struct({
+      id: Schema.String.pipe(DynamoModel.identifier),
+      org,
+      name: Schema.String,
+    })
+    return {
+      Team,
+      primaryKey: {
+        pk: { field: "pk", composite: ["org"] },
+        sk: { field: "sk", composite: ["id"] },
+      },
+      seed: { id: "t1", org: "acme", name: "Tigers" },
+      teamId: "t1" as unknown,
+      key: { id: "t1" } as Record<string, unknown>,
     }
   },
 } as const
@@ -282,9 +314,12 @@ export const suite = (
   describeIt: (name: string, body: () => void) => void = describe,
 ) =>
   describeIt("an entity-level ref names its entity's key composite", () => {
-    it("the fixture is published 1.39.0's, and holds every shape", () => {
+    it("the fixtures are published 1.39.0's and 1.40.0's, and hold every shape", () => {
       expect(published.generatedFrom).toBe("effect-dynamodb@1.39.0")
-      expect(Object.keys(published.shapes).sort()).toEqual(Object.keys(shapes).sort())
+      expect(published140.generatedFrom).toBe("effect-dynamodb@1.40.0")
+      expect(
+        [...Object.keys(published.shapes), ...Object.keys(published140.shapes)].sort(),
+      ).toEqual(Object.keys(shapes).sort())
     })
 
     it("an entity whose identifier is its key: put and cascade are 1.39.0's, byte for byte", () =>
@@ -395,20 +430,29 @@ export const suite = (
         }),
       ))
 
-    it("an entity keyed by two composites: refused before anything is fetched, cascade as on 1.39.0", () =>
+    // No one id names an item of an entity keyed by two composites, but it's fetched under its
+    // identifier as on 1.40.0: that fails where the other composite has no value of its own and
+    // composes where it has one (an encoding default). Nothing is refused for counting composites.
+    it("an entity keyed by two composites: put fails and the cascade runs as on 1.39.0, byte for byte", () =>
       Effect.runPromise(
         Effect.gen(function* () {
           const before = published.shapes["keyed by two composites"]!
           expect(before.put).toMatchObject({ failed: "ValidationError", operation: "get.decode" })
           const { recorded } = yield* runShape(harness, "keyed by two composites")
-          expect(recorded.put.failed).toBe("ValidationError")
-          expect(recorded.put.operation).toBe("hydrateRefs")
-          expect(recorded.put.cause).toContain("[EDD-9158]")
-          expect(recorded.putRequests).toEqual(before.putRequests)
-          expect(recorded.rows).toEqual(before.rows)
-          expect(recorded.cascade).toEqual(before.cascade)
-          expect(recorded.cascadeRequests).toEqual(before.cascadeRequests)
-          expect(recorded.cascadeRows).toEqual(before.cascadeRows)
+          expect(recorded).toEqual(before)
+        }),
+      ))
+
+    it("an entity keyed by two composites, one with an encoding default: put and cascade are 1.40.0's, byte for byte", () =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          const label = "keyed by two composites, one with an encoding default"
+          const before = published140.shapes[label]!
+          expect(before.put).toEqual({
+            ok: { id: "p1", league: "l", team: { id: "t1", org: "acme", name: "Tigers" } },
+          })
+          const { recorded } = yield* runShape(harness, label)
+          expect(recorded).toEqual(before)
         }),
       ))
 

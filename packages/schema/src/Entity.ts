@@ -38,7 +38,7 @@ import {
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
-import { refIdAttribute, refIdField, refKeyComposite } from "./internal/AggregateSchemas.js"
+import { refIdAttribute, refIdField } from "./internal/AggregateSchemas.js"
 import { bothKindsKeyRefusal, keyFormValueKind } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
@@ -514,8 +514,6 @@ interface ResolvedRef {
   readonly keyField: string
   /** The schema a `${field}Id` is taken as: `keyField`'s own field. */
   readonly keySchema: Schema.Top
-  /** Whether `keyField` is the referenced entity's one key composite, so an id names one item. */
-  readonly keyed: boolean
   readonly refEntity: EntityDefinition
   readonly refEntityType: string
 }
@@ -1288,9 +1286,9 @@ export const buildEntityDefinition = (config: {
 
         // An id names the referenced entity's one key composite, as an aggregate edge's id does
         // (#214, #241): it's fetched, and read back, under that. An entity keyed by more than one
-        // composite has none, so no id names one of its items: `put` refuses it (`EDD-9158`), and
-        // what's read back is read under its identifier, as before.
-        const keyComposite = refKeyComposite(refEntity)
+        // composite has none: its id is fetched, and read back, under its identifier, as up to
+        // 1.40.0, which composes the key wherever the other composites compose without a value
+        // (an encoding default) and fails as it did where they don't.
         const keyField = refIdAttribute(refEntity)!
         return {
           fieldName,
@@ -1298,7 +1296,6 @@ export const buildEntityDefinition = (config: {
           keyField,
           keySchema:
             keyField === idField.name ? idField.schema : (refIdField(refEntity) ?? idField.schema),
-          keyed: keyComposite !== undefined,
           refEntity,
           refEntityType: refEntity.entityType,
         }

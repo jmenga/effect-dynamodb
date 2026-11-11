@@ -432,8 +432,8 @@ export const refKeyComposite = (entity: RefEntity): string | undefined => {
  * The attribute of `entity` an entity-level ref id (`Entity.make({ refs })`'s `${field}Id`) names:
  * its {@link refKeyComposite}, as an aggregate edge's id (#214, #241). It's fetched under that, read
  * back from the stored ref under that (`putValuesOf`, a row check), and a cascade from `entity` is
- * keyed by it. An entity keyed by more than one composite has none, so no id names one of its items
- * (`put` refuses one, `EDD-9158`): its identifier, as up to 1.40.0. `undefined` with neither.
+ * keyed by it. An entity keyed by more than one composite has none: its identifier, as up to
+ * 1.40.0. `undefined` with neither.
  */
 export const refIdAttribute = (entity: RefEntity): string | undefined =>
   refKeyComposite(entity) ?? getIdentifierField(entity.model as Schema.Top)?.name

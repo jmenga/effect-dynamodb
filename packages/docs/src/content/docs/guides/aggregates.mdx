@@ -115,7 +115,7 @@ On `put` and `update`, Entity automatically:
 3. Embeds the entity's core domain data (Schema.Type — no system fields) in the DynamoDB item
 4. Returns `RefNotFound` if any referenced entity doesn't exist
 
-An ID is a value of the referenced entity's key composite, the one attribute its primary key is composed from, and it is fetched under that, as an aggregate edge's ID is. The entity's `identifier` needn't be its key: `teamId` names the team keyed by `id`, even where the team's identifier is `code`. Before 1.41.0 the ID was fetched under the identifier, so a `put` naming such an entity failed with a `ValidationError`. An entity keyed by more than one attribute can't be named by one ID: a `put` or `update` giving one fails with a `ValidationError` (`EDD-9158`) before anything is fetched or written.
+An ID is a value of the referenced entity's key composite, the one attribute its primary key is composed from, and it is fetched under that, as an aggregate edge's ID is. The entity's `identifier` needn't be its key: `teamId` names the team keyed by `id`, even where the team's identifier is `code`. Before 1.41.0 the ID was fetched under the identifier, so a `put` naming such an entity failed with a `ValidationError`. An entity keyed by more than one attribute is fetched under its identifier, as before: that works where the key's other attributes are filled in when the key is encoded (an encoding default), and fails with a `ValidationError` where they aren't.
 
 ```typescript region="ref-not-found" example="guide-aggregates.ts"
   // #region ref-not-found
