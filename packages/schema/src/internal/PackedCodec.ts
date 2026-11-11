@@ -232,7 +232,7 @@ const isPlainObject = (value: object): boolean => {
 export const DATE_MARKER = "~effect/DateTime"
 /** The marker it carried on Effect's betas and early rcs. */
 export const BETA_DATE_MARKER = "~effect/time/DateTime"
-const ZONE_MARKER = "~effect/DateTime/TimeZone"
+export const ZONE_MARKER = "~effect/DateTime/TimeZone"
 
 const isRealDate = (value: unknown): value is DateTime.DateTime =>
   DateTime.isDateTime(value) && !isPlainObject(value)

@@ -4294,6 +4294,41 @@ would have read back. Packed storage doesn't change: `stringifyStrict` refuses a
 `bigint`, so a packed stream's append fails with nothing written, as it did, and a
 number already packed reads lifted.
 
+**Effect's look-alike declarations on a read.** `Schema.Duration`, `Schema.BigDecimal`,
+the time zones, `Schema.Cookie` / `Schema.Cookies`, `Schema.UrlParams`, `Schema.SemVer` /
+`Schema.SemVerRange`, the network and DNS record types, and a `DateTime` in a
+`Schema.Option` or a `Schema.Result` are stored as the map the marshaller makes of an
+instance, and each declaration's guard takes that map back. `readingInstances`
+(`internal/InstanceReads.ts`, schema package) gives the entity read fields, the
+aggregate's assembly schema and a stream's read schemas a copy of each such declaration
+whose parser decides exactly as before and then returns the instance the map stands
+for (`readingDeclaration`, `rebuildStored` in `internal/EffectInstances.ts`). The
+rules: a row is decoded once, and everything a schema runs runs as often as it did;
+the rebuild sits on the declaration node whose parser let the map through, with or
+without an encoding, except behind one of Effect's own codecs, whose step made the
+instance; code inspecting the value (a check, a transformation, a class or declaration
+holding it) sees the instance, which is the one intended change; a union takes the
+member it took. The instance carries every stored property the rebuild made no use of,
+and a value whose instance wouldn't write back what was stored stays the map, so
+writing a row again stores what was read. A schema holding none of these is returned
+as the same object. `effectDeclarationOf` recognises a declaration by its parse
+function, so a `.check()`, an annotation and a brand keep it, and a `Schema.declare`
+of one's own doesn't have it.
+
+**What the marshaller does beyond marshalling** (`Marshaller.ts`). It marshals first,
+exactly as `@aws-sdk/util-dynamodb` does. Only if that throws does it look for empty
+sets to leave out, and for a `BigDecimal` whose cached `normalized` form leads into a
+cycle, which it writes as a fresh decimal (`holdsCachedCycle` reads data descriptors
+and calls no getter, so an item holding none is handled as it always was). Then
+`datingCookies` looks through the marshalled output for a cookie's marker and writes
+the expiry of each of Effect's cookies (by prototype) as ISO text, where a `Date`
+marshals to an empty map; it finds the source cookie by descriptors, calls no getter,
+and touches nothing else. A typed cookie reads the text back as the `Date`
+(`cookieOptions`). Cookies are held to the write-back check like every kind but a
+date, comparing an expiry as the marshaller writes it (`optionsWriteAs`), so a cookie
+1.39.0 wrote with an expiry (an empty map), one holding properties of its own inside
+it, and a jar keyed other than by its cookies' names stay the map.
+
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values
 can. `holdsCustomDeclaration` finds a declaration with no `representation` id (and
@@ -4312,7 +4347,9 @@ that takes the map keeps writing. A value the marshaller refuses is left to
 marshalled groups so a custom `decompose` and packed edges are covered,
 `encodeToWire` on a stream and `outboxItems` for an outbox. A member holding no custom
 declaration has no check object at all, so its requests don't change and it pays
-for the scan alone. `CustomDeclarationWrites.test.ts` fails on a write path that isn't
+for the scan alone. The check decodes what the write marshalled, so a custom
+declaration's parser runs once more on a write of its value than the write's own
+encode runs it: CPU only, with no request (`CustomDeclarationParserRuns.test.ts`). `CustomDeclarationWrites.test.ts` fails on a write path that isn't
 in `test/helpers/CustomDeclarationPaths.ts`, and on a new `Schema.encode` call
 anywhere that writes. Rows already stored aren't touched and still fail on read.
 

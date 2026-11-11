@@ -1,0 +1,1672 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "expires": "2030-01-02T03:04:05.678Z",
+ "entity": {
+  "put": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "f": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     }
+    }
+   ]
+  },
+  "conditionedPut": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "f": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     },
+     "ExpressionAttributeValues": {
+      ":e1": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      }
+     },
+     "ConditionExpression": "#e0 = :e1"
+    }
+   ]
+  },
+  "updateSet": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "updateItem",
+     "ExpressionAttributeValues": {
+      ":u0": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      }
+     },
+     "ConditionExpression": "attribute_exists(#exists)",
+     "UpdateExpression": "SET #u0 = :u0"
+    }
+   ]
+  },
+  "pathSet": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "updateItem",
+     "ExpressionAttributeValues": {
+      ":ps1": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      }
+     },
+     "ConditionExpression": "attribute_exists(#exists)",
+     "UpdateExpression": "SET #ps0 = :ps1"
+    }
+   ]
+  },
+  "listPut": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "l": {
+       "L": [
+        {
+         "M": {
+          "name": {
+           "S": "p"
+          },
+          "value": {
+           "S": "q"
+          },
+          "valueEncoded": {
+           "S": "q"
+          },
+          "options": {
+           "M": {
+            "secure": {
+             "BOOL": true
+            }
+           }
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        },
+        {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "value": {
+           "S": "b c"
+          },
+          "valueEncoded": {
+           "S": "b%20c"
+          },
+          "options": {
+           "M": {
+            "path": {
+             "S": "/"
+            },
+            "expires": {
+             "M": {}
+            },
+            "maxAge": {
+             "M": {
+              "value": {
+               "M": {
+                "_tag": {
+                 "S": "Millis"
+                },
+                "millis": {
+                 "N": "5000"
+                }
+               }
+              },
+              "~effect/Duration": {
+               "S": "~effect/Duration"
+              }
+             }
+            },
+            "httpOnly": {
+             "BOOL": true
+            }
+           }
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        }
+       ]
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     }
+    }
+   ]
+  },
+  "listAppend": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "updateItem",
+     "ExpressionAttributeValues": {
+      ":u0": {
+       "L": [
+        {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "value": {
+           "S": "b c"
+          },
+          "valueEncoded": {
+           "S": "b%20c"
+          },
+          "options": {
+           "M": {
+            "path": {
+             "S": "/"
+            },
+            "expires": {
+             "M": {}
+            },
+            "maxAge": {
+             "M": {
+              "value": {
+               "M": {
+                "_tag": {
+                 "S": "Millis"
+                },
+                "millis": {
+                 "N": "5000"
+                }
+               }
+              },
+              "~effect/Duration": {
+               "S": "~effect/Duration"
+              }
+             }
+            },
+            "httpOnly": {
+             "BOOL": true
+            }
+           }
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        }
+       ]
+      }
+     },
+     "ConditionExpression": "attribute_exists(#exists)",
+     "UpdateExpression": "SET #u0 = list_append(#u0, :u0)"
+    }
+   ]
+  },
+  "jar": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "j": {
+       "M": {
+        "cookies": {
+         "M": {
+          "p": {
+           "M": {
+            "name": {
+             "S": "p"
+            },
+            "value": {
+             "S": "q"
+            },
+            "valueEncoded": {
+             "S": "q"
+            },
+            "options": {
+             "M": {
+              "secure": {
+               "BOOL": true
+              }
+             }
+            },
+            "~effect/http/Cookies/Cookie": {
+             "S": "~effect/http/Cookies/Cookie"
+            }
+           }
+          },
+          "a": {
+           "M": {
+            "name": {
+             "S": "a"
+            },
+            "value": {
+             "S": "b c"
+            },
+            "valueEncoded": {
+             "S": "b%20c"
+            },
+            "options": {
+             "M": {
+              "path": {
+               "S": "/"
+              },
+              "expires": {
+               "M": {}
+              },
+              "maxAge": {
+               "M": {
+                "value": {
+                 "M": {
+                  "_tag": {
+                   "S": "Millis"
+                  },
+                  "millis": {
+                   "N": "5000"
+                  }
+                 }
+                },
+                "~effect/Duration": {
+                 "S": "~effect/Duration"
+                }
+               }
+              },
+              "httpOnly": {
+               "BOOL": true
+              }
+             }
+            },
+            "~effect/http/Cookies/Cookie": {
+             "S": "~effect/http/Cookies/Cookie"
+            }
+           }
+          }
+         }
+        },
+        "~effect/http/Cookies": {
+         "S": "~effect/http/Cookies"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     }
+    }
+   ]
+  },
+  "option": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "o": {
+       "M": {
+        "value": {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "value": {
+           "S": "b c"
+          },
+          "valueEncoded": {
+           "S": "b%20c"
+          },
+          "options": {
+           "M": {
+            "path": {
+             "S": "/"
+            },
+            "expires": {
+             "M": {}
+            },
+            "maxAge": {
+             "M": {
+              "value": {
+               "M": {
+                "_tag": {
+                 "S": "Millis"
+                },
+                "millis": {
+                 "N": "5000"
+                }
+               }
+              },
+              "~effect/Duration": {
+               "S": "~effect/Duration"
+              }
+             }
+            },
+            "httpOnly": {
+             "BOOL": true
+            }
+           }
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        },
+        "_tag": {
+         "S": "Some"
+        },
+        "_op": {
+         "S": "Some"
+        },
+        "~effect/Option": {
+         "M": {}
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     }
+    }
+   ]
+  },
+  "unknown": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "u": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     }
+    }
+   ]
+  },
+  "unknownFirst": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "ua": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     }
+    }
+   ]
+  },
+  "cookieFirst": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "a"
+      },
+      "cu": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "pk": {
+       "S": "$look#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$look#v1#row"
+      }
+     }
+    }
+   ]
+  },
+  "batchPut": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "batchWriteItem",
+     "RequestItems": {
+      "t": [
+       {
+        "PutRequest": {
+         "Item": {
+          "id": {
+           "S": "a"
+          },
+          "f": {
+           "M": {
+            "name": {
+             "S": "a"
+            },
+            "value": {
+             "S": "b c"
+            },
+            "valueEncoded": {
+             "S": "b%20c"
+            },
+            "options": {
+             "M": {
+              "path": {
+               "S": "/"
+              },
+              "expires": {
+               "M": {}
+              },
+              "maxAge": {
+               "M": {
+                "value": {
+                 "M": {
+                  "_tag": {
+                   "S": "Millis"
+                  },
+                  "millis": {
+                   "N": "5000"
+                  }
+                 }
+                },
+                "~effect/Duration": {
+                 "S": "~effect/Duration"
+                }
+               }
+              },
+              "httpOnly": {
+               "BOOL": true
+              }
+             }
+            },
+            "~effect/http/Cookies/Cookie": {
+             "S": "~effect/http/Cookies/Cookie"
+            }
+           }
+          },
+          "__edd_e__": {
+           "S": "Row"
+          },
+          "pk": {
+           "S": "$look#v1#row#id_a"
+          },
+          "sk": {
+           "S": "$look#v1#row"
+          }
+         }
+        }
+       }
+      ]
+     }
+    }
+   ]
+  },
+  "transactionPut": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "transactWriteItems",
+     "TransactItems": [
+      {
+       "Put": {
+        "TableName": "t",
+        "Item": {
+         "id": {
+          "S": "a"
+         },
+         "f": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "value": {
+            "S": "b c"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             },
+             "maxAge": {
+              "M": {
+               "value": {
+                "M": {
+                 "_tag": {
+                  "S": "Millis"
+                 },
+                 "millis": {
+                  "N": "5000"
+                 }
+                }
+               },
+               "~effect/Duration": {
+                "S": "~effect/Duration"
+               }
+              }
+             },
+             "httpOnly": {
+              "BOOL": true
+             }
+            }
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Row"
+         },
+         "pk": {
+          "S": "$look#v1#row#id_a"
+         },
+         "sk": {
+          "S": "$look#v1#row"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "aggregate": {
+  "create": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "transactWriteItems",
+     "TransactItems": [
+      {
+       "Put": {
+        "TableName": "t",
+        "Item": {
+         "id": {
+          "S": "a"
+         },
+         "f": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "value": {
+            "S": "b c"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             },
+             "maxAge": {
+              "M": {
+               "value": {
+                "M": {
+                 "_tag": {
+                  "S": "Millis"
+                 },
+                 "millis": {
+                  "N": "5000"
+                 }
+                }
+               },
+               "~effect/Duration": {
+                "S": "~effect/Duration"
+               }
+              }
+             },
+             "httpOnly": {
+              "BOOL": true
+             }
+            }
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         },
+         "g": {
+          "M": {
+           "c": {
+            "M": {
+             "name": {
+              "S": "a"
+             },
+             "value": {
+              "S": "b c"
+             },
+             "valueEncoded": {
+              "S": "b%20c"
+             },
+             "options": {
+              "M": {
+               "path": {
+                "S": "/"
+               },
+               "expires": {
+                "M": {}
+               },
+               "maxAge": {
+                "M": {
+                 "value": {
+                  "M": {
+                   "_tag": {
+                    "S": "Millis"
+                   },
+                   "millis": {
+                    "N": "5000"
+                   }
+                  }
+                 },
+                 "~effect/Duration": {
+                  "S": "~effect/Duration"
+                 }
+                }
+               },
+               "httpOnly": {
+                "BOOL": true
+               }
+              }
+             },
+             "~effect/http/Cookies/Cookie": {
+              "S": "~effect/http/Cookies/Cookie"
+             }
+            }
+           },
+           "at": {
+            "S": "2025-01-01T00:00:00.000Z"
+           }
+          }
+         },
+         "u": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "value": {
+            "S": "b c"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             },
+             "maxAge": {
+              "M": {
+               "value": {
+                "M": {
+                 "_tag": {
+                  "S": "Millis"
+                 },
+                 "millis": {
+                  "N": "5000"
+                 }
+                }
+               },
+               "~effect/Duration": {
+                "S": "~effect/Duration"
+               }
+              }
+             },
+             "httpOnly": {
+              "BOOL": true
+             }
+            }
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Root"
+         },
+         "pk": {
+          "S": "$look#v1#root#a"
+         },
+         "sk": {
+          "S": "$look#v1#root"
+         }
+        },
+        "ConditionExpression": "attribute_not_exists(#pk)",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ },
+ "stream": {
+  "append": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "pk": {
+       "S": "$look#v1#tally#a"
+      },
+      "sk": {
+       "S": "$look#v1#tally.event_1#0000000001"
+      },
+      "__edd_e__": {
+       "S": "tally.event"
+      },
+      "streamId": {
+       "S": "a"
+      },
+      "version": {
+       "N": "1"
+      },
+      "eventType": {
+       "S": "Noted"
+      },
+      "data": {
+       "M": {
+        "_tag": {
+         "S": "Noted"
+        },
+        "f": {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "value": {
+           "S": "b c"
+          },
+          "valueEncoded": {
+           "S": "b%20c"
+          },
+          "options": {
+           "M": {
+            "path": {
+             "S": "/"
+            },
+            "expires": {
+             "M": {}
+            },
+            "maxAge": {
+             "M": {
+              "value": {
+               "M": {
+                "_tag": {
+                 "S": "Millis"
+                },
+                "millis": {
+                 "N": "5000"
+                }
+               }
+              },
+              "~effect/Duration": {
+               "S": "~effect/Duration"
+              }
+             }
+            },
+            "httpOnly": {
+             "BOOL": true
+            }
+           }
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        },
+        "u": {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "value": {
+           "S": "b c"
+          },
+          "valueEncoded": {
+           "S": "b%20c"
+          },
+          "options": {
+           "M": {
+            "path": {
+             "S": "/"
+            },
+            "expires": {
+             "M": {}
+            },
+            "maxAge": {
+             "M": {
+              "value": {
+               "M": {
+                "_tag": {
+                 "S": "Millis"
+                },
+                "millis": {
+                 "N": "5000"
+                }
+               }
+              },
+              "~effect/Duration": {
+               "S": "~effect/Duration"
+              }
+             }
+            },
+            "httpOnly": {
+             "BOOL": true
+            }
+           }
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        }
+       }
+      },
+      "timestamp": {
+       "S": "2026-11-09T14:43:35.512Z"
+      },
+      "__edd_wt__": {
+       "S": "87b9f265d90bbac46d79fe44d67fe764"
+      }
+     },
+     "ConditionExpression": "attribute_not_exists(pk)"
+    }
+   ]
+  }
+ },
+ "ref": {
+  "splice": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "putItem",
+     "Item": {
+      "targetId": {
+       "S": "t1"
+      },
+      "f": {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "value": {
+         "S": "b c"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          },
+          "maxAge": {
+           "M": {
+            "value": {
+             "M": {
+              "_tag": {
+               "S": "Millis"
+              },
+              "millis": {
+               "N": "5000"
+              }
+             }
+            },
+            "~effect/Duration": {
+             "S": "~effect/Duration"
+            }
+           }
+          },
+          "httpOnly": {
+           "BOOL": true
+          }
+         }
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Target"
+      },
+      "pk": {
+       "S": "$look#v1#target#targetid_t1"
+      },
+      "sk": {
+       "S": "$look#v1#target"
+      }
+     }
+    },
+    {
+     "op": "putItem",
+     "Item": {
+      "id": {
+       "S": "h1"
+      },
+      "target": {
+       "M": {
+        "targetId": {
+         "S": "t1"
+        },
+        "f": {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "value": {
+           "S": "b c"
+          },
+          "valueEncoded": {
+           "S": "b%20c"
+          },
+          "options": {
+           "M": {
+            "path": {
+             "S": "/"
+            },
+            "expires": {
+             "M": {}
+            },
+            "maxAge": {
+             "M": {
+              "value": {
+               "M": {
+                "_tag": {
+                 "S": "Millis"
+                },
+                "millis": {
+                 "N": "5000"
+                }
+               }
+              },
+              "~effect/Duration": {
+               "S": "~effect/Duration"
+              }
+             }
+            },
+            "httpOnly": {
+             "BOOL": true
+            }
+           }
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        }
+       }
+      },
+      "__edd_e__": {
+       "S": "Holder"
+      },
+      "pk": {
+       "S": "$look#v1#holder#id_h1"
+      },
+      "sk": {
+       "S": "$look#v1#holder"
+      }
+     }
+    }
+   ]
+  }
+ },
+ "projection": {
+  "apply": {
+   "outcome": "ok",
+   "requests": [
+    {
+     "op": "transactWriteItems",
+     "TransactItems": [
+      {
+       "Put": {
+        "TableName": "read",
+        "Item": {
+         "orderId": {
+          "S": "o1"
+         },
+         "rev": {
+          "N": "1"
+         },
+         "f": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "value": {
+            "S": "b c"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             },
+             "maxAge": {
+              "M": {
+               "value": {
+                "M": {
+                 "_tag": {
+                  "S": "Millis"
+                 },
+                 "millis": {
+                  "N": "5000"
+                 }
+                }
+               },
+               "~effect/Duration": {
+                "S": "~effect/Duration"
+               }
+              }
+             },
+             "httpOnly": {
+              "BOOL": true
+             }
+            }
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Summary"
+         },
+         "pk": {
+          "S": "$look#v1#summary#orderid_o1"
+         },
+         "sk": {
+          "S": "$look#v1#summary"
+         }
+        },
+        "ConditionExpression": "attribute_not_exists(#g)",
+        "ExpressionAttributeNames": {
+         "#g": "rev"
+        }
+       }
+      },
+      {
+       "Put": {
+        "TableName": "read",
+        "Item": {
+         "pk": {
+          "S": "$look#v1#summary#orderid_o1"
+         },
+         "sk": {
+          "S": "$look#v1#summary#outbox#000000000001#0000"
+         },
+         "__edd_e__": {
+          "S": "Summary#outbox"
+         },
+         "__edd_row_pk__": {
+          "S": "$look#v1#summary#orderid_o1"
+         },
+         "__edd_row_sk__": {
+          "S": "$look#v1#summary"
+         },
+         "effect": {
+          "M": {
+           "c": {
+            "M": {
+             "name": {
+              "S": "a"
+             },
+             "value": {
+              "S": "b c"
+             },
+             "valueEncoded": {
+              "S": "b%20c"
+             },
+             "options": {
+              "M": {
+               "path": {
+                "S": "/"
+               },
+               "expires": {
+                "M": {}
+               },
+               "maxAge": {
+                "M": {
+                 "value": {
+                  "M": {
+                   "_tag": {
+                    "S": "Millis"
+                   },
+                   "millis": {
+                    "N": "5000"
+                   }
+                  }
+                 },
+                 "~effect/Duration": {
+                  "S": "~effect/Duration"
+                 }
+                }
+               },
+               "httpOnly": {
+                "BOOL": true
+               }
+              }
+             },
+             "~effect/http/Cookies/Cookie": {
+              "S": "~effect/http/Cookies/Cookie"
+             }
+            }
+           },
+           "u": {
+            "M": {
+             "name": {
+              "S": "a"
+             },
+             "value": {
+              "S": "b c"
+             },
+             "valueEncoded": {
+              "S": "b%20c"
+             },
+             "options": {
+              "M": {
+               "path": {
+                "S": "/"
+               },
+               "expires": {
+                "M": {}
+               },
+               "maxAge": {
+                "M": {
+                 "value": {
+                  "M": {
+                   "_tag": {
+                    "S": "Millis"
+                   },
+                   "millis": {
+                    "N": "5000"
+                   }
+                  }
+                 },
+                 "~effect/Duration": {
+                  "S": "~effect/Duration"
+                 }
+                }
+               },
+               "httpOnly": {
+                "BOOL": true
+               }
+              }
+             },
+             "~effect/http/Cookies/Cookie": {
+              "S": "~effect/http/Cookies/Cookie"
+             }
+            }
+           }
+          }
+         },
+         "source": {
+          "S": "projection"
+         },
+         "streamId": {
+          "S": "o1"
+         },
+         "version": {
+          "N": "1"
+         },
+         "eventType": {
+          "S": "Noted"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

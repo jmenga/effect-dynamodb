@@ -370,3 +370,9 @@ An update also refuses a `.remove()` of a primary key composite, as it refuses a
 - **A retained entity's `.add()`, `.subtract()`, `.append()` and `.deleteFromSet()` of an entry now change it.** Naming a sparse map's entry by its attribute (`.add({ "data#views": 1 })`) on a `versioned: { retain: true }` entity reported success and left the entry as it was, on 1.39.0 too. A retained `.deleteFromSet()` also no longer shrinks the set in the snapshot of the version before it.
 - **`clearMap` removes exactly the entries a row's reader reads.** On 1.39.0 it also removed an attribute named `<prefix>#` itself, which is no entry and can be a key attribute, and the update then failed.
 - **`removeEntries` takes any key the reader reads**, one holding `#` included. It still refuses the empty key, which names no entry.
+
+## What reads back changed in 1.40
+
+`Schema.Duration`, `Schema.BigDecimal`, the time zones, `Schema.Cookie`, `Schema.UrlParams`, `Schema.SemVer` and the network types read back as real instances, where 1.39 handed back the map each is stored as. Nothing has to move: rows already stored read the same way. Code of yours that inspects one of these values on a read (a `.check()`, a transformation, a declaration holding it) now sees the instance, so a check written against the map's shape answers differently.
+
+Two things change for a cookie. A real `Cookie`'s expiry is now stored as ISO text wherever it's written, untyped fields included; 1.39 stored an empty map and lost it. And a condition on a cookie that has an expiry no longer matches a row 1.39 wrote for it, since that row's expiry was lost. A cookie 1.39 stored with an expiry still reads back as the map it's stored as, as in 1.39, and so does a value holding properties of its own inside a cookie or a jar, so writing what was read stores the row unchanged.

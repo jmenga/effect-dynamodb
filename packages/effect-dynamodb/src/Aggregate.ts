@@ -57,6 +57,7 @@ import {
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { readingInstances } from "@effect-dynamodb/schema/internal/InstanceReads.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { KeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import { isDispatchEligible } from "@effect-dynamodb/schema/internal/PackedCodec.js"
@@ -1628,6 +1629,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
     resolveRef,
     absentReads: true,
   }) as unknown as Schema.Codec<any>
+  // What assembly decodes the rows with: `decodeSchema`, with each of Effect's look-alike
+  // declarations (a `BigDecimal`, a `Duration`, a date in an `Option`, ...) reading back as a real
+  // instance (`readingInstances`). Reads only: the plain state `update` hands a mutation
+  // (`readToPlain`) is `decodeSchema`'s.
+  const assemblySchema = readingInstances(decodeSchema)
   // The same schema for WRITES — `create` input and `update`'s mutated state —
   // with the container `.check()` refinements the substitution rebuilds kept, so
   // a write that breaks one is rejected (#133), and a value is asked as the domain
@@ -1913,7 +1919,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           )
           yield* unpackAggregateItems(rows, dispatchByType, aggregateName)
           yield* assembleAggregate(
-            decodeSchema,
+            assemblySchema,
             rootNode,
             rows,
             contextFields,
@@ -2529,7 +2535,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
       // 1. Assemble current state
       const current = yield* assembleAggregate(
-        decodeSchema,
+        assemblySchema,
         rootNode,
         allItems,
         contextFields,
@@ -2732,7 +2738,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         for (const item of written) stored.set(String(item.sk), item)
       }
       return (yield* assembleAggregate(
-        decodeSchema,
+        assemblySchema,
         rootNode,
         [...stored.values()],
         contextFields,
@@ -2805,7 +2811,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
 
         const current = yield* assembleAggregate(
-          decodeSchema,
+          assemblySchema,
           rootNode,
           allItems,
           contextFields,
@@ -3394,7 +3400,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
 
           const result = yield* assembleAggregate(
-            decodeSchema,
+            assemblySchema,
             rootNode,
             allItems,
             contextFields,
@@ -3719,7 +3725,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               if (allItems.length === 0) return undefined
 
               const result = yield* assembleAggregate(
-                decodeSchema,
+                assemblySchema,
                 rootNode,
                 allItems,
                 contextFields,

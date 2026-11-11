@@ -8,7 +8,9 @@
  *   (or set DYNAMODB_ENDPOINT to another port)
  */
 
+import { readFileSync } from "node:fs"
 import {
+  type AttributeValue,
   DynamoDBClient,
   PutItemCommand,
   ScanCommand,
@@ -37,6 +39,7 @@ import {
   SchemaGetter,
   SemVer,
 } from "effect"
+import * as Cookies from "effect/http/Cookies"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Batch from "../src/Batch.js"
@@ -406,18 +409,15 @@ describeConnected("what a [EDD-9125] refusal points to", () => {
 })
 
 describeConnected("what [EDD-9125] leaves standing, as the modeling guide says", () => {
-  it.effect("a Schema.Duration reads back as a plain object its functions still work on", () =>
+  it.effect("a Schema.Duration reads back as the Duration written", () =>
     onEntity(Schema.Duration, (rows) =>
       Effect.gen(function* () {
         const second = Duration.seconds(1)
         yield* rows.put({ id: "a", f: second }).asEffect()
         const read = (yield* rows.get({ id: "a" })).f
-        expect(Duration.toMillis(read)).toBe(1000)
+        expect(Equal.equals(read, second)).toBe(true)
         expect(Duration.toMillis(Duration.sum(read, second))).toBe(2000)
-        expect(Duration.format(read)).toBe(Duration.format(second))
-        expect(Equal.equals(read, second)).toBe(false)
-        expect(read.pipe).toBeUndefined()
-        expect(Object.getPrototypeOf(read)).toBe(Object.prototype)
+        expect(typeof read.pipe).toBe("function")
       }),
     ),
   )
@@ -504,25 +504,31 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
     ),
   )
 
-  it.effect("a Schema.BigDecimal below 2^53 reads back, and its arithmetic throws", () =>
-    onEntity(Schema.BigDecimal, (rows) =>
-      Effect.gen(function* () {
-        const value = BigDecimal.fromStringUnsafe("1.5")
-        yield* rows.put({ id: "a", f: value }).asEffect()
-        const read = (yield* rows.get({ id: "a" })).f
-        expect(BigDecimal.format(read)).toBe("1.5")
-        expect(() => BigDecimal.sum(read, value)).toThrow("Cannot mix BigInt")
-      }),
-    ),
+  it.effect(
+    "a Schema.BigDecimal reads back as the BigDecimal written, below 2^53 and past it",
+    () =>
+      onEntity(Schema.BigDecimal, (rows) =>
+        Effect.gen(function* () {
+          for (const text of ["1.5", "123456789012345678.9"]) {
+            const value = BigDecimal.fromStringUnsafe(text)
+            yield* rows.put({ id: "a", f: value }).asEffect()
+            const read = (yield* rows.get({ id: "a" })).f
+            expect(BigDecimal.equals(read, value)).toBe(true)
+            expect(BigDecimal.sum(read, value)).toEqual(BigDecimal.sum(value, value))
+          }
+        }),
+      ),
   )
 
-  it.effect("a Schema.BigDecimal once normalised dies at put, and writes nothing", () =>
+  it.effect("a Schema.BigDecimal once normalised is stored as a fresh one of its value is", () =>
     onEntity(Schema.BigDecimal, (rows, tableName) =>
       Effect.gen(function* () {
+        yield* rows.put({ id: "a", f: BigDecimal.fromStringUnsafe("1.5") }).asEffect()
+        const fresh = (yield* rowsOf(tableName))[0]?.f
         const value = BigDecimal.normalize(BigDecimal.fromStringUnsafe("1.5"))
-        const exit = yield* Effect.exit(rows.put({ id: "a", f: value }).asEffect())
-        expect(Exit.isFailure(exit)).toBe(true)
-        expect(yield* rowsOf(tableName)).toEqual([])
+        yield* rows.put({ id: "a", f: value }).asEffect()
+        expect((yield* rowsOf(tableName))[0]?.f).toEqual(fresh)
+        expect(BigDecimal.equals((yield* rows.get({ id: "a" })).f, value)).toBe(true)
       }),
     ),
   )
@@ -539,15 +545,66 @@ describeConnected("what [EDD-9125] leaves standing, as the modeling guide says",
     ),
   )
 
-  it.effect("a Schema.SemVer reads back as a plain object its functions still work on", () =>
+  it.effect("a Schema.SemVer reads back as the SemVer written", () =>
     onEntity(Schema.SemVer, (rows) =>
       Effect.gen(function* () {
         const value = Schema.decodeUnknownSync(Schema.SemVerFromString)("1.2.3")
         yield* rows.put({ id: "a", f: value }).asEffect()
         const read = (yield* rows.get({ id: "a" })).f
         expect(SemVer.format(read)).toBe("1.2.3")
+        expect(Object.getPrototypeOf(read)).toBe(Object.getPrototypeOf(value))
+        expect(Equal.equals(read, value)).toBe(true)
       }),
     ),
+  )
+
+  it.effect(
+    "a Schema.Cookie keeps its expiry, and a condition on it doesn't match a row that lost its own",
+    () =>
+      onEntity(Schema.Cookie, (rows, tableName) =>
+        Effect.gen(function* () {
+          const expires = new Date("2030-01-02T03:04:05.678Z")
+          const cookie = () => Cookies.makeCookieUnsafe("a", "b", { path: "/", expires })
+          yield* rows.put({ id: "a", f: cookie() }).asEffect()
+          const [row] = yield* rowsOf(tableName)
+          expect(row?.f?.M?.options?.M?.expires).toEqual({ S: expires.toISOString() })
+          const read = (yield* rows.get({ id: "a" })).f
+          expect(Cookies.isCookie(read)).toBe(true)
+          expect(read.options.expires).toEqual(expires)
+
+          // A condition on the cookie matches the row holding it.
+          yield* rows
+            .update({ id: "a" })
+            .set({ n: 1 })
+            .condition((t: any, { eq }: any) => eq(t.f, cookie()))
+            .asEffect()
+          // As 1.39.0 stored one, its expiry an empty map: a condition on a cookie with an expiry
+          // doesn't match it, where 1.39.0's matched it whatever its date had been.
+          yield* Effect.promise(() =>
+            raw.send(
+              new UpdateItemCommand({
+                TableName: tableName,
+                Key: { pk: row!.pk!, sk: row!.sk! },
+                UpdateExpression: "SET #f.#o.#e = :lost",
+                ExpressionAttributeNames: { "#f": "f", "#o": "options", "#e": "expires" },
+                ExpressionAttributeValues: { ":lost": { M: {} } },
+              }),
+            ),
+          )
+          const refused = yield* rows
+            .update({ id: "a" })
+            .set({ n: 2 })
+            .condition((t: any, { eq }: any) => eq(t.f, cookie()))
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(refused._tag).toBe("ConditionalCheckFailed")
+          // It reads back as the map 1.39.0 read, and a condition on that matches it.
+          const lost = (yield* rows.get({ id: "a" })).f
+          expect(Object.getPrototypeOf(lost)).toBe(Object.prototype)
+          expect(lost.options.expires).toEqual({})
+          yield* rows.update({ id: "a" }).set({ n: 3 }).condition({ f: lost }).asEffect()
+        }),
+      ),
   )
 
   it.effect("a Schema.HashSet: an empty one reads back, a non-empty one is refused at write", () =>
@@ -1788,4 +1845,154 @@ describeConnected("a many edge's collection is rows, not a stored value", () => 
       ),
     )
   }
+})
+
+describeConnected("a cookie 1.39.0 stored, read and written back", () => {
+  // Rows as published 1.39.0 stored them, and what it did writing back what it read
+  // (`fixtures/cookie-writeback-1.39.0.json`, never regenerated). `CookieWriteBack.test.ts` holds
+  // the same cases on a recording table, which compares maps by their text.
+  type Item = Record<string, AttributeValue>
+  const fixture = JSON.parse(
+    readFileSync(new URL("./fixtures/cookie-writeback-1.39.0.json", import.meta.url), "utf8"),
+  ) as {
+    readonly entity: Record<
+      string,
+      { readonly row: Item; readonly ops: Record<string, { readonly outcome: string }> }
+    >
+    readonly aggregate: {
+      readonly rows: ReadonlyArray<Item>
+      readonly ops: Record<string, { readonly outcome: string; readonly f: unknown }>
+    }
+  }
+  const look = DynamoSchema.make({ name: "look", version: 1 })
+  const FIELDS = { cookie: Schema.Cookie, jar: Schema.Cookies, list: Schema.Array(Schema.Cookie) }
+  const seed = (tableName: string, rows: ReadonlyArray<Item>) =>
+    Effect.promise(() =>
+      Promise.all(rows.map((Item) => raw.send(new PutItemCommand({ TableName: tableName, Item })))),
+    )
+  const outcomeOf = (exit: Exit.Exit<unknown, unknown>) => {
+    if (Exit.isSuccess(exit)) return "ok"
+    const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail") as
+      | { readonly error: { readonly _tag: string; readonly message?: string } }
+      | undefined
+    return failure === undefined
+      ? "defect"
+      : `${failure.error._tag}: ${String(failure.error.message ?? "").slice(0, 160)}`
+  }
+  const OPS: Record<
+    string,
+    { readonly immutable: boolean; readonly run: (rows: any, got: any) => any }
+  > = {
+    putBack: { immutable: false, run: (rows, got) => rows.put(got).asEffect() },
+    setBack: {
+      immutable: false,
+      run: (rows, got) => rows.update({ id: got.id }).set({ f: got.f, n: 2 }).asEffect(),
+    },
+    conditionBack: {
+      immutable: false,
+      run: (rows, got) =>
+        rows.update({ id: got.id }).set({ n: 1 }).condition({ f: got.f }).asEffect(),
+    },
+    unrelated: {
+      immutable: false,
+      run: (rows, got) => rows.update({ id: got.id }).set({ n: 1 }).asEffect(),
+    },
+    immutableSetBack: {
+      immutable: true,
+      run: (rows, got) => rows.update({ id: got.id }).set({ f: got.f, n: 2 }).asEffect(),
+    },
+  }
+
+  for (const [name, pinned] of Object.entries(fixture.entity)) {
+    for (const immutable of [false, true]) {
+      const ops = Object.entries(OPS).filter(([, op]) => op.immutable === immutable)
+      it.effect(`${name}: ${ops.map(([op]) => op).join(", ")}`, () => {
+        const base = Schema.Struct({
+          id: Schema.String,
+          f: FIELDS[name.split(".")[0] as keyof typeof FIELDS] as Schema.Top,
+          n: Schema.optional(Schema.Number),
+        })
+        const Rows = Entity.make({
+          model: immutable
+            ? DynamoModel.configure(base, { f: { immutable: true } } as never)
+            : base,
+          entityType: "Row",
+          primaryKey: keyed,
+        } as never) as any
+        const MainTable = Table.make({ schema: look, entities: { Rows } } as never) as any
+        return onTable(MainTable, (tableName) =>
+          Effect.gen(function* () {
+            const db: any = yield* DynamoClient.make({ entities: { Rows }, tables: { MainTable } })
+            for (const [op, { run }] of ops) {
+              yield* seed(tableName, [pinned.row])
+              const got = yield* db.entities.Rows.get({ id: pinned.row.id!.S })
+              expect([op, outcomeOf(yield* Effect.exit(run(db.entities.Rows, got)))]).toEqual([
+                op,
+                pinned.ops[op]!.outcome,
+              ])
+              const [after] = yield* rowsOf(tableName)
+              expect(after?.f).toEqual(pinned.row.f)
+            }
+          }),
+        )
+      })
+    }
+  }
+
+  it.effect("an aggregate's update of its root, a one edge and a many element", () => {
+    const line = Schema.Struct({
+      lid: Schema.String,
+      f: Schema.Cookie,
+      note: Schema.optional(Schema.String),
+    })
+    const Base = Table.make({ schema: look, entities: {} })
+    const Root = (Aggregate.make as any)(
+      Schema.Struct({
+        id: Schema.String,
+        f: Schema.Cookie,
+        note: Schema.optional(Schema.String),
+        one: Schema.Struct({ f: Schema.Cookie, note: Schema.optional(Schema.String) }),
+        lines: Schema.Array(line),
+      }),
+      {
+        table: Base,
+        schema: look,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { name: "root" },
+        root: { entityType: "Root" },
+        edges: {
+          one: (Aggregate.one as any)({ entityType: "One" }),
+          lines: (Aggregate.many as any)({ entityType: "Line", sk: { composite: ["lid"] } }),
+        },
+      },
+    )
+    const MUTATIONS: Record<string, (state: any) => any> = {
+      noop: (state) => state,
+      rootNote: (state) => ({ ...state, note: "changed" }),
+      oneNote: (state) => ({ ...state, one: { ...state.one, note: "n" } }),
+      lineNote: (state) => ({
+        ...state,
+        lines: state.lines.map((l: any) => (l.lid === "x" ? { ...l, note: "n" } : l)),
+      }),
+    }
+    const cookiesOf = (rows: ReadonlyArray<Item>) =>
+      Object.fromEntries(rows.map((row) => [`${row.__edd_e__!.S}|${row.sk!.S}`, row.f]))
+    return onTable(Base, (tableName) =>
+      Effect.gen(function* () {
+        const db: any = yield* DynamoClient.make({
+          entities: {},
+          aggregates: { Root },
+          tables: { MainTable: { ...Base, aggregates: { Root } } },
+        } as never)
+        for (const [op, mutate] of Object.entries(MUTATIONS)) {
+          yield* seed(tableName, fixture.aggregate.rows)
+          const exit = yield* Effect.exit(
+            db.aggregates.Root.update({ id: "a" }, ({ state }: any) => mutate(state)),
+          )
+          expect([op, outcomeOf(exit)]).toEqual([op, fixture.aggregate.ops[op]!.outcome])
+          expect(cookiesOf(yield* rowsOf(tableName))).toEqual(fixture.aggregate.ops[op]!.f)
+        }
+      }),
+    )
+  })
 })
