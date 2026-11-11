@@ -7474,8 +7474,8 @@ instance).
     rows (`a#<id>` and `b#<id>`, say) can't be told at definition from
     projections sharing rows, and each projection writes only its own
     attributes, so on its own rows they keep their roles, as on 1.39.0.
-    Projections that share rows and swap an attribute's roles are broken, as
-    on 1.39.0, and can't be detected.
+    Projections that share rows and swap an attribute's roles are refused on
+    a row both have written (`EDD-9144`), and only there.
     A checkpoint map stored as a sparse map is compared by its container's
     name, not by the attributes its entries are stored in, and needs nothing
     more: every role is a model field (`EDD-9081`), and `Entity.make` refuses a
@@ -7495,6 +7495,18 @@ instance).
     `drainPending` write no row and don't run it, so a worker providing only
     its outbox's table delivers as on 1.39.0. Projections may share an
     attribute in one role, such as a revision.
+  - **One meaning per attribute on a row two projections write
+    (`EDD-9144`).** On a row whose token records another layout, an attribute
+    that layout keeps as bookkeeping and this projection keeps in another role
+    is refused when the row is read, before the projection uses it (1.39.0
+    and 1.40.0 read one projection's revision as another's checkpoint,
+    reported the event `alreadyApplied` and left the row a tombstone); and a
+    write over the live row that gives such an attribute another value,
+    without keeping it in that role, is refused before anything is sent.
+    Rows only one of them has written refuse nothing: projections writing
+    disjoint rows may give one name different meanings, as `EDD-9133`
+    allows. The read-time refusal comes before `alreadyApplied` is decided,
+    so a redelivery is refused too.
   - **A sparse-map checkpoint field.** Its keys (`<source>#<streamId>`) hold
     `#`, which a sparse map can't store. A tombstone's write is checked as the
     row's write is (`serializeSparseOrFail`, on a copy), so both refuse such a

@@ -3,7 +3,8 @@
  * layout, every projection write, tombstone and rebuild write, and `create` over a tombstone, writes
  * a fresh row token (`__edd_rt__`) conditioned on the one it read, so a write that read the row
  * before another fails and retries. A tombstone, and a write over one, carry the bookkeeping of the
- * other projections that have written the row. A read model with one projection layout carries no token: without
+ * other projections that have written the row, and an attribute holding two meanings on such a row
+ * is refused (`EDD-9144`). A read model with one projection layout carries no token: without
  * `removal` it sends and stores what 1.40.0 did, and with `removal` and no revision its write over a
  * tombstone it read names the tombstone, so it can't replace a row `create` wrote there.
  */
@@ -269,6 +270,58 @@ describe("a row two projections write (#237 §1)", () => {
       }).pipe(Effect.provide(layer))
     },
   )
+})
+
+describe("[EDD-9144] an attribute holding two meanings on a row two projections write (#237 §2)", () => {
+  it.effect("the other's revision is never read as this projection's checkpoint", () => {
+    const { A, B, layer, row } = setup(
+      { checkpoint: "a", revision: "shared", removal: true },
+      { checkpoint: "shared" },
+    )
+    return Effect.gen(function* () {
+      yield* Orders.append({ id: "x" }, [new Cancelled({})], 0)
+      yield* Invoices.append({ id: "x" }, [new Placed({ amount: 5 })], 0)
+      yield* A.apply((yield* Orders.read({ id: "x" }))[0]!)
+      // 1.39.0 and 1.40.0 read A's revision 1 as B's checkpoint: `alreadyApplied`, no write.
+      const error = yield* Effect.flip(B.apply((yield* Invoices.read({ id: "x" }))[0]!))
+      expect(error).toMatchObject({ _tag: "ValidationError" })
+      expect(String((error as { readonly cause?: unknown }).cause)).toContain(
+        `[EDD-9144] EventStore.projection("Invoice" → "Row"): on read model "Row", "shared" is ` +
+          `EventStore.projection("Order" → "Row")'s revision on a row ` +
+          `EventStore.projection("Order" → "Row") has written, and this projection's checkpoint.`,
+      )
+      expect(row("x")?.__edd_e__).toBe("Row#tombstone")
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("a write changing the other's checkpoint is refused before anything is sent", () => {
+    // A keeps `shared` as data; B keeps it as its checkpoint.
+    const { Rows, B, layer, row } = setup(
+      { checkpoint: "a", revision: "ra" },
+      { checkpoint: "shared" },
+    )
+    return Effect.gen(function* () {
+      yield* Invoices.append({ id: "x" }, [new Placed({ amount: 5 })], 0)
+      yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 })], 0)
+      yield* B.apply((yield* Invoices.read({ id: "x" }))[0]!)
+      const before = row("x")
+      const changing = EventStore.projection({
+        stream: Orders,
+        readModel: Rows,
+        key: (id: { readonly id: string }) => ({ id: id.id }),
+        initial: (id: { readonly id: string }): Row => ({ id: id.id, total: 0 }),
+        evolve: (state: Row) => Effect.succeed({ ...state, shared: 7 }),
+        checkpoint: "a",
+        revision: "ra",
+      })
+      const error = yield* Effect.flip(changing.apply((yield* Orders.read({ id: "x" }))[0]!))
+      expect(String((error as { readonly cause?: unknown }).cause)).toContain(
+        `this write changes "shared", which is EventStore.projection("Invoice" → "Row")'s ` +
+          `checkpoint, on a row EventStore.projection("Invoice" → "Row") has written.`,
+      )
+      expect(row("x")).toEqual(before)
+    }).pipe(Effect.provide(layer))
+  })
 })
 
 describe("a read model with one projection layout", () => {

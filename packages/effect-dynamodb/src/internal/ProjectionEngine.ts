@@ -52,6 +52,7 @@ import {
   Duration as Dur,
   type Duration,
   Effect,
+  Equal,
   Option,
   Random,
   Result,
@@ -389,6 +390,37 @@ interface Row {
   readonly createdAt: unknown
   /** The item as read: its row token, and another projection's bookkeeping as stored (#237). */
   readonly item?: Record<string, AttributeValue> | undefined
+}
+
+/**
+ * Two decoded values alike: primitives by `Object.is`, arrays and plain records entry by entry,
+ * anything else by `Equal.equals`.
+ */
+const sameValue = (a: unknown, b: unknown): boolean => {
+  if (Object.is(a, b)) return true
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return (
+      Array.isArray(a) &&
+      Array.isArray(b) &&
+      a.length === b.length &&
+      a.every((v, i) => sameValue(v, b[i]))
+    )
+  }
+  const plain = (v: object) => {
+    const proto = Object.getPrototypeOf(v)
+    return proto === Object.prototype || proto === null
+  }
+  if (plain(a) && plain(b)) {
+    const x = a as Record<string, unknown>
+    const y = b as Record<string, unknown>
+    const keys = Object.keys(x)
+    return (
+      keys.length === Object.keys(y).length &&
+      keys.every((k) => Object.hasOwn(y, k) && sameValue(x[k], y[k]))
+    )
+  }
+  return Equal.equals(a, b)
 }
 
 /** A table's service, as an entity or an outbox names it. */
@@ -1896,6 +1928,12 @@ export const makeEngine = (config: EngineConfig) => {
     const fromScratch = options?.fromScratch === true
     const attempt = Effect.gen(function* () {
       const row = yield* readRow(key)
+      // An attribute this projection keeps that another, which has written the row, keeps in
+      // another role would be read in the wrong one (`[EDD-9144]`).
+      const misread = sharedMeaning(row)
+      if (misread !== undefined) {
+        return yield* new ValidationError({ entityType, operation: config.label, cause: misread })
+      }
       type Plan = {
         readonly work: InstanceWork
         readonly slot: Slot
@@ -2188,13 +2226,21 @@ export const makeEngine = (config: EngineConfig) => {
               }
         // The bookkeeping of the other projections that have written the row (`carriedOf`): over
         // a tombstone it replaces what `initial` gave it; over a live row it fills what the state
-        // left out (a `toItem` that drops it, say).
+        // left out (a `toItem` that drops it, say), and a change to it is refused (`[EDD-9144]`).
         // A rebuild over a live row carries none: it drops the other projections' contributions to
         // the state, so they lose their checkpoints too and apply again.
         let carry = noCarry
         if (Option.isSome(row) && row.value.tombstone) {
           carry = { attributes: carriedOf(row, "row"), fill: {} }
         } else if (Option.isSome(row) && !fromScratch) {
+          const changed = sharedMeaning(row, mapped)
+          if (changed !== undefined) {
+            return yield* new ValidationError({
+              entityType,
+              operation: config.label,
+              cause: changed,
+            })
+          }
           carry = { attributes: {}, fill: carriedOf(row, "row") }
         }
         written = yield* writeRow(key, Option.some(mapped), {}, row, enqueued, nextRevision, carry)
@@ -2250,6 +2296,43 @@ export const makeEngine = (config: EngineConfig) => {
       }
     }
     return out
+  }
+
+  /**
+   * `[EDD-9144]` (#237): an attribute holding two meanings on `row`. Another projection that has
+   * written the row (`writtenBy`) keeps it as bookkeeping and this projection keeps it in another
+   * role, so each would read the other's value as its own; or, given `item` (what a write over the
+   * live row stores), this write gives it another value than the row holds without keeping it in
+   * that role. The problem, or `undefined`. On rows only one of them writes nothing is refused:
+   * projections writing disjoint rows may give one name different meanings.
+   */
+  const sharedMeaning = (
+    row: Option.Option<Row>,
+    item?: Record<string, unknown>,
+  ): string | undefined => {
+    for (const { layout, field, role, stored } of writtenBy(row)) {
+      const mine = ownRoles.get(stored)
+      if (mine?.has(role)) continue
+      if (mine !== undefined) {
+        return (
+          `[EDD-9144] ${config.label}: on read model "${entityType}", "${field}" is ` +
+          `${layout.label}'s ${role} on a row ${layout.label} has written, and this ` +
+          `projection's ${[...mine].join(" and ")}. An attribute holds one meaning on a row two ` +
+          "projections write: give each meaning its own field."
+        )
+      }
+      if (item === undefined || Option.isNone(row) || row.value.tombstone) continue
+      const value = item[field]
+      const held = Object.hasOwn(row.value.values, field) ? row.value.values[field] : undefined
+      if (value === undefined || sameValue(value, held)) continue
+      return (
+        `[EDD-9144] ${config.label}: on read model "${entityType}", this write changes ` +
+        `"${field}", which is ${layout.label}'s ${role}, on a row ${layout.label} has written. ` +
+        "An attribute holds one meaning on a row two projections write: give each meaning its " +
+        "own field."
+      )
+    }
+    return undefined
   }
 
   /**
