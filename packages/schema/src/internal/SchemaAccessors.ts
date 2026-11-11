@@ -1512,3 +1512,125 @@ export const pathIsRequired = (
     typeof last === "number" ? positionRemoval(ends, last) : propertyRemoval(ends, last)
   return removal === "required"
 }
+
+/**
+ * What an update writes an operand of at a path below a field: a value (`pathSet`,
+ * `pathIfNotExists`), or elements added to a list (`pathAppend`, `pathPrepend`, `.append()`).
+ */
+export type OperandKind = "value" | "elements"
+
+/**
+ * The ways a value written at the end of a path is read, through the nodes {@link modelled}
+ * models, collected into `readers`; `false` once the walk meets anything it can't say exactly.
+ *
+ * The position itself is read by whatever node is there, transformed, checked or declared: it is
+ * the read's own. Above it, each segment is taken as DynamoDB takes it:
+ *
+ * - a struct's property, declared on the struct. One it doesn't declare isn't read at all, so any
+ *   value there reads, and neither can `__proto__` be judged;
+ * - a record's value, under any key but `__proto__`;
+ * - a list's element. Below the end, an element that is there: the tuple's at that position, or
+ *   the rest's past them. At the end, DynamoDB writes past a list's last element at its end, so a
+ *   position is known only where it lands on one reader whatever the length: a position every
+ *   value holds, any position of an array, or one past the elements of a tuple holding nothing
+ *   optional and a rest;
+ * - a union's members and a suspension's schema, each as itself.
+ *
+ * A way the path can't take (a property of a list or a scalar, a position of a map) adds nothing:
+ * DynamoDB refuses the write on such a value.
+ */
+const readersBelow = (
+  ast: SchemaAST.AST,
+  segments: ReadonlyArray<string | number>,
+  readers: Array<SchemaAST.AST>,
+  seen: ReadonlySet<SchemaAST.AST> = new Set(),
+): boolean => {
+  const [head, ...rest] = segments
+  if (head === undefined) {
+    readers.push(ast)
+    return true
+  }
+  const node = seen.has(ast) ? undefined : modelled(ast)
+  if (node === undefined) return false
+  if (node._tag === "Union" || node._tag === "Suspend") {
+    const within = new Set(seen).add(ast)
+    return (node._tag === "Union" ? node.members : [node.suspended]).every((member) =>
+      readersBelow(member, segments, readers, within),
+    )
+  }
+  if (node._tag === "Struct") {
+    if (typeof head !== "string") return true
+    const property = node.ast.propertySignatures.find((signature) => signature.name === head)
+    return property !== undefined && head !== "__proto__"
+      ? readersBelow(property.type, rest, readers)
+      : false
+  }
+  if (node._tag === "Record") {
+    if (typeof head !== "string") return true
+    return head === "__proto__" ? false : readersBelow(node.value, rest, readers)
+  }
+  if (node._tag === "List") {
+    if (typeof head !== "number") return true
+    const { elements, rest: tail } = node.ast
+    const required = elements.filter((element) => !SchemaAST.isOptional(element)).length
+    if (rest.length > 0 || head < required) {
+      const element = elements[head] ?? (head >= elements.length ? tail[0] : undefined)
+      return element === undefined ? true : readersBelow(element, rest, readers)
+    }
+    const element = required === elements.length && head >= elements.length ? tail[0] : undefined
+    return element === undefined ? false : readersBelow(element, rest, readers)
+  }
+  return true
+}
+
+/**
+ * The element reader of every list a value at the end of a path can be, through unions and
+ * suspensions, collected into `readers`; `false` for a list that isn't one array (a tuple: where
+ * added elements land depends on its length) or anything the walk doesn't model. A struct, a
+ * record and a scalar add nothing: DynamoDB refuses to add elements to one.
+ */
+const elementReaders = (
+  ast: SchemaAST.AST,
+  readers: Array<SchemaAST.AST>,
+  seen: ReadonlySet<SchemaAST.AST> = new Set(),
+): boolean => {
+  const node = seen.has(ast) ? undefined : modelled(ast)
+  if (node === undefined) return false
+  if (node._tag === "Union" || node._tag === "Suspend") {
+    const within = new Set(seen).add(ast)
+    return (node._tag === "Union" ? node.members : [node.suspended]).every((member) =>
+      elementReaders(member, readers, within),
+    )
+  }
+  if (node._tag !== "List") return true
+  const [element, ...more] = node.ast.rest
+  if (node.ast.elements.length > 0 || element === undefined || more.length > 0) return false
+  readers.push(element)
+  return true
+}
+
+/**
+ * What reads an operand an update writes at `segments` below a field whose READ schema is
+ * `field`: for a value, the node at that position, one for each way the schema has to it; for
+ * elements, each array's element there. `undefined` when the walk can't say exactly, or no value
+ * holds the position (DynamoDB refuses such a write): the operand is then judged as 1.39.0
+ * judged it.
+ *
+ * A row reads only where a reader reads what's written, so an operand none of them reads is one
+ * no row holding it reads ({@link modelled} lists what the walk passes through; the rest is
+ * `undefined`). An operand one of them reads may still be wrong for the member a row holds, as
+ * it always was.
+ */
+export const readersAt = (
+  field: Schema.Top,
+  segments: ReadonlyArray<string | number>,
+  kind: OperandKind,
+): ReadonlyArray<SchemaAST.AST> | undefined => {
+  const at: Array<SchemaAST.AST> = []
+  if (!readersBelow(field.ast, segments, at)) return undefined
+  const readers: Array<SchemaAST.AST> = []
+  if (kind === "value") readers.push(...at)
+  else if (!at.every((node) => elementReaders(node, readers))) return undefined
+  const distinct = [...new Set(readers)]
+  return distinct.length === 0 ? undefined : distinct
+}

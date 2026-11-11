@@ -69,7 +69,9 @@ import {
   type AbsentReading,
   absentReading,
   absentStored,
+  type OperandKind,
   pathIsRequired,
+  readersAt,
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
@@ -134,6 +136,7 @@ import {
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
 import { BASE_DELAY_MS, MAX_RETRIES } from "./internal/Hydrate.js"
+import { judgeOperand, type OperandVerdict } from "./internal/OperandReaders.js"
 import {
   decodeImage,
   imageEntityType,
@@ -3452,6 +3455,81 @@ const makeImpl = <
     return undefined
   }
 
+  /** Each field as a row's read decodes it (`decodeRecord`), keyed by domain name. */
+  const readFieldSchemas = (getSchemaFields(schemas.recordSchema as unknown as Schema.Top) ??
+    {}) as globalThis.Record<string, Schema.Top>
+  const readFieldSchema = (field: string): Schema.Top | undefined =>
+    Object.hasOwn(readFieldSchemas, field) ? readFieldSchemas[field] : undefined
+
+  /**
+   * Where a row's read takes an operand written at `segments` (#236): the read schema of the field
+   * it decodes the attribute as, and the segments below it there. `undefined` where that isn't
+   * one field exactly as `decodeRecord` reads it (an attribute that isn't a model field's, a
+   * packed or hidden field, a sparse map written whole, a stored name another field also
+   * claims). A path's first segment holding `#` names an attribute as given (`compilePath`); a
+   * record op's key is resolved as the expression compiles it. A sparse map's entry is read in
+   * its field's map under its key, and is encoded by the model at that position (`modelPath`).
+   */
+  const readPosition = (
+    segments: ReadonlyArray<string | number>,
+    naming: "path" | "field",
+  ):
+    | {
+        readonly reader: Schema.Top
+        readonly below: ReadonlyArray<string | number>
+        readonly modelPath?: ReadonlyArray<string | number>
+      }
+    | undefined => {
+    const [head, ...below] = segments
+    if (typeof head !== "string") return undefined
+    const literal = naming === "path" && head.includes("#")
+    const attribute = literal || !isModelField(head) ? head : resolveDbName(head)
+    if (typeof attribute !== "string") return undefined
+    const entry = hasSparseFields ? sparseEntries.entryOf(attribute) : undefined
+    if (entry !== undefined) {
+      if (Object.hasOwn(data.packedFields, entry.field)) return undefined
+      const reader = readFieldSchema(entry.field)
+      return reader === undefined
+        ? undefined
+        : { reader, below: [entry.key, ...below], modelPath: [entry.field, entry.key, ...below] }
+    }
+    if (literal || !isModelField(head)) return undefined
+    if (Object.hasOwn(data.packedFields, head) || Object.hasOwn(sparseFields, head))
+      return undefined
+    // The attribute is read as this field alone.
+    if (modelFieldStoredIn(attribute) !== head) return undefined
+    if (attribute !== head && isModelField(attribute)) return undefined
+    const reader = readFieldSchema(head)
+    return reader === undefined ? undefined : { reader, below }
+  }
+
+  /**
+   * An operand as a row's read takes it (#236, `judgeOperand`): where its position is read
+   * exactly, what 1.40.0 sends (`encoded`, past 1.40.0's own checks) is sent unless no row holding
+   * it reads; elsewhere it is sent as 1.40.0 sent it.
+   */
+  const operandAsRead = (
+    segments: ReadonlyArray<string | number>,
+    naming: "path" | "field",
+    kind: OperandKind,
+    value: unknown,
+    encoded: unknown,
+  ): OperandVerdict => {
+    const position = readPosition(segments, naming)
+    const readers =
+      position === undefined ? undefined : readersAt(position.reader, position.below, kind)
+    if (position === undefined || readers === undefined) return { encoded, issue: undefined }
+    const { modelPath } = position
+    return judgeOperand(readers, kind, value, encoded, () => {
+      if (modelPath === undefined) return []
+      try {
+        return [encodePathValue(modelPath, value, kind).encoded]
+      } catch {
+        return []
+      }
+    })
+  }
+
   /**
    * An update's operands written as values of its fields — `.append()`'s entries and the values of
    * `pathSet` (a copy excepted), `pathAppend`, `pathPrepend` and `pathIfNotExists` — in the form
@@ -3465,7 +3543,9 @@ const makeImpl = <
     for (const [field, value] of Object.entries(uState.append ?? {})) {
       const { encoded, issue } = encodePathValue([field], value, "elements")
       if (issue !== undefined) return { operation: "update.append", issue }
-      append[field] = encoded
+      const read = operandAsRead([field], "field", "elements", value, encoded)
+      if (read.issue !== undefined) return { operation: "update.append", issue: read.issue }
+      append[field] = read.encoded
     }
     const each = (
       operation: string,
@@ -3490,7 +3570,9 @@ const makeImpl = <
         }
         const { encoded, issue } = encodePathValue(op.segments, op.value, kind)
         if (issue !== undefined) return { operation, issue }
-        values.push(encoded)
+        const read = operandAsRead(op.segments, "path", kind, op.value, encoded)
+        if (read.issue !== undefined) return { operation, issue: read.issue }
+        values.push(read.encoded)
       }
       return values
     }

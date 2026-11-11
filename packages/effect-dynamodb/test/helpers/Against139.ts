@@ -84,11 +84,23 @@ export const wrote = (outcome: Outcome): boolean =>
  *   1.39.0 renamed it as if it were a top-level field (`count`, stored as `renamed`), so it wrote
  *   another property, and the row the update leaves reads differently.
  *
+ * - `"refuses what wouldn't read"` (#236): 1.39.0 sent an operand no row holding it reads, at a
+ *   position the read schema resolves exactly (a sparse map's entry, a suspended or branded
+ *   schema), and wrote a row that didn't read. The operand is refused now, with nothing sent;
+ * - `"stores what reads"` (#236): the same, for an operand only its encoded form is valid for.
+ *   The same requests are sent, holding the operand as its reader reads it back (`"7"`, not `7`:
+ *   `stored` names the two forms), and the row reads.
+ *
  * And for every case: an update that wrote a row its reader then couldn't decode failed with a
  * `ValidationError` whose operation was `decode`; the release branch reports the same failure as
  * operation `update`, saying the update was applied.
  */
-export type Since139 = "reads" | "reads the entry" | "names the property"
+export type Since139 =
+  | "reads"
+  | "reads the entry"
+  | "names the property"
+  | "refuses what wouldn't read"
+  | "stores what reads"
 
 /** An update that was written and whose row then didn't decode, in either release's words. */
 const writtenUnreadable = (outcome: Outcome): boolean =>
@@ -100,18 +112,53 @@ const writtenUnreadable = (outcome: Outcome): boolean =>
     (outcome.failure.operation === "update" &&
       outcome.failure.says.startsWith("The update WAS applied")))
 
+/** Where two JSON values differ: each pair of differing parts, outermost first. */
+const differences = (was: unknown, got: unknown): ReadonlyArray<readonly [unknown, unknown]> => {
+  if (JSON.stringify(was) === JSON.stringify(got)) return []
+  const walkable = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null
+  if (!walkable(was) || !walkable(got) || Array.isArray(was) !== Array.isArray(got)) {
+    return [[was, got]]
+  }
+  const keys = [...new Set([...Object.keys(was), ...Object.keys(got)])]
+  if (keys.some((key) => !Object.hasOwn(was, key) || !Object.hasOwn(got, key))) return [[was, got]]
+  return keys.flatMap((key) => differences(was[key], got[key]))
+}
+
 /** How an update ended. */
 const ending = (outcome: Outcome): unknown =>
   writtenUnreadable(outcome) ? "written, and the row doesn't decode" : (outcome.failure ?? "ok")
 
 /** `got` is what 1.39.0 did (`was`), but for the requests it sent before refusing an operand. */
-export const expectAs139 = (got: Outcome, was: Outcome, since?: Since139): void => {
+export const expectAs139 = (
+  got: Outcome,
+  was: Outcome,
+  since?: Since139,
+  stored: readonly [was: unknown, now: unknown] = [{ N: "7" }, { S: "7" }],
+): void => {
   if (since === "names the property") {
     // The same requests, but for the property's name.
     expect(wrote(was)).toBe(true)
     expect(got.requests).toEqual(
       JSON.parse(JSON.stringify(was.requests).replace(/("#ps\d+"):"renamed"/g, '$1:"count"')),
     )
+    return
+  }
+  if (since === "refuses what wouldn't read" || since === "stores what reads") {
+    // 1.39.0 wrote it, and the row it left didn't read.
+    expect(wrote(was)).toBe(true)
+    expect(was.reads).toBe(false)
+    if (since === "refuses what wouldn't read") {
+      expect(refusedOperand(got)).toBe(true)
+      expect(got.requests).toEqual([])
+    } else {
+      // The operand is sent in the form its reader reads back, and nothing else differs.
+      const changes = differences(was.requests, got.requests)
+      expect(changes.length).toBeGreaterThan(0)
+      for (const change of changes) expect(change).toEqual(stored)
+      expect(got.ok).toBe(true)
+    }
+    expect(got.reads).toBe(true)
     return
   }
   if (refusedOperand(was)) {

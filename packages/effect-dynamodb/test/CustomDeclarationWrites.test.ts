@@ -422,6 +422,10 @@ describe("a new write path can't go unnoticed", () => {
     ],
     "EventStore.ts": [2, "`encodeToWire`, which checks"],
     "StorageEncoding.ts": [4, "a public helper: what's done with its value is the caller's"],
+    "internal/OperandReaders.ts": [
+      1,
+      "an update's operand in another form, kept only where its position's readers read it back",
+    ],
     "internal/ProjectionEngine.ts": [1, "the outbox, which checks"],
     "internal/TransactableOps.ts": [2, "`validateAndBuildPutItem`, which checks"],
   }

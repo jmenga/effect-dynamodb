@@ -3375,6 +3375,7 @@ of an update that reads first, so a failed read was reported in its place.
 A copy (`pathSet` or `pathSubtract` naming another attribute, `isPath`) holds no
 operand: its `value` isn't written, so nothing reads it, encodes it or checks
 that it would store or read back.
+
 Only the moment changes: the check, its verdict, its error and the bytes of an
 operand it accepts are the ones the write was built with. An update refused for
 a second reason reports the operand, where it reported whichever it met first
@@ -3383,6 +3384,34 @@ as it read and built the write: a missing item (`ItemNotFound`), a stale
 another value on a retained entity (`ValidationError` `update`), a ref whose
 target isn't there (`RefNotFound`), a packed value with no compressor
 (`ValidationError` `update.packed`).
+
+**Where the read resolves the position (#236): exact or absent.** The write
+schema's walk above doesn't know every position: a sparse map's entry (named by
+its stored name, `target#a`), a union's members past the first, a list of a
+union, a suspended or branded schema. There the operand used to be sent as
+given, and a row could be left that no read decodes. After the check above,
+`operandAsRead` (`Entity.ts`) asks where a row's read takes the operand:
+`readPosition` maps the path to the field `decodeRecord` reads the attribute as
+(a sparse map's entry under its field and key; a path's head as `compilePath`
+resolves it, a record op's as the expression does) and `readersAt`
+(`SchemaAccessors.ts`) walks that field's READ schema through the nodes
+`modelled` models exactly, collecting what decodes the value at the end: the
+node there, one per way through the unions, or each array's element for an
+append. Anything it can't resolve exactly (an `Option`, a transformed or
+checked node above the position, a decoding default, a hidden, packed or
+non-model attribute, an entry keyed `__proto__`, a tuple position whose
+element depends on the list's length) gives no readers, and the operand is sent
+as 1.40.0 sent it. Where it resolves, `judgeOperand` (`internal/OperandReaders.ts`)
+decides: what 1.40.0 sends is sent when one of the readers reads it back as
+stored, so no operand a row holding it reads is refused or changed; otherwise no
+row holding it reads, and it is written in the one other stored form the readers
+read back (the model's encoding at the position, or a reader's own), or refused
+with a `ValidationError` under the same operation names when there is none, or
+when the union's members would store it differently. `readersAt`'s soundness
+(no reader reads the operand ⇒ no row holding it decodes) is property-tested
+with Effect's decoder as the oracle (`ReadersAt.property.test.ts`). An operand
+one of the readers reads may still be wrong for the union member a row holds,
+as it always was.
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to
