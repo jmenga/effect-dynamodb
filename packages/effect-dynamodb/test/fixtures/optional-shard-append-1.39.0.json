@@ -506,6 +506,174 @@
      ]
     }
    ]
+  },
+  "`by` optional, the index's partition composite always carried, and sparse": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "an append without `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": []
+    },
+    {
+     "step": "an append giving `by` as undefined",
+     "outcome": {
+      "ok": {
+       "current": {
+        "id": "1",
+        "tenant": "t",
+        "at": 2
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append carrying `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "1",
+       "tenant": "t",
+       "at": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    }
+   ]
   }
  }
 }

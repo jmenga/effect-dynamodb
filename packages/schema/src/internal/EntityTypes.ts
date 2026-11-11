@@ -56,28 +56,6 @@ type TypeFields<TModel extends Schema.Top> = [ModelType<TModel>] extends [never]
 export type ModelFieldName<TModel extends Schema.Top> = keyof ModelFields<TModel> & string
 
 /**
- * The fields every value of the model holds: declared, with a required key, and neither
- * `undefined` nor `null` among their values. It is the type-level `SchemaAccessors.alwaysHeld`.
- * `never` for a model whose fields aren't declared in its type, where none is known to be.
- */
-export type AlwaysHeldFieldName<TModel extends Schema.Top> =
-  IsAny<TModel> extends true
-    ? never
-    : [DeclaredFields<TModel>] extends [never]
-      ? never
-      : {
-          [K in keyof DeclaredFields<TModel> & string]: DeclaredFields<TModel>[K] extends {
-            readonly "~type.optionality": "optional"
-          }
-            ? never
-            : [Extract<Schema.Schema.Type<DeclaredFields<TModel>[K]>, null | undefined>] extends [
-                  never,
-                ]
-              ? K
-              : never
-        }[keyof DeclaredFields<TModel> & string]
-
-/**
  * The model fields a stored row can be without: those whose stored side is
  * optional (`optional`, `optionalKey`, a decoding default, the
  * `OptionFromOptional` family) or includes a value with no stored form

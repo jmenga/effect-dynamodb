@@ -400,7 +400,9 @@ describe("a model the types can't read", () => {
   })
 })
 
-describe("an appendInput that can't compose a sharded index's key (EDD-9113)", () => {
+// Every such input compiles and loads, as on 1.39.0: an append that can't compose the index's key
+// fails with EDD-9100 when it's made.
+describe("an appendInput carrying a sharded index's `by` attribute", () => {
   class Series extends Schema.Class<Series>("ClearTypesSeries")({
     id: Schema.String,
     at: Schema.Number,
@@ -441,25 +443,22 @@ describe("an appendInput that can't compose a sharded index's key (EDD-9113)", (
     })
   })
 
-  it("`by` without the composite before it is a compile error, and throws at make", () => {
-    expect(() =>
-      Entity.make({
-        model: Series,
-        entityType: "Series",
-        primaryKey,
-        indexes,
-        timeSeries: {
-          orderBy: "at",
-          // @ts-expect-error carries `group` but not `region`
-          appendInput: Schema.Struct({
-            id: Schema.String,
-            at: Schema.Number,
-            tenant: Schema.String,
-            group: Schema.String,
-          }),
-        },
-      }),
-    ).toThrow("[EDD-9113]")
+  it("`by` without the composite before it compiles and loads", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
   })
 
   it("not carrying `by` compiles", () => {
@@ -475,7 +474,7 @@ describe("an appendInput that can't compose a sharded index's key (EDD-9113)", (
     })
   })
 
-  it("an optional `by` compiles and loads, as up to 1.39.0: an append may leave it out", () => {
+  it("an optional `by` compiles and loads", () => {
     Entity.make({
       model: Series,
       entityType: "Series",
@@ -492,25 +491,22 @@ describe("an appendInput that can't compose a sharded index's key (EDD-9113)", (
     })
   })
 
-  it("an optional `by` beside the partition composite compiles, and make refuses it", () => {
-    // The literals don't show that an append naming the partition needs the shard's source too.
-    expect(() =>
-      Entity.make({
-        model: Series,
-        entityType: "Series",
-        primaryKey,
-        indexes,
-        timeSeries: {
-          orderBy: "at",
-          appendInput: Schema.Struct({
-            id: Schema.String,
-            at: Schema.Number,
-            tenant: Schema.String,
-            group: Schema.optional(Schema.String),
-          }),
-        },
-      }),
-    ).toThrow("[EDD-9113]")
+  it("an optional `by` beside the partition composite compiles and loads", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          group: Schema.optional(Schema.String),
+        }),
+      },
+    })
   })
 })
 

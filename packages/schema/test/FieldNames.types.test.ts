@@ -890,7 +890,9 @@ describe("definition attribute names are typed from the model", () => {
   })
 })
 
-describe("timeSeries.appendInput against a sharded index (EDD-9113)", () => {
+// Every such input compiles and loads, as on 1.39.0: an append that can't compose the index's key
+// fails with EDD-9100 when it's made.
+describe("timeSeries.appendInput against a sharded index", () => {
   class Series extends Schema.Class<Series>("FieldNamesSeries")({
     id: Schema.String,
     at: Schema.Number,
@@ -931,25 +933,22 @@ describe("timeSeries.appendInput against a sharded index (EDD-9113)", () => {
     })
   })
 
-  it("`by` without the composite before it does not, and make throws", () => {
-    expect(() =>
-      Entity.make({
-        model: Series,
-        entityType: "Series",
-        primaryKey,
-        indexes,
-        timeSeries: {
-          orderBy: "at",
-          // @ts-expect-error carries `group` but not `region`
-          appendInput: Schema.Struct({
-            id: Schema.String,
-            at: Schema.Number,
-            tenant: Schema.String,
-            group: Schema.String,
-          }),
-        },
-      }),
-    ).toThrow("[EDD-9113]")
+  it("`by` without the composite before it compiles and loads", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
   })
 
   it("an optional `by` compiles and loads: an append may leave it out", () => {
@@ -1009,24 +1008,21 @@ describe("timeSeries.appendInput against a sharded index (EDD-9113)", () => {
     })
   })
 
-  it("a required `by` after a composite no append holds, beside optional ones, still doesn't", () => {
-    expect(() =>
-      Entity.make({
-        model: Series,
-        entityType: "Series",
-        primaryKey,
-        indexes,
-        timeSeries: {
-          orderBy: "at",
-          // @ts-expect-error every append carries `group`, and none can carry `region`
-          appendInput: Schema.Struct({
-            id: Schema.String,
-            at: Schema.optional(Schema.Number),
-            tenant: Schema.String,
-            group: Schema.String,
-          }),
-        },
-      }),
-    ).toThrow()
+  it("a required `by` after a composite no append holds, beside optional ones, compiles and loads", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.optional(Schema.Number),
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
   })
 })

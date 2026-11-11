@@ -1,0 +1,317 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (with effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local at a clock fixed at 1700000000000 ms: for each scenario, whether Entity.make loaded the definition, then each step's outcome (a failure as its tag and EDD code, or the first line of its message) and the table's rows after it, scanned and sorted by key. Never regenerate it or edit it to match a later release.",
+ "clock": 1700000000000,
+ "scenarios": {
+  "an optional `by` after 40 optional sort key composites": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "s1",
+       "seq": 1,
+       "tenant": "t"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "1"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append without `by`",
+     "outcome": {
+      "ok": {
+       "current": {
+        "id": "s1",
+        "seq": 2,
+        "tenant": "t"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "2"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "2"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor#e#0000000000000002"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append with `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "2"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "2"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor#e#0000000000000002"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "s1",
+       "seq": 2,
+       "tenant": "t"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "2"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "2"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor#e#0000000000000002"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "a required `by` after a gap, then 40 optional sort key composites": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "s1",
+       "seq": 1,
+       "tenant": "t"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "1"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append of nothing it may leave out",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "1"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append of everything",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "1"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "s1",
+       "seq": 1,
+       "tenant": "t"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Sensor"
+       },
+       "id": {
+        "S": "s1"
+       },
+       "pk": {
+        "S": "$kept#v1#sensor#id_s1"
+       },
+       "seq": {
+        "N": "1"
+       },
+       "sk": {
+        "S": "$kept#v1#sensor"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

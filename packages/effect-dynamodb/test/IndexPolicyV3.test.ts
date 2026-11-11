@@ -2747,7 +2747,6 @@ describe("Entity writes — shape 9d: `by` after a composite the update can't su
         tenant: Schema.String,
         at: Schema.DateTimeUtc,
         group: Schema.String,
-        region: Schema.optional(Schema.String),
       }),
     },
   })
@@ -2911,7 +2910,7 @@ describe("Entity writes — shape 9d: `by` after a composite the update can't su
   )
 
   describe("the append path", () => {
-    it.effect("an append carrying `by` without the gap refuses", () =>
+    it.effect("an appendInput carrying `by` without the gap refuses", () =>
       on((db, table) =>
         Effect.gen(function* () {
           yield* db.entities.Series.put(seed).asEffect()

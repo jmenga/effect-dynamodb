@@ -1221,7 +1221,6 @@ describeConnected("#183 canonical shapes — shape 9d, `by` after a composite", 
         tenant: Schema.String,
         at: Schema.Number,
         group: Schema.String,
-        region: Schema.optional(Schema.String),
       }),
     },
   })
@@ -1336,7 +1335,7 @@ describeConnected("#183 canonical shapes — shape 9d, `by` after a composite", 
     ),
   )
 
-  it.live("an append carrying `by` without the gap refuses", () =>
+  it.live("an appendInput carrying `by` without the gap refuses", () =>
     onAgree((db) =>
       Effect.gen(function* () {
         const series = db.entities.Series
