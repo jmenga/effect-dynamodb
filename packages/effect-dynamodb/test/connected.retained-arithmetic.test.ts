@@ -6,7 +6,9 @@
  * attribute, the one the case names, or are both refused by DynamoDB with nothing written. A
  * bigint field's value is computed exactly on both sides of 2^53, where the update that reads
  * first died mixing a bigint with a number; a number's fraction as DynamoDB computes it (`0.3`,
- * not `0.30000000000000004`); a set's members by value.
+ * not `0.30000000000000004`); a set's members by value. A set operand is sent, and applied, as
+ * the set at its position stores its members (`memberKindCases`: a `NumberFromString` set's are
+ * strings), and a `NumberValue` operand is the number its text holds.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -19,7 +21,12 @@ import { Cause, Config, Effect, Exit, Layer } from "effect"
 import { describe, expect } from "vitest"
 import * as Lib from "../src/index.js"
 import { READ_FIRST, type ReadFirstUpdate } from "./helpers/ReadFirstUpdates.js"
-import { arithmeticCases, arithmeticModel, sorted } from "./helpers/RetainedArithmetic.js"
+import {
+  arithmeticCases,
+  arithmeticModel,
+  memberKindCases,
+  sorted,
+} from "./helpers/RetainedArithmetic.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -125,8 +132,11 @@ const outcome = (
 describeConnected.each(READ_FIRST)(
   "$name: the arithmetic stores what DynamoDB's does",
   (config) => {
+    const cases = [...arithmeticCases, ...memberKindCases].filter(
+      (each) => each.pathOp !== true || config.takesPathOps,
+    )
     for (const transaction of [false, true]) {
-      for (const each of arithmeticCases) {
+      for (const each of cases) {
         it.effect(`${each.name}, ${transaction ? "in a transaction" : "alone"}`, () =>
           Effect.gen(function* () {
             const plain = yield* outcome(

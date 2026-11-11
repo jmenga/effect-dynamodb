@@ -500,6 +500,12 @@ type EncodedOperands = {
   readonly pathAppends: ReadonlyArray<unknown>
   readonly pathPrepends: ReadonlyArray<unknown>
   readonly pathIfNotExists: ReadonlyArray<unknown>
+  /** `.add()`'s and `.deleteFromSet()`'s by field: a set as its members are stored (`setOperand`). */
+  readonly add: globalThis.Record<string, unknown>
+  readonly deleteFromSet: globalThis.Record<string, unknown>
+  /** `pathAdd`'s and `pathDelete`'s at their operation's index, likewise. */
+  readonly pathAdds: ReadonlyArray<unknown>
+  readonly pathDeletes: ReadonlyArray<unknown>
 }
 
 /** An update's operand its write schema refuses at its path: the operation, and the schema's issue. */
@@ -3581,11 +3587,46 @@ const makeImpl = <
   }
 
   /**
+   * A set operand of `.add()`, `.deleteFromSet()`, `pathAdd` or `pathDelete`, as the members of the
+   * set at its position are stored (#236). A set field's members may be stored in another form than
+   * the domain's (`Schema.ReadonlySet(Schema.NumberFromString)` stores strings): sent as given, the
+   * operand was a set of another kind, which DynamoDB refuses (`ADD`, `DELETE`), and which a
+   * retained update applied to the row it read. Where the position is read exactly and the set as
+   * given wouldn't read back there, it is sent as the reader stores it, when there is exactly one
+   * such form; anything else (another operand, a position not read exactly, a set that reads, or
+   * one no form of reads) is sent as given, as 1.40.0 sent it. Never a refusal: a set's operand
+   * isn't the value stored.
+   */
+  const setOperand = (
+    segments: ReadonlyArray<string | number>,
+    naming: "path" | "field",
+    value: unknown,
+  ): unknown => {
+    if (!(value instanceof Set)) return value
+    const position = readPosition(segments, naming)
+    const readers =
+      position === undefined ? undefined : readersAt(position.reader, position.below, "value")
+    if (position === undefined || readers === undefined) return value
+    const modelPath = position.modelPath ?? segments
+    const verdict = judgeOperand(readers, "value", value, value, () => {
+      try {
+        const { encoded, issue } = encodePathValue(modelPath, value, "value")
+        return issue === undefined ? [encoded] : []
+      } catch {
+        return CANT_SAY
+      }
+    })
+    return verdict.issue === undefined ? verdict.encoded : value
+  }
+
+  /**
    * An update's operands written as values of its fields — `.append()`'s entries and the values of
    * `pathSet` (a copy excepted), `pathAppend`, `pathPrepend` and `pathIfNotExists` — in the form
    * they're written, each checked against the write schema at its path. Decided once, before the
    * update reads or sends anything: the first one the schema refuses refuses the update, and the
    * write sends the rest as encoded here. Each path operation's value is at its operation's index.
+   * The set operands of `.add()`, `.deleteFromSet()`, `pathAdd` and `pathDelete` are written as
+   * {@link setOperand} has them, and never refused here.
    */
   const encodeOperands = (uState: UpdateState): EncodedOperands | RefusedOperand => {
     // Keyed by a name the caller supplies: no prototype, so `__proto__` is a key like any other.
@@ -3634,7 +3675,32 @@ const makeImpl = <
     if ("issue" in pathPrepends) return pathPrepends
     const pathIfNotExists = each("update.pathIfNotExists", uState.pathIfNotExists, "value")
     if ("issue" in pathIfNotExists) return pathIfNotExists
-    return { append, pathSets, pathAppends, pathPrepends, pathIfNotExists }
+    const byField = (record: globalThis.Record<string, unknown> | undefined) => {
+      const out: globalThis.Record<string, unknown> = Object.create(null)
+      for (const [field, value] of Object.entries(record ?? {})) {
+        out[field] = setOperand([field], "field", value)
+      }
+      return out
+    }
+    const byPath = (
+      ops:
+        | ReadonlyArray<{
+            readonly segments: ReadonlyArray<string | number>
+            readonly value: unknown
+          }>
+        | undefined,
+    ) => (ops ?? []).map((op) => setOperand(op.segments, "path", op.value))
+    return {
+      append,
+      pathSets,
+      pathAppends,
+      pathPrepends,
+      pathIfNotExists,
+      add: byField(uState.add),
+      deleteFromSet: byField(uState.deleteFromSet),
+      pathAdds: byPath(uState.pathAdds),
+      pathDeletes: byPath(uState.pathDeletes),
+    }
   }
 
   /**
@@ -8078,11 +8144,13 @@ const makeImpl = <
           })
         }
         if (uState.add) {
-          for (const [attr, val] of Object.entries(uState.add)) {
+          for (const attr of Object.keys(uState.add)) {
             // DynamoDB's ADD: a number adds, a set unions, and a row without the attribute
             // starts from nothing. A value of another kind is refused, as `ADD` is. The sum is
             // DynamoDB's, exact on a bigint field and a number's fraction alike, and a set's
-            // members are compared by value (`DynamoArithmetic`, #236).
+            // members are compared by value, a set operand as its members are stored, as it's
+            // sent (`setOperand`, `DynamoArithmetic`, #236).
+            const val = operands.add[attr]
             const [holder, key] = slot(attr)
             const before = held(holder, key)
             const refused = expressionRefusal(
@@ -8129,7 +8197,8 @@ const makeImpl = <
           }
         }
         if (uState.deleteFromSet) {
-          for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
+          for (const attr of Object.keys(uState.deleteFromSet)) {
+            const val = operands.deleteFromSet[attr]
             const [holder, key] = slot(attr)
             const before = held(holder, key)
             // DynamoDB's DELETE: nothing on a row without the attribute, and refused on a value
@@ -9165,24 +9234,24 @@ const makeImpl = <
         }
       }
 
-      // ADD (atomic numeric increment / set addition)
+      // ADD (atomic numeric increment / set addition); a set as its members are stored (#236)
       if (uState.add) {
-        for (const [attr, val] of Object.entries(uState.add)) {
+        for (const attr of Object.keys(uState.add)) {
           const nameKey = `#a${addClauses.length}`
           const valKey = `:a${addClauses.length}`
           names[nameKey] = resolveDbName(attr)
-          values[valKey] = toAttributeValue(val)
+          values[valKey] = toAttributeValue(operands.add[attr])
           addClauses.push(`${nameKey} ${valKey}`)
         }
       }
 
-      // DELETE (remove elements from set)
+      // DELETE (remove elements from set), as its members are stored (#236)
       if (uState.deleteFromSet) {
-        for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
+        for (const attr of Object.keys(uState.deleteFromSet)) {
           const nameKey = `#d${deleteClauses.length}`
           const valKey = `:d${deleteClauses.length}`
           names[nameKey] = resolveDbName(attr)
-          values[valKey] = toAttributeValue(val)
+          values[valKey] = toAttributeValue(operands.deleteFromSet[attr])
           deleteClauses.push(`${nameKey} ${valKey}`)
         }
       }
@@ -9260,20 +9329,20 @@ const makeImpl = <
 
       // Path ADD operations
       if (uState.pathAdds) {
-        for (const op of uState.pathAdds) {
+        for (const [index, op] of uState.pathAdds.entries()) {
           const pathExpr = compilePath(op.segments, names, "pad", pathCounter, resolveDbName)
           const valKey = `:pad${pathCounter.value++}`
-          values[valKey] = toAttributeValue(op.value)
+          values[valKey] = toAttributeValue(operands.pathAdds[index])
           addClauses.push(`${pathExpr} ${valKey}`)
         }
       }
 
       // Path DELETE operations
       if (uState.pathDeletes) {
-        for (const op of uState.pathDeletes) {
+        for (const [index, op] of uState.pathDeletes.entries()) {
           const pathExpr = compilePath(op.segments, names, "pd", pathCounter, resolveDbName)
           const valKey = `:pd${pathCounter.value++}`
-          values[valKey] = toAttributeValue(op.value)
+          values[valKey] = toAttributeValue(operands.pathDeletes[index])
           deleteClauses.push(`${pathExpr} ${valKey}`)
         }
       }

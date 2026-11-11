@@ -13,15 +13,26 @@ export interface ReadFirstUpdate {
   readonly entity: Record<string, unknown>
   /** What the update does besides the operation under test. */
   readonly prefix: (update: any) => any
+  /**
+   * Whether the update may hold a path operation too: a retained one sends it in its
+   * transaction; one changing a unique field or computing an index composite refuses it.
+   */
+  readonly takesPathOps: boolean
 }
 
 /** The model fields the configurations use: `email` and `rank`, both optional, and `name`. */
 export const READ_FIRST: ReadonlyArray<ReadFirstUpdate> = [
-  { name: "a retained entity", entity: { versioned: { retain: true } }, prefix: (u) => u },
+  {
+    name: "a retained entity",
+    entity: { versioned: { retain: true } },
+    prefix: (u) => u,
+    takesPathOps: true,
+  },
   {
     name: "a unique field changed",
     entity: { unique: { email: ["email"] } },
     prefix: (u) => u.set({ email: "b" }),
+    takesPathOps: false,
   },
   {
     name: "an index composite computed",
@@ -35,5 +46,6 @@ export const READ_FIRST: ReadonlyArray<ReadFirstUpdate> = [
       },
     },
     prefix: (u) => u.add({ rank: 1 }),
+    takesPathOps: false,
   },
 ]

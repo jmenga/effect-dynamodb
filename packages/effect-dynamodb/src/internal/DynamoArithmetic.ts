@@ -9,22 +9,31 @@
  * and a bigint field's operand is a `bigint`. So the sum is taken on the numbers' decimal text, and
  * given back as a read would give the stored result: `5 + 2n` is `7`, `0.2 + 0.1` is `0.3`, and
  * `(2^53 + 1) + 2` is `9007199254740995n`. A result DynamoDB can't hold (39 significant digits) is
- * written as it is, for DynamoDB to refuse, as it refuses the expression.
+ * written as it is, for DynamoDB to refuse, as it refuses the expression. An operand may also be a
+ * `NumberValue` (`@aws-sdk/util-dynamodb`), which marshalling writes as the number its text holds:
+ * it is that number here too.
  */
+
+import { NumberValueImpl as NumberValue } from "@aws-sdk/util-dynamodb"
+
+/** A number as a read, an operand or a set member holds one. */
+export type Numeric = number | bigint | NumberValue
 
 /** A decimal number: `digits × 10^-scale`, `scale >= 0`. */
 type Decimal = { readonly digits: bigint; readonly scale: number }
 
-/** The decimal a number or bigint holds, or `undefined` for one DynamoDB has no number for. */
-const decimalOf = (value: number | bigint): Decimal | undefined => {
+/** The decimal a number holds, or `undefined` for one DynamoDB has no number for. */
+const decimalOf = (value: Numeric): Decimal | undefined => {
   if (typeof value === "bigint") return { digits: value, scale: 0 }
-  if (!Number.isFinite(value)) return undefined
+  if (typeof value === "number" && !Number.isFinite(value)) return undefined
   // `String` gives the shortest text that reads back as the same number: what a read of the
-  // stored text gave, and what marshalling writes for it.
-  const match = /^(-?)(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/.exec(String(value))
+  // stored text gave, and what marshalling writes for it. A `NumberValue`'s is its own text.
+  const text = typeof value === "number" ? String(value) : value.value
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text.trim())
   if (match === null) return undefined
   const [, sign = "", whole = "", fraction = "", exponent = "0"] = match
-  const digits = BigInt(`${sign}${whole}${fraction}`)
+  if (whole.length + fraction.length === 0) return undefined
+  const digits = BigInt(`${sign === "-" ? "-" : ""}${whole}${fraction}`)
   const scale = fraction.length - Number(exponent)
   return scale >= 0 ? { digits, scale } : { digits: digits * 10n ** BigInt(-scale), scale: 0 }
 }
@@ -56,19 +65,15 @@ const asRead = (decimal: Decimal): number | bigint => {
 }
 
 /** Whether a value is a number as a read or an operand holds one. */
-export const isNumeric = (value: unknown): value is number | bigint =>
-  typeof value === "number" || typeof value === "bigint"
+export const isNumeric = (value: unknown): value is Numeric =>
+  typeof value === "number" || typeof value === "bigint" || value instanceof NumberValue
 
 /**
  * `before + operand`, or `before - operand` (`negate`), as DynamoDB's `ADD` or `#f - :v` stores
  * it, as a read returns it. Two values DynamoDB has no number for (`NaN`, an infinity) are added
  * as JavaScript adds them, for marshalling to refuse.
  */
-export const numberSum = (
-  before: number | bigint,
-  operand: number | bigint,
-  negate: boolean,
-): number | bigint => {
+export const numberSum = (before: Numeric, operand: Numeric, negate: boolean): number | bigint => {
   const [a, b] = [decimalOf(before), decimalOf(operand)]
   if (a === undefined || b === undefined) {
     return negate ? Number(before) - Number(operand) : Number(before) + Number(operand)
