@@ -320,10 +320,14 @@ class LostRace {
 // The engine
 // ---------------------------------------------------------------------------
 
-/** A key's identity: its fields, sorted, as JSON. */
+/**
+ * A key's identity: its fields, sorted, as JSON. JSON has no bigint, so one is written as an
+ * object holding its digits, which no number or string is; any other key's text is unchanged.
+ */
 export const keyId = (key: unknown): string =>
   JSON.stringify(
     Object.entries(key as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    (_name, value) => (typeof value === "bigint" ? { bigint: value.toString() } : value),
   )
 
 /** `K | Option<K>` → `Option<K>`. */
