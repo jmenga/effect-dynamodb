@@ -6494,7 +6494,12 @@ one expression (#240): a write that changed one in between wrote its own vector
 and partition, so `reembed`'s is cancelled, and the item is skipped, neither
 retried nor counted. A sparse map's entries are held as read; one added in between
 isn't seen. Up to 1.40.0 the condition was `attribute_exists(#pk)` alone, and such
-a write's vector was overwritten with the old text's.
+a write's vector was overwritten with the old text's. The option not taken is a
+revision attribute that every write bumps: `reembed` would hold it alone, one term
+that sees every write, a sparse map's new entry and the attributes past the limits
+included, and `rekey`'s guard would see a `reembed` too. Every item would then
+carry an attribute no release writes today, so it is a stored-format change, and it
+waits for the next major, behind one flag off by default until then.
 
 ### Lifecycle integration
 
