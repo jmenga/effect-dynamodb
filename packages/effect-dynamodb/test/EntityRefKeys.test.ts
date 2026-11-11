@@ -1,12 +1,14 @@
 /**
- * Entity-level refs name the referenced entity's key composite, and a cascade stores what a put
- * stores, on a recording table. The suites are `helpers/EntityRefKeys.ts` and
- * `helpers/EntityRefCascade.ts`; connected twin: `connected.entity-ref-keys.test.ts`.
+ * Entity-level refs name the referenced entity's key composite, a cascade stores what a put
+ * stores, and every write keys the indexes a ref's id is a composite of as a put keys them, on a
+ * recording table. The suites are `helpers/EntityRefKeys.ts`, `helpers/EntityRefCascade.ts` and
+ * `helpers/EntityRefWrites.ts`; connected twin: `connected.entity-ref-keys.test.ts`.
  */
 
 import { Effect, Layer } from "effect"
 import { suite as cascadeSuite } from "./helpers/EntityRefCascade.js"
 import { type Harness, INDEXES, suite } from "./helpers/EntityRefKeys.js"
+import { suite as writesSuite } from "./helpers/EntityRefWrites.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const tables = new Map<string, ReturnType<typeof makeRecordingTable>>()
@@ -37,3 +39,4 @@ const harness: Harness = {
 
 suite(harness)
 cascadeSuite(harness)
+writesSuite(harness)

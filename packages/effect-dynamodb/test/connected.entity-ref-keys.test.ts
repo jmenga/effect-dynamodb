@@ -1,7 +1,8 @@
 /**
- * Entity-level refs name the referenced entity's key composite, and a cascade stores what a put
- * stores, against DynamoDB Local. The suites are `helpers/EntityRefKeys.ts` and
- * `helpers/EntityRefCascade.ts`; recording-table twin: `EntityRefKeys.test.ts`.
+ * Entity-level refs name the referenced entity's key composite, a cascade stores what a put
+ * stores, and every write keys the indexes a ref's id is a composite of as a put keys them,
+ * against DynamoDB Local. The suites are `helpers/EntityRefKeys.ts`, `helpers/EntityRefCascade.ts`
+ * and `helpers/EntityRefWrites.ts`; recording-table twin: `EntityRefKeys.test.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -14,6 +15,7 @@ import { describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import { suite as cascadeSuite } from "./helpers/EntityRefCascade.js"
 import { type Harness, INDEXES, suite } from "./helpers/EntityRefKeys.js"
+import { suite as writesSuite } from "./helpers/EntityRefWrites.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -128,3 +130,4 @@ const harness: Harness = {
 
 suite(harness, dynamoAvailable ? describe : describe.skip)
 cascadeSuite(harness, dynamoAvailable ? describe : describe.skip)
+writesSuite(harness, dynamoAvailable ? describe : describe.skip)
