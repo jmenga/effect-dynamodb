@@ -1,7 +1,8 @@
 /**
  * Schemas built by nesting wrappers at random, from a seed, and values sampled from Effect's
- * arbitrary for each, encoded to what DynamoDB stores: the generator of `ReadersAt.property.test.ts`.
- * It is `PathIsRequired.property.test.ts`'s, so a seed builds the same schema in both.
+ * arbitrary for each, encoded to what DynamoDB stores: the generator of
+ * `PathIsRequired.property.test.ts` and `ReadersAt.property.test.ts`, so a seed builds the same
+ * schema in both.
  */
 import { Arbitrary, Effect, Schema } from "effect"
 
