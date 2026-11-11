@@ -193,6 +193,8 @@ yield* db.entities.VPages.update({ pageId: "v-1" })
   .set({ status: "reset" })
 ```
 
+The clear comes first: `.clearMap("metrics").set({ metrics: { "2026-06": { views: 1, clicks: 0 } } })` leaves only that entry, and an `.add()` to an entry starts from nothing. A `.subtract()` or a path operation into an entry the clear removes has nothing left to work on, and is refused with a `ValidationError` (`EDD-9151`) before anything is written.
+
 **Race window:** between the read and the update, a concurrent writer can add a new bucket. The new bucket survives the clear.
 
 - **`versioned: { retain: true }`** — the existing optimistic-lock CAS closes the race automatically. Clear fails on stale version, retry resolves.
@@ -228,7 +230,7 @@ In a collection each member names an entry by its own prefix, and a member witho
 
 A sparse map renamed with `field:` (`{ storedAs: DynamoModel.SparseMap(), field: "sr" }`) has two stored forms. `put` stores it whole, as one map attribute `sr`; an update and a plain entity's `upsert` store its entries, as `counts#<key>`. A read takes `sr` when the row holds it, and the entries otherwise.
 
-- An update that reads the row (a retained entity's, `clearMap`, any update in `Transaction.transactWrite`) writes an entry where the row holds the map: inside `sr`, or as its own attribute.
+- An update that reads the row (a retained entity's, `clearMap`, any update in `Transaction.transactWrite`) writes an entry where the row holds the map: inside `sr`, or as its own attribute. One that clears the map removes `sr` too, and writes the entries as their own attributes.
 - An update that doesn't read the row, and a plain entity's `upsert`, write the entries as their own attributes, guarded on the row not holding `sr`. On a row `put` wrote, they're refused with a `ValidationError` (`EDD-9150`) and nothing is written: send the update in a transaction, or put the item. Up to 1.40.0 such a write reported success and changed nothing a read sees. A `.condition()` or `expectedVersion` the row doesn't meet still fails with its own error (`ConditionalCheckFailed`, `OptimisticLockError`).
 - A copy from an entry (`pathSet` with `isPath`) writes no entry and is never refused for the form. Spelled through the map (`counts.entry("a")`), it reads the entry where a read takes it when the update reads the row; otherwise it's sent as before.
 - A condition or a filter on an entry (`t.counts.a`, `t.counts.entry("a")`) asks the row where it holds the map, so it holds on rows of either form.

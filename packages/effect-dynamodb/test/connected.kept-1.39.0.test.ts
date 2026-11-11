@@ -27,6 +27,7 @@ import * as Table from "../src/Table.js"
 import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
+import { clearWritesSuite } from "./helpers/ClearWrites.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { entryInQueriesSuite } from "./helpers/EntryInQueries.js"
 import { entrySelectsSuite } from "./helpers/EntrySelects.js"
@@ -176,6 +177,10 @@ describeConnected(
 
 describeConnected("a select of a sparse map's entry", () => {
   entrySelectsSuite(openTable)
+})
+
+describeConnected("a clearMap with another write to the map", () => {
+  clearWritesSuite(openTable)
 })
 
 describeConnected("a path below a struct that renames its keys as they're stored", () => {

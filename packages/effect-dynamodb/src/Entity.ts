@@ -654,6 +654,72 @@ class MissingForCreate extends Data.TaggedError("MissingForCreate")<{
 export { countOperators }
 
 /**
+ * An update's clauses against the attributes its `.clearMap()` removes (`cleared`: what the
+ * clear's read found of the map), so the request names no path twice (#238). The clear comes
+ * first: a `SET` of a cleared attribute's whole value replaces it, and the clear doesn't remove
+ * it; an `ADD` to one starts from nothing, so it's sent as that `SET`; a `REMOVE` of one is the
+ * clear's own, and one below it, or a `DELETE` from it, is left out, the clear removing all of it.
+ * Anything else reads the cleared value or writes below it (`.subtract()`, `.append()`, a path
+ * operation), and there's nothing left for it: the update is refused (the reason returned), where
+ * DynamoDB refused the overlapping request 1.40.0 sent. Updates the clause lists and `cleared` in
+ * place.
+ */
+const clearedOverlap = (
+  cleared: Set<string>,
+  names: globalThis.Record<string, string>,
+  setClauses: Array<string>,
+  addClauses: Array<string>,
+  deleteClauses: Array<string>,
+  removeClauses: Array<string>,
+): string | undefined => {
+  if (cleared.size === 0) return undefined
+  const named = (token: string) =>
+    token.startsWith("#") && Object.hasOwn(names, token) ? names[token]! : token
+  const headOf = (path: string) => named(path.split(/[.[]/)[0]!)
+  const whole = (path: string) => !/[.[]/.test(path)
+  const mentions = (text: string, attribute: string) =>
+    (text.match(/#[A-Za-z0-9_]+/g) ?? []).some((token) => named(token) === attribute)
+  const refusal = (attribute: string) =>
+    `.clearMap() removes "${attribute}", which this update also reads or writes below ` +
+    `(.subtract(), .append(), a path operation): after the clear there's nothing there for it. ` +
+    `Write the entry's new value with .set(), or update without clearing. Nothing was written. ` +
+    `[EDD-9151]`
+  const replaced = new Set<string>()
+  for (const clause of setClauses) {
+    const at = clause.indexOf(" = ")
+    const path = clause.slice(0, at).trim()
+    const head = headOf(path)
+    if (!cleared.has(head)) continue
+    if (!whole(path) || mentions(clause.slice(at + 3), head)) return refusal(head)
+    replaced.add(head)
+  }
+  for (const [i, clause] of [...addClauses.entries()].reverse()) {
+    const [path, value] = clause.trim().split(/\s+/) as [string, string]
+    const head = headOf(path)
+    if (!cleared.has(head)) continue
+    if (!whole(path)) return refusal(head)
+    addClauses.splice(i, 1)
+    setClauses.push(`${path} = ${value}`)
+    replaced.add(head)
+  }
+  for (const [i, clause] of [...deleteClauses.entries()].reverse()) {
+    const path = clause.trim().split(/\s+/)[0]!
+    const head = headOf(path)
+    if (!cleared.has(head)) continue
+    if (!whole(path)) return refusal(head)
+    deleteClauses.splice(i, 1)
+  }
+  for (const [i, path] of [...removeClauses.entries()].reverse()) {
+    const head = headOf(path.trim())
+    if (!cleared.has(head)) continue
+    if (whole(path.trim())) replaced.add(head)
+    else removeClauses.splice(i, 1)
+  }
+  for (const head of replaced) cleared.delete(head)
+  return undefined
+}
+
+/**
  * The top-level attributes an UpdateExpression writes (SET / REMOVE / ADD /
  * DELETE targets), resolved through its attribute names.
  */
@@ -9250,6 +9316,17 @@ const makeImpl = <
           ...uState.upsertOver?.fill,
           ...currentDomainItem,
         }
+        // Sparse-map clear: blow away the entire bucket Record, before anything
+        // the update writes into it, as the expression an update sends clears
+        // first (#238). The retain path always reads-then-writes the full item,
+        // so the version CAS already gives clearMap atomic semantics for free —
+        // no per-bucket GET dance needed here.
+        if (uState.sparseClearFields) {
+          for (const field of uState.sparseClearFields) {
+            if (!hasSparseFields || !(field in sparseFields)) continue
+            newItem[field] = {}
+          }
+        }
         // Apply user updates. For sparse fields, merge bucket-by-bucket
         // rather than whole-field replace — concurrent writers to disjoint
         // buckets must coexist (the version CAS protects against same-bucket
@@ -9291,16 +9368,6 @@ const makeImpl = <
             const bucket = newItem[op.field] as globalThis.Record<string, unknown> | undefined
             if (!bucket) continue
             for (const k of op.keys) delete bucket[k]
-          }
-        }
-        // Sparse-map clear: blow away the entire bucket Record. The retain
-        // path always reads-then-writes the full item, so the version CAS
-        // already gives clearMap atomic semantics for free — no per-bucket
-        // GET dance needed here.
-        if (uState.sparseClearFields) {
-          for (const field of uState.sparseClearFields) {
-            if (!hasSparseFields || !(field in sparseFields)) continue
-            newItem[field] = {}
           }
         }
         // Where a record operation's attribute is in the row as read: an operation naming a
@@ -10318,13 +10385,17 @@ const makeImpl = <
        * stored only as entries, written as they always were; for one a `field:` rename stores whole,
        * `"whole"` (inside its attribute) when the row this update holds holds the attribute, else
        * `"entries"` (each entry its own attribute). Each map written either way is guarded on the
-       * row holding it so ({@link formGuards}), so the entry lands only where a read takes it.
+       * row holding it so ({@link formGuards}), so the entry lands only where a read takes it. A map
+       * this update clears is written as entries, unguarded: the clear removes what its read found
+       * of the map, the attribute it's stored whole under included, so the row ends holding the map
+       * as entries whatever it held.
        */
       const formGuards = new Map<string, "whole" | "entries">()
       const formConditions: Array<string> = []
       const entryForm = (field: string): "whole" | "entries" | undefined => {
         const attribute = renamedMapAttribute(field)
         if (attribute === undefined) return undefined
+        if (uState.sparseClearFields?.includes(field) === true) return "entries"
         const form = held !== undefined && Object.hasOwn(held, attribute) ? "whole" : "entries"
         formGuards.set(field, form)
         return form
@@ -10799,15 +10870,32 @@ const makeImpl = <
       // found the reader takes as the map's entries — and, for a map a
       // `field:` rename stores whole, the attribute it holds it in (#238).
       if (clearRead !== undefined) {
-        const clearItemKeys = Object.keys(clearRead)
+        const cleared = new Set<string>()
         for (const field of uState.sparseClearFields ?? []) {
-          for (const attrName of clearItemKeys) {
-            if (sparseMapOf(attrName) === field) {
-              const nameKey = `#sc${removeClauses.length}`
-              names[nameKey] = attrName
-              removeClauses.push(nameKey)
-            }
+          for (const attrName of Object.keys(clearRead)) {
+            if (sparseMapOf(attrName) === field) cleared.add(attrName)
           }
+        }
+        // The clear comes first, and one request never names a path twice (#238).
+        const overlap = clearedOverlap(
+          cleared,
+          names,
+          setClauses,
+          addClauses,
+          deleteClauses,
+          removeClauses,
+        )
+        if (overlap !== undefined) {
+          return yield* new ValidationError({
+            entityType,
+            operation: "update.clearMap",
+            cause: overlap,
+          })
+        }
+        for (const attrName of cleared) {
+          const nameKey = `#sc${removeClauses.length}`
+          names[nameKey] = attrName
+          removeClauses.push(nameKey)
         }
       }
 
