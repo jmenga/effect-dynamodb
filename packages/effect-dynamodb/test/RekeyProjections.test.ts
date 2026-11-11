@@ -7,9 +7,10 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Cause, Effect, Exit, Layer, Schema } from "effect"
+import { Cause, DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -1927,15 +1928,24 @@ interface PairSide {
   readonly pk: ReadonlyArray<PairKey>
   readonly member?: boolean
   readonly outbox?: "remote" | "local" | "none"
+  /** `Pair`, or a model with its fields of other types. */
+  readonly model?: Schema.Top
 }
 
-/** `sides` in schema `pair` under `w`'s setting, with one outbox table, `O`, named `o`. */
-const pairs = (w: World, sides: ReadonlyArray<PairSide>) => {
+/**
+ * `sides` in schema `pair` under `w`'s setting, with one outbox table, `O`, named `o`; every
+ * projection writes `row`.
+ */
+const pairs = (
+  w: World,
+  sides: ReadonlyArray<PairSide>,
+  row: Record<string, unknown> = PAIR_ROW,
+) => {
   const schema = DynamoSchema.make({ name: "pair", version: 1, escapeKeys: w === On })
   const built = sides.map((side) => ({
     side,
     Ledgers: Entity.make({
-      model: Pair,
+      model: (side.model ?? Pair) as typeof Pair,
       entityType: "Ledger",
       primaryKey: {
         pk: { field: "pk", composite: [...side.pk] },
@@ -1958,8 +1968,8 @@ const pairs = (w: World, sides: ReadonlyArray<PairSide>) => {
       : EventStore.projection({
           stream: w.Accounts,
           readModel: Ledgers as unknown as Entity.Entity<any, any, any, any, any>,
-          key: () => PAIR_ROW,
-          initial: (): Pair => ({ ...PAIR_ROW, total: 0, version: 0, rev: 0 }),
+          key: () => row,
+          initial: (): Pair => ({ ...(row as typeof PAIR_ROW), total: 0, version: 0, rev: 0 }),
           evolve: (state: Pair, event: EventStore.StreamEvent<AccountEvent>) =>
             Effect.succeed(
               event.data._tag === "Added"
@@ -1994,7 +2004,7 @@ const pairs = (w: World, sides: ReadonlyArray<PairSide>) => {
         ...order.flatMap((i) => (read[i] === undefined ? [] : [[`R${i}`, read[i]!]])),
       ]),
     } as any) as Effect.Effect<any, never, any>
-  return { w, O, built, projections, layer, client }
+  return { w, O, built, projections, layer, client, row }
 }
 type Pairs = ReturnType<typeof pairs>
 
@@ -2004,7 +2014,7 @@ const applyPair = (s: Pairs, side: number, events: ReadonlyArray<unknown>) =>
 const drained = (s: Pairs, side: number) =>
   Effect.gen(function* () {
     const delivered: Array<number> = []
-    yield* (s.projections[side] as any).drain(PAIR_ROW, (effect: { readonly total: number }) =>
+    yield* (s.projections[side] as any).drain(s.row, (effect: { readonly total: number }) =>
       Effect.sync(() => void delivered.push(effect.total)),
     ) as Effect.Effect<unknown>
     return delivered
@@ -2083,6 +2093,185 @@ describe("[EDD-9134] a number composite beside a label its key text can't spell"
   )
 })
 
+/** A row of every composite the date pairs below are keyed by. */
+const Dated = Schema.Struct({
+  at: Schema.DateTimeUtc,
+  at_x: Schema.String,
+  total: Schema.Number,
+  version: Schema.Number,
+  rev: Schema.Number,
+})
+type Dated = typeof Dated.Type
+
+const DATED_ROW = { at: DateTime.makeUnsafe("2026-11-11T08:00:00.000Z"), at_x: "q" } as const
+
+/** One side of a date pair: its model (`Dated` with `at` replaced) and the composite it's keyed by. */
+type DatedSide = readonly [
+  at: Schema.Top | DynamoModel.ConfiguredModel<any, any>,
+  key: "at" | "at_x",
+]
+
+/**
+ * Two `Ledger` read models in schema `dates` under `w`'s setting, each keyed by one composite, with
+ * their projections' outboxes on one table, `O`, named `o`.
+ */
+const datePair = (w: World, sides: ReadonlyArray<DatedSide>) => {
+  const schema = DynamoSchema.make({ name: "dates", version: 1, escapeKeys: w === On })
+  const O = Table.make({ schema, entities: {} })
+  const built = sides.map(([model, composite], i) => {
+    const Ledgers = Entity.make({
+      model: model as typeof Dated,
+      entityType: "Ledger",
+      primaryKey: {
+        pk: { field: "pk", composite: [composite] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const ReadTable = Table.make({ schema, entities: { Ledgers } })
+    const projection = EventStore.projection({
+      stream: w.Accounts,
+      readModel: Ledgers as unknown as Entity.Entity<any, any, any, any, any>,
+      key: () => DATED_ROW,
+      initial: (): Dated => ({ ...DATED_ROW, total: 0, version: 0, rev: 0 }),
+      evolve: (state: Dated, event: EventStore.StreamEvent<AccountEvent>) =>
+        Effect.succeed(
+          event.data._tag === "Added"
+            ? { ...state, total: state.total + event.data.amount }
+            : state,
+        ),
+      checkpoint: "version",
+      revision: "rev",
+      outbox: {
+        schema: Notice,
+        effects: (event: EventStore.StreamEvent<AccountEvent>, next: Dated | undefined) =>
+          event.data._tag === "Added"
+            ? [{ account: event.streamId, total: next?.total ?? -1 }]
+            : [],
+        table: O,
+      },
+    } as any)
+    return { Ledgers, ReadTable, projection, name: `r${i}` }
+  })
+  const layer = Layer.mergeAll(
+    w.EventsTable.layer({ name: "t" }),
+    O.layer({ name: "o" }),
+    ...built.map((side) => side.ReadTable.layer({ name: side.name })),
+  )
+  /** `DynamoClient.make`'s and `processBatch`'s defects (`"binds"` for none). */
+  const bind = Effect.gen(function* () {
+    const defect = <R>(effect: Effect.Effect<unknown, unknown, R>) =>
+      effect.pipe(
+        Effect.as("binds"),
+        Effect.catchDefect((cause) => Effect.succeed(String(cause))),
+      )
+    return {
+      make: yield* defect(
+        DynamoClient.make({
+          entities: { A: built[0]!.Ledgers, B: built[1]!.Ledgers },
+          tables: { O, R0: built[0]!.ReadTable, R1: built[1]!.ReadTable },
+        } as any),
+      ),
+      processBatch: yield* defect(
+        EventStore.processBatch([], {
+          projections: { a: built[0]!.projection as any, b: built[1]!.projection as any },
+          source: "lambda",
+        }),
+      ),
+    }
+  }).pipe(Effect.provide(Layer.mergeAll(makeRecordingTable().layer, layer)))
+  return { sides: built, layer, bind }
+}
+
+/** `Dated` with `at` as `at`. */
+const datedWith = (at: Schema.Top) => Schema.Struct({ ...Dated.fields, at })
+
+describe("[EDD-9134] a date composite beside a label its key text can't spell", () => {
+  // A is keyed by the date `at` (`at_2026-11-11t08:00:00.000z`, or its epoch), B by the string
+  // `at_x` (`at_x_q`): a date's key text never starts with `x`, so no key of one is a key of the
+  // other. 1.39.0 bound them; 1.40.0 took the date for any text and refused them.
+  it.effect.each([
+    ["stored as ISO text", Dated],
+    [
+      "stored as epoch milliseconds",
+      DynamoModel.configure(Dated, { at: { storedAs: DynamoModel.DateEpochMs } }),
+    ],
+  ] as const)("they bind, apply and drain, each its own (%s)", ([, model]) => {
+    const tables = routedTables()
+    const s = datePair(On, [
+      [model, "at"],
+      [Dated, "at_x"],
+    ])
+    return Effect.gen(function* () {
+      expect(yield* s.bind).toEqual({ make: "binds", processBatch: "binds" })
+      const events = yield* seed(On, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+      for (const side of s.sides) yield* side.projection.applyBatch(events)
+      expect(tables.rows("o", "Ledger#outbox").map(([stored]) => stored.split("|")[0])).toEqual(
+        expect.arrayContaining([
+          model === Dated
+            ? "$dates#v1#ledger#at_2026-11-11t08:00:00.000z"
+            : "$dates#v1#ledger#at_0001794384000000",
+          "$dates#v1#ledger#at_x_q",
+        ]),
+      )
+      for (const side of s.sides) {
+        const delivered: Array<number> = []
+        yield* side.projection.drain(DATED_ROW, (effect: { readonly total: number }) =>
+          Effect.sync(() => void delivered.push(effect.total)),
+        )
+        expect(delivered).toEqual([2])
+      }
+    }).pipe(Effect.provide(Layer.mergeAll(tables.layer, s.layer))) as Effect.Effect<void, unknown>
+  })
+
+  it.effect.each([
+    ["DynamoModel.DateString", DynamoModel.DateString],
+    ["Schema.DateTimeUtc", Schema.DateTimeUtc],
+    ["Schema.Date", Schema.Date],
+    ["DynamoModel.UnsafeDateString", DynamoModel.UnsafeDateString],
+    ["DynamoModel.DateTimeZoned", DynamoModel.DateTimeZoned],
+    ["DynamoModel.DateEpochSeconds", DynamoModel.DateEpochSeconds],
+    ["an optional DynamoModel.DateString", Schema.optional(DynamoModel.DateString)],
+  ] as const)("a date as %s binds beside `at_x`, under either setting", ([, at]) =>
+    Effect.gen(function* () {
+      for (const w of [On, Off]) {
+        const bound = yield* datePair(w, [
+          [datedWith(at), "at"],
+          [Dated, "at_x"],
+        ]).bind
+        expect(bound).toEqual({ make: "binds", processBatch: "binds" })
+      }
+    }),
+  )
+
+  it.effect("a date beside a string or a date of its name is still refused", () =>
+    Effect.gen(function* () {
+      for (const other of [Schema.String, Schema.DateTimeUtc, DynamoModel.DateTimeZoned]) {
+        for (const at of [Schema.DateTimeUtc, DynamoModel.DateTimeZoned]) {
+          const bound = yield* datePair(On, [
+            [datedWith(at), "at"],
+            [datedWith(other), "at"],
+          ]).bind
+          expect(bound.make).toContain(
+            `[EDD-9134] DynamoClient.make: "A" writes its projection's outbox items into another ` +
+              `table ("o"), where "B" writes its own under the same key space (partition keys ` +
+              `starting "$dates#v1#ledger#at_"`,
+          )
+          expect(bound.processBatch).toContain("[EDD-9134] EventStore.processBatch:")
+        }
+      }
+      // Two epochs, or an epoch beside a number: a number's text.
+      const epoch = DynamoModel.configure(Dated, { at: { storedAs: DynamoModel.DateEpochMs } })
+      for (const other of [epoch, datedWith(Schema.Number)]) {
+        const bound = yield* datePair(On, [
+          [epoch, "at"],
+          [other, "at"],
+        ]).bind
+        expect(bound.make).toContain("[EDD-9134] DynamoClient.make:")
+      }
+    }),
+  )
+})
+
 describe.each(DIRECTIONS)("[EDD-9134] a member of the outbox's table, %s", (_d, from, to) => {
   // M is a member of the outbox table, keyed by `shop`; R's projection writes its outbox there,
   // keyed by `shop` and `branch`. M claims the outbox items of its entity type on its table, and
@@ -2121,6 +2310,51 @@ describe.each(DIRECTIONS)("[EDD-9134] a member of the outbox's table, %s", (_d, 
         }
         // R's item is where it was, delivered by R's drainer under the setting it was written.
         expect(yield* drained(written, 1)).toEqual([2])
+      }).pipe(
+        Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+      ) as Effect.Effect<void, unknown>
+    },
+  )
+
+  // M's `kind` is the literal union `a | b`, R's a string. M's reader reads a literal composite as
+  // any text, as R's reads its string, and composes it as R does: it moves R's item where R's
+  // drainer reads it, a value outside M's literals included, as 1.39.0 did. 1.40.0 refused it.
+  it.effect.each([
+    ["one of M's literals", "a"],
+    ["no literal of M's", "c d"],
+  ] as const)(
+    "a member keyed as the read model, by a literal union where it has a string, moves its items there (%s)",
+    ([, kind]) => {
+      const tables = routedTables()
+      const Text = Schema.Struct({ ...Pair.fields, kind: Schema.String })
+      const sides: ReadonlyArray<PairSide> = [
+        { pk: ["kind", "shop"], member: true, outbox: "none" },
+        { pk: ["kind", "shop"], model: Text },
+      ]
+      const row = { ...PAIR_ROW, kind }
+      const written = pairs(from, sides, row)
+      const now = pairs(to, sides, row)
+      return Effect.gen(function* () {
+        const events = yield* seed(from, "moved", [new Opened(), new Added({ amount: 2 })], 0)
+        yield* applyPair(written, 1, events)
+        const before = tables.rows("o", "Ledger#outbox").map(([stored]) => stored)
+        expect(before).toHaveLength(1)
+        // Either way round: whichever the client binds first.
+        for (const order of [
+          [0, 1],
+          [1, 0],
+        ]) {
+          const db = yield* now.client(order)
+          const report = (yield* db.tables.O.rekey({
+            streams: [to.Accounts],
+          })) as Table.RekeyReport
+          expect(report.skipped.unrecognizedKey).toBe(0)
+          expect(report.conflicts).toEqual([])
+        }
+        const after = tables.rows("o", "Ledger#outbox").map(([stored]) => stored)
+        expect(after).toHaveLength(1)
+        expect(after[0] === before[0]).toBe(from === to)
+        expect(yield* drained(now, 1)).toEqual([2])
       }).pipe(
         Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
       ) as Effect.Effect<void, unknown>

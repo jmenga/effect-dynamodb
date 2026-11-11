@@ -16,7 +16,7 @@
  */
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
-import { isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
+import { type DynamoEncoding, isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   ConcurrentModification,
@@ -31,7 +31,9 @@ import {
   keyFormValueKind,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import {
+  optionalField,
   readingStreamValues,
+  resolveFieldEncoding,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
@@ -370,12 +372,29 @@ export const physicalTableName = (tag: TableTag): Effect.Effect<string | undefin
   )
 
 /**
+ * The date encoding a composite field is stored under, as the entity resolves it: the field's own
+ * (a `DynamoModel` date schema, or an Effect date schema's default), its `storedAs` override, or,
+ * for an optional field, its value's. `undefined` for a field that is no date.
+ */
+const dateEncodingOf = (
+  field: Schema.Top,
+  override: DynamoEncoding | undefined,
+): DynamoEncoding | undefined => {
+  const own = resolveFieldEncoding(field, undefined)
+  if (own !== null) return resolveFieldEncoding(field, override) ?? undefined
+  const inner = optionalField(field)?.inner
+  if (inner === undefined || resolveFieldEncoding(inner, undefined) === null) return undefined
+  return resolveFieldEncoding(inner, override) ?? undefined
+}
+
+/**
  * What a composite of `model` can be in a key (`KeyComposer.CompositeValues`), by its schema, as
  * one side sees it:
  *
  * - `"written"`, the keys its rows are written under: the key text of its literals (a literal
- *   union), of `true` and `false` (a boolean), or a number's or bigint's key text; any other field
- *   (a string, a field the model doesn't declare) may hold any text, `#` included.
+ *   union), of `true` and `false` (a boolean), a number's or bigint's key text, or a date's (an
+ *   epoch's number, or the ISO text of a date stored as a string); any other field (a string, a
+ *   field the model doesn't declare) may hold any text, `#` included.
  * - `"read"`, the keys `rekey`'s reader takes as its rows' (`KeyText136.readIndexKeys`): a number,
  *   a bigint or a boolean only as text its value composes again, and a literal composite as any
  *   text, which it reads as a string.
@@ -388,6 +407,22 @@ const compositeValues =
     const fields = getSchemaFields(schema)
     if (fields === undefined || !Object.hasOwn(fields, composite)) return "open"
     const field = fields[composite]!
+    if (side === "written") {
+      const configured = isConfiguredModel(model) ? model.attributes : undefined
+      const date = dateEncodingOf(
+        field,
+        configured !== undefined && Object.hasOwn(configured, composite)
+          ? configured[composite]!.encoding
+          : undefined,
+      )
+      if (date !== undefined) {
+        return date.storage !== "string"
+          ? "number"
+          : date.domain === "DateTime.Zoned"
+            ? "zonedDate"
+            : "date"
+      }
+    }
     const literals = keyFormLiterals(field)
     if (side === "written" && literals !== undefined) return { values: literals }
     const kind = keyFormValueKind(field)
@@ -487,7 +522,11 @@ const readAsEachOther = (a: unknown, b: unknown): boolean => {
 /**
  * Whether two entities compose every key the same way: one schema (name, version, casing,
  * `escapeKeys`), entity type and version, primary key composites, casing and collection, and each
- * composite of one type. Then either one's reader moves a row as the other's would.
+ * composite of one kind of key text (a string, a number, a bigint or a boolean), whether or not one
+ * of them is limited to literals: a reader reads a literal composite as any value of its kind, and
+ * its key form composes that value as one of its kind (a literal union beside a string moves an
+ * item where the string's would, as on 1.39.0). A composite of no one kind takes the same type on
+ * both. Then either one's reader moves a row as the other's would.
  */
 const sameKeys = (a: unknown, b: unknown): boolean => {
   type Member = {
@@ -515,7 +554,8 @@ const sameKeys = (a: unknown, b: unknown): boolean => {
   const typeOf = (fields: ReturnType<typeof getSchemaFields>, composite: string) => {
     if (fields === undefined || !Object.hasOwn(fields, composite)) return undefined
     const field = fields[composite]!
-    return JSON.stringify([keyFormValueKind(field), keyFormLiterals(field)])
+    const kind = keyFormValueKind(field)
+    return kind !== undefined ? kind : JSON.stringify([kind, keyFormLiterals(field)])
   }
   const same = (u: ReadonlyArray<string>, v: ReadonlyArray<string>) =>
     u.length === v.length && u.every((name, i) => name === v[i])

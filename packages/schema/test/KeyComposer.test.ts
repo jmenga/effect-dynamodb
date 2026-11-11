@@ -3837,6 +3837,31 @@ describe("composeKeySpace", () => {
       expect(meet(space(["n"]), space(["n_e"]))).toBe(false)
     })
 
+    it("a date's text starts with its year, and an instant's holds no letter but T and Z", () => {
+      const space = plain({ at: "date", zoned: "zonedDate" })
+      expect(space(["at"]).values).toEqual([{ kind: "date", zoned: false }])
+      // `at_2026-11-11t08:00:00.000z` and `at_x_q`: a date's text can't start with `x`.
+      expect(meet(space(["at"]), space(["at_x"]))).toBe(false)
+      expect(meet(space(["zoned"]), plain({})(["zoned_x"]))).toBe(false)
+      // As text, it can.
+      expect(meet(plain({})(["at"]), space(["at_x"]))).toBe(true)
+      // A date beside a date, a number (a year's digits) or text: the same keys.
+      expect(meet(space(["at"]), space(["at"]))).toBe(true)
+      expect(meet(space(["at"]), plain({ at: "number" })(["at"]))).toBe(true)
+      expect(meet(space(["zoned"]), plain({})(["zoned"]))).toBe(true)
+      // The sign of a wide year.
+      const whole = (text: string) => ({ text, after: [], open: false })
+      expect(meet(space(["at"]), whole("$a#v1#ledger#at_+275760-09-13t00:00:00.000z"))).toBe(true)
+      expect(meet(space(["at"]), whole("$a#v1#ledger#at_-000001-01-01T00:00:00.000Z"))).toBe(true)
+      // An instant's text holds no other letter; a zoned date's holds its zone's name.
+      const tokyo = "2024-01-01t15:00:00.000+09:00[asia/tokyo]"
+      expect(meet(space(["at"]), whole(`$a#v1#ledger#at_${tokyo}`))).toBe(false)
+      expect(meet(space(["zoned"]), whole(`$a#v1#ledger#zoned_${tokyo}`))).toBe(true)
+      // Never empty, never the delimiter.
+      expect(meet(space(["at"]), whole("$a#v1#ledger#at_"))).toBe(false)
+      expect(meet(space(["zoned"]), whole("$a#v1#ledger#zoned_2024#x"))).toBe(false)
+    })
+
     it("a number's text is never empty", () => {
       const space = plain({ n: "number" })
       const whole = { text: "$a#v1#ledger#n_", after: [], open: false }
