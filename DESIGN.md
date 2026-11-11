@@ -1020,12 +1020,67 @@ context gives them (two handles on one table are one table), or by handle when
 it gives none. Read models that never meet at one of those sites, bound
 separately or in different programs, can't be checked: key spaces must be
 distinct per outbox table, and that is the application's to keep. A unit that moves together (an aggregate, a
-stream, a moved row's target) is claimed once per run (`claim`, `once`), so it is
-moved and counted once whichever of its rows the scan reaches first, and a row
-reached after it moved — by this run, or by an application write between the
-scan and the move — is `unchanged`: `moved` counts what the run moved. After the
-scan each member's `finish` runs (`RekeyMember.finish`): an aggregate judges the rows
+stream) is judged once per run, so it is moved and counted once whichever of its
+rows the scan reaches first; a row an application write moved between the scan
+and the move is `unchanged`: `moved` counts what the run moved. After the scan
+each member's `finish` runs (`RekeyMember.finish`): an aggregate judges the rows
 it found below a root it never saw there.
+
+**One outcome whatever the order (#240).** Over a table nothing else writes to,
+the report and the rows a run leaves don't depend on the order the scan returns
+rows in, its segment count or its `concurrency`; `test/RekeyVisitOrder.test.ts`
+runs every scenario over shuffled visit orders and several segment counts and
+compares the report and the rows, dry run and real. Up to 1.40.0 they did: the
+scan and a move needing a row out of its way both judged that row, so it could
+be reported twice, two ways, or counted as `unchanged` after the run moved it.
+
+- **One verdict per unit.** A stored row (`Rekey.rowUnit`, by its key), an
+  aggregate partition and an event stream are each a unit judged once a run
+  (`RekeyRowContext.judge`): the first visit judges it (the scan's, or a move's
+  that needs it out of the way), a visit meanwhile waits for that verdict, and a
+  later one finds it settled. A unique sentinel's reservation is a unit of its
+  own (`Rekey.reservationUnit`), apart from the move that carries it with a
+  tombstone. A wait that would close a loop (a row in the way of a row in the
+  way of it, through the units each waits on) isn't taken: every unit on the
+  loop is told `loop`, and each reports `contended` (`LOOP_MESSAGE`), so every
+  wait that is taken ends.
+- **A row in the way is judged as its own unit first.** A move whose target
+  holds another value's old row moves that row first (`clearTarget`). One that
+  belongs to a unit moving together (another aggregate sharing the partition,
+  another stream) is judged as the scan would judge that unit (`yieldTo`, the
+  member's `holder`), reading nothing more: the asker's rows show what it is.
+  What stays there is `taken`. An aggregate whose row is in the way under both
+  keys of the chain tells its rows from another's by the values a row's sort
+  key is composed from (`otherElement`), never by key alone.
+- **The run doesn't meet its own writes** (`Journal`). Every write on the
+  table is noted by key as it's answered. The scan passes a row the run put
+  (its fingerprint, `textHash` of `canonicalItem`, is one the run left there),
+  and a row the run took that a page read before the take still returned.
+  Anything else at such a key, a row someone wrote there since, is a new row,
+  counted and judged.
+- **`scanned` counts each row stored when the run met it, once**: when the scan
+  returns it, or when the run takes it (moves it away, or writes over it as read)
+  before the scan reaches it. Rows the run put aren't counted, so over a table
+  nothing else writes to, `scanned` is the number of rows stored when the run
+  started, in a dry run and a real run alike. A row the run moved isn't
+  `unchanged`, whichever member meets it after.
+- **A dry run plans the writes a real run sends** (`RekeyRowContext.plan`): it
+  sends none, but notes what each would do if it succeeded as far as the run
+  knows (no row the plan placed where it asks for none, none the plan took where
+  it asks for one), and its reads (gets, queries, the scan's pages) see the plan.
+  So a later decision sees what an earlier one would have done: a dry run's
+  report is the run's, chains included, but for `indexKeys.repaired` (a dry run
+  writes no key and counts none).
+- **Conflicts are reported one per row** (member, kind, key): the first by
+  precedence (`failed`, `unguarded`, `uncomposable`, `bothKeys`, `contended`,
+  `taken`), in a fixed order (member, kind, key, reason, target, message).
+
+The journal costs memory: an entry per key the scan returns (a key text), and,
+for each key the run wrote to, what it left there (a fingerprint, not the row).
+It reads and writes nothing: over a table with nothing to move, a run sends
+exactly the requests 1.40.0 sent (`test/fixtures/rekey-requests-1.40.0.json`,
+from the published package; `RekeyQuietRequests.test.ts` and its connected
+twin).
 
 **Idempotence.** A row moves only when it is stored under a key its values
 composed under another form and that key differs from the one they compose now. The scan is

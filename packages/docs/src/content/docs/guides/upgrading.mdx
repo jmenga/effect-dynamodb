@@ -146,7 +146,7 @@ The report counts:
 | `capacity` | What the run consumed: capacity units (read and write), requests |
 | `resume` | `Some(token)` to go on from, when the run stopped before the end of the table; `None` when it covered the whole table |
 
-A row is counted once, by the run that moves it. A row the scan reaches after something else moved it (a stream copied ahead of its scan position) is `unchanged`, so `scanned` is not the sum of the other counts.
+Each row is judged once a run, however often the scan and the moves of other rows reach it, so the report and the rows a run leaves don't depend on the order the scan returns rows in, on `segments` or on `concurrency`. `scanned` counts each row stored when the run met it, once: a row the run puts isn't counted, so over a table nothing else writes to it's the number of rows the table held, in a dry run and a run alike. A row the run moved isn't `unchanged` when the scan reaches it again; a row your application moved before `rekey` got to it is.
 
 ## Run
 
