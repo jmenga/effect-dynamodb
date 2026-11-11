@@ -339,10 +339,42 @@ describe("pathIsRequired", () => {
       ["city"],
       false,
     ],
+    // A value of the member without it is left as it was, and which member's value is stored
+    // only a read says. Published 1.39.0 sent the removal, and the row read back.
     [
-      "a union where only one member has it",
+      "a union where only one member has it: a value of the other is left as it was",
       Schema.Union([Address, Schema.Struct({ other: Schema.String })]),
       ["city"],
+      false,
+    ],
+    [
+      "a union whose other member reads the value without it",
+      Schema.Union([
+        Schema.Struct({ x: Schema.Number, y: Schema.String }),
+        Schema.Struct({ y: Schema.String }),
+      ]),
+      ["x"],
+      false,
+    ],
+    [
+      "a tagged union whose other member doesn't have it",
+      Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("a"), x: Schema.Number }),
+        Schema.Struct({ kind: Schema.Literal("b"), y: Schema.String }),
+      ]),
+      ["x"],
+      false,
+    ],
+    [
+      "a union's member that can't hold the path doesn't count: DynamoDB refuses it there",
+      Schema.NullOr(Address),
+      ["city"],
+      true,
+    ],
+    [
+      "below a property a union's other member lacks: DynamoDB refuses the path there",
+      Schema.Union([Schema.Struct({ a: Address }), Schema.Struct({ other: Schema.String })]),
+      ["a", "city"],
       true,
     ],
     ["a nested set", Schema.Struct({ s: Schema.ReadonlySet(Schema.String) }), ["s"], false],

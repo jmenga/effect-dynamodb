@@ -1,0 +1,2521 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (with effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local at a clock fixed at 1700000000000 ms: for each scenario, whether Entity.make loaded the definition, then each step's outcome (a failure as its tag and EDD code, or the first line of its message) and the table's rows after it, scanned and sorted by key. Never regenerate it or edit it to match a later release.",
+ "clock": 1700000000000,
+ "scenarios": {
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x, retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       },
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "y": "kept"
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "y": "kept"
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x, in a transaction, retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       },
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "y": "kept"
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ kind: \"a\", x }, { kind: \"b\", y }]), holding {\"kind\":\"b\",\"y\":\"kept\"}: pathRemove f.x": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ kind: \"a\", x }, { kind: \"b\", y }]), holding {\"kind\":\"b\",\"y\":\"kept\"}: pathRemove f.x, retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       },
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ kind: \"a\", x }, { kind: \"b\", y }]), holding {\"kind\":\"b\",\"y\":\"kept\"}: pathRemove f.x, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ kind: \"a\", x }, { kind: \"b\", y }]), holding {\"kind\":\"b\",\"y\":\"kept\"}: pathRemove f.x, in a transaction, retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       },
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "b",
+        "y": "kept"
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         },
+         "kind": {
+          "S": "b"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ kind: \"a\", x }, { kind: \"b\", y }]), holding {\"kind\":\"a\",\"x\":1}: pathRemove f.x": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "a",
+        "x": 1
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "kind": {
+          "S": "a"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "kind": {
+          "S": "a"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "kind": {
+          "S": "a"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ kind: \"a\", x }, { kind: \"b\", y }]), holding {\"kind\":\"a\",\"x\":1}: pathRemove f.x, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "kind": "a",
+        "x": 1
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "kind": {
+          "S": "a"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "kind": {
+          "S": "a"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "kind": {
+          "S": "a"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { x: string }]), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { x: string }]), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: NullOr({ x, y }), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: NullOr({ x, y }), holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { x, y }, holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { x, y }, holding {\"x\":1,\"y\":\"kept\"}: pathRemove f.x, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: set f undefined": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: set f undefined, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: remove f": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([{ x, y }, { y }]), holding {\"x\":1,\"y\":\"kept\"}: remove f, in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "x": 1,
+        "y": "kept"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "x": {
+          "N": "1"
+         },
+         "y": {
+          "S": "kept"
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

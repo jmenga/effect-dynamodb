@@ -1291,7 +1291,10 @@ const pathVerdict = (ast: SchemaAST.AST, segments: ReadonlyArray<string | number
       return below(property.type, lackable)
     }
     const index = ast.indexSignatures[0]
-    return index === undefined ? "absent" : rest.length > 0 ? pathVerdict(index.type, rest) : "open"
+    if (index !== undefined) return rest.length > 0 ? pathVerdict(index.type, rest) : "open"
+    // A value of this doesn't hold the property: removing it changes nothing, so the row reads as
+    // it did. Removing below it is a path DynamoDB refuses on such a value.
+    return rest.length > 0 ? "absent" : "open"
   }
   if (SchemaAST.isArrays(ast)) {
     if (typeof head !== "number") return "absent"
@@ -1318,8 +1321,11 @@ const pathVerdict = (ast: SchemaAST.AST, segments: ReadonlyArray<string | number
  *
  * It walks the stored side of the schema, so a `Schema.Class` and a `ref`
  * field are seen through and a decoding default counts as optional. A union
- * is judged by the members that declare the property: a value holding it is
- * one of those. A property whose absent attribute is one of its values
+ * requires a property only when every member that holds properties requires
+ * it: a value of a member without it is left as it was, and which member's
+ * value is stored only a read says. A member that can't hold the path (a
+ * scalar, `null`) doesn't count, since DynamoDB refuses the removal on its
+ * value. A property whose absent attribute is one of its values
  * ({@link absentReading}) is not required. `false` means the schema can't say the
  * row breaks: a record's keys, a list's elements, and anything opaque (a
  * `Schema.declare`, a set, a `.check()` such as a minimum length, which is a
