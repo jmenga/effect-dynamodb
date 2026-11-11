@@ -19,6 +19,7 @@ import * as Batch from "../src/Batch.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import { fromAttributeValue, toAttributeMap, toAttributeValue } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
@@ -420,17 +421,44 @@ const steady = (node: unknown): unknown =>
         )
       : node
 
+/**
+ * `requests` without the read-model tag 1.41.0 writes on each outbox item (`__edd_rm__`, #237),
+ * which is the projection's read model's, and how many items held it.
+ */
+const untagged = (requests: unknown): { readonly tagged: number; readonly as139: unknown } => {
+  let tagged = 0
+  const walk = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(walk)
+    if (typeof node !== "object" || node === null) return node
+    const out: Record<string, unknown> = {}
+    for (const [name, value] of Object.entries(node)) {
+      if (name === "__edd_rm__") {
+        expect(value).toEqual({ S: readModelTag(Summaries) })
+        tagged++
+        continue
+      }
+      out[name] = walk(value)
+    }
+    return out
+  }
+  return { as139: walk(requests), tagged }
+}
+
 describe("a cookie's expiry is written as ISO text wherever the cookie is written", () => {
   for (const [group, name, run, typed] of CASES) {
-    it.effect(`${group} ${name}: what 1.39.0 sent, but each cookie's expiry`, () =>
-      Effect.gen(function* () {
-        const expected = scenarioOf(group, name)
-        expect(expected.outcome).toBe("ok")
-        const sent = yield* run()
-        const { at, as139 } = isoExpiries(sent)
-        expect(steady(as139)).toEqual(steady(expected.requests))
-        expect(at).toEqual(typed)
-      }),
+    it.effect(
+      `${group} ${name}: what 1.39.0 sent, but each cookie's expiry, and each outbox item's read model`,
+      () =>
+        Effect.gen(function* () {
+          const expected = scenarioOf(group, name)
+          expect(expected.outcome).toBe("ok")
+          const sent = yield* run()
+          const { at, as139 } = isoExpiries(sent)
+          const { tagged, as139: plain } = untagged(as139)
+          expect(tagged).toBe(group === "projection" ? 1 : 0)
+          expect(steady(plain)).toEqual(steady(expected.requests))
+          expect(at).toEqual(typed)
+        }),
     )
   }
 })

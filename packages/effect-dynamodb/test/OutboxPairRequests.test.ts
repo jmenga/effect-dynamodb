@@ -3,7 +3,8 @@
  * (`helpers/OutboxPairRequests.ts`): keys that meet only through a value holding `#`, and keys
  * that part where a number's key text can't spell the other's label. 1.39.0 bound them and applied
  * their events, each to its own keys: a client still binds them, and every request and stored item
- * is what the published 1.39.0 sent and stored.
+ * is what the published 1.39.0 sent and stored, but each outbox item names its read model
+ * (`__edd_rm__`, from 1.41.0).
  */
 
 import { readFileSync } from "node:fs"
@@ -14,6 +15,7 @@ import { beforeEach } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import * as Table from "../src/Table.js"
 import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
 import { type Sent, scenario } from "./helpers/OutboxPairRequests.js"
@@ -43,21 +45,92 @@ beforeEach(resetStore)
 const tables = { events: "events", readA: "readA", readB: "readB", outbox: "outbox" }
 const lib = { DynamoSchema, Table, Entity, EventStore, DynamoClient }
 
-/** `sent` and the tables' items are what 1.39.0 sent and stored (`captured`). */
-const expectCaptured = (sent: ReadonlyArray<Sent>, captured: Captured) => {
+type Item = Record<string, { readonly S?: string }>
+
+/** `item` with the read model's tag after the row it names, where 1.41.0 writes it. */
+const tagged = (item: Item, tag: string): Item =>
+  Object.fromEntries(
+    Object.entries(item).flatMap(([name, value]) =>
+      name === "__edd_row_sk__"
+        ? [
+            [name, value],
+            ["__edd_rm__", { S: tag }],
+          ]
+        : [[name, value]],
+    ),
+  )
+
+/**
+ * What 1.39.0 sent and stored (`captured`), but each outbox item carrying the tag of the read model
+ * whose projection wrote it (`__edd_rm__`, #237): the row written beside it in one transaction,
+ * and the stored row it names.
+ */
+const markedCapture = (captured: Captured, readModels: Record<string, unknown>): Captured => {
+  const tags = Object.fromEntries(
+    Object.entries(readModels).map(([table, entity]) => [table, readModelTag(entity)!]),
+  )
+  expect(new Set(Object.values(tags)).size).toBe(2)
+  const isOutbox = (item: Item) => item.__edd_e__?.S === "Ledger#outbox"
+  const requests = captured.requests.map((request) => {
+    const input = request.input as {
+      readonly TransactItems?: ReadonlyArray<{ readonly Put?: { TableName: string; Item: Item } }>
+    }
+    if (input.TransactItems === undefined) return request
+    const row = input.TransactItems.find((t) => Object.hasOwn(tags, t.Put?.TableName ?? ""))
+    if (row === undefined) return request
+    return {
+      ...request,
+      input: {
+        ...input,
+        TransactItems: input.TransactItems.map((t) =>
+          t.Put !== undefined && isOutbox(t.Put.Item)
+            ? { ...t, Put: { ...t.Put, Item: tagged(t.Put.Item, tags[row.Put!.TableName]!) } }
+            : t,
+        ),
+      },
+    }
+  })
+  const owner = (item: Item) =>
+    Object.keys(tags).find((table) =>
+      (captured.items[table] as ReadonlyArray<Item>).some(
+        (stored) =>
+          stored.pk?.S === item.__edd_row_pk__?.S && stored.sk?.S === item.__edd_row_sk__?.S,
+      ),
+    )!
+  return {
+    requests,
+    items: {
+      ...captured.items,
+      outbox: (captured.items.outbox as ReadonlyArray<Item>).map((item) =>
+        isOutbox(item) ? tagged(item, tags[owner(item)]!) : item,
+      ),
+    },
+  }
+}
+
+/**
+ * `sent` and the tables' items are what 1.39.0 sent and stored (`captured`), each outbox item
+ * carrying its read model's tag.
+ */
+const expectCaptured = (
+  sent: ReadonlyArray<Sent>,
+  captured: Captured,
+  readModels: Record<string, unknown>,
+) => {
+  const expected = markedCapture(captured, readModels)
   expect(sent.map((request) => JSON.stringify(request))).toEqual(
-    captured.requests.map((request) => JSON.stringify(request)),
+    expected.requests.map((request) => JSON.stringify(request)),
   )
   for (const table of ["readA", "readB", "outbox"] as const) {
-    expect(JSON.parse(JSON.stringify(itemsOf(table)))).toEqual(captured.items[table])
+    expect(JSON.parse(JSON.stringify(itemsOf(table)))).toEqual(expected.items[table])
   }
 }
 
 describe("read models whose outbox keys meet only through a value holding `#`", () => {
   it.effect("bind, and send and store what 1.39.0 did", () =>
     Effect.gen(function* () {
-      const { run } = scenario(lib, tables)
-      expectCaptured(yield* run(InMemoryClient), fixture)
+      const { run, readModels } = scenario(lib, tables)
+      expectCaptured(yield* run(InMemoryClient), fixture, readModels)
     }),
   )
 })
@@ -69,8 +142,8 @@ describe("read models whose outbox keys part where a number's text can't spell a
     "bind, and send and store what 1.39.0 did, escapeKeys %s",
     (setting) =>
       Effect.gen(function* () {
-        const { run } = scenario(lib, tables, "typed", setting === "on")
-        expectCaptured(yield* run(InMemoryClient), typed[setting])
+        const { run, readModels } = scenario(lib, tables, "typed", setting === "on")
+        expectCaptured(yield* run(InMemoryClient), typed[setting], readModels)
       }),
   )
 })

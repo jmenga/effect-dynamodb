@@ -309,6 +309,14 @@ export const KEY_TEXT = "__edd_kt__"
 export const OUTBOX_ROW_PK = "__edd_row_pk__"
 export const OUTBOX_ROW_SK = "__edd_row_sk__"
 
+/**
+ * The read model an outbox item was written for (#237): a tag of its key template
+ * (`ProjectionEngine.readModelTag`). Written from 1.41.0; part of no key. Read models of one entity
+ * type share the outbox index's partition, and a key alone can't always say whose an item is
+ * (`[shop]` with `north#branch_b1` beside `[shop, branch]`): `outboxOwnership` reads it first.
+ */
+export const OUTBOX_READ_MODEL = "__edd_rm__"
+
 /** A drainer's claim on an outbox item: its token, and the epoch millis it holds until. */
 export const OUTBOX_CLAIM = "__edd_claim__"
 export const OUTBOX_CLAIMED_UNTIL = "__edd_claimed_until__"

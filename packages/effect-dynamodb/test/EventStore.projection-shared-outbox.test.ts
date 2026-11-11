@@ -339,3 +339,132 @@ describe("drainPending, a read model keyed by a date beside one keyed by a label
     )
   }
 })
+
+/**
+ * Read models of one entity type in one schema whose keys only a value holding `#` can make the
+ * same (`[shop]` with `north#branch_b1` beside `[shop, branch]`), or whose keys part where a
+ * literal can't spell the other's label: they bind, as on 1.39.0. A key alone can't always say
+ * whose an item is, so from 1.41.0 each outbox item names its read model (`__edd_rm__`), and each
+ * drainer delivers exactly its own (#237). An item written before, at a key both write, is drained
+ * as 1.40.0 drained it.
+ */
+describe("drainPending, read models whose keys only a value holding `#` can make the same", () => {
+  const world = (pairs: "prefix" | "literal") => {
+    const schema = DynamoSchema.make({ name: "one", version: 1 })
+    const Outbox = Table.make({ schema, entities: {} })
+    const Model = Schema.Struct({
+      shop: Schema.String,
+      branch: Schema.String,
+      at: Schema.Literals(["a", "b"]),
+      at_x: Schema.String,
+      total: Schema.Number,
+      cp: Schema.optional(Schema.Number),
+      rev: Schema.optional(Schema.Number),
+    })
+    const key = { shop: "north", branch: "b1", at: "a", at_x: "q" } as const
+    const composites =
+      pairs === "prefix" ? ([["shop"], ["shop", "branch"]] as const) : ([["at"], ["at_x"]] as const)
+    const sides = composites.map((pk, i) => {
+      const Ledgers = Entity.make({
+        model: Model,
+        entityType: "Ledger",
+        primaryKey: { pk: { field: "pk", composite: [...pk] }, sk: { field: "sk", composite: [] } },
+      } as any)
+      const ReadTable = Table.make({ schema, entities: { Ledgers } })
+      const Notifying = EventStore.projection({
+        stream: Orders,
+        readModel: Ledgers,
+        key: () => key,
+        initial: () => ({ ...key, total: 0 }),
+        evolve: (state: any, event: any) =>
+          Effect.succeed({ ...state, total: state.total + event.data.amount }),
+        checkpoint: "cp",
+        revision: "rev",
+        outbox: {
+          schema: Schema.String,
+          effects: () => [i === 0 ? "A" : "B"],
+          table: Outbox,
+          index,
+        },
+      } as any)
+      return { Ledgers, ReadTable, Notifying: Notifying as any, name: `read${i}` }
+    })
+    const table = makeRecordingTable({ indexes: { outbox: { pk: index.pk, sk: index.sk } } })
+    const layer = Layer.mergeAll(
+      table.layer,
+      EventsTable.layer({ name: "events" }),
+      Outbox.layer({ name: "outbox" }),
+      ...sides.map((side) => side.ReadTable.layer({ name: side.name })),
+    )
+    const bound = DynamoClient.make({
+      entities: { A: sides[0]!.Ledgers, B: sides[1]!.Ledgers },
+      tables: { Outbox, R0: sides[0]!.ReadTable, R1: sides[1]!.ReadTable },
+    } as any)
+    const outboxItems = () =>
+      [...table.items.values()].filter((item) => item.__edd_e__?.S === "Ledger#outbox")
+    const apply = (id: string) =>
+      Effect.gen(function* () {
+        yield* bound
+        yield* Orders.append({ id }, [new Placed({ amount: 2 })], 0)
+        const events = yield* Orders.read({ id })
+        for (const side of sides) yield* side.Notifying.applyBatch(events)
+      })
+    const drain = (i: 0 | 1) =>
+      Effect.gen(function* () {
+        const seen: Array<unknown> = []
+        const result = yield* sides[i]!.Notifying.drainPending((effect: unknown) =>
+          Effect.sync(() => void seen.push(effect)),
+        )
+        expect(result.undelivered).toEqual([])
+        return seen
+      })
+    return { layer, outboxItems, apply, drain }
+  }
+
+  it.effect.each(["prefix", "literal"] as const)(
+    "%s: each drainer delivers exactly its own, and leaves the other's unclaimed",
+    (pairs) => {
+      const w = world(pairs)
+      return Effect.gen(function* () {
+        yield* w.apply(`own-${pairs}`)
+        expect(w.outboxItems()).toHaveLength(2)
+        expect(yield* w.drain(0)).toEqual(["A"])
+        const left = w.outboxItems()
+        expect(left).toHaveLength(1)
+        expect(left[0]!.__edd_claim__).toBeUndefined()
+        expect(yield* w.drain(1)).toEqual(["B"])
+        expect(w.outboxItems()).toEqual([])
+      }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+    },
+  )
+
+  it.effect(
+    "an item written before 1.41.0, at a key both write, is drained as 1.40.0 drained it",
+    () => {
+      const w = world("prefix")
+      return Effect.gen(function* () {
+        yield* w.apply("unmarked")
+        // As 1.40.0 wrote them: no read-model tag.
+        for (const item of w.outboxItems()) delete (item as Record<string, unknown>).__edd_rm__
+        // `[shop]` writes `shop_north#branch_b1` too (a shop holding `#`): it drains both, as
+        // 1.40.0 did; `[shop, branch]` writes no `shop_north`, and leaves that one.
+        expect(yield* w.drain(0)).toEqual(["A", "B"])
+        expect(yield* w.drain(1)).toEqual([])
+        expect(w.outboxItems()).toEqual([])
+      }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+    },
+  )
+
+  it.effect("an unmarked item at a key only the other writes is left to its drainer", () => {
+    const w = world("prefix")
+    return Effect.gen(function* () {
+      yield* w.apply("left")
+      for (const item of w.outboxItems()) delete (item as Record<string, unknown>).__edd_rm__
+      expect(yield* w.drain(1)).toEqual(["B"])
+      const left = w.outboxItems()
+      expect(left.map((item) => item.__edd_row_pk__?.S)).toEqual(["$one#v1#ledger#shop_north"])
+      expect(left[0]!.__edd_claim__).toBeUndefined()
+      expect(yield* w.drain(0)).toEqual(["A"])
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+})

@@ -934,7 +934,11 @@ and retained history. None of these is ever regenerated from this repo.
 
 **Rows holding no values.** A projection's row tombstone or outbox item says which text its key is
 by `__edd_kt__` (`KeyText136.formOfMark`, `markOf`): none is off's, `1` that of 1.37.0 and 1.38.0, `2`
-that of `escapeKeys: true` when it differs from off's. `rekey` reads the key back by the mark.
+that of `escapeKeys: true` when it differs from off's. `rekey` reads the key back by the mark. An
+outbox item written from 1.41.0 also names its read model by `__edd_rm__` (`readModelTag`, #237),
+part of no key, which `drainPending` and the outbox table's `rekey` read first
+(`outboxOwnership`); `rekey` moves an item as it is, tag and all, and adds none to an item
+written before.
 
 #### `rekey`
 
@@ -7454,20 +7458,32 @@ instance).
   drains after the write; `drainPending` sweeps through a sparse
   `outbox.index`. The index is keyed by entity type alone, so read models of one
   entity type sharing it (another schema or primary collection) list each
-  other's items: `drainPending` drains only the rows whose keys its read
-  model's composer writes, under every setting a row can have been written
-  under, for values of its composites' kinds (a date's ISO text or epoch, a
-  number's key text, a literal's, any text for a string, `#` included:
-  `KeyComposer.composeKeySpace` with `walkOpen`), and leaves the others'
-  items unclaimed for their drainers. What its reader would take isn't
-  enough: a date's reader takes `x_q` as a date's text, which no date writes.
-  Read models whose keys meet only through a string value holding `#`
-  (`shop_x` and `shop_x#branch_y`), which bind as on 1.39.0, can each be
-  written by the other's keys: such an item is drained by both drainers, as
-  on 1.40.0, where each drained every item of the index. Its requests are the ones 1.40.0
-  sent. On 1.39.0 and 1.40.0 it claimed another read model's head item, failed
-  to decode it with its own schema, and left the claim, so that read model's
-  drainer stopped there until the claim expired.
+  other's items. Whose an item is, is one decision (`outboxOwnership`, also
+  `rekey`'s): the row it names must have a key the read model's composer
+  writes, under every setting a row can have been written under, for values
+  of its composites' kinds (a date the library encodes as its ISO text or
+  epoch, a number's key text, a literal's, any text for a string, `#`
+  included: `KeyComposer.composeKeySpace` with `walkOpen`); what its reader
+  would take isn't enough (a date's reader takes `x_q` as a date's text, which
+  no date writes). Then the item's read-model tag (`__edd_rm__`, written from
+  1.41.0: a hash of the schema's name and version, the entity type and its
+  version, the primary collection and the primary key's composites,
+  `readModelTag`) says whether it's this read model's. Read models whose keys
+  meet only through a string value holding `#` (`[shop]` with `north#branch_b1`
+  beside `[shop, branch]`), which bind as on 1.39.0, can't be told apart by
+  key; the tag tells them apart. An item written before 1.41.0, at a key the
+  read model writes, carries no tag: `drainPending` drains it, as 1.40.0 did
+  every item of the index, so an item another read model's key can make too
+  is drained by both drainers, as on 1.40.0. Outbox items are short-lived, so
+  those drain away after an upgrade. The others' items are left unclaimed for
+  their drainers. Its requests are the ones 1.40.0 sent. On 1.39.0 and 1.40.0
+  it claimed another read model's head item, failed to decode it with its own
+  schema, and left the claim, so that read model's drainer stopped there until
+  the claim expired. The tag is additive, part of no key: the published
+  1.40.0's `drainPending` delivers and deletes a tagged item exactly as an
+  untagged one, with the same requests
+  (`test/fixtures/outbox-marked-drain-1.40.0.json`), so a 1.40.0 drainer in a
+  rolling deployment drains what 1.41.0 writes, as it drains every item.
 - **`EventStore.processBatch`** routes through each projection's internal
   routes (one per source stream; `bindProjection` wraps their decode and apply
   in its context), so single- and multi-source projections share one feed.

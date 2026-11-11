@@ -1,0 +1,351 @@
+{
+ "version": "1.40.0",
+ "tag": "1keqa9c",
+ "unmarked": {
+  "item": {
+   "__edd_row_pk__": {
+    "S": "$roll#v1#ledger#shop_north"
+   },
+   "streamId": {
+    "S": "o1"
+   },
+   "__edd_e__": {
+    "S": "Ledger#outbox"
+   },
+   "effect": {
+    "M": {
+     "total": {
+      "N": "2"
+     }
+    }
+   },
+   "sk": {
+    "S": "$roll#v1#ledger#outbox#000000000001#0000"
+   },
+   "obsk": {
+    "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000001#0000"
+   },
+   "pk": {
+    "S": "$roll#v1#ledger#shop_north"
+   },
+   "source": {
+    "S": "projection"
+   },
+   "eventType": {
+    "S": "Placed"
+   },
+   "version": {
+    "N": "1"
+   },
+   "obpk": {
+    "S": "Ledger#outbox"
+   },
+   "__edd_row_sk__": {
+    "S": "$roll#v1#ledger"
+   }
+  },
+  "result": {
+   "delivered": 1,
+   "undelivered": []
+  },
+  "delivered": [
+   {
+    "effect": {
+     "total": 2
+    },
+    "meta": {
+     "source": "projection",
+     "streamId": "o1",
+     "version": 1,
+     "eventType": "Placed"
+    }
+   }
+  ],
+  "requests": [
+   {
+    "operation": "query",
+    "input": {
+     "TableName": "outbox",
+     "IndexName": "outbox",
+     "KeyConditionExpression": "#p = :p",
+     "ExpressionAttributeNames": {
+      "#p": "obpk"
+     },
+     "ExpressionAttributeValues": {
+      ":p": {
+       "S": "Ledger#outbox"
+      }
+     }
+    }
+   },
+   {
+    "operation": "query",
+    "input": {
+     "TableName": "outbox",
+     "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+     "ExpressionAttributeNames": {
+      "#pk": "pk",
+      "#sk": "sk"
+     },
+     "ExpressionAttributeValues": {
+      ":pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      ":sk": {
+       "S": "$roll#v1#ledger#outbox#"
+      }
+     },
+     "ConsistentRead": true,
+     "Limit": 1
+    }
+   },
+   {
+    "operation": "updateItem",
+    "input": {
+     "TableName": "outbox",
+     "Key": {
+      "pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      "sk": {
+       "S": "$roll#v1#ledger#outbox#000000000001#0000"
+      }
+     },
+     "UpdateExpression": "SET #c = :c, #u = :u",
+     "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+     "ExpressionAttributeNames": {
+      "#c": "__edd_claim__",
+      "#u": "__edd_claimed_until__",
+      "#pk": "pk"
+     },
+     "ExpressionAttributeValues": {
+      ":c": {
+       "volatile": true
+      },
+      ":u": {
+       "volatile": true
+      },
+      ":now": {
+       "volatile": true
+      }
+     }
+    }
+   },
+   {
+    "operation": "deleteItem",
+    "input": {
+     "TableName": "outbox",
+     "Key": {
+      "pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      "sk": {
+       "S": "$roll#v1#ledger#outbox#000000000001#0000"
+      }
+     },
+     "ConditionExpression": "attribute_exists(#pk)",
+     "ExpressionAttributeNames": {
+      "#pk": "pk"
+     }
+    }
+   },
+   {
+    "operation": "query",
+    "input": {
+     "TableName": "outbox",
+     "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+     "ExpressionAttributeNames": {
+      "#pk": "pk",
+      "#sk": "sk"
+     },
+     "ExpressionAttributeValues": {
+      ":pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      ":sk": {
+       "S": "$roll#v1#ledger#outbox#"
+      }
+     },
+     "ConsistentRead": true,
+     "Limit": 1
+    }
+   }
+  ],
+  "left": []
+ },
+ "marked": {
+  "item": {
+   "__edd_row_pk__": {
+    "S": "$roll#v1#ledger#shop_north"
+   },
+   "streamId": {
+    "S": "o1"
+   },
+   "__edd_e__": {
+    "S": "Ledger#outbox"
+   },
+   "effect": {
+    "M": {
+     "total": {
+      "N": "2"
+     }
+    }
+   },
+   "sk": {
+    "S": "$roll#v1#ledger#outbox#000000000001#0000"
+   },
+   "obsk": {
+    "S": "$roll#v1#ledger#shop_north#$roll#v1#ledger#outbox#000000000001#0000"
+   },
+   "pk": {
+    "S": "$roll#v1#ledger#shop_north"
+   },
+   "source": {
+    "S": "projection"
+   },
+   "eventType": {
+    "S": "Placed"
+   },
+   "version": {
+    "N": "1"
+   },
+   "obpk": {
+    "S": "Ledger#outbox"
+   },
+   "__edd_row_sk__": {
+    "S": "$roll#v1#ledger"
+   },
+   "__edd_rm__": {
+    "S": "1keqa9c"
+   }
+  },
+  "result": {
+   "delivered": 1,
+   "undelivered": []
+  },
+  "delivered": [
+   {
+    "effect": {
+     "total": 2
+    },
+    "meta": {
+     "source": "projection",
+     "streamId": "o1",
+     "version": 1,
+     "eventType": "Placed"
+    }
+   }
+  ],
+  "requests": [
+   {
+    "operation": "query",
+    "input": {
+     "TableName": "outbox",
+     "IndexName": "outbox",
+     "KeyConditionExpression": "#p = :p",
+     "ExpressionAttributeNames": {
+      "#p": "obpk"
+     },
+     "ExpressionAttributeValues": {
+      ":p": {
+       "S": "Ledger#outbox"
+      }
+     }
+    }
+   },
+   {
+    "operation": "query",
+    "input": {
+     "TableName": "outbox",
+     "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+     "ExpressionAttributeNames": {
+      "#pk": "pk",
+      "#sk": "sk"
+     },
+     "ExpressionAttributeValues": {
+      ":pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      ":sk": {
+       "S": "$roll#v1#ledger#outbox#"
+      }
+     },
+     "ConsistentRead": true,
+     "Limit": 1
+    }
+   },
+   {
+    "operation": "updateItem",
+    "input": {
+     "TableName": "outbox",
+     "Key": {
+      "pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      "sk": {
+       "S": "$roll#v1#ledger#outbox#000000000001#0000"
+      }
+     },
+     "UpdateExpression": "SET #c = :c, #u = :u",
+     "ConditionExpression": "attribute_exists(#pk) AND (attribute_not_exists(#u) OR #u < :now)",
+     "ExpressionAttributeNames": {
+      "#c": "__edd_claim__",
+      "#u": "__edd_claimed_until__",
+      "#pk": "pk"
+     },
+     "ExpressionAttributeValues": {
+      ":c": {
+       "volatile": true
+      },
+      ":u": {
+       "volatile": true
+      },
+      ":now": {
+       "volatile": true
+      }
+     }
+    }
+   },
+   {
+    "operation": "deleteItem",
+    "input": {
+     "TableName": "outbox",
+     "Key": {
+      "pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      "sk": {
+       "S": "$roll#v1#ledger#outbox#000000000001#0000"
+      }
+     },
+     "ConditionExpression": "attribute_exists(#pk)",
+     "ExpressionAttributeNames": {
+      "#pk": "pk"
+     }
+    }
+   },
+   {
+    "operation": "query",
+    "input": {
+     "TableName": "outbox",
+     "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :sk)",
+     "ExpressionAttributeNames": {
+      "#pk": "pk",
+      "#sk": "sk"
+     },
+     "ExpressionAttributeValues": {
+      ":pk": {
+       "S": "$roll#v1#ledger#shop_north"
+      },
+      ":sk": {
+       "S": "$roll#v1#ledger#outbox#"
+      }
+     },
+     "ConsistentRead": true,
+     "Limit": 1
+    }
+   }
+  ],
+  "left": []
+ }
+}

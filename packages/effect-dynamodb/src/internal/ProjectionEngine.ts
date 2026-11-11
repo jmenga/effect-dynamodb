@@ -75,6 +75,7 @@ import {
   composePrimaryKey,
   KEY_TEXT,
   marshalOrFail,
+  OUTBOX_READ_MODEL,
   type ProjectionRole,
   projectionTtlChecked,
   projectionTtlConflict,
@@ -728,6 +729,85 @@ const readModelType = (entity: unknown): string | undefined =>
   (entity as { readonly entityType?: string }).entityType
 
 /**
+ * @internal The tag a read model's outbox items carry (`OUTBOX_READ_MODEL`, #237): a hash of what
+ * its rows' keys are composed from: the schema's name and version, the entity type and its
+ * version, the primary collection and the primary key's composites. Not the key text's setting
+ * (`escapeKeys`, casing), which `rekey` moves items across, nor a composite's type, which can
+ * change with the key text staying. `undefined` for an entity on no table.
+ */
+export const readModelTag = (entity: unknown): string | undefined => {
+  const member = entity as {
+    readonly entityType?: string
+    readonly _entityVersion?: number
+    readonly indexes?: { readonly primary?: IndexDefinition }
+    readonly _schema?: DynamoSchema.DynamoSchema
+  }
+  const primary = member.indexes?.primary
+  if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
+    return undefined
+  }
+  let hash = 0x811c9dc5
+  const text = JSON.stringify([
+    member._schema.name,
+    member._schema.version,
+    member.entityType,
+    member._entityVersion ?? 1,
+    primary.collection ?? null,
+    primary.pk.composite,
+    primary.sk.composite,
+  ])
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(36)
+}
+
+/** Whose an outbox item is, as one read model sees it ({@link outboxOwnership}). */
+export type OutboxOwnership = "mine" | "foreign" | "unmarked"
+
+const ownershipOf = new WeakMap<object, (item: Record<string, AttributeValue>) => OutboxOwnership>()
+
+/**
+ * @internal Whose an outbox item is, as `readModel` sees it (#237): the one decision `drainPending`
+ * and the outbox table's `rekey` make. The row it names (`__edd_row_pk__`, `__edd_row_sk__`) must
+ * have a key the read model's composer writes, under any setting, for values of its composites'
+ * kinds (`keySpaceOf`, `"owned"`: a date the library encodes as its text, a number's key text, a
+ * literal's, a string as any text, `#` included): what its reader would take (a date or a literal
+ * as any text) isn't enough. Then:
+ *
+ * - `"mine"`: the item names this read model (`OUTBOX_READ_MODEL`, from 1.41.0).
+ * - `"foreign"`: it names another, or its row's key is no key this read model writes.
+ * - `"unmarked"`: written before 1.41.0, at a key this read model writes, which another read model
+ *   may write too (`[shop]` with `north#branch_b1` beside `[shop, branch]`). `drainPending` drains
+ *   it, as 1.40.0 did; `rekey` asks the other read models on the table.
+ *
+ * Every key is taken as the read model's when its key space can't be composed.
+ */
+export const outboxOwnership = (
+  readModel: object,
+): ((item: Record<string, AttributeValue>) => OutboxOwnership) => {
+  const known = ownershipOf.get(readModel)
+  if (known !== undefined) return known
+  const tag = readModelTag(readModel)
+  const space = keySpaceOf(readModel, "owned")
+  const whole = (text: string): KeyComposer.KeySpace => ({ text, after: [], open: false })
+  const decide = (item: Record<string, AttributeValue>): OutboxOwnership => {
+    const pk = item[ROW_PK]?.S
+    const sk = item[ROW_SK]?.S
+    if (space !== undefined) {
+      if (pk === undefined || sk === undefined) return "foreign"
+      if (!spacesMeet(space, { pk: whole(pk), sk: whole(sk) })) return "foreign"
+    }
+    const marked = item[OUTBOX_READ_MODEL]?.S
+    if (marked === undefined) return "unmarked"
+    return marked === tag ? "mine" : "foreign"
+  }
+  ownershipOf.set(readModel, decide)
+  return decide
+}
+
+/**
  * @internal `[EDD-9134]` ({@link sharedOutboxKeySpace}) as a defect, from the sites that define
  * what runs (`DynamoClient.make`, `EventStore.processBatch`), before anything runs.
  */
@@ -1068,6 +1148,9 @@ export const makeEngine = (config: EngineConfig) => {
       ? undefined
       : readBackOf(config.outbox.schema, () => readingStreamValues(config.outbox!.schema))
 
+  /** The tag this read model's outbox items carry (`readModelTag`). */
+  const outboxTag = readModelTag(readModel)
+
   const outboxItems = (
     rowKey: Record<string, unknown>,
     revision: number,
@@ -1102,6 +1185,7 @@ export const makeEngine = (config: EngineConfig) => {
           __edd_e__: outboxMarker(entityType),
           [ROW_PK]: rowPk,
           [ROW_SK]: rowSk,
+          ...(outboxTag !== undefined && { [OUTBOX_READ_MODEL]: outboxTag }),
           effect: encoded,
           source: e.source,
           streamId: e.event.streamId,
@@ -1815,25 +1899,9 @@ export const makeEngine = (config: EngineConfig) => {
   }
 
   /**
-   * Whether an outbox item's row (`__edd_row_pk__`, `__edd_row_sk__`) is a row of this read model:
-   * its key is one the read model's composer writes, under every setting a row can have been
-   * written under, for values of its composites' kinds (`keySpaceOf`, `"owned"`): a date's ISO
-   * text or epoch, a number's key text, a literal's, any text for a string. What its reader would
-   * take (a date or a literal as any text) isn't enough. The outbox index is keyed by entity type
-   * alone, so read models of one entity type sharing it (another schema or primary collection,
-   * say) list each other's items there. Every row when the read model's key space can't be
-   * composed.
-   */
-  const ownRowOf = (): ((pk: string, sk: string) => boolean) => {
-    const space = keySpaceOf(readModel, "owned")
-    if (space === undefined) return () => true
-    const whole = (text: string): KeyComposer.KeySpace => ({ text, after: [], open: false })
-    return (pk, sk) => spacesMeet(space, { pk: whole(pk), sk: whole(sk) })
-  }
-
-  /**
    * Every row of this read model with pending effects, through the outbox's sparse index, drained.
-   * Rows of another read model the index lists (`ownRowOf`) are left to its drainer.
+   * The rows of the items another read model's are (`outboxOwnership`) are left to its drainer;
+   * an item written before 1.41.0 at a key both write is drained, as 1.40.0 did.
    */
   const drainPending = <E, R>(
     deliver: (effect: any, meta: OutboxMeta) => Effect.Effect<void, E, R>,
@@ -1849,7 +1917,7 @@ export const makeEngine = (config: EngineConfig) => {
       }
       const client = yield* Capacity.client
       const TableName = yield* outboxTable
-      const ownRow = ownRowOf()
+      const whose = outboxOwnership(readModel)
       const rows = new Map<string, readonly [string, string]>()
       let start: Record<string, AttributeValue> | undefined
       do {
@@ -1862,10 +1930,11 @@ export const makeEngine = (config: EngineConfig) => {
           ...(start === undefined ? {} : { ExclusiveStartKey: start }),
         })
         for (const item of page.Items ?? []) {
+          if (whose(item) === "foreign") continue
           const raw = fromAttributeMap(item) as Record<string, unknown>
           const pk = String(raw[ROW_PK])
           const sk = String(raw[ROW_SK])
-          if (ownRow(pk, sk)) rows.set(`${pk}\u0000${sk}`, [pk, sk])
+          rows.set(`${pk}\u0000${sk}`, [pk, sk])
         }
         start = page.LastEvaluatedKey
       } while (start !== undefined)

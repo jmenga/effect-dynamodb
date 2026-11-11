@@ -194,5 +194,5 @@ export const scenario = (
   ): Effect.Effect<ReadonlyArray<Sent>, unknown, R> =>
     steps.pipe(Effect.provide(layer(client))) as Effect.Effect<ReadonlyArray<Sent>, unknown, R>
 
-  return { run }
+  return { run, readModels: { [tables.readA]: A.Ledgers, [tables.readB]: B.Ledgers } }
 }
