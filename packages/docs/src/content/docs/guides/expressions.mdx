@@ -670,7 +670,9 @@ Products.condition((t, ops) => {
 
 All string segments are automatically aliased through `ExpressionAttributeNames` to handle DynamoDB reserved words.
 
-A `field:` rename from `DynamoModel.configure` names a top-level attribute, so it applies to a path's first segment only. Below it a value is stored whole, under its own property names. With `count` stored as `renamed`, `t.count` is `#renamed`, and `t.meta.count` is `#meta.#count`, which is where `put` stored it. That holds for an update's path operations, a condition, a filter and a projection alike. A path doesn't follow a nested struct's own key encoding (`Schema.encodeKeys`): set the whole value for such a struct.
+A `field:` rename from `DynamoModel.configure` names a top-level attribute, so it applies to a path's first segment only. Below it a value is stored whole, under its own property names. With `count` stored as `renamed`, `t.count` is `#renamed`, and `t.meta.count` is `#meta.#count`, which is where `put` stored it. That holds for an update's path operations, a condition, a filter and a projection alike.
+
+A path below a struct that renames its own keys (`Schema.encodeKeys`) names them as they're stored. With `meta: Schema.Struct({ amount: Schema.Number }).pipe(Schema.encodeKeys({ amount: "am" }))`, `t.meta.amount` names `meta.am`, where `put` stored it. A segment already spelled by its stored name (`t.meta.am`) is sent as written. Where the members of a union on the way store a property under different names, the path is sent as written.
 
 ---
 
