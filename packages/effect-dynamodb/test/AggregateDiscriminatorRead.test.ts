@@ -12,9 +12,9 @@ const tables = new Map<string, ReturnType<typeof makeRecordingTable>>()
 let made = 0
 
 suite({
-  onTable: (body) => {
+  onTable: (body, pk = "pk") => {
     const tableName = `discriminator-read-${made++}`
-    const table = makeRecordingTable({ indexes: { [INDEX.name]: { pk: "pk", sk: INDEX.sk } } })
+    const table = makeRecordingTable({ indexes: { [INDEX.name]: { pk, sk: INDEX.sk } } })
     tables.set(tableName, table)
     return body(tableName).pipe(
       Effect.provide(Layer.merge(table.layer, Main.layer({ name: tableName }))),

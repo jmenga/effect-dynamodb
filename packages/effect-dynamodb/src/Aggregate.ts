@@ -5367,14 +5367,14 @@ const besideValue = (node: ResolvedNode, systemAttrs: ReadonlySet<string>): Read
 
 /**
  * The attributes the library writes on every row of an edge, beside a value (`value`, the edge's
- * field or a `many` edge's element) that can't hold them (#241): its static discriminator values
- * (a sub-aggregate's, on every row beneath it, and a `one` edge's own), and the aggregate's key
- * attributes not named `pk` or `sk` (`keyAttributes`). A read takes each off again, so the value is
- * what the caller gave. A value that can hold one keeps it on a read, as before: a struct or class
- * declaring a field of that name (on either side of a transformation, in any union member), or a
- * record. Decoding through a struct drops an attribute it doesn't declare anyway, so this matters
- * to a value that keeps what it's given: `Schema.Unknown`, a declaration, or a union member falling
- * back to one.
+ * field or a `many` edge's element) that provably can't hold them (#241): its static discriminator
+ * values (a sub-aggregate's, on every row beneath it, and a `one` edge's own), and the aggregate's
+ * key attributes not named `pk` or `sk` (`keyAttributes`). A read takes each off again, so the value
+ * is what the caller gave. Exact or absent: only where the value's schema is known exactly
+ * ({@link namesHeldBy}) and doesn't hold the name. A value that can hold one keeps it, and one whose
+ * schema can't be seen into (a declaration, a transformation, a union with such a member) reads
+ * exactly as 1.40.0 read it. Decoding through a struct drops an attribute it doesn't declare
+ * anyway, so this matters to `Schema.Unknown` / `Schema.Any`, alone or in a union of known schemas.
  */
 const attributesBeside = (
   discriminator: Record<string, unknown> | undefined,
@@ -5389,42 +5389,91 @@ const attributesBeside = (
     ...(keyAttributes ?? []),
   ]
   if (written.length === 0) return undefined
-  const held = namesHeld(value.ast)
-  if (held === "any") return undefined
-  const beside = written.filter((name) => !held.has(name))
+  const holds = namesHeldBy(value.ast)
+  if (holds === undefined) return undefined
+  const beside = written.filter((name) => !holds(name))
   return beside.length === 0 ? undefined : new Set(beside)
 }
 
 /**
- * The property names a value of `ast` can hold: a struct's fields (a class's, a union member's, on
- * the encoded and the decoded side of each transformation), or `"any"` for one with an index
- * signature (a record).
+ * Whether a value of `ast` can hold a property of a name, where that's known exactly; `undefined`
+ * where it isn't. Known: `Unknown` and `Any` (no name declared), a struct's fields and the keys its
+ * index signatures take, a class's fields, a value that is no object (a string, a literal), and a
+ * union or a suspension of those. Anything else (a declaration, a transformation, an index key
+ * schema that can't be asked) is not known, and nothing is taken out of its value.
  */
-const namesHeld = (ast: SchemaAST.AST): ReadonlySet<string> | "any" => {
-  const names = new Set<string>()
-  const seen = new Set<SchemaAST.AST>()
-  const anyName = (node: SchemaAST.AST): boolean => {
-    if (seen.has(node)) return false
-    seen.add(node)
-    if ((node.encoding ?? []).some((link) => anyName(link.to))) return true
-    switch (node._tag) {
-      case "Objects":
-        if (node.indexSignatures.length > 0) return true
-        for (const property of node.propertySignatures) {
-          if (typeof property.name === "string") names.add(property.name)
-        }
-        return false
-      case "Union":
-        return node.types.some(anyName)
-      case "Declaration":
-        return node.typeParameters.some(anyName)
-      case "Suspend":
-        return anyName(node.thunk())
-      default:
-        return false
-    }
+const namesHeldBy = (
+  ast: SchemaAST.AST,
+  visiting: Set<SchemaAST.AST> = new Set(),
+): ((name: string) => boolean) | undefined => {
+  if (visiting.has(ast)) return undefined
+  if (SchemaAST.isDeclaration(ast)) {
+    // A class: a declaration whose one type parameter is the struct it's encoded as.
+    const fields = ast.typeParameters[0]
+    const isClass =
+      ast.typeParameters.length === 1 &&
+      fields !== undefined &&
+      SchemaAST.isObjects(fields) &&
+      ast.encoding?.length === 1 &&
+      ast.encoding[0]!.to === fields
+    return isClass ? namesHeldBy(fields, visiting) : undefined
   }
-  return anyName(ast) ? "any" : names
+  if ((ast.encoding?.length ?? 0) > 0) return undefined
+  switch (ast._tag) {
+    case "Unknown":
+    case "Any":
+    case "String":
+    case "Number":
+    case "Boolean":
+    case "BigInt":
+    case "Symbol":
+    case "UniqueSymbol":
+    case "Literal":
+    case "TemplateLiteral":
+    case "Enum":
+    case "Null":
+    case "Undefined":
+    case "Void":
+    case "Never":
+      return () => false
+    case "Objects": {
+      const names = new Set(
+        ast.propertySignatures
+          .map((property) => property.name)
+          .filter((name): name is string => typeof name === "string"),
+      )
+      const keys: Array<(name: string) => boolean> = []
+      for (const signature of ast.indexSignatures) {
+        try {
+          keys.push(Schema.is(Schema.make(signature.parameter)))
+        } catch {
+          return undefined
+        }
+      }
+      return (name) => names.has(name) || keys.some((key) => key(name))
+    }
+    case "Union": {
+      visiting.add(ast)
+      const members = ast.types.map((member) => namesHeldBy(member, visiting))
+      visiting.delete(ast)
+      if (members.some((member) => member === undefined)) return undefined
+      return (name) => members.some((member) => member!(name))
+    }
+    case "Suspend": {
+      let inner: SchemaAST.AST
+      try {
+        inner = ast.thunk()
+      } catch {
+        return undefined
+      }
+      visiting.add(ast)
+      const held = namesHeldBy(inner, visiting)
+      visiting.delete(ast)
+      return held
+    }
+    default:
+      return undefined
+  }
 }
 
 const stripMetadata = (

@@ -39,7 +39,7 @@ const sent = new Map<string, Array<{ command: string; input: unknown }>>()
 let made = 0
 
 const harness = {
-  onTable: <A, E>(body: (tableName: string) => Effect.Effect<A, E, any>) => {
+  onTable: <A, E>(body: (tableName: string) => Effect.Effect<A, E, any>, pk = "pk") => {
     const tableName = `aggregate-discriminator-read-${Date.now()}-${made++}`
     const requests: Array<{ command: string; input: unknown }> = []
     sent.set(tableName, requests)
@@ -65,11 +65,11 @@ const harness = {
           TableName: tableName,
           BillingMode: "PAY_PER_REQUEST",
           KeySchema: [
-            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: pk, KeyType: "HASH" },
             { AttributeName: "sk", KeyType: "RANGE" },
           ],
           AttributeDefinitions: [
-            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: pk, AttributeType: "S" },
             { AttributeName: "sk", AttributeType: "S" },
             { AttributeName: INDEX.sk, AttributeType: "S" },
           ],
@@ -77,7 +77,7 @@ const harness = {
             {
               IndexName: INDEX.name,
               KeySchema: [
-                { AttributeName: "pk", KeyType: "HASH" },
+                { AttributeName: pk, KeyType: "HASH" },
                 { AttributeName: INDEX.sk, KeyType: "RANGE" },
               ],
               Projection: { ProjectionType: "ALL" },

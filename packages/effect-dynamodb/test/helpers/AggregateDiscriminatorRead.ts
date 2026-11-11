@@ -1,18 +1,21 @@
 /**
  * The attributes the library writes on an edge's rows beside its value stay out of the value on a
  * read (#241): a sub-aggregate's discriminator, written on every row beneath it, a `one` edge's own
- * discriminator, and the aggregate's key attributes not named `pk` or `sk` (here the collection
- * sort key's mirror, `csk`). A value decoded through a struct drops them anyway; a value that
- * keeps what it's given (`Schema.Unknown`, a declaration, a union member falling back to one) was
- * handed them back inside, by 1.39.0 and 1.40.0 alike. A value that can hold one (a struct
- * declaring the name, a record) keeps it as before, and a custom `assemble` is still handed them.
+ * discriminator, and the aggregate's key attributes not named `pk` or `sk` (the collection sort
+ * key's mirror, `csk`, and a partition key attribute named `PK`). A value decoded through a struct
+ * drops them anyway; `Schema.Unknown` (alone, suspended or in a union of schemas known exactly) was
+ * handed them back inside, by 1.39.0 and 1.40.0 alike. Exact or absent: a value that can hold one
+ * (a struct declaring the name, a record) keeps it as before, a value whose schema can't be seen
+ * into (a declaration, a transformation, a union with such a member) reads exactly as 1.40.0 read
+ * it, and a custom `assemble` is still handed them.
  *
  * Nothing written changes: `create` and a no-op `update` send and store what 1.40.0 did, and the
  * no-op `update` still sends only its read. A union member that renames a field and is given its
  * domain value is still stored under the domain name (`text`, not `line`), as 1.40.0 stores it.
  *
  * `fixtures/aggregate-discriminator-read-1.39.0.json` holds what published 1.39.0 and 1.40.0 did
- * for each shape on DynamoDB Local. One suite, run on a recording table
+ * for each of `shapes` on DynamoDB Local, and `fixtures/aggregate-discriminator-read-opaque-1.40.0.json`
+ * for each of `opaqueShapes`. One suite, run on a recording table
  * (`AggregateDiscriminatorRead.test.ts`) and against DynamoDB Local
  * (`connected.aggregate-discriminator-read.test.ts`).
  */
@@ -45,16 +48,15 @@ type Recorded = {
   readonly getAfterUpdate: Outcome
 }
 
-const published = JSON.parse(
-  readFileSync(
-    new URL("../fixtures/aggregate-discriminator-read-1.39.0.json", import.meta.url),
-    "utf8",
-  ),
-) as {
+type Published = {
   readonly generatedFrom: ReadonlyArray<string>
   readonly "1.39.0": Record<string, Recorded>
   readonly "1.40.0": Record<string, Recorded>
 }
+const fixture = (name: string): Published =>
+  JSON.parse(readFileSync(new URL(`../fixtures/${name}`, import.meta.url), "utf8"))
+const published = fixture("aggregate-discriminator-read-1.39.0.json")
+const publishedOpaque = fixture("aggregate-discriminator-read-opaque-1.40.0.json")
 
 const schema = DynamoSchema.make({ name: "disc", version: 1 })
 export const Main = Table.make({ schema, entities: {} })
@@ -78,6 +80,8 @@ type Shape = {
   readonly edges: Record<string, unknown>
   /** The aggregate's `collection`, when it isn't `{ name: "agg" }`. */
   readonly collection?: unknown
+  /** The partition key attribute, when it isn't `pk`. */
+  readonly pk?: string
   readonly input: unknown
   /** What a read returns. */
   readonly read: unknown
@@ -124,12 +128,14 @@ const own = { kind: "own", qty: 3, text: "KEEP" }
 export const shapes: Record<string, () => Shape> = {
   "a union member renaming a field, given its domain value": () =>
     manyShape(renaming(), own, false, own, own),
+  // A union with a transformation member can't be seen into: read as 1.40.0 read it.
   "sub-aggregate, a union member renaming a field, given its domain value": () =>
-    manyShape(renaming(), own, true, own, { ...own, side: 1 }),
+    manyShape(renaming(), own, true, { ...own, side: 1 }, { ...own, side: 1 }),
   "sub-aggregate, an Unknown element": () =>
     manyShape(Schema.Unknown, note, true, note, { ...note, side: 1 }),
+  // A declaration can't be seen into: read as 1.40.0 read it.
   "sub-aggregate, a declared element": () =>
-    manyShape(Schema.declare(isObject), note, true, note, { ...note, side: 1 }),
+    manyShape(Schema.declare(isObject), note, true, { ...note, side: 1 }, { ...note, side: 1 }),
   "sub-aggregate, a struct element declaring the discriminator's name": () =>
     manyShape(
       Schema.Struct({ qty: Schema.Number, side: Schema.Number }),
@@ -232,10 +238,128 @@ shapes["a struct element declaring csk, the collection sort key mirrored in csk"
   }
 }
 
+const requiresSide = (u: unknown): u is { readonly side: 1 } =>
+  isObject(u) && (u as { readonly side?: unknown }).side === 1
+const identity = {
+  decode: SchemaGetter.transform((x: unknown) => x),
+  encode: SchemaGetter.transform((x: unknown) => x),
+}
+const sideNote = { ...note, side: 1 }
+/** Keyed under `PK`, assembled off `lsi1` (`PK`, `csk`). */
+const underPK = { collection: mirrored, pk: "PK" } as const
+
+/** Shapes captured in `fixtures/aggregate-discriminator-read-opaque-1.40.0.json`. */
+export const opaqueShapes: Record<string, () => Shape> = {
+  "sub-aggregate, a declared element requiring the discriminator": () =>
+    manyShape(
+      Schema.declare(
+        (u): u is { qty: number; side: 1 } =>
+          requiresSide(u) && typeof (u as { qty?: unknown }).qty === "number",
+      ),
+      { qty: 1, side: 1 },
+      true,
+      { side: 1, qty: 1 },
+      { side: 1, qty: 1 },
+    ),
+  "sub-aggregate, a union of a struct and a declared element": () =>
+    manyShape(
+      Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("a"), qty: Schema.Number }),
+        Schema.declare(isObject),
+      ]),
+      note,
+      true,
+      sideNote,
+      sideNote,
+    ),
+  "sub-aggregate, a transformed element": () =>
+    manyShape(
+      (Schema.Struct({ qty: Schema.Number, note: Schema.String }) as any).pipe(
+        Schema.decodeTo(Schema.Unknown, identity as never),
+      ),
+      note,
+      true,
+      note,
+      note,
+    ),
+  // Known exactly: `Unknown` behind a suspension, or beside a struct in a union.
+  "sub-aggregate, a suspended Unknown element": () =>
+    manyShape(
+      Schema.suspend(() => Schema.Unknown),
+      note,
+      true,
+      note,
+      sideNote,
+    ),
+  "sub-aggregate, a union of a struct and Unknown": () =>
+    manyShape(
+      Schema.Union([
+        Schema.Struct({ kind: Schema.Literal("a"), qty: Schema.Number }),
+        Schema.Unknown,
+      ]),
+      note,
+      true,
+      note,
+      sideNote,
+    ),
+  "sub-aggregate, a declared one edge requiring the discriminator": () => {
+    const Part = Schema.Struct({ title: Schema.String, note: Schema.declare(requiresSide) })
+    const Sub = (Aggregate.make as any)(Part, {
+      root: { entityType: "Part" },
+      edges: { note: Aggregate.one({ entityType: "Note" } as never) },
+    })
+    const read = { id: "a", part: { title: "p", note: { side: 1, text: "n" } } }
+    return {
+      model: Schema.Struct({ id: Schema.String, part: Part }),
+      edges: { part: Sub.with({ discriminator: { side: 1 } }) },
+      input: { id: "a", part: { title: "p", note: { text: "n", side: 1 } } },
+      read,
+      published: read,
+    }
+  },
+  "an Unknown element, keyed under PK": () => ({
+    model: Schema.Struct({ id: Schema.String, lines: Schema.Array(Schema.Unknown) }),
+    edges: { lines: sheets() },
+    ...underPK,
+    input: { id: "a", lines: [note] },
+    read: { id: "a", lines: [note] },
+    published: {
+      id: "a",
+      lines: [{ ...note, csk: "$disc#v1#sheet#0000000000000001", PK: "$disc#v1#agg#a" }],
+    },
+  }),
+  "an Unknown one edge, keyed under PK": () => ({
+    model: Schema.Struct({ id: Schema.String, note: Schema.Unknown }),
+    edges: { note: Aggregate.one({ entityType: "Note" } as never) },
+    ...underPK,
+    input: { id: "a", note: { text: "n" } },
+    read: { id: "a", note: { text: "n" } },
+    published: { id: "a", note: { text: "n", csk: "$disc#v1#note", PK: "$disc#v1#agg#a" } },
+  }),
+  "a struct element declaring PK, keyed under PK": () => {
+    // The struct holds `PK`, so it keeps what the row holds there, as before.
+    const read = { id: "a", lines: [{ qty: 1, PK: "$disc#v1#agg#a" }] }
+    return {
+      model: Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Array(
+          Schema.Struct({ qty: Schema.Number, PK: Schema.optional(Schema.String) }),
+        ),
+      }),
+      edges: { lines: sheets() },
+      ...underPK,
+      input: { id: "a", lines: [{ qty: 1 }] },
+      read,
+      published: read,
+    }
+  },
+}
+
 export interface Harness {
-  /** Run `body` on a fresh, empty table named `tableName`. */
+  /** Run `body` on a fresh, empty table named `tableName`, keyed by `pk` (`"pk"`) and `sk`. */
   readonly onTable: <A, E>(
     body: (tableName: string) => Effect.Effect<A, E, any>,
+    pk?: string,
   ) => Effect.Effect<A, unknown>
   /** Every row of the table. */
   readonly rows: (tableName: string) => Effect.Effect<ReadonlyArray<Row>>
@@ -243,7 +367,7 @@ export interface Harness {
   readonly requests: (tableName: string) => Effect.Effect<ReadonlyArray<Request>>
 }
 
-const keyOf = (row: Row) => `${row.pk?.S} ${row.sk?.S}`
+const keyOf = (row: Row) => `${(row.pk ?? row.PK)?.S} ${row.sk?.S}`
 const sorted = (rows: ReadonlyArray<Row>) =>
   [...rows].sort((a, b) => (keyOf(a) < keyOf(b) ? -1 : keyOf(a) > keyOf(b) ? 1 : 0))
 
@@ -260,44 +384,48 @@ const judged = (result: Outcome) =>
     : { failed: result.failed, operation: result.operation }
 
 const run = (harness: Harness, shape: Shape) =>
-  harness.onTable((tableName) =>
-    Effect.gen(function* () {
-      const A = (Aggregate.make as any)(shape.model, {
-        table: Main,
-        schema,
-        pk: { field: "pk", composite: ["id"] },
-        collection: shape.collection ?? { name: "agg" },
-        root: { entityType: "Root" },
-        edges: shape.edges,
-      })
-      const db: any = yield* DynamoClient.make({
-        entities: {},
-        aggregates: { A },
-        tables: { Main },
-      } as never)
-      yield* harness.requests(tableName)
-      const create = outcome(yield* Effect.exit(db.aggregates.A.create(shape.input)))
-      const requests = yield* harness.requests(tableName)
-      const rows = sorted(yield* harness.rows(tableName))
-      const get = outcome(yield* Effect.exit(db.aggregates.A.get({ id: "a" })))
-      yield* harness.requests(tableName)
-      const update = outcome(
-        yield* Effect.exit(db.aggregates.A.update({ id: "a" }, ({ state }: any) => ({ ...state }))),
-      )
-      const updateRequests = yield* harness.requests(tableName)
-      const updateRows = sorted(yield* harness.rows(tableName))
-      const getAfterUpdate = outcome(yield* Effect.exit(db.aggregates.A.get({ id: "a" })))
-      return {
-        create,
-        requests,
-        rows,
-        get,
-        update,
-        updateRequests,
-        updateRows,
-        getAfterUpdate,
-      } satisfies Recorded
-    }),
+  harness.onTable(
+    (tableName) =>
+      Effect.gen(function* () {
+        const A = (Aggregate.make as any)(shape.model, {
+          table: Main,
+          schema,
+          pk: { field: shape.pk ?? "pk", composite: ["id"] },
+          collection: shape.collection ?? { name: "agg" },
+          root: { entityType: "Root" },
+          edges: shape.edges,
+        })
+        const db: any = yield* DynamoClient.make({
+          entities: {},
+          aggregates: { A },
+          tables: { Main },
+        } as never)
+        yield* harness.requests(tableName)
+        const create = outcome(yield* Effect.exit(db.aggregates.A.create(shape.input)))
+        const requests = yield* harness.requests(tableName)
+        const rows = sorted(yield* harness.rows(tableName))
+        const get = outcome(yield* Effect.exit(db.aggregates.A.get({ id: "a" })))
+        yield* harness.requests(tableName)
+        const update = outcome(
+          yield* Effect.exit(
+            db.aggregates.A.update({ id: "a" }, ({ state }: any) => ({ ...state })),
+          ),
+        )
+        const updateRequests = yield* harness.requests(tableName)
+        const updateRows = sorted(yield* harness.rows(tableName))
+        const getAfterUpdate = outcome(yield* Effect.exit(db.aggregates.A.get({ id: "a" })))
+        return {
+          create,
+          requests,
+          rows,
+          get,
+          update,
+          updateRequests,
+          updateRows,
+          getAfterUpdate,
+        } satisfies Recorded
+      }),
+    shape.pk,
   )
 
 export const suite = (
@@ -327,25 +455,41 @@ export const suite = (
       }
     })
 
-    for (const [label, define] of Object.entries(shapes)) {
-      it(`${label}: sends and stores what 1.40.0 did, and reads back the value`, () =>
-        Effect.runPromise(
-          Effect.gen(function* () {
-            const shape = define()
-            const then = published["1.40.0"][label]!
-            const actual = yield* run(harness, shape)
-            expect(judged(actual.create)).toEqual(judged(then.create))
-            expect(actual.requests).toEqual(then.requests)
-            expect(actual.rows).toEqual(sorted(then.rows))
-            // A no-op update sends its read and nothing else.
-            expect(actual.updateRequests.map((request) => request.command)).toEqual(["Query"])
-            expect(actual.updateRequests).toEqual(then.updateRequests)
-            expect(actual.updateRows).toEqual(sorted(then.updateRows))
-            for (const step of ["get", "update", "getAfterUpdate"] as const) {
-              expect({ step, ...judged(then[step]) }).toEqual({ step, ok: shape.published })
-              expect({ step, ...judged(actual[step]) }).toEqual({ step, ok: shape.read })
-            }
-          }),
-        ))
+    it("the opaque fixture is published 1.39.0's and 1.40.0's, which did the same", () => {
+      expect(publishedOpaque.generatedFrom).toEqual([
+        "effect-dynamodb@1.39.0",
+        "effect-dynamodb@1.40.0",
+      ])
+      expect(Object.keys(publishedOpaque["1.40.0"]).sort()).toEqual(
+        Object.keys(opaqueShapes).sort(),
+      )
+      expect(publishedOpaque["1.39.0"]).toEqual(publishedOpaque["1.40.0"])
+    })
+
+    for (const [set, thenSet] of [
+      [shapes, published["1.40.0"]],
+      [opaqueShapes, publishedOpaque["1.40.0"]],
+    ] as const) {
+      for (const [label, define] of Object.entries(set)) {
+        it(`${label}: sends and stores what 1.40.0 did, and reads back the value`, () =>
+          Effect.runPromise(
+            Effect.gen(function* () {
+              const shape = define()
+              const then = thenSet[label]!
+              const actual = yield* run(harness, shape)
+              expect(judged(actual.create)).toEqual(judged(then.create))
+              expect(actual.requests).toEqual(then.requests)
+              expect(actual.rows).toEqual(sorted(then.rows))
+              // A no-op update sends its read and nothing else.
+              expect(actual.updateRequests.map((request) => request.command)).toEqual(["Query"])
+              expect(actual.updateRequests).toEqual(then.updateRequests)
+              expect(actual.updateRows).toEqual(sorted(then.updateRows))
+              for (const step of ["get", "update", "getAfterUpdate"] as const) {
+                expect({ step, ...judged(then[step]) }).toEqual({ step, ok: shape.published })
+                expect({ step, ...judged(actual[step]) }).toEqual({ step, ok: shape.read })
+              }
+            }),
+          ))
+      }
     }
   })

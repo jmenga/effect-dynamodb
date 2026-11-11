@@ -507,8 +507,9 @@ const retitled = (rows: ReadonlyArray<unknown>) =>
  * (`fixtures/aggregate-create-result-1.39.0.json`). `create`, its requests and rows, and `get` are
  * 1.39.0's, and so is the update where 1.39.0's went through. Where 1.39.0 refused the update, it
  * goes through and sets the title. A renaming member given its stored form reads back, where 1.39.0
- * couldn't, with the row's attributes in their stored order. A sub-aggregate's discriminator is
- * stored beside the element and stays out of it on a read (#241); 1.40.0 handed it back inside.
+ * couldn't, with the row's attributes: in their stored order, and a sub-aggregate's
+ * discriminator with them (a union with a transformation member can't be seen into, so it's read
+ * as 1.40.0 read it, #241).
  */
 export const compareCreateResult = (
   group: "fields" | "renames",
@@ -526,7 +527,7 @@ export const compareCreateResult = (
     expect(actual.updateRows).toEqual(expected.updateRows)
     const element = { kind: "own", qty: 3, text: "KEEP" }
     const read = label.startsWith("sub-aggregate, ")
-      ? { id: "a", part: { lines: [element] } }
+      ? { id: "a", part: { lines: [{ ...element, side: 1 }] } }
       : { id: "a", lines: [element] }
     for (const step of ["get", "update", "getAfterUpdate"] as const) {
       expect({ step, failed: expected[step].failed }).toEqual({ step, failed: "ValidationError" })

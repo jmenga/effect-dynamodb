@@ -4935,19 +4935,25 @@ removed `__edd_e__`, the attributes named `pk` and `sk`, those beginning with
 without the static discriminators and the key attributes under other names
 (`PK`, `csk`) when its value can't hold them (`attributesBeside`, computed once
 per node in `resolveNode`, applied by `besideValue` beside the timestamps
-`stampsToStrip` removes). Whether a value can hold a name is `namesHeld` on its
-schema: a property of a struct or class on either side of a transformation, in
-any union member, or any name for a record. Decoding through a struct drops an
-attribute it doesn't declare, so this only changes a value that keeps what it's
-given (`Schema.Unknown`, a declaration, a union member that falls back to one,
-such as one renaming a field whose row holds the domain name): 1.39.0 and 1.40.0
-handed those attributes back inside it. A value that declares the name keeps it
-(a struct field named like the mirror reads the key text, as before), and a
-custom `assemble` is handed the rows as before (the aggregates guide documents
-what it gets). Nothing written changes: the decomposed rows still carry them, so
-a no-op `update` writes nothing (`AggregateDiscriminatorRead.test.ts`,
+`stampsToStrip` removes). Exact or absent: an attribute is removed only where
+the value's schema is known exactly and doesn't hold the name (`namesHeldBy`):
+`Schema.Unknown` and `Schema.Any`, a struct's fields and the keys its index
+signatures take, a class's fields, a value that is no object, and a union or a
+suspension of those. Anything that can't be seen into (a declaration, a
+transformation, a union with such a member) reads exactly as 1.40.0 read it: a
+declaration may require the attribute (one that takes `{ qty, side: 1 }` under
+a sub-aggregate bound with `{ side: 1 }`), and removing it made such rows
+unreadable. Decoding through a struct drops an attribute it doesn't declare, so
+this only changes `Schema.Unknown` / `Schema.Any`, alone, suspended or in a
+union of known schemas: 1.39.0 and 1.40.0 handed those attributes back inside
+it. A value that declares the name keeps it (a struct field named like the
+mirror reads the key text, as before), and a custom `assemble` is handed the
+rows as before (the aggregates guide documents what it gets). Nothing written
+changes: the decomposed rows still carry them, so a no-op `update` writes
+nothing (`AggregateDiscriminatorRead.test.ts`,
 `connected.aggregate-discriminator-read.test.ts`, against
-`fixtures/aggregate-discriminator-read-1.39.0.json`). Context attributes are
+`fixtures/aggregate-discriminator-read-1.39.0.json` and
+`fixtures/aggregate-discriminator-read-opaque-1.40.0.json`). Context attributes are
 written on those rows by design and still read back into such a value.
 
 **What `create` hydrates, and by what key.** An edge with an `entity` is given
