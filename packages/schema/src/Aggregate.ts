@@ -27,6 +27,7 @@ import {
   refuseAggregateKeyOverMovingValue,
   refuseAggregateKeysOverBothKinds,
   refuseManySortKeysOverMovingValue,
+  refuseValueFieldsOnRowAttributes,
   unwrapModel,
 } from "./internal/AggregateSchemas.js"
 import type {
@@ -329,6 +330,7 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
     config,
     config.edges,
   )
+  refuseValueFieldsOnRowAttributes(config.root.entityType, schema, config)
   const derivedSchemas = deriveAggregateSchemas(
     schema,
     config.edges,

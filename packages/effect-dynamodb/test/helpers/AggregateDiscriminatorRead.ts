@@ -94,6 +94,11 @@ type Shape = {
    * this release stores it (`helpers/AggregateWholeElements.ts`).
    */
   readonly nowStored?: (row: Row) => Row
+  /**
+   * A value declaring a field named like a key attribute its rows hold: 1.40.0 read the key text back
+   * in it, whatever was given. `Aggregate.make` now refuses it (`EDD-9159`); this is the message.
+   */
+  readonly refused?: string
 }
 
 const sheets = () => Aggregate.many({ entityType: "Sheet", sk: { composite: ["qty"] } } as never)
@@ -233,7 +238,7 @@ shapes["an Unknown one edge, the collection sort key mirrored in csk"] = () => (
   published: { id: "a", note: { text: "n", csk: "$disc#v1#note" } },
 })
 shapes["a struct element declaring csk, the collection sort key mirrored in csk"] = () => {
-  // The struct holds `csk`, so it keeps what the row holds there: the mirror, as before.
+  // 1.40.0 read the mirror back in the struct's `csk`, given none. Refused at make now.
   const read = { id: "a", lines: [{ qty: 1, csk: "$disc#v1#sheet#0000000000000001" }] }
   return {
     model: Schema.Struct({
@@ -247,6 +252,9 @@ shapes["a struct element declaring csk, the collection sort key mirrored in csk"
     input: { id: "a", lines: [{ qty: 1 }] },
     read,
     published: read,
+    refused:
+      '[EDD-9159] Aggregate "Root": an element of edge "lines" declares a field "csk", which is ' +
+      "also the attribute holding the collection sort key's copy.",
   }
 }
 
@@ -349,7 +357,7 @@ export const opaqueShapes: Record<string, () => Shape> = {
     published: { id: "a", note: { text: "n", csk: "$disc#v1#note", PK: "$disc#v1#agg#a" } },
   }),
   "a struct element declaring PK, keyed under PK": () => {
-    // The struct holds `PK`, so it keeps what the row holds there, as before.
+    // 1.40.0 read the partition key back in the struct's `PK`, given none. Refused at make now.
     const read = { id: "a", lines: [{ qty: 1, PK: "$disc#v1#agg#a" }] }
     return {
       model: Schema.Struct({
@@ -363,6 +371,9 @@ export const opaqueShapes: Record<string, () => Shape> = {
       input: { id: "a", lines: [{ qty: 1 }] },
       read,
       published: read,
+      refused:
+        '[EDD-9159] Aggregate "Root": an element of edge "lines" declares a field "PK", which is ' +
+        "also the attribute holding the partition key.",
     }
   },
 }
@@ -488,6 +499,16 @@ export const suite = (
             Effect.gen(function* () {
               const shape = define()
               const then = thenSet[label]!
+              if (shape.refused !== undefined) {
+                // 1.40.0 stored it and read the key text back in the field, given none.
+                expect({ ...judged(then.get) }).toEqual({ ok: shape.published })
+                const refusal = yield* Effect.exit(run(harness, shape))
+                expect(Exit.isFailure(refusal)).toBe(true)
+                expect(Cause.pretty((refusal as Exit.Failure<unknown, unknown>).cause)).toContain(
+                  shape.refused,
+                )
+                return
+              }
               const actual = yield* run(harness, shape)
               const now =
                 shape.nowStored === undefined

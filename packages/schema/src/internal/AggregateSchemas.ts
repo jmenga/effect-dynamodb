@@ -128,6 +128,245 @@ export const refuseManySortKeysOverMovingValue = (
 }
 
 /**
+ * The names a stored value of `schema` declares: the fields of its stored side, through optionality,
+ * classes, unions and suspensions. A record's keys are taken, not declared, and a declaration
+ * (`Schema.declare`) declares nothing that can be seen, so neither gives a name.
+ */
+export const storedFieldNames = (schema: Schema.Top): ReadonlySet<string> => {
+  const names = new Set<string>()
+  const seen = new Set<SchemaAST.AST>()
+  const visit = (ast: SchemaAST.AST): void => {
+    if (seen.has(ast)) return
+    seen.add(ast)
+    if (SchemaAST.isObjects(ast)) {
+      for (const property of ast.propertySignatures) {
+        if (typeof property.name === "string") names.add(property.name)
+      }
+    } else if (SchemaAST.isUnion(ast)) {
+      for (const member of ast.types) visit(member)
+    } else if (SchemaAST.isSuspend(ast)) {
+      let inner: SchemaAST.AST
+      try {
+        inner = SchemaAST.toEncoded(ast.thunk())
+      } catch {
+        return
+      }
+      visit(inner)
+    }
+  }
+  visit(SchemaAST.toEncoded(schema.ast))
+  return names
+}
+
+/** The kinds of row an aggregate writes, by how a read hands back the value one holds. */
+export type RowKind = "root" | "subAggregate" | "edge"
+
+/** The index key attributes a read takes off the root's row. */
+const ROOT_INDEX_ATTRIBUTES: ReadonlySet<string> = new Set([
+  "gsi1pk",
+  "gsi1sk",
+  "gsi2pk",
+  "gsi2sk",
+  "gsi3pk",
+  "gsi3sk",
+  "gsi4pk",
+  "gsi4sk",
+  "gsi5pk",
+  "gsi5sk",
+  "lsi1sk",
+  "lsi2sk",
+])
+
+/**
+ * Whether a read takes the attribute `name` off a row of `kind` before handing back the value it
+ * holds, whatever the value declares: `__edd_e__`, `pk` and `sk` everywhere; on the root's row the
+ * index keys `gsi1pk` … `gsi5sk`, `lsi1sk` and `lsi2sk`; on a sub-aggregate's root row any name
+ * starting `pk`, `sk`, `gsi` or `lsi`; on an edge's row any name starting `gsi` or `lsi`. The rule
+ * each read has applied through 1.40.0 (#241), the one place it's stated.
+ */
+export const readTakesOff = (kind: RowKind, name: string): boolean => {
+  if (name === "__edd_e__" || name === "pk" || name === "sk") return true
+  switch (kind) {
+    case "root":
+      return ROOT_INDEX_ATTRIBUTES.has(name)
+    case "subAggregate":
+      return (
+        name.startsWith("pk") ||
+        name.startsWith("sk") ||
+        name.startsWith("gsi") ||
+        name.startsWith("lsi")
+      )
+    case "edge":
+      return name.startsWith("gsi") || name.startsWith("lsi")
+  }
+}
+
+/** A key attribute the library writes on a row, with what it holds, to name it in an error. */
+export type RowKeyAttribute = readonly [attribute: string, what: string]
+
+/** The parts of an aggregate's config naming the key attributes its rows are written with. */
+export type RowKeyConfig = {
+  readonly pk: { readonly field: string }
+  readonly collection: {
+    readonly index?: string | undefined
+    readonly sk?: { readonly field: string } | undefined
+  }
+  readonly list?:
+    | { readonly pk: { readonly field: string }; readonly sk: { readonly field: string } }
+    | undefined
+}
+
+/**
+ * The key attributes the library writes on every row an aggregate writes, over a value's field of
+ * the same name (#241): `__edd_e__`, the partition key attribute, `sk` and, with a collection index,
+ * the collection sort key's copy.
+ */
+export const rowKeyAttributes = (config: RowKeyConfig): ReadonlyArray<RowKeyAttribute> => [
+  ["__edd_e__", "the attribute holding its entity type"],
+  [config.pk.field, "the attribute holding the partition key"],
+  ["sk", "the attribute holding its sort key"],
+  ...(config.collection.index === undefined || config.collection.sk === undefined
+    ? []
+    : [
+        [
+          config.collection.sk.field,
+          "the attribute holding the collection sort key's copy",
+        ] as const,
+      ]),
+]
+
+/**
+ * The root's list keys, written on its row only when every list composite has a value (they're
+ * sparse), over a field of the same name (#241).
+ */
+export const listKeyAttributes = (config: RowKeyConfig): ReadonlyArray<RowKeyAttribute> =>
+  config.list === undefined
+    ? []
+    : [
+        [config.list.pk.field, "the attribute holding its list partition key"],
+        [config.list.sk.field, "the attribute holding its list sort key"],
+      ]
+
+/**
+ * The key attributes of a row of `kind` (`written`) a value declaring `names` has a field of, by
+ * what a read does with each ({@link readTakesOff}): `misread`, handed back, so the field reads the
+ * library's key text whatever was given, on every row; `lost`, taken off, so a value given there
+ * reads back without it, and one given none reads as it was.
+ */
+export const valueFieldsOverRowKeys = (
+  kind: RowKind,
+  written: ReadonlyArray<RowKeyAttribute>,
+  names: Iterable<string>,
+): {
+  readonly misread: ReadonlyArray<RowKeyAttribute>
+  readonly lost: ReadonlyArray<RowKeyAttribute>
+} => {
+  const declared = new Set(names)
+  const misread: Array<RowKeyAttribute> = []
+  const lost: Array<RowKeyAttribute> = []
+  for (const entry of written) {
+    if (!declared.has(entry[0])) continue
+    if (readTakesOff(kind, entry[0])) lost.push(entry)
+    else misread.push(entry)
+  }
+  return { misread, lost }
+}
+
+/**
+ * `[EDD-9159]`, at make: a row's value declaring a field named like a key attribute the aggregate
+ * writes on every row ({@link rowKeyAttributes}) that a read hands back (#241). The library writes
+ * the key text over the value's own, so the field reads it back whatever the caller gave, on every
+ * row: 1.40.0 misread each. Only an actual collision: a field the value's stored side declares
+ * (`storedFieldNames`) of a name the row is written with. A record's keys, a declaration and a custom
+ * `decompose`'s rows (what it returns isn't the element's schema) aren't. Refused at write, where
+ * the value is known (`Aggregate.ts`): a field the read takes off (`pk`, `sk`, …), which loses only
+ * a value given there; a discriminator, which collides only with a value other than its own; and a
+ * list key ({@link listKeyAttributes}), written only when every list composite has a value. The
+ * value of each kind of row is named as the operational `resolveNode` names it
+ * ({@link declaredValueNames}).
+ */
+export const refuseValueFieldsOnRowAttributes = (
+  aggregate: string,
+  rootSchema: Schema.Top,
+  config: RowKeyConfig & {
+    readonly edges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>
+  },
+): void => {
+  const refuse = (owner: string, kind: RowKind, names: Iterable<string> | undefined): void => {
+    if (names === undefined) return
+    const [first] = valueFieldsOverRowKeys(kind, rowKeyAttributes(config), names).misread
+    if (first === undefined) return
+    throw new Error(
+      `[EDD-9159] Aggregate "${aggregate}": ${owner} declares a field "${first[0]}", which is also ` +
+        `${first[1]}. The library writes that attribute on the row over the value's own and a read ` +
+        `hands it back, so the field would read the library's value whatever was given. Name the ` +
+        `field something else.`,
+    )
+  }
+  const walk = (
+    fields: Record<string, Schema.Top> | undefined,
+    edges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
+    path: ReadonlyArray<string>,
+  ): void => {
+    for (const [name, edge] of Object.entries(edges)) {
+      if (!("_tag" in edge)) continue
+      const here = [...path, name].join(".")
+      if (edge._tag === "OneEdge") {
+        refuse(`the value of edge "${here}"`, "edge", declaredValueNames.one(fields, name))
+      } else if (edge._tag === "ManyEdge") {
+        refuse(
+          `an element of edge "${here}"`,
+          "edge",
+          declaredValueNames.many(fields, name, edge as ManyEdge),
+        )
+      } else if (edge._tag === "BoundSubAggregate") {
+        const bound = edge as BoundSubAggregate<any>
+        const subFields = getSchemaFields(unwrapModel(bound.aggregate.schema))
+        refuse(
+          `the sub-aggregate at "${here}"`,
+          "subAggregate",
+          declaredValueNames.own(subFields, bound.aggregate.edges),
+        )
+        walk(subFields, bound.aggregate.edges, [...path, name])
+      }
+    }
+  }
+  const rootFields = getSchemaFields(unwrapModel(rootSchema))
+  refuse("its root", "root", declaredValueNames.own(rootFields, config.edges))
+  walk(rootFields, config.edges, [])
+}
+
+/**
+ * The field names the value of each kind of row declares, for {@link valueFieldsOverRowKeys}: the
+ * root's and a sub-aggregate's own fields (`own`, those no edge claims), a `one` edge's value (the
+ * field holding it), a `many` edge's element (none with a custom `decompose`). `undefined` where
+ * nothing is declared.
+ */
+export const declaredValueNames = {
+  own: (
+    fields: Record<string, Schema.Top> | undefined,
+    edges: Record<string, unknown>,
+  ): ReadonlyArray<string> =>
+    Object.keys(fields ?? {}).filter((name) => !Object.hasOwn(edges, name)),
+  one: (
+    fields: Record<string, Schema.Top> | undefined,
+    edgeName: string,
+  ): ReadonlySet<string> | undefined => {
+    const value = own(fields, edgeName)
+    return value === undefined ? undefined : storedFieldNames(value)
+  },
+  many: (
+    fields: Record<string, Schema.Top> | undefined,
+    edgeName: string,
+    edge: { readonly decompose?: unknown },
+  ): ReadonlySet<string> | undefined => {
+    if (edge.decompose !== undefined) return undefined
+    const element = manyElementSchema(fields, edgeName)
+    return element === undefined ? undefined : storedFieldNames(element)
+  },
+}
+
+/**
  * `[EDD-9128]`: a key an aggregate composes from a field storing both numeric kinds
  * (`bothKindsKeyRefusal`): its partition key, its collection and list keys, and a `many` edge's sort
  * key, on the root's edges and those of the sub-aggregates under it. A sort-key composite that's a
