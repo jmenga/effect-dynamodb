@@ -814,6 +814,70 @@ export const suite = (
         }),
     )
 
+    // The row a pair's survivor was read from is the one stored under its own key in 1.40.0's
+    // text, whatever the update changes in it: its `created` is carried, as an ordinary update of
+    // that row carries it, never the other row's and never a new one.
+    for (const survivor of ["l1", "l2"] as const) {
+      const removed = survivor === "l1" ? "l2" : "l1"
+      it.effect(
+        `under escapeKeys: true, an update removing ${removed} of each pair and changing ${survivor}: the survivor keeps its own created`,
+        () =>
+          Effect.gen(function* () {
+            const createdOf: Record<string, string> = {
+              l1: "2001-01-01T00:00:00.000Z",
+              l2: "2002-02-02T00:00:00.000Z",
+              l3: "2003-03-03T00:00:00.000Z",
+            }
+            const seeded = then.pair[0].rows.map((row) =>
+              row.lineId?.S === undefined
+                ? row
+                : { ...row, createdAt: { S: createdOf[row.lineId.S]! } },
+            )
+            const repair = yield* session(harness, ON, seeded, ({ db, step }) =>
+              step(
+                "update",
+                () =>
+                  later(
+                    db.aggregates.Pairs.update({ id: "p1" }, ({ state }: any) => ({
+                      ...state,
+                      ...Object.fromEntries(
+                        ["cased", "zones"].map((edge) => [
+                          edge,
+                          state[edge]
+                            .filter((l: any) => l.lineId !== removed)
+                            .map((l: any) => (l.lineId === survivor ? { ...l, padded: "q" } : l)),
+                        ]),
+                      ),
+                    })),
+                  ),
+                PK.pair,
+              ),
+            )
+            expect(repair.outcome).toHaveProperty("ok")
+            const lines = repair.rows.filter((row) => row.lineId !== undefined)
+            expect(lines.map((row) => [row.lineId?.S, row.padded?.S]).sort()).toEqual(
+              [
+                [survivor, "q "],
+                [survivor, "q "],
+                ["l3", "z "],
+                ["l3", "z "],
+              ].sort(),
+            )
+            const now = new Date(published.clock + 5000).toISOString()
+            for (const row of lines) {
+              expect({ line: row.lineId?.S, created: row.createdAt }).toEqual({
+                line: row.lineId?.S,
+                created: { S: createdOf[row.lineId!.S!]! },
+              })
+              expect({ line: row.lineId?.S, updated: row.updatedAt }).toEqual({
+                line: row.lineId?.S,
+                updated: { S: now },
+              })
+            }
+          }),
+      )
+    }
+
     it.effect(
       "under escapeKeys: true, two elements whose values compose one key in a group the write leaves alone: the write goes ahead",
       () =>
