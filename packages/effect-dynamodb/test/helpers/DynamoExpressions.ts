@@ -46,9 +46,14 @@ const refuse = (message: string): never => {
   throw validationException(message)
 }
 
-/** Whether `error` is a `ValidationException` (a refusal), as opposed to a defect. */
+/**
+ * Whether `error` is DynamoDB's refusal of the request, as opposed to a defect: a
+ * `ValidationException`, or the `TransactionCanceledException` a `TransactGetItems` key check
+ * fails with.
+ */
 export const isRefusal = (error: unknown): error is Error =>
-  error instanceof Error && error.name === "ValidationException"
+  error instanceof Error &&
+  (error.name === "ValidationException" || error.name === "TransactionCanceledException")
 
 /** A request the in-memory tables don't read: a defect naming it, never an approximation. */
 export class UnreadableRequest extends Error {
@@ -107,6 +112,26 @@ export const setOwn = <V>(obj: Record<string, V>, key: string, value: V): void =
 }
 
 const clone = <A>(value: A): A => structuredClone(value)
+
+/**
+ * An item as the AWS SDK's client hands it back. Its reader keeps a top-level attribute named
+ * `__proto__` as an own key with no value (`undefined`); in a map, such an attribute reads back
+ * whole. Measured with `@aws-sdk/client-dynamodb` 3.1111.0 on DynamoDB Local, which stores the
+ * attribute and evaluates conditions on it (`connected.helper-conformance.test.ts`). Every item
+ * these tables return goes through this.
+ */
+export const asRead = (item: Item): Item => {
+  const copy = clone(item)
+  if (Object.hasOwn(copy, "__proto__")) {
+    Object.defineProperty(copy, "__proto__", {
+      value: undefined,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
+  }
+  return copy
+}
 
 // ---------------------------------------------------------------------------
 // Java's HashMap order: the order DynamoDB Local reports among several problems
@@ -223,9 +248,6 @@ const scientificText = (d: Decimal): string => {
   return `${sign}${mantissa}E${exponent >= 0 ? "+" : ""}${exponent}`
 }
 
-/** A number's value as text: equal for two spellings of one number (`1.50`, `15E-1`). */
-export const numberValue = (text: string): string => plainText(stripZeros(decimalOf(text)))
-
 /** `a + b` or `a - b` as DynamoDB Local computes and stores it, or its refusal. */
 const arithmetic = (a: string, b: string, operator: "+" | "-"): string => {
   const [x, y] = [decimalOf(a), decimalOf(b)]
@@ -323,8 +345,11 @@ export const compareKeyValues = (a: AttributeValue, b: AttributeValue): number =
   order(a, b) ?? unreadable("the key values", shown([a, b]), "not of one key type")
 
 /**
- * A key as an identity: the table, then each key attribute's type and value (a number by its
- * value, bytes by their bytes). Two keys name one item exactly when their identities are equal.
+ * A key as an identity: the table, then each key attribute's type and value. Two keys name one
+ * item exactly when their identities are equal. Every key these tables take is an `S`
+ * ({@link checkKey}); any other is a defect here, as DynamoDB doesn't compare every kind of key
+ * alike (on DynamoDB Local, `BatchGetItem` takes the number keys `1` and `1.0` as two keys where
+ * `BatchWriteItem` and both transactions take them as one item).
  */
 export const keyIdentity = (table: string, key: Item, attributes: ReadonlyArray<string>): string =>
   JSON.stringify([
@@ -332,11 +357,8 @@ export const keyIdentity = (table: string, key: Item, attributes: ReadonlyArray<
     ...attributes.map((name) => {
       const value = own(key, name)
       if (value === undefined) return null
-      const type = typeOf(value)
-      if (type === "N") return [type, numberValue(value.N!)]
-      if (type === "B") return [type, Buffer.from(value.B!).toString("hex")]
-      if (type === "S") return [type, value.S]
-      return unreadable("the key", shown(key), `${name} is a ${type}`)
+      if (typeOf(value) === "S") return ["S", value.S]
+      return unreadable("the key", shown(key), `${name} is not a string`)
     }),
   ])
 
@@ -477,7 +499,10 @@ const tokenize = (kind: string, expression: string): Array<Token> => {
   }
 }
 
-/** DynamoDB's reserved words, which an expression can't use as a bare attribute name. */
+/**
+ * DynamoDB's reserved words, which an expression can't use as a bare attribute name: AWS's published
+ * list, less `CONVERT` and `SIZE`, which DynamoDB Local reads as names.
+ */
 const RESERVED = new Set(
   (
     "ABORT ABSOLUTE ACTION ADD AFTER AGENT AGGREGATE ALL ALLOCATE ALTER ANALYZE AND ANY ARCHIVE " +
@@ -487,7 +512,7 @@ const RESERVED = new Set(
     "CASCADED CASE CAST CATALOG CHAR CHARACTER CHECK CLASS CLOB CLOSE CLUSTER CLUSTERED CLUSTERING " +
     "CLUSTERS COALESCE COLLATE COLLATION COLLECTION COLUMN COLUMNS COMBINE COMMENT COMMIT COMPACT " +
     "COMPILE COMPRESS CONDITION CONFLICT CONNECT CONNECTION CONSISTENCY CONSISTENT CONSTRAINT " +
-    "CONSTRAINTS CONSTRUCTOR CONSUMED CONTINUE CONVERT COPY CORRESPONDING COUNT COUNTER CREATE " +
+    "CONSTRAINTS CONSTRUCTOR CONSUMED CONTINUE COPY CORRESPONDING COUNT COUNTER CREATE " +
     "CROSS CUBE CURRENT CURSOR CYCLE DATA DATABASE DATE DATETIME DAY DEALLOCATE DEC DECIMAL " +
     "DECLARE DEFAULT DEFERRABLE DEFERRED DEFINE DEFINED DEFINITION DELETE DELIMITED DEPTH DEREF " +
     "DESC DESCRIBE DESCRIPTOR DETACH DETERMINISTIC DIAGNOSTICS DIRECTORIES DISABLE DISCONNECT " +
@@ -516,7 +541,7 @@ const RESERVED = new Set(
     "RESTORE RESTRICT RESULT RETURN RETURNING RETURNS REVERSE REVOKE RIGHT ROLE ROLES ROLLBACK " +
     "ROLLUP ROUTINE ROW ROWS RULE RULES SAMPLE SATISFIES SAVE SAVEPOINT SCAN SCHEMA SCOPE SCROLL " +
     "SEARCH SECOND SECTION SEGMENT SEGMENTS SELECT SELF SEMI SENSITIVE SEPARATE SEQUENCE " +
-    "SERIALIZABLE SESSION SET SETS SHARD SHARE SHARED SHORT SHOW SIGNAL SIMILAR SIZE SKEWED " +
+    "SERIALIZABLE SESSION SET SETS SHARD SHARE SHARED SHORT SHOW SIGNAL SIMILAR SKEWED " +
     "SMALLINT SNAPSHOT SOME SOURCE SPACE SPACES SPARSE SPECIFIC SPECIFICTYPE SPLIT SQL SQLCODE " +
     "SQLERROR SQLEXCEPTION SQLSTATE SQLWARNING START STATE STATIC STATUS STORAGE STORE STORED " +
     "STREAM STRING STRUCT STYLE SUB SUBMULTISET SUBPARTITION SUBSTRING SUBTYPE SUM SUPER " +
@@ -530,8 +555,14 @@ const RESERVED = new Set(
   ).split(" "),
 )
 
-/** DynamoDB's 573 reserved words, which the conformance suite checks against DynamoDB Local. */
-export const reservedWords: ReadonlyArray<string> = [...RESERVED]
+/**
+ * The expression grammar's own words: DynamoDB Local reads one where a name should be as a syntax
+ * error, not as a reserved word.
+ */
+const KEYWORDS = new Set(["ADD", "AND", "BETWEEN", "DELETE", "IN", "NOT", "OR", "REMOVE", "SET"])
+
+/** The words the tables refuse as a bare name, which the conformance suite checks against DynamoDB Local. */
+export const reservedWords: ReadonlyArray<string> = [...new Set([...RESERVED, ...KEYWORDS])]
 
 // ---------------------------------------------------------------------------
 // Expressions
@@ -677,7 +708,12 @@ class Reader {
       return name
     }
     if (token.kind === "word") {
-      if (RESERVED.has(token.text.toUpperCase())) {
+      const upper = token.text.toUpperCase()
+      if (KEYWORDS.has(upper)) {
+        this.at--
+        return this.syntaxError()
+      }
+      if (RESERVED.has(upper)) {
         this.invalid(`Attribute name is a reserved keyword; reserved keyword: ${token.text}`)
       }
       return token.text
@@ -1820,7 +1856,7 @@ export const conditionalCheckFailed = (
   Object.assign(new Error(DDB_CONDITION_FAILED), {
     name: "ConditionalCheckFailedException",
     ...(input.ReturnValuesOnConditionCheckFailure === "ALL_OLD" &&
-      current !== undefined && { Item: clone(current) }),
+      current !== undefined && { Item: asRead(current) }),
   })
 
 /** A single write's answer: the item to store (`undefined`: none) and the output, or a failed condition. */
@@ -1841,7 +1877,7 @@ type WriteInput = ExpressionInput & {
 }
 
 const attributes = (item: Item | undefined): { readonly Attributes?: Item } =>
-  item === undefined ? {} : { Attributes: clone(item) }
+  item === undefined ? {} : { Attributes: asRead(item) }
 
 /** The top-level attributes of `item` an update's actions name. */
 const touched = (item: Item | undefined, actions: ReadonlyArray<Action>): Item | undefined => {
@@ -1969,7 +2005,7 @@ export const getItem = (
   const { projection } = readExpressions(input)
   const current = read(key)
   if (current === undefined) return {}
-  return { Item: projection === undefined ? clone(current) : project(current, projection) }
+  return { Item: asRead(projection === undefined ? current : project(current, projection)) }
 }
 
 /** Where a table finds an item and its key attributes. */
@@ -2007,10 +2043,9 @@ export const transactionCanceled = (
 const KINDS = ["Put", "Update", "Delete", "ConditionCheck"] as const
 
 /**
- * A key or item check inside a transaction. DynamoDB Local refuses the request when a `Put` item
- * lacks a key attribute, but answers other key problems in a transaction its own way (a
- * `ValidationError` cancellation reason, or a `TransactionCanceledException` with no reasons),
- * which these tables don't model.
+ * A key or item check inside a transaction write. DynamoDB Local refuses the request when a `Put`
+ * item lacks a key attribute, but cancels the transaction with a `ValidationError` reason for
+ * other key problems, which these tables don't model.
  */
 const inTransaction = <A>(check: () => A, what: unknown, refused: ReadonlyArray<string>): A => {
   try {
@@ -2093,10 +2128,10 @@ export const transactWrite = (
     if (!conditionHolds(op.expressions.condition, current, options)) {
       reasons.push({
         Code: "ConditionalCheckFailed",
-        // A cancellation reason's message ends in a full stop; the exception's doesn't.
-        Message: `${DDB_CONDITION_FAILED}.`,
+        // A `ConditionCheck`'s reason ends in a full stop; a write's doesn't.
+        Message: op.kind === "ConditionCheck" ? `${DDB_CONDITION_FAILED}.` : DDB_CONDITION_FAILED,
         ...(op.body.ReturnValuesOnConditionCheckFailure === "ALL_OLD" &&
-          current !== undefined && { Item: clone(current) }),
+          current !== undefined && { Item: asRead(current) }),
       })
       continue
     }
@@ -2134,7 +2169,13 @@ export const transactGet = (
     const body = op.Get as ExpressionInput & { TableName: string; Key: Item }
     checkFields("Get", body)
     const schema = tables.schema(body.TableName)
-    inTransaction(() => checkKey(body.Key, schema), body, [])
+    try {
+      checkKey(body.Key, schema)
+    } catch (error) {
+      // DynamoDB Local cancels the read, with the check's message and no reasons.
+      if (!isRefusal(error)) throw error
+      throw Object.assign(new Error(error.message), { name: "TransactionCanceledException" })
+    }
     const { projection } = readExpressions(body)
     return { body, schema, projection }
   })
@@ -2147,7 +2188,7 @@ export const transactGet = (
     Responses: gets.map(({ body, projection }) => {
       const item = tables.read(body.TableName, body.Key)
       if (item === undefined) return {}
-      return { Item: projection === undefined ? clone(item) : project(item, projection) }
+      return { Item: asRead(projection === undefined ? item : project(item, projection)) }
     }),
   }
 }
@@ -2173,7 +2214,7 @@ export const batchGet = (
     Responses[table] = keys.flatMap((key) => {
       const item = tables.read(table, key)
       if (item === undefined) return []
-      return [projection === undefined ? clone(item) : project(item, projection)]
+      return [asRead(projection === undefined ? item : project(item, projection))]
     })
   }
   return { Responses, UnprocessedKeys: {} }
@@ -2298,14 +2339,16 @@ const page = (
   }
   const examined = input.Limit === undefined ? rows : rows.slice(0, input.Limit)
   const last = examined[examined.length - 1]
-  const more = examined.length < rows.length && last !== undefined
+  // A read that stops at its `Limit` says where, even when nothing is left after that row.
+  const more =
+    last !== undefined && (examined.length < rows.length || examined.length === input.Limit)
   const kept = examined.filter(
     (row) => expressions.filter === undefined || evaluate(expressions.filter, row),
   )
   return {
     ...(select !== "COUNT" && {
       Items: kept.map((row) =>
-        expressions.projection === undefined ? clone(row) : project(row, expressions.projection),
+        asRead(expressions.projection === undefined ? row : project(row, expressions.projection)),
       ),
     }),
     Count: kept.length,
@@ -2332,7 +2375,7 @@ export const query = (
   }
   const schema = index ?? table
   if (index !== undefined && input.ConsistentRead === true) {
-    refuse("Consistent read cannot be true when querying a GSI")
+    refuse("Consistent reads are not supported on global secondary indexes")
   }
   const parts = keyConditionParts(expressions.keyCondition)
   const on = (part: Condition): string | undefined => {
