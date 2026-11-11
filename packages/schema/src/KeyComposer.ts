@@ -19,6 +19,7 @@ import {
 import type { CompositeKeyHoleError } from "./Errors.js"
 import { encodeBigInt, encodeNumber, isStoredNaN } from "./internal/NumericKey.js"
 import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
+import { zonesAsStored } from "./internal/StoredForm.js"
 import {
   concatBytes,
   interleave,
@@ -535,7 +536,8 @@ const serializeWith = (
   }
   // Native Date
   if (value instanceof Date) return value.toISOString()
-  return String(value)
+  // A named zone's text names it as 4.1.2 did, whichever Effect is installed
+  return String(zonesAsStored(value))
 }
 
 /**

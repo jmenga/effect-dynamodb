@@ -50,6 +50,7 @@ import {
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
 import { CANT_SAY, issueOf } from "./SchemaIssue.js"
+import { zonedIsoText } from "./StoredForm.js"
 import { parseZonedIso } from "./ZonedIso.js"
 
 // ---------------------------------------------------------------------------
@@ -558,7 +559,7 @@ const toWirePrimitive = (input: unknown, encoding: DynamoEncoding): string | num
   }
   switch (encoding.storage) {
     case "string":
-      if (encoding.domain === "DateTime.Zoned" && zoned) return DateTime.formatIsoZoned(zoned)
+      if (encoding.domain === "DateTime.Zoned" && zoned) return zonedIsoText(zoned)
       return new Date(epochMs).toISOString()
     case "epochMs":
       return epochMs

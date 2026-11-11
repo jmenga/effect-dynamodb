@@ -73,6 +73,7 @@ import {
   refuseUnreadable,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
+import { isZoneInstance, storedFormOf } from "@effect-dynamodb/schema/internal/StoredForm.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
   type Context,
@@ -4368,6 +4369,17 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
       b instanceof Set &&
       a.size === b.size &&
       [...a].every((member) => b.has(member))
+    )
+  }
+
+  // A zone compares as it's stored. Effect 4.1.3 keeps the name a zone was made from, so `Etc/UTC`
+  // and `UTC` are two zones stored as one map, where 4.1.2 made them one zone: compared by their
+  // properties, an update that sets the zone already stored wrote it again.
+  if (isZoneInstance(a) || isZoneInstance(b)) {
+    return (
+      isZoneInstance(a) &&
+      isZoneInstance(b) &&
+      JSON.stringify(storedFormOf(a)) === JSON.stringify(storedFormOf(b))
     )
   }
 

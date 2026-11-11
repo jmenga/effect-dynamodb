@@ -5038,7 +5038,7 @@ decimal's cached normalized form (`isCachedNormal`, which `Marshaller.ts` import
 there, so a native and a packed write leave out the same property). Inside a look-alike
 (an instance carrying, on its prototype, one of the markers `EffectInstances` rebuilds
 by) every value is the library's, so it's what the unmarshaller hands back: a
-safe-integer bigint as a number, a cookie's expiry as the ISO text `datingCookies`
+safe-integer bigint as a number, a cookie's expiry as the ISO text `finishingInstances`
 writes (`expiryText`, which `optionsWriteAs` uses too), a named zone's formatter as the
 empty map. An `Option` or a `Result` holds the caller's value, which is left as it is
 and packed by the rules every packed value follows: a bigint, a `Date` or bytes in it is
@@ -5065,14 +5065,43 @@ exactly as `@aws-sdk/util-dynamodb` does. Only if that throws does it look for e
 sets to leave out, and for a `BigDecimal` whose cached `normalized` form leads into a
 cycle, which it writes as a fresh decimal (`holdsCachedCycle` reads data descriptors
 and calls no getter, so an item holding none is handled as it always was). Then
-`datingCookies` looks through the marshalled output for a cookie's marker and writes
-the expiry of each of Effect's cookies (by prototype) as ISO text, where a `Date`
-marshals to an empty map; it finds the source cookie by descriptors, calls no getter,
-and touches nothing else. A typed cookie reads the text back as the `Date`
+`finishingInstances` looks through the marshalled output for a cookie's marker and a
+zone's. It writes the expiry of each of Effect's cookies (by prototype) as ISO text,
+where a `Date` marshals to an empty map, and a named zone's name as Effect 4.1.2 held it
+(below); it finds the source instance by descriptors, calls no getter, and touches
+nothing else. A typed cookie reads the text back as the `Date`
 (`cookieOptions`). Cookies are held to the write-back check like every kind but a
 date, comparing an expiry as the marshaller writes it (`optionsWriteAs`), so a cookie
 1.39.0 wrote with an expiry (an empty map), one holding properties of its own inside
 it, and a jar keyed other than by its cookies' names stay the map.
+
+**A named zone's name on any Effect 4.1 (1.41.0).** Effect 4.1.3 changed a named zone.
+It gained an own enumerable `resolvedId` (the name `Intl` resolves it to), and its `id`
+became the name it was made from, unless `Intl` resolves that only in another case. On
+4.1.2 the `id` was the resolved name and there was no `resolvedId`. So every named
+zone, native or packed, stored one more entry on 4.1.3, and a zone made from an alias
+(`Etc/UTC`, `GMT`, `Asia/Kolkata`, `US/Eastern`) stored another `id`, ISO text and key
+text: a consumer's stored bytes depended on the Effect patch installed. The stored form
+is 4.1.2's whichever Effect is installed. `resolvedZoneName` (`internal/StoredForm.ts`)
+is the one decision: a real zone (its marker inherited, not its own) holding an own
+string `resolvedId` that its own formatter resolves to, and not one kept as read, is
+stored under that name and without `resolvedId`; any other value is untouched, so on
+4.1.2 nothing changes. Every stored form asks it: the marshaller (`finishingInstances`),
+packed storage (`libraryMap`, `storedDate`), the write-back check (`writtenProperties`),
+key text (`zonesAsStored`, for a zone in an `Option`, a `Result` or a zoned date too),
+the ISO text of `DynamoModel.DateTimeZoned` and of a date stored as text
+(`zonedIsoText`), and an aggregate's comparison, where two zones compare by their
+stored form, so setting an equal zone still writes nothing. A map read back holding
+`resolvedId` (written by 1.38.0–1.40.0 on 4.1.3) is rebuilt as a zone kept as read
+(`keepingAsRead`), so writing it stores the bytes read; a zone read from a 4.1.2 map
+stores the 4.1.2 map. Effect's own codecs are left as they are:
+`Schema.TimeZoneNamedFromString`, `Schema.TimeZoneFromString` and
+`Schema.DateTimeZonedFromString` write a zone made from an alias by the name it was
+made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`). `ZoneNames.test.ts` (both
+packages) makes 4.1.3's zone on the installed Effect's prototype and asserts the stored
+values literally, so it holds on either version, and `EffectValueTypes.test.ts` holds
+each of Effect's value types in each position (typed and untyped native attributes,
+packed, key text, aggregate comparison) to one literal table.
 
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values

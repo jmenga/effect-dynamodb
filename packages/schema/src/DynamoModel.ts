@@ -21,6 +21,7 @@ import {
   recordValueAst,
   recordValueAstFromAst,
 } from "./internal/SchemaAccessors.js"
+import { zonedIsoText } from "./internal/StoredForm.js"
 import { parseZonedIso } from "./internal/ZonedIso.js"
 
 // ---------------------------------------------------------------------------
@@ -351,7 +352,7 @@ export const DateTimeZoned = Schema.String.pipe(
         return Effect.fail(new SchemaIssue.InvalidType(Schema.String.ast, s))
       }
     }),
-    encode: SchemaGetter.transform((dt: DateTime.Zoned) => DateTime.formatIsoZoned(dt)),
+    encode: SchemaGetter.transform((dt: DateTime.Zoned) => zonedIsoText(dt)),
   }),
   Schema.annotate({
     [DynamoEncodingKey]: { storage: "string", domain: "DateTime.Zoned" } satisfies DynamoEncoding,

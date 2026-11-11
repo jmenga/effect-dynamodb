@@ -38,7 +38,10 @@ import {
   HOST_MARKER as HOST,
   IP_INTERFACE_MARKER as IP_INTERFACE,
   IP_NETWORK_MARKER as IP_NETWORK,
+  isKeptAsRead,
+  keepingAsRead,
   NET_ADDRESS_MARKER as NET_ADDRESS,
+  resolvedZoneName,
   SEMVER_MARKER as SEMVER,
   SEMVER_RANGE_MARKER as SEMVER_RANGE,
   URL_PARAMS_MARKER as URL_PARAMS,
@@ -302,8 +305,19 @@ const rebuildDateTime = (value: unknown): DateTime.DateTime | undefined =>
     ? reviveMarshalledDateTime(value)
     : undefined
 
-const rebuildTimeZone = (value: unknown): DateTime.TimeZone | undefined =>
-  markedBy(value, ZONE_MARKER) ? reviveTimeZone(value) : undefined
+/**
+ * A zone from the map it's stored as. A map holding `resolvedId` was written on Effect 4.1.3 or later,
+ * by a release that stored a zone as Effect held it: the zone is a copy kept to be written back as
+ * read ({@link keepingAsRead}), where any other is stored as 4.1.2 held it.
+ */
+const rebuildTimeZone = (value: unknown): DateTime.TimeZone | undefined => {
+  if (!markedBy(value, ZONE_MARKER)) return undefined
+  const zone = reviveTimeZone(value)
+  if (zone === undefined || !Object.hasOwn(value, "resolvedId")) return zone
+  return keepingAsRead(
+    Object.create(Object.getPrototypeOf(zone), Object.getOwnPropertyDescriptors(zone)),
+  )
+}
 
 /** An expiry as it's stored, ISO text, back as the `Date` it was written from. */
 const expiryOf = (text: string): Date | undefined => {
@@ -545,11 +559,16 @@ const REBUILDS: { readonly [K in InstanceKind]: (value: unknown) => unknown } = 
   DnsRecord: rebuildDnsRecord,
 }
 
-/** What marshalling stores of an object: its enumerable properties, its prototype's included. */
+/**
+ * What a native write stores of an object: its enumerable properties, its prototype's included, and
+ * a named zone under the name {@link resolvedZoneName} gives it, without `resolvedId`.
+ */
 const writtenProperties = (value: object): ReadonlyArray<readonly [string, unknown]> => {
+  const zoneName = resolvedZoneName(value)
   const properties: Array<readonly [string, unknown]> = []
   for (const key in value) {
-    const property = (value as StoredMap)[key]
+    if (zoneName !== undefined && key === "resolvedId") continue
+    const property = zoneName !== undefined && key === "id" ? zoneName : (value as StoredMap)[key]
     if (property !== undefined && typeof property !== "function") properties.push([key, property])
   }
   return properties
@@ -642,6 +661,7 @@ const carrying = (instance: object, stored: StoredMap): object => {
     Object.getPrototypeOf(instance),
     Object.getOwnPropertyDescriptors(instance),
   ) as object
+  if (isKeptAsRead(instance)) keepingAsRead(copy)
   for (const key of carried) {
     Object.defineProperty(copy, key, {
       value: stored[key],

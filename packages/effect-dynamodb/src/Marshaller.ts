@@ -18,6 +18,8 @@ import {
   cachesCycle,
   isBigDecimalInstance,
   isCachedNormal,
+  resolvedZoneName,
+  ZONE_MARKER,
 } from "@effect-dynamodb/schema/internal/StoredForm.js"
 import { Data } from "effect"
 
@@ -229,16 +231,19 @@ const storedElements = (list: ReadonlyArray<unknown>): ReadonlyArray<unknown> | 
 }
 
 /**
- * Gives each of Effect's cookies in `source` its expiry, in what marshalling made of it.
+ * Gives each of Effect's cookies in `source` its expiry, and each of its named zones its name, in what
+ * marshalling made of them.
  *
  * A cookie's `options.expires` is a `Date`, and marshalling stores a `Date` as an empty map: the
- * expiry was lost. Here it's ISO text instead. Marshalling has already run, exactly as it always
- * did, and nothing else it made is touched: this only looks through its output for a cookie's
- * marker, and finds the cookie it came from by descriptors, calling no getter. A cookie is Effect's
- * own, by its prototype; a map that only looks like one, a cookie behind a getter and an invalid
- * `Date` are left as marshalled.
+ * expiry was lost. Here it's ISO text instead. A named zone is stored as Effect 4.1.2 held it, under
+ * the name `resolvedZoneName` gives it and without the `resolvedId` 4.1.3 added: what 1.40.0 stored
+ * on 4.1.2, whichever Effect is installed. Marshalling has already run, exactly as it always did, and
+ * nothing else it made is touched: this only looks through its output for a cookie's marker or a
+ * zone's, and finds the instance it came from by descriptors, calling no getter. A cookie or a zone
+ * is Effect's own, by its prototype; a map that only looks like one, one behind a getter and an
+ * invalid `Date` are left as marshalled.
  */
-const datingCookies = (
+const finishingInstances = (
   marshalled: Record<string, AttributeValue>,
   source: unknown,
 ): Record<string, AttributeValue> => {
@@ -281,10 +286,20 @@ const datingCookies = (
     if (Number.isNaN(Date.prototype.getTime.call(expiry))) return
     options!.expires = { S: Date.prototype.toISOString.call(expiry) }
   }
+  const name = (map: Record<string, AttributeValue>): void => {
+    if (!Object.hasOwn(map, "resolvedId") || !Object.hasOwn(map, "id")) return
+    const zone = sourceAt()
+    if (typeof zone !== "object" || zone === null) return
+    const resolved = resolvedZoneName(zone)
+    if (resolved === undefined) return
+    map.id = { S: resolved }
+    delete map.resolvedId
+  }
   const visit = (attribute: AttributeValue): void => {
     const map = attribute.M
     if (map !== undefined) {
       if (Object.hasOwn(map, COOKIE_MARKER)) date(map)
+      if (Object.hasOwn(map, ZONE_MARKER)) name(map)
       for (const key of Object.keys(map)) {
         path.push(key)
         visit(map[key]!)
@@ -352,7 +367,7 @@ const NO_EMPTY_SET =
  * ({@link holdsCachedCycle}, which calls no getter) goes on exactly as before.
  * Whatever is still refused has no attribute to leave out, and throws
  * {@link UnstorableValue}. What marshalling makes of a cookie is then given the
- * cookie's expiry ({@link datingCookies}).
+ * cookie's expiry, and what it makes of a named zone the zone's name ({@link finishingInstances}).
  */
 const marshallStorable = (item: Record<string, unknown>): Record<string, AttributeValue> => {
   let written: Record<string, unknown> = item
@@ -369,7 +384,7 @@ const marshallStorable = (item: Record<string, unknown>): Record<string, Attribu
       throw unstorableAt(written, [], cause instanceof Error ? cause.message : String(cause))
     }
   }
-  return datingCookies(marshalled, written)
+  return finishingInstances(marshalled, written)
 }
 
 /**

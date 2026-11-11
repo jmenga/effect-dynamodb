@@ -17,7 +17,7 @@
  * to refuse where it is. An `Option` or a `Result` holds the caller's value, which is packed by the
  * rules every packed value is: only the map around it is built here.
  */
-import { BigDecimal, DateTime } from "effect"
+import { BigDecimal, DateTime, Option, Result } from "effect"
 import * as Cookies from "effect/http/Cookies"
 
 /** The marker a marshalled `DateTime` carries. */
@@ -145,6 +145,91 @@ export const expiryText = (expires: unknown): string | undefined =>
     : undefined
 
 // ---------------------------------------------------------------------------
+// A named zone's name
+// ---------------------------------------------------------------------------
+
+/** The zones a read rebuilt from a stored map holding `resolvedId`, written back as they were read. */
+const keptAsRead = new WeakSet<object>()
+
+/** A zone a read rebuilt from a stored map holding `resolvedId`: it's written back as it was read. */
+export const keepingAsRead = <Z extends object>(zone: Z): Z => {
+  keptAsRead.add(zone)
+  return zone
+}
+
+/** Whether a zone is one a read rebuilt from a map holding `resolvedId` ({@link keepingAsRead}). */
+export const isKeptAsRead = (zone: object): boolean => keptAsRead.has(zone)
+
+/**
+ * The name one of Effect's named zones is stored under, where Effect now holds it under another; or
+ * `undefined`, where it's stored as Effect holds it. The one decision on what names a zone.
+ *
+ * Effect 4.1.3 gave a named zone a `resolvedId`, the name its own `Intl` formatter resolves it to, and
+ * kept the name it was made from as its `id`. Up to 4.1.2 the `id` was that resolved name and there
+ * was no `resolvedId`. Stored as Effect holds it, the same zone was another map on 4.1.3 (a
+ * `resolvedId` entry, and for a name `Intl` resolves to another, `Etc/UTC` to `UTC`, another `id`)
+ * and another key text and ISO text. A zone is stored as 4.1.2 held it: under its resolved name,
+ * without `resolvedId`. Only a `resolvedId` that is the zone's own formatter's resolution is
+ * Effect's; a zone a read rebuilt from a map holding one ({@link keepingAsRead}) is written as read.
+ * Reads descriptors only, so no getter is called.
+ */
+export const resolvedZoneName = (zone: object): string | undefined => {
+  if (keptAsRead.has(zone) || !inherits(zone, ZONE_MARKER)) return undefined
+  const resolved = ownData(zone, "resolvedId")
+  const format = ownData(zone, "format")
+  if (typeof resolved !== "string" || !(format instanceof Intl.DateTimeFormat)) return undefined
+  return format.resolvedOptions().timeZone === resolved ? resolved : undefined
+}
+
+/** One of Effect's zones itself, not the map DynamoDB hands back for one: its marker is inherited. */
+export const isZoneInstance = (value: object): boolean => inherits(value, ZONE_MARKER)
+
+/** A zone under this name, as Effect makes one from it; `undefined` when it can't. */
+const namedZone = (name: string): DateTime.TimeZone | undefined => {
+  try {
+    return DateTime.zoneMakeNamedUnsafe(name)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * A value whose text names a zone, with each of Effect's named zones in it as 4.1.2 held it
+ * ({@link resolvedZoneName}), so its text is the text 4.1.2 gave it: a zone itself, the zone of a
+ * zoned date, and the value of an `Option` or a `Result`, whose text is their content's. The same
+ * reference when nothing in it changes.
+ */
+export const zonesAsStored = (value: unknown): unknown => {
+  if (typeof value !== "object" || value === null || isPlainObject(value)) return value
+  const name = resolvedZoneName(value)
+  if (name !== undefined) {
+    return ownData(value, "id") === name ? value : (namedZone(name) ?? value)
+  }
+  if (isRealDate(value)) {
+    if (!DateTime.isZoned(value)) return value
+    const zone = zonesAsStored(value.zone) as DateTime.TimeZone
+    return zone === value.zone
+      ? value
+      : DateTime.makeZonedUnsafe(value.epochMilliseconds, { timeZone: zone })
+  }
+  if (inherits(value, OPTION_MARKER) && Option.isOption(value) && Option.isSome(value)) {
+    const held = zonesAsStored(value.value)
+    return held === value.value ? value : Option.some(held)
+  }
+  if (inherits(value, RESULT_MARKER) && Result.isResult(value)) {
+    const held = Result.isSuccess(value) ? value.success : value.failure
+    const stored = zonesAsStored(held)
+    if (stored === held) return value
+    return Result.isSuccess(value) ? Result.succeed(stored) : Result.fail(stored)
+  }
+  return value
+}
+
+/** A zoned date as ISO text with its zone's name, the name 4.1.2 gave it ({@link zonesAsStored}). */
+export const zonedIsoText = (date: DateTime.Zoned): string =>
+  DateTime.formatIsoZoned(zonesAsStored(date) as DateTime.Zoned)
+
+// ---------------------------------------------------------------------------
 // DynamoDB Local's order
 // ---------------------------------------------------------------------------
 
@@ -205,7 +290,12 @@ const storedDate = (date: DateTime.DateTime): object => {
     epochMilliseconds: date.epochMilliseconds,
     zone:
       zone._tag === "Named"
-        ? { format: {}, id: zone.id, [ZONE_MARKER]: ZONE_MARKER, _tag: "Named" }
+        ? {
+            format: {},
+            id: resolvedZoneName(zone) ?? zone.id,
+            [ZONE_MARKER]: ZONE_MARKER,
+            _tag: "Named",
+          }
         : { offset: zone.offset, [ZONE_MARKER]: ZONE_MARKER, _tag: "Offset" },
     _tag: "Zoned",
   }
@@ -235,14 +325,20 @@ const libraryValue = (value: unknown, open: Set<object>): unknown => {
   return isPlainObject(value) ? libraryMap(value, open) : value
 }
 
-/** An object inside one of Effect's look-alikes, or one itself, as the map marshalling stores. */
+/**
+ * An object inside one of Effect's look-alikes, or one itself, as the map a native write stores: a
+ * named zone under the name {@link resolvedZoneName} gives it, without `resolvedId`.
+ */
 const libraryMap = (value: object, open: Set<object>, cookieOptions = false): object => {
   open.add(value)
   const cookie = Object.getPrototypeOf(value) === COOKIE_PROTO
+  const zoneName = resolvedZoneName(value)
   const entries: Array<readonly [string, unknown]> = []
   for (const key in value) {
     if (isCachedNormal(value, key)) continue
-    const property = (value as Record<string, unknown>)[key]
+    if (zoneName !== undefined && key === "resolvedId") continue
+    const property =
+      zoneName !== undefined && key === "id" ? zoneName : (value as Record<string, unknown>)[key]
     if (!isStored(property)) continue
     const expiry = cookieOptions && key === "expires" ? expiryText(property) : undefined
     entries.push([
