@@ -109,14 +109,15 @@ describe("a 4.1.3 zone's stored forms are 4.1.2's", () => {
     expect(KeyComposer.serializeValue(at(zone))).toBe("1970-01-01T00:00:00.000Z")
   })
 
-  it("ISO text, the library's and DynamoModel.DateTimeZoned's", () =>
+  it.effect("ISO text, the library's and DynamoModel.DateTimeZoned's", () =>
     Effect.gen(function* () {
       const date = at(madeAs413("Etc/UTC", "UTC")) as DateTime.Zoned
       expect(zonedIsoText(date)).toBe("1970-01-01T00:00:00.000+00:00[UTC]")
       expect(yield* Schema.encodeEffect(DynamoModel.DateTimeZoned)(date)).toBe(
         "1970-01-01T00:00:00.000+00:00[UTC]",
       )
-    }))
+    }),
+  )
 
   it("leaves what it doesn't change as the same reference", () => {
     const zone = madeAs412("UTC")
