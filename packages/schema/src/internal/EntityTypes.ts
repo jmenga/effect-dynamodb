@@ -56,6 +56,93 @@ type TypeFields<TModel extends Schema.Top> = [ModelType<TModel>] extends [never]
 export type ModelFieldName<TModel extends Schema.Top> = keyof ModelFields<TModel> & string
 
 /**
+ * The model fields a stored row can be without: those whose stored side is
+ * optional (`optional`, `optionalKey`, a decoding default, the
+ * `OptionFromOptional` family) or includes a value with no stored form
+ * (`UndefinedOr`, a set), but not `NullOr`. It is the type-level
+ * {@link rowCanLack}. A model whose fields aren't declared in its type has any
+ * field, so generic code still compiles and the runtime decides.
+ */
+export type ClearableFields<TModel extends Schema.Top> =
+  IsAny<TModel> extends true
+    ? string
+    : [DeclaredFields<TModel>] extends [never]
+      ? string
+      : {
+          [K in keyof DeclaredFields<TModel> & string]: DeclaredFields<TModel>[K] extends {
+            readonly "~encoded.optionality": "optional"
+          }
+            ? K
+            : StoredWithoutForm<DeclaredFields<TModel>[K]> extends true
+              ? K
+              : never
+        }[keyof DeclaredFields<TModel> & string]
+
+/**
+ * Whether a field's stored side includes a value DynamoDB has no form for:
+ * `undefined` or a set. A type can't see a `.check()` that refuses the value, so
+ * a field whose set must not be empty compiles and is refused at run time.
+ */
+type StoredWithoutForm<S> = S extends { readonly Encoded: infer E }
+  ? undefined extends E
+    ? true
+    : [Extract<E, ReadonlySet<any>>] extends [never]
+      ? false
+      : true
+  : false
+
+/**
+ * The names `.remove()` takes: model fields a row can lack, less what no update
+ * may clear: primary-key composites, refs, library-managed fields, and the
+ * fields configured immutable or stored as a sparse map (`TUnremovable`). A
+ * timestamp is the library's when it's a date; one of another type is the caller's.
+ */
+export type RemovableFields<
+  TModel extends Schema.Top,
+  TIndexes,
+  TRefs,
+  TTimestamps,
+  TVersioned,
+  TUnremovable extends string,
+> =
+  string extends ClearableFields<TModel>
+    ? string
+    : Exclude<
+        ClearableFields<TModel>,
+        | (string extends PrimaryKeyComposites<TIndexes> ? never : PrimaryKeyComposites<TIndexes>)
+        | (keyof TRefs & string)
+        | TUnremovable
+        | ManagedDateField<
+            ModelType<TModel>,
+            CreatedAtFieldName<TTimestamps> | UpdatedAtFieldName<TTimestamps>
+          >
+        | VersionFieldName<TVersioned>
+      >
+
+/**
+ * The names `.append().remove()` takes: {@link RemovableFields} the entity's
+ * `appendInput` declares, less the `orderBy` clock.
+ */
+export type AppendRemovableFields<
+  TModel extends Schema.Top,
+  TIndexes,
+  TRefs,
+  TTimeSeries,
+  TTimestamps,
+  TVersioned,
+  TUnremovable extends string,
+> = TTimeSeries extends {
+  readonly orderBy: infer O
+  readonly appendInput: infer A extends Schema.Top
+}
+  ? Exclude<
+      RemovableFields<TModel, TIndexes, TRefs, TTimestamps, TVersioned, TUnremovable> &
+        ModelFieldName<A>,
+      string extends O ? never : O
+    >
+  : never
+
+/**
  * Flatten an intersection of object types into a single object literal for
  * cleaner hover/IntelliSense display. Pure identity at the type level —
  * `Simplify<A & B>` is assignable to `A & B` and vice versa.
@@ -82,7 +169,8 @@ type TimestampFieldName<C, Default extends string> = [C] extends [undefined]
       ? F
       : Default
 
-type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
+/** @internal The attribute `timestamps` keeps `created` in. */
+export type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
   ? never
   : TTimestamps extends true
     ? "createdAt"
@@ -90,7 +178,8 @@ type CreatedAtFieldName<TTimestamps> = [TTimestamps] extends [undefined | false]
       ? TimestampFieldName<C, "createdAt">
       : "createdAt"
 
-type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] extends [
+/** @internal The attribute `timestamps` keeps `updated` in. */
+export type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] extends [
   undefined | false,
 ]
   ? [TTimestamps] extends [undefined | false]
@@ -102,7 +191,8 @@ type UpdatedAtFieldName<TTimestamps, TTimeSeries = undefined> = [TTimeSeries] ex
         : "updatedAt"
   : never // time-series entities auto-suppress updatedAt
 
-type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | false]
+/** @internal The attribute `versioned` keeps its version in. */
+export type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | false]
   ? never
   : TVersioned extends true
     ? "version"
@@ -111,9 +201,26 @@ type VersionFieldName<TVersioned> = [TVersioned] extends [undefined | false]
       : "version"
 
 /**
+ * The fields of `K` the library manages: the dates, required or under `Schema.optional` /
+ * `Schema.optionalKey`. Any other model field of that name is the caller's, required or not as the
+ * model says (`resolveSystemFields`, rule b), and that includes `Schema.UndefinedOr` of a date: a
+ * required key whose value may be empty isn't a date to the run time, so nothing stamps it.
+ */
+export type ManagedDateField<T, K> = {
+  [P in K & keyof T]: [Exclude<T[P], undefined>] extends [DateTime.DateTime | Date]
+    ? undefined extends T[P]
+      ? T extends Record<P, unknown>
+        ? never
+        : P
+      : P
+    : never
+}[K & keyof T]
+
+/**
  * Apply system-field collision adjustments to an input/create type:
- *   - Colliding `createdAt`/`updatedAt` become optional (caller may supply or
- *     let the library auto-generate).
+ *   - A colliding date `createdAt`/`updatedAt` becomes optional (caller may
+ *     supply or let the library auto-generate). One of any other type is the
+ *     caller's own, unchanged.
  *   - Colliding `version` is stripped entirely (optimistic locking requires
  *     library-managed increment).
  */
@@ -127,15 +234,15 @@ export type WithSystemCollisions<T, TTimestamps, TVersioned, TTimeSeries = undef
         : Simplify<
             Omit<
               T,
-              | (CreatedAtFieldName<TTimestamps> & keyof T)
-              | (UpdatedAtFieldName<TTimestamps, TTimeSeries> & keyof T)
+              | ManagedDateField<T, CreatedAtFieldName<TTimestamps>>
+              | ManagedDateField<T, UpdatedAtFieldName<TTimestamps, TTimeSeries>>
               | (VersionFieldName<TVersioned> & keyof T)
             > &
               Partial<
                 Pick<
                   T,
-                  | (CreatedAtFieldName<TTimestamps> & keyof T)
-                  | (UpdatedAtFieldName<TTimestamps, TTimeSeries> & keyof T)
+                  | ManagedDateField<T, CreatedAtFieldName<TTimestamps>>
+                  | ManagedDateField<T, UpdatedAtFieldName<TTimestamps, TTimeSeries>>
                 >
               >
           >
@@ -155,7 +262,8 @@ export type WithSystemCollisionsForUpdate<T, TTimestamps, TVersioned> =
         : Simplify<
             Omit<
               T,
-              (CreatedAtFieldName<TTimestamps> & keyof T) | (VersionFieldName<TVersioned> & keyof T)
+              | ManagedDateField<T, CreatedAtFieldName<TTimestamps>>
+              | (VersionFieldName<TVersioned> & keyof T)
             >
           >
 
@@ -264,15 +372,20 @@ export type EntityUpdateType<
   TTimestamps = undefined,
   TVersioned = undefined,
 > = WithSystemCollisionsForUpdate<
-  {
-    [K in keyof Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>]?: Omit<
-      ModelType<TModel>,
-      PrimaryKeyComposites<TIndexes>
-    >[K]
-  },
+  UpdateFields<TModel, Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes>>>,
   TTimestamps,
   TVersioned
 >
+
+/**
+ * The payload's model fields. Any of them may be left out, and `undefined`
+ * clears one, which only a field a row can lack takes: `.set({ note: undefined })`
+ * on a required `note` is a compile error (under `exactOptionalPropertyTypes`,
+ * and refused at run time either way).
+ */
+type UpdateFields<TModel extends Schema.Top, T> = {
+  [K in keyof T]?: T[K] | (K extends ClearableFields<TModel> ? undefined : never)
+}
 
 /**
  * Input type for `.append()` on a time-series entity.
@@ -392,7 +505,10 @@ export type EntityRefUpdateType<
 > = [TRefs] extends [undefined]
   ? EntityUpdateType<TModel, TIndexes, TTimestamps, TVersioned>
   : WithSystemCollisionsForUpdate<
-      Partial<Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes> | (keyof TRefs & string)>> & {
+      UpdateFields<
+        TModel,
+        Omit<ModelType<TModel>, PrimaryKeyComposites<TIndexes> | (keyof TRefs & string)>
+      > & {
         readonly [K in keyof TRefs & string as `${K}Id`]?: EntityIdentifierValue<TRefs[K]>
       },
       TTimestamps,

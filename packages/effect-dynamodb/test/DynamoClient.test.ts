@@ -2058,18 +2058,24 @@ describe(".within() on Z-order accessors (#171)", () => {
     ),
   )
 
-  it.effect("a value no level holds throws EDD-9092 at .within()", () =>
+  it.effect("a value no level holds fails the query with EDD-9092, nothing sent", () =>
     run((listings) =>
       Effect.gen(function* () {
+        const refusal = (query: any) =>
+          Effect.map(Effect.flip(query.collect() as Effect.Effect<never, any>), (error: any) => {
+            expect(error._tag).toBe("ValidationError")
+            expect(error.cause._tag).toBe("ZOrderValueError")
+            return error.cause.message as string
+          })
         const byStatus = listings.byStatus({ region: ZListings.REGION }) as any
-        expect(() => byStatus.within({ status: { eq: "archived" } })).toThrow(
+        expect(yield* refusal(byStatus.within({ status: { eq: "archived" } }))).toMatch(
           /\[EDD-9092\] Z-order dimension "status" can't place "archived"/,
         )
-        expect(() => byStatus.within({ status: { in: ["live", "archived"] } })).toThrow(
+        expect(yield* refusal(byStatus.within({ status: { in: ["live", "archived"] } }))).toMatch(
           /\[EDD-9092\]/,
         )
         const byFacets = listings.byFacets({ region: ZListings.REGION }) as any
-        expect(() => byFacets.within({ price: { gte: Number.NaN } })).toThrow(
+        expect(yield* refusal(byFacets.within({ price: { gte: Number.NaN } }))).toMatch(
           /\[EDD-9092\] Z-order dimension "price" can't place NaN/,
         )
         // Out of range is clamped into the box, never refused: the filter is exact.

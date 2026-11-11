@@ -47,6 +47,17 @@ describe("containsWireTransform", () => {
     ).toBe(true)
   })
 
+  it("sees through a declaration to what it holds", () => {
+    expect(containsWireTransform(Schema.Option(Schema.DateFromString))).toBe(true)
+    expect(containsWireTransform(Schema.ReadonlySet(Schema.BigIntFromString))).toBe(true)
+    expect(containsWireTransform(Schema.Result(Schema.String, Schema.URLFromString))).toBe(true)
+    expect(containsWireTransform(Schema.Option(Schema.Array(Schema.DateFromString)))).toBe(true)
+    expect(containsWireTransform(Schema.Option(Player))).toBe(true)
+    expect(containsWireTransform(Schema.Option(Schema.String))).toBe(false)
+    expect(containsWireTransform(Schema.ReadonlySet(Schema.Number))).toBe(false)
+    expect(containsWireTransform(Schema.Option(Schema.Struct({ id: Schema.String })))).toBe(false)
+  })
+
   it("is true for classes — including a DynamoModel.ref-annotated one", () => {
     expect(containsWireTransform(Player)).toBe(true)
     expect(containsWireTransform(Player.pipe(DynamoModel.ref))).toBe(true)

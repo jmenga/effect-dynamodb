@@ -22,6 +22,7 @@ import {
   type DynamoEncoding,
   type ExtractIdentifier,
   type ExtractPackedFields,
+  type ExtractUnremovableFields,
   getIdentifierField,
   getPackedFields,
   getSparseFields,
@@ -37,6 +38,7 @@ import {
 import type * as DynamoSchema from "./DynamoSchema.js"
 import { makeCompositeNullableError } from "./Errors.js"
 import type { RefEntity } from "./internal/AggregateEdges.js"
+import { bothKindsKeyRefusal, keyFormValueKind } from "./internal/CompositeCodec.js"
 import type {
   CascadeIndexConfig,
   GeneratedIdConfig,
@@ -60,6 +62,7 @@ import {
   resolveFieldEncoding,
   resolveSystemFields,
   resolveUniqueFields,
+  storedAsOverTransform,
   validateNoTransformOverride,
 } from "./internal/EntitySchemas.js"
 import type {
@@ -70,11 +73,17 @@ import type {
   KeyFields,
   ModelFieldName,
   PrefixFieldNames,
+  VersionFieldName,
 } from "./internal/EntityTypes.js"
+import { refuseUnreadable } from "./internal/SchemaAccessors.js"
 import {
+  refuseReadAsSparseEntry,
   refuseRepeatedIndex,
   refuseSharedKeyAttributeOnEverySchema,
-  refuseStoredInTableKey,
+  refuseStoredInKeyAttribute,
+  refuseStoredUnderLibraryAttribute,
+  writtenKey,
+  writtenKeyAttributes,
 } from "./internal/SharedKeyAttribute.js"
 import {
   type BoundDimension,
@@ -364,17 +373,69 @@ type ShardedPkFieldsGuard<TIndexes, TPrimaryKey> = {
     : unknown
 }
 
+/** The `versioned` attribute, when an index can't be composed from it: only `retain` reads the item. */
+type UnknownVersionField<TVersioned> = TVersioned extends { readonly retain: true }
+  ? never
+  : VersionFieldName<TVersioned>
+
+/** One half's composites without `V`: an error on the half that holds it, nothing on any other. */
+type CompositesWithout<THalf, V> = THalf extends {
+  readonly composite: infer C extends ReadonlyArray<string>
+}
+  ? [Extract<C[number], V>] extends [never]
+    ? unknown
+    : { readonly composite: ReadonlyArray<Exclude<C[number], V>> }
+  : unknown
+
+/** A Z-order half's dimensions and prefix without `V`, as {@link CompositesWithout}. */
+type ZOrderEntriesWithout<THalf, V> = (THalf extends { readonly zorder: infer Z }
+  ? { readonly zorder: { readonly [I in keyof Z]: EntryWithout<Z[I], V> } }
+  : unknown) &
+  (THalf extends { readonly prefix: infer P }
+    ? { readonly prefix: { readonly [I in keyof P]: EntryWithout<P[I], V> } }
+    : unknown)
+
+type EntryWithout<TEntry, V> = TEntry extends V
+  ? never
+  : TEntry extends { readonly field: V }
+    ? { readonly field: never }
+    : unknown
+
 /**
- * @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name, and
- * {@link ShardedPkFieldsGuard} over its primary key.
+ * @internal A secondary index over the `versioned` attribute is an error on that composite, unless
+ * `retain` makes the value known (`EDD-9121`). `Entity.make` checks again at runtime, and checks the
+ * primary key and `shards.by`. A half that doesn't hold it gets `unknown`, so it loses no completions.
+ */
+type VersionCompositesGuard<TIndexes, TVersioned> = [UnknownVersionField<TVersioned>] extends [
+  never,
+]
+  ? unknown
+  : {
+      readonly [K in keyof TIndexes]: (TIndexes[K] extends { readonly pk: infer P }
+        ? { readonly pk: CompositesWithout<P, UnknownVersionField<TVersioned>> }
+        : unknown) &
+        (TIndexes[K] extends { readonly sk: infer S }
+          ? {
+              readonly sk: CompositesWithout<S, UnknownVersionField<TVersioned>> &
+                ZOrderEntriesWithout<S, UnknownVersionField<TVersioned>>
+            }
+          : unknown)
+    }
+
+/**
+ * @internal {@link ZOrderEntriesGuard} over the fields `Entity.make`'s keys name,
+ * {@link ShardedPkFieldsGuard} over its primary key, and {@link VersionCompositesGuard} over its
+ * `versioned` config.
  */
 export type EntityIndexesGuard<
   TModel extends Schema.Top,
   TRefs,
   TIndexes,
   TPrimaryKey,
+  TVersioned = undefined,
 > = ZOrderEntriesGuard<TIndexes, KeyFields<TModel, RefsOrNone<TRefs>>> &
-  ShardedPkFieldsGuard<TIndexes, TPrimaryKey>
+  ShardedPkFieldsGuard<TIndexes, TPrimaryKey> &
+  VersionCompositesGuard<TIndexes, TVersioned>
 
 type ZOrderHalfGuard<SK, TFields> = (SK extends { readonly zorder: infer Z }
   ? {
@@ -551,6 +612,7 @@ export interface EntityDefinition<
   TGeneratedId extends GeneratedIdConfig | undefined = undefined,
   TVectorIndexes extends globalThis.Record<string, VectorIndexConfig> | undefined = undefined,
   TPackedFields extends string = never,
+  TUnremovable extends string = never,
 > {
   readonly _tag: "Entity"
   readonly model: TModel
@@ -579,6 +641,11 @@ export interface EntityDefinition<
    * a packed field can be tested only with `exists` / `notExists` as a whole.
    */
   readonly _packedFields: ReadonlyArray<TPackedFields>
+  /**
+   * @internal Phantom — never read at runtime. Carries the fields
+   * `.remove()` refuses by configuration (immutable, sparse map).
+   */
+  _unremovableFields?(field: TUnremovable): void
 
   /** @internal Resolved ref metadata — used by cascade to inspect target entities */
   readonly _resolvedRefs: ReadonlyArray<{
@@ -731,6 +798,7 @@ export const buildEntityDefinition = (config: {
   // Unwrap ConfiguredModel to get the raw model and attribute overrides
   const configured = isConfiguredModel(config.model) ? config.model : undefined
   const rawModel = configured ? configured.model : (config.model as Schema.Top)
+  refuseUnreadable(`Entity "${config.entityType}"`, "entity", rawModel)
   const configuredAttributes = configured?.attributes ?? {}
   // Schema.Class is a constructable function whose AST is a `Declaration`.
   // The `typeof` check alone is not enough: since Effect 4.0.0-rc,
@@ -742,11 +810,22 @@ export const buildEntityDefinition = (config: {
     (rawModel.ast as { readonly _tag?: string })._tag === "Declaration"
   const modelFields = getFields(rawModel)
   const hasHiddenFields = Object.values(modelFields).some(isHidden)
+  // `Schema.optional(X)` is a union with `Undefined`, which has no date representation of its own,
+  // so the value schema is what's read: an optional date is a date, as `Schema.optionalKey(X)`
+  // always was. An aggregate's stamp overwrites what a caller supplied, so its optional dates stay
+  // the caller's. A date transform carrying a `storedAs` of the other wire kind isn't read through:
+  // `Entity.make` refuses one as a stamp outside `Schema.optional`, its stamp could never be read
+  // back, and 1.39.0 left such a field the caller's.
   const systemFields = resolveSystemFields(
     config.timestamps,
     config.versioned,
     config.timeSeries,
-    modelFields,
+    Object.fromEntries(
+      Object.entries(modelFields).map(([name, field]) => {
+        const inner = optionalField(field as Schema.Top)?.inner
+        return [name, inner === undefined || storedAsOverTransform(inner) ? field : inner]
+      }),
+    ) as typeof modelFields,
     configuredAttributes,
     `Entity "${config.entityType}"`,
   )
@@ -800,6 +879,21 @@ export const buildEntityDefinition = (config: {
         )
       }
     }
+  }
+
+  refuseKeysOverMovingValues(config.entityType, config.indexes, systemFields, config.versioned)
+  if (
+    systemFields.version !== null &&
+    (configuredAttributes as globalThis.Record<string, { readonly field?: string } | undefined>)[
+      systemFields.version
+    ]?.field !== undefined
+  ) {
+    throw new Error(
+      `[EDD-9122] Entity "${config.entityType}": "${systemFields.version}" is where \`versioned\` ` +
+        `keeps the version, so \`configure\` can't store it under another name: the write would ` +
+        `succeed and every later read and write of the item would find no version. To name the ` +
+        `attribute, use \`versioned: { field: "..." }\` and give the model's field that name.`,
+    )
   }
 
   // ---------------------------------------------------------------------------
@@ -897,6 +991,43 @@ export const buildEntityDefinition = (config: {
     }
   }
 
+  // EDD-9128: no value is composed into key text from a field storing both numeric kinds. A
+  // Z-order dimension is quantized, not composed, and its own check refuses a union (EDD-9088).
+  // What composes each key composite, in words, for `appendInput`'s check below.
+  const composedInto = new Map<string, string>()
+  const refuseBothKinds = (where: string, attrs: ReadonlyArray<string>): void => {
+    for (const attr of attrs) {
+      if (!composedInto.has(attr)) composedInto.set(attr, where)
+      const resolved = resolveCompositeSchemaForNullCheck(attr)
+      if (resolved === undefined) continue
+      const refused = bothKindsKeyRefusal(
+        `Entity "${config.entityType}"`,
+        where,
+        attr,
+        resolved.schema,
+      )
+      if (refused !== undefined) throw refused
+    }
+  }
+  for (const [indexName, indexDef] of Object.entries(config.indexes)) {
+    const dimensions = isZOrderHalf(indexDef.sk)
+      ? new Set(indexDef.sk.zorderHalf.dimensions.map((dimension) => dimension.field))
+      : new Set<string>()
+    refuseBothKinds(indexName === "primary" ? "the primary key" : `index "${indexName}"`, [
+      ...indexDef.pk.composite,
+      ...indexDef.sk.composite.filter((attr) => !dimensions.has(attr)),
+    ])
+  }
+  for (const [constraintName, constraintDef] of Object.entries(config.unique ?? {})) {
+    refuseBothKinds(`unique constraint "${constraintName}"`, resolveUniqueFields(constraintDef))
+  }
+  for (const [logicalName, vectorConfig] of Object.entries(config.vectorIndexes ?? {})) {
+    refuseBothKinds(`vector index "${logicalName}"'s partition`, vectorConfig.partition ?? [])
+  }
+  if (config.timeSeries !== undefined && config.timeSeries !== null) {
+    refuseBothKinds("an event's sort key (timeSeries.orderBy)", [config.timeSeries.orderBy])
+  }
+
   // ---------------------------------------------------------------------------
   // Validate timeSeries config (EDD-9010..9016)
   // ---------------------------------------------------------------------------
@@ -968,6 +1099,36 @@ export const buildEntityDefinition = (config: {
         throw new Error(
           `[EDD-9013] Entity "${config.entityType}": timeSeries.appendInput missing primary-key composite "${composite}". ` +
             `Every PK/SK composite must appear in appendInput so the event can be addressed.`,
+        )
+      }
+    }
+
+    // EDD-9128: `.append()` takes its input through `appendInput`, and composes the event's sort key
+    // and the current item's keys from it, so `appendInput`'s own fields are refused as the model's
+    // are: `orderBy` and every key composite it carries. One composing the other numeric kind's key
+    // text than its model field is refused too: the event is keyed by one kind's text and every read
+    // composes the other's.
+    const appendFields = getSchemaFields(ts.appendInput as Schema.Top) ?? {}
+    for (const [attr, where] of composedInto) {
+      const field = appendFields[attr]
+      if (field === undefined) continue
+      const owner = `Entity "${config.entityType}"`
+      const at = `${where}, through timeSeries.appendInput,`
+      const refused = bothKindsKeyRefusal(owner, at, attr, field)
+      if (refused !== undefined) throw refused
+      const model = modelFields[attr] as Schema.Top | undefined
+      const given = keyFormValueKind(field)
+      const read = model === undefined ? undefined : keyFormValueKind(model)
+      if (
+        (given === "number" || given === "bigint") &&
+        (read === "number" || read === "bigint") &&
+        given !== read
+      ) {
+        throw new Error(
+          `[EDD-9128] ${owner}: ${at} can't be composed from "${attr}", which timeSeries.appendInput ` +
+            `holds as a ${given} and the model as a ${read}. The two compose different key text, so ` +
+            `an event appended under one would never be found by a read composing the other. ` +
+            `Declare the same kind in both.`,
         )
       }
     }
@@ -1323,14 +1484,75 @@ export const buildEntityDefinition = (config: {
     if (field) fieldRenames[domainName] = field
   }
   const hasRenames = Object.keys(fieldRenames).length > 0
-  refuseStoredInTableKey(config.entityType, primaryIndex, [
+  const storedAttributes = [
     ...Object.keys(modelFields).map(
       (name) => [name, fieldRenames[name] ?? name] as readonly [string, string],
     ),
     ...[systemFields.createdAt, systemFields.updatedAt, systemFields.version]
       .filter((name) => name !== null)
       .map((name) => [name, name] as readonly [string, string]),
-  ])
+  ]
+  const keyAttributes = writtenKeyAttributes(initialIndexes, vectorIndexes)
+  refuseStoredInKeyAttribute(config.entityType, keyAttributes, storedAttributes)
+  refuseStoredUnderLibraryAttribute(config.entityType, keyAttributes, storedAttributes)
+  // Every attribute a row of this entity holds under a name the definition supplies, each by the
+  // name it is stored under. The table's TTL attribute is the table configuration's to name:
+  // `DynamoClient.make` checks it.
+  // A timestamp's or the version's name is the configuration's: looked up among the renames
+  // the model declares, never among what every object inherits.
+  const storedName = (name: string): string =>
+    Object.hasOwn(fieldRenames, name) ? fieldRenames[name]! : name
+  const softDeletes = config.softDelete === true || typeof config.softDelete === "object"
+  refuseReadAsSparseEntry(
+    config.entityType,
+    [
+      ...keyAttributes.map((key) => writtenKey(key)),
+      ...Object.keys(modelFields)
+        .filter((name) => !Object.hasOwn(sparseFields, name))
+        .map((name) => ({
+          attribute: storedName(name),
+          what: `the attribute the field "${name}" is stored in`,
+        })),
+      // A sparse map's entries go under its prefix. Under a `field:` rename a put stores the map
+      // whole in that attribute.
+      ...Object.entries(sparseFields).flatMap(([name, sparse]) => [
+        {
+          attribute: sparse.prefix,
+          what: `the prefix the sparse map "${name}" stores its entries under`,
+        },
+        ...(Object.hasOwn(fieldRenames, name)
+          ? [
+              {
+                attribute: storedName(name),
+                what: `the attribute a put stores the sparse map "${name}" whole in`,
+              },
+            ]
+          : []),
+      ]),
+      // A timestamp or the version a model field also declares is stored where that field is.
+      ...(
+        [
+          [systemFields.createdAt, "its created timestamp"],
+          [systemFields.updatedAt, "its updated timestamp"],
+          [systemFields.version, "its version"],
+        ] as const
+      ).flatMap(([name, holds]) =>
+        name === null
+          ? []
+          : [{ attribute: storedName(name), what: `the attribute that holds ${holds}` }],
+      ),
+      ...(softDeletes
+        ? [
+            { attribute: "deletedAt", what: "the attribute that holds when a row was deleted" },
+            ...Object.entries(vectorIndexes).map(([name, vector]) => ({
+              attribute: vector.stashField,
+              what: `the attribute a deleted row keeps vector index "${name}"'s embedding in`,
+            })),
+          ]
+        : []),
+    ],
+    sparseFields,
+  )
 
   const renameToDynamo = (item: globalThis.Record<string, unknown>): void => {
     if (!hasRenames) return
@@ -1405,6 +1627,65 @@ export const buildEntityDefinition = (config: {
 const optionalFieldEncoding = (schema: Schema.Top | undefined): DynamoEncoding | undefined => {
   const inner = schema === undefined ? undefined : optionalField(schema)?.inner
   return inner === undefined ? undefined : (resolveFieldEncoding(inner, undefined) ?? undefined)
+}
+
+/**
+ * `[EDD-9121]`: a key over a value the library changes on every write, where the write can't know
+ * it or can't move the key (`DESIGN.md` §7, "Composites the library stamps").
+ *
+ * A plain `versioned` update adds one to the stored version without reading it, so a secondary index
+ * over it would never hold a key. `versioned: { retain: true }` reads the item on every write, so
+ * the value is known and the key moves with it. A primary key never changes, whatever is known, and
+ * a shard follows its source, which a query could then never pin.
+ */
+const refuseKeysOverMovingValues = (
+  entityType: string,
+  indexes: globalThis.Record<string, IndexDefinition>,
+  systemFields: ResolvedSystemFields,
+  versioned: VersionedConfig | undefined,
+): void => {
+  const { updatedAt, version } = systemFields
+  const retained = typeof versioned === "object" && versioned !== null && versioned.retain === true
+  const moving = [updatedAt, version].filter((field): field is string => field !== null)
+  const primary = indexes.primary
+  for (const field of moving) {
+    if (
+      primary !== undefined &&
+      [...primary.pk.composite, ...primary.sk.composite].includes(field)
+    ) {
+      throw new Error(
+        `[EDD-9121] Entity "${entityType}": the primary key can't be composed from "${field}". ` +
+          `The library changes it on every write and a primary key never changes, so the key ` +
+          `would stop matching the value at the first update. Remove it from the primary key, or ` +
+          `use a field the library doesn't manage.`,
+      )
+    }
+  }
+  for (const [indexName, index] of Object.entries(indexes)) {
+    if (indexName === "primary") continue
+    for (const field of moving) {
+      if (index.shards?.by?.includes(field) === true) {
+        throw new Error(
+          `[EDD-9121] Entity "${entityType}": index "${indexName}" shards.by can't name "${field}". ` +
+            `The library changes it on every write, so the shard would go stale on each one and ` +
+            `no pin could reach the item. Omit it to hash the primary key.`,
+        )
+      }
+    }
+    if (
+      version !== null &&
+      !retained &&
+      [...index.pk.composite, ...index.sk.composite].includes(version)
+    ) {
+      throw new Error(
+        `[EDD-9121] Entity "${entityType}": index "${indexName}" can't be composed from "${version}". ` +
+          `The library adds one to it on every write without reading the item, so the new value ` +
+          `isn't known when the key is written and no item would ever hold this key. Remove it ` +
+          `from the index, or use \`versioned: { retain: true }\`, which reads the item on every ` +
+          `write.`,
+      )
+    }
+  }
 }
 
 /** `[EDD-9090]`: a Z-order index is never a collection member. */
@@ -1522,7 +1803,8 @@ export const make = <
   readonly model: TModel | ConfiguredModel<TModel, TAttrs>
   readonly entityType: TEntityType
   readonly primaryKey: TPrimaryKey
-  readonly indexes?: TGsiIndexes & EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey>
+  readonly indexes?: TGsiIndexes &
+    EntityIndexesGuard<TModel, TRefs, TGsiIndexes, TPrimaryKey, TVersioned>
   readonly timestamps?: TTimestamps
   readonly versioned?: TVersioned
   readonly softDelete?: TSoftDelete
@@ -1544,7 +1826,8 @@ export const make = <
   TTimeSeries,
   TGeneratedId,
   TVectorIndexes,
-  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>
+  ExtractPackedFields<ConfiguredModel<TModel, TAttrs>>,
+  ExtractUnremovableFields<ConfiguredModel<TModel, TAttrs>>
 > => {
   const gsiIndexes: globalThis.Record<string, IndexDefinition> = {}
   if (config.indexes) {

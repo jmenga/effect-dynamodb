@@ -13,13 +13,13 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Layer, Schema } from "effect"
-import * as Batch from "../src/Batch.js"
+import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import * as Expression from "../src/Expression.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
+import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
-import * as Transaction from "../src/Transaction.js"
 import {
   inBound,
   type ListingItem,
@@ -30,6 +30,7 @@ import {
   STORE,
 } from "./helpers/ListingsFixture.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
+import * as RefusedValues from "./helpers/RefusedValues.js"
 
 const ids = (items: ReadonlyArray<{ readonly listingId: string }>) =>
   items.map((item) => item.listingId)
@@ -430,149 +431,203 @@ describe("numeric primary-key composites round-trip (#171 E8)", () => {
 })
 
 // ---------------------------------------------------------------------------
-// NaN has no key text: [EDD-9096] on every path that composes a key from it
+// A value the library can't compose or send: a ValidationError on every path (helpers/RefusedValues)
 // ---------------------------------------------------------------------------
 
-class Gauge extends Schema.Class<Gauge>("Gauge")({
-  gaugeId: Schema.String,
-  slot: Schema.Number,
-  score: Schema.Number,
-}) {}
-/** An index composite and the soft-delete lifecycle (`restore`, `purge`). */
-const Gauges = Entity.make({
-  model: Gauge,
-  entityType: "Gauge",
-  primaryKey: {
-    pk: { field: "pk", composite: ["gaugeId"] },
-    sk: { field: "sk", composite: ["slot"] },
-  },
-  indexes: {
-    byScore: {
-      name: "gsi1",
-      pk: { field: "gsi1pk", composite: ["gaugeId"] },
-      sk: { field: "gsi1sk", composite: ["score"] },
-    },
-  },
-  softDelete: true,
-})
-const Badge = Schema.Struct({ badgeId: Schema.String, slot: Schema.Number, code: Schema.Number })
-/** A numeric unique field, and the multi-item operations. */
-const Badges = Entity.make({
-  model: Badge,
-  entityType: "Badge",
-  primaryKey: {
-    pk: { field: "pk", composite: ["badgeId"] },
-    sk: { field: "sk", composite: ["slot"] },
-  },
-  unique: { code: ["code"] },
-})
-const Slot = Schema.Struct({ slotId: Schema.String, slot: Schema.Number })
-/** Neither unique nor lifecycle: `Batch.write` takes it. */
-const Slots = Entity.make({
-  model: Slot,
-  entityType: "Slot",
-  primaryKey: {
-    pk: { field: "pk", composite: ["slotId"] },
-    sk: { field: "sk", composite: ["slot"] },
-  },
-})
-const Meter = Schema.Struct({ meterId: Schema.String, at: Schema.Number, v: Schema.Number })
-const Meters = Entity.make({
-  model: Meter,
-  entityType: "Meter",
-  primaryKey: {
-    pk: { field: "pk", composite: ["meterId"] },
-    sk: { field: "sk", composite: [] },
-  },
-  timeSeries: { orderBy: "at", appendInput: Meter },
-})
-const NanTable = Table.make({
-  schema: DynamoSchema.make({ name: "nan-keys", version: 1, escapeKeys: true }),
-  entities: { Gauges, Badges, Slots, Meters },
-})
-/**
- * Every write dies: a NaN must be refused before any write is built. (A
- * guarded put reads the current item before it composes the sentinels.)
- */
-const NanLayer = Layer.merge(
-  Layer.succeed(DynamoClient, mockDynamoClient({ getItem: () => Effect.succeed({} as never) })),
-  NanTable.layer({ name: "gauges" }),
-)
+describe.each(
+  RefusedValues.SETTINGS,
+)("escapeKeys %s: a value that can't be stored", (_name, on) => {
+  const w = RefusedValues.refusedWorld(on)
+  /**
+   * Every write dies: a refused value must be refused before any write is built. (A guarded put reads
+   * the current item before it composes the sentinels.)
+   */
+  const layer = Layer.merge(
+    Layer.succeed(
+      DynamoClient,
+      mockDynamoClient({
+        getItem: () => Effect.succeed({} as never),
+        query: () => Effect.succeed({ Items: [] } as never),
+      }),
+    ),
+    w.Base.layer({ name: "t" }),
+  )
+  const provided = <A, E>(body: (client: any) => Effect.Effect<A, E, any>) =>
+    Effect.flatMap(w.client as Effect.Effect<any>, body).pipe(
+      Effect.provide(layer),
+    ) as Effect.Effect<A, E>
 
-describe("[EDD-9096] a NaN composite is a ValidationError, never a write (#171 E8)", () => {
-  const NaN = Number.NaN
-  const db = DynamoClient.make({
-    entities: { Gauges, Badges, Slots, Meters },
-    tables: { NanTable },
-  })
-  const cases: ReadonlyArray<
-    readonly [string, (client: Effect.Success<typeof db>) => Effect.Effect<unknown, unknown, any>]
-  > = [
-    ["get", (c) => c.entities.Gauges.get({ gaugeId: "g", slot: NaN }).asEffect()],
-    ["delete", (c) => c.entities.Gauges.delete({ gaugeId: "g", slot: NaN }).asEffect()],
-    [
-      "update of a NaN key",
-      (c) => c.entities.Gauges.update({ gaugeId: "g", slot: NaN }).set({ score: 1 }).asEffect(),
-    ],
-    [
-      "update setting a NaN index composite",
-      (c) => c.entities.Gauges.update({ gaugeId: "g", slot: 1 }).set({ score: NaN }).asEffect(),
-    ],
-    [
-      "upsert of a NaN key",
-      (c) => c.entities.Gauges.upsert({ gaugeId: "g", slot: NaN, score: 1 }).asEffect(),
-    ],
-    [
-      "upsert of a NaN index composite",
-      (c) => c.entities.Gauges.upsert({ gaugeId: "g", slot: 1, score: NaN }).asEffect(),
-    ],
-    ["restore", (c) => c.entities.Gauges.restore({ gaugeId: "g", slot: NaN })],
-    ["purge", (c) => c.entities.Gauges.purge({ gaugeId: "g", slot: NaN })],
-    [
-      "append of a NaN orderBy",
-      (c) => c.entities.Meters.append({ meterId: "m", at: NaN, v: 1 }).asEffect(),
-    ],
-    ["Batch.get", () => Batch.get([Slots.get({ slotId: "s", slot: NaN })])],
-    ["Batch.write delete", () => Batch.write([Slots.delete({ slotId: "s", slot: NaN })])],
-    ["Batch.write put", () => Batch.write([Slots.put({ slotId: "s", slot: NaN })])],
-    ["transactGet", () => Transaction.transactGet([Badges.get({ badgeId: "b", slot: NaN })])],
-    [
-      "transactWrite delete",
-      () => Transaction.transactWrite([Badges.delete({ badgeId: "b", slot: NaN })]),
-    ],
-    [
-      "transactWrite put of a NaN unique field",
-      () => Transaction.transactWrite([Badges.put({ badgeId: "b", slot: 1, code: NaN })]),
-    ],
-    [
-      "put of a NaN unique field",
-      (c) => c.entities.Badges.put({ badgeId: "b", slot: 1, code: NaN }).asEffect(),
-    ],
-  ]
+  describe("[EDD-9096] NaN has no key text", () => {
+    for (const [name, run] of RefusedValues.keyCases(w, Number.NaN)) {
+      it.effect(name, () =>
+        provided((client) =>
+          RefusedValues.expectRefused(
+            Effect.suspend(() => run(client)),
+            "KeyValueError",
+            "[EDD-9096]",
+          ),
+        ),
+      )
+    }
 
-  for (const [name, run] of cases) {
-    it.effect(name, () =>
-      Effect.gen(function* () {
-        const error = yield* Effect.flip(Effect.flatMap(db, (client) => run(client)))
-        expect((error as { readonly _tag: string })._tag).toBe("ValidationError")
-        const cause = (error as { readonly cause: { readonly _tag: string; message: string } })
-          .cause
-        expect(cause._tag).toBe("KeyValueError")
-        expect(cause.message).toContain("[EDD-9096]")
-      }).pipe(Effect.provide(NanLayer)),
+    it.effect("an aggregate's delete says it on the error it declares", () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          const error: any = yield* Effect.flip(client.aggregates.Agg.delete({ id: Number.NaN }))
+          expect(error._tag).toBe("AggregateAssemblyError")
+          expect(error.reason).toContain("EDD-9096")
+        }),
+      ),
     )
+
+    it.effect("explain sends nothing and says it's refused", () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          const query = client.entities.Gauges.byScore({ gaugeId: "g", score: Number.NaN })
+          const explained = yield* query.explain()
+          expect(explained.plan).toBe("empty")
+          expect(explained.index).toBe("gsi1")
+          expect(explained.reason).toContain("refused")
+          expect(explained.keyConditions).toEqual([])
+        }),
+      ),
+    )
+
+    it.effect("asParams fails as a terminal does", () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          const query = (w.Gauges as any).query.byScore({ gaugeId: "g", score: Number.NaN })
+          const error: any = yield* Effect.flip(Query.asParams(query))
+          expect(error._tag).toBe("ValidationError")
+          expect(client).toBeDefined()
+        }),
+      ),
+    )
+
+    it.effect("the refusal names the operation and what it's on", () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          const error: any = yield* Effect.flip(
+            client.entities.Gauges.byScore({ gaugeId: "g", score: Number.NaN }).collect(),
+          )
+          expect(error.operation).toBe("Entity.query")
+          expect(error.entityType).toBe("Gauge")
+          const late: any = yield* Effect.flip(
+            client.entities.Gauges.byScore({ gaugeId: "g" })
+              .where((t: any, { gte }: any) => gte(t.score, Number.NaN))
+              .collect(),
+          )
+          expect(late.operation).toBe("Entity.query")
+          expect(late.entityType).toBe("Gauge")
+        }),
+      ),
+    )
+
+    it.effect("anything else a query is given stays a misuse, thrown at the call", () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          // No SK to bound: EDD-9045 / EDD-9093 are mistakes in the program, not values.
+          const accessor = client.entities.Gauges.byScore({ gaugeId: "g" })
+          expect(() => accessor.within({ score: { gte: 1 } }).where(() => ({}))).toThrow(/EDD-9093/)
+          expect(() => client.entities.Gauges.byScore({})).toThrow()
+          expect(() => client.entities.Gauges.byTick({})).toThrow()
+        }),
+      ),
+    )
+
+    it.effect("a refused query's builders stay what they are", () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          const refused = client.entities.Gauges.byScore({ gaugeId: "g", score: Number.NaN })
+          // Its config is a stand-in with no `.within()` or `.zorder()` of its own to refuse them.
+          const chained = refused.within({ score: { gte: 1 } })
+          expect(() => chained.within({ score: { gte: 1 } })).toThrow(/EDD-9093/)
+          yield* RefusedValues.expectRefused(chained.collect(), "KeyValueError", "[EDD-9096]")
+          yield* RefusedValues.expectRefused(
+            refused.where((t: any, { gte }: any) => gte(t.score, 1)).collect(),
+            "KeyValueError",
+            "[EDD-9096]",
+          )
+          yield* RefusedValues.expectRefused(
+            refused.zorder({ strategy: "jump" }).collect(),
+            "KeyValueError",
+            "[EDD-9096]",
+          )
+        }),
+      ),
+    )
+  })
+
+  for (const [label, value] of [
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["a number past MAX_SAFE_INTEGER", 1e21],
+  ] as const) {
+    describe(`[EDD-9124] ${label} has no DynamoDB form`, () => {
+      for (const [name, run] of RefusedValues.valueCases(w, value)) {
+        it.effect(name, () =>
+          provided((client) => RefusedValues.expectUnstorable(Effect.suspend(() => run(client)))),
+        )
+      }
+    })
   }
 
-  it.effect("a query accessor throws it, as it throws for other unusable composites", () =>
-    Effect.gen(function* () {
-      const client = yield* db
-      expect(() => client.entities.Gauges.primary({ gaugeId: "g", slot: NaN })).toThrow(
-        "[EDD-9096]",
-      )
-      expect(() =>
-        client.entities.Gauges.primary({ gaugeId: "g" }).where((t, { gte }) => gte(t.slot, NaN)),
-      ).toThrow("[EDD-9096]")
-    }).pipe(Effect.provide(NanLayer)),
+  it.effect(
+    "an empty set isn't refused where a row can be without it: it's an absent attribute",
+    () =>
+      provided((client) =>
+        Effect.gen(function* () {
+          const put = yield* Effect.exit(
+            client.entities.Gauges.put({
+              gaugeId: "g",
+              slot: 1,
+              score: 1,
+              tags: new Set<string>(),
+            }).asEffect(),
+          )
+          // Refused here only by the layer's dying write, past the marshaller.
+          expect(String(Exit.isFailure(put) ? Cause.squash(put.cause) : "")).not.toContain(
+            "EDD-9124",
+          )
+        }),
+      ),
+  )
+})
+
+describe("a condition built before its operation", () => {
+  it("throws, having no channel to fail into: it's plain data, built where it's called", () => {
+    expect(() => Expression.condition({ eq: { plain: Number.NaN } })).toThrow(/EDD-9124/)
+  })
+})
+
+describe("a key value under off keeps the text it has", () => {
+  const w = RefusedValues.refusedWorld(false, "kept")
+  const requested: Array<unknown> = []
+  const layer = Layer.merge(
+    Layer.succeed(
+      DynamoClient,
+      mockDynamoClient({
+        getItem: (input) =>
+          Effect.sync(() => {
+            requested.push(input.Key)
+            return {} as never
+          }),
+      }),
+    ),
+    w.Base.layer({ name: "t" }),
+  )
+
+  it.effect(
+    "Infinity composes the text 1.36 stored, and a key-only read sends it",
+    () =>
+      Effect.gen(function* () {
+        const db: any = yield* w.client as Effect.Effect<any>
+        yield* Effect.flip(db.entities.Gauges.get({ gaugeId: "g", slot: Number.POSITIVE_INFINITY }))
+        expect(requested.at(-1)).toEqual({
+          pk: { S: "$kept#v1#gauge#gaugeid_g" },
+          sk: { S: "$kept#v1#gauge#slot_00000000infinity" },
+        })
+      }).pipe(Effect.provide(layer)) as Effect.Effect<void>,
   )
 })
 

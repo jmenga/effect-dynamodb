@@ -8,7 +8,7 @@
 
 import * as zlib from "node:zlib"
 import { describe, expect, it } from "@effect/vitest"
-import { Effect, Exit, Schema } from "effect"
+import { DateTime, Effect, Equal, Exit, Schema } from "effect"
 import * as Compression from "../src/Compression.js"
 import * as DynamoModel from "../src/DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../src/Errors.js"
@@ -140,6 +140,101 @@ describe("header layout", () => {
     }
     for (const value of [{}, [], "x", 0, -1, 12.5, true, false, null, { I: 1 }, ["P"]]) {
       expect(PackedCodec.isBase64PackedText(JSON.stringify(value))).toBe(false)
+    }
+  })
+})
+
+describe("stringifyStrict, a real date", () => {
+  const iso = "2025-01-01T00:00:00.000Z"
+  const utc = DateTime.makeUnsafe(iso)
+  const named = DateTime.makeZonedUnsafe(iso, { timeZone: "Asia/Tokyo" })
+  const offset = DateTime.makeZonedUnsafe(iso, { timeZone: DateTime.zoneMakeOffset(32400000) })
+  // What a date read back from a native row has always been packed as, measured on 1.39.0.
+  const utcText =
+    '{"epochMilliseconds":1735689600000,"~effect/DateTime":"~effect/DateTime","_tag":"Utc"}'
+  const namedText =
+    '{"~effect/DateTime":"~effect/DateTime","epochMilliseconds":1735689600000,"zone":{"format":{},"id":"Asia/Tokyo","~effect/DateTime/TimeZone":"~effect/DateTime/TimeZone","_tag":"Named"},"_tag":"Zoned"}'
+  const offsetText =
+    '{"~effect/DateTime":"~effect/DateTime","epochMilliseconds":1735689600000,"zone":{"offset":32400000,"~effect/DateTime/TimeZone":"~effect/DateTime/TimeZone","_tag":"Offset"},"_tag":"Zoned"}'
+
+  it.each([
+    ["Utc", utc, utcText],
+    ["a named zone", named, namedText],
+    ["an offset zone", offset, offsetText],
+  ] as const)("%s is written in the form a read date is", (_name, date, text) => {
+    expect(PackedCodec.stringifyStrict(date)).toBe(text)
+    expect(PackedCodec.stringifyStrict({ at: date })).toBe(`{"at":${text}}`)
+    expect(PackedCodec.stringifyStrict([date])).toBe(`[${text}]`)
+    expect(PackedCodec.stringifyStrict({ a: [{ at: date }] })).toBe(`{"a":[{"at":${text}}]}`)
+  })
+
+  it("is found wherever it is, beside what isn't a date", () => {
+    expect(PackedCodec.stringifyStrict([utc, 1, "x"])).toBe(`[${utcText},1,"x"]`)
+    expect(PackedCodec.stringifyStrict([1, utc, "x"])).toBe(`[1,${utcText},"x"]`)
+    expect(PackedCodec.stringifyStrict([[utc], [1]])).toBe(`[[${utcText}],[1]]`)
+    expect(PackedCodec.stringifyStrict([[1], [utc]])).toBe(`[[1],[${utcText}]]`)
+    expect(PackedCodec.stringifyStrict({ a: utc, b: 1 })).toBe(`{"a":${utcText},"b":1}`)
+    expect(PackedCodec.stringifyStrict({ b: 1, a: utc })).toBe(`{"b":1,"a":${utcText}}`)
+    expect(PackedCodec.stringifyStrict({ a: { d: utc }, b: { n: 1 } })).toBe(
+      `{"a":{"d":${utcText}},"b":{"n":1}}`,
+    )
+    expect(PackedCodec.stringifyStrict({ b: { n: 1 }, a: { d: utc } })).toBe(
+      `{"b":{"n":1},"a":{"d":${utcText}}}`,
+    )
+  })
+
+  it("doesn't let through what's beside it", () => {
+    for (const [value, text] of [
+      [{ at: utc, bad: 1n }, "lines.bad is a bigint"],
+      [{ bad: 1n, at: utc }, "lines.bad is a bigint"],
+      [[utc, new Set()], "lines[1] is a Set"],
+      [[new Date(0), utc], "lines[0] is a Date"],
+    ] as const) {
+      expect(() => PackedCodec.stringifyStrict(value, "lines")).toThrow(text)
+    }
+  })
+
+  it("is the one class instance taken", () => {
+    class WithToJson {
+      toJSON() {
+        return "x"
+      }
+    }
+    expect(() => PackedCodec.stringifyStrict(new WithToJson(), "v")).toThrow(
+      "instance of WithToJson",
+    )
+    expect(() => PackedCodec.stringifyStrict({ toJSON: () => "x" }, "v")).toThrow(
+      "instance of Object",
+    )
+    expect(() => PackedCodec.stringifyStrict(new Date(0), "v")).toThrow("a Date")
+    expect(() => PackedCodec.stringifyStrict(named.zone, "v")).toThrow("an instance of Object")
+  })
+
+  it("a plain object with a date's keys is written as it is, whatever its order", () => {
+    const read = JSON.parse(namedText)
+    expect(PackedCodec.stringifyStrict(read)).toBe(namedText)
+    const other = { _tag: "Utc", "~effect/DateTime": "~effect/DateTime", epochMilliseconds: 5 }
+    expect(PackedCodec.stringifyStrict(other)).toBe(JSON.stringify(other))
+  })
+
+  it("JSON text doesn't lose the instant or the zone", () => {
+    const back = JSON.parse(PackedCodec.stringifyStrict(named))
+    expect(back.epochMilliseconds).toBe(DateTime.toEpochMillis(named))
+    expect(back.zone.id).toBe("Asia/Tokyo")
+    expect(Equal.equals(named, DateTime.makeZonedUnsafe(iso, { timeZone: back.zone.id }))).toBe(
+      true,
+    )
+  })
+
+  it("packs and unpacks through the codec, compressed too", () => {
+    for (const config of [
+      DynamoModel.Packed({ format: "json" }),
+      DynamoModel.Packed({ format: "json", compression: { codec: "gzip", threshold: 1 } }),
+    ]) {
+      const stored = PackedCodec.packValueSync(config, { at: named }, all, ctx, "data")
+      expect(stored).not.toBeInstanceOf(ValidationError)
+      const back = PackedCodec.unpackStoredSync(stored as string | Uint8Array, all, ctx, "data")
+      expect(JSON.stringify(back)).toBe(`{"at":${namedText}}`)
     }
   })
 })

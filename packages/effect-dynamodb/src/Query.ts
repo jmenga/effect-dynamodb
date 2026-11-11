@@ -27,7 +27,7 @@ import {
   packedExprRefusal,
   packedProjectionRefusal,
 } from "./internal/Packed.js"
-import { compilePath } from "./internal/PathBuilder.js"
+import { compilePath, storedPath } from "./internal/PathBuilder.js"
 import {
   canonicalJson,
   compositePlanner,
@@ -210,6 +210,11 @@ interface QueryState {
   readonly scanForward: boolean
   readonly consistentRead: boolean
   readonly ignoreOwnershipFlag: boolean
+  /**
+   * What every terminal fails with: a value this query was given has no key
+   * (see {@link refuse}). Nothing is sent.
+   */
+  readonly refusal?: ValidationError | undefined
   /**
    * Where an unplanned query resumes: set by internal callers, or by
    * {@link prepared} from a {@link startFrom} cursor.
@@ -689,6 +694,52 @@ export const fanOut = <A>(self: Query<A>, read: ReadPartitions): Query<A> =>
         fanOut: { ...read.fanOut, partitions: read.partitions },
       })
 
+/**
+ * @internal A query whose terminals fail with `refusal`: building one has no error
+ * channel to fail into, and a value a key can't hold is the caller's error, not a
+ * defect. Nothing is sent.
+ */
+export const refuse = <A>(self: Query<A>, refusal: ValidationError): Query<A> =>
+  new QueryImpl<A>({ ...self._state, refusal })
+
+/** @internal Has {@link refuse} refused this query? Its builders have nothing left to do. */
+export const isRefused = (self: Query<unknown>): boolean => self._state.refusal !== undefined
+
+/** @internal A query that could not even be built: a composite it was given has no key. */
+export const refused = <A>(indexName: string | undefined, refusal: ValidationError): Query<A> =>
+  refuse(
+    make<A>({
+      tableName: "",
+      indexName,
+      pkField: "",
+      pkValue: "",
+      skField: undefined,
+      entityTypes: [],
+      decoder: () => Effect.die(refusal),
+    }),
+    refusal,
+  )
+
+/**
+ * @internal What `build` returns, or `onRefusal` of the `ValidationError` for a value it
+ * threw for (`Capacity.isRefusedValue`). Any other throw is a misuse of the API and stays one.
+ */
+export const orRefusal = <T>(
+  operation: { readonly name: string; readonly target?: string | undefined } | undefined,
+  build: () => T,
+  onRefusal: (refusal: ValidationError) => T,
+): T => {
+  try {
+    return build()
+  } catch (cause) {
+    if (!Capacity.isRefusedValue(cause)) throw cause
+    const name = operation?.name ?? "query"
+    return onRefusal(
+      new ValidationError({ entityType: operation?.target ?? name, operation: name, cause }),
+    )
+  }
+}
+
 /** @internal Does this query read a sharded index's partitions (#183)? */
 export const isFanOut = (self: Query<unknown>): boolean => self._state.fanOut !== undefined
 
@@ -1080,7 +1131,7 @@ export const selectRenamed = <A>(
   const heads = [...new Set(paths.map((path) => String(path[0])))]
   return selectProjected(
     self,
-    paths.map((path) => [resolveDbName(String(path[0])), ...path.slice(1)]),
+    paths.map((path) => storedPath(path, resolveDbName)),
     (raw) => {
       const item: Record<string, unknown> = {}
       for (const head of heads) {
@@ -1805,6 +1856,7 @@ const prepared = (
   state: QueryState,
   tableName: string,
 ): Effect.Effect<QueryState, DynamoClientError | ValidationError, DynamoClient> => {
+  if (state.refusal !== undefined) return Effect.fail(state.refusal)
   // `.within()` is offered only where no prepare step is installed (an
   // entity's `versions` installs one).
   if (state.planner !== undefined && state.prepare !== undefined) {
@@ -3293,6 +3345,17 @@ const countPlanned = (
 export const explain = <A>(self: Query<A>): Effect.Effect<QueryExplain, never, never> =>
   Effect.sync(() => {
     const state = self._state
+    if (state.refusal !== undefined) {
+      return {
+        index: state.indexName ?? "primary",
+        plan: "empty",
+        reason: `refused: ${state.refusal.message}`,
+        keyConditions: [],
+        filter: undefined,
+        rowChecks: [],
+        sizing: explainedSizing(state),
+      } satisfies QueryExplain
+    }
     if (state.fanOut !== undefined) return explainFanOut(state, state.fanOut)
     const factory = state.planner
     if (factory === undefined) {
@@ -3334,7 +3397,7 @@ export const asParams = <A>(
 ): Effect.Effect<Record<string, unknown>, ValidationError, any> =>
   Effect.gen(function* () {
     const state = self._state
-    const refusal = refuseEmptyFilterParts(state)
+    const refusal = state.refusal ?? refuseEmptyFilterParts(state)
     if (refusal !== undefined) return yield* refusal
     const tableName = state.resolveTableName ? yield* state.resolveTableName : state.tableName
     // A planned query shows the first request it would send from the start:

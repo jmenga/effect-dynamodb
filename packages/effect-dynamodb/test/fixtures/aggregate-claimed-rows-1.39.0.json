@@ -1,0 +1,5953 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "scenarios": {
+  "equal content": {
+   "created": {
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 500,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "created b get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026087-1",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$equal#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026087-1",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$equal#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$equal#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794162026087-1",
+          "Key": {
+           "pk": {
+            "S": "$equal#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$equal#v1#line#0000000000000500"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "remove a get b": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "rekey a dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p%20q"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ]
+   }
+  },
+  "decimal 0.100": {
+   "created": {
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 500,
+       "note": "same",
+       "payload": 0.1
+      }
+     ]
+    }
+   },
+   "created b get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same",
+       "payload": 0.1
+      }
+     ]
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026218-5",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$equal#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026218-5",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$equal#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$equal#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794162026218-5",
+          "Key": {
+           "pk": {
+            "S": "$equal#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$equal#v1#line#0000000000000500"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "remove a get b": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same",
+       "payload": 0.1
+      }
+     ]
+    }
+   },
+   "rekey a dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p%20q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ]
+   }
+  },
+  "decimal 0.10000000000000001": {
+   "created": {
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.10000000000000001"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 500,
+       "note": "same",
+       "payload": 0.1
+      }
+     ]
+    }
+   },
+   "created b get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same",
+       "payload": 0.1
+      }
+     ]
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026323-9",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$equal#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026323-9",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$equal#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$equal#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794162026323-9",
+          "Key": {
+           "pk": {
+            "S": "$equal#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$equal#v1#line#0000000000000500"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.10000000000000001"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "remove a get b": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 5000,
+       "note": "same",
+       "payload": 0.1
+      }
+     ]
+    }
+   },
+   "rekey a dry run": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.10000000000000001"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a": {
+    "report": {
+     "scanned": 4,
+     "unchanged": 0,
+     "moved": 2,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000005000"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "payload": {
+       "N": "0.10000000000000001"
+      },
+      "f": {
+       "N": "500"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#line#0000000000000500"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p%20q"
+      },
+      "payload": {
+       "N": "0.1"
+      },
+      "f": {
+       "N": "50"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$equal#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$equal#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ]
+   }
+  },
+  "guard narrow": {
+   "created": {
+    "rows": [
+     {
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "f": {
+       "N": "5"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 50,
+       "note": "same"
+      }
+     ]
+    }
+   },
+   "b takes the key": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026424-13",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$guard#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026424-13",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Rootb"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#rootb"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "foreign-1794162026424-13",
+          "Item": {
+           "f": {
+            "N": "5"
+           },
+           "note": {
+            "S": "same"
+           },
+           "z_owner": {
+            "S": "b"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#line#0000000000000050"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "f": {
+       "N": "5"
+      },
+      "z_owner": {
+       "S": "b"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": [
+       {
+        "f": 500,
+        "note": "same",
+        "z_owner": "b"
+       }
+      ]
+     }
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026444-14",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$guard#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026444-14",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794162026444-14",
+          "Key": {
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#line#0000000000000005"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "f": {
+       "N": "5"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "race remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026466-15",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$guard#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026466-15",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794162026466-15",
+          "Key": {
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#line#0000000000000005"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "f": {
+       "N": "5"
+      },
+      "z_owner": {
+       "S": "b"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "rekey a dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "f": {
+       "N": "5"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "note": {
+       "S": "same"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "f": {
+       "N": "5"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ]
+   }
+  },
+  "guard wide": {
+   "created": {
+    "rows": [
+     {
+      "a085": {
+       "S": "value"
+      },
+      "a086": {
+       "S": "value"
+      },
+      "a087": {
+       "S": "value"
+      },
+      "a120": {
+       "S": "value"
+      },
+      "a000": {
+       "S": "value"
+      },
+      "a088": {
+       "S": "value"
+      },
+      "a121": {
+       "S": "value"
+      },
+      "a081": {
+       "S": "value"
+      },
+      "a082": {
+       "S": "value"
+      },
+      "a083": {
+       "S": "value"
+      },
+      "a084": {
+       "S": "value"
+      },
+      "a080": {
+       "S": "value"
+      },
+      "a009": {
+       "S": "value"
+      },
+      "a005": {
+       "S": "value"
+      },
+      "a126": {
+       "S": "value"
+      },
+      "a006": {
+       "S": "value"
+      },
+      "a127": {
+       "S": "value"
+      },
+      "a007": {
+       "S": "value"
+      },
+      "a128": {
+       "S": "value"
+      },
+      "a008": {
+       "S": "value"
+      },
+      "a129": {
+       "S": "value"
+      },
+      "a001": {
+       "S": "value"
+      },
+      "a089": {
+       "S": "value"
+      },
+      "a122": {
+       "S": "value"
+      },
+      "a002": {
+       "S": "value"
+      },
+      "a123": {
+       "S": "value"
+      },
+      "a003": {
+       "S": "value"
+      },
+      "a124": {
+       "S": "value"
+      },
+      "a004": {
+       "S": "value"
+      },
+      "a125": {
+       "S": "value"
+      },
+      "a074": {
+       "S": "value"
+      },
+      "a075": {
+       "S": "value"
+      },
+      "a076": {
+       "S": "value"
+      },
+      "a077": {
+       "S": "value"
+      },
+      "a110": {
+       "S": "value"
+      },
+      "a070": {
+       "S": "value"
+      },
+      "a071": {
+       "S": "value"
+      },
+      "a072": {
+       "S": "value"
+      },
+      "a073": {
+       "S": "value"
+      },
+      "a119": {
+       "S": "value"
+      },
+      "a115": {
+       "S": "value"
+      },
+      "a116": {
+       "S": "value"
+      },
+      "a117": {
+       "S": "value"
+      },
+      "a118": {
+       "S": "value"
+      },
+      "a078": {
+       "S": "value"
+      },
+      "a111": {
+       "S": "value"
+      },
+      "a079": {
+       "S": "value"
+      },
+      "a112": {
+       "S": "value"
+      },
+      "a113": {
+       "S": "value"
+      },
+      "a114": {
+       "S": "value"
+      },
+      "a140": {
+       "S": "value"
+      },
+      "a020": {
+       "S": "value"
+      },
+      "a141": {
+       "S": "value"
+      },
+      "a021": {
+       "S": "value"
+      },
+      "a142": {
+       "S": "value"
+      },
+      "a022": {
+       "S": "value"
+      },
+      "a143": {
+       "S": "value"
+      },
+      "a027": {
+       "S": "value"
+      },
+      "a148": {
+       "S": "value"
+      },
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "a028": {
+       "S": "value"
+      },
+      "a149": {
+       "S": "value"
+      },
+      "a029": {
+       "S": "value"
+      },
+      "a023": {
+       "S": "value"
+      },
+      "a144": {
+       "S": "value"
+      },
+      "a024": {
+       "S": "value"
+      },
+      "a145": {
+       "S": "value"
+      },
+      "a025": {
+       "S": "value"
+      },
+      "a146": {
+       "S": "value"
+      },
+      "a026": {
+       "S": "value"
+      },
+      "a147": {
+       "S": "value"
+      },
+      "a096": {
+       "S": "value"
+      },
+      "a097": {
+       "S": "value"
+      },
+      "a130": {
+       "S": "value"
+      },
+      "a010": {
+       "S": "value"
+      },
+      "a098": {
+       "S": "value"
+      },
+      "a131": {
+       "S": "value"
+      },
+      "a011": {
+       "S": "value"
+      },
+      "a099": {
+       "S": "value"
+      },
+      "a132": {
+       "S": "value"
+      },
+      "a092": {
+       "S": "value"
+      },
+      "a093": {
+       "S": "value"
+      },
+      "f": {
+       "N": "5"
+      },
+      "a094": {
+       "S": "value"
+      },
+      "a095": {
+       "S": "value"
+      },
+      "a090": {
+       "S": "value"
+      },
+      "a091": {
+       "S": "value"
+      },
+      "a016": {
+       "S": "value"
+      },
+      "a137": {
+       "S": "value"
+      },
+      "a017": {
+       "S": "value"
+      },
+      "a138": {
+       "S": "value"
+      },
+      "a018": {
+       "S": "value"
+      },
+      "a139": {
+       "S": "value"
+      },
+      "a019": {
+       "S": "value"
+      },
+      "a012": {
+       "S": "value"
+      },
+      "a133": {
+       "S": "value"
+      },
+      "a013": {
+       "S": "value"
+      },
+      "a134": {
+       "S": "value"
+      },
+      "a014": {
+       "S": "value"
+      },
+      "a135": {
+       "S": "value"
+      },
+      "a015": {
+       "S": "value"
+      },
+      "a136": {
+       "S": "value"
+      },
+      "a041": {
+       "S": "value"
+      },
+      "a042": {
+       "S": "value"
+      },
+      "a043": {
+       "S": "value"
+      },
+      "a044": {
+       "S": "value"
+      },
+      "a040": {
+       "S": "value"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "a049": {
+       "S": "value"
+      },
+      "a045": {
+       "S": "value"
+      },
+      "a046": {
+       "S": "value"
+      },
+      "a047": {
+       "S": "value"
+      },
+      "a048": {
+       "S": "value"
+      },
+      "a030": {
+       "S": "value"
+      },
+      "a151": {
+       "S": "value"
+      },
+      "a031": {
+       "S": "value"
+      },
+      "a152": {
+       "S": "value"
+      },
+      "a032": {
+       "S": "value"
+      },
+      "a153": {
+       "S": "value"
+      },
+      "a033": {
+       "S": "value"
+      },
+      "a154": {
+       "S": "value"
+      },
+      "a150": {
+       "S": "value"
+      },
+      "a038": {
+       "S": "value"
+      },
+      "a159": {
+       "S": "value"
+      },
+      "a039": {
+       "S": "value"
+      },
+      "a034": {
+       "S": "value"
+      },
+      "a155": {
+       "S": "value"
+      },
+      "a035": {
+       "S": "value"
+      },
+      "a156": {
+       "S": "value"
+      },
+      "a036": {
+       "S": "value"
+      },
+      "a157": {
+       "S": "value"
+      },
+      "a037": {
+       "S": "value"
+      },
+      "a158": {
+       "S": "value"
+      },
+      "a063": {
+       "S": "value"
+      },
+      "note": {
+       "S": "same"
+      },
+      "a064": {
+       "S": "value"
+      },
+      "a065": {
+       "S": "value"
+      },
+      "a066": {
+       "S": "value"
+      },
+      "a060": {
+       "S": "value"
+      },
+      "a061": {
+       "S": "value"
+      },
+      "a062": {
+       "S": "value"
+      },
+      "a108": {
+       "S": "value"
+      },
+      "a109": {
+       "S": "value"
+      },
+      "a104": {
+       "S": "value"
+      },
+      "a105": {
+       "S": "value"
+      },
+      "a106": {
+       "S": "value"
+      },
+      "a107": {
+       "S": "value"
+      },
+      "a067": {
+       "S": "value"
+      },
+      "a100": {
+       "S": "value"
+      },
+      "a068": {
+       "S": "value"
+      },
+      "a101": {
+       "S": "value"
+      },
+      "a069": {
+       "S": "value"
+      },
+      "a102": {
+       "S": "value"
+      },
+      "a103": {
+       "S": "value"
+      },
+      "a052": {
+       "S": "value"
+      },
+      "a053": {
+       "S": "value"
+      },
+      "a054": {
+       "S": "value"
+      },
+      "a055": {
+       "S": "value"
+      },
+      "a050": {
+       "S": "value"
+      },
+      "a051": {
+       "S": "value"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "a056": {
+       "S": "value"
+      },
+      "a057": {
+       "S": "value"
+      },
+      "a058": {
+       "S": "value"
+      },
+      "a059": {
+       "S": "value"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "created a get": {
+    "ok": {
+     "id": "p q",
+     "lines": [
+      {
+       "f": 50,
+       "note": "same",
+       "a000": "value",
+       "a001": "value",
+       "a002": "value",
+       "a003": "value",
+       "a004": "value",
+       "a005": "value",
+       "a006": "value",
+       "a007": "value",
+       "a008": "value",
+       "a009": "value",
+       "a010": "value",
+       "a011": "value",
+       "a012": "value",
+       "a013": "value",
+       "a014": "value",
+       "a015": "value",
+       "a016": "value",
+       "a017": "value",
+       "a018": "value",
+       "a019": "value",
+       "a020": "value",
+       "a021": "value",
+       "a022": "value",
+       "a023": "value",
+       "a024": "value",
+       "a025": "value",
+       "a026": "value",
+       "a027": "value",
+       "a028": "value",
+       "a029": "value",
+       "a030": "value",
+       "a031": "value",
+       "a032": "value",
+       "a033": "value",
+       "a034": "value",
+       "a035": "value",
+       "a036": "value",
+       "a037": "value",
+       "a038": "value",
+       "a039": "value",
+       "a040": "value",
+       "a041": "value",
+       "a042": "value",
+       "a043": "value",
+       "a044": "value",
+       "a045": "value",
+       "a046": "value",
+       "a047": "value",
+       "a048": "value",
+       "a049": "value",
+       "a050": "value",
+       "a051": "value",
+       "a052": "value",
+       "a053": "value",
+       "a054": "value",
+       "a055": "value",
+       "a056": "value",
+       "a057": "value",
+       "a058": "value",
+       "a059": "value",
+       "a060": "value",
+       "a061": "value",
+       "a062": "value",
+       "a063": "value",
+       "a064": "value",
+       "a065": "value",
+       "a066": "value",
+       "a067": "value",
+       "a068": "value",
+       "a069": "value",
+       "a070": "value",
+       "a071": "value",
+       "a072": "value",
+       "a073": "value",
+       "a074": "value",
+       "a075": "value",
+       "a076": "value",
+       "a077": "value",
+       "a078": "value",
+       "a079": "value",
+       "a080": "value",
+       "a081": "value",
+       "a082": "value",
+       "a083": "value",
+       "a084": "value",
+       "a085": "value",
+       "a086": "value",
+       "a087": "value",
+       "a088": "value",
+       "a089": "value",
+       "a090": "value",
+       "a091": "value",
+       "a092": "value",
+       "a093": "value",
+       "a094": "value",
+       "a095": "value",
+       "a096": "value",
+       "a097": "value",
+       "a098": "value",
+       "a099": "value",
+       "a100": "value",
+       "a101": "value",
+       "a102": "value",
+       "a103": "value",
+       "a104": "value",
+       "a105": "value",
+       "a106": "value",
+       "a107": "value",
+       "a108": "value",
+       "a109": "value",
+       "a110": "value",
+       "a111": "value",
+       "a112": "value",
+       "a113": "value",
+       "a114": "value",
+       "a115": "value",
+       "a116": "value",
+       "a117": "value",
+       "a118": "value",
+       "a119": "value",
+       "a120": "value",
+       "a121": "value",
+       "a122": "value",
+       "a123": "value",
+       "a124": "value",
+       "a125": "value",
+       "a126": "value",
+       "a127": "value",
+       "a128": "value",
+       "a129": "value",
+       "a130": "value",
+       "a131": "value",
+       "a132": "value",
+       "a133": "value",
+       "a134": "value",
+       "a135": "value",
+       "a136": "value",
+       "a137": "value",
+       "a138": "value",
+       "a139": "value",
+       "a140": "value",
+       "a141": "value",
+       "a142": "value",
+       "a143": "value",
+       "a144": "value",
+       "a145": "value",
+       "a146": "value",
+       "a147": "value",
+       "a148": "value",
+       "a149": "value",
+       "a150": "value",
+       "a151": "value",
+       "a152": "value",
+       "a153": "value",
+       "a154": "value",
+       "a155": "value",
+       "a156": "value",
+       "a157": "value",
+       "a158": "value",
+       "a159": "value"
+      }
+     ]
+    }
+   },
+   "b takes the key": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026571-19",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$guard#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026571-19",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Rootb"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#rootb"
+           }
+          }
+         }
+        },
+        {
+         "Put": {
+          "TableName": "foreign-1794162026571-19",
+          "Item": {
+           "f": {
+            "N": "5"
+           },
+           "note": {
+            "S": "same"
+           },
+           "z_owner": {
+            "S": "b"
+           },
+           "a000": {
+            "S": "value"
+           },
+           "a001": {
+            "S": "value"
+           },
+           "a002": {
+            "S": "value"
+           },
+           "a003": {
+            "S": "value"
+           },
+           "a004": {
+            "S": "value"
+           },
+           "a005": {
+            "S": "value"
+           },
+           "a006": {
+            "S": "value"
+           },
+           "a007": {
+            "S": "value"
+           },
+           "a008": {
+            "S": "value"
+           },
+           "a009": {
+            "S": "value"
+           },
+           "a010": {
+            "S": "value"
+           },
+           "a011": {
+            "S": "value"
+           },
+           "a012": {
+            "S": "value"
+           },
+           "a013": {
+            "S": "value"
+           },
+           "a014": {
+            "S": "value"
+           },
+           "a015": {
+            "S": "value"
+           },
+           "a016": {
+            "S": "value"
+           },
+           "a017": {
+            "S": "value"
+           },
+           "a018": {
+            "S": "value"
+           },
+           "a019": {
+            "S": "value"
+           },
+           "a020": {
+            "S": "value"
+           },
+           "a021": {
+            "S": "value"
+           },
+           "a022": {
+            "S": "value"
+           },
+           "a023": {
+            "S": "value"
+           },
+           "a024": {
+            "S": "value"
+           },
+           "a025": {
+            "S": "value"
+           },
+           "a026": {
+            "S": "value"
+           },
+           "a027": {
+            "S": "value"
+           },
+           "a028": {
+            "S": "value"
+           },
+           "a029": {
+            "S": "value"
+           },
+           "a030": {
+            "S": "value"
+           },
+           "a031": {
+            "S": "value"
+           },
+           "a032": {
+            "S": "value"
+           },
+           "a033": {
+            "S": "value"
+           },
+           "a034": {
+            "S": "value"
+           },
+           "a035": {
+            "S": "value"
+           },
+           "a036": {
+            "S": "value"
+           },
+           "a037": {
+            "S": "value"
+           },
+           "a038": {
+            "S": "value"
+           },
+           "a039": {
+            "S": "value"
+           },
+           "a040": {
+            "S": "value"
+           },
+           "a041": {
+            "S": "value"
+           },
+           "a042": {
+            "S": "value"
+           },
+           "a043": {
+            "S": "value"
+           },
+           "a044": {
+            "S": "value"
+           },
+           "a045": {
+            "S": "value"
+           },
+           "a046": {
+            "S": "value"
+           },
+           "a047": {
+            "S": "value"
+           },
+           "a048": {
+            "S": "value"
+           },
+           "a049": {
+            "S": "value"
+           },
+           "a050": {
+            "S": "value"
+           },
+           "a051": {
+            "S": "value"
+           },
+           "a052": {
+            "S": "value"
+           },
+           "a053": {
+            "S": "value"
+           },
+           "a054": {
+            "S": "value"
+           },
+           "a055": {
+            "S": "value"
+           },
+           "a056": {
+            "S": "value"
+           },
+           "a057": {
+            "S": "value"
+           },
+           "a058": {
+            "S": "value"
+           },
+           "a059": {
+            "S": "value"
+           },
+           "a060": {
+            "S": "value"
+           },
+           "a061": {
+            "S": "value"
+           },
+           "a062": {
+            "S": "value"
+           },
+           "a063": {
+            "S": "value"
+           },
+           "a064": {
+            "S": "value"
+           },
+           "a065": {
+            "S": "value"
+           },
+           "a066": {
+            "S": "value"
+           },
+           "a067": {
+            "S": "value"
+           },
+           "a068": {
+            "S": "value"
+           },
+           "a069": {
+            "S": "value"
+           },
+           "a070": {
+            "S": "value"
+           },
+           "a071": {
+            "S": "value"
+           },
+           "a072": {
+            "S": "value"
+           },
+           "a073": {
+            "S": "value"
+           },
+           "a074": {
+            "S": "value"
+           },
+           "a075": {
+            "S": "value"
+           },
+           "a076": {
+            "S": "value"
+           },
+           "a077": {
+            "S": "value"
+           },
+           "a078": {
+            "S": "value"
+           },
+           "a079": {
+            "S": "value"
+           },
+           "a080": {
+            "S": "value"
+           },
+           "a081": {
+            "S": "value"
+           },
+           "a082": {
+            "S": "value"
+           },
+           "a083": {
+            "S": "value"
+           },
+           "a084": {
+            "S": "value"
+           },
+           "a085": {
+            "S": "value"
+           },
+           "a086": {
+            "S": "value"
+           },
+           "a087": {
+            "S": "value"
+           },
+           "a088": {
+            "S": "value"
+           },
+           "a089": {
+            "S": "value"
+           },
+           "a090": {
+            "S": "value"
+           },
+           "a091": {
+            "S": "value"
+           },
+           "a092": {
+            "S": "value"
+           },
+           "a093": {
+            "S": "value"
+           },
+           "a094": {
+            "S": "value"
+           },
+           "a095": {
+            "S": "value"
+           },
+           "a096": {
+            "S": "value"
+           },
+           "a097": {
+            "S": "value"
+           },
+           "a098": {
+            "S": "value"
+           },
+           "a099": {
+            "S": "value"
+           },
+           "a100": {
+            "S": "value"
+           },
+           "a101": {
+            "S": "value"
+           },
+           "a102": {
+            "S": "value"
+           },
+           "a103": {
+            "S": "value"
+           },
+           "a104": {
+            "S": "value"
+           },
+           "a105": {
+            "S": "value"
+           },
+           "a106": {
+            "S": "value"
+           },
+           "a107": {
+            "S": "value"
+           },
+           "a108": {
+            "S": "value"
+           },
+           "a109": {
+            "S": "value"
+           },
+           "a110": {
+            "S": "value"
+           },
+           "a111": {
+            "S": "value"
+           },
+           "a112": {
+            "S": "value"
+           },
+           "a113": {
+            "S": "value"
+           },
+           "a114": {
+            "S": "value"
+           },
+           "a115": {
+            "S": "value"
+           },
+           "a116": {
+            "S": "value"
+           },
+           "a117": {
+            "S": "value"
+           },
+           "a118": {
+            "S": "value"
+           },
+           "a119": {
+            "S": "value"
+           },
+           "a120": {
+            "S": "value"
+           },
+           "a121": {
+            "S": "value"
+           },
+           "a122": {
+            "S": "value"
+           },
+           "a123": {
+            "S": "value"
+           },
+           "a124": {
+            "S": "value"
+           },
+           "a125": {
+            "S": "value"
+           },
+           "a126": {
+            "S": "value"
+           },
+           "a127": {
+            "S": "value"
+           },
+           "a128": {
+            "S": "value"
+           },
+           "a129": {
+            "S": "value"
+           },
+           "a130": {
+            "S": "value"
+           },
+           "a131": {
+            "S": "value"
+           },
+           "a132": {
+            "S": "value"
+           },
+           "a133": {
+            "S": "value"
+           },
+           "a134": {
+            "S": "value"
+           },
+           "a135": {
+            "S": "value"
+           },
+           "a136": {
+            "S": "value"
+           },
+           "a137": {
+            "S": "value"
+           },
+           "a138": {
+            "S": "value"
+           },
+           "a139": {
+            "S": "value"
+           },
+           "a140": {
+            "S": "value"
+           },
+           "a141": {
+            "S": "value"
+           },
+           "a142": {
+            "S": "value"
+           },
+           "a143": {
+            "S": "value"
+           },
+           "a144": {
+            "S": "value"
+           },
+           "a145": {
+            "S": "value"
+           },
+           "a146": {
+            "S": "value"
+           },
+           "a147": {
+            "S": "value"
+           },
+           "a148": {
+            "S": "value"
+           },
+           "a149": {
+            "S": "value"
+           },
+           "a150": {
+            "S": "value"
+           },
+           "a151": {
+            "S": "value"
+           },
+           "a152": {
+            "S": "value"
+           },
+           "a153": {
+            "S": "value"
+           },
+           "a154": {
+            "S": "value"
+           },
+           "a155": {
+            "S": "value"
+           },
+           "a156": {
+            "S": "value"
+           },
+           "a157": {
+            "S": "value"
+           },
+           "a158": {
+            "S": "value"
+           },
+           "a159": {
+            "S": "value"
+           },
+           "__edd_e__": {
+            "S": "Line"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#line#0000000000000050"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "a085": {
+       "S": "value"
+      },
+      "a086": {
+       "S": "value"
+      },
+      "a087": {
+       "S": "value"
+      },
+      "a120": {
+       "S": "value"
+      },
+      "a000": {
+       "S": "value"
+      },
+      "a088": {
+       "S": "value"
+      },
+      "a121": {
+       "S": "value"
+      },
+      "a081": {
+       "S": "value"
+      },
+      "a082": {
+       "S": "value"
+      },
+      "a083": {
+       "S": "value"
+      },
+      "a084": {
+       "S": "value"
+      },
+      "a080": {
+       "S": "value"
+      },
+      "a009": {
+       "S": "value"
+      },
+      "a005": {
+       "S": "value"
+      },
+      "a126": {
+       "S": "value"
+      },
+      "a006": {
+       "S": "value"
+      },
+      "a127": {
+       "S": "value"
+      },
+      "a007": {
+       "S": "value"
+      },
+      "a128": {
+       "S": "value"
+      },
+      "a008": {
+       "S": "value"
+      },
+      "a129": {
+       "S": "value"
+      },
+      "a001": {
+       "S": "value"
+      },
+      "a089": {
+       "S": "value"
+      },
+      "a122": {
+       "S": "value"
+      },
+      "a002": {
+       "S": "value"
+      },
+      "a123": {
+       "S": "value"
+      },
+      "a003": {
+       "S": "value"
+      },
+      "a124": {
+       "S": "value"
+      },
+      "a004": {
+       "S": "value"
+      },
+      "a125": {
+       "S": "value"
+      },
+      "a074": {
+       "S": "value"
+      },
+      "a075": {
+       "S": "value"
+      },
+      "a076": {
+       "S": "value"
+      },
+      "a077": {
+       "S": "value"
+      },
+      "a110": {
+       "S": "value"
+      },
+      "a070": {
+       "S": "value"
+      },
+      "a071": {
+       "S": "value"
+      },
+      "a072": {
+       "S": "value"
+      },
+      "a073": {
+       "S": "value"
+      },
+      "a119": {
+       "S": "value"
+      },
+      "a115": {
+       "S": "value"
+      },
+      "a116": {
+       "S": "value"
+      },
+      "a117": {
+       "S": "value"
+      },
+      "a118": {
+       "S": "value"
+      },
+      "a078": {
+       "S": "value"
+      },
+      "a111": {
+       "S": "value"
+      },
+      "a079": {
+       "S": "value"
+      },
+      "a112": {
+       "S": "value"
+      },
+      "a113": {
+       "S": "value"
+      },
+      "a114": {
+       "S": "value"
+      },
+      "a140": {
+       "S": "value"
+      },
+      "a020": {
+       "S": "value"
+      },
+      "a141": {
+       "S": "value"
+      },
+      "a021": {
+       "S": "value"
+      },
+      "a142": {
+       "S": "value"
+      },
+      "a022": {
+       "S": "value"
+      },
+      "a143": {
+       "S": "value"
+      },
+      "a027": {
+       "S": "value"
+      },
+      "a148": {
+       "S": "value"
+      },
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "a028": {
+       "S": "value"
+      },
+      "a149": {
+       "S": "value"
+      },
+      "a029": {
+       "S": "value"
+      },
+      "a023": {
+       "S": "value"
+      },
+      "a144": {
+       "S": "value"
+      },
+      "a024": {
+       "S": "value"
+      },
+      "a145": {
+       "S": "value"
+      },
+      "a025": {
+       "S": "value"
+      },
+      "a146": {
+       "S": "value"
+      },
+      "a026": {
+       "S": "value"
+      },
+      "a147": {
+       "S": "value"
+      },
+      "a096": {
+       "S": "value"
+      },
+      "a097": {
+       "S": "value"
+      },
+      "a130": {
+       "S": "value"
+      },
+      "a010": {
+       "S": "value"
+      },
+      "a098": {
+       "S": "value"
+      },
+      "a131": {
+       "S": "value"
+      },
+      "a011": {
+       "S": "value"
+      },
+      "a099": {
+       "S": "value"
+      },
+      "a132": {
+       "S": "value"
+      },
+      "a092": {
+       "S": "value"
+      },
+      "a093": {
+       "S": "value"
+      },
+      "f": {
+       "N": "5"
+      },
+      "a094": {
+       "S": "value"
+      },
+      "a095": {
+       "S": "value"
+      },
+      "a090": {
+       "S": "value"
+      },
+      "a091": {
+       "S": "value"
+      },
+      "a016": {
+       "S": "value"
+      },
+      "a137": {
+       "S": "value"
+      },
+      "a017": {
+       "S": "value"
+      },
+      "a138": {
+       "S": "value"
+      },
+      "a018": {
+       "S": "value"
+      },
+      "a139": {
+       "S": "value"
+      },
+      "a019": {
+       "S": "value"
+      },
+      "a012": {
+       "S": "value"
+      },
+      "a133": {
+       "S": "value"
+      },
+      "a013": {
+       "S": "value"
+      },
+      "a134": {
+       "S": "value"
+      },
+      "a014": {
+       "S": "value"
+      },
+      "a135": {
+       "S": "value"
+      },
+      "a015": {
+       "S": "value"
+      },
+      "a136": {
+       "S": "value"
+      },
+      "a041": {
+       "S": "value"
+      },
+      "a042": {
+       "S": "value"
+      },
+      "a043": {
+       "S": "value"
+      },
+      "a044": {
+       "S": "value"
+      },
+      "z_owner": {
+       "S": "b"
+      },
+      "a040": {
+       "S": "value"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "a049": {
+       "S": "value"
+      },
+      "a045": {
+       "S": "value"
+      },
+      "a046": {
+       "S": "value"
+      },
+      "a047": {
+       "S": "value"
+      },
+      "a048": {
+       "S": "value"
+      },
+      "a030": {
+       "S": "value"
+      },
+      "a151": {
+       "S": "value"
+      },
+      "a031": {
+       "S": "value"
+      },
+      "a152": {
+       "S": "value"
+      },
+      "a032": {
+       "S": "value"
+      },
+      "a153": {
+       "S": "value"
+      },
+      "a033": {
+       "S": "value"
+      },
+      "a154": {
+       "S": "value"
+      },
+      "a150": {
+       "S": "value"
+      },
+      "a038": {
+       "S": "value"
+      },
+      "a159": {
+       "S": "value"
+      },
+      "a039": {
+       "S": "value"
+      },
+      "a034": {
+       "S": "value"
+      },
+      "a155": {
+       "S": "value"
+      },
+      "a035": {
+       "S": "value"
+      },
+      "a156": {
+       "S": "value"
+      },
+      "a036": {
+       "S": "value"
+      },
+      "a157": {
+       "S": "value"
+      },
+      "a037": {
+       "S": "value"
+      },
+      "a158": {
+       "S": "value"
+      },
+      "a063": {
+       "S": "value"
+      },
+      "note": {
+       "S": "same"
+      },
+      "a064": {
+       "S": "value"
+      },
+      "a065": {
+       "S": "value"
+      },
+      "a066": {
+       "S": "value"
+      },
+      "a060": {
+       "S": "value"
+      },
+      "a061": {
+       "S": "value"
+      },
+      "a062": {
+       "S": "value"
+      },
+      "a108": {
+       "S": "value"
+      },
+      "a109": {
+       "S": "value"
+      },
+      "a104": {
+       "S": "value"
+      },
+      "a105": {
+       "S": "value"
+      },
+      "a106": {
+       "S": "value"
+      },
+      "a107": {
+       "S": "value"
+      },
+      "a067": {
+       "S": "value"
+      },
+      "a100": {
+       "S": "value"
+      },
+      "a068": {
+       "S": "value"
+      },
+      "a101": {
+       "S": "value"
+      },
+      "a069": {
+       "S": "value"
+      },
+      "a102": {
+       "S": "value"
+      },
+      "a103": {
+       "S": "value"
+      },
+      "a052": {
+       "S": "value"
+      },
+      "a053": {
+       "S": "value"
+      },
+      "a054": {
+       "S": "value"
+      },
+      "a055": {
+       "S": "value"
+      },
+      "a050": {
+       "S": "value"
+      },
+      "a051": {
+       "S": "value"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "a056": {
+       "S": "value"
+      },
+      "a057": {
+       "S": "value"
+      },
+      "a058": {
+       "S": "value"
+      },
+      "a059": {
+       "S": "value"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": [
+       {
+        "f": 500,
+        "note": "same",
+        "z_owner": "b",
+        "a000": "value",
+        "a001": "value",
+        "a002": "value",
+        "a003": "value",
+        "a004": "value",
+        "a005": "value",
+        "a006": "value",
+        "a007": "value",
+        "a008": "value",
+        "a009": "value",
+        "a010": "value",
+        "a011": "value",
+        "a012": "value",
+        "a013": "value",
+        "a014": "value",
+        "a015": "value",
+        "a016": "value",
+        "a017": "value",
+        "a018": "value",
+        "a019": "value",
+        "a020": "value",
+        "a021": "value",
+        "a022": "value",
+        "a023": "value",
+        "a024": "value",
+        "a025": "value",
+        "a026": "value",
+        "a027": "value",
+        "a028": "value",
+        "a029": "value",
+        "a030": "value",
+        "a031": "value",
+        "a032": "value",
+        "a033": "value",
+        "a034": "value",
+        "a035": "value",
+        "a036": "value",
+        "a037": "value",
+        "a038": "value",
+        "a039": "value",
+        "a040": "value",
+        "a041": "value",
+        "a042": "value",
+        "a043": "value",
+        "a044": "value",
+        "a045": "value",
+        "a046": "value",
+        "a047": "value",
+        "a048": "value",
+        "a049": "value",
+        "a050": "value",
+        "a051": "value",
+        "a052": "value",
+        "a053": "value",
+        "a054": "value",
+        "a055": "value",
+        "a056": "value",
+        "a057": "value",
+        "a058": "value",
+        "a059": "value",
+        "a060": "value",
+        "a061": "value",
+        "a062": "value",
+        "a063": "value",
+        "a064": "value",
+        "a065": "value",
+        "a066": "value",
+        "a067": "value",
+        "a068": "value",
+        "a069": "value",
+        "a070": "value",
+        "a071": "value",
+        "a072": "value",
+        "a073": "value",
+        "a074": "value",
+        "a075": "value",
+        "a076": "value",
+        "a077": "value",
+        "a078": "value",
+        "a079": "value",
+        "a080": "value",
+        "a081": "value",
+        "a082": "value",
+        "a083": "value",
+        "a084": "value",
+        "a085": "value",
+        "a086": "value",
+        "a087": "value",
+        "a088": "value",
+        "a089": "value",
+        "a090": "value",
+        "a091": "value",
+        "a092": "value",
+        "a093": "value",
+        "a094": "value",
+        "a095": "value",
+        "a096": "value",
+        "a097": "value",
+        "a098": "value",
+        "a099": "value",
+        "a100": "value",
+        "a101": "value",
+        "a102": "value",
+        "a103": "value",
+        "a104": "value",
+        "a105": "value",
+        "a106": "value",
+        "a107": "value",
+        "a108": "value",
+        "a109": "value",
+        "a110": "value",
+        "a111": "value",
+        "a112": "value",
+        "a113": "value",
+        "a114": "value",
+        "a115": "value",
+        "a116": "value",
+        "a117": "value",
+        "a118": "value",
+        "a119": "value",
+        "a120": "value",
+        "a121": "value",
+        "a122": "value",
+        "a123": "value",
+        "a124": "value",
+        "a125": "value",
+        "a126": "value",
+        "a127": "value",
+        "a128": "value",
+        "a129": "value",
+        "a130": "value",
+        "a131": "value",
+        "a132": "value",
+        "a133": "value",
+        "a134": "value",
+        "a135": "value",
+        "a136": "value",
+        "a137": "value",
+        "a138": "value",
+        "a139": "value",
+        "a140": "value",
+        "a141": "value",
+        "a142": "value",
+        "a143": "value",
+        "a144": "value",
+        "a145": "value",
+        "a146": "value",
+        "a147": "value",
+        "a148": "value",
+        "a149": "value",
+        "a150": "value",
+        "a151": "value",
+        "a152": "value",
+        "a153": "value",
+        "a154": "value",
+        "a155": "value",
+        "a156": "value",
+        "a157": "value",
+        "a158": "value",
+        "a159": "value"
+       }
+      ]
+     }
+    }
+   },
+   "remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026597-20",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$guard#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026597-20",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794162026597-20",
+          "Key": {
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#line#0000000000000005"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "a085": {
+       "S": "value"
+      },
+      "a086": {
+       "S": "value"
+      },
+      "a087": {
+       "S": "value"
+      },
+      "a120": {
+       "S": "value"
+      },
+      "a000": {
+       "S": "value"
+      },
+      "a088": {
+       "S": "value"
+      },
+      "a121": {
+       "S": "value"
+      },
+      "a081": {
+       "S": "value"
+      },
+      "a082": {
+       "S": "value"
+      },
+      "a083": {
+       "S": "value"
+      },
+      "a084": {
+       "S": "value"
+      },
+      "a080": {
+       "S": "value"
+      },
+      "a009": {
+       "S": "value"
+      },
+      "a005": {
+       "S": "value"
+      },
+      "a126": {
+       "S": "value"
+      },
+      "a006": {
+       "S": "value"
+      },
+      "a127": {
+       "S": "value"
+      },
+      "a007": {
+       "S": "value"
+      },
+      "a128": {
+       "S": "value"
+      },
+      "a008": {
+       "S": "value"
+      },
+      "a129": {
+       "S": "value"
+      },
+      "a001": {
+       "S": "value"
+      },
+      "a089": {
+       "S": "value"
+      },
+      "a122": {
+       "S": "value"
+      },
+      "a002": {
+       "S": "value"
+      },
+      "a123": {
+       "S": "value"
+      },
+      "a003": {
+       "S": "value"
+      },
+      "a124": {
+       "S": "value"
+      },
+      "a004": {
+       "S": "value"
+      },
+      "a125": {
+       "S": "value"
+      },
+      "a074": {
+       "S": "value"
+      },
+      "a075": {
+       "S": "value"
+      },
+      "a076": {
+       "S": "value"
+      },
+      "a077": {
+       "S": "value"
+      },
+      "a110": {
+       "S": "value"
+      },
+      "a070": {
+       "S": "value"
+      },
+      "a071": {
+       "S": "value"
+      },
+      "a072": {
+       "S": "value"
+      },
+      "a073": {
+       "S": "value"
+      },
+      "a119": {
+       "S": "value"
+      },
+      "a115": {
+       "S": "value"
+      },
+      "a116": {
+       "S": "value"
+      },
+      "a117": {
+       "S": "value"
+      },
+      "a118": {
+       "S": "value"
+      },
+      "a078": {
+       "S": "value"
+      },
+      "a111": {
+       "S": "value"
+      },
+      "a079": {
+       "S": "value"
+      },
+      "a112": {
+       "S": "value"
+      },
+      "a113": {
+       "S": "value"
+      },
+      "a114": {
+       "S": "value"
+      },
+      "a140": {
+       "S": "value"
+      },
+      "a020": {
+       "S": "value"
+      },
+      "a141": {
+       "S": "value"
+      },
+      "a021": {
+       "S": "value"
+      },
+      "a142": {
+       "S": "value"
+      },
+      "a022": {
+       "S": "value"
+      },
+      "a143": {
+       "S": "value"
+      },
+      "a027": {
+       "S": "value"
+      },
+      "a148": {
+       "S": "value"
+      },
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "a028": {
+       "S": "value"
+      },
+      "a149": {
+       "S": "value"
+      },
+      "a029": {
+       "S": "value"
+      },
+      "a023": {
+       "S": "value"
+      },
+      "a144": {
+       "S": "value"
+      },
+      "a024": {
+       "S": "value"
+      },
+      "a145": {
+       "S": "value"
+      },
+      "a025": {
+       "S": "value"
+      },
+      "a146": {
+       "S": "value"
+      },
+      "a026": {
+       "S": "value"
+      },
+      "a147": {
+       "S": "value"
+      },
+      "a096": {
+       "S": "value"
+      },
+      "a097": {
+       "S": "value"
+      },
+      "a130": {
+       "S": "value"
+      },
+      "a010": {
+       "S": "value"
+      },
+      "a098": {
+       "S": "value"
+      },
+      "a131": {
+       "S": "value"
+      },
+      "a011": {
+       "S": "value"
+      },
+      "a099": {
+       "S": "value"
+      },
+      "a132": {
+       "S": "value"
+      },
+      "a092": {
+       "S": "value"
+      },
+      "a093": {
+       "S": "value"
+      },
+      "f": {
+       "N": "5"
+      },
+      "a094": {
+       "S": "value"
+      },
+      "a095": {
+       "S": "value"
+      },
+      "a090": {
+       "S": "value"
+      },
+      "a091": {
+       "S": "value"
+      },
+      "a016": {
+       "S": "value"
+      },
+      "a137": {
+       "S": "value"
+      },
+      "a017": {
+       "S": "value"
+      },
+      "a138": {
+       "S": "value"
+      },
+      "a018": {
+       "S": "value"
+      },
+      "a139": {
+       "S": "value"
+      },
+      "a019": {
+       "S": "value"
+      },
+      "a012": {
+       "S": "value"
+      },
+      "a133": {
+       "S": "value"
+      },
+      "a013": {
+       "S": "value"
+      },
+      "a134": {
+       "S": "value"
+      },
+      "a014": {
+       "S": "value"
+      },
+      "a135": {
+       "S": "value"
+      },
+      "a015": {
+       "S": "value"
+      },
+      "a136": {
+       "S": "value"
+      },
+      "a041": {
+       "S": "value"
+      },
+      "a042": {
+       "S": "value"
+      },
+      "a043": {
+       "S": "value"
+      },
+      "a044": {
+       "S": "value"
+      },
+      "a040": {
+       "S": "value"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "a049": {
+       "S": "value"
+      },
+      "a045": {
+       "S": "value"
+      },
+      "a046": {
+       "S": "value"
+      },
+      "a047": {
+       "S": "value"
+      },
+      "a048": {
+       "S": "value"
+      },
+      "a030": {
+       "S": "value"
+      },
+      "a151": {
+       "S": "value"
+      },
+      "a031": {
+       "S": "value"
+      },
+      "a152": {
+       "S": "value"
+      },
+      "a032": {
+       "S": "value"
+      },
+      "a153": {
+       "S": "value"
+      },
+      "a033": {
+       "S": "value"
+      },
+      "a154": {
+       "S": "value"
+      },
+      "a150": {
+       "S": "value"
+      },
+      "a038": {
+       "S": "value"
+      },
+      "a159": {
+       "S": "value"
+      },
+      "a039": {
+       "S": "value"
+      },
+      "a034": {
+       "S": "value"
+      },
+      "a155": {
+       "S": "value"
+      },
+      "a035": {
+       "S": "value"
+      },
+      "a156": {
+       "S": "value"
+      },
+      "a036": {
+       "S": "value"
+      },
+      "a157": {
+       "S": "value"
+      },
+      "a037": {
+       "S": "value"
+      },
+      "a158": {
+       "S": "value"
+      },
+      "a063": {
+       "S": "value"
+      },
+      "note": {
+       "S": "same"
+      },
+      "a064": {
+       "S": "value"
+      },
+      "a065": {
+       "S": "value"
+      },
+      "a066": {
+       "S": "value"
+      },
+      "a060": {
+       "S": "value"
+      },
+      "a061": {
+       "S": "value"
+      },
+      "a062": {
+       "S": "value"
+      },
+      "a108": {
+       "S": "value"
+      },
+      "a109": {
+       "S": "value"
+      },
+      "a104": {
+       "S": "value"
+      },
+      "a105": {
+       "S": "value"
+      },
+      "a106": {
+       "S": "value"
+      },
+      "a107": {
+       "S": "value"
+      },
+      "a067": {
+       "S": "value"
+      },
+      "a100": {
+       "S": "value"
+      },
+      "a068": {
+       "S": "value"
+      },
+      "a101": {
+       "S": "value"
+      },
+      "a069": {
+       "S": "value"
+      },
+      "a102": {
+       "S": "value"
+      },
+      "a103": {
+       "S": "value"
+      },
+      "a052": {
+       "S": "value"
+      },
+      "a053": {
+       "S": "value"
+      },
+      "a054": {
+       "S": "value"
+      },
+      "a055": {
+       "S": "value"
+      },
+      "a050": {
+       "S": "value"
+      },
+      "a051": {
+       "S": "value"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "a056": {
+       "S": "value"
+      },
+      "a057": {
+       "S": "value"
+      },
+      "a058": {
+       "S": "value"
+      },
+      "a059": {
+       "S": "value"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "race remove a": {
+    "requests": [
+     {
+      "command": "Query",
+      "input": {
+       "TableName": "foreign-1794162026621-21",
+       "KeyConditionExpression": "#pk = :pk",
+       "ExpressionAttributeNames": {
+        "#pk": "pk"
+       },
+       "ExpressionAttributeValues": {
+        ":pk": {
+         "S": "$guard#v1#shared#p q"
+        }
+       }
+      }
+     },
+     {
+      "command": "TransactWriteItems",
+      "input": {
+       "TransactItems": [
+        {
+         "Put": {
+          "TableName": "foreign-1794162026621-21",
+          "Item": {
+           "id": {
+            "S": "p q"
+           },
+           "__edd_e__": {
+            "S": "Roota"
+           },
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#roota"
+           }
+          }
+         }
+        },
+        {
+         "Delete": {
+          "TableName": "foreign-1794162026621-21",
+          "Key": {
+           "pk": {
+            "S": "$guard#v1#shared#p q"
+           },
+           "sk": {
+            "S": "$guard#v1#line#0000000000000005"
+           }
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "rows": [
+     {
+      "a085": {
+       "S": "value"
+      },
+      "a086": {
+       "S": "value"
+      },
+      "a087": {
+       "S": "value"
+      },
+      "a120": {
+       "S": "value"
+      },
+      "a000": {
+       "S": "value"
+      },
+      "a088": {
+       "S": "value"
+      },
+      "a121": {
+       "S": "value"
+      },
+      "a081": {
+       "S": "value"
+      },
+      "a082": {
+       "S": "value"
+      },
+      "a083": {
+       "S": "value"
+      },
+      "a084": {
+       "S": "value"
+      },
+      "a080": {
+       "S": "value"
+      },
+      "a009": {
+       "S": "value"
+      },
+      "a005": {
+       "S": "value"
+      },
+      "a126": {
+       "S": "value"
+      },
+      "a006": {
+       "S": "value"
+      },
+      "a127": {
+       "S": "value"
+      },
+      "a007": {
+       "S": "value"
+      },
+      "a128": {
+       "S": "value"
+      },
+      "a008": {
+       "S": "value"
+      },
+      "a129": {
+       "S": "value"
+      },
+      "a001": {
+       "S": "value"
+      },
+      "a089": {
+       "S": "value"
+      },
+      "a122": {
+       "S": "value"
+      },
+      "a002": {
+       "S": "value"
+      },
+      "a123": {
+       "S": "value"
+      },
+      "a003": {
+       "S": "value"
+      },
+      "a124": {
+       "S": "value"
+      },
+      "a004": {
+       "S": "value"
+      },
+      "a125": {
+       "S": "value"
+      },
+      "a074": {
+       "S": "value"
+      },
+      "a075": {
+       "S": "value"
+      },
+      "a076": {
+       "S": "value"
+      },
+      "a077": {
+       "S": "value"
+      },
+      "a110": {
+       "S": "value"
+      },
+      "a070": {
+       "S": "value"
+      },
+      "a071": {
+       "S": "value"
+      },
+      "a072": {
+       "S": "value"
+      },
+      "a073": {
+       "S": "value"
+      },
+      "a119": {
+       "S": "value"
+      },
+      "a115": {
+       "S": "value"
+      },
+      "a116": {
+       "S": "value"
+      },
+      "a117": {
+       "S": "value"
+      },
+      "a118": {
+       "S": "value"
+      },
+      "a078": {
+       "S": "value"
+      },
+      "a111": {
+       "S": "value"
+      },
+      "a079": {
+       "S": "value"
+      },
+      "a112": {
+       "S": "value"
+      },
+      "a113": {
+       "S": "value"
+      },
+      "a114": {
+       "S": "value"
+      },
+      "a140": {
+       "S": "value"
+      },
+      "a020": {
+       "S": "value"
+      },
+      "a141": {
+       "S": "value"
+      },
+      "a021": {
+       "S": "value"
+      },
+      "a142": {
+       "S": "value"
+      },
+      "a022": {
+       "S": "value"
+      },
+      "a143": {
+       "S": "value"
+      },
+      "a027": {
+       "S": "value"
+      },
+      "a148": {
+       "S": "value"
+      },
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "a028": {
+       "S": "value"
+      },
+      "a149": {
+       "S": "value"
+      },
+      "a029": {
+       "S": "value"
+      },
+      "a023": {
+       "S": "value"
+      },
+      "a144": {
+       "S": "value"
+      },
+      "a024": {
+       "S": "value"
+      },
+      "a145": {
+       "S": "value"
+      },
+      "a025": {
+       "S": "value"
+      },
+      "a146": {
+       "S": "value"
+      },
+      "a026": {
+       "S": "value"
+      },
+      "a147": {
+       "S": "value"
+      },
+      "a096": {
+       "S": "value"
+      },
+      "a097": {
+       "S": "value"
+      },
+      "a130": {
+       "S": "value"
+      },
+      "a010": {
+       "S": "value"
+      },
+      "a098": {
+       "S": "value"
+      },
+      "a131": {
+       "S": "value"
+      },
+      "a011": {
+       "S": "value"
+      },
+      "a099": {
+       "S": "value"
+      },
+      "a132": {
+       "S": "value"
+      },
+      "a092": {
+       "S": "value"
+      },
+      "a093": {
+       "S": "value"
+      },
+      "f": {
+       "N": "5"
+      },
+      "a094": {
+       "S": "value"
+      },
+      "a095": {
+       "S": "value"
+      },
+      "a090": {
+       "S": "value"
+      },
+      "a091": {
+       "S": "value"
+      },
+      "a016": {
+       "S": "value"
+      },
+      "a137": {
+       "S": "value"
+      },
+      "a017": {
+       "S": "value"
+      },
+      "a138": {
+       "S": "value"
+      },
+      "a018": {
+       "S": "value"
+      },
+      "a139": {
+       "S": "value"
+      },
+      "a019": {
+       "S": "value"
+      },
+      "a012": {
+       "S": "value"
+      },
+      "a133": {
+       "S": "value"
+      },
+      "a013": {
+       "S": "value"
+      },
+      "a134": {
+       "S": "value"
+      },
+      "a014": {
+       "S": "value"
+      },
+      "a135": {
+       "S": "value"
+      },
+      "a015": {
+       "S": "value"
+      },
+      "a136": {
+       "S": "value"
+      },
+      "a041": {
+       "S": "value"
+      },
+      "a042": {
+       "S": "value"
+      },
+      "a043": {
+       "S": "value"
+      },
+      "a044": {
+       "S": "value"
+      },
+      "z_owner": {
+       "S": "b"
+      },
+      "a040": {
+       "S": "value"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "a049": {
+       "S": "value"
+      },
+      "a045": {
+       "S": "value"
+      },
+      "a046": {
+       "S": "value"
+      },
+      "a047": {
+       "S": "value"
+      },
+      "a048": {
+       "S": "value"
+      },
+      "a030": {
+       "S": "value"
+      },
+      "a151": {
+       "S": "value"
+      },
+      "a031": {
+       "S": "value"
+      },
+      "a152": {
+       "S": "value"
+      },
+      "a032": {
+       "S": "value"
+      },
+      "a153": {
+       "S": "value"
+      },
+      "a033": {
+       "S": "value"
+      },
+      "a154": {
+       "S": "value"
+      },
+      "a150": {
+       "S": "value"
+      },
+      "a038": {
+       "S": "value"
+      },
+      "a159": {
+       "S": "value"
+      },
+      "a039": {
+       "S": "value"
+      },
+      "a034": {
+       "S": "value"
+      },
+      "a155": {
+       "S": "value"
+      },
+      "a035": {
+       "S": "value"
+      },
+      "a156": {
+       "S": "value"
+      },
+      "a036": {
+       "S": "value"
+      },
+      "a157": {
+       "S": "value"
+      },
+      "a037": {
+       "S": "value"
+      },
+      "a158": {
+       "S": "value"
+      },
+      "a063": {
+       "S": "value"
+      },
+      "note": {
+       "S": "same"
+      },
+      "a064": {
+       "S": "value"
+      },
+      "a065": {
+       "S": "value"
+      },
+      "a066": {
+       "S": "value"
+      },
+      "a060": {
+       "S": "value"
+      },
+      "a061": {
+       "S": "value"
+      },
+      "a062": {
+       "S": "value"
+      },
+      "a108": {
+       "S": "value"
+      },
+      "a109": {
+       "S": "value"
+      },
+      "a104": {
+       "S": "value"
+      },
+      "a105": {
+       "S": "value"
+      },
+      "a106": {
+       "S": "value"
+      },
+      "a107": {
+       "S": "value"
+      },
+      "a067": {
+       "S": "value"
+      },
+      "a100": {
+       "S": "value"
+      },
+      "a068": {
+       "S": "value"
+      },
+      "a101": {
+       "S": "value"
+      },
+      "a069": {
+       "S": "value"
+      },
+      "a102": {
+       "S": "value"
+      },
+      "a103": {
+       "S": "value"
+      },
+      "a052": {
+       "S": "value"
+      },
+      "a053": {
+       "S": "value"
+      },
+      "a054": {
+       "S": "value"
+      },
+      "a055": {
+       "S": "value"
+      },
+      "a050": {
+       "S": "value"
+      },
+      "a051": {
+       "S": "value"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "a056": {
+       "S": "value"
+      },
+      "a057": {
+       "S": "value"
+      },
+      "a058": {
+       "S": "value"
+      },
+      "a059": {
+       "S": "value"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ],
+    "result": {
+     "ok": {
+      "id": "p q",
+      "lines": []
+     }
+    }
+   },
+   "rekey a dry run": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query"
+    ],
+    "rows": [
+     {
+      "a085": {
+       "S": "value"
+      },
+      "a086": {
+       "S": "value"
+      },
+      "a087": {
+       "S": "value"
+      },
+      "a120": {
+       "S": "value"
+      },
+      "a000": {
+       "S": "value"
+      },
+      "a088": {
+       "S": "value"
+      },
+      "a121": {
+       "S": "value"
+      },
+      "a081": {
+       "S": "value"
+      },
+      "a082": {
+       "S": "value"
+      },
+      "a083": {
+       "S": "value"
+      },
+      "a084": {
+       "S": "value"
+      },
+      "a080": {
+       "S": "value"
+      },
+      "a009": {
+       "S": "value"
+      },
+      "a005": {
+       "S": "value"
+      },
+      "a126": {
+       "S": "value"
+      },
+      "a006": {
+       "S": "value"
+      },
+      "a127": {
+       "S": "value"
+      },
+      "a007": {
+       "S": "value"
+      },
+      "a128": {
+       "S": "value"
+      },
+      "a008": {
+       "S": "value"
+      },
+      "a129": {
+       "S": "value"
+      },
+      "a001": {
+       "S": "value"
+      },
+      "a089": {
+       "S": "value"
+      },
+      "a122": {
+       "S": "value"
+      },
+      "a002": {
+       "S": "value"
+      },
+      "a123": {
+       "S": "value"
+      },
+      "a003": {
+       "S": "value"
+      },
+      "a124": {
+       "S": "value"
+      },
+      "a004": {
+       "S": "value"
+      },
+      "a125": {
+       "S": "value"
+      },
+      "a074": {
+       "S": "value"
+      },
+      "a075": {
+       "S": "value"
+      },
+      "a076": {
+       "S": "value"
+      },
+      "a077": {
+       "S": "value"
+      },
+      "a110": {
+       "S": "value"
+      },
+      "a070": {
+       "S": "value"
+      },
+      "a071": {
+       "S": "value"
+      },
+      "a072": {
+       "S": "value"
+      },
+      "a073": {
+       "S": "value"
+      },
+      "a119": {
+       "S": "value"
+      },
+      "a115": {
+       "S": "value"
+      },
+      "a116": {
+       "S": "value"
+      },
+      "a117": {
+       "S": "value"
+      },
+      "a118": {
+       "S": "value"
+      },
+      "a078": {
+       "S": "value"
+      },
+      "a111": {
+       "S": "value"
+      },
+      "a079": {
+       "S": "value"
+      },
+      "a112": {
+       "S": "value"
+      },
+      "a113": {
+       "S": "value"
+      },
+      "a114": {
+       "S": "value"
+      },
+      "a140": {
+       "S": "value"
+      },
+      "a020": {
+       "S": "value"
+      },
+      "a141": {
+       "S": "value"
+      },
+      "a021": {
+       "S": "value"
+      },
+      "a142": {
+       "S": "value"
+      },
+      "a022": {
+       "S": "value"
+      },
+      "a143": {
+       "S": "value"
+      },
+      "a027": {
+       "S": "value"
+      },
+      "a148": {
+       "S": "value"
+      },
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "a028": {
+       "S": "value"
+      },
+      "a149": {
+       "S": "value"
+      },
+      "a029": {
+       "S": "value"
+      },
+      "a023": {
+       "S": "value"
+      },
+      "a144": {
+       "S": "value"
+      },
+      "a024": {
+       "S": "value"
+      },
+      "a145": {
+       "S": "value"
+      },
+      "a025": {
+       "S": "value"
+      },
+      "a146": {
+       "S": "value"
+      },
+      "a026": {
+       "S": "value"
+      },
+      "a147": {
+       "S": "value"
+      },
+      "a096": {
+       "S": "value"
+      },
+      "a097": {
+       "S": "value"
+      },
+      "a130": {
+       "S": "value"
+      },
+      "a010": {
+       "S": "value"
+      },
+      "a098": {
+       "S": "value"
+      },
+      "a131": {
+       "S": "value"
+      },
+      "a011": {
+       "S": "value"
+      },
+      "a099": {
+       "S": "value"
+      },
+      "a132": {
+       "S": "value"
+      },
+      "a092": {
+       "S": "value"
+      },
+      "a093": {
+       "S": "value"
+      },
+      "f": {
+       "N": "5"
+      },
+      "a094": {
+       "S": "value"
+      },
+      "a095": {
+       "S": "value"
+      },
+      "a090": {
+       "S": "value"
+      },
+      "a091": {
+       "S": "value"
+      },
+      "a016": {
+       "S": "value"
+      },
+      "a137": {
+       "S": "value"
+      },
+      "a017": {
+       "S": "value"
+      },
+      "a138": {
+       "S": "value"
+      },
+      "a018": {
+       "S": "value"
+      },
+      "a139": {
+       "S": "value"
+      },
+      "a019": {
+       "S": "value"
+      },
+      "a012": {
+       "S": "value"
+      },
+      "a133": {
+       "S": "value"
+      },
+      "a013": {
+       "S": "value"
+      },
+      "a134": {
+       "S": "value"
+      },
+      "a014": {
+       "S": "value"
+      },
+      "a135": {
+       "S": "value"
+      },
+      "a015": {
+       "S": "value"
+      },
+      "a136": {
+       "S": "value"
+      },
+      "a041": {
+       "S": "value"
+      },
+      "a042": {
+       "S": "value"
+      },
+      "a043": {
+       "S": "value"
+      },
+      "a044": {
+       "S": "value"
+      },
+      "a040": {
+       "S": "value"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "a049": {
+       "S": "value"
+      },
+      "a045": {
+       "S": "value"
+      },
+      "a046": {
+       "S": "value"
+      },
+      "a047": {
+       "S": "value"
+      },
+      "a048": {
+       "S": "value"
+      },
+      "a030": {
+       "S": "value"
+      },
+      "a151": {
+       "S": "value"
+      },
+      "a031": {
+       "S": "value"
+      },
+      "a152": {
+       "S": "value"
+      },
+      "a032": {
+       "S": "value"
+      },
+      "a153": {
+       "S": "value"
+      },
+      "a033": {
+       "S": "value"
+      },
+      "a154": {
+       "S": "value"
+      },
+      "a150": {
+       "S": "value"
+      },
+      "a038": {
+       "S": "value"
+      },
+      "a159": {
+       "S": "value"
+      },
+      "a039": {
+       "S": "value"
+      },
+      "a034": {
+       "S": "value"
+      },
+      "a155": {
+       "S": "value"
+      },
+      "a035": {
+       "S": "value"
+      },
+      "a156": {
+       "S": "value"
+      },
+      "a036": {
+       "S": "value"
+      },
+      "a157": {
+       "S": "value"
+      },
+      "a037": {
+       "S": "value"
+      },
+      "a158": {
+       "S": "value"
+      },
+      "a063": {
+       "S": "value"
+      },
+      "note": {
+       "S": "same"
+      },
+      "a064": {
+       "S": "value"
+      },
+      "a065": {
+       "S": "value"
+      },
+      "a066": {
+       "S": "value"
+      },
+      "a060": {
+       "S": "value"
+      },
+      "a061": {
+       "S": "value"
+      },
+      "a062": {
+       "S": "value"
+      },
+      "a108": {
+       "S": "value"
+      },
+      "a109": {
+       "S": "value"
+      },
+      "a104": {
+       "S": "value"
+      },
+      "a105": {
+       "S": "value"
+      },
+      "a106": {
+       "S": "value"
+      },
+      "a107": {
+       "S": "value"
+      },
+      "a067": {
+       "S": "value"
+      },
+      "a100": {
+       "S": "value"
+      },
+      "a068": {
+       "S": "value"
+      },
+      "a101": {
+       "S": "value"
+      },
+      "a069": {
+       "S": "value"
+      },
+      "a102": {
+       "S": "value"
+      },
+      "a103": {
+       "S": "value"
+      },
+      "a052": {
+       "S": "value"
+      },
+      "a053": {
+       "S": "value"
+      },
+      "a054": {
+       "S": "value"
+      },
+      "a055": {
+       "S": "value"
+      },
+      "a050": {
+       "S": "value"
+      },
+      "a051": {
+       "S": "value"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "a056": {
+       "S": "value"
+      },
+      "a057": {
+       "S": "value"
+      },
+      "a058": {
+       "S": "value"
+      },
+      "a059": {
+       "S": "value"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     }
+    ]
+   },
+   "rekey a": {
+    "report": {
+     "scanned": 3,
+     "unchanged": 1,
+     "moved": 1,
+     "indexKeysRewritten": 0,
+     "conflicts": []
+    },
+    "commands": [
+     "Scan",
+     "GetItem",
+     "GetItem",
+     "Query",
+     "Query",
+     "TransactWriteItems"
+    ],
+    "rows": [
+     {
+      "a085": {
+       "S": "value"
+      },
+      "a086": {
+       "S": "value"
+      },
+      "a087": {
+       "S": "value"
+      },
+      "a120": {
+       "S": "value"
+      },
+      "a000": {
+       "S": "value"
+      },
+      "a088": {
+       "S": "value"
+      },
+      "a121": {
+       "S": "value"
+      },
+      "a081": {
+       "S": "value"
+      },
+      "a082": {
+       "S": "value"
+      },
+      "a083": {
+       "S": "value"
+      },
+      "a084": {
+       "S": "value"
+      },
+      "a080": {
+       "S": "value"
+      },
+      "a009": {
+       "S": "value"
+      },
+      "a005": {
+       "S": "value"
+      },
+      "a126": {
+       "S": "value"
+      },
+      "a006": {
+       "S": "value"
+      },
+      "a127": {
+       "S": "value"
+      },
+      "a007": {
+       "S": "value"
+      },
+      "a128": {
+       "S": "value"
+      },
+      "a008": {
+       "S": "value"
+      },
+      "a129": {
+       "S": "value"
+      },
+      "a001": {
+       "S": "value"
+      },
+      "a089": {
+       "S": "value"
+      },
+      "a122": {
+       "S": "value"
+      },
+      "a002": {
+       "S": "value"
+      },
+      "a123": {
+       "S": "value"
+      },
+      "a003": {
+       "S": "value"
+      },
+      "a124": {
+       "S": "value"
+      },
+      "a004": {
+       "S": "value"
+      },
+      "a125": {
+       "S": "value"
+      },
+      "a074": {
+       "S": "value"
+      },
+      "a075": {
+       "S": "value"
+      },
+      "a076": {
+       "S": "value"
+      },
+      "a077": {
+       "S": "value"
+      },
+      "a110": {
+       "S": "value"
+      },
+      "a070": {
+       "S": "value"
+      },
+      "a071": {
+       "S": "value"
+      },
+      "a072": {
+       "S": "value"
+      },
+      "a073": {
+       "S": "value"
+      },
+      "a119": {
+       "S": "value"
+      },
+      "a115": {
+       "S": "value"
+      },
+      "a116": {
+       "S": "value"
+      },
+      "a117": {
+       "S": "value"
+      },
+      "a118": {
+       "S": "value"
+      },
+      "a078": {
+       "S": "value"
+      },
+      "a111": {
+       "S": "value"
+      },
+      "a079": {
+       "S": "value"
+      },
+      "a112": {
+       "S": "value"
+      },
+      "a113": {
+       "S": "value"
+      },
+      "a114": {
+       "S": "value"
+      },
+      "a140": {
+       "S": "value"
+      },
+      "a020": {
+       "S": "value"
+      },
+      "a141": {
+       "S": "value"
+      },
+      "a021": {
+       "S": "value"
+      },
+      "a142": {
+       "S": "value"
+      },
+      "a022": {
+       "S": "value"
+      },
+      "a143": {
+       "S": "value"
+      },
+      "a027": {
+       "S": "value"
+      },
+      "a148": {
+       "S": "value"
+      },
+      "sk": {
+       "S": "$guard#v1#line#0000000000000050"
+      },
+      "a028": {
+       "S": "value"
+      },
+      "a149": {
+       "S": "value"
+      },
+      "a029": {
+       "S": "value"
+      },
+      "a023": {
+       "S": "value"
+      },
+      "a144": {
+       "S": "value"
+      },
+      "a024": {
+       "S": "value"
+      },
+      "a145": {
+       "S": "value"
+      },
+      "a025": {
+       "S": "value"
+      },
+      "a146": {
+       "S": "value"
+      },
+      "a026": {
+       "S": "value"
+      },
+      "a147": {
+       "S": "value"
+      },
+      "a096": {
+       "S": "value"
+      },
+      "a097": {
+       "S": "value"
+      },
+      "a130": {
+       "S": "value"
+      },
+      "a010": {
+       "S": "value"
+      },
+      "a098": {
+       "S": "value"
+      },
+      "a131": {
+       "S": "value"
+      },
+      "a011": {
+       "S": "value"
+      },
+      "a099": {
+       "S": "value"
+      },
+      "a132": {
+       "S": "value"
+      },
+      "a092": {
+       "S": "value"
+      },
+      "a093": {
+       "S": "value"
+      },
+      "f": {
+       "N": "5"
+      },
+      "a094": {
+       "S": "value"
+      },
+      "a095": {
+       "S": "value"
+      },
+      "a090": {
+       "S": "value"
+      },
+      "a091": {
+       "S": "value"
+      },
+      "a016": {
+       "S": "value"
+      },
+      "a137": {
+       "S": "value"
+      },
+      "a017": {
+       "S": "value"
+      },
+      "a138": {
+       "S": "value"
+      },
+      "a018": {
+       "S": "value"
+      },
+      "a139": {
+       "S": "value"
+      },
+      "a019": {
+       "S": "value"
+      },
+      "a012": {
+       "S": "value"
+      },
+      "a133": {
+       "S": "value"
+      },
+      "a013": {
+       "S": "value"
+      },
+      "a134": {
+       "S": "value"
+      },
+      "a014": {
+       "S": "value"
+      },
+      "a135": {
+       "S": "value"
+      },
+      "a015": {
+       "S": "value"
+      },
+      "a136": {
+       "S": "value"
+      },
+      "a041": {
+       "S": "value"
+      },
+      "a042": {
+       "S": "value"
+      },
+      "a043": {
+       "S": "value"
+      },
+      "a044": {
+       "S": "value"
+      },
+      "a040": {
+       "S": "value"
+      },
+      "__edd_e__": {
+       "S": "Line"
+      },
+      "a049": {
+       "S": "value"
+      },
+      "a045": {
+       "S": "value"
+      },
+      "a046": {
+       "S": "value"
+      },
+      "a047": {
+       "S": "value"
+      },
+      "a048": {
+       "S": "value"
+      },
+      "a030": {
+       "S": "value"
+      },
+      "a151": {
+       "S": "value"
+      },
+      "a031": {
+       "S": "value"
+      },
+      "a152": {
+       "S": "value"
+      },
+      "a032": {
+       "S": "value"
+      },
+      "a153": {
+       "S": "value"
+      },
+      "a033": {
+       "S": "value"
+      },
+      "a154": {
+       "S": "value"
+      },
+      "a150": {
+       "S": "value"
+      },
+      "a038": {
+       "S": "value"
+      },
+      "a159": {
+       "S": "value"
+      },
+      "a039": {
+       "S": "value"
+      },
+      "a034": {
+       "S": "value"
+      },
+      "a155": {
+       "S": "value"
+      },
+      "a035": {
+       "S": "value"
+      },
+      "a156": {
+       "S": "value"
+      },
+      "a036": {
+       "S": "value"
+      },
+      "a157": {
+       "S": "value"
+      },
+      "a037": {
+       "S": "value"
+      },
+      "a158": {
+       "S": "value"
+      },
+      "a063": {
+       "S": "value"
+      },
+      "note": {
+       "S": "same"
+      },
+      "a064": {
+       "S": "value"
+      },
+      "a065": {
+       "S": "value"
+      },
+      "a066": {
+       "S": "value"
+      },
+      "a060": {
+       "S": "value"
+      },
+      "a061": {
+       "S": "value"
+      },
+      "a062": {
+       "S": "value"
+      },
+      "a108": {
+       "S": "value"
+      },
+      "a109": {
+       "S": "value"
+      },
+      "a104": {
+       "S": "value"
+      },
+      "a105": {
+       "S": "value"
+      },
+      "a106": {
+       "S": "value"
+      },
+      "a107": {
+       "S": "value"
+      },
+      "a067": {
+       "S": "value"
+      },
+      "a100": {
+       "S": "value"
+      },
+      "a068": {
+       "S": "value"
+      },
+      "a101": {
+       "S": "value"
+      },
+      "a069": {
+       "S": "value"
+      },
+      "a102": {
+       "S": "value"
+      },
+      "a103": {
+       "S": "value"
+      },
+      "a052": {
+       "S": "value"
+      },
+      "a053": {
+       "S": "value"
+      },
+      "a054": {
+       "S": "value"
+      },
+      "a055": {
+       "S": "value"
+      },
+      "a050": {
+       "S": "value"
+      },
+      "a051": {
+       "S": "value"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "a056": {
+       "S": "value"
+      },
+      "a057": {
+       "S": "value"
+      },
+      "a058": {
+       "S": "value"
+      },
+      "a059": {
+       "S": "value"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#rootb"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p q"
+      },
+      "__edd_e__": {
+       "S": "Rootb"
+      }
+     },
+     {
+      "sk": {
+       "S": "$guard#v1#roota"
+      },
+      "id": {
+       "S": "p q"
+      },
+      "pk": {
+       "S": "$guard#v1#shared#p%20q"
+      },
+      "__edd_e__": {
+       "S": "Roota"
+      }
+     }
+    ]
+   }
+  }
+ }
+}

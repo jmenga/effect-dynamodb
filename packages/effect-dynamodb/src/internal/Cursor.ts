@@ -1,13 +1,13 @@
 /**
- * @internal Cursor — the opaque string a query's `fetch` hands back (#171,
- * design §10).
+ * @internal Cursor — the opaque string a query's `fetch` or an aggregate's
+ * `list` hands back (#171, design §10).
  *
  * Two formats:
  *
  * - **Legacy** — `btoa(JSON.stringify(key))`: a bare `LastEvaluatedKey`. Every
- *   query without a planner still emits it whenever it can carry the key
- *   exactly (every value `S` / `N`, and JSON text `btoa` accepts), so the
- *   cursors of plain queries are the bytes they always were.
+ *   query without a planner, and `Aggregate.list`, still emits it whenever it
+ *   can carry the key exactly (every value `S` / `N`, and JSON text `btoa`
+ *   accepts), so their cursors are the bytes they always were.
  * - **v2** — `"v2." + base64url(utf8(JSON))` of a {@link CursorV2}: a key with
  *   `B` values or text outside Latin-1 (on which `btoa` threw), and every
  *   cursor of a planned query, which carries its plan's fingerprint, mode and
@@ -146,11 +146,11 @@ const isLatin1 = (text: string): boolean => {
 }
 
 /**
- * The cursor of a query without a planner, resuming after `key`: the legacy
- * bytes whenever they carry it exactly (every value `S` / `N`, Latin-1 JSON —
- * what every such cursor always was), else `{ v: 2, k }`. A `B` value
- * serialises as `{"0":…}` in the legacy form and never round-trips, and
- * `btoa` throws on text above U+00FF (design §19 E2).
+ * The cursor of a query without a planner or an aggregate's list, resuming
+ * after `key`: the legacy bytes whenever they carry it exactly (every value
+ * `S` / `N`, Latin-1 JSON — what every such cursor always was), else
+ * `{ v: 2, k }`. A `B` value serialises as `{"0":…}` in the legacy form and
+ * never round-trips, and `btoa` throws on text above U+00FF (design §19 E2).
  */
 export const encodeKeyCursor = (key: Record<string, AttributeValue>): string => {
   const json = JSON.stringify(key)
@@ -231,4 +231,19 @@ export const decode = (text: string): CursorV2 | undefined => {
   const positions = [parsed.k, parsed.a, parsed.d].filter((field) => field !== undefined)
   if (positions.length > 1) return undefined
   return parsed as unknown as CursorV2
+}
+
+/**
+ * The `ExclusiveStartKey` of a cursor {@link encodeKeyCursor} wrote, or
+ * `undefined` when `text` isn't one: malformed by {@link decode}'s rules, or a
+ * v2 envelope holding anything beside the key, as a planned or sharded query's
+ * does. For a reader with no plan to place a cursor in. The key isn't checked
+ * against the request: as on a query without a planner, that is DynamoDB's to
+ * refuse, and a key of the right shape resumes from wherever it points.
+ */
+export const decodeKeyCursor = (text: string): Record<string, AttributeValue> | undefined => {
+  const cursor = decode(text)
+  if (cursor?.k === undefined) return undefined
+  const keyOnly = Object.keys(cursor).every((field) => field === "v" || field === "k")
+  return keyOnly ? keyFromWire(cursor.k) : undefined
 }

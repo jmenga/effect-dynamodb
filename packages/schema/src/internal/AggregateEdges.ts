@@ -20,8 +20,8 @@ import type { Schema } from "effect"
  * the edge descriptors and the runtime helpers in `AggregateSchemas.ts`.
  *
  * `indexes` mirrors `Entity.indexes` (`{ primary: { pk: { composite } }, ... }`);
- * `RefEntityIdentifierValue` reads `indexes.primary.pk.composite` to recover the
- * branded id type. A wider/looser `indexes` simply falls back to `string`.
+ * the aggregate input types read the primary key's one composite off it to
+ * recover the id's type. A wider/looser `indexes` simply falls back to `string`.
  *
  * This is a PURE structural bound: edge derivation only reads
  * `model`/`indexes`/`entityType`/`schemas` to recover the ref-id field and its
@@ -50,7 +50,7 @@ export interface RefEntity<M extends Schema.Top = Schema.Top, TIndexes = unknown
  *
  * Generic over the referenced entity `E` so its branded primary-key identifier
  * type flows into the derived aggregate input/update types via
- * `RefEntityIdentifierValue<E>`. `E = RefEntity` (the default) preserves the
+ * its primary key's one composite. `E = RefEntity` (the default) preserves the
  * non-generic shape for edges without an associated entity.
  */
 export interface OneEdge<E extends RefEntity = RefEntity> {

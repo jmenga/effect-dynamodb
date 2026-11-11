@@ -1,0 +1,165 @@
+{
+  "generatedBy": "effect-dynamodb@1.39.0: gen-colliding-edges.mjs",
+  "escapeKeysOff": [
+    {
+      "n": {
+        "N": "-3"
+      },
+      "note": {
+        "S": "bigint"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#a #_%"
+      },
+      "sk": {
+        "S": "$edges#v1#line#000000000000000000000000000000000000-3"
+      }
+    },
+    {
+      "id": {
+        "S": "a #_%"
+      },
+      "__edd_e__": {
+        "S": "Root"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#a #_%"
+      },
+      "sk": {
+        "S": "$edges#v1#root"
+      }
+    },
+    {
+      "n": {
+        "N": "3"
+      },
+      "note": {
+        "S": "bigint"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#both"
+      },
+      "sk": {
+        "S": "$edges#v1#line#00000000000000000000000000000000000003"
+      }
+    },
+    {
+      "n": {
+        "N": "3"
+      },
+      "note": {
+        "S": "number"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#both"
+      },
+      "sk": {
+        "S": "$edges#v1#line#0000000000000003"
+      }
+    },
+    {
+      "id": {
+        "S": "both"
+      },
+      "__edd_e__": {
+        "S": "Root"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#both"
+      },
+      "sk": {
+        "S": "$edges#v1#root"
+      }
+    }
+  ],
+  "escapeKeysOn": [
+    {
+      "n": {
+        "N": "-3"
+      },
+      "note": {
+        "S": "bigint"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#a%20%23_%25"
+      },
+      "sk": {
+        "S": "$edges#v1#line#-99999999999999999999999999999999999996:"
+      }
+    },
+    {
+      "id": {
+        "S": "a #_%"
+      },
+      "__edd_e__": {
+        "S": "Root"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#a%20%23_%25"
+      },
+      "sk": {
+        "S": "$edges#v1#root"
+      }
+    },
+    {
+      "n": {
+        "N": "3"
+      },
+      "note": {
+        "S": "bigint"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#both"
+      },
+      "sk": {
+        "S": "$edges#v1#line#00000000000000000000000000000000000003"
+      }
+    },
+    {
+      "n": {
+        "N": "3"
+      },
+      "note": {
+        "S": "number"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#both"
+      },
+      "sk": {
+        "S": "$edges#v1#line#0000000000000003"
+      }
+    },
+    {
+      "id": {
+        "S": "both"
+      },
+      "__edd_e__": {
+        "S": "Root"
+      },
+      "pk": {
+        "S": "$edges#v1#roots#both"
+      },
+      "sk": {
+        "S": "$edges#v1#root"
+      }
+    }
+  ]
+}

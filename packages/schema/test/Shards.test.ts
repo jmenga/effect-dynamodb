@@ -2004,3 +2004,188 @@ describe("assertCollectionShardsAgreement", () => {
     ).toThrow("[EDD-9103]")
   })
 })
+
+// `Entity.make` loads every time-series definition, as 1.39.0 did, whatever its `appendInput` carries
+// beside a sharded index's `by` attribute. An append that can't compose the index's key fails with
+// EDD-9100 when it's made, through the composer every append goes through; nothing is written.
+// (`OptionalShardAppend.ts` and `WideShardAppend.ts` in effect-dynamodb pin what 1.39.0 did.)
+describe("an appendInput carrying a sharded index's `by` attribute", () => {
+  class Reading extends Schema.Class<Reading>("ReadingAppendShard")({
+    id: Schema.String,
+    at: Schema.Number,
+    tenant: Schema.String,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+    site: Schema.optional(Schema.String),
+  }) {}
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const index = (
+    policy: "sparse" | "preserve",
+    sk: ReadonlyArray<string>,
+    by: ReadonlyArray<string>,
+  ) =>
+    ({
+      byTenant: {
+        name: "gsi",
+        indexPolicy: { pk: policy, sk: policy },
+        pk: { field: "gpk", composite: ["tenant"] },
+        sk: { field: "gsk", composite: sk },
+        shards: { count: 4, by },
+      },
+    }) as const
+  const make = (indexes: unknown, appendInput: Record<string, Schema.Top>) =>
+    Entity.make({
+      model: Reading,
+      entityType: "Reading",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({ id: Schema.String, at: Schema.Number, ...appendInput }),
+      },
+    } as never) as unknown as { readonly indexes: Record<string, KeyComposer.IndexDefinition> }
+  /** Composes the index keys of an append holding `held`, as the append does. */
+  const append = (
+    entity: { readonly indexes: Record<string, KeyComposer.IndexDefinition> },
+    held: Record<string, unknown>,
+  ) =>
+    KeyComposer.composeGsiKeysForUpdatePolicyAware(
+      schema,
+      "Reading",
+      1,
+      { primary: entity.indexes.primary!, byTenant: entity.indexes.byTenant! },
+      Object.fromEntries(Object.entries(held).filter(([field]) => field !== "id")),
+      held,
+    )
+
+  it.each<[string, ReturnType<typeof index>, Record<string, Schema.Top>, Record<string, unknown>]>([
+    [
+      "`by` without the composite before it, under preserve",
+      index("preserve", ["region", "group"], ["group"]),
+      { tenant: Schema.String, group: Schema.String },
+      { id: "1", at: 1, tenant: "t", group: "g" },
+    ],
+    [
+      "`by` without the partition key's composite",
+      index("sparse", ["group"], ["group"]),
+      { group: Schema.String },
+      { id: "1", at: 1, group: "g" },
+    ],
+    [
+      "`by` before a composite every append leaves out, with one after it",
+      index("preserve", ["group", "region", "site"], ["group"]),
+      { tenant: Schema.String, group: Schema.String, site: Schema.String },
+      { id: "1", at: 1, tenant: "t", group: "g", site: "s" },
+    ],
+    [
+      "an optional `by` beside the partition key's composite, left out",
+      index("preserve", ["region", "group"], ["group"]),
+      { tenant: Schema.String, group: Schema.optional(Schema.String) },
+      { id: "1", at: 1, tenant: "t" },
+    ],
+    [
+      "an optional `by` beside the partition key's composite, held",
+      index("preserve", ["region", "group"], ["group"]),
+      { tenant: Schema.String, group: Schema.optional(Schema.String) },
+      { id: "1", at: 1, tenant: "t", group: "g" },
+    ],
+  ])("%s: loads, and the append fails with EDD-9100", (_name, indexes, appendInput, held) => {
+    const entity = make(indexes, appendInput)
+    expect(() => append(entity, held)).toThrow("[EDD-9100]")
+  })
+
+  it("the whole key carried composes", () => {
+    const entity = make(index("preserve", ["region", "group"], ["group"]), {
+      tenant: Schema.String,
+      region: Schema.String,
+      group: Schema.String,
+    })
+    expect(() =>
+      append(entity, { id: "1", at: 1, tenant: "t", region: "r", group: "g" }),
+    ).not.toThrow()
+  })
+
+  it.each([
+    ["Schema.optional", Schema.optional(Schema.String)],
+    ["Schema.optionalKey", Schema.optionalKey(Schema.String)],
+    ["Schema.UndefinedOr", Schema.UndefinedOr(Schema.String)],
+    ["Schema.NullOr", Schema.NullOr(Schema.String)],
+  ])("`by` under %s: an append without it leaves the index alone", (_name, group) => {
+    const entity = make(index("preserve", ["region", "group"], ["group"]), { group })
+    expect(() => append(entity, { id: "1", at: 1 })).not.toThrow()
+  })
+
+  it("under sparse, a sort key hole takes the row out of the index", () => {
+    const entity = make(index("sparse", ["region", "group"], ["group"]), {
+      tenant: Schema.String,
+      group: Schema.String,
+    })
+    expect(() => append(entity, { id: "1", at: 1, tenant: "t", group: "g" })).not.toThrow()
+  })
+
+  it("a gap after `by` is a truncated key, not a hole", () => {
+    const entity = make(index("preserve", ["group", "site"], ["group"]), {
+      tenant: Schema.String,
+      group: Schema.String,
+    })
+    expect(() => append(entity, { id: "1", at: 1, tenant: "t", group: "g" })).not.toThrow()
+  })
+
+  // Published 1.39.0 loaded both in milliseconds; a check trying every combination of what an input
+  // may leave out never finished at 31.
+  describe("however many composites an input may leave out", () => {
+    const optional = Object.fromEntries(
+      Array.from({ length: 40 }, (_, i) => [`p${i}`, Schema.optionalKey(Schema.String)]),
+    )
+    const load = (sk: ReadonlyArray<string>, appendInput: Record<string, Schema.Top>) => {
+      const start = performance.now()
+      Entity.make({
+        model: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.optionalKey(Schema.String),
+          gap: Schema.optionalKey(Schema.String),
+          group: Schema.optionalKey(Schema.String),
+          ...optional,
+        }),
+        entityType: "Reading",
+        primaryKey,
+        indexes: {
+          byTenant: {
+            name: "gsi",
+            pk: { field: "gpk", composite: ["tenant"] },
+            sk: { field: "gsk", composite: sk },
+            shards: { count: 4, by: ["group"] },
+          },
+        },
+        timeSeries: {
+          orderBy: "at",
+          appendInput: Schema.Struct({ id: Schema.String, at: Schema.Number, ...appendInput }),
+        },
+      } as never)
+      return performance.now() - start
+    }
+
+    it("40 optional composites and an optional `by` after them load at once", () => {
+      expect(
+        load([...Object.keys(optional), "group"], {
+          ...optional,
+          group: Schema.optionalKey(Schema.String),
+        }),
+      ).toBeLessThan(250)
+    })
+
+    it("a `by` no append composes, beside 40 optional composites, loads at once", () => {
+      expect(
+        load(["gap", "group", ...Object.keys(optional)], {
+          tenant: Schema.String,
+          group: Schema.String,
+          ...optional,
+        }),
+      ).toBeLessThan(250)
+    })
+  })
+})

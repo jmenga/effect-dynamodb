@@ -325,23 +325,235 @@ export interface BuiltTransactWriteItems {
   readonly keys: () => KeyAttributes
 }
 
+/** A put's item, built and validated (`validateAndBuildPutItem`). */
+type BuiltPut = Effect.Success<ReturnType<typeof validateAndBuildPutItem>>
+
+/** One caller op, with everything its items need that takes no read. */
+interface PreparedOp {
+  readonly type: "put" | "delete" | "conditionCheck" | "planned"
+  readonly putKind?: "put" | "create" | "upsert" | undefined
+  readonly entity: Entity
+  /** Index into the caller's `operations` array — preserved for provenance. */
+  readonly opIndex: number
+  readonly input?: Record<string, unknown> | undefined
+  readonly condition?: ExpressionResult | undefined
+  /** The caller's own condition — what a `create` over a tombstone keeps. */
+  readonly callerCondition?: Expr | ConditionInput | undefined
+  /** A put's item. */
+  readonly built?: BuiltPut | undefined
+  /** A delete's or a check's primary key. */
+  readonly primaryKey?: Record<string, unknown> | undefined
+  /** A planned op's plan, from its own read: its key is already encoded and composed. */
+  readonly plan?:
+    | (() => Effect.Effect<
+        TransactPlan,
+        ValidationError | PlanUpdateError | PlanDeleteError,
+        DynamoClient | TableConfig
+      >)
+    | undefined
+}
+
 /**
- * The read pre-pass that lets `Transaction.transactWrite` carry the ops the
- * build step below cannot: every `update`, and every `delete` of an entity
- * whose delete writes more than its own row (`unique`, `versioned: { retain:
- * true }`, `softDelete` — EDD-9048). Each is planned by the entity's own op
- * (`Entity._planUpdate` / `_planDelete`): the standalone op itself, run with
- * its write recorded instead of sent, so the transaction writes exactly what
- * the standalone op would have — every read, item and guard included.
+ * A transaction's ops checked and composed with nothing read
+ * ({@link prepareTransactWriteOps}): every refusal an op's own values decide,
+ * its keys and put items included, comes before the first read of any op.
+ */
+export interface PreparedTransactWrite {
+  readonly count: number
+  readonly ops: ReadonlyArray<PreparedOp>
+  /** The nested stream appends, built, by caller op index. */
+  readonly streamOps: ReadonlyMap<number, BuiltStreamAppend>
+}
+
+/**
+ * Check and compose every op of a transaction without reading: refuse what an
+ * op can't carry, compile its condition, build a put's item, compose a
+ * delete's or a check's key and build a nested stream append — so a value
+ * with no key text, a put or an event its schema refuses, or an append op
+ * with no events, fails the transaction before any op reads, whatever its
+ * place in it.
  *
- * Ops a planned write cannot carry are refused before anything is read
- * (EDD-9059 – EDD-9061, `rejectUnsupportedOp`). Returns the plans keyed by
- * index into `operations`; ops that need no plan are absent. Run on every
+ * With `plan`, `Transaction.transactWrite` carries the ops the build step
+ * cannot: every `update`, and every `delete` of an entity whose delete writes
+ * more than its own row (`unique`, `versioned: { retain: true }`,
+ * `softDelete` — EDD-9048). Each is planned by the entity's own op
+ * (`Entity._planUpdate` / `_planDelete`) in {@link planTransactWriteOps}; here
+ * its key is encoded and composed (`Entity._encodeKey`), what it can't carry
+ * refused (EDD-9059 – EDD-9061, `rejectUnsupportedOp`), and an update's own
+ * operands decided (`Entity._prepareUpdate`: its payload, and the keys the
+ * payload composes), which its plan reuses. Without `plan`
+ * (`EventStore.append`), such ops are refused.
+ */
+export const prepareTransactWriteOps = (
+  operations: ReadonlyArray<AppendWriteOp | TransactWriteUpdateOp>,
+  operation: string,
+  options?:
+    | {
+        readonly streams?: boolean | undefined
+        readonly plan?: boolean | undefined
+      }
+    | undefined,
+): Effect.Effect<
+  PreparedTransactWrite,
+  ValidationError | DynamoClientError,
+  TableConfig | DynamoClient
+> =>
+  Effect.gen(function* () {
+    const ops: Array<PreparedOp> = []
+    const streamOps = new Map<number, BuiltStreamAppend>()
+
+    for (let opIndex = 0; opIndex < operations.length; opIndex++) {
+      const op = operations[opIndex]!
+      // Another stream's append (#166): only an EventStore append carries it.
+      if (isStreamAppendOp(op)) {
+        if (options?.streams !== true) {
+          return yield* new ValidationError({
+            entityType: "unknown",
+            operation,
+            cause:
+              `${operation}: operation ${opIndex} is a stream append op (appendOp of stream ` +
+              `"${op.streamName}"): a stream append op rides only in an EventStore append's ` +
+              "additionalItems. Nothing was sent.",
+          })
+        }
+        // Built by its own stream, reading nothing: its refusals (no events, an
+        // event its schema refuses) come before any op reads.
+        streamOps.set(opIndex, yield* op._build(`operation ${opIndex}`))
+        continue
+      }
+      // Check for ConditionCheckOp first (has its own TypeId)
+      if (op != null && typeof op === "object" && ConditionCheckTypeId in op) {
+        const checkOp = op as ConditionCheckOp
+        // A check that asserts nothing (`Expression.condition({})`) would be
+        // sent as an empty ConditionExpression, which DynamoDB rejects (#134).
+        if (checkOp._condition.expression.trim() === "") {
+          return yield* new ValidationError({
+            entityType: checkOp._entity.entityType,
+            operation: `${operation}.check`,
+            cause: `${operation}: Transaction.check() was given an empty condition. Nothing was sent.`,
+          })
+        }
+        ops.push({
+          type: "conditionCheck",
+          entity: checkOp._entity,
+          opIndex,
+          condition: checkOp._condition,
+          primaryKey: yield* composePrimaryKeyOrFail(
+            checkOp._entity,
+            checkOp._key,
+            `${operation}.check`,
+          ),
+        })
+        continue
+      }
+
+      const info = extractTransactable(op)
+      if (!info) {
+        return yield* new ValidationError({
+          entityType: "unknown",
+          operation,
+          cause: `${operation}: unrecognized operation type. Use EntityPut, EntityDelete, or Transaction.check().`,
+        })
+      }
+
+      if (options?.plan === true && info.opType === "update" && info.updateState !== undefined) {
+        const { entity, key, updateState } = info
+        yield* rejectUnsupportedOp(entity, operation, "update", undefined, undefined, {
+          updateState,
+        })
+        const encoded = yield* entity._encodeKey(key, `${operation}.update.decodeKey`)
+        // What the update decides from its own operands: refused here, and planned from.
+        const prepared = yield* entity._prepareUpdate(key, updateState, encoded)
+        // No `condition` here, so a planned op is never in `conditioned`, even
+        // with a `.condition()` of its own: its verdict reports that as
+        // `"Condition"`. Only `EventStore.append` reads `conditioned`, and it
+        // plans nothing — if it ever does, add planned ops to it.
+        ops.push({
+          type: "planned",
+          entity,
+          opIndex,
+          plan: () => entity._planUpdate(key, updateState, prepared),
+        })
+        continue
+      }
+      if (
+        options?.plan === true &&
+        info.opType === "delete" &&
+        info.deleteRequest !== undefined &&
+        info.entity._multiItemWriteFeatures.length > 0
+      ) {
+        const { entity, key, deleteRequest } = info
+        yield* rejectUnsupportedOp(entity, operation, "delete", undefined, undefined, {
+          returnValues: deleteRequest.returnValues,
+          readsStoredRow: true,
+        })
+        const encoded = yield* entity._encodeKey(key, `${operation}.delete.decodeKey`)
+        ops.push({
+          type: "planned",
+          entity,
+          opIndex,
+          plan: () =>
+            entity._planDelete(
+              key,
+              { condition: deleteRequest.condition, mustExist: deleteRequest.mustExist },
+              encoded,
+            ),
+        })
+        continue
+      }
+
+      if (info.opType === "put") {
+        yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
+        yield* refuseEmptyParts(info.entity, operation, "put", info.condition)
+        ops.push({
+          type: "put",
+          putKind: info.putKind,
+          entity: info.entity,
+          opIndex,
+          input: info.input!,
+          condition: compileOpCondition(info.entity, info.condition),
+          callerCondition: info.callerCondition,
+          built: yield* validateAndBuildPutItem(info.entity, info.input!, `${operation}.put`),
+        })
+      } else if (info.opType === "delete") {
+        yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined, undefined, {
+          returnValues: info.deleteRequest?.returnValues,
+        })
+        yield* refuseEmptyParts(info.entity, operation, "delete", info.condition)
+        ops.push({
+          type: "delete",
+          entity: info.entity,
+          opIndex,
+          condition: compileOpCondition(info.entity, info.condition),
+          primaryKey: yield* composePrimaryKeyOrFail(info.entity, info.key!, `${operation}.delete`),
+        })
+      } else {
+        return yield* new ValidationError({
+          entityType: info.entity.entityType,
+          operation,
+          cause:
+            info.opType === "update"
+              ? `${operation}: update is not supported here — compiling an update reads the ` +
+                "stored row, which this path does not do. Transaction.transactWrite accepts " +
+                "updates; otherwise run the update as its own operation."
+              : `${operation}: unsupported operation type "${info.opType}". Use EntityPut, EntityDelete, or Transaction.check().`,
+        })
+      }
+    }
+    return { count: operations.length, ops, streamOps }
+  })
+
+/**
+ * The read pass that lets `Transaction.transactWrite` carry its planned ops
+ * ({@link prepareTransactWriteOps}): each is the standalone op itself, run
+ * with its write recorded instead of sent, so the transaction writes exactly
+ * what the standalone op would have — every read, item and guard included.
+ * Returns the plans keyed by index into the caller's operations. Run on every
  * attempt, so a transaction cancelled by a lost race is planned again from
  * fresh reads.
  */
 export const planTransactWriteOps = (
-  operations: ReadonlyArray<TransactWriteOp | TransactWriteUpdateOp>,
+  prepared: PreparedTransactWrite,
 ): Effect.Effect<
   ReadonlyMap<number, TransactPlan>,
   ValidationError | PlanUpdateError | PlanDeleteError,
@@ -349,33 +561,8 @@ export const planTransactWriteOps = (
 > =>
   Effect.gen(function* () {
     const plans = new Map<number, TransactPlan>()
-    for (let opIndex = 0; opIndex < operations.length; opIndex++) {
-      const op = operations[opIndex]
-      if (op != null && typeof op === "object" && ConditionCheckTypeId in op) continue
-      const info = extractTransactable(op)
-      if (info === undefined) continue
-      if (info.opType === "update" && info.updateState !== undefined) {
-        yield* rejectUnsupportedOp(info.entity, "transactWrite", "update", undefined, undefined, {
-          updateState: info.updateState,
-        })
-        plans.set(opIndex, yield* info.entity._planUpdate(info.key, info.updateState))
-      } else if (
-        info.opType === "delete" &&
-        info.deleteRequest !== undefined &&
-        info.entity._multiItemWriteFeatures.length > 0
-      ) {
-        yield* rejectUnsupportedOp(info.entity, "transactWrite", "delete", undefined, undefined, {
-          returnValues: info.deleteRequest.returnValues,
-          readsStoredRow: true,
-        })
-        plans.set(
-          opIndex,
-          yield* info.entity._planDelete(info.key, {
-            condition: info.deleteRequest.condition,
-            mustExist: info.deleteRequest.mustExist,
-          }),
-        )
-      }
+    for (const op of prepared.ops) {
+      if (op.plan !== undefined) plans.set(op.opIndex, yield* op.plan())
     }
     return plans
   })
@@ -406,6 +593,10 @@ export const planTransactWriteOps = (
  * `ValidationError` otherwise. Its items are built by the inner stream
  * (provenance `kind: "stream"`), recorded in `streams`, and left out of
  * `conditioned`.
+ *
+ * The ops are checked and composed first ({@link prepareTransactWriteOps}), or
+ * come so (`prepared`, with `plans`, from `transactWrite`), so nothing is read
+ * before every op's own refusals.
  */
 export const buildTransactWriteItems = (
   operations: ReadonlyArray<AppendWriteOp | TransactWriteUpdateOp>,
@@ -414,10 +605,10 @@ export const buildTransactWriteItems = (
     | {
         readonly streams?: boolean | undefined
         /**
-         * Updates and multi-item deletes, planned by {@link planTransactWriteOps}
-         * and keyed by index into `operations`. A caller that runs no pre-pass
-         * (`EventStore.append`) passes none, and such ops are refused.
+         * `operations` prepared with `plan` ({@link prepareTransactWriteOps}),
+         * and its planned ops' plans ({@link planTransactWriteOps}).
          */
+        readonly prepared?: PreparedTransactWrite | undefined
         readonly plans?: ReadonlyMap<number, TransactPlan> | undefined
       }
     | undefined,
@@ -439,117 +630,11 @@ export const buildTransactWriteItems = (
       }
     }
 
-    const opInfos: Array<{
-      type: "put" | "delete" | "conditionCheck" | "planned"
-      putKind?: "put" | "create" | "upsert" | undefined
-      entity: Entity
-      /** Index into the caller's `operations` array — preserved for provenance. */
-      opIndex: number
-      key?: Record<string, unknown> | undefined
-      input?: Record<string, unknown> | undefined
-      condition?: ExpressionResult | undefined
-      /** The caller's own condition — what a `create` over a tombstone keeps. */
-      callerCondition?: Expr | ConditionInput | undefined
-      plan?: TransactPlan | undefined
-    }> = []
-    /** The nested stream appends, by caller op index. */
-    const streamOps = new Map<number, StreamAppendOp>()
-
-    for (let opIndex = 0; opIndex < operations.length; opIndex++) {
-      const op = operations[opIndex]!
-      // Another stream's append (#166): only an EventStore append carries it.
-      if (isStreamAppendOp(op)) {
-        if (options?.streams !== true) {
-          return yield* new ValidationError({
-            entityType: "unknown",
-            operation,
-            cause:
-              `${operation}: operation ${opIndex} is a stream append op (appendOp of stream ` +
-              `"${op.streamName}"): a stream append op rides only in an EventStore append's ` +
-              "additionalItems. Nothing was sent.",
-          })
-        }
-        streamOps.set(opIndex, op)
-        continue
-      }
-      // Check for ConditionCheckOp first (has its own TypeId)
-      if (op != null && typeof op === "object" && ConditionCheckTypeId in op) {
-        const checkOp = op as ConditionCheckOp
-        // A check that asserts nothing (`Expression.condition({})`) would be
-        // sent as an empty ConditionExpression, which DynamoDB rejects (#134).
-        if (checkOp._condition.expression.trim() === "") {
-          return yield* new ValidationError({
-            entityType: checkOp._entity.entityType,
-            operation: `${operation}.check`,
-            cause: `${operation}: Transaction.check() was given an empty condition. Nothing was sent.`,
-          })
-        }
-        opInfos.push({
-          type: "conditionCheck",
-          entity: checkOp._entity,
-          opIndex,
-          key: checkOp._key,
-          condition: checkOp._condition,
-        })
-        continue
-      }
-
-      const info = extractTransactable(op)
-      if (!info) {
-        return yield* new ValidationError({
-          entityType: "unknown",
-          operation,
-          cause: `${operation}: unrecognized operation type. Use EntityPut, EntityDelete, or Transaction.check().`,
-        })
-      }
-
-      const plan = options?.plans?.get(opIndex)
-      if (plan !== undefined) {
-        // No `condition` here, so a planned op is never in `conditioned`, even
-        // with a `.condition()` of its own: its verdict reports that as
-        // `"Condition"`. Only `EventStore.append` reads `conditioned`, and it
-        // plans nothing — if it ever does, add planned ops to it.
-        opInfos.push({ type: "planned", entity: info.entity, opIndex, plan })
-        continue
-      }
-
-      if (info.opType === "put") {
-        yield* rejectUnsupportedOp(info.entity, operation, "put", info.putKind, info.input)
-        yield* refuseEmptyParts(info.entity, operation, "put", info.condition)
-        opInfos.push({
-          type: "put",
-          putKind: info.putKind,
-          entity: info.entity,
-          opIndex,
-          input: info.input!,
-          condition: compileOpCondition(info.entity, info.condition),
-          callerCondition: info.callerCondition,
-        })
-      } else if (info.opType === "delete") {
-        yield* rejectUnsupportedOp(info.entity, operation, "delete", undefined, undefined, {
-          returnValues: info.deleteRequest?.returnValues,
-        })
-        yield* refuseEmptyParts(info.entity, operation, "delete", info.condition)
-        opInfos.push({
-          type: "delete",
-          entity: info.entity,
-          opIndex,
-          key: info.key!,
-          condition: compileOpCondition(info.entity, info.condition),
-        })
-      } else {
-        return yield* new ValidationError({
-          entityType: info.entity.entityType,
-          operation,
-          cause:
-            info.opType === "update"
-              ? `${operation}: update is not supported here — compiling an update reads the ` +
-                "stored row, which this path does not do. Transaction.transactWrite accepts " +
-                "updates; otherwise run the update as its own operation."
-              : `${operation}: unsupported operation type "${info.opType}". Use EntityPut, EntityDelete, or Transaction.check().`,
-        })
-      }
-    }
+    const prepared =
+      options?.prepared ??
+      (yield* prepareTransactWriteOps(operations, operation, { streams: options?.streams }))
+    const opInfos = prepared.ops
+    const streamOps = prepared.streamOps
 
     const tableNames = yield* resolveTableNames(opInfos)
 
@@ -585,48 +670,51 @@ export const buildTransactWriteItems = (
 
     // The nested stream appends, built by their own streams, are pushed in
     // caller op order between the entity ops' items.
-    const pushStreamOp = (opIndex: number) =>
-      Effect.gen(function* () {
-        const op = streamOps.get(opIndex)!
-        const nested = yield* op._build(`operation ${opIndex}`)
-        streams.push({
-          opIndex,
-          start: items.length,
-          count: nested.items.length,
-          verdict: nested.verdict,
-        })
-        streamKeys.push(nested.keys)
-        // Built once, on failure, then indexed.
-        let built: ReadonlyArray<TransactItemTarget> | undefined
-        const nestedTarget = (i: number): TransactItemTarget => {
-          if (built === undefined) built = nested.targets()
-          return built[i]!
-        }
-        for (const [i, item] of nested.items.entries()) {
-          items.push(item)
-          provenance.push({ opIndex, kind: "stream", entityType: nested.entityType })
-          naming.push(() => nestedTarget(i))
-        }
+    const pushStreamOp = (opIndex: number): void => {
+      const nested = streamOps.get(opIndex)!
+      streams.push({
+        opIndex,
+        start: items.length,
+        count: nested.items.length,
+        verdict: nested.verdict,
       })
+      streamKeys.push(nested.keys)
+      // Built once, on failure, then indexed.
+      let built: ReadonlyArray<TransactItemTarget> | undefined
+      const nestedTarget = (i: number): TransactItemTarget => {
+        if (built === undefined) built = nested.targets()
+        return built[i]!
+      }
+      for (const [i, item] of nested.items.entries()) {
+        items.push(item)
+        provenance.push({ opIndex, kind: "stream", entityType: nested.entityType })
+        naming.push(() => nestedTarget(i))
+      }
+    }
     let nextOpIndex = 0
-    const flushStreamOpsBefore = (opIndex: number) =>
-      Effect.gen(function* () {
-        for (; nextOpIndex < opIndex; nextOpIndex++) {
-          if (streamOps.has(nextOpIndex)) yield* pushStreamOp(nextOpIndex)
-        }
-        nextOpIndex = opIndex + 1
-      })
+    const flushStreamOpsBefore = (opIndex: number): void => {
+      for (; nextOpIndex < opIndex; nextOpIndex++) {
+        if (streamOps.has(nextOpIndex)) pushStreamOp(nextOpIndex)
+      }
+      nextOpIndex = opIndex + 1
+    }
 
     for (const op of opInfos) {
-      yield* flushStreamOpsBefore(op.opIndex)
+      flushStreamOpsBefore(op.opIndex)
       tableName = tableNames.get(op.entity)!
       const primary = op.entity.indexes.primary!
       keyFields = [primary.pk.field, primary.sk.field]
 
       if (op.type === "planned") {
         // Already marshalled and table-resolved; read like a guarded put's.
-        guarded.push({ opIndex: op.opIndex, start: items.length, plan: op.plan! })
-        for (const [i, item] of op.plan!.items.entries()) {
+        const plan = options?.plans?.get(op.opIndex)
+        if (plan === undefined) {
+          return yield* Effect.die(
+            new Error(`${operation}: operation ${op.opIndex} was not planned`),
+          )
+        }
+        guarded.push({ opIndex: op.opIndex, start: items.length, plan })
+        for (const [i, item] of plan.items.entries()) {
           push(
             item,
             { opIndex: op.opIndex, kind: "guarded", entityType: op.entity.entityType },
@@ -637,7 +725,7 @@ export const buildTransactWriteItems = (
       }
 
       if (op.type === "put") {
-        const built = yield* validateAndBuildPutItem(op.entity, op.input!, `${operation}.put`)
+        const built = op.built!
         if (op.entity._incarnationToken || op.entity._multiItemWriteFeatures.includes("unique")) {
           const plan = yield* op.entity._planPut({
             tableName,
@@ -649,6 +737,7 @@ export const buildTransactWriteItems = (
             create: op.putKind === "create",
             operation,
             key: op.input!,
+            composeKeys: built.composeKeys,
           })
           guarded.push({ opIndex: op.opIndex, start: items.length, plan })
           for (const [i, item] of plan.items.entries()) {
@@ -664,7 +753,7 @@ export const buildTransactWriteItems = (
         // carrying its checkpoints over, guarded on that tombstone.
         const over =
           op.putKind === "create"
-            ? yield* op.entity._overTombstone(tableName, built.item)
+            ? yield* op.entity._overTombstone(built.item)
             : Option.none<ConditionInput>()
         push(
           {
@@ -685,9 +774,7 @@ export const buildTransactWriteItems = (
           {
             Delete: {
               TableName: tableName,
-              Key: toAttributeMap(
-                yield* composePrimaryKeyOrFail(op.entity, op.key!, `${operation}.delete`),
-              ),
+              Key: toAttributeMap(op.primaryKey!),
               ...conditionFields(op.condition),
             },
           },
@@ -698,9 +785,7 @@ export const buildTransactWriteItems = (
           {
             ConditionCheck: {
               TableName: tableName,
-              Key: toAttributeMap(
-                yield* composePrimaryKeyOrFail(op.entity, op.key!, `${operation}.check`),
-              ),
+              Key: toAttributeMap(op.primaryKey!),
               ConditionExpression: op.condition!.expression,
               ...conditionFields(op.condition),
             },
@@ -710,7 +795,7 @@ export const buildTransactWriteItems = (
       }
     }
 
-    yield* flushStreamOpsBefore(operations.length)
+    flushStreamOpsBefore(operations.length)
 
     const keys = () =>
       mergeKeyAttributes(

@@ -113,6 +113,74 @@ A zoned field, either `DynamoModel.DateTimeZoned` or a self `Schema.DateTimeZone
 
 Offsets that aren't whole minutes, such as historical local-mean-time offsets or a sub-minute `DateTime.zoneMakeOffset`, are rounded to the minute by Effect's ISO format, and the instant read back moves by the same amount. Earlier versions behaved the same way.
 
+#### Maps
+
+Use `Schema.Record` for a keyed collection of values. A `Schema.ReadonlyMap` is refused when the model loads (`EDD-9125`), at any depth: it would be stored as a DynamoDB map, which reads back as a plain object, so the row wouldn't decode. `Schema.Record` is stored the same way, so rows a map field wrote read back with no rewrite.
+
+A `Map` in your domain model is fine as long as its encoded side isn't one: decode it from a `Schema.Record` with `Schema.decodeTo`, or wrap it in `Schema.toCodecJson`. The field of a `many` edge can also be one, since its collection is taken apart into rows and never stored itself, so it's created, read and updated like any other `many` edge.
+
+#### Types that can't be read back
+
+`Entity.make`, `Aggregate.make`, `EventStore.makeStream` (each event, `metadata` and the snapshot state) and `outbox.schema` on `EventStore.projection` and `EventStore.multiProjection` refuse these when the definition loads (`EDD-9125`), at any depth, naming the path:
+
+| Refused | What happens without the refusal | Use |
+|---------|----------------------------------|-----|
+| `Schema.URL` | Stored as a map of its parts, and the row doesn't decode | `Schema.URLFromString` |
+| `Schema.ByteSize` | Stored as a number, and the row doesn't decode | `Schema.ByteSizeFromString` or `Schema.ByteSizeFromNumber` |
+| `Schema.URLSearchParams` | Stored as a map of its size alone | `Schema.String`, holding the parameters as text |
+| `Schema.RegExp` | Stored as an empty map | `Schema.String`, holding the pattern as text |
+| `Schema.FormData` | Stored as an empty map | `Schema.Record` |
+| `Schema.Headers` | Stored as a map, and the row doesn't decode | `Schema.Record` |
+| `Schema.File` | Stored as bytes, without its name or type | `Schema.Uint8Array` |
+| `Schema.ErrorInstance` | Stored as an empty map | `Schema.Defect()` |
+| `Schema.Chunk` | The write overflows the stack, and nothing is stored | `Schema.Array` |
+| `Schema.HashMap` | A non-empty one can't be written, and an empty one doesn't decode | `Schema.Record` |
+| `Schema.ReadonlyMap` | See [Maps](#maps) | `Schema.Record` |
+| A bigint `Schema.Literal` | Stored as a number, and the row doesn't decode | A string or number literal |
+
+A few more depend on what stores them. An entity's and an aggregate's fields are substituted before they're marshalled, so these read back there, in a struct, an array, a record, a tuple or a union. A stream, a snapshot and an outbox encode through the schema alone, and nothing reaches inside another declaration such as `Schema.Option` or `Schema.ReadonlySet`, a `Schema.suspend`, or a transformation, such as `Schema.OptionFromOptional`, unless it's a transformation onto the same type or between two lists holding the same type. In those places they're refused too. So are a `Schema.Date` and a `Schema.Redacted` in a struct, a record, a tuple or a union with a decoding default, where a read reaches them and a write doesn't:
+
+| Refused | What happens without the refusal | Use |
+|---------|----------------------------------|-----|
+| `Schema.Date` | Stored as an empty map, so the instant is lost | `Schema.DateFromString` or `Schema.DateFromMillis` |
+| `Schema.Redacted` | The value isn't stored, and the read dies | `Schema.RedactedFromValue` |
+
+`Schema.BigInt` isn't refused on any of them. It's stored as a number, and every read gives back a `bigint`, at any depth, under `Schema.Option`, `Schema.Result`, `Schema.ReadonlySet`, a `Schema.suspend` or a transformation such as `Schema.DurationFromNanos`, `Schema.ByteSizeFromBigInt` or `Schema.OptionFromNullOr(Schema.BigInt)`, on rows already stored too. A number past 2^53 and a smaller one read back alike.
+
+What's refused is a union in which a read can't tell a `bigint` from something else stored as a number. On a stream, a snapshot and an outbox, that's any such union. On an entity or an aggregate, it's one under another declaration, a `Schema.suspend` or a transformation, where the read lifts the number before the union sees it. `Schema.Union([Schema.Number, Schema.BigInt])` is one, in either order, as is `Schema.Literal(5)` or `Schema.Unknown` beside it, because `5n` and `5` are stored the same. Member order counts in a struct, because a read tries the members in order. `Schema.Union([Schema.Struct({ a: Schema.BigInt }), Schema.Struct({ a: Schema.Number, c: Schema.String })])` is refused, as the first member would take what the second stored and lose `c`, while the reverse order reads both back as written. A member that doesn't say what it takes, such as a `Schema.instanceOf` or `Schema.IpAddress`, is treated as taking the number, so a `bigint` beside it is refused on a stream, a snapshot and an outbox even when the values would read back. Use `Schema.BigIntFromString`, which is stored as a string. Under `DynamoModel.Packed`, a `bigint` fails its write with a `ValidationError` naming the path, as JSON has no form for it, and nothing is written.
+
+`Schema.DateTimeUtcFromDate` and any other transformation over `Schema.Date` are refused on an entity, a stream, a snapshot and an outbox, and on an aggregate under a union or `Schema.NullOr`, or when it decodes to something other than a date. Use `Schema.DateTimeUtcFromString` or `Schema.DateTimeUtcFromMillis`.
+
+`Schema.Date` and `Schema.Redacted` after another member of a `Schema.optionalKey` union are refused on an entity and an aggregate, in a struct or a list there too, because only the first member is written in its stored form: `Schema.optionalKey(Schema.Union([Schema.String, Schema.Date]))` would store a date as an empty map. Declare the member first, use `Schema.optional`, or use `Schema.DateFromString` or `Schema.RedactedFromValue`. On an aggregate, an attribute that's only a date or null isn't refused, because its date encoder stores it as a string.
+
+What's read is the stored side, so any of these under `Schema.toCodecJson`, or decoded from a type that reads back, isn't refused.
+
+#### Types that read back changed
+
+These aren't refused, because rows exist and read, but what comes back isn't quite what was written. Prefer the form on the right for a new field.
+
+- **`Schema.Duration`.** Stored as Effect's internal form, a map. It reads back as a real `Duration`, equal to the one written, on rows already stored too. `Schema.DurationFromMillis` is stored as a number.
+- **`Schema.Option`.** Comes back as a real `Option`, equal to the one written, but it's stored as Effect's internal form: a map with `_op`, `_tag`, `value` and a `~effect/Option` marker. `Schema.OptionFromNullOr` stores the value or `null`, and comes back as an `Option` too. On an aggregate, `Schema.OptionFromOptional` and `Schema.OptionFromOptionalKey` read back, but `create` takes the value as it's stored, not an `Option`, and `update` refuses them, so use `Schema.OptionFromNullOr` there.
+- **`Schema.BigInt` next to a member that takes a number, directly on an entity or an aggregate.** A stream, a snapshot and an outbox refuse this, as does an entity or an aggregate under another declaration, a `Schema.suspend` or a transformation. A stored number reads back as a number below 2^53 and as a `bigint` past it, and each member gets its try before a number is lifted to a `bigint`. So `Schema.Union([Schema.Number, Schema.BigInt])`, in either order, reads `5n` back as the number `5`, and a value past 2^53 as a `bigint`. With `Schema.Literal(5)` or a checked number in place of `Schema.Number`, only what that member takes changes: `6n` stays `6n`. The same goes for a transformation over a `bigint`, such as `Schema.Union([Schema.DurationFromNanos, Schema.Number])`, and for what a declaration holds: `Schema.Union([Schema.Option(Schema.BigInt), Schema.Option(Schema.Number)])` reads `Option.some(5n)` as `Option.some(5)`. `Schema.Union([Schema.Struct({ v: Schema.BigInt }), Schema.Struct({ v: Schema.Number })])` reads `{ v: 5n }` as `{ v: 5 }`, and a `Schema.DateFromMillis` member reads `5n` as a date. To keep them apart, use `Schema.BigIntFromString`, which is stored as a string. A member that can't hold a number doesn't compete: `Schema.NullOr(Schema.BigInt)`, `Schema.Union([Schema.String, Schema.BigInt])` and `Schema.Union([Schema.Number, Schema.Struct({ b: Schema.BigInt })])` come back as written. Under `Schema.optionalKey`, a first `Schema.BigInt` takes the number, so `Schema.optionalKey(Schema.Union([Schema.BigInt, Schema.Number]))` reads `5` back as `5n`. In a key, `5` and `5n` compose different text, and a key composed again from a stored row couldn't tell which was written, so `Entity.make` and `Aggregate.make` refuse such a field (`EDD-9128`) as a key composite, a unique constraint field, a vector partition or a time-series `orderBy`. A dotted composite (`nested.n`) is the field it names, through `Schema.optional`, `Schema.optionalKey`, `Schema.NullOr`, `Schema.suspend` and a class, and a time-series `appendInput` is checked as the model is. Declare the one kind it holds, then run `rekey`, which moves rows written with the other kind to the key text of the value as it reads back. A field whose kinds can't be read from its declaration, a `Schema.Unknown`, a `Schema.Any`, an opaque `Schema.declare` or a transformation whose stored side is one of those, is judged by its value instead: the value DynamoDB will hand back is decoded through the field, and a write whose value reads back as something else fails with a `ValidationError` and writes nothing. So a `Schema.Unknown` given a `bigint` below 2^53, or a whole `number` past it, is refused, while a `Schema.Unknown` decoded to a `Schema.BigInt` reads `5n` back as `5n` and stores it. An aggregate's dotted composite is judged through the field that holds it, decoded as a read decodes it: a struct that stores `{ n: 5n }` and decodes it to `{ n: 5 }` reads back the value its key was composed from, so it's stored.
+- **`Schema.DateTimeUtc` after another member of a `Schema.optionalKey` union.** Only the first member is written in its stored form, so `Schema.optionalKey(Schema.Union([Schema.String, Schema.DateTimeUtc]))` stores a date as Effect's internal form, a map, and a string that looks like a date reads back as that string. It comes back as a real `DateTime`, equal to the one written. Declared first, or under `Schema.optional`, it's stored as a string, and the text of a date reads back as a date. To tell them apart, use `Schema.DateTimeUtcFromString` with a string that can't look like a date.
+- **`Schema.DateTimeUtc` beneath a decoding default.** In a struct or a record under `Schema.withDecodingDefault` or `Schema.withDecodingDefaultKey`, and on an entity in a `Schema.NullOr` too, it's stored as Effect's internal form, a map, as what's stored there can't be changed without moving rows. It comes back as a real `DateTime`, equal to the one written. Use `Schema.DateTimeUtcFromString`, which is stored as a string.
+- **`Schema.DateTimeUtc` and `Schema.DateTimeZoned` on a stream, a snapshot and an outbox.** Stored as Effect's internal form, a map, or its JSON under `DynamoModel.Packed`. Every read gives back a real `DateTime` with a real zone, equal to the one written, at any depth and under `Schema.Option`. A union is read by trying its members, so a struct listed first that takes the same fields keeps them, and a `Schema.Unknown` field reads back the map, since nothing there declares a date. Use `Schema.DateTimeUtcFromString`, which is stored as a string.
+- **`Schema.BigDecimal`.** Stored as Effect's internal form, a map. It reads back as a real `BigDecimal`, equal to the one written, below 2^53 and past it. One that's been compared, hashed or normalised is stored as a fresh one of its value is. `Schema.BigDecimalFromString` is stored as text.
+- **`Schema.HashSet`.** A non-empty one is refused at write (`EDD-9124`), naming the field, with nothing written, and only an empty one reads back. Use `Schema.ReadonlySet`.
+- **`Schema.SemVer`, `Schema.SemVerRange`, the time zones, `Schema.Cookie`, `Schema.Cookies`, `Schema.UrlParams`, and the IP, MAC, socket, host and DNS record types.** Stored as Effect's internal form, a map, and read back as real instances, equal to the ones written, on rows already stored too. So is a `Schema.DateTimeUtc` or a `Schema.DateTimeZoned` in a `Schema.Option` or a `Schema.Result`. A value given properties of its own keeps them, except inside a cookie or a jar, where it reads back as the map it's stored as. Code of yours that inspects one on a read, a `.check()`, a transformation or a declaration holding it, sees the instance. A form stored as a string, such as `Schema.SemVerFromString`, is smaller.
+- **`Schema.Cookie`'s expiry.** A cookie's `expires` is stored as ISO text, wherever the cookie is written, and a field typed as a cookie reads it back as the `Date`. 1.39.0 stored it as an empty map, so a cookie it wrote with an expiry reads back as the map it's stored as, as 1.39.0 read it, and a condition on a cookie with an expiry doesn't match that row.
+- **The crypto keys.** Read back as plain objects with no prototype.
+
+Under `DynamoModel.Packed`, nothing here can leave a row you can't read. A value JSON can't represent fails the write with a `ValidationError` naming the path, and nothing is written.
+
+#### Declarations of your own
+
+A `Schema.instanceOf` over a class of your own can't be judged when the model loads: it has the same AST as a duck-typed `Schema.declare`, and only the second reads back. So the value is judged when it's written. It goes through the real marshaller and back, which is what a read would hand the schema, and if that doesn't decode, the write fails with a `ValidationError` (`EDD-9126`) and nothing is written. Use a `Schema.Class`, or decode the class from something that's stored, with `Schema.decodeTo`.
+
+That covers every write that stores the value: `put`, `create`, `upsert`, `update` and `patch` with their path operations, a time-series `.append()`, `Batch.write`, `Transaction.transactWrite`, an aggregate's `create` and `update`, and on a stream `append`, `commandHandler`, `additionalItems`, `writeSnapshot`, inline snapshots, metadata and outbox effects. What's judged is whether it reads back, not whether it's an instance, so a duck-typed `Schema.declare` that takes what's stored keeps writing, and so does a union with another member that takes the map. A model without a declaration of your own pays only for a scan when it loads, and its requests don't change.
+
+Rows an earlier release stored aren't touched. They stay as they are and still fail on read.
+
 #### Container checks
 
 A `.check()` refinement on an array, a struct or a class built over a checked struct is enforced on every write when the container holds a date or another value the library substitutes, for example `Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))`. That covers `put`, `create`, `update` and `.set()`, path operations, `.append()`, Batch and Transaction. A violating value fails with a `ValidationError`. Earlier versions silently dropped these checks, so rows that break them may already exist. Reads don't enforce them, so those rows still read, and the next write that sets the field to a valid value repairs them.
@@ -160,7 +228,7 @@ const EmployeeModel = DynamoModel.configure(Employee, {
 
 Primary key composite attributes are inherently immutable — you don't need to mark them.
 
-An update may restate an immutable field with its current value, so spreading a whole record into `.set()` works. A `.set()` with a different value fails with a `ValidationError`, as does a `.set()` that changes a primary-key composite. Earlier versions silently ignored the latter.
+An update may restate an immutable field with its current value, so spreading a whole record into `.set()` works. A `.set()` with a different value fails with a `ValidationError`, as does a `.set()` that changes a primary-key composite. Earlier versions silently ignored the latter. Clearing either kind of field fails the same way, as does any other update operation naming it.
 
 ### Identifier and Ref
 
@@ -345,6 +413,8 @@ softDelete: { ttl: Duration.days(30), preserveUnique: true }
 ```
 
 See [Lifecycle](/effect-dynamodb/guides/lifecycle/) for details on versioning and soft delete.
+
+An index or a primary key can be composed from `createdAt`, and an index from `updatedAt`: see [Keys over values the library stamps](/effect-dynamodb/guides/index-policy/#keys-over-values-the-library-stamps). A model field named like a timestamp is stamped if it's a date, optional or not, and otherwise stays yours. To store the version under another name use `versioned: { field }`: a `configure` `field:` rename of it is refused (`EDD-9122`), while `createdAt` and `updatedAt` may be renamed either way.
 
 ### Generated IDs
 

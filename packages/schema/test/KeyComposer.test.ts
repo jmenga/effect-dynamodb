@@ -1931,6 +1931,208 @@ describe("KeyComposer", () => {
     // Fixtures are bound through `Entity.make`: binding is what gives a
     // Z-order half its layout, and the composers only ever see bound halves.
 
+    describe("halves holding a value the write stamps (canonical shapes 16 to 18)", () => {
+      const NOW = "2026-02-02T00:00:00.000Z"
+      const at = (
+        name: string,
+        pk: ReadonlyArray<string>,
+        sk: ReadonlyArray<string>,
+        policy?: "sparse" | "preserve",
+      ) => ({
+        [name]: {
+          index: "gsi1",
+          pk: { field: "gsi1pk", composite: [...pk] },
+          sk: { field: "gsi1sk", composite: [...sk] },
+          ...(policy === undefined ? {} : { indexPolicy: { pk: policy, sk: policy } }),
+        },
+      })
+      const compose = (
+        indexes: Record<string, KeyComposer.IndexDefinition>,
+        payload: Record<string, unknown>,
+        keyRecord: Record<string, unknown>,
+        options: { readonly removedSet?: ReadonlySet<string> } = {},
+      ) =>
+        KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Ticket",
+          1,
+          indexes,
+          payload,
+          keyRecord,
+          { ...options, stamped: { updatedAt: NOW } },
+        )
+      const STAMP = `updatedat_${NOW.toLowerCase()}`
+      const SK = "$myapp#v1#ticket"
+
+      describe.each(["sparse", "preserve"] as const)("under %s", (policy) => {
+        it("shape 16: `sk: [updatedAt]` always moves, on a write naming nothing of it", () => {
+          const update = compose(
+            at("i", ["owner"], ["updatedAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#${STAMP}` })
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: `[status, updatedAt]`, status unknown: left, never dropped or truncated", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: status named: moves, with the new stamp", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { status: "open" },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_open#${STAMP}` })
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: status in the key record: moves on a write that doesn't name it", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { note: "n" },
+            { id: "1", status: "open" },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_open#${STAMP}` })
+        })
+
+        it("shape 17: a caller's `updatedAt` in the payload makes it no more this writer's", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { updatedAt: NOW },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 17: `.remove([status])` still follows the structural rule", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            {},
+            { id: "1" },
+            { removedSet: new Set(["status"]) },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual(["gsi1sk"])
+        })
+
+        it("shape 17: a named clear isn't left: the policy decides, as for any hole", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { status: null },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual(policy === "sparse" ? ["gsi1sk"] : [])
+        })
+
+        it("shape 17a: two others, one named: left whole, not truncated as without the stamp", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "region", "updatedAt"], policy),
+            { status: "open" },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+          const both = compose(
+            at("i", ["owner"], ["status", "region", "updatedAt"], policy),
+            { status: "open", region: "r" },
+            { id: "1" },
+          )
+          expect(both.sets).toEqual({ gsi1sk: `${SK}#status_open#region_r#${STAMP}` })
+        })
+
+        it("shape 2 analogue: the rest of the half is in the primary key, so it moves", () => {
+          const update = compose(
+            at("i", ["owner"], ["id", "updatedAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#id_1#${STAMP}` })
+        })
+
+        it("shape 6 analogue: an empty partition half is evaluated, a stamped sort half moves", () => {
+          const update = compose(at("i", [], ["updatedAt"], policy), { note: "n" }, { id: "1" })
+          expect(update.sets).toEqual({ gsi1pk: "$myapp#v1#ticket", gsi1sk: `${SK}#${STAMP}` })
+        })
+
+        it("shape 16 in a partition half: `pk: [updatedAt]` moves too", () => {
+          const update = compose(at("i", ["updatedAt"], ["id"], policy), { note: "n" }, { id: "1" })
+          expect(update.sets.gsi1pk).toBe(`$myapp#v1#ticket#${STAMP}`)
+        })
+
+        it("shape 18: `sk: [createdAt]` isn't stamped by an update: the writer leaves it", () => {
+          const update = compose(
+            at("i", ["owner"], ["createdAt"], policy),
+            { note: "n" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({})
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 18: `pk: [createdAt]` is the same", () => {
+          const update = compose(at("i", ["createdAt"], ["id"], policy), { note: "n" }, { id: "1" })
+          expect(update.sets.gsi1pk).toBeUndefined()
+          expect(update.removes).toEqual([])
+        })
+
+        it("shape 18a: `[status, createdAt]` on `.set({ status })` follows the partial-payload rule", () => {
+          const update = compose(
+            at("i", ["owner"], ["status", "createdAt"], policy),
+            { status: "b" },
+            {
+              id: "1",
+            },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_b` })
+          expect(update.removes).toEqual([])
+        })
+
+        it("with nothing stamped, the same half is the skip-predicate's, as ever", () => {
+          const update = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Ticket",
+            1,
+            at("i", ["owner"], ["status", "updatedAt"], policy),
+            { status: "b" },
+            { id: "1" },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#status_b` })
+        })
+
+        it("a retain version is stamped the same way", () => {
+          const update = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+            schema,
+            "Ticket",
+            1,
+            at("i", ["owner"], ["version"], policy),
+            { note: "n" },
+            { id: "1" },
+            { stamped: { version: 4 } },
+          )
+          expect(update.sets).toEqual({ gsi1sk: `${SK}#version_0000000000000004` })
+        })
+      })
+    })
+
     describe("Z-order halves (#171 — canonical shapes 7 and 8)", () => {
       const Listing = Schema.Struct({
         listingId: Schema.String,
@@ -3125,5 +3327,547 @@ describe("index-level casing", () => {
     ).toThrow(
       '[EDD-9055] Collection "Fleet" members compose its keys with different casings (A: lowercase, B: preserve)',
     )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// A cleared composite (#177). `.set({ f: undefined })` and `.remove(["f"])` reach
+// the composer as one form: in `removedSet`, out of the payload. It's an explicit
+// removal, so a half it clears goes under `preserve` as under `sparse`.
+// ---------------------------------------------------------------------------
+
+describe("a cleared composite, by canonical GSI-composite shape", () => {
+  class Facets extends Schema.Class<Facets>("Facets")({
+    channel: Schema.String,
+    deviceId: Schema.String,
+    enrichment: Schema.optional(Schema.String),
+    alertState: Schema.optional(Schema.String),
+    region: Schema.optional(Schema.String),
+    country: Schema.optional(Schema.String),
+    city: Schema.optional(Schema.String),
+    site: Schema.optional(Schema.String),
+    a: Schema.optional(Schema.String),
+    b: Schema.optional(Schema.String),
+    binding: Schema.optional(Schema.String),
+    price: Schema.optional(Schema.Number),
+    bedrooms: Schema.optional(Schema.Number),
+    live: Schema.optional(Schema.Literals(["draft", "live"])),
+    agencyId: Schema.optional(Schema.String),
+    officeId: Schema.optional(Schema.String),
+    note: Schema.optional(Schema.String),
+  }) {}
+
+  const schema = DynamoSchema.make({ name: "clears", version: 1 })
+  const primaryKey = {
+    pk: { field: "pk", composite: ["channel"] },
+    sk: { field: "sk", composite: ["deviceId"] },
+  } as const
+  const keyRecord = { channel: "ch", deviceId: "d" }
+  const dimensions = [
+    { field: "price", min: 0, max: 1000 },
+    { field: "bedrooms", min: 0, max: 15 },
+  ] as const
+
+  const CASES: ReadonlyArray<{
+    readonly name: string
+    readonly index: { readonly pk: unknown; readonly sk: unknown }
+    readonly payload: Record<string, unknown>
+    readonly removed: ReadonlyArray<string>
+    readonly sets: ReadonlyArray<string>
+    readonly removes: ReadonlyArray<string>
+  }> = [
+    {
+      name: "shape 1, multi-writer: the other writer's half is skipped",
+      index: {
+        pk: { field: "gpk", composite: ["enrichment"] },
+        sk: { field: "gsk", composite: ["alertState"] },
+      },
+      payload: {},
+      removed: ["alertState"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 2, primary-key composites only (#43): SET on an unrelated clear",
+      index: {
+        pk: { field: "gpk", composite: ["channel"] },
+        sk: { field: "gsk", composite: ["deviceId"] },
+      },
+      payload: {},
+      removed: ["note"],
+      sets: ["gpk", "gsk"],
+      removes: [],
+    },
+    {
+      name: "shape 3, hierarchical: the parents given truncate it",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", composite: ["country", "city", "site"] },
+      },
+      payload: { country: "c", city: "t" },
+      removed: ["site"],
+      sets: ["gsk"],
+      removes: [],
+    },
+    {
+      name: "shape 3, hierarchical: no parents given, nothing to truncate to",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", composite: ["country", "city", "site"] },
+      },
+      payload: {},
+      removed: ["site"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 4, a hole",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", composite: ["country", "city"] },
+      },
+      payload: { city: "t" },
+      removed: ["country"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 5, all mutable",
+      index: {
+        pk: { field: "gpk", composite: ["a"] },
+        sk: { field: "gsk", composite: ["b"] },
+      },
+      payload: { a: "a2" },
+      removed: ["b"],
+      sets: ["gpk"],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 6, an empty half (#46): always evaluated",
+      index: {
+        pk: { field: "gpk", composite: ["binding"] },
+        sk: { field: "gsk", composite: [] },
+      },
+      payload: {},
+      removed: ["binding"],
+      sets: ["gsk"],
+      removes: ["gpk"],
+    },
+    {
+      name: "shape 7, a Z-order dimension: all or nothing, never truncated",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", zorder: dimensions },
+      },
+      payload: { price: 20 },
+      removed: ["bedrooms"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 7a, a single-bit dimension",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", zorder: ["live"] },
+      },
+      payload: {},
+      removed: ["live"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 7a′, mixed widths",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", zorder: ["live", { field: "price", min: 0, max: 8191 }] },
+      },
+      payload: { price: 20 },
+      removed: ["live"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 7b, an empty partition key half: SET, as the sort key goes",
+      index: {
+        pk: { field: "gpk", composite: [] },
+        sk: { field: "gsk", zorder: dimensions },
+      },
+      payload: { price: 20 },
+      removed: ["bedrooms"],
+      sets: ["gpk"],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8, the prefix cleared, the dimensions given",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId"], zorder: dimensions },
+      },
+      payload: { price: 20, bedrooms: 3 },
+      removed: ["agencyId"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8, a dimension cleared, the prefix given",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId"], zorder: dimensions },
+      },
+      payload: { agencyId: "ag" },
+      removed: ["price"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8a, every Z-order field a primary-key composite (#43): SET on an unrelated clear",
+      index: {
+        pk: { field: "gpk", composite: ["channel"] },
+        sk: { field: "gsk", prefix: ["channel"], zorder: [{ field: "deviceId", bytes: 4 }] },
+      },
+      payload: {},
+      removed: ["note"],
+      sets: ["gpk", "gsk"],
+      removes: [],
+    },
+    {
+      name: "shape 8b, the prefix's writer clears it, with no dimensions",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId"], zorder: dimensions },
+      },
+      payload: {},
+      removed: ["agencyId"],
+      sets: [],
+      removes: ["gsk"],
+    },
+    {
+      name: "shape 8c, a hierarchical prefix's leaf: never a truncated key",
+      index: {
+        pk: { field: "gpk", composite: ["region"] },
+        sk: { field: "gsk", prefix: ["agencyId", "officeId"], zorder: dimensions },
+      },
+      payload: { agencyId: "ag", price: 20, bedrooms: 3 },
+      removed: ["officeId"],
+      sets: [],
+      removes: ["gsk"],
+    },
+  ]
+
+  const indexesOf = (index: { readonly pk: unknown; readonly sk: unknown }, policy: string) =>
+    (
+      Entity.make({
+        model: Facets,
+        entityType: "Facets",
+        primaryKey,
+        indexes: {
+          it: { name: "gsi", indexPolicy: { pk: policy, sk: policy }, ...index },
+        },
+      } as never) as unknown as { indexes: Record<string, KeyComposer.IndexDefinition> }
+    ).indexes
+
+  for (const policy of ["sparse", "preserve"] as const) {
+    for (const { name, index, payload, removed, sets, removes } of CASES) {
+      it(`${policy}, ${name}`, () => {
+        const result = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+          schema,
+          "Facets",
+          1,
+          indexesOf(index, policy),
+          payload,
+          keyRecord,
+          { removedSet: new Set(removed) },
+        )
+        expect(Object.keys(result.sets).sort()).toEqual(sets)
+        expect([...result.removes].sort()).toEqual(removes)
+      })
+    }
+  }
+
+  it("the truncated key of shape 3 holds the parents and stops", () => {
+    const { sets } = KeyComposer.composeGsiKeysForUpdatePolicyAware(
+      schema,
+      "Facets",
+      1,
+      indexesOf(CASES[2]!.index, "preserve"),
+      { country: "c", city: "t" },
+      keyRecord,
+      { removedSet: new Set(["site"]) },
+    )
+    expect(sets.gsk).toBe("$clears#v1#facets#country_c#city_t")
+  })
+
+  it("leaving a composite out is not clearing it: the policy decides, then the clear overrides", () => {
+    const compose = (policy: string, removed: ReadonlyArray<string>) =>
+      KeyComposer.composeGsiKeysForUpdatePolicyAware(
+        schema,
+        "Facets",
+        1,
+        indexesOf(
+          {
+            pk: { field: "gpk", composite: ["region"] },
+            sk: { field: "gsk", zorder: dimensions },
+          },
+          policy,
+        ),
+        { price: 20 },
+        keyRecord,
+        { removedSet: new Set(removed) },
+      )
+    expect(compose("sparse", []).removes).toEqual(["gsk"])
+    expect(compose("preserve", []).removes).toEqual([])
+    expect(compose("preserve", ["bedrooms"]).removes).toEqual(["gsk"])
+  })
+})
+
+describe("composeKnownHalves", () => {
+  const schema = DynamoSchema.make({ name: "myapp", version: 1 })
+  const Rows = Entity.make({
+    model: Schema.Struct({
+      id: Schema.String,
+      owner: Schema.optional(Schema.String),
+      note: Schema.optional(Schema.String),
+      region: Schema.optional(Schema.String),
+      score: Schema.optional(Schema.Number),
+      price: Schema.optional(Schema.Number),
+    }),
+    entityType: "Row",
+    primaryKey: {
+      pk: { field: "pk", composite: ["id"] },
+      sk: { field: "sk", composite: [] },
+    },
+    indexes: {
+      byOwner: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["owner"] },
+        sk: { field: "gsi1sk", composite: ["note", "score"] },
+      },
+      bySharded: {
+        name: "gsi2",
+        pk: { field: "gsi2pk", composite: [] },
+        sk: { field: "gsi2sk", composite: ["region", "note"] },
+        shards: { count: 8, by: ["region"] },
+      },
+      byConstant: {
+        name: "gsi3",
+        pk: { field: "gsi3pk", composite: ["owner"] },
+        sk: { field: "gsi3sk", composite: [] },
+      },
+      byPrice: {
+        name: "gsi4",
+        pk: { field: "gsi4pk", composite: ["owner"] },
+        sk: { field: "gsi4sk", zorder: [{ field: "price", min: 0, max: 100 }] },
+      },
+    },
+  })
+  const halves = (index: keyof typeof Rows.indexes, record: Record<string, unknown>) =>
+    KeyComposer.composeKnownHalves(schema, "Row", 1, Rows.indexes[index], record)
+
+  it("composes both halves when every composite has a value", () => {
+    const record = { owner: "o1", note: "n1", score: 2 }
+    expect(halves("byOwner", record)).toEqual({
+      gsi1pk: KeyComposer.composePk(schema, "Row", Rows.indexes.byOwner, record),
+      gsi1sk: KeyComposer.composeSk(schema, "Row", 1, Rows.indexes.byOwner, record),
+    })
+  })
+
+  it("composes the one half that has them, and only that one", () => {
+    expect(Object.keys(halves("byOwner", { owner: "o1", note: "n1" }))).toEqual(["gsi1pk"])
+    expect(Object.keys(halves("byOwner", { note: "n1", score: 2 }))).toEqual(["gsi1sk"])
+    expect(halves("byOwner", { note: "n1" })).toEqual({})
+  })
+
+  it("takes null and undefined for no value, and 0 and an empty string for values", () => {
+    expect(Object.keys(halves("byOwner", { owner: null, note: undefined, score: 2 }))).toEqual([])
+    expect(Object.keys(halves("byOwner", { owner: "", note: "", score: 0 }))).toEqual([
+      "gsi1pk",
+      "gsi1sk",
+    ])
+  })
+
+  it("a half with no composites always composes", () => {
+    expect(halves("byConstant", {})).toEqual({ gsi3sk: "$myapp#v1#row" })
+    expect(Object.keys(halves("byConstant", { owner: "o1" }))).toEqual(["gsi3pk", "gsi3sk"])
+  })
+
+  it("a sharded partition key needs what its shard is computed from", () => {
+    expect(Object.keys(halves("bySharded", { note: "n1" }))).toEqual([])
+    expect(Object.keys(halves("bySharded", { region: "eu" }))).toEqual(["gsi2pk"])
+    expect(Object.keys(halves("bySharded", { note: "n1", region: "eu" }))).toEqual([
+      "gsi2pk",
+      "gsi2sk",
+    ])
+  })
+
+  it("a Z-order half composes its bytes, or nothing", () => {
+    expect(Object.keys(halves("byPrice", { owner: "o1" }))).toEqual(["gsi4pk"])
+    expect(halves("byPrice", { owner: "o1", price: 7 }).gsi4sk).toBeInstanceOf(Uint8Array)
+  })
+
+  it("a value with no key text is refused, not left out", () => {
+    expect(() => halves("byOwner", { owner: "o1", note: "n1", score: Number.NaN })).toThrow(
+      "EDD-9096",
+    )
+  })
+})
+
+describe("composeKeySpace", () => {
+  const schema = DynamoSchema.make({ name: "a", version: 1, escapeKeys: true })
+  const index = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>, collection?: string) => ({
+    pk: { field: "pk", composite: [...pk] },
+    sk: { field: "sk", composite: [...sk] },
+    ...(collection === undefined ? {} : { collection, type: "clustered" as const }),
+  })
+
+  it("is the text before the first composite's value, its label included", () => {
+    expect(
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop", "x"], ["name"])),
+    ).toEqual({
+      pk: { text: "$a#v1#ledger#shop_", after: [], values: [], open: true },
+      sk: { text: "$a#v1#ledger#name_", after: [], values: [], open: true },
+    })
+    expect(
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop"], ["name"], "ca")),
+    ).toEqual({
+      pk: { text: "$a#v1#ca#shop_", after: [], values: [], open: true },
+      sk: { text: "$a#v1#ca#ledger_1#name_", after: [], values: [], open: true },
+    })
+  })
+
+  it("is the whole key for a half with no composite", () => {
+    expect(KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop"], [])).sk).toEqual({
+      text: "$a#v1#ledger",
+      after: [],
+      values: [],
+      open: false,
+    })
+  })
+
+  it("goes on past a composite that can't hold the delimiter, to the next label", () => {
+    const valuesOf = (name: string): KeyComposer.CompositeValues =>
+      name === "n" || name === "m" ? "number" : "open"
+    const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string> = []) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk), valuesOf)
+    const number = { kind: "number" }
+    // Up to the first composite that can hold it, its label included.
+    expect(space(["n", "shop", "x"]).pk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#shop_"],
+      values: [number],
+      open: true,
+    })
+    // Every composite walked: the key ends after the last value.
+    expect(space(["n", "m"]).pk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#m_", ""],
+      values: [number, number],
+      open: false,
+    })
+    expect(space(["shop"], ["n", "name"]).sk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#name_"],
+      values: [number],
+      open: true,
+    })
+    const meet = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) =>
+      KeyComposer.keySpacesMeet(space(a).pk, space(b).pk)
+    // The labels after the value differ: no key of one is a key of the other.
+    expect(meet(["n", "idA"], ["n", "idB"])).toBe(false)
+    expect(meet(["n", "m"], ["n", "idB"])).toBe(false)
+    // One ends where the other goes on.
+    expect(meet(["n"], ["n", "idA"])).toBe(false)
+    expect(meet(["n", "m"], ["n", "m", "idA"])).toBe(false)
+    // The same labels: one space, whatever follows the first open value.
+    expect(meet(["n", "idA"], ["n", "idA", "idB"])).toBe(true)
+    expect(meet(["n", "m"], ["n", "m"])).toBe(true)
+    // A label that starts another's: the longer one's rest can be the shorter one's value.
+    expect(meet(["n", "id"], ["n", "id_b"])).toBe(true)
+    // A value that can hold the delimiter can hold the other's next label too.
+    expect(meet(["shop", "idA"], ["shop", "idB"])).toBe(true)
+    expect(meet(["shop"], ["shop", "idB"])).toBe(true)
+  })
+
+  it("meets another when either could start the other", () => {
+    const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk))
+    const meet = (a: ReturnType<typeof space>, b: ReturnType<typeof space>) =>
+      KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
+    // Different first composites: apart.
+    expect(meet(space(["idA"], ["name"]), space(["idB"], ["name"]))).toBe(false)
+    // The same first composite: one space, whatever follows.
+    expect(meet(space(["idA"], ["name"]), space(["idA", "idB"], ["name"]))).toBe(true)
+    // A whole key starting with an open space's text, and two whole keys.
+    const whole = { text: "$a#v1#ledger#shop_x", after: [], open: false }
+    const other = (text: string) => ({ text, after: [], open: false })
+    expect(KeyComposer.keySpacesMeet(space(["shop"], []).pk, whole)).toBe(true)
+    expect(KeyComposer.keySpacesMeet(whole, other("$a#v1#ledger#shop_x"))).toBe(true)
+    expect(KeyComposer.keySpacesMeet(whole, other("$a#v1#ledger#shop_y"))).toBe(false)
+  })
+
+  describe("a value is what its type can compose", () => {
+    /** Every composite walked, as where read models are bound: `values` says what each can be. */
+    const plain =
+      (values: Record<string, KeyComposer.CompositeValues>, options = {}) =>
+      (pk: ReadonlyArray<string>) =>
+        KeyComposer.composeKeySpace(
+          schema,
+          "Ledger",
+          1,
+          index(pk, []),
+          (name) => values[name] ?? "text",
+          options,
+        ).pk
+    const meet = (a: KeyComposer.KeySpace, b: KeyComposer.KeySpace) =>
+      KeyComposer.keySpacesMeet(a, b)
+
+    it("a number's text holds no letter a label starts with", () => {
+      const space = plain({ n: "number" })
+      // `n_7` and `n_x_q`: a number's text can't be `x_q`.
+      expect(meet(space(["n"]), space(["n_x"]))).toBe(false)
+      // As text, `n` can be `x_q`.
+      const text = plain({})
+      expect(meet(text(["n"]), text(["n_x"]))).toBe(true)
+      // A number and a number: the same keys for the same values.
+      expect(meet(space(["n"]), space(["n"]))).toBe(true)
+      // A number beside text: the text can be the number's.
+      expect(meet(space(["n"]), text(["n"]))).toBe(true)
+      // A label holding `_`, which no number's text holds.
+      expect(meet(space(["n"]), space(["n_1"]))).toBe(false)
+      // Its first character is never a letter, even one its later ones can be.
+      expect(meet(space(["n"]), space(["n_e"]))).toBe(false)
+    })
+
+    it("a number's text is never empty", () => {
+      const space = plain({ n: "number" })
+      const whole = { text: "$a#v1#ledger#n_", after: [], open: false }
+      expect(meet(space(["n"]), whole)).toBe(false)
+      expect(meet(plain({})(["n"]), whole)).toBe(true)
+    })
+
+    it("literals and booleans are their own text", () => {
+      const space = plain({ kind: { values: ["a", "b"] }, on: { values: [true, false] } })
+      expect(space(["kind"])).toEqual({
+        text: "$a#v1#ledger#kind_",
+        after: [""],
+        values: [{ kind: "oneOf", texts: ["a", "b"] }],
+        open: false,
+      })
+      // `kind_a` can't be `kind_x_q`, nor `kind_b_q`'s text `kind_b` followed by more.
+      expect(meet(space(["kind"]), space(["kind_x"]))).toBe(false)
+      expect(meet(space(["kind", "idA"]), space(["kind", "idB"]))).toBe(false)
+      expect(meet(space(["kind", "idA"]), space(["kind", "idA"]))).toBe(true)
+      // A literal holding what the other's label starts with.
+      const ab = plain({ kind: { values: ["x_q"] } })
+      expect(meet(ab(["kind"]), plain({})(["kind_x"]))).toBe(true)
+      expect(space(["on"]).values).toEqual([{ kind: "oneOf", texts: ["true", "false"] }])
+    })
+
+    it("a literal's text under every setting, with everyForm", () => {
+      const values = { kind: { values: ["a b"] } }
+      expect(plain(values)(["kind"]).values).toEqual([{ kind: "oneOf", texts: ["a%20b"] }])
+      expect(plain(values, { everyForm: true })(["kind"]).values).toEqual([
+        { kind: "oneOf", texts: ["a%20b", "a b"] },
+      ])
+    })
   })
 })

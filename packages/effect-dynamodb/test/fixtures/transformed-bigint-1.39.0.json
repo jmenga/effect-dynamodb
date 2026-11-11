@@ -1,0 +1,1338 @@
+{
+  "writtenBy": {
+    "effect-dynamodb": "1.39.0",
+    "effect": "4.1.2"
+  },
+  "entity": [
+    {
+      "set": {
+        "NS": [
+          "1152921504606846976"
+        ]
+      },
+      "nanos": {
+        "N": "1152921504606846976"
+      },
+      "tree": {
+        "M": {
+          "next": {
+            "M": {
+              "n": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "n": {
+            "N": "1152921504606846976"
+          }
+        }
+      },
+      "none": {
+        "M": {
+          "_op": {
+            "S": "None"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "_tag": {
+            "S": "None"
+          }
+        }
+      },
+      "suspended": {
+        "N": "1152921504606846976"
+      },
+      "result": {
+        "M": {
+          "_op": {
+            "S": "Success"
+          },
+          "success": {
+            "N": "1152921504606846976"
+          },
+          "_tag": {
+            "S": "Success"
+          },
+          "~effect/Result": {
+            "M": {}
+          }
+        }
+      },
+      "optionStruct": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "M": {
+              "b": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      },
+      "bytes": {
+        "N": "1152921504606846976"
+      },
+      "__edd_e__": {
+        "S": "Account"
+      },
+      "fromNullNone": {
+        "NULL": true
+      },
+      "sk": {
+        "S": "$bigints#v1#account"
+      },
+      "id": {
+        "S": "big"
+      },
+      "pk": {
+        "S": "$bigints#v1#account#id_big"
+      },
+      "fromNull": {
+        "N": "1152921504606846976"
+      },
+      "option": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "N": "1152921504606846976"
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      }
+    },
+    {
+      "set": {
+        "NS": [
+          "5"
+        ]
+      },
+      "nanos": {
+        "N": "5"
+      },
+      "tree": {
+        "M": {
+          "next": {
+            "M": {
+              "n": {
+                "N": "5"
+              }
+            }
+          },
+          "n": {
+            "N": "5"
+          }
+        }
+      },
+      "none": {
+        "M": {
+          "_op": {
+            "S": "None"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "_tag": {
+            "S": "None"
+          }
+        }
+      },
+      "suspended": {
+        "N": "5"
+      },
+      "result": {
+        "M": {
+          "_op": {
+            "S": "Success"
+          },
+          "success": {
+            "N": "5"
+          },
+          "_tag": {
+            "S": "Success"
+          },
+          "~effect/Result": {
+            "M": {}
+          }
+        }
+      },
+      "optionStruct": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "M": {
+              "b": {
+                "N": "5"
+              }
+            }
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      },
+      "bytes": {
+        "N": "5"
+      },
+      "__edd_e__": {
+        "S": "Account"
+      },
+      "fromNullNone": {
+        "NULL": true
+      },
+      "sk": {
+        "S": "$bigints#v1#account"
+      },
+      "id": {
+        "S": "small"
+      },
+      "pk": {
+        "S": "$bigints#v1#account#id_small"
+      },
+      "fromNull": {
+        "N": "5"
+      },
+      "option": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "N": "5"
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      }
+    }
+  ],
+  "aggregate": [
+    {
+      "result": {
+        "M": {
+          "_op": {
+            "S": "Success"
+          },
+          "success": {
+            "N": "1152921504606846976"
+          },
+          "_tag": {
+            "S": "Success"
+          },
+          "~effect/Result": {
+            "M": {}
+          }
+        }
+      },
+      "optionStruct": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "M": {
+              "b": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      },
+      "set": {
+        "NS": [
+          "1152921504606846976"
+        ]
+      },
+      "bytes": {
+        "N": "1152921504606846976"
+      },
+      "__edd_e__": {
+        "S": "Ledger"
+      },
+      "tree": {
+        "M": {
+          "next": {
+            "M": {
+              "n": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "n": {
+            "N": "1152921504606846976"
+          }
+        }
+      },
+      "sk": {
+        "S": "$bigints#v1#ledger"
+      },
+      "id": {
+        "S": "ledger-big"
+      },
+      "none": {
+        "M": {
+          "_op": {
+            "S": "None"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "_tag": {
+            "S": "None"
+          }
+        }
+      },
+      "pk": {
+        "S": "$bigints#v1#ledgers#ledger-big"
+      },
+      "suspended": {
+        "N": "1152921504606846976"
+      },
+      "option": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "N": "1152921504606846976"
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      }
+    },
+    {
+      "result": {
+        "M": {
+          "_op": {
+            "S": "Success"
+          },
+          "success": {
+            "N": "1152921504606846976"
+          },
+          "_tag": {
+            "S": "Success"
+          },
+          "~effect/Result": {
+            "M": {}
+          }
+        }
+      },
+      "optionStruct": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "M": {
+              "b": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      },
+      "set": {
+        "NS": [
+          "1152921504606846976"
+        ]
+      },
+      "bytes": {
+        "N": "1152921504606846976"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "tree": {
+        "M": {
+          "next": {
+            "M": {
+              "n": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "n": {
+            "N": "1152921504606846976"
+          }
+        }
+      },
+      "sk": {
+        "S": "$bigints#v1#line#a"
+      },
+      "none": {
+        "M": {
+          "_op": {
+            "S": "None"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "_tag": {
+            "S": "None"
+          }
+        }
+      },
+      "pk": {
+        "S": "$bigints#v1#ledgers#ledger-big"
+      },
+      "sku": {
+        "S": "a"
+      },
+      "suspended": {
+        "N": "1152921504606846976"
+      },
+      "option": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "N": "1152921504606846976"
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      }
+    },
+    {
+      "result": {
+        "M": {
+          "_op": {
+            "S": "Success"
+          },
+          "success": {
+            "N": "5"
+          },
+          "_tag": {
+            "S": "Success"
+          },
+          "~effect/Result": {
+            "M": {}
+          }
+        }
+      },
+      "optionStruct": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "M": {
+              "b": {
+                "N": "5"
+              }
+            }
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      },
+      "set": {
+        "NS": [
+          "5"
+        ]
+      },
+      "bytes": {
+        "N": "5"
+      },
+      "__edd_e__": {
+        "S": "Ledger"
+      },
+      "tree": {
+        "M": {
+          "next": {
+            "M": {
+              "n": {
+                "N": "5"
+              }
+            }
+          },
+          "n": {
+            "N": "5"
+          }
+        }
+      },
+      "sk": {
+        "S": "$bigints#v1#ledger"
+      },
+      "id": {
+        "S": "ledger-small"
+      },
+      "none": {
+        "M": {
+          "_op": {
+            "S": "None"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "_tag": {
+            "S": "None"
+          }
+        }
+      },
+      "pk": {
+        "S": "$bigints#v1#ledgers#ledger-small"
+      },
+      "suspended": {
+        "N": "5"
+      },
+      "option": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "N": "5"
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      }
+    },
+    {
+      "result": {
+        "M": {
+          "_op": {
+            "S": "Success"
+          },
+          "success": {
+            "N": "5"
+          },
+          "_tag": {
+            "S": "Success"
+          },
+          "~effect/Result": {
+            "M": {}
+          }
+        }
+      },
+      "optionStruct": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "M": {
+              "b": {
+                "N": "5"
+              }
+            }
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      },
+      "set": {
+        "NS": [
+          "5"
+        ]
+      },
+      "bytes": {
+        "N": "5"
+      },
+      "__edd_e__": {
+        "S": "Line"
+      },
+      "tree": {
+        "M": {
+          "next": {
+            "M": {
+              "n": {
+                "N": "5"
+              }
+            }
+          },
+          "n": {
+            "N": "5"
+          }
+        }
+      },
+      "sk": {
+        "S": "$bigints#v1#line#a"
+      },
+      "none": {
+        "M": {
+          "_op": {
+            "S": "None"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "_tag": {
+            "S": "None"
+          }
+        }
+      },
+      "pk": {
+        "S": "$bigints#v1#ledgers#ledger-small"
+      },
+      "sku": {
+        "S": "a"
+      },
+      "suspended": {
+        "N": "5"
+      },
+      "option": {
+        "M": {
+          "_op": {
+            "S": "Some"
+          },
+          "~effect/Option": {
+            "M": {}
+          },
+          "value": {
+            "N": "5"
+          },
+          "_tag": {
+            "S": "Some"
+          }
+        }
+      }
+    }
+  ],
+  "stream": [
+    {
+      "metadata": {
+        "M": {
+          "m": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "1152921504606846976"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "streamId": {
+        "S": "stored-big"
+      },
+      "data": {
+        "M": {
+          "result": {
+            "M": {
+              "_op": {
+                "S": "Success"
+              },
+              "success": {
+                "N": "1152921504606846976"
+              },
+              "_tag": {
+                "S": "Success"
+              },
+              "~effect/Result": {
+                "M": {}
+              }
+            }
+          },
+          "optionStruct": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "M": {
+                  "b": {
+                    "N": "1152921504606846976"
+                  }
+                }
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          },
+          "set": {
+            "NS": [
+              "1152921504606846976"
+            ]
+          },
+          "nanos": {
+            "N": "1152921504606846976"
+          },
+          "bytes": {
+            "N": "1152921504606846976"
+          },
+          "_tag": {
+            "S": "Paid"
+          },
+          "tree": {
+            "M": {
+              "next": {
+                "M": {
+                  "n": {
+                    "N": "1152921504606846976"
+                  }
+                }
+              },
+              "n": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "fromNullNone": {
+            "NULL": true
+          },
+          "none": {
+            "M": {
+              "_op": {
+                "S": "None"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "_tag": {
+                "S": "None"
+              }
+            }
+          },
+          "fromNull": {
+            "N": "1152921504606846976"
+          },
+          "suspended": {
+            "N": "1152921504606846976"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "1152921504606846976"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "__edd_wt__": {
+        "S": "40bb1a010691a17d26e7df84c43f8f7e"
+      },
+      "__edd_e__": {
+        "S": "tally.event"
+      },
+      "sk": {
+        "S": "$bigints#v1#tally.event_1#0000000001"
+      },
+      "pk": {
+        "S": "$bigints#v1#tally#stored-big"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "1"
+      },
+      "timestamp": {
+        "S": "2026-11-07T12:01:55.695Z"
+      }
+    },
+    {
+      "streamId": {
+        "S": "stored-big"
+      },
+      "asOfVersion": {
+        "N": "1"
+      },
+      "__edd_e__": {
+        "S": "tally.snapshot"
+      },
+      "sk": {
+        "S": "$bigints#v1#tally.snapshot"
+      },
+      "pk": {
+        "S": "$bigints#v1#tally#stored-big"
+      },
+      "state": {
+        "M": {
+          "result": {
+            "M": {
+              "_op": {
+                "S": "Success"
+              },
+              "success": {
+                "N": "1152921504606846976"
+              },
+              "_tag": {
+                "S": "Success"
+              },
+              "~effect/Result": {
+                "M": {}
+              }
+            }
+          },
+          "optionStruct": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "M": {
+                  "b": {
+                    "N": "1152921504606846976"
+                  }
+                }
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          },
+          "set": {
+            "NS": [
+              "1152921504606846976"
+            ]
+          },
+          "nanos": {
+            "N": "1152921504606846976"
+          },
+          "bytes": {
+            "N": "1152921504606846976"
+          },
+          "tree": {
+            "M": {
+              "next": {
+                "M": {
+                  "n": {
+                    "N": "1152921504606846976"
+                  }
+                }
+              },
+              "n": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "fromNullNone": {
+            "NULL": true
+          },
+          "none": {
+            "M": {
+              "_op": {
+                "S": "None"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "_tag": {
+                "S": "None"
+              }
+            }
+          },
+          "fromNull": {
+            "N": "1152921504606846976"
+          },
+          "suspended": {
+            "N": "1152921504606846976"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "1152921504606846976"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "timestamp": {
+        "S": "2026-11-07T12:01:56.080Z"
+      }
+    },
+    {
+      "metadata": {
+        "M": {
+          "m": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "streamId": {
+        "S": "stored-small"
+      },
+      "data": {
+        "M": {
+          "result": {
+            "M": {
+              "_op": {
+                "S": "Success"
+              },
+              "success": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Success"
+              },
+              "~effect/Result": {
+                "M": {}
+              }
+            }
+          },
+          "optionStruct": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "M": {
+                  "b": {
+                    "N": "5"
+                  }
+                }
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          },
+          "set": {
+            "NS": [
+              "5"
+            ]
+          },
+          "nanos": {
+            "N": "5"
+          },
+          "bytes": {
+            "N": "5"
+          },
+          "_tag": {
+            "S": "Paid"
+          },
+          "tree": {
+            "M": {
+              "next": {
+                "M": {
+                  "n": {
+                    "N": "5"
+                  }
+                }
+              },
+              "n": {
+                "N": "5"
+              }
+            }
+          },
+          "fromNullNone": {
+            "NULL": true
+          },
+          "none": {
+            "M": {
+              "_op": {
+                "S": "None"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "_tag": {
+                "S": "None"
+              }
+            }
+          },
+          "fromNull": {
+            "N": "5"
+          },
+          "suspended": {
+            "N": "5"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "__edd_wt__": {
+        "S": "cc1bd1f8107225f9ac96629c2c07e503"
+      },
+      "__edd_e__": {
+        "S": "tally.event"
+      },
+      "sk": {
+        "S": "$bigints#v1#tally.event_1#0000000001"
+      },
+      "pk": {
+        "S": "$bigints#v1#tally#stored-small"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "1"
+      },
+      "timestamp": {
+        "S": "2026-11-07T12:01:55.687Z"
+      }
+    },
+    {
+      "streamId": {
+        "S": "stored-small"
+      },
+      "asOfVersion": {
+        "N": "1"
+      },
+      "__edd_e__": {
+        "S": "tally.snapshot"
+      },
+      "sk": {
+        "S": "$bigints#v1#tally.snapshot"
+      },
+      "pk": {
+        "S": "$bigints#v1#tally#stored-small"
+      },
+      "state": {
+        "M": {
+          "result": {
+            "M": {
+              "_op": {
+                "S": "Success"
+              },
+              "success": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Success"
+              },
+              "~effect/Result": {
+                "M": {}
+              }
+            }
+          },
+          "optionStruct": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "M": {
+                  "b": {
+                    "N": "5"
+                  }
+                }
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          },
+          "set": {
+            "NS": [
+              "5"
+            ]
+          },
+          "nanos": {
+            "N": "5"
+          },
+          "bytes": {
+            "N": "5"
+          },
+          "tree": {
+            "M": {
+              "next": {
+                "M": {
+                  "n": {
+                    "N": "5"
+                  }
+                }
+              },
+              "n": {
+                "N": "5"
+              }
+            }
+          },
+          "fromNullNone": {
+            "NULL": true
+          },
+          "none": {
+            "M": {
+              "_op": {
+                "S": "None"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "_tag": {
+                "S": "None"
+              }
+            }
+          },
+          "fromNull": {
+            "N": "5"
+          },
+          "suspended": {
+            "N": "5"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "timestamp": {
+        "S": "2026-11-07T12:01:55.689Z"
+      }
+    }
+  ],
+  "outbox": [
+    {
+      "__edd_row_pk__": {
+        "S": "$bigints#v1#summary#id_outboxed"
+      },
+      "streamId": {
+        "S": "outboxed"
+      },
+      "__edd_e__": {
+        "S": "Summary#outbox"
+      },
+      "effect": {
+        "M": {
+          "result": {
+            "M": {
+              "_op": {
+                "S": "Success"
+              },
+              "success": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Success"
+              },
+              "~effect/Result": {
+                "M": {}
+              }
+            }
+          },
+          "optionStruct": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "M": {
+                  "b": {
+                    "N": "5"
+                  }
+                }
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          },
+          "set": {
+            "NS": [
+              "5"
+            ]
+          },
+          "nanos": {
+            "N": "5"
+          },
+          "bytes": {
+            "N": "5"
+          },
+          "tree": {
+            "M": {
+              "next": {
+                "M": {
+                  "n": {
+                    "N": "5"
+                  }
+                }
+              },
+              "n": {
+                "N": "5"
+              }
+            }
+          },
+          "fromNullNone": {
+            "NULL": true
+          },
+          "none": {
+            "M": {
+              "_op": {
+                "S": "None"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "_tag": {
+                "S": "None"
+              }
+            }
+          },
+          "fromNull": {
+            "N": "5"
+          },
+          "suspended": {
+            "N": "5"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "sk": {
+        "S": "$bigints#v1#summary#outbox#000000000001#0000"
+      },
+      "pk": {
+        "S": "$bigints#v1#summary#id_outboxed"
+      },
+      "source": {
+        "S": "projection"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "1"
+      },
+      "__edd_row_sk__": {
+        "S": "$bigints#v1#summary"
+      }
+    }
+  ]
+}

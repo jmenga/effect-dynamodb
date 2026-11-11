@@ -37,7 +37,7 @@ const ChangeFeedLive = Layer.mergeAll(
 ).pipe(Layer.provideMerge(ClientLive))
 ```
 
-- **`DynamoStreamsClient.layer({ region, endpoint?, credentials? })`** builds the SDK client when the layer is built and destroys it when its scope closes. `layerConfig` reads the same settings from `Config`, and `layerFromSdkClient(client)` wraps a client you construct yourself.
+- **`DynamoStreamsClient.layer({ region, endpoint?, credentials?, requestHandler?, maxAttempts? })`** builds the SDK client when the layer is built and destroys it when its scope closes. `requestHandler` and `maxAttempts` go to the SDK client, as on `DynamoClient` ([Timeouts and cancelling requests](/effect-dynamodb/guides/advanced/#timeouts-and-cancelling-requests)); the SDK sets no request timeout by default. `layerConfig` reads the same settings from `Config`, and `layerFromSdkClient(client)` wraps a client you construct yourself.
 - **`CheckpointStore.layerMemory`** keeps everything in memory, for tests or a feed that may start over. Its lease is process-local.
 
 The feed reads the stream named by the table's `LatestStreamArn`. The table needs a stream (`NEW_IMAGE` or `NEW_AND_OLD_IMAGES` for projections):
@@ -161,6 +161,9 @@ One lease per consumer and stream, held in the checkpoint store, keeps a second 
 - it is taken when the feed starts, renewed every `renewEvery` (default a third of `duration`, which defaults to 30 s), and released when the stream ends. `renewEvery` must be less than half of `duration` (`changeFeed` throws `[EDD-9083]` otherwise), which leaves `duration − 2 × renewEvery` to retry a failed renewal in;
 - a second process fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or, with `lease: { onHeld: "wait" }`, retries until the lease is released or expires;
 - a renewal the checkpoint store fails to write is retried until `renewEvery` before the lease would lapse, then fails the feed with that `CheckpointStoreError`;
+- a renewal left unanswered is aborted and tried again inside that window. Each attempt waits `renewEvery` at most, and until one has gone unanswered it leaves a quarter of the time left for the retry, so one fits at the default ratio too. At that ratio, a renewal that takes over three quarters of `renewEvery` is aborted;
+- a renewal still unanswered at the end of the window ends the feed, with `ChangeFeedLeaseLost`, without waiting for the request. The feed doesn't wait for a custom `CheckpointStore`'s call either, which may not be interruptible;
+- aborting ends the wait, not the request, so a renewal may land after it was given up on. It is conditional on the owner, so it can't take the lease from another process or recreate a released one. It can move this process's own expiry back, until the next renewal puts it right;
 - if another process takes the lease (this one stopped renewing), the feed fails with `ChangeFeedLeaseLost`;
 - once the lease is lost either way, a batch still in flight cannot commit: its acknowledgement fails with `ChangeFeedLeaseLost`.
 
@@ -182,7 +185,7 @@ Expiry compares the holder's clock with the taker's, so hosts need roughly synch
 
 `changeFeed` throws `[EDD-9083]` for options it can't honour: `renewEvery` of half the lease `duration` or more, a `batchSize` outside 1–1000, or a `maxConcurrentReads` that is not a positive integer. `CheckpointStore.layerDynamoDB({ tableName, finishedTtl })` throws `[EDD-9084]` for a `finishedTtl` under 28 hours: a finished shard's checkpoint must outlive the shards that depend on it (24 hours of retention plus a shard's lifetime), or a restart reports records lost that were not.
 
-Throttling (`LimitExceededException`, `ThrottlingException`) and `InternalServerError` are retried. Any other failure ends the stream with a typed error: `ChangeFeedError` is the shared client errors (`DynamoError`, `ResourceNotFoundError`, …), `ChangeFeedTrimmed`, `ChangeFeedLeaseHeld`, `ChangeFeedLeaseLost` or `CheckpointStoreError`.
+Throttling (`LimitExceededException`, `ThrottlingException`) and `InternalServerError` are retried, and so is a request timeout you configured on the client's handler. Any other failure, a dropped or refused connection included, ends the stream with a typed error: `ChangeFeedError` is the shared client errors (`DynamoError`, `ResourceNotFoundError`, …), `ChangeFeedTrimmed`, `ChangeFeedLeaseHeld`, `ChangeFeedLeaseLost` or `CheckpointStoreError`.
 
 ## DynamoDB Local
 

@@ -1,0 +1,679 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (with effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local at a clock fixed at 1700000000000 ms: for each time-series definition, whether Entity.make loaded it, then each step's outcome (a failure as its tag and EDD code) and the table's rows after it, scanned and sorted by key. Never regenerate it or edit it to match a later release.",
+ "clock": 1700000000000,
+ "scenarios": {
+  "`by` optional, the index's partition composite never carried": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "1",
+       "tenant": "t",
+       "at": 1,
+       "region": "r",
+       "group": "a"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "1"
+       },
+       "group": {
+        "S": "a"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.4#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#region_r#group_a"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "region": {
+        "S": "r"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append without `by`",
+     "outcome": {
+      "ok": {
+       "current": {
+        "id": "1",
+        "tenant": "t",
+        "at": 2,
+        "region": "r",
+        "group": "a"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "group": {
+        "S": "a"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.4#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#region_r#group_a"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "region": {
+        "S": "r"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append carrying `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "group": {
+        "S": "a"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.4#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#region_r#group_a"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "region": {
+        "S": "r"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "`by` required, an optional composite after a gap": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "1",
+       "tenant": "t",
+       "at": 1,
+       "group": "a",
+       "mid": "m",
+       "tail": "x"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "1"
+       },
+       "group": {
+        "S": "a"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.4#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#group_a#mid_m#tail_x"
+       },
+       "id": {
+        "S": "1"
+       },
+       "mid": {
+        "S": "m"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tail": {
+        "S": "x"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append without the composite after the gap",
+     "outcome": {
+      "ok": {
+       "current": {
+        "id": "1",
+        "tenant": "t",
+        "at": 2,
+        "group": "b",
+        "mid": "m",
+        "tail": "x"
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "group": {
+        "S": "b"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.5#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#group_b"
+       },
+       "id": {
+        "S": "1"
+       },
+       "mid": {
+        "S": "m"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tail": {
+        "S": "x"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "group": {
+        "S": "b"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append carrying it",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "group": {
+        "S": "b"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.5#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#group_b"
+       },
+       "id": {
+        "S": "1"
+       },
+       "mid": {
+        "S": "m"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tail": {
+        "S": "x"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "group": {
+        "S": "b"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "`by` optional, the index's partition composite always carried": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "1",
+       "tenant": "t",
+       "at": 1,
+       "region": "r",
+       "group": "a"
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "1"
+       },
+       "group": {
+        "S": "a"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.4#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#region_r#group_a"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "region": {
+        "S": "r"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append without `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "1"
+       },
+       "group": {
+        "S": "a"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.4#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#region_r#group_a"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "region": {
+        "S": "r"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append carrying `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "1"
+       },
+       "group": {
+        "S": "a"
+       },
+       "gsi1pk": {
+        "S": "$kept#v1#series#!8.4#tenant_t"
+       },
+       "gsi1sk": {
+        "S": "$kept#v1#series#region_r#group_a"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "region": {
+        "S": "r"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "`by` optional, the index's partition composite always carried, and sparse": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "an append without `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": []
+    },
+    {
+     "step": "an append giving `by` as undefined",
+     "outcome": {
+      "ok": {
+       "current": {
+        "id": "1",
+        "tenant": "t",
+        "at": 2
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "an append carrying `by`",
+     "outcome": {
+      "fail": "ValidationError",
+      "code": "EDD-9100"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "1",
+       "tenant": "t",
+       "at": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Series"
+       },
+       "at": {
+        "N": "2"
+       },
+       "id": {
+        "S": "1"
+       },
+       "pk": {
+        "S": "$kept#v1#series#id_1"
+       },
+       "sk": {
+        "S": "$kept#v1#series#e#0000000000000002"
+       },
+       "tenant": {
+        "S": "t"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ }
+}

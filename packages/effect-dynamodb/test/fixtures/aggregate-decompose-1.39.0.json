@@ -1,0 +1,175 @@
+{
+  "generatedFrom": "effect-dynamodb@1.39.0",
+  "returned": {
+    "created": {
+      "id": "created",
+      "lines": [
+        {
+          "lineId": "l1",
+          "f": 500
+        }
+      ],
+      "kept": [
+        {
+          "lineId": "k1",
+          "f": 500
+        }
+      ]
+    },
+    "updated-once": {
+      "id": "updated-once",
+      "lines": [
+        {
+          "lineId": "l1",
+          "f": 500,
+          "note": "n0"
+        }
+      ],
+      "kept": [
+        {
+          "lineId": "k1",
+          "f": 5000,
+          "note": "n0"
+        }
+      ]
+    }
+  },
+  "read": {
+    "created": {
+      "id": "created",
+      "lines": [
+        {
+          "lineId": "l1",
+          "f": 50
+        }
+      ],
+      "kept": [
+        {
+          "lineId": "k1",
+          "f": 500
+        }
+      ]
+    },
+    "updated-once": {
+      "id": "updated-once",
+      "lines": [
+        {
+          "lineId": "l1",
+          "f": 50,
+          "note": "n0"
+        }
+      ],
+      "kept": [
+        {
+          "lineId": "k1",
+          "f": 5000,
+          "note": "n0"
+        }
+      ]
+    }
+  },
+  "rows": [
+    {
+      "sk": {
+        "S": "$dc#v1#dckept#0000000000000500"
+      },
+      "lineId": {
+        "S": "k1"
+      },
+      "pk": {
+        "S": "$dc#v1#dcorder#created"
+      },
+      "f": {
+        "N": "50"
+      },
+      "__edd_e__": {
+        "S": "DcKept"
+      }
+    },
+    {
+      "sk": {
+        "S": "$dc#v1#dcline#0000000000000050"
+      },
+      "lineId": {
+        "S": "l1"
+      },
+      "pk": {
+        "S": "$dc#v1#dcorder#created"
+      },
+      "f": {
+        "N": "5"
+      },
+      "__edd_e__": {
+        "S": "DcLine"
+      }
+    },
+    {
+      "sk": {
+        "S": "$dc#v1#dcorder"
+      },
+      "id": {
+        "S": "created"
+      },
+      "pk": {
+        "S": "$dc#v1#dcorder#created"
+      },
+      "__edd_e__": {
+        "S": "DcOrder"
+      }
+    },
+    {
+      "sk": {
+        "S": "$dc#v1#dckept#0000000000005000"
+      },
+      "lineId": {
+        "S": "k1"
+      },
+      "note": {
+        "S": "n0"
+      },
+      "pk": {
+        "S": "$dc#v1#dcorder#updated-once"
+      },
+      "f": {
+        "N": "500"
+      },
+      "__edd_e__": {
+        "S": "DcKept"
+      }
+    },
+    {
+      "sk": {
+        "S": "$dc#v1#dcline#0000000000000050"
+      },
+      "lineId": {
+        "S": "l1"
+      },
+      "note": {
+        "S": "n0"
+      },
+      "pk": {
+        "S": "$dc#v1#dcorder#updated-once"
+      },
+      "f": {
+        "N": "5"
+      },
+      "__edd_e__": {
+        "S": "DcLine"
+      }
+    },
+    {
+      "sk": {
+        "S": "$dc#v1#dcorder"
+      },
+      "id": {
+        "S": "updated-once"
+      },
+      "pk": {
+        "S": "$dc#v1#dcorder#updated-once"
+      },
+      "__edd_e__": {
+        "S": "DcOrder"
+      }
+    }
+  ]
+}

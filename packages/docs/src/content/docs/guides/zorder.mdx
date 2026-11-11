@@ -182,7 +182,8 @@ const regionMatches = yield* db.entities.Listings.search({ region: "north" })
 - **Prefix composites** take one exact value each.
 - **A dimension left out** means its full range. `.within({})` changes nothing.
 - **Every bound is exact.** Quantization lets rows just outside the box share a level with rows inside it, so the library checks every bound on the rows it reads: with a `FilterExpression` where DynamoDB's comparison of the stored attribute agrees with the dimension's order, and on each row in the client where it doesn't (a `Schema.NumberFromString` field stored as text, a `DateTimeZoned` field, a hashed prefix).
-- **Bad bounds throw at `.within()`**, before anything is sent: a value that can't be encoded (`EDD-9050`), one a dimension can't place (`EDD-9092`), or a misuse reachable from untyped code, such as an unknown field or a range on a prefix composite (`EDD-9093`).
+- **A value a dimension can't place** (`EDD-9092`) fails the query at its terminal with a `ValidationError`, before anything is sent, and `.explain()` says why.
+- **Other bad bounds throw at `.within()`**, before anything is sent: a value that can't be encoded (`EDD-9050`), or a misuse reachable from untyped code, such as an unknown field or a range on a prefix composite (`EDD-9093`).
 
 `.where()` is not offered on a Z-order accessor: the sort key is a binary address, with no text order to compare against.
 
@@ -324,7 +325,7 @@ const nowInBox = yield* db.entities.Listings.search({ region: "north" })
 // nowInBox includes the updated listing (once the GSI has caught up)
 ```
 
-A Z-order sort key is **all or nothing**. An update recomposes it only when every prefix composite and dimension is in the update (or the primary key). Otherwise the index's [`indexPolicy`](/effect-dynamodb/guides/index-policy/#z-order-sort-keys) decides: under `"preserve"` (the default) the stored address is left alone and may go stale; under `"sparse"` the item leaves the index; `.remove([field])` of one of them removes the key either way. An update that touches none of them leaves the key alone. A partial address is meaningless, so the key is never truncated. A change within one level writes the same bytes, and the entry stays where it is.
+A Z-order sort key is **all or nothing**. An update recomposes it only when every prefix composite and dimension is in the update (or the primary key). Otherwise the index's [`indexPolicy`](/effect-dynamodb/guides/index-policy/#z-order-sort-keys) decides: under `"preserve"` (the default) the stored address is left alone and may go stale; under `"sparse"` the item leaves the index; clearing one of them, with `.remove([field])` or `.set({ field: undefined })`, removes the key either way. An update that touches none of them leaves the key alone. A partial address is meaningless, so the key is never truncated. A change within one level writes the same bytes, and the entry stays where it is.
 
 - **Choose steps so values change rarely.** The step sets how often the entry moves. A "last seen" timestamp at minute resolution would move the entry on almost every write; quantize it to hours or days, or leave it out of the address.
 - **Each move costs two index writes.** DynamoDB deletes the old entry and puts the new one, on the GSI's partition key: `region` here, shared by every listing in it, at 1,000 WCU per second per partition. When a GSI's writes are throttled, DynamoDB throttles writes to the **base table** as well, so frequent moves can throttle unrelated writes. Coarser steps, or a more selective GSI partition key, reduce it.

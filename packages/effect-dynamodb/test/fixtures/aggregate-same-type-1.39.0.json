@@ -1,0 +1,606 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "read": {
+  "created": {
+   "id": "created",
+   "customer": "c",
+   "region": "r!!",
+   "f": 500,
+   "label": "a!!",
+   "nested": {
+    "x": 500
+   },
+   "list": [
+    500
+   ],
+   "rec": {
+    "k": 500
+   },
+   "opt": 500,
+   "maybe": 500,
+   "maker": {
+    "makerId": "m1",
+    "rate": 50,
+    "label": "a!"
+   },
+   "boss": {
+    "f": 500
+   },
+   "lines": [
+    {
+     "id": "l1",
+     "f": 500
+    }
+   ],
+   "squad": {
+    "f": 500,
+    "boss": {
+     "f": 500
+    }
+   }
+  },
+  "updated-once": {
+   "id": "updated-once",
+   "customer": "c",
+   "region": "r!!!",
+   "f": 5000,
+   "label": "a!!!",
+   "note": "n0",
+   "nested": {
+    "x": 5000
+   },
+   "list": [
+    5000
+   ],
+   "rec": {
+    "k": 5000
+   },
+   "opt": 5000,
+   "maybe": 5000,
+   "maker": {
+    "makerId": "m1",
+    "rate": 500,
+    "label": "a!!"
+   },
+   "boss": {
+    "f": 5000
+   },
+   "lines": [
+    {
+     "id": "l1",
+     "f": 5000
+    }
+   ],
+   "squad": {
+    "f": 5000,
+    "boss": {
+     "f": 5000
+    }
+   }
+  },
+  "updated-twice": {
+   "id": "updated-twice",
+   "customer": "c",
+   "region": "r!!!!",
+   "f": 50000,
+   "label": "a!!!!",
+   "note": "n1",
+   "nested": {
+    "x": 50000
+   },
+   "list": [
+    50000
+   ],
+   "rec": {
+    "k": 50000
+   },
+   "opt": 50000,
+   "maybe": 50000,
+   "maker": {
+    "makerId": "m1",
+    "rate": 5000,
+    "label": "a!!!"
+   },
+   "boss": {
+    "f": 50000
+   },
+   "lines": [
+    {
+     "id": "l1",
+     "f": 50000
+    }
+   ],
+   "squad": {
+    "f": 50000,
+    "boss": {
+     "f": 50000
+    }
+   }
+  }
+ },
+ "rows": [
+  {
+   "sk": {
+    "S": "$dv#v1#dvboss#part#0000000000000001"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#created"
+   },
+   "region": {
+    "S": "r!"
+   },
+   "f": {
+    "N": "50"
+   },
+   "part": {
+    "N": "1"
+   },
+   "__edd_e__": {
+    "S": "DvBoss"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvbossrow"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#created"
+   },
+   "region": {
+    "S": "r!"
+   },
+   "f": {
+    "N": "50"
+   },
+   "__edd_e__": {
+    "S": "DvBossRow"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvline#l1"
+   },
+   "id": {
+    "S": "l1"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#created"
+   },
+   "region": {
+    "S": "r!"
+   },
+   "f": {
+    "N": "50"
+   },
+   "__edd_e__": {
+    "S": "DvLine"
+   }
+  },
+  {
+   "rate": {
+    "N": "5"
+   },
+   "__edd_e__": {
+    "S": "DvMakerRow"
+   },
+   "sk": {
+    "S": "$dv#v1#dvmakerrow"
+   },
+   "label": {
+    "S": "a"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#created"
+   },
+   "region": {
+    "S": "r!"
+   },
+   "makerId": {
+    "S": "m1"
+   }
+  },
+  {
+   "gsi1sk": {
+    "S": "$dv#v1#dvlist#created"
+   },
+   "maybe": {
+    "N": "50"
+   },
+   "f": {
+    "N": "50"
+   },
+   "gsi1pk": {
+    "S": "$dv#v1#dvlist#c"
+   },
+   "label": {
+    "S": "a!"
+   },
+   "list": {
+    "L": [
+     {
+      "N": "50"
+     }
+    ]
+   },
+   "nested": {
+    "M": {
+     "x": {
+      "N": "50"
+     }
+    }
+   },
+   "rec": {
+    "M": {
+     "k": {
+      "N": "50"
+     }
+    }
+   },
+   "opt": {
+    "N": "50"
+   },
+   "__edd_e__": {
+    "S": "DvRoot"
+   },
+   "sk": {
+    "S": "$dv#v1#dvroot"
+   },
+   "id": {
+    "S": "created"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#created"
+   },
+   "region": {
+    "S": "r!"
+   },
+   "customer": {
+    "S": "c"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvsquad#part#0000000000000001"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#created"
+   },
+   "region": {
+    "S": "r!"
+   },
+   "f": {
+    "N": "50"
+   },
+   "part": {
+    "N": "1"
+   },
+   "__edd_e__": {
+    "S": "DvSquad"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvboss#part#0000000000000001"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-once"
+   },
+   "region": {
+    "S": "r!!"
+   },
+   "f": {
+    "N": "500"
+   },
+   "part": {
+    "N": "1"
+   },
+   "__edd_e__": {
+    "S": "DvBoss"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvbossrow"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-once"
+   },
+   "region": {
+    "S": "r!!"
+   },
+   "f": {
+    "N": "500"
+   },
+   "__edd_e__": {
+    "S": "DvBossRow"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvline#l1"
+   },
+   "id": {
+    "S": "l1"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-once"
+   },
+   "region": {
+    "S": "r!!"
+   },
+   "f": {
+    "N": "500"
+   },
+   "__edd_e__": {
+    "S": "DvLine"
+   }
+  },
+  {
+   "rate": {
+    "N": "50"
+   },
+   "__edd_e__": {
+    "S": "DvMakerRow"
+   },
+   "sk": {
+    "S": "$dv#v1#dvmakerrow"
+   },
+   "label": {
+    "S": "a!"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-once"
+   },
+   "region": {
+    "S": "r!!"
+   },
+   "makerId": {
+    "S": "m1"
+   }
+  },
+  {
+   "note": {
+    "S": "n0"
+   },
+   "gsi1sk": {
+    "S": "$dv#v1#dvlist#updated-once"
+   },
+   "maybe": {
+    "N": "500"
+   },
+   "f": {
+    "N": "500"
+   },
+   "gsi1pk": {
+    "S": "$dv#v1#dvlist#c"
+   },
+   "label": {
+    "S": "a!!"
+   },
+   "list": {
+    "L": [
+     {
+      "N": "500"
+     }
+    ]
+   },
+   "nested": {
+    "M": {
+     "x": {
+      "N": "500"
+     }
+    }
+   },
+   "rec": {
+    "M": {
+     "k": {
+      "N": "500"
+     }
+    }
+   },
+   "opt": {
+    "N": "500"
+   },
+   "__edd_e__": {
+    "S": "DvRoot"
+   },
+   "sk": {
+    "S": "$dv#v1#dvroot"
+   },
+   "id": {
+    "S": "updated-once"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-once"
+   },
+   "region": {
+    "S": "r!!"
+   },
+   "customer": {
+    "S": "c"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvsquad#part#0000000000000001"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-once"
+   },
+   "region": {
+    "S": "r!!"
+   },
+   "f": {
+    "N": "500"
+   },
+   "part": {
+    "N": "1"
+   },
+   "__edd_e__": {
+    "S": "DvSquad"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvboss#part#0000000000000001"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-twice"
+   },
+   "region": {
+    "S": "r!!!"
+   },
+   "f": {
+    "N": "5000"
+   },
+   "part": {
+    "N": "1"
+   },
+   "__edd_e__": {
+    "S": "DvBoss"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvbossrow"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-twice"
+   },
+   "region": {
+    "S": "r!!!"
+   },
+   "f": {
+    "N": "5000"
+   },
+   "__edd_e__": {
+    "S": "DvBossRow"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvline#l1"
+   },
+   "id": {
+    "S": "l1"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-twice"
+   },
+   "region": {
+    "S": "r!!!"
+   },
+   "f": {
+    "N": "5000"
+   },
+   "__edd_e__": {
+    "S": "DvLine"
+   }
+  },
+  {
+   "rate": {
+    "N": "500"
+   },
+   "__edd_e__": {
+    "S": "DvMakerRow"
+   },
+   "sk": {
+    "S": "$dv#v1#dvmakerrow"
+   },
+   "label": {
+    "S": "a!!"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-twice"
+   },
+   "region": {
+    "S": "r!!!"
+   },
+   "makerId": {
+    "S": "m1"
+   }
+  },
+  {
+   "note": {
+    "S": "n1"
+   },
+   "gsi1sk": {
+    "S": "$dv#v1#dvlist#updated-twice"
+   },
+   "maybe": {
+    "N": "5000"
+   },
+   "f": {
+    "N": "5000"
+   },
+   "gsi1pk": {
+    "S": "$dv#v1#dvlist#c"
+   },
+   "label": {
+    "S": "a!!!"
+   },
+   "list": {
+    "L": [
+     {
+      "N": "5000"
+     }
+    ]
+   },
+   "nested": {
+    "M": {
+     "x": {
+      "N": "5000"
+     }
+    }
+   },
+   "rec": {
+    "M": {
+     "k": {
+      "N": "5000"
+     }
+    }
+   },
+   "opt": {
+    "N": "5000"
+   },
+   "__edd_e__": {
+    "S": "DvRoot"
+   },
+   "sk": {
+    "S": "$dv#v1#dvroot"
+   },
+   "id": {
+    "S": "updated-twice"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-twice"
+   },
+   "region": {
+    "S": "r!!!"
+   },
+   "customer": {
+    "S": "c"
+   }
+  },
+  {
+   "sk": {
+    "S": "$dv#v1#dvsquad#part#0000000000000001"
+   },
+   "pk": {
+    "S": "$dv#v1#dvroot#updated-twice"
+   },
+   "region": {
+    "S": "r!!!"
+   },
+   "f": {
+    "N": "5000"
+   },
+   "part": {
+    "N": "1"
+   },
+   "__edd_e__": {
+    "S": "DvSquad"
+   }
+  }
+ ]
+}

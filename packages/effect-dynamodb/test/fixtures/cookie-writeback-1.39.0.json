@@ -1,0 +1,2338 @@
+{
+ "comment": "Captured from published effect-dynamodb@1.39.0 against DynamoDB Local (cookie-writeback.mjs): the rows it stores for cookies, and what it does when a value read from one is written back. A record of what 1.39.0 did: never regenerate it.",
+ "version": "1.39.0",
+ "expires": "2030-01-02T03:04:05.678Z",
+ "entity": {
+  "cookie.expiry": {
+   "row": {
+    "sk": {
+     "S": "$look#v1#row"
+    },
+    "id": {
+     "S": "expiry"
+    },
+    "pk": {
+     "S": "$look#v1#row#id_expiry"
+    },
+    "f": {
+     "M": {
+      "name": {
+       "S": "a"
+      },
+      "valueEncoded": {
+       "S": "b%20c"
+      },
+      "options": {
+       "M": {
+        "path": {
+         "S": "/"
+        },
+        "expires": {
+         "M": {}
+        }
+       }
+      },
+      "value": {
+       "S": "b c"
+      },
+      "~effect/http/Cookies/Cookie": {
+       "S": "~effect/http/Cookies/Cookie"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Row"
+    }
+   },
+   "readAs": "map",
+   "ops": {
+    "putBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": null
+    },
+    "setBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    },
+    "conditionBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "unrelated": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "immutableSetBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    }
+   }
+  },
+  "cookie.plain": {
+   "row": {
+    "sk": {
+     "S": "$look#v1#row"
+    },
+    "id": {
+     "S": "plain"
+    },
+    "pk": {
+     "S": "$look#v1#row#id_plain"
+    },
+    "f": {
+     "M": {
+      "name": {
+       "S": "p"
+      },
+      "valueEncoded": {
+       "S": "q"
+      },
+      "options": {
+       "M": {
+        "secure": {
+         "BOOL": true
+        },
+        "path": {
+         "S": "/"
+        },
+        "maxAge": {
+         "M": {
+          "~effect/Duration": {
+           "S": "~effect/Duration"
+          },
+          "value": {
+           "M": {
+            "millis": {
+             "N": "5000"
+            },
+            "_tag": {
+             "S": "Millis"
+            }
+           }
+          }
+         }
+        }
+       }
+      },
+      "value": {
+       "S": "q"
+      },
+      "~effect/http/Cookies/Cookie": {
+       "S": "~effect/http/Cookies/Cookie"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Row"
+    }
+   },
+   "readAs": "map",
+   "ops": {
+    "putBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "p"
+       },
+       "valueEncoded": {
+        "S": "q"
+       },
+       "options": {
+        "M": {
+         "secure": {
+          "BOOL": true
+         },
+         "path": {
+          "S": "/"
+         },
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "q"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": null
+    },
+    "setBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "p"
+       },
+       "valueEncoded": {
+        "S": "q"
+       },
+       "options": {
+        "M": {
+         "secure": {
+          "BOOL": true
+         },
+         "path": {
+          "S": "/"
+         },
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "q"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    },
+    "conditionBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "p"
+       },
+       "valueEncoded": {
+        "S": "q"
+       },
+       "options": {
+        "M": {
+         "secure": {
+          "BOOL": true
+         },
+         "path": {
+          "S": "/"
+         },
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "q"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "unrelated": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "p"
+       },
+       "valueEncoded": {
+        "S": "q"
+       },
+       "options": {
+        "M": {
+         "secure": {
+          "BOOL": true
+         },
+         "path": {
+          "S": "/"
+         },
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "q"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "immutableSetBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "p"
+       },
+       "valueEncoded": {
+        "S": "q"
+       },
+       "options": {
+        "M": {
+         "secure": {
+          "BOOL": true
+         },
+         "path": {
+          "S": "/"
+         },
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "q"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    }
+   }
+  },
+  "cookie.maxAgeExtra": {
+   "row": {
+    "sk": {
+     "S": "$look#v1#row"
+    },
+    "id": {
+     "S": "maxAgeExtra"
+    },
+    "pk": {
+     "S": "$look#v1#row#id_maxageextra"
+    },
+    "f": {
+     "M": {
+      "name": {
+       "S": "a"
+      },
+      "valueEncoded": {
+       "S": "b"
+      },
+      "options": {
+       "M": {
+        "maxAge": {
+         "M": {
+          "~effect/Duration": {
+           "S": "~effect/Duration"
+          },
+          "value": {
+           "M": {
+            "millis": {
+             "N": "5000"
+            },
+            "_tag": {
+             "S": "Millis"
+            }
+           }
+          },
+          "source": {
+           "S": "x"
+          }
+         }
+        }
+       }
+      },
+      "value": {
+       "S": "b"
+      },
+      "~effect/http/Cookies/Cookie": {
+       "S": "~effect/http/Cookies/Cookie"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Row"
+    }
+   },
+   "readAs": "map",
+   "ops": {
+    "putBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b"
+       },
+       "options": {
+        "M": {
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           },
+           "source": {
+            "S": "x"
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "b"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": null
+    },
+    "setBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b"
+       },
+       "options": {
+        "M": {
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           },
+           "source": {
+            "S": "x"
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "b"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    },
+    "conditionBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b"
+       },
+       "options": {
+        "M": {
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           },
+           "source": {
+            "S": "x"
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "b"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "unrelated": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b"
+       },
+       "options": {
+        "M": {
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           },
+           "source": {
+            "S": "x"
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "b"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "immutableSetBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b"
+       },
+       "options": {
+        "M": {
+         "maxAge": {
+          "M": {
+           "~effect/Duration": {
+            "S": "~effect/Duration"
+           },
+           "value": {
+            "M": {
+             "millis": {
+              "N": "5000"
+             },
+             "_tag": {
+              "S": "Millis"
+             }
+            }
+           },
+           "source": {
+            "S": "x"
+           }
+          }
+         }
+        }
+       },
+       "value": {
+        "S": "b"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    }
+   }
+  },
+  "jar.expiry": {
+   "row": {
+    "sk": {
+     "S": "$look#v1#row"
+    },
+    "id": {
+     "S": "expiry"
+    },
+    "pk": {
+     "S": "$look#v1#row#id_expiry"
+    },
+    "f": {
+     "M": {
+      "cookies": {
+       "M": {
+        "a": {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "valueEncoded": {
+           "S": "b%20c"
+          },
+          "options": {
+           "M": {
+            "path": {
+             "S": "/"
+            },
+            "expires": {
+             "M": {}
+            }
+           }
+          },
+          "value": {
+           "S": "b c"
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        }
+       }
+      },
+      "~effect/http/Cookies": {
+       "S": "~effect/http/Cookies"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Row"
+    }
+   },
+   "readAs": "map",
+   "ops": {
+    "putBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             }
+            }
+           },
+           "value": {
+            "S": "b c"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": null
+    },
+    "setBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             }
+            }
+           },
+           "value": {
+            "S": "b c"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    },
+    "conditionBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             }
+            }
+           },
+           "value": {
+            "S": "b c"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "unrelated": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             }
+            }
+           },
+           "value": {
+            "S": "b c"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "immutableSetBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b%20c"
+           },
+           "options": {
+            "M": {
+             "path": {
+              "S": "/"
+             },
+             "expires": {
+              "M": {}
+             }
+            }
+           },
+           "value": {
+            "S": "b c"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    }
+   }
+  },
+  "jar.memberExtra": {
+   "row": {
+    "sk": {
+     "S": "$look#v1#row"
+    },
+    "id": {
+     "S": "memberExtra"
+    },
+    "pk": {
+     "S": "$look#v1#row#id_memberextra"
+    },
+    "f": {
+     "M": {
+      "cookies": {
+       "M": {
+        "a": {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "valueEncoded": {
+           "S": "b"
+          },
+          "note": {
+           "S": "n"
+          },
+          "value": {
+           "S": "b"
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        }
+       }
+      },
+      "~effect/http/Cookies": {
+       "S": "~effect/http/Cookies"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Row"
+    }
+   },
+   "readAs": "map",
+   "ops": {
+    "putBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "note": {
+            "S": "n"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": null
+    },
+    "setBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "note": {
+            "S": "n"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    },
+    "conditionBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "note": {
+            "S": "n"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "unrelated": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "note": {
+            "S": "n"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "immutableSetBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "a": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "note": {
+            "S": "n"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    }
+   }
+  },
+  "jar.rekeyed": {
+   "row": {
+    "sk": {
+     "S": "$look#v1#row"
+    },
+    "id": {
+     "S": "rekeyed"
+    },
+    "pk": {
+     "S": "$look#v1#row#id_rekeyed"
+    },
+    "f": {
+     "M": {
+      "cookies": {
+       "M": {
+        "k": {
+         "M": {
+          "name": {
+           "S": "a"
+          },
+          "valueEncoded": {
+           "S": "b"
+          },
+          "value": {
+           "S": "b"
+          },
+          "~effect/http/Cookies/Cookie": {
+           "S": "~effect/http/Cookies/Cookie"
+          }
+         }
+        }
+       }
+      },
+      "~effect/http/Cookies": {
+       "S": "~effect/http/Cookies"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Row"
+    }
+   },
+   "readAs": "map",
+   "ops": {
+    "putBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "k": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": null
+    },
+    "setBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "k": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    },
+    "conditionBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "k": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "unrelated": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "k": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "immutableSetBack": {
+     "outcome": "ok",
+     "f": {
+      "M": {
+       "cookies": {
+        "M": {
+         "k": {
+          "M": {
+           "name": {
+            "S": "a"
+           },
+           "valueEncoded": {
+            "S": "b"
+           },
+           "value": {
+            "S": "b"
+           },
+           "~effect/http/Cookies/Cookie": {
+            "S": "~effect/http/Cookies/Cookie"
+           }
+          }
+         }
+        }
+       },
+       "~effect/http/Cookies": {
+        "S": "~effect/http/Cookies"
+       }
+      }
+     },
+     "n": {
+      "N": "2"
+     }
+    }
+   }
+  },
+  "list.expiry": {
+   "row": {
+    "sk": {
+     "S": "$look#v1#row"
+    },
+    "id": {
+     "S": "expiry"
+    },
+    "pk": {
+     "S": "$look#v1#row#id_expiry"
+    },
+    "f": {
+     "L": [
+      {
+       "M": {
+        "name": {
+         "S": "a"
+        },
+        "valueEncoded": {
+         "S": "b%20c"
+        },
+        "options": {
+         "M": {
+          "path": {
+           "S": "/"
+          },
+          "expires": {
+           "M": {}
+          }
+         }
+        },
+        "value": {
+         "S": "b c"
+        },
+        "~effect/http/Cookies/Cookie": {
+         "S": "~effect/http/Cookies/Cookie"
+        }
+       }
+      }
+     ]
+    },
+    "__edd_e__": {
+     "S": "Row"
+    }
+   },
+   "readAs": "map",
+   "ops": {
+    "putBack": {
+     "outcome": "ok",
+     "f": {
+      "L": [
+       {
+        "M": {
+         "name": {
+          "S": "a"
+         },
+         "valueEncoded": {
+          "S": "b%20c"
+         },
+         "options": {
+          "M": {
+           "path": {
+            "S": "/"
+           },
+           "expires": {
+            "M": {}
+           }
+          }
+         },
+         "value": {
+          "S": "b c"
+         },
+         "~effect/http/Cookies/Cookie": {
+          "S": "~effect/http/Cookies/Cookie"
+         }
+        }
+       }
+      ]
+     },
+     "n": null
+    },
+    "setBack": {
+     "outcome": "ok",
+     "f": {
+      "L": [
+       {
+        "M": {
+         "name": {
+          "S": "a"
+         },
+         "valueEncoded": {
+          "S": "b%20c"
+         },
+         "options": {
+          "M": {
+           "path": {
+            "S": "/"
+           },
+           "expires": {
+            "M": {}
+           }
+          }
+         },
+         "value": {
+          "S": "b c"
+         },
+         "~effect/http/Cookies/Cookie": {
+          "S": "~effect/http/Cookies/Cookie"
+         }
+        }
+       }
+      ]
+     },
+     "n": {
+      "N": "2"
+     }
+    },
+    "conditionBack": {
+     "outcome": "ok",
+     "f": {
+      "L": [
+       {
+        "M": {
+         "name": {
+          "S": "a"
+         },
+         "valueEncoded": {
+          "S": "b%20c"
+         },
+         "options": {
+          "M": {
+           "path": {
+            "S": "/"
+           },
+           "expires": {
+            "M": {}
+           }
+          }
+         },
+         "value": {
+          "S": "b c"
+         },
+         "~effect/http/Cookies/Cookie": {
+          "S": "~effect/http/Cookies/Cookie"
+         }
+        }
+       }
+      ]
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "unrelated": {
+     "outcome": "ok",
+     "f": {
+      "L": [
+       {
+        "M": {
+         "name": {
+          "S": "a"
+         },
+         "valueEncoded": {
+          "S": "b%20c"
+         },
+         "options": {
+          "M": {
+           "path": {
+            "S": "/"
+           },
+           "expires": {
+            "M": {}
+           }
+          }
+         },
+         "value": {
+          "S": "b c"
+         },
+         "~effect/http/Cookies/Cookie": {
+          "S": "~effect/http/Cookies/Cookie"
+         }
+        }
+       }
+      ]
+     },
+     "n": {
+      "N": "1"
+     }
+    },
+    "immutableSetBack": {
+     "outcome": "ok",
+     "f": {
+      "L": [
+       {
+        "M": {
+         "name": {
+          "S": "a"
+         },
+         "valueEncoded": {
+          "S": "b%20c"
+         },
+         "options": {
+          "M": {
+           "path": {
+            "S": "/"
+           },
+           "expires": {
+            "M": {}
+           }
+          }
+         },
+         "value": {
+          "S": "b c"
+         },
+         "~effect/http/Cookies/Cookie": {
+          "S": "~effect/http/Cookies/Cookie"
+         }
+        }
+       }
+      ]
+     },
+     "n": {
+      "N": "2"
+     }
+    }
+   }
+  }
+ },
+ "aggregate": {
+  "rows": [
+   {
+    "sk": {
+     "S": "$look#v1#line#x"
+    },
+    "pk": {
+     "S": "$look#v1#root#a"
+    },
+    "lid": {
+     "S": "x"
+    },
+    "f": {
+     "M": {
+      "name": {
+       "S": "a"
+      },
+      "valueEncoded": {
+       "S": "b%20c"
+      },
+      "options": {
+       "M": {
+        "path": {
+         "S": "/"
+        },
+        "expires": {
+         "M": {}
+        }
+       }
+      },
+      "value": {
+       "S": "b c"
+      },
+      "~effect/http/Cookies/Cookie": {
+       "S": "~effect/http/Cookies/Cookie"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Line"
+    }
+   },
+   {
+    "sk": {
+     "S": "$look#v1#line#y"
+    },
+    "pk": {
+     "S": "$look#v1#root#a"
+    },
+    "lid": {
+     "S": "y"
+    },
+    "f": {
+     "M": {
+      "name": {
+       "S": "a"
+      },
+      "valueEncoded": {
+       "S": "b%20c"
+      },
+      "options": {
+       "M": {
+        "path": {
+         "S": "/"
+        },
+        "expires": {
+         "M": {}
+        }
+       }
+      },
+      "value": {
+       "S": "b c"
+      },
+      "~effect/http/Cookies/Cookie": {
+       "S": "~effect/http/Cookies/Cookie"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Line"
+    }
+   },
+   {
+    "sk": {
+     "S": "$look#v1#one"
+    },
+    "pk": {
+     "S": "$look#v1#root#a"
+    },
+    "f": {
+     "M": {
+      "name": {
+       "S": "a"
+      },
+      "valueEncoded": {
+       "S": "b%20c"
+      },
+      "options": {
+       "M": {
+        "path": {
+         "S": "/"
+        },
+        "expires": {
+         "M": {}
+        }
+       }
+      },
+      "value": {
+       "S": "b c"
+      },
+      "~effect/http/Cookies/Cookie": {
+       "S": "~effect/http/Cookies/Cookie"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "One"
+    }
+   },
+   {
+    "sk": {
+     "S": "$look#v1#root"
+    },
+    "id": {
+     "S": "a"
+    },
+    "pk": {
+     "S": "$look#v1#root#a"
+    },
+    "f": {
+     "M": {
+      "name": {
+       "S": "a"
+      },
+      "valueEncoded": {
+       "S": "b%20c"
+      },
+      "options": {
+       "M": {
+        "path": {
+         "S": "/"
+        },
+        "expires": {
+         "M": {}
+        }
+       }
+      },
+      "value": {
+       "S": "b c"
+      },
+      "~effect/http/Cookies/Cookie": {
+       "S": "~effect/http/Cookies/Cookie"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "Root"
+    }
+   }
+  ],
+  "readAs": {
+   "root": "map",
+   "one": "map",
+   "line": "map"
+  },
+  "ops": {
+   "noop": {
+    "outcome": "ok",
+    "f": {
+     "Line|$look#v1#line#x": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Line|$look#v1#line#y": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "One|$look#v1#one": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Root|$look#v1#root": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     }
+    }
+   },
+   "rootNote": {
+    "outcome": "ok",
+    "f": {
+     "Line|$look#v1#line#x": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Line|$look#v1#line#y": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "One|$look#v1#one": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Root|$look#v1#root": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     }
+    }
+   },
+   "oneNote": {
+    "outcome": "ok",
+    "f": {
+     "Line|$look#v1#line#x": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Line|$look#v1#line#y": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "One|$look#v1#one": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Root|$look#v1#root": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     }
+    }
+   },
+   "lineNote": {
+    "outcome": "ok",
+    "f": {
+     "Line|$look#v1#line#x": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Line|$look#v1#line#y": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "One|$look#v1#one": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     },
+     "Root|$look#v1#root": {
+      "M": {
+       "name": {
+        "S": "a"
+       },
+       "valueEncoded": {
+        "S": "b%20c"
+       },
+       "options": {
+        "M": {
+         "path": {
+          "S": "/"
+         },
+         "expires": {
+          "M": {}
+         }
+        }
+       },
+       "value": {
+        "S": "b c"
+       },
+       "~effect/http/Cookies/Cookie": {
+        "S": "~effect/http/Cookies/Cookie"
+       }
+      }
+     }
+    }
+   }
+  }
+ }
+}

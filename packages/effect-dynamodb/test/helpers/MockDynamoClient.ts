@@ -107,34 +107,198 @@ export const applyUpdate = (
   if (item === undefined) return undefined
   const names = input.ExpressionAttributeNames ?? {}
   const values = input.ExpressionAttributeValues ?? {}
-  const expression = input.UpdateExpression ?? ""
-  const set = /^SET (.*?)(?: REMOVE (.*))?$/.exec(expression)
-  const remove = /^REMOVE (.*)$/.exec(expression)
-  const sets = set?.[1]?.split(", ") ?? []
-  const removes = (set?.[2] ?? remove?.[1])?.split(", ") ?? []
-  const simple =
-    (set !== null || remove !== null) &&
-    sets.every((clause) => /^#\w+ = (:\w+|#\w+ \+ :\w+)$/.test(clause)) &&
-    removes.every((clause) => /^#\w+$/.test(clause))
-  const next: Record<string, AttributeValue> = { ...item }
-  if (!simple) {
-    if (next.version?.N !== undefined) {
-      next.version = { N: String(Number(next.version.N) + 1) }
+  const clauses = updateClauses(input.UpdateExpression ?? "")
+  const next = structuredClone(item) as Record<string, AttributeValue>
+  const applied = clauses !== undefined && applyClauses(next, clauses, names, values)
+  if (applied) return next
+  // An expression this doesn't read: the write landed, and its fields are unknown.
+  const fallback: Record<string, AttributeValue> = { ...item }
+  if (fallback.version?.N !== undefined) {
+    fallback.version = { N: String(Number(fallback.version.N) + 1) }
+  }
+  return fallback
+}
+
+type UpdateClause = { readonly action: "SET" | "REMOVE" | "ADD" | "DELETE"; readonly text: string }
+
+/** An update expression's clauses, or `undefined` if it has none. */
+const updateClauses = (expression: string): ReadonlyArray<UpdateClause> | undefined => {
+  const sections = expression.split(/(?:^|\s)(?=(?:SET|REMOVE|ADD|DELETE)\s)/).filter(Boolean)
+  if (sections.length === 0) return undefined
+  return sections.flatMap((section) => {
+    const space = section.indexOf(" ")
+    const action = section.slice(0, space) as UpdateClause["action"]
+    return splitTopLevel(section.slice(space + 1)).map((text) => ({ action, text }))
+  })
+}
+
+/** Split on the commas outside any parentheses. */
+const splitTopLevel = (text: string): ReadonlyArray<string> => {
+  const parts: Array<string> = []
+  let depth = 0
+  let current = ""
+  for (const char of text) {
+    if (char === "(") depth++
+    if (char === ")") depth--
+    if (char === "," && depth === 0) {
+      parts.push(current.trim())
+      current = ""
+    } else {
+      current += char
     }
-    return next
   }
-  for (const clause of sets) {
-    const [target, source] = clause.split(" = ") as [string, string]
-    const name = names[target]!
-    const increment = /^(#\w+) \+ (:\w+)$/.exec(source)
-    next[name] = increment
-      ? {
-          N: String(Number(next[names[increment[1]!]!]?.N ?? 0) + Number(values[increment[2]!]!.N)),
-        }
-      : values[source]!
+  parts.push(current.trim())
+  return parts
+}
+
+/** A document path's segments, or `undefined` if the text isn't one. */
+const pathSegments = (
+  text: string,
+  names: Record<string, string>,
+): ReadonlyArray<string | number> | undefined => {
+  const segments: Array<string | number> = []
+  for (const part of text.split(".")) {
+    const parsed = /^(#\w+)((?:\[\d+\])*)$/.exec(part)
+    const name = parsed === null ? undefined : names[parsed[1]!]
+    if (parsed === null || name === undefined) return undefined
+    segments.push(name)
+    for (const index of parsed[2]!.matchAll(/\[(\d+)\]/g)) segments.push(Number(index[1]))
   }
-  for (const clause of removes) delete next[names[clause]!]
-  return next
+  return segments
+}
+
+type Container = { [key: string]: AttributeValue } | Array<AttributeValue>
+
+/** The map or list holding a path's last segment. */
+const parentOf = (
+  root: Record<string, AttributeValue>,
+  segments: ReadonlyArray<string | number>,
+): Container | undefined => {
+  let container: Container | undefined = root
+  for (const segment of segments.slice(0, -1)) {
+    const value: AttributeValue | undefined = (container as any)?.[segment]
+    container = value?.M ?? value?.L
+    if (container === undefined) return undefined
+  }
+  return container
+}
+
+const readPath = (
+  root: Record<string, AttributeValue>,
+  segments: ReadonlyArray<string | number>,
+): AttributeValue | undefined => (parentOf(root, segments) as any)?.[segments[segments.length - 1]!]
+
+const writePath = (
+  root: Record<string, AttributeValue>,
+  segments: ReadonlyArray<string | number>,
+  value: AttributeValue,
+): void => {
+  const parent = parentOf(root, segments)
+  if (parent !== undefined) (parent as any)[segments[segments.length - 1]!] = value
+}
+
+const removePath = (
+  root: Record<string, AttributeValue>,
+  segments: ReadonlyArray<string | number>,
+): void => {
+  const parent = parentOf(root, segments)
+  const last = segments[segments.length - 1]!
+  if (Array.isArray(parent)) parent.splice(last as number, 1)
+  else if (parent !== undefined) delete parent[last]
+}
+
+/** A SET clause's right-hand side, or `undefined` if this doesn't read it. */
+const operand = (
+  text: string,
+  root: Record<string, AttributeValue>,
+  names: Record<string, string>,
+  values: Record<string, AttributeValue>,
+): { readonly value: AttributeValue | undefined } | undefined => {
+  const trimmed = text.trim()
+  const sum = splitOutside(trimmed, /\s([+-])\s/)
+  if (sum !== undefined) {
+    const left = operand(sum.left, root, names, values)
+    const right = operand(sum.right, root, names, values)
+    if (left?.value?.N === undefined || right?.value?.N === undefined) return undefined
+    const [a, b] = [Number(left.value.N), Number(right.value.N)]
+    return { value: { N: String(sum.operator === "+" ? a + b : a - b) } }
+  }
+  if (trimmed.startsWith(":")) {
+    const value = values[trimmed]
+    return value === undefined ? undefined : { value }
+  }
+  const call = /^(if_not_exists|list_append)\((.*)\)$/.exec(trimmed)
+  if (call !== null) {
+    const [first, second] = splitTopLevel(call[2]!)
+    const a = operand(first!, root, names, values)
+    const b = operand(second!, root, names, values)
+    if (a === undefined || b === undefined) return undefined
+    if (call[1] === "if_not_exists") return { value: a.value ?? b.value }
+    if (a.value?.L === undefined || b.value?.L === undefined) return undefined
+    return { value: { L: [...a.value.L, ...b.value.L] } }
+  }
+  const path = pathSegments(trimmed, names)
+  return path === undefined ? undefined : { value: readPath(root, path) }
+}
+
+/** `text` split on its last top-level match of `separator`. */
+const splitOutside = (text: string, separator: RegExp) => {
+  let depth = 0
+  for (let at = text.length - 1; at >= 0; at--) {
+    if (text[at] === ")") depth++
+    if (text[at] === "(") depth--
+    if (depth !== 0) continue
+    const match = separator.exec(text.slice(at, at + 3))
+    if (match?.index === 0) {
+      return { left: text.slice(0, at), operator: match[1]!, right: text.slice(at + 3) }
+    }
+  }
+  return undefined
+}
+
+/** Apply every clause to `root`; `false` if one of them can't be read. */
+const applyClauses = (
+  root: Record<string, AttributeValue>,
+  clauses: ReadonlyArray<UpdateClause>,
+  names: Record<string, string>,
+  values: Record<string, AttributeValue>,
+): boolean => {
+  // DynamoDB evaluates every right-hand side against the item as it was.
+  const before = structuredClone(root)
+  for (const { action, text } of clauses) {
+    if (action === "REMOVE") {
+      const path = pathSegments(text, names)
+      if (path === undefined) return false
+      removePath(root, path)
+    } else if (action === "SET") {
+      const at = text.indexOf(" = ")
+      const path = at < 0 ? undefined : pathSegments(text.slice(0, at), names)
+      const value = at < 0 ? undefined : operand(text.slice(at + 3), before, names, values)
+      if (path === undefined || value?.value === undefined) return false
+      writePath(root, path, value.value)
+    } else {
+      const [target, source] = text.split(/\s+/)
+      const path = target === undefined ? undefined : pathSegments(target, names)
+      const value = source === undefined ? undefined : values[source]
+      if (path === undefined || value === undefined) return false
+      const current = readPath(root, path)
+      if (value.N !== undefined && action === "ADD") {
+        writePath(root, path, { N: String(Number(current?.N ?? 0) + Number(value.N)) })
+      } else {
+        const kind = value.SS !== undefined ? "SS" : value.NS !== undefined ? "NS" : undefined
+        if (kind === undefined) return false
+        const held: ReadonlyArray<string> = (current as any)?.[kind] ?? []
+        const given: ReadonlyArray<string> = (value as any)[kind]
+        const merged =
+          action === "ADD"
+            ? [...new Set([...held, ...given])]
+            : held.filter((entry) => !given.includes(entry))
+        if (merged.length === 0) removePath(root, path)
+        else writePath(root, path, { [kind]: merged } as unknown as AttributeValue)
+      }
+    }
+  }
+  return true
 }
 
 /**

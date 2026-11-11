@@ -1,0 +1,57 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "scenarios": [
+  {
+   "name": "Batch.write versioned puts",
+   "requests": [
+    {
+     "command": "TransactWriteItems",
+     "json": "{\"TransactItems\":[{\"Put\":{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"v1\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc v1\"},\"__edd_e__\":{\"S\":\"VersionedDoc\"},\"pk\":{\"S\":\"$order#v1#versioneddoc#docid_v1\"},\"sk\":{\"S\":\"$order#v1#versioneddoc\"},\"gsi1pk\":{\"S\":\"$order#v1#versioneddoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#versioneddoc#docid_v1\"},\"createdAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"updatedAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"version\":{\"N\":\"1\"},\"__edd_i__\":{\"S\":\"da82f018-0fcd-45d2-b764-400ac92eddf9\"}},\"ConditionExpression\":\"attribute_not_exists(#pk)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\"}}},{\"Put\":{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"v2\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc v2\"},\"__edd_e__\":{\"S\":\"VersionedDoc\"},\"pk\":{\"S\":\"$order#v1#versioneddoc#docid_v2\"},\"sk\":{\"S\":\"$order#v1#versioneddoc\"},\"gsi1pk\":{\"S\":\"$order#v1#versioneddoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#versioneddoc#docid_v2\"},\"createdAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"updatedAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"version\":{\"N\":\"1\"},\"__edd_i__\":{\"S\":\"15642800-83c3-4e3a-907c-6486c6b1f876\"}},\"ConditionExpression\":\"attribute_not_exists(#pk)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\"}}}]}"
+    }
+   ]
+  },
+  {
+   "name": "Batch.write plain puts",
+   "requests": [
+    {
+     "command": "BatchWriteItem",
+     "json": "{\"RequestItems\":{\"t\":[{\"PutRequest\":{\"Item\":{\"docId\":{\"S\":\"s1\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc s1\"},\"__edd_e__\":{\"S\":\"StampedDoc\"},\"pk\":{\"S\":\"$order#v1#stampeddoc#docid_s1\"},\"sk\":{\"S\":\"$order#v1#stampeddoc\"},\"gsi1pk\":{\"S\":\"$order#v1#stampeddoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#stampeddoc#docid_s1\"},\"createdAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"updatedAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"}}}},{\"PutRequest\":{\"Item\":{\"docId\":{\"S\":\"p1\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc p1\"},\"__edd_e__\":{\"S\":\"PlainDoc\"},\"pk\":{\"S\":\"$order#v1#plaindoc#docid_p1\"},\"sk\":{\"S\":\"$order#v1#plaindoc\"},\"gsi1pk\":{\"S\":\"$order#v1#plaindoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#plaindoc#docid_p1\"}}}}]}}"
+    }
+   ]
+  },
+  {
+   "name": "Transaction.transactWrite puts",
+   "requests": [
+    {
+     "command": "GetItem",
+     "json": "{\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$order#v1#versioneddoc#docid_v3\"},\"sk\":{\"S\":\"$order#v1#versioneddoc\"}},\"ConsistentRead\":true}"
+    },
+    {
+     "command": "TransactWriteItems",
+     "json": "{\"TransactItems\":[{\"Put\":{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"v3\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc v3\"},\"__edd_e__\":{\"S\":\"VersionedDoc\"},\"pk\":{\"S\":\"$order#v1#versioneddoc#docid_v3\"},\"sk\":{\"S\":\"$order#v1#versioneddoc\"},\"gsi1pk\":{\"S\":\"$order#v1#versioneddoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#versioneddoc#docid_v3\"},\"createdAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"updatedAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"version\":{\"N\":\"1\"},\"__edd_i__\":{\"S\":\"1d1effaf-67a1-48ba-bd5c-dac8b72c9693\"}},\"ConditionExpression\":\"attribute_not_exists(#pk)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\"},\"ReturnValuesOnConditionCheckFailure\":\"ALL_OLD\"}},{\"Put\":{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"s2\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc s2\"},\"__edd_e__\":{\"S\":\"StampedDoc\"},\"pk\":{\"S\":\"$order#v1#stampeddoc#docid_s2\"},\"sk\":{\"S\":\"$order#v1#stampeddoc\"},\"gsi1pk\":{\"S\":\"$order#v1#stampeddoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#stampeddoc#docid_s2\"},\"createdAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"updatedAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"}}}},{\"Put\":{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"p2\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc p2\"},\"__edd_e__\":{\"S\":\"PlainDoc\"},\"pk\":{\"S\":\"$order#v1#plaindoc#docid_p2\"},\"sk\":{\"S\":\"$order#v1#plaindoc\"},\"gsi1pk\":{\"S\":\"$order#v1#plaindoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#plaindoc#docid_p2\"}}}}]}"
+    }
+   ]
+  },
+  {
+   "name": "Entity.put",
+   "requests": [
+    {
+     "command": "GetItem",
+     "json": "{\"TableName\":\"t\",\"Key\":{\"pk\":{\"S\":\"$order#v1#versioneddoc#docid_v4\"},\"sk\":{\"S\":\"$order#v1#versioneddoc\"}},\"ConsistentRead\":true}"
+    },
+    {
+     "command": "PutItem",
+     "json": "{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"v4\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc v4\"},\"createdAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"updatedAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"version\":{\"N\":\"1\"},\"__edd_i__\":{\"S\":\"bd1ec1d2-bea7-4b11-af3b-0f79092cab91\"},\"__edd_e__\":{\"S\":\"VersionedDoc\"},\"pk\":{\"S\":\"$order#v1#versioneddoc#docid_v4\"},\"sk\":{\"S\":\"$order#v1#versioneddoc\"},\"gsi1pk\":{\"S\":\"$order#v1#versioneddoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#versioneddoc#docid_v4\"}},\"ConditionExpression\":\"attribute_not_exists(#pk)\",\"ExpressionAttributeNames\":{\"#pk\":\"pk\"},\"ReturnValuesOnConditionCheckFailure\":\"ALL_OLD\"}"
+    },
+    {
+     "command": "PutItem",
+     "json": "{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"s3\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc s3\"},\"createdAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"updatedAt\":{\"S\":\"2026-01-02T03:04:05.678Z\"},\"__edd_e__\":{\"S\":\"StampedDoc\"},\"pk\":{\"S\":\"$order#v1#stampeddoc#docid_s3\"},\"sk\":{\"S\":\"$order#v1#stampeddoc\"},\"gsi1pk\":{\"S\":\"$order#v1#stampeddoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#stampeddoc#docid_s3\"}}}"
+    },
+    {
+     "command": "PutItem",
+     "json": "{\"TableName\":\"t\",\"Item\":{\"docId\":{\"S\":\"p3\"},\"owner\":{\"S\":\"ann\"},\"title\":{\"S\":\"doc p3\"},\"__edd_e__\":{\"S\":\"PlainDoc\"},\"pk\":{\"S\":\"$order#v1#plaindoc#docid_p3\"},\"sk\":{\"S\":\"$order#v1#plaindoc\"},\"gsi1pk\":{\"S\":\"$order#v1#plaindoc#owner_ann\"},\"gsi1sk\":{\"S\":\"$order#v1#plaindoc#docid_p3\"}}}"
+    }
+   ]
+  }
+ ]
+}

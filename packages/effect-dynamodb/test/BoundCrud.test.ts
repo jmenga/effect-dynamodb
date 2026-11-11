@@ -33,7 +33,7 @@ class Product extends Schema.Class<Product>("Product")({
   price: Schema.Number,
   stock: Schema.Number,
   viewCount: Schema.Number,
-  status: Schema.String,
+  status: Schema.optional(Schema.String),
   tags: Schema.Array(Schema.String),
 }) {}
 

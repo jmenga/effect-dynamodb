@@ -261,6 +261,145 @@ All combinators chain as methods on the `BoundUpdate` builder. They compile to a
     .expectedVersion(6)
 ```
 
+### Clearing a Field
+
+`.remove(["field"])` and `.set({ field: undefined })` are one operation. The attribute goes, any index key built from it goes (see [Index Policy](/effect-dynamodb/guides/index-policy/)), and a unique value it held is released. A value that encodes to nothing clears the same way, such as `Option.none()` on a `Schema.OptionFromOptional` field.
+
+```typescript region="update-clear" example="guide-expressions.ts"
+  // One operation, two spellings: the attribute goes, any index key built from it goes,
+  // and a unique value it held is released.
+  yield* db.entities.Products.update({ productId: "p-4" }).remove(["description"])
+  yield* db.entities.Products.update({ productId: "p-4" }).set({ description: undefined })
+
+  // A field no row can be without doesn't compile, and is refused before anything is sent:
+  // the row would no longer be readable.
+  const refusal = yield* db.entities.Products.update({ productId: "p-4" })
+    // @ts-expect-error `name` is required
+    .remove(["name"])
+    .asEffect()
+    .pipe(Effect.flip)
+
+  // An attribute the model no longer declares is cleaned up with a path.
+  yield* db.entities.Products.update({ productId: "p-4" }).pathRemove(["retiredAttribute"])
+```
+
+A row can lack a field if its schema reads one without it: `Schema.optional`, `Schema.optionalKey`, the `Schema.OptionFromOptional` family, or a decoding default, which is what the field reads back as. Where a decoding default, a step or a middleware of your own, a `Schema.suspend` or a check takes part in reading a row without the field, the write that clears it reads the absence once to find out, and nothing runs when the entity is defined. It can also lack a field holding a [value DynamoDB can't store](#values-dynamodb-cant-store). Anything else is refused with a `ValidationError`, for `.remove`, `.set({ field: undefined })`, a `pathRemove`, and the `.remove` on a time-series `.append`. So is a required property below a field, such as `pathRemove(["address", "city"])` when `city` is required, even if `address` itself is optional, and a list position no shorter list can be read without, such as either position of a `[string, string]`. That's judged from the schema only where every value it reads would break: below a `Schema.Unknown` member, a transformed or checked node, or a record with more than one index signature, the removal is sent, as is one a union's other member may read what's left of.
+
+`Schema.NullOr` requires the key and allows an empty value, so `.set({ field: null })` stores a `null` rather than clearing it. On an optional field, `null` clears as `undefined` does.
+
+Every update operation names model fields, never what the library stores. These are refused the same way, for `.remove`, `.add`, `.subtract`, `.append`, `.deleteFromSet` and every path operation:
+
+| Name | Why, and what to do instead |
+|---|---|
+| Another field's stored name (`g` for `configure(M, { region: { field: "g" } })`) | Name the model field, `region` |
+| A secondary index's key attribute (`gsi1pk`) | The library composes it. Clear the composite it's built from |
+| `__edd_e__` and any other `__edd_*` attribute | The library manages them |
+| The version attribute, `createdAt`, `updatedAt`, `deletedAt`, the TTL attribute | The library manages them, on an entity configured to use them |
+| A primary-key composite, or `pk` / `sk` | It identifies the item |
+| An immutable field | It can't change after creation |
+| A sparse map, or one of its entries by stored name | Use `.removeEntries` or `.clearMap` |
+
+An attribute the model simply doesn't know stays allowed at run time, because that's the only way to clean up one it no longer declares. The types only offer the model's own names to `.remove`, so use `.pathRemove(["attribute"])` for it.
+
+### Values DynamoDB Can't Store
+
+DynamoDB has no form for `undefined` or an empty set. On a field whose type includes one, that value is stored as an absent attribute, and an absent attribute reads back as that value.
+
+```typescript region="model-no-stored-form" example="guide-expressions.ts"
+class Device extends Schema.Class<Device>("Device")({
+  deviceId: Schema.String,
+  // Required, and both can hold a value DynamoDB can't store.
+  labels: Schema.ReadonlySet(Schema.String),
+  lastError: Schema.UndefinedOr(Schema.String),
+}) {}
+```
+
+```typescript region="update-no-stored-form" example="guide-expressions.ts"
+  // Stored as a row without either attribute. Every read gives the values back.
+  const device = yield* db.entities.Devices.put({
+    deviceId: "d-1",
+    labels: new Set(),
+    lastError: undefined,
+  })
+
+  // The ordinary operations, then. Emptying the set takes the attribute away.
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).add({ labels: new Set(["indoor"]) })
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).deleteFromSet({
+    labels: new Set(["indoor"]),
+  })
+
+  // So these are clears as well, and the field can be cleared by name.
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).set({ labels: new Set() })
+  yield* db.entities.Devices.update({ deviceId: "d-1" }).remove(["lastError"])
+
+  const read = yield* db.entities.Devices.get({ deviceId: "d-1" })
+  // read.labels is an empty Set, and read.lastError is undefined
+
+  // A condition or a filter comparing with an empty set asks whether the attribute is there.
+  const unlabelled = yield* db.entities.Devices.scan()
+    .filter({ labels: new Set() })
+    .collect()
+```
+
+This holds at any depth (a struct, a class, the elements of a list, what a `Schema.suspend` or a transformation holds, and what's inside an `Option`, a `Result`, an `Exit` or a `Cause`), and on every path that writes or reads an item: `put`, `update`, `upsert`, `append`, `Batch`, `Transaction`, version snapshots, soft delete and restore, aggregates, and the events and snapshots of an event stream. Any other value is stored exactly as before. A field left `Schema.optional` keeps its own reading: an empty set stored there reads back as no field.
+
+| The field | Stored | Reads back |
+|---|---|---|
+| `Schema.ReadonlySet(...)` holding nothing | No attribute | An empty set |
+| `Schema.UndefinedOr(...)` holding `undefined` | No attribute | `undefined` |
+| `Schema.NullOr(Schema.ReadonlySet(...))` holding `null` | `NULL` | `null` |
+| `Schema.NullOr(Schema.ReadonlySet(...))` holding nothing | No attribute | An empty set |
+| `Schema.UndefinedOr(Schema.ReadonlySet(...))` holding nothing | No attribute | `undefined`, the one value an absent attribute can mean there |
+| `Schema.optional(Schema.ReadonlySet(...))` holding nothing | No attribute | No field |
+| `Schema.Option(Schema.ReadonlySet(...))` holding `Option.some` of nothing | An `Option` with no value | `Option.some` of an empty set |
+| A set with `.check(Schema.isMinSize(1))` | Refused: the schema says it can't hold nothing | |
+
+Some places have no attribute to leave out, or no way to say so:
+
+- **An empty set in a list or a tuple.** Leaving it out moves the elements after it, so it's refused with a `ValidationError` naming where it is, such as `"pair[1]"`, before anything is sent. That goes for a `Schema.Array` of sets, a `Schema.Tuple`, an `.append` or `pathSet` operand, a list in a `Schema.Unknown` field, and a list in an event, its metadata, a snapshot's state or an outbox effect. Use `pathRemove` to remove an element.
+- **`undefined` in a tuple position.** A stored list closes up, so the values after it would move, or the row couldn't be read. It's refused the same way, unless no value follows it in an optional position or it encodes to something else. The check looks at the domain value, so a position only its encoding makes `undefined` (`Option.none()` under `Schema.OptionFromUndefinedOr`) isn't seen, and closes up. Use `Schema.OptionFromNullOr` there.
+- **`undefined` in a list.** It closes up: `["a", undefined, "b"]` in a `Schema.Array(Schema.UndefinedOr(...))` or a `Schema.Unknown` field is stored, and reads back, as `["a", "b"]`. So does the rest of a `Schema.TupleWithRest`. Use `Schema.NullOr` for a position that has to hold nothing.
+- **A record entry.** An entry holding an empty set isn't stored, so the record reads back without that key.
+- **A `.select()`.** A projection returns what's stored, undecoded, so the attribute stays absent.
+- **A comparison.** Only `eq` and `ne` have a meaning for an empty set, as `attribute_not_exists` and `attribute_exists`. Any other comparison with one is refused. `eq(t.field, undefined)` is left as it is, since an `undefined` there is more often a mistake, and `.filter({ field: undefined })` still means no filter.
+
+`Schema.Unknown`, `Schema.Any` and `Schema.Void` fields count as holding `undefined`, since they can.
+
+Anything else the marshaller won't take is refused the same way, naming the field: `NaN`, `Infinity`, a number past `Number.MAX_SAFE_INTEGER` (use `Schema.BigInt`), and a set of anything but strings, numbers or binary. With `escapeKeys`, a `NaN` feeding a key is `EDD-9096` instead. A `DynamoModel.Packed` field is judged by its own form, so it holds a number that large and refuses `NaN`, because JSON does.
+
+The marshaller lets a few things past. DynamoDB rejects a set mixing strings and numbers, as a `DynamoError`. A function in a map is dropped, and a class with no enumerable fields, such as a plain `Date`, is stored as an empty map. A `Schema.HashSet` can't be stored: a non-empty one is refused, and an empty one is stored as a map of its internals, reading back empty.
+
+The rule has limits a value can run into:
+
+- **Schemas it can't walk.** `Schema.suspend` and a class built with `.check()` or `.annotate()` aren't looked into, and nor is what's beneath a container's decoding default. An absent attribute inside them is a decode failure, and a tuple inside them isn't checked. `oneOf` union members stay strict, because a lenient copy would make two members match.
+- **A transform that won't round trip.** A transform encoding a value to an empty set that doesn't decode one back can't read back what it stored. `.set` of that value is refused, naming the field, and `put` fails with `EDD-9050` as a defect, writing nothing.
+- **The `Expression` builders.** `Expression.condition` and the other builders are plain functions that build their expression when called, so a value they can't marshal throws there, as `UnstorableValue`. Inside `Effect.gen` that's a defect, and it's how a `Transaction.check` gets its condition. `.condition()` and `.filter()` take the same input and refuse it with a `ValidationError`.
+- **Reads that come first.** An aggregate `update` and a `commandHandler` read before they decide what to write, so a refused value there has cost a read, though nothing is written.
+
+### Relative Updates Aren't Checked Against the Model
+
+`.set` is checked before anything is sent, because the value is in hand. `.add`, `.subtract`, `.append`, `.deleteFromSet` and most path operations change a value only DynamoDB holds, so a `.check()` on the field can't be judged without reading the row first, and an update doesn't read. Guard them with `.condition()`, which DynamoDB judges against the stored value.
+
+```typescript region="update-relative" example="guide-expressions.ts"
+  // DynamoDB applies `.subtract` to a value only it holds, so the model can't judge the result
+  // first. A condition can: refused, it writes nothing.
+  const refusedByCondition = yield* db.entities.Products.update({ productId: "p-5" })
+    .subtract({ stock: 3 })
+    .condition((t, { gte }) => gte(t.stock, 3))
+    .asEffect()
+    .pipe(Effect.flip)
+  // ConditionalCheckFailed, and the stock is still 2
+
+  // Without one the write lands, and the ValidationError says so: "The update WAS applied, and
+  // the stored row no longer matches the model: ..."
+  const landed = yield* db.entities.Products.update({ productId: "p-5" })
+    .subtract({ stock: 3 })
+    .asEffect()
+    .pipe(Effect.flip)
+```
+
+An unguarded update that breaks a `.check()` fails with a `ValidationError` that says the update was applied and names the field, and reads of that row then fail until it's repaired. `.returnValues("none")` decodes nothing, so it doesn't report the problem at all, and neither does a `Transaction.transactWrite`, which returns no row.
+
 ### Path-Based Combinators
 
 For nested attributes, array elements, and attribute-to-attribute operations, use the path-based combinators. These take the update operation as the first argument, so wrap them in a lambda when passing as a combinator to `update()`:
@@ -310,7 +449,7 @@ For nested attributes, array elements, and attribute-to-attribute operations, us
 | Operation | Record Combinator | Path Combinator | DynamoDB |
 |---|---|---|---|
 | Set value | `Entity.set({ field: value })` | `Entity.pathSet(...)` | `SET #f = :v` |
-| Remove attribute | `Entity.remove(["field"])` | `Entity.pathRemove(segs)` | `REMOVE #f` |
+| Remove attribute a row can lack | `Entity.remove(["field"])` | `Entity.pathRemove(segs)` | `REMOVE #f` |
 | Atomic add | `Entity.add({ field: n })` | `Entity.pathAdd(...)` | `ADD #f :v` |
 | Subtract | `Entity.subtract({ field: n })` | `Entity.pathSubtract(...)` | `SET #f = #f - :v` |
 | Append to list | `Entity.append({ field: [...] })` | `Entity.pathAppend(...)` | `SET #f = list_append(#f, :v)` |
@@ -526,6 +665,8 @@ Products.condition((t, ops) => {
 | `t.tags.size()` | Size function | `["tags"]` | `size(#tags)` |
 
 All string segments are automatically aliased through `ExpressionAttributeNames` to handle DynamoDB reserved words.
+
+A `field:` rename from `DynamoModel.configure` names a top-level attribute, so it applies to a path's first segment only. Below it a value is stored whole, under its own property names. With `count` stored as `renamed`, `t.count` is `#renamed`, and `t.meta.count` is `#meta.#count`, which is where `put` stored it. That holds for an update's path operations, a condition, a filter and a projection alike. A path doesn't follow a nested struct's own key encoding (`Schema.encodeKeys`): set the whole value for such a struct.
 
 ---
 

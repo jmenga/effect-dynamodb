@@ -8,7 +8,9 @@
  *   - `rekey()`: move every row, in parallel segments, checkpointing a resume token
  *   - A bounded run (`maxPages`) resumed until the table is done
  *   - A rerun moves nothing
+ *   - `rekey({ repairIndexKeys: true })`: write an index key its row's values compose and it lacks
  *   - `rekey` under the default moves them back, the same way
+ *   - An entity keyed by a codec whose `encode` takes its own output: 1.39.0's rows need `rekey`
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -17,7 +19,7 @@
  *   npx tsx examples/guide-upgrade.ts
  */
 
-import { Config, Console, Effect, Layer, Option, Ref, Schema } from "effect"
+import { Config, Console, Effect, Layer, Option, Ref, Schema, SchemaGetter } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -57,6 +59,19 @@ class Sensor extends Schema.Class<Sensor>("Sensor")({
   offset: Schema.Number,
 }) {}
 
+// A codec whose `encode` takes its own output: it prepends `badge:`, and `decode` strips it.
+const BadgeId = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.transform((s: string) => s.slice("badge:".length)),
+    encode: SchemaGetter.transform((s: string) => `badge:${s}`),
+  }),
+)
+
+class Badge extends Schema.Class<Badge>("Badge")({
+  badgeId: BadgeId,
+  holder: Schema.String,
+}) {}
+
 class Calibrated extends Schema.TaggedClass<Calibrated>()("Calibrated", {
   offset: Schema.Number,
 }) {}
@@ -83,14 +98,22 @@ const membersUnder = (schema: DynamoSchema.DynamoSchema) => {
     versioned: { retain: true },
     softDelete: true,
   })
-  const MainTable = Table.make({ schema, entities: { Sensors } })
+  const Badges = Entity.make({
+    model: Badge,
+    entityType: "Badge",
+    primaryKey: {
+      pk: { field: "pk", composite: ["badgeId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  })
+  const MainTable = Table.make({ schema, entities: { Sensors, Badges } })
   const Calibrations = EventStore.makeStream({
     table: MainTable,
     streamName: "Calibrations",
     events: [Calibrated],
     streamId: { composite: ["siteId"] },
   })
-  return { Sensors, MainTable, Calibrations }
+  return { Sensors, Badges, MainTable, Calibrations }
 }
 
 const Default = membersUnder(DefaultSchema)
@@ -103,7 +126,7 @@ const { Sensors, MainTable, Calibrations } = membersUnder(AppSchema)
 const program = Effect.gen(function* () {
   yield* Console.log("=== Setup: a table written with the default ===\n")
   const before = yield* DynamoClient.make({
-    entities: { Sensors: Default.Sensors },
+    entities: { Sensors: Default.Sensors, Badges: Default.Badges },
     tables: { MainTable: Default.MainTable },
   })
   // A table left by an earlier, interrupted run is started afresh.
@@ -145,7 +168,7 @@ const program = Effect.gen(function* () {
   const plan = yield* db.tables.MainTable.rekey({ dryRun: true, streams: [Calibrations] })
   // plan.moved      → { item: 1, snapshot: 3, tombstone: 1, outbox: 0, event: 0, aggregate: 0, stream: 0 }
   // plan.conflicts  → []  (rows under both keys, or whose current key is taken)
-  // plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0 }
+  // plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0, rootNotSeen: 0 }
   // #endregion
   assertEq(
     plan.moved,
@@ -227,6 +250,47 @@ const program = Effect.gen(function* () {
   )
   yield* Console.log(`Nothing left to move; ${again.unchanged} rows already current.`)
 
+  // --- Repairing index keys ---
+  yield* Console.log("\n=== Repairing index keys ===\n")
+
+  // What an update under an earlier release could leave: the row holds its label, and no key for it.
+  yield* db.entities.Sensors.put({ siteId: "south", sensorId: 7, label: "pump", offset: 0 })
+  const raw = yield* DynamoClient
+  const { Items: rows = [] } = yield* raw.scan({ TableName: tableName, ConsistentRead: true })
+  const pump = rows.find((row) => row.label?.S === "pump" && row.gsi1sk !== undefined)!
+  yield* raw.updateItem({
+    TableName: tableName,
+    Key: { pk: pump.pk!, sk: pump.sk! },
+    UpdateExpression: "REMOVE gsi1sk",
+  })
+  const byPump = db.entities.Sensors.byLabel({ siteId: "south", label: "pump" })
+  assertEq((yield* byPump.collect()).length, 0, "a query misses the damaged row")
+
+  // #region repair
+  // `rekey` counts index keys that aren't what their row's values compose.
+  // `repairIndexKeys` writes them: dry run first, to see what it would write.
+  const repairs = yield* db.tables.MainTable.rekey({
+    dryRun: true,
+    repairIndexKeys: true,
+    streams: [Calibrations],
+  })
+  // repairs.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 }
+
+  const repaired = yield* db.tables.MainTable.rekey({
+    repairIndexKeys: true,
+    streams: [Calibrations],
+  })
+  // repaired.indexKeys → the same, and the row is back in its index
+  // #endregion
+  assertEq(
+    repairs.indexKeys,
+    { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 },
+    "what the dry run says",
+  )
+  assertEq(repaired.indexKeys, repairs.indexKeys, "the run agrees")
+  assertEq((yield* byPump.collect()).length, 1, "a query finds it")
+  yield* Console.log(`Repaired: ${JSON.stringify(repaired.indexKeys)}`)
+
   // --- Back to the default ---
   yield* Console.log("\n=== Back to the default ===\n")
 
@@ -240,6 +304,42 @@ const program = Effect.gen(function* () {
   const backHome = yield* before.entities.Sensors.get({ siteId: "north", sensorId: -3 })
   assertEq(backHome.label, "intake valve", "found again under the default")
   yield* Console.log(`Moved back: ${JSON.stringify(backAgain.moved)}`)
+
+  // --- An entity keyed by a codec (1.40.0) ---
+  yield* Console.log("\n=== An entity keyed by a codec ===\n")
+
+  // What 1.39.0 wrote: the badge's row keyed by its stored text encoded once more.
+  yield* before.entities.Badges.put({ badgeId: "b7", holder: "ana" })
+  const badgeKey = { pk: { S: "$upgrade#v1#badge#badgeid_badge:b7" }, sk: { S: "$upgrade#v1#badge" } }
+  const { Item: written } = yield* raw.getItem({ TableName: tableName, Key: badgeKey })
+  assertEq(written?.badgeId?.S, "badge:b7", "put stores the encoded value, under its key")
+  yield* raw.putItem({
+    TableName: tableName,
+    Item: { ...written, pk: { S: "$upgrade#v1#badge#badgeid_badge:badge:b7" } },
+  })
+  yield* raw.deleteItem({ TableName: tableName, Key: badgeKey })
+
+  // #region codec
+  // 1.39.0 keyed the badge "b7" by `badge:badge:b7`, and 1.40.0 keys it `badge:b7`:
+  // its rows aren't found until `rekey` has moved them, whatever `escapeKeys` says.
+  const notYet = yield* before.entities.Badges.get({ badgeId: "b7" }).pipe(Effect.flip)
+  // notYet._tag → "ItemNotFound"
+  const codecRun = yield* before.tables.MainTable.rekey({ streams: [Default.Calibrations] })
+  // codecRun.moved → { item: 1, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
+  const badge = yield* before.entities.Badges.get({ badgeId: "b7" })
+  // badge.holder → "ana"
+  // #endregion
+  assertEq(notYet._tag, "ItemNotFound", "1.39.0's row isn't found before rekey")
+  assertEq(
+    codecRun.moved,
+    { item: 1, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 },
+    "rekey moves the badge",
+  )
+  assertEq(codecRun.conflicts.length, 0, "with no conflicts")
+  assertEq(badge.holder, "ana", "found after rekey")
+  const { Item: moved139 } = yield* raw.getItem({ TableName: tableName, Key: badgeKey })
+  assertEq(moved139?.badgeId?.S, "badge:b7", "at the key put writes")
+  yield* Console.log(`Moved: ${JSON.stringify(codecRun.moved)}`)
 
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===\n")

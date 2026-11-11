@@ -12,7 +12,8 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import {
   compositeKeyFormKind,
-  makeCompositeKeyForm,
+  makeCompositeDomainKeyForm,
+  refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -130,7 +131,10 @@ const collectionKeyForm = (
   }
   const source = (e.schemas?.inputSchema ?? e.model) as Schema.Top | undefined
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value) => {
+  // The caller's composites are DOMAIN values: the key `put` wrote for one is the
+  // key form of the value it stores (`Entity._domainKeyForm`).
+  const form = makeCompositeDomainKeyForm(source, (attr, value, reason) => {
+    if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
@@ -320,6 +324,13 @@ export const make = <
       { prune: false },
     )
   }
+  // A composite with no key text (`NaN`, an inexact number) refuses the query, as a bound
+  // collection's does: its terminal fails with a `ValidationError` and sends nothing.
+  const refusable = <A>(build: () => Query.Query<A>): Query.Query<A> =>
+    Query.orRefusal({ name: "Collection.query", target: name }, build, (refusal) =>
+      Query.refused<A>(sharedDynamoIndexName, refusal),
+    )
+
   // Main query: returns grouped results
   const queryAll = (pkComposites: Record<string, unknown>) => {
     // Each item is tagged with its member by `collectionDecoder`; the collect
@@ -363,62 +374,63 @@ export const make = <
     {}
 
   for (const [key, entity] of entityEntries) {
-    selectors[key] = (pkComposites: Record<string, unknown>) => {
-      const indexDef = entity.indexes[sharedIndexName!]!
-      const read = KeyComposer.composeReadPartitions(
-        sharedSchema!,
-        entity.entityType,
-        indexDef,
-        collectionKeyForm(entity, pkComposites),
-        { prune: false },
-      )
-      const pkValue = read.partitions[0]!
-
-      let q = Query.make({
-        tableName: "",
-        indexName: sharedDynamoIndexName,
-        pkField: sharedPkField!,
-        pkValue,
-        skField: sharedSkField,
-        entityTypes: [entity.entityType],
-        decoder: (raw) => entity._decodeRecord(raw),
-        ...entityPackedQueryOptions(entity),
-        resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
-        keyFields: [
-          sharedPkField,
-          sharedSkField,
-          entity.indexes.primary?.pk.field,
-          entity.indexes.primary?.sk.field,
-        ],
-        keyConditionDiagnosis: { operation: "query", label: `collection "${name}" (${key})` },
-      }).pipe((made) => Query.fanOut(made, read))
-
-      // Clustered entity selectors add begins_with on the entity SK prefix.
-      // For sub-collections, the prefix uses the FULL hierarchy from root to
-      // the queried collection name, matching what composeSk writes at put time.
-      if (collectionType === "clustered" && collectionSkPrefix) {
-        const coll = indexDef.collection
-        const hierarchy = Array.isArray(coll) ? coll.slice(0, coll.indexOf(name) + 1) : name
-        const entitySkPrefix = DynamoSchema.composeClusteredSortKey(
+    selectors[key] = (pkComposites: Record<string, unknown>) =>
+      refusable(() => {
+        const indexDef = entity.indexes[sharedIndexName!]!
+        const read = KeyComposer.composeReadPartitions(
           sharedSchema!,
-          hierarchy,
           entity.entityType,
-          1,
-          [],
-          { casing: indexDef.casing },
+          indexDef,
+          collectionKeyForm(entity, pkComposites),
+          { prune: false },
         )
-        q = q.pipe(Query.where({ beginsWith: entitySkPrefix }))
-      }
+        const pkValue = read.partitions[0]!
 
-      return q
-    }
+        let q = Query.make({
+          tableName: "",
+          indexName: sharedDynamoIndexName,
+          pkField: sharedPkField!,
+          pkValue,
+          skField: sharedSkField,
+          entityTypes: [entity.entityType],
+          decoder: (raw) => entity._decodeRecord(raw),
+          ...entityPackedQueryOptions(entity),
+          resolveTableName: entity._tableTag.useSync((tc: TableConfig) => tc.name),
+          keyFields: [
+            sharedPkField,
+            sharedSkField,
+            entity.indexes.primary?.pk.field,
+            entity.indexes.primary?.sk.field,
+          ],
+          keyConditionDiagnosis: { operation: "query", label: `collection "${name}" (${key})` },
+        }).pipe((made) => Query.fanOut(made, read))
+
+        // Clustered entity selectors add begins_with on the entity SK prefix.
+        // For sub-collections, the prefix uses the FULL hierarchy from root to
+        // the queried collection name, matching what composeSk writes at put time.
+        if (collectionType === "clustered" && collectionSkPrefix) {
+          const coll = indexDef.collection
+          const hierarchy = Array.isArray(coll) ? coll.slice(0, coll.indexOf(name) + 1) : name
+          const entitySkPrefix = DynamoSchema.composeClusteredSortKey(
+            sharedSchema!,
+            hierarchy,
+            entity.entityType,
+            1,
+            [],
+            { casing: indexDef.casing },
+          )
+          q = q.pipe(Query.where({ beginsWith: entitySkPrefix }))
+        }
+
+        return q
+      })
   }
 
   return {
     _tag: "Collection" as const,
     name,
     entities,
-    query: queryAll,
+    query: (pkComposites: Record<string, unknown>) => refusable(() => queryAll(pkComposites)),
     ...selectors,
   } as Collection<TEntities> & {
     readonly [K in keyof TEntities]: (

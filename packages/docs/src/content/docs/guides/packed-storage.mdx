@@ -355,6 +355,8 @@ Native, JSON and compressed values of the same field therefore decode through th
 
 **JSON only.** A value that isn't JSON is refused when it's written, with a `ValidationError` that names the field, the path inside it and the type. That covers `bigint`, `Uint8Array` and other binary, `Set`, `Map`, a `Date` or other class instance, non-finite numbers, `undefined` inside an array, symbols and functions. An `undefined` property is omitted, as it is from a map. A field that needs one of these should stay native, or use a JSON-shaped schema such as `Schema.BigIntFromString`, `Schema.Uint8ArrayFromBase64` or an array instead of a set.
 
+A `DateTime` is the one instance a packed value takes. Where a schema has already encoded it, as an entity field does, there's nothing to take: it's text by then. Where nothing has, it's stored as the JSON of the map a native field holds, so one value reads back the same from every form. That's event data and snapshot state on a stream, which comes back as a real `DateTime` wherever the schema declares one, and a `Schema.Unknown` field, which comes back as the map.
+
 ## EventStore streams
 
 ```typescript region="stream" example="guide-packed-storage.ts"
@@ -414,6 +416,38 @@ const { snapshot, version } = yield* Ledger.readLatest(id)
 ```
 
 `append` and `commandHandler` encode each event, and compress it when that's configured. Every read path decodes by stored form: `read`, `readFrom`, `currentVersion`, `readLatest` (including snapshot replay), `readSnapshot`, `readIndex`, `query.events` and `query.index`. In this example the 2,967-byte JSON of the inline snapshot's state is stored as 213 bytes.
+
+### Dates in event data and snapshot state
+
+A date in event data or a snapshot state can be new, or one a read returned. They're stored the same way, and every read gives back a real `DateTime`, including from rows an earlier release packed.
+
+```typescript region="stream-date" example="guide-packed-storage.ts"
+class Scheduled extends Schema.TaggedClass<Scheduled>()("Scheduled", {
+  at: Schema.DateTimeUtc,
+}) {}
+
+const Schedule = EventStore.makeStream({
+  table: EventsTable,
+  streamName: "Schedule",
+  events: [Scheduled],
+  streamId: { composite: ["scheduleId"] },
+  storedAs: { data: DynamoModel.Packed({ format: "json" }) },
+})
+```
+
+```typescript region="stream-date-append" example="guide-packed-storage.ts"
+const at = DateTime.makeUnsafe("2025-01-01T00:00:00.000Z")
+const scheduleId = { scheduleId: "S-1" }
+yield* Schedule.append(scheduleId, [new Scheduled({ at })], 0)
+
+// A date a read returned can be written back as it is
+const scheduled = yield* Schedule.read(scheduleId)
+yield* Schedule.append(
+  scheduleId,
+  scheduled.map((event) => new Scheduled({ at: event.data.at })),
+  1,
+)
+```
 
 ### Raw rows and filters
 
@@ -493,16 +527,16 @@ const asZstdSync = StorageEncoding.valueBytesSync({
 
 | Helper | Returns |
 |---|---|
-| `stream.measureAppend(streamId, events, expectedVersion, options?)` | `{ events, sentinel, snapshot, transactionBytes }`: the item size of each event `Put`, the idempotency sentinel and the inline snapshot, plus what the stream's own actions add to the `TransactWriteItems` request. The items are built by the same code `append` uses. Nothing is read or written. An append of one event and nothing else is sent as a `PutItem`, where only the 400 KB item limit applies; its measured sizes include the 42-byte write token that `PutItem` carries. |
+| `stream.measureAppend(streamId, events, expectedVersion, options?)` | `{ events, sentinel, snapshot, transactionBytes, requestBytes }`: the item size of each event `Put`, the idempotency sentinel and the inline snapshot, plus what the append's actions (its `additionalItems` included, when passed) add to the `TransactWriteItems` request. `requestBytes` is the exact request body the append would send: its JSON text, which is larger than the items (a control character is 1 byte in an item and 6 in JSON), to compare with `limits.request`. The request is built by the same code `append` uses. Nothing is read or written. An append of one event and nothing else is sent as a `PutItem`, where only the 400 KB item limit applies; its measured sizes include the 42-byte write token that `PutItem` carries. |
 | `stream.measureSnapshot(streamId, state, asOfVersion)` | the item size of the snapshot `writeSnapshot` would write |
 | `StorageEncoding.valueBytes({ schema, value, storedAs? })` | the size of one attribute **value** as stored, packed under `storedAs`, or as a native map if `storedAs` is omitted. An item's size is the sum, over its attributes, of the name's UTF-8 bytes plus the value's bytes. |
 | `StorageEncoding.valueBytesSync({ schema, value, storedAs?, compressors? })` | the same number, synchronously, for pure planning code. Compressors are passed in (a registry or a list; none by default, which is enough for an uncompressed config or a value under its threshold), and a failure throws the `ValidationError` `valueBytes` fails with. |
-| `StorageEncoding.limits` | `{ item: 409_600, transaction: 4_194_304 }` |
+| `StorageEncoding.limits` | `{ item: 409_600, transaction: 4_194_304, request: 16_777_216 }`. `request` is the request body limit: AWS documents 16 MB for `BatchWriteItem`, and DynamoDB Local rejects any request body over 16 MiB (HTTP 413). |
 | `StorageEncoding.encode(storedAs, wire)` / `StorageEncoding.decode(stored)` | one value to and from its stored `AttributeValue` (`decode` takes DynamoDB JSON) |
 | `StorageEncoding.decodeUnmarshalled(stored)` | one already-unmarshalled stored value (a JSON string, bytes or base64, or a native value) to its wire form |
 | `StorageEncoding.encodeSync` / `decodeSync` / `decodeUnmarshalledSync` | the same, synchronously, for pure code or a hand-rolled loop over many values: pass `{ compressors }` (a registry or a list; none by default) and catch the thrown `ValidationError` |
 
-`measureAppend` doesn't accept `additionalItems`, because building a guarded put reads the table. Add their sizes yourself. Compressed sizes can differ between compressor versions, so leave a margin when you plan on one runtime and write on another.
+`measureAppend` takes the append's `additionalItems` too, and measures the request with them in it: adding items changes the request (a lone event's `PutItem` becomes a `TransactWriteItems`), so never add their sizes to a measurement taken without them. It sends no request. An additional item `append` reads the table to build (a put of a versioned or unique-constrained entity, a `create` over a projection tombstone) has no size without that read, so it fails the measurement with a `ValidationError`. Compressed sizes can differ between compressor versions, so leave a margin when you plan on one runtime and write on another.
 
 ## DynamoDB Streams images
 

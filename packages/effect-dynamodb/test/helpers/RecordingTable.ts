@@ -9,7 +9,9 @@
  * hash of the key, paged the same way), BatchGetItem, BatchWriteItem,
  * TransactGetItems and TransactWriteItems (`Put` / `Update` / `Delete` /
  * `ConditionCheck`). A failed condition answers `ALL_OLD` when the request
- * asked for it, as DynamoDB does.
+ * asked for it, as DynamoDB does. With `refuseBodiesOver`, a request whose
+ * body ({@link sdkBodyBytes}) is over that many bytes is refused as DynamoDB
+ * Local refuses one over 16 MiB: HTTP 413, before it is read.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -27,6 +29,31 @@ export interface Request {
 }
 
 const keyOf = (key: Item) => `${key.pk?.S}|${key.sk?.S}`
+
+/**
+ * The body the AWS SDK sends for `input`, by native `JSON.stringify` (binary
+ * as base64) — independent of the library's own measure — plus the
+ * `ClientRequestToken` (60 bytes) the SDK fills on a `TransactWriteItems`
+ * without one. Checked against the SDK in `RequestSize.test.ts`.
+ */
+export const sdkBodyBytes = (command: string, input: Record<string, unknown>): number =>
+  Buffer.byteLength(
+    JSON.stringify(input, (_key, value) =>
+      value instanceof Uint8Array ? Buffer.from(value).toString("base64") : value,
+    ),
+    "utf8",
+  ) + (command === "TransactWriteItems" && input.ClientRequestToken === undefined ? 60 : 0)
+
+/** DynamoDB Local's refusal of a request body over 16 MiB, as the AWS SDK reports it. */
+export const tooLargeFailure = (operation: string) =>
+  new DynamoError({
+    operation,
+    cause: Object.assign(new Error("UnknownError"), {
+      name: "Unknown",
+      $fault: "client",
+      $metadata: { httpStatusCode: 413, attempts: 1, totalRetryDelay: 0 },
+    }),
+  })
 
 const conditionFailed = (operation: string, item: Item | undefined, input: Record<string, any>) =>
   new DynamoError({
@@ -46,6 +73,13 @@ const passes = (input: Record<string, any>, item: Item | undefined) =>
     input.ExpressionAttributeValues ?? {},
   )
 
+/**
+ * A key attribute's value as text that sorts as DynamoDB sorts it: a string as it is, bytes (a
+ * Z-order `B` sort key) one character per byte, which compares byte by byte.
+ */
+const keyText = (value: AttributeValue | undefined): string =>
+  value?.S ?? (value?.B === undefined ? "" : Buffer.from(value.B).toString("latin1"))
+
 const sortKeyHolds = (
   condition: string | undefined,
   item: Item,
@@ -55,15 +89,15 @@ const sortKeyHolds = (
   if (condition === undefined) return true
   const between = /^(#\w+) BETWEEN (:\w+) AND (:\w+)$/.exec(condition)
   if (between) {
-    const value = item[names[between[1]!]!]?.S ?? ""
-    return value >= values[between[2]!]!.S! && value <= values[between[3]!]!.S!
+    const value = keyText(item[names[between[1]!]!])
+    return value >= keyText(values[between[2]!]) && value <= keyText(values[between[3]!])
   }
   const begins = /^begins_with\((#\w+), (:\w+)\)$/.exec(condition)
-  if (begins) return (item[names[begins[1]!]!]?.S ?? "").startsWith(values[begins[2]!]!.S!)
+  if (begins) return keyText(item[names[begins[1]!]!]).startsWith(keyText(values[begins[2]!]))
   const comparison = /^(#\w+) (<=|>=|=|<|>) (:\w+)$/.exec(condition)
   if (comparison) {
-    const value = item[names[comparison[1]!]!]?.S ?? ""
-    const operand = values[comparison[3]!]!.S!
+    const value = keyText(item[names[comparison[1]!]!])
+    const operand = keyText(values[comparison[3]!])
     switch (comparison[2]) {
       case "=":
         return value === operand
@@ -92,6 +126,8 @@ export interface IndexKeys {
  */
 export const makeRecordingTable = (options?: {
   readonly indexes?: Readonly<Record<string, IndexKeys>> | undefined
+  /** Refuse a request whose body is over this many bytes, as DynamoDB Local refuses one over 16 MiB. */
+  readonly refuseBodiesOver?: number | undefined
 }) => {
   const items = new Map<string, Item>()
   const requests: Array<Request> = []
@@ -102,6 +138,10 @@ export const makeRecordingTable = (options?: {
     requests.push(request)
     hooks.onRequest?.(request)
   }
+  /** Whether DynamoDB Local would refuse `input` for its body. */
+  const refused = (command: string, input: Record<string, any>) =>
+    options?.refuseBodiesOver !== undefined &&
+    sdkBodyBytes(command, input) > options.refuseBodiesOver
 
   const update = (input: Record<string, any>, current: Item | undefined): Item =>
     applyUpdate(current ?? { ...input.Key }, input)!
@@ -116,6 +156,7 @@ export const makeRecordingTable = (options?: {
     putItem: (input) =>
       Effect.suspend(() => {
         record("PutItem", input)
+        if (refused("PutItem", input)) return Effect.fail(tooLargeFailure("PutItem"))
         const key = keyOf(input.Item!)
         const current = items.get(key)
         if (!passes(input, current)) return Effect.fail(conditionFailed("PutItem", current, input))
@@ -169,7 +210,7 @@ export const makeRecordingTable = (options?: {
         const values = input.ExpressionAttributeValues ?? {}
         const kc = /^(#\w+) = (:\w+)(?: AND (.*))?$/.exec(input.KeyConditionExpression ?? "")!
         const pk = values[kc[2]!]!.S
-        const sortOf = (item: Item) => item[index.sk]?.S ?? ""
+        const sortOf = (item: Item) => keyText(item[index.sk])
         const tableKey = (item: Item) => keyOf(item)
         let rows = [...items.values()]
           .filter(
@@ -241,9 +282,18 @@ export const makeRecordingTable = (options?: {
         const examined = input.Limit === undefined ? rows : rows.slice(0, input.Limit)
         const last = examined[examined.length - 1]
         const more = examined.length < rows.length && last !== undefined
+        const names = input.ExpressionAttributeNames ?? {}
+        const values = input.ExpressionAttributeValues ?? {}
+        const returned = examined
+          .map(([, item]) => item)
+          .filter(
+            (item) =>
+              input.FilterExpression === undefined ||
+              holds(input.FilterExpression, item, names, values),
+          )
         return {
-          Items: examined.map(([, item]) => item),
-          Count: examined.length,
+          Items: returned,
+          Count: returned.length,
           ScannedCount: examined.length,
           ...(more && { LastEvaluatedKey: { pk: last[1].pk!, sk: last[1].sk! } }),
         } as never
@@ -261,8 +311,9 @@ export const makeRecordingTable = (options?: {
         return { Responses, UnprocessedKeys: {} } as never
       }),
     batchWriteItem: (input) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         record("BatchWriteItem", input)
+        if (refused("BatchWriteItem", input)) return Effect.fail(tooLargeFailure("BatchWriteItem"))
         for (const requests of Object.values(input.RequestItems ?? {})) {
           for (const request of requests) {
             if (request.PutRequest?.Item !== undefined) {
@@ -273,7 +324,7 @@ export const makeRecordingTable = (options?: {
             }
           }
         }
-        return { UnprocessedItems: {} } as never
+        return Effect.succeed({ UnprocessedItems: {} } as never)
       }),
     transactGetItems: (input) =>
       Effect.sync(() => {
@@ -288,6 +339,9 @@ export const makeRecordingTable = (options?: {
     transactWriteItems: (input) =>
       Effect.suspend(() => {
         record("TransactWriteItems", input)
+        if (refused("TransactWriteItems", input)) {
+          return Effect.fail(tooLargeFailure("TransactWriteItems"))
+        }
         const ops = input.TransactItems ?? []
         const keys = ops.map((op) =>
           keyOf(op.Put?.Item ?? op.Update?.Key ?? op.Delete?.Key ?? op.ConditionCheck?.Key ?? {}),

@@ -42,6 +42,7 @@ import {
   withVector as withVectorCombinator,
 } from "./EntityCombinators.js"
 import type {
+  AddOperand,
   CascadeTarget,
   EntityDelete,
   EntityGet,
@@ -320,29 +321,38 @@ export interface BoundUpdate<
   E,
   VN extends string = string,
   P extends PropertyKey = never,
+  RN extends string = string,
 > extends Pipeable.Pipeable {
   readonly [BoundOpTypeId]: BoundOpTypeId
   readonly _boundOpType: "update"
   /** Set the fields to update (record-based SET). */
-  readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN, P>
-  /** Remove attributes (REMOVE clause). */
-  readonly remove: (fields: ReadonlyArray<string>) => BoundUpdate<Model, A, U, E, VN, P>
-  /** Atomic numeric ADD. */
-  readonly add: (values: globalThis.Record<string, number>) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly set: (updates: U) => BoundUpdate<Model, A, U, E, VN, P, RN>
+  /**
+   * Clear model fields a row can lack (REMOVE clause); `.set({ field: undefined })`
+   * is the same operation. Takes field names, not stored attribute names. A
+   * field the model requires, a typo and a stored name don't compile, and are
+   * refused at run time, before anything is sent. To clean up an attribute the
+   * model no longer declares, use `.pathRemove(["attribute"])`.
+   */
+  remove(fields: ReadonlyArray<RN>): BoundUpdate<Model, A, U, E, VN, P, RN>
+  /** Atomic ADD: a number adds, a set unions. */
+  readonly add: (
+    values: globalThis.Record<string, AddOperand>,
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Numeric SET subtraction (synthesized as `SET #f = #f - :v`). */
   readonly subtract: (
     values: globalThis.Record<string, number>,
-  ) => BoundUpdate<Model, A, U, E, VN, P>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** List append (synthesized as `SET #f = list_append(#f, :v)`). */
   readonly append: (
     values: globalThis.Record<string, ReadonlyArray<unknown>>,
-  ) => BoundUpdate<Model, A, U, E, VN, P>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Delete elements from a set attribute. */
   readonly deleteFromSet: (
     values: globalThis.Record<string, unknown>,
-  ) => BoundUpdate<Model, A, U, E, VN, P>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Optimistic concurrency — expected version. */
-  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly expectedVersion: (version: number) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /**
    * Add a condition expression. Callback or shorthand.
    *
@@ -366,7 +376,7 @@ export interface BoundUpdate<
   readonly withVector: (
     name: VN,
     vector: ReadonlyArray<number>,
-  ) => BoundUpdate<Model, A, U, E, VN, P>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /**
    * What the update returns. `"allNew"` (the default) / `"allOld"`: the whole
    * item after / before it. `"updatedNew"` / `"updatedOld"`: only the
@@ -381,25 +391,25 @@ export interface BoundUpdate<
     readonly targets: ReadonlyArray<CascadeTarget>
     readonly filter?: globalThis.Record<string, unknown> | undefined
     readonly mode?: "eventual" | "transactional" | undefined
-  }) => BoundUpdate<Model, A, U, E, VN, P>
+  }) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based SET. */
-  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly pathSet: (op: PathSetOp) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based REMOVE. */
   readonly pathRemove: (
     segments: ReadonlyArray<string | number>,
-  ) => BoundUpdate<Model, A, U, E, VN, P>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based ADD. */
-  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly pathAdd: (op: PathAddOp) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based SUBTRACT. */
-  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly pathSubtract: (op: PathSubtractOp) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based APPEND. */
-  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly pathAppend: (op: PathAppendOp) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based PREPEND. */
-  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly pathPrepend: (op: PathPrependOp) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based if_not_exists. */
-  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly pathIfNotExists: (op: PathIfNotExistsOp) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Path-based DELETE (set removal). */
-  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly pathDelete: (op: PathDeleteOp) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /**
    * Remove specific entries from a sparse-map field. Compiles to
    * `REMOVE <prefix>#k1, <prefix>#k2, ...`. Removing an entry that doesn't
@@ -408,14 +418,14 @@ export interface BoundUpdate<
   readonly removeEntries: (
     field: string,
     keys: ReadonlyArray<string>,
-  ) => BoundUpdate<Model, A, U, E, VN, P>
+  ) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /**
    * Clear all entries of a sparse-map field. Two-op helper: reads the current
    * item, then folds REMOVE clauses for the discovered `<prefix>#*` attrs into
    * the same final UpdateItem. Atomic via the version CAS for `versioned`
    * entities; best-effort for non-versioned.
    */
-  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E, VN, P>
+  readonly clearMap: (field: string) => BoundUpdate<Model, A, U, E, VN, P, RN>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */
@@ -424,7 +434,7 @@ export interface BoundUpdate<
 
 /** @internal */
 export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
-  implements BoundUpdate<Model, A, U, E, VN>
+  implements BoundUpdate<Model, A, U, E, VN, never, string>
 {
   readonly [BoundOpTypeId]: BoundOpTypeId = BoundOpTypeId as BoundOpTypeId
   readonly _boundOpType = "update" as const
@@ -442,10 +452,18 @@ export class BoundUpdateImpl<Model, A, U, E, VN extends string = string>
   }
 
   remove(fields: ReadonlyArray<string>): BoundUpdateImpl<Model, A, U, E, VN> {
-    return this._with(removeCombinator(this._op, fields))
+    return this._with(
+      removeCombinator(this._op as EntityUpdate<A, any, unknown, E, any>, fields) as EntityUpdate<
+        A,
+        any,
+        U,
+        E,
+        any
+      >,
+    )
   }
 
-  add(values: globalThis.Record<string, number>): BoundUpdateImpl<Model, A, U, E, VN> {
+  add(values: globalThis.Record<string, AddOperand>): BoundUpdateImpl<Model, A, U, E, VN> {
     return this._with(addCombinator(this._op, values))
   }
 
@@ -687,7 +705,8 @@ export const makeBoundDelete = <Model, E>(
 export const makeBoundUpdate = <Model, A, U, E, VN extends string = string>(
   op: EntityUpdate<A, any, U, E, any>,
   config: BoundCrudConfig<Model>,
-): BoundUpdate<Model, A, U, E, VN> => new BoundUpdateImpl<Model, A, U, E, VN>(op, config)
+): BoundUpdate<Model, A, U, E, VN> =>
+  new BoundUpdateImpl<Model, A, U, E, VN>(op, config) as unknown as BoundUpdate<Model, A, U, E, VN>
 
 // ---------------------------------------------------------------------------
 // BoundAppend — time-series append() builder
@@ -717,10 +736,16 @@ export const makeBoundUpdate = <Model, A, U, E, VN extends string = string>(
  * yield* db.entities.Telemetry.append(input).condition(c).skipFollowUp() // → void
  * ```
  */
-export interface BoundAppend<Model, A, E, ESkip, P extends PropertyKey = never>
-  extends Pipeable.Pipeable {
+export interface BoundAppend<
+  Model,
+  A,
+  E,
+  ESkip,
+  P extends PropertyKey = never,
+  RN extends string = string,
+> extends Pipeable.Pipeable {
   /** Add a condition expression. Callback or shorthand. */
-  readonly condition: (cond: ConditionArg<Model, P>) => BoundAppend<Model, A, E, ESkip, P>
+  readonly condition: (cond: ConditionArg<Model, P>) => BoundAppend<Model, A, E, ESkip, P, RN>
   /**
    * Emit REMOVE clauses for `appendInput` attributes the caller wants cleared
    * on the current item. Cleared attributes also cascade-drop any GSI half
@@ -728,20 +753,22 @@ export interface BoundAppend<Model, A, E, ESkip, P extends PropertyKey = never>
    * REMOVE clauses ride the same UpdateItem as the scoped SET + CAS — no
    * separate write, no race window.
    *
-   * Validated at execution time:
+   * Typed to the `appendInput` fields a row can lack, and validated at
+   * execution time:
+   * - Names must be model fields, not stored attribute names.
    * - Names must appear in `appendInput` (enrichment fields outside
    *   `appendInput` cannot be cleared via `.append()` — use `.update()`).
-   * - Names must not name `orderBy`, a primary-key composite, or a
-   *   ref-derived `${name}Id` field.
+   * - Names must not name `orderBy`, a primary-key composite, a ref, or a field
+   *   a row can't lack (it could not be read afterwards).
    * - Names must not overlap the encoded payload (DynamoDB rejects an
    *   UpdateExpression that touches the same attribute in both SET and
    *   REMOVE).
    *
    * Chained `.remove()` calls accumulate.
    */
-  readonly remove: (attrs: ReadonlyArray<string>) => BoundAppend<Model, A, E, ESkip, P>
+  remove(attrs: ReadonlyArray<RN>): BoundAppend<Model, A, E, ESkip, P, RN>
   /** Skip the follow-up GetItem; success becomes `void`. */
-  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip, P>
+  readonly skipFollowUp: () => BoundAppend<Model, void, ESkip, ESkip, P, RN>
   /** Convert to an executable Effect for Effect combinator interop. */
   readonly asEffect: () => Effect.Effect<A, E, never>
   /** Yield support for `Effect.gen`. */

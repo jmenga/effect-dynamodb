@@ -12,6 +12,7 @@ import { DynamoEncodingKey, isRecord, isRecordAst, isRecordSchema } from "../src
 import { inferDefaultEncoding } from "../src/internal/EntitySchemas.js"
 import {
   extractArrayElement,
+  extractKeyedValue,
   firstTypeParameterAst,
   getSchemaFields,
   hasEncodingTransformation,
@@ -35,6 +36,23 @@ describe("SchemaAST canary tests", () => {
       expect(resolved).toBeDefined()
       const rep = resolved.representation as { id: string }
       expect(rep.id).toBe("effect/schema/DateTimeUtc")
+    })
+  })
+
+  describe("what a set is told apart by", () => {
+    it("Schema.ReadonlySet has representation.id === 'effect/schema/ReadonlySet'", () => {
+      const ast = Schema.ReadonlySet(Schema.String).ast
+      expect(ast._tag).toBe("Declaration")
+      const rep = (ast.annotations as Record<string, unknown>).representation as { id: string }
+      expect(rep.id).toBe("effect/schema/ReadonlySet")
+    })
+
+    it("toEncoded keeps a set's .check(), and its element schema", () => {
+      const encoded = SchemaAST.toEncoded(
+        Schema.ReadonlySet(Schema.String).check(Schema.isMinSize(1)).ast,
+      )
+      expect(encoded.checks?.length).toBe(1)
+      expect((encoded as SchemaAST.Declaration).typeParameters[0]?._tag).toBe("String")
     })
   })
 
@@ -107,6 +125,30 @@ describe("SchemaAST canary tests", () => {
 // ---------------------------------------------------------------------------
 
 describe("SchemaAccessors typed accessors", () => {
+  describe("extractKeyedValue", () => {
+    const Value = Schema.Struct({ a: Schema.String })
+
+    it("is the value of a record, under optional too", () => {
+      const keyed = Schema.Record(Schema.String, Value)
+      expect(extractKeyedValue(keyed)).toBe(Value)
+      expect(extractKeyedValue(Schema.optional(keyed))).toBe(Value)
+      expect(extractKeyedValue(Schema.optionalKey(keyed))).toBe(Value)
+    })
+
+    it("nothing else has one, whatever it holds in `.value`", () => {
+      for (const other of [
+        Schema.Array(Value),
+        Schema.Option(Value),
+        Schema.Redacted(Schema.String),
+        Value,
+        Schema.String,
+      ]) {
+        expect(extractKeyedValue(other)).toBeUndefined()
+        expect(extractKeyedValue(Schema.optional(other))).toBeUndefined()
+      }
+    })
+  })
+
   describe("getSchemaFields", () => {
     it("reads .fields from a Schema.Struct", () => {
       const s = Schema.Struct({ a: Schema.String, b: Schema.Number })

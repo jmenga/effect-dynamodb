@@ -273,7 +273,7 @@ The gate mirrors the per-half evaluation gate of [policy-aware GSI composition](
 - `.set({ description: undefined })`
 - `.pathSet({ segments: ["description"], … })` and the other path operations
 
-A clear is a change. An embedding that outlives its source is worse than no embedding — the item stays findable by a description it no longer has.
+A clear is a change, and only a source field the model declares optional can be cleared at all. An embedding that outlives its source is worse than no embedding — the item stays findable by a description it no longer has.
 
 When the payload carries only *part* of the source (here `description` but not `name`), the library reads the current item once so the new embedding reflects the complete post-update source text — not the fragment that happened to be in this payload. Cleared attributes are subtracted from that merged record.
 
@@ -282,6 +282,7 @@ When the payload carries only *part* of the source (here `description` but not `
 If the write leaves no source text at all, the vector and partition attributes are `REMOVE`d and the item drops out of the index — sparse semantics are the only way to delete a vector index entry:
 
 ```typescript
+// With both source fields optional in the model
 yield* db.entities.Products.update(key).remove(["name", "description"])
 // The product still exists. It is no longer searchable.
 ```

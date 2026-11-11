@@ -144,9 +144,25 @@ const PaymentTotals = Entity.make({
   },
 })
 
+const SlotTotals = Entity.make({
+  model: Schema.Struct({ orderId: Schema.String, slot: Schema.Number, version: Schema.Number }),
+  entityType: "SlotTotal",
+  primaryKey: {
+    pk: { field: "pk", composite: ["orderId"] },
+    sk: { field: "sk", composite: ["slot"] },
+  },
+})
+
 const ReadTable = Table.make({
   schema: AppSchema,
-  entities: { OrderSummaries, TenantSummaries, ZoneTotals, TaggedSummaries, PaymentTotals },
+  entities: {
+    OrderSummaries,
+    TenantSummaries,
+    ZoneTotals,
+    TaggedSummaries,
+    PaymentTotals,
+    SlotTotals,
+  },
 })
 
 class RejectedEvent extends Data.TaggedError("RejectedEvent")<{ readonly version: number }> {}
@@ -557,6 +573,33 @@ describe("EventStore.projection — applyBatch", () => {
       expect((outcome.error as ConcurrentModification).attributes).toEqual(["version"])
       // The first attempt and two retries, each re-reading the row.
       expect(calls).toEqual({ query: 0, getItem: 3, putItem: 3 })
+    }).pipe(Effect.provide(TestLayer)),
+  )
+
+  it.effect("a key its row can't compose fails that row, not the batch", () =>
+    Effect.gen(function* () {
+      const projection = EventStore.projection({
+        stream: Orders,
+        readModel: SlotTotals,
+        key: (id) => ({ orderId: id.orderId, slot: id.orderId === "bad" ? Number.NaN : 1 }),
+        initial: (id) => ({
+          orderId: id.orderId,
+          slot: id.orderId === "bad" ? Number.NaN : 1,
+          version: 0,
+        }),
+        evolve: (state, event) => Effect.succeed({ ...state, version: event.version }),
+        checkpoint: "version",
+      })
+      const bad = yield* seed("bad", [new OrderPlaced({ amount: 1 })])
+      const good = yield* seed("good", [new OrderPlaced({ amount: 1 })])
+      const result = yield* projection.applyBatch([...bad, ...good])
+      const failed = result.outcomes.find((outcome) => outcome._tag === "Failed")!
+      if (failed._tag !== "Failed") throw new Error("not failed")
+      expect(failed.streamId).toBe("bad")
+      const error = failed.error as ValidationError
+      expect(error).toBeInstanceOf(ValidationError)
+      expect(String((error.cause as { readonly message?: string }).message)).toContain("[EDD-9096]")
+      expect(result.outcomes.some((outcome) => outcome._tag === "Applied")).toBe(true)
     }).pipe(Effect.provide(TestLayer)),
   )
 

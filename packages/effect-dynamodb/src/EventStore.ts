@@ -71,6 +71,11 @@ import {
   ValidationError,
   VersionConflict,
 } from "@effect-dynamodb/schema/Errors.js"
+import {
+  readingStreamValues,
+  writingTuplePositions,
+} from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import {
   isDispatchEligible,
@@ -78,12 +83,15 @@ import {
   packValue,
   unpackStoredSync,
 } from "@effect-dynamodb/schema/internal/PackedCodec.js"
+import { refuseUnreadable } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
+  type Cause,
   Context,
   DateTime,
   type Duration,
   Effect,
+  Exit,
   Function,
   Option,
   Pipeable,
@@ -96,8 +104,13 @@ import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
-import { asReadGuard } from "./internal/ExpressionLimits.js"
-import { itemBytes, transactItemBytes } from "./internal/ItemSize.js"
+import { asReadGuard, wholeRowGuard } from "./internal/ExpressionLimits.js"
+import {
+  itemBytes,
+  jsonBytes,
+  transactItemBytes,
+  transactWriteBodyBytes,
+} from "./internal/ItemSize.js"
 import {
   isMultiProjection,
   type MultiProjection,
@@ -117,6 +130,8 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
+import { notReadBack, type ReadBack, readBackOf } from "./internal/RoundTrip.js"
+import { marshalOrFail } from "./internal/TransactableOps.js"
 import {
   type AppendWriteOp,
   type BuiltStreamAppend,
@@ -392,11 +407,11 @@ export interface AppendMeasurement {
   /** The item size of the inline snapshot `Put`, when `snapshot` is given. */
   readonly snapshot: number | undefined
   /**
-   * What the stream's own actions (the contiguity check, the event puts, the
-   * sentinel and the inline snapshot) add to the `TransactWriteItems` request
-   * — its 4 MB (4,194,304-byte) limit counts items, keys and expressions.
-   * Caller `additionalItems` are not included: add their size yourself. With
-   * a `headProof` (`"none"` included) there is no contiguity check to count.
+   * What the append's actions (the contiguity check, the event puts, the
+   * items the caller's `additionalItems` build, the sentinel and the inline
+   * snapshot) add to the `TransactWriteItems` request — its 4 MB
+   * (4,194,304-byte) limit counts items, keys and expressions. With a
+   * `headProof` (`"none"` included) there is no contiguity check to count.
    *
    * An append whose only item is its one event is sent as a `PutItem`
    * instead (see {@link EventStream.append}), to which the 4 MB limit does
@@ -404,11 +419,27 @@ export interface AppendMeasurement {
    * included (as it is in `events`).
    */
   readonly transactionBytes: number
+  /**
+   * The body of the request the append would send for the same arguments, in
+   * bytes: its JSON text as the AWS SDK serializes it — the
+   * `TransactWriteItems` (its `ClientRequestToken` included) or, for an append
+   * of one event and nothing else, the `PutItem` — with
+   * `ReturnConsumedCapacity` when consumed-capacity reporting is on where this
+   * runs. Each character counts its UTF-8 bytes as escaped in JSON (a control
+   * character 6, a quote or backslash 2), binary its base64, so this can be
+   * several times `transactionBytes`. Compare it with
+   * `StorageEncoding.limits.request`. It is measured on the request itself:
+   * pass the append's `additionalItems` to have them counted, since adding
+   * them changes the request (a lone event's `PutItem` becomes a
+   * `TransactWriteItems`). `0` when the append would send nothing.
+   */
+  readonly requestBytes: number
 }
 
 /**
- * The options {@link EventStream.measureAppend} accepts: those of
- * {@link EventStream.append} except `additionalItems`.
+ * The options of {@link EventStream.append} except `additionalItems`.
+ * {@link EventStream.measureAppend} takes {@link AppendOptions}, which these
+ * are assignable to.
  */
 export type MeasureAppendOptions<TMetadata, TState = never> = Omit<
   AppendOptionsBase<TState>,
@@ -2343,23 +2374,29 @@ export interface EventStream<
   /**
    * The bytes {@link EventStream.append} would write for these arguments, by
    * DynamoDB's own size accounting — for planning chunks against the 400 KB
-   * item and 4 MB transaction limits without re-implementing the stream's
+   * item and 4 MB transaction limits, and the request body against 16 MB
+   * (`requestBytes`), without re-implementing the stream's
    * item layout or packing. The items are built by the same code `append`
    * uses (envelope, keys, packed and compressed `data`, metadata, stream-index
    * attributes, the sentinel, the inline snapshot), so the numbers are exact
    * for the request `append` would send now with this runtime's compressors.
    *
-   * Nothing is read or written, and nothing is refused for its size: this is
-   * caller-side planning, not a pre-check. `additionalItems` are not accepted
-   * — add their size yourself. Fails as `append` would on invalid options
-   * (`ValidationError`), and — with a `CompressorNotRegistered` cause — when a
-   * value crosses its compression threshold without a registered compressor.
+   * Nothing is read or written, and nothing is refused for its size: this
+   * is caller-side planning, not a pre-check. With `additionalItems` the
+   * request is built as `append` builds it — the same items, in the same
+   * transaction. An additional item `append` reads the table to build (a put
+   * of a versioned or unique-constrained entity, a `create` over a projection
+   * tombstone) has no size without that read, so it fails the measurement
+   * with a `ValidationError` naming the read. Fails as `append` would on
+   * invalid options (`ValidationError`), and — with a
+   * `CompressorNotRegistered` cause — when a value crosses its compression
+   * threshold without a registered compressor.
    */
   measureAppend(
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: MeasureAppendOptions<TMetadata, TState> | undefined,
+    options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendMeasurement, ValidationError, TableConfig>
 
   /**
@@ -2752,6 +2789,35 @@ export const makeStream = <
   // -------------------------------------------------------------------------
 
   const snapshot = config.snapshot as SnapshotConfig | undefined
+
+  // What a stream stores has to read back (EDD-9125): an append that succeeds and a read that
+  // can't decode leaves events nobody can read.
+  const streamLabel = `EventStream "${config.streamName}"`
+  config.events.forEach((event, position) => {
+    const identifier = (event as { readonly identifier?: unknown }).identifier
+    const named = typeof identifier === "string" ? `event "${identifier}"` : `events[${position}]`
+    refuseUnreadable(`${streamLabel}, ${named}`, "schema", event, { whole: "the event" })
+  })
+  if (config.events.length > 1) {
+    // Read through one union, so what one event stores can be what another reads.
+    refuseUnreadable(
+      streamLabel,
+      "schema",
+      Schema.Union(config.events as unknown as ReadonlyArray<Schema.Top>),
+      { whole: "the union of its events" },
+    )
+  }
+  if (config.metadata !== undefined) {
+    refuseUnreadable(`${streamLabel}, metadata`, "schema", config.metadata, {
+      whole: "the metadata",
+    })
+  }
+  if (snapshot !== undefined) {
+    refuseUnreadable(`${streamLabel}, snapshot state`, "schema", snapshot.schema, {
+      whole: "the state",
+    })
+  }
+
   if (snapshot !== undefined && snapshot.every !== undefined) {
     if (!Number.isInteger(snapshot.every) || snapshot.every <= 0) {
       throw new Error(
@@ -2939,18 +3005,46 @@ export const makeStream = <
     return eventUnion
   }
 
+  const writableCodecs = new Map<Schema.Codec<any>, Schema.Codec<any>>()
+  /** A codec refusing a tuple position its stored list can't keep. Built once per schema. */
+  const writableCodec = (declared: Schema.Codec<any>): Schema.Codec<any> => {
+    const known = writableCodecs.get(declared)
+    if (known !== undefined) return known
+    const writable = writingTuplePositions(declared) as Schema.Codec<any>
+    writableCodecs.set(declared, writable)
+    return writable
+  }
+
+  /**
+   * What checks a schema's stored values read back (`EDD-9126`), for one holding a custom
+   * declaration. An event is read through the union of the events; anything else through itself.
+   */
+  const readBacks = new Map<Schema.Top, ReadBack | undefined>()
+  const readBackFor = (declared: Schema.Top): ReadBack | undefined => {
+    if (readBacks.has(declared)) return readBacks.get(declared)
+    const isEvent = declared === eventUnion || config.events.includes(declared as never)
+    const readBack = readBackOf(declared, () =>
+      readingStreamValues(isEvent ? eventUnion : declared),
+    )
+    readBacks.set(declared, readBack)
+    return readBack
+  }
+
   /**
    * Validate input and produce wire-form output: `Schema.encode` first, with a
-   * `decode → encode` fallback for inputs already in encoded shape. Mirrors
-   * the Entity write path (`encodeOrDecodeEncode` in `Entity.ts`).
+   * `decode → encode` fallback for inputs already in encoded shape, then refused if it wouldn't read
+   * back. Mirrors the Entity write path (`encodeForWrite` in `Entity.ts`). Everything a stream stores
+   * from its own schemas goes through this.
    */
   const encodeToWire = (
-    codec: Schema.Codec<any>,
+    declared: Schema.Codec<any>,
     input: unknown,
     operation: string,
     errorEntityType: string = entityType,
-  ): Effect.Effect<unknown, ValidationError> =>
-    Schema.encodeUnknownEffect(codec)(input).pipe(
+    packed = false,
+  ): Effect.Effect<unknown, ValidationError> => {
+    const codec = writableCodec(declared)
+    const wire = Schema.encodeUnknownEffect(codec)(input).pipe(
       Effect.catch((primaryCause) =>
         Schema.decodeUnknownEffect(codec)(input).pipe(
           Effect.flatMap((decoded) => Schema.encodeUnknownEffect(codec)(decoded)),
@@ -2964,12 +3058,39 @@ export const makeStream = <
         ),
       ),
     )
+    // What's packed doesn't go through the marshaller's map, and packing refuses an instance itself.
+    const readBack = packed ? undefined : readBackFor(declared)
+    return readBack === undefined
+      ? wire
+      : wire.pipe(
+          Effect.tap((encoded) =>
+            readBack(encoded).pipe(
+              Effect.mapError(
+                (issue) =>
+                  new ValidationError({
+                    entityType: errorEntityType,
+                    operation,
+                    cause: notReadBack("The value", issue),
+                  }),
+              ),
+            ),
+          ),
+        )
+  }
 
   // ---------------------------------------------------------------------------
   // Decode a raw DynamoDB item → StreamEvent<TEvent>
   // ---------------------------------------------------------------------------
 
   const decodeEnvelope = Schema.decodeUnknownEffect(EventEnvelope)
+  // `undefined` and an empty set are stored as absent attributes, in an event as
+  // anywhere else, and read back as those values. A decode that dies on one fails as
+  // 1.39.0's did, which decoded through the declared schema (`decodingAsBefore`).
+  const decodingStream = (declared: Schema.Top) =>
+    decodingAsBefore(readingStreamValues(declared), declared)
+  const decodeEventData = decodingStream(eventUnion)
+  const decodeMetadata = decodingStream(metadataSchema ?? Schema.Unknown)
+  const decodeSnapshotState = decodingStream(snapshot?.schema ?? Schema.Unknown)
 
   /**
    * An event's stored `data` → its wire form (plain JSON), by the stored
@@ -3021,8 +3142,7 @@ export const makeStream = <
       // JSON string (`S`) parsed, compressed binary (`B`) decompressed and
       // parsed — whatever the stream's current `storedAs` says.
       const wireData = yield* unpackData(raw.data, "EventStore.decode")
-      const decoder = Schema.decodeUnknownEffect(eventUnion as Schema.Schema<TEvent>)
-      const data = yield* (decoder(wireData) as Effect.Effect<TEvent, unknown>).pipe(
+      const data = yield* (decodeEventData(wireData) as Effect.Effect<TEvent, unknown>).pipe(
         Effect.mapError(toValidationError("EventStore.decode")),
       )
 
@@ -3032,9 +3152,9 @@ export const makeStream = <
       let metadata: unknown
       if (raw.metadata !== undefined) {
         metadata = metadataSchema
-          ? yield* Schema.decodeUnknownEffect(metadataSchema as Schema.Schema<unknown>)(
-              raw.metadata,
-            ).pipe(Effect.mapError(toValidationError("EventStore.decode.metadata")))
+          ? yield* decodeMetadata(raw.metadata).pipe(
+              Effect.mapError(toValidationError("EventStore.decode.metadata")),
+            )
           : raw.metadata
       }
 
@@ -3158,6 +3278,7 @@ export const makeStream = <
       state,
       operation,
       snapshotEntityType,
+      stateStoredAs !== undefined,
     )
 
   /**
@@ -3559,7 +3680,7 @@ export const makeStream = <
       }
       // Top-level and native, beside `state`, so packing never touches it.
       if (sealed) item[SEALED_ATTRIBUTE] = true
-      return toAttributeMap(item)
+      return yield* marshalOrFail(snapshotEntityType, operation, () => toAttributeMap(item))
     })
 
   /**
@@ -3630,8 +3751,8 @@ export const makeStream = <
       }
 
       // The head proof (#164), checked ahead of the no-op fast path, as the
-      // per-event options are. An index into `additionalItems` is checked by
-      // `append`, which has them (`measureAppend` does not take them).
+      // per-event options are. An index into `additionalItems` is checked
+      // against them by `headProofOp`.
       const headProof = options?.headProof
       if (headProof !== undefined) {
         const problem = headProofShapeProblem(headProof)
@@ -3803,6 +3924,8 @@ export const makeStream = <
               memberSchemaFor(event) as Schema.Codec<any>,
               event,
               "EventStore.append",
+              entityType,
+              dataStoredAs !== undefined,
             )
 
             // Inject _tag for plain Schema.Class events; Schema.TaggedClass
@@ -3905,7 +4028,9 @@ export const makeStream = <
             return {
               Put: {
                 TableName: tableName,
-                Item: toAttributeMap(item),
+                Item: yield* marshalOrFail(entityType, "EventStore.append", () =>
+                  toAttributeMap(item),
+                ),
                 ConditionExpression: "attribute_not_exists(pk)",
                 // The first put of a writer one version behind a seal lands on
                 // the sealing event: its item tells `StreamSealed` from a
@@ -4035,20 +4160,16 @@ export const makeStream = <
       return parts
     }) as Effect.Effect<AppendParts | undefined, ValidationError, TableConfig>
 
-  const append = (
-    streamId: StreamIdInput<TStreamIdFields>,
-    events: ReadonlyArray<TEvent>,
-    expectedVersion: number,
-    options?: AppendOptions<unknown, unknown> | undefined,
-  ) =>
+  /**
+   * The additional item a head proof names (#164), which must exist: checked
+   * before anything is read, and ahead of the no-op fast path. Its shape is
+   * checked first, by `buildAppend`'s own rule.
+   */
+  const headProofOp = (
+    headProof: HeadProof | undefined,
+    additionalOps: ReadonlyArray<AppendWriteOp>,
+  ): Effect.Effect<number | undefined, ValidationError> =>
     Effect.gen(function* () {
-      const additionalOps = options?.additionalItems ?? []
-      const idempotency = options?.idempotency
-      const headProof = options?.headProof
-
-      // The additional item a head proof names (#164) must exist — checked
-      // before anything is read, and ahead of the no-op fast path. Its shape
-      // is checked first, by `buildAppend`'s own rule.
       const proofOp =
         typeof headProof === "object" && headProofShapeProblem(headProof) === undefined
           ? headProof.additionalItem
@@ -4063,13 +4184,30 @@ export const makeStream = <
             "Nothing was written.",
         })
       }
+      return proofOp
+    })
 
-      const parts = yield* buildAppend(streamId, events, expectedVersion, options)
-      if (parts === undefined) return { version: expectedVersion, events: [] }
-      const { tableName, streamIdStr, contiguityCheck, eventItems, sentinelPut, snapshotPut } =
-        parts
-
-      const client = yield* Capacity.client
+  /**
+   * The append's one transaction, laid out — see {@link AppendTransaction}:
+   * the caller's `additionalItems` compiled through the same builder
+   * `Transaction.transactWrite` uses, so the two APIs cannot drift, and placed
+   * among the stream's own items. `append` builds it for each attempt (a
+   * guarded put among the additional items reads its item) and sends it;
+   * `measureAppend` builds it once and measures it.
+   */
+  const buildAppendTransaction = (
+    parts: AppendParts,
+    additionalOps: ReadonlyArray<AppendWriteOp>,
+    expectedVersion: number,
+    headProof: HeadProof | undefined,
+    proofOp: number | undefined,
+  ): Effect.Effect<
+    AppendTransaction,
+    ValidationError | DynamoClientError,
+    DynamoClient | TableConfig
+  > =>
+    Effect.gen(function* () {
+      const { tableName, contiguityCheck, eventItems, sentinelPut, snapshotPut } = parts
 
       /**
        * Lay out the append's one transaction — see {@link AppendTransaction}:
@@ -4126,37 +4264,63 @@ export const makeStream = <
         }
       }
 
+      // Caller-owned items, compiled through the same builder
+      // `Transaction.transactWrite` uses, so the two APIs cannot drift.
+      // Another stream's append (#166) is accepted here, and only here.
+      const additional = yield* buildTransactWriteItems(
+        additionalOps,
+        "EventStore.append.additionalItems",
+        { streams: true },
+      )
+      // An item without a condition of its own proves nothing about the
+      // head: accepting it would drop the gap protection silently. Nor
+      // does another stream's append: its conditions are its stream's.
+      if (proofOp !== undefined && !additional.conditioned.has(proofOp)) {
+        const named = additionalOps[proofOp]
+        return yield* new ValidationError({
+          entityType,
+          operation: "EventStore.append.headProof",
+          cause: isStreamAppendOp(named)
+            ? `headProof names additionalItems[${proofOp}], which is an append of stream ` +
+              `"${named.streamName}" (appendOp): its conditions prove that stream's head, ` +
+              "not this one's. Name an item conditioned on this stream being at " +
+              "expectedVersion. Nothing was written."
+            : `headProof names additionalItems[${proofOp}], which carries no condition of its ` +
+              "own: the proof must be conditioned on the stream being at expectedVersion " +
+              "(`.condition()`, `create()` or `Transaction.check`). Nothing was written.",
+        })
+      }
+      return layout(additional)
+    })
+
+  const append = (
+    streamId: StreamIdInput<TStreamIdFields>,
+    events: ReadonlyArray<TEvent>,
+    expectedVersion: number,
+    options?: AppendOptions<unknown, unknown> | undefined,
+  ) =>
+    Effect.gen(function* () {
+      const additionalOps = options?.additionalItems ?? []
+      const idempotency = options?.idempotency
+      const headProof = options?.headProof
+      const proofOp = yield* headProofOp(headProof, additionalOps)
+
+      const parts = yield* buildAppend(streamId, events, expectedVersion, options)
+      if (parts === undefined) return { version: expectedVersion, events: [] }
+
+      const client = yield* Capacity.client
+
       // A guarded put among the additional items reads its item; a race with
       // that read cancels the append, which is then built and written again.
       let lost: OptimisticLockError | ConcurrentModification | undefined
       for (let attempt = 0; attempt < GUARDED_TRANSACTION_ATTEMPTS; attempt++) {
-        // Caller-owned items, compiled through the same builder
-        // `Transaction.transactWrite` uses, so the two APIs cannot drift.
-        // Another stream's append (#166) is accepted here, and only here.
-        const additional = yield* buildTransactWriteItems(
+        const tx = yield* buildAppendTransaction(
+          parts,
           additionalOps,
-          "EventStore.append.additionalItems",
-          { streams: true },
+          expectedVersion,
+          headProof,
+          proofOp,
         )
-        // An item without a condition of its own proves nothing about the
-        // head: accepting it would drop the gap protection silently. Nor
-        // does another stream's append: its conditions are its stream's.
-        if (proofOp !== undefined && !additional.conditioned.has(proofOp)) {
-          const named = additionalOps[proofOp]
-          return yield* new ValidationError({
-            entityType,
-            operation: "EventStore.append.headProof",
-            cause: isStreamAppendOp(named)
-              ? `headProof names additionalItems[${proofOp}], which is an append of stream ` +
-                `"${named.streamName}" (appendOp): its conditions prove that stream's head, ` +
-                "not this one's. Name an item conditioned on this stream being at " +
-                "expectedVersion. Nothing was written."
-              : `headProof names additionalItems[${proofOp}], which carries no condition of its ` +
-                "own: the proof must be conditioned on the stream being at expectedVersion " +
-                "(`.condition()`, `create()` or `Transaction.check`). Nothing was written.",
-          })
-        }
-        const tx = layout(additional)
 
         // DynamoDB's rules — one operation per item (an additional item
         // repeating an event, the contiguity check, the idempotency sentinel
@@ -4168,7 +4332,7 @@ export const makeStream = <
         const outcome = yield* sendAppendTransaction(
           client,
           tx,
-          streamIdStr,
+          parts.streamIdStr,
           idempotency?.commandId,
         )
         if (outcome === undefined) {
@@ -4294,48 +4458,69 @@ export const makeStream = <
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: MeasureAppendOptions<unknown, unknown> | undefined,
+    options?: AppendOptions<unknown, unknown> | undefined,
   ): Effect.Effect<AppendMeasurement, ValidationError, TableConfig> =>
     Effect.gen(function* () {
-      if ((options as { additionalItems?: unknown } | undefined)?.additionalItems !== undefined) {
+      const additionalOps = options?.additionalItems
+      const headProof = options?.headProof
+      // A `{ additionalItem }` proof is checked against the additional items
+      // when they are given, as `append` checks it. Without them it stands for
+      // an item the caller adds, so the append is a transaction.
+      const proofOp =
+        additionalOps === undefined ? undefined : yield* headProofOp(headProof, additionalOps)
+      const parts = yield* buildAppend(streamId, events, expectedVersion, options)
+      if (parts === undefined) {
+        return {
+          events: [],
+          sentinel: undefined,
+          snapshot: undefined,
+          transactionBytes: 0,
+          requestBytes: 0,
+        }
+      }
+      // The transaction `append` would send, built by the same code: the
+      // stream's items and the items the caller's `additionalItems` build, in
+      // the same places. Nothing is sent: an item `append` reads the table to
+      // build has no size without that read, and fails the measurement.
+      const built = yield* Capacity.withoutRequests(
+        buildAppendTransaction(parts, additionalOps ?? [], expectedVersion, headProof, proofOp),
+      )
+      if (built.refused !== undefined) {
+        const { command, input } = built.refused
         return yield* new ValidationError({
           entityType,
           operation: "EventStore.measureAppend",
           cause:
-            "measureAppend does not measure additionalItems (building a guarded put reads the " +
-            "table): measure the stream's own items without them, and add the size of your " +
-            "own items.",
+            `an additional item is built from the stored row: append would send ${command}` +
+            (typeof input.TableName === "string" ? ` on table "${input.TableName}"` : "") +
+            " to build it (a put of a versioned or unique-constrained entity, or a create " +
+            "over a projection tombstone, reads its item). measureAppend sends no request, " +
+            "so it has no size to give for this append. Nothing was read or written.",
         })
       }
-      const parts = yield* buildAppend(
-        streamId,
-        events,
-        expectedVersion,
-        options as AppendOptions<unknown, unknown> | undefined,
-      )
-      if (parts === undefined) {
-        return { events: [], sentinel: undefined, snapshot: undefined, transactionBytes: 0 }
+      if (Exit.isFailure(built.exit)) {
+        // No request was refused, so nothing here is a client error.
+        return yield* Effect.failCause(built.exit.cause as Cause.Cause<ValidationError>)
       }
+      const tx = built.exit.value
+      // An append of one event and nothing else is sent as a `PutItem`
+      // carrying a write token (#173), measured here with a placeholder token
+      // of its length.
+      const single = typeof headProof !== "object" && isSingleEventPut(tx.items, tx.eventCount)
+      const sent = single
+        ? [withWriteToken(tx.items[0]!, "0".repeat(WRITE_TOKEN_LENGTH))]
+        : tx.items
       const putBytes = (item: TransactWriteItem): number => itemBytes(item.Put?.Item ?? {})
-      const laidOut = [
-        ...(parts.contiguityCheck === undefined ? [] : [parts.contiguityCheck]),
-        ...parts.eventItems,
-        ...(parts.sentinelPut === undefined ? [] : [parts.sentinelPut]),
-        ...(parts.snapshotPut === undefined ? [] : [parts.snapshotPut]),
-      ]
-      // A single-item append is sent as a `PutItem` carrying a write token
-      // (#173), whose bytes are measured here as a placeholder of its length.
-      // A `{ additionalItem }` proof means the append carries that item, so
-      // it is a transaction.
-      const single =
-        typeof options?.headProof !== "object" && isSingleEventPut(laidOut, parts.eventItems.length)
-      const owned = single ? [withWriteToken(laidOut[0]!, "0".repeat(WRITE_TOKEN_LENGTH))] : laidOut
-      const eventItems = single ? owned : parts.eventItems
+      // What the client sends beside the items: the request as `append` sends it.
+      const fields = yield* Capacity.requestFields
       const measurement: AppendMeasurement = {
-        events: eventItems.map(putBytes),
+        events: (single ? sent : parts.eventItems).map(putBytes),
         sentinel: parts.sentinelPut === undefined ? undefined : putBytes(parts.sentinelPut),
         snapshot: parts.snapshotPut === undefined ? undefined : putBytes(parts.snapshotPut),
-        transactionBytes: owned.reduce((sum, item) => sum + transactItemBytes(item), 0),
+        transactionBytes: sent.reduce((sum, item) => sum + transactItemBytes(item), 0),
+        requestBytes: single
+          ? jsonBytes({ ...sent[0]!.Put, ...fields })
+          : transactWriteBodyBytes({ TransactItems: sent, ...fields }),
       }
       return measurement
     })
@@ -4595,9 +4780,7 @@ export const makeStream = <
       : Effect.succeed(raw.state)
     ).pipe(
       Effect.flatMap((state) =>
-        Schema.decodeUnknownEffect((snapshot as SnapshotConfig).schema as Schema.Codec<unknown>)(
-          state,
-        ).pipe(
+        decodeSnapshotState(state).pipe(
           Effect.mapError(
             (cause) => new ValidationError({ entityType: snapshotEntityType, operation, cause }),
           ),
@@ -5234,6 +5417,7 @@ export const makeStream = <
       const client = yield* Capacity.client
       const firstSk = composeEventSk(1)
       const nowSeconds = DateTime.toEpochSeconds(yield* DateTime.now)
+      const unprovable = Rekey.unprovableRow(ctx)
       const live = (row: Record<string, AttributeValue>) => {
         const ttl = row[ttlAttribute]?.N
         return ttl === undefined || Number(ttl) > nowSeconds
@@ -5278,7 +5462,7 @@ export const makeStream = <
         row.__edd_e__?.S === entityType ? Number(row.version?.N ?? 0) : 0
       const asOfOf = (row: Record<string, AttributeValue>) => Number(row.asOfVersion?.N ?? 0)
       const conflict = (
-        reason: "bothKeys" | "taken" | "contended",
+        reason: "bothKeys" | "taken" | "contended" | "unguarded",
         message: string,
         sk = firstSk,
       ): Rekey.RekeyTally => ({
@@ -5318,13 +5502,39 @@ export const makeStream = <
                 }),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
-      /** Delete `row` at `from` while it is as read. `false` when a write changed it. */
+      /**
+       * `row` as read, whole, or, a row too wide for that, the strongest guard that fits, as
+       * 1.39.0 sent: only a stream already part-moved deletes one (`unguardedRows`).
+       */
+      const guardOfRow = (row: Record<string, AttributeValue>) =>
+        wholeRowGuard(row, "pk", [], [], []) ?? asReadGuard(row, "pk", [])
+      /**
+       * With writes going on (`unprovable`), the rows of a stream nothing of which has moved that
+       * are too wide to guard whole, each reported `unguarded`, before anything is copied: its rows
+       * move together, so one leaves the stream as it is. One already part-moved (a row of it under
+       * `to`, or flipped) is finished under the strongest guard that fits (`guardOfRow`).
+       */
+      const unguardedRows = (rows: ReadonlyArray<Record<string, AttributeValue>>) => {
+        if (unprovable === "strongest") return undefined
+        const unguarded = rows.filter((row) => wholeRowGuard(row, "pk", [], [], []) === undefined)
+        if (unguarded.length === 0) return undefined
+        return Rekey.mergeTallies(
+          ...unguarded.map((row) =>
+            conflict(
+              "unguarded",
+              `${Rekey.UNGUARDED_MESSAGE} The stream's other rows are left with it.`,
+              skOf(row),
+            ),
+          ),
+        )
+      }
+      /** Delete `row` at `from` while it is as read (`guardOfRow`). `false` when a write changed it. */
       const remove = (row: Record<string, AttributeValue>) =>
         client
           .deleteItem({
             TableName: ctx.tableName,
             Key: toAttributeMap({ pk: from, sk: skOf(row) }),
-            ...asReadGuard(row, "pk", []),
+            ...guardOfRow(row),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
 
@@ -5393,6 +5603,11 @@ export const makeStream = <
         const flipped = first === undefined || first[MOVED_ATTRIBUTE] !== undefined
         if (!flipped) {
           const atTarget = yield* readAll(to)
+          // Nothing of it has moved while no row of it is under `to` (`unguardedRows`).
+          if (!atTarget.some((row) => !elsewhere(row))) {
+            const refused = unguardedRows(rows)
+            if (refused !== undefined) return Rekey.mergeTallies(tally, refused)
+          }
           // Another stream under other key text moves out first.
           const stale = atTarget.find(elsewhere)
           if (stale !== undefined) {
@@ -5799,7 +6014,7 @@ export interface BoundEventStream<
     streamId: StreamIdInput<TStreamIdFields>,
     events: ReadonlyArray<TEvent>,
     expectedVersion: number,
-    options?: MeasureAppendOptions<TMetadata, TState> | undefined,
+    options?: AppendOptions<TMetadata, TState> | undefined,
   ): Effect.Effect<AppendMeasurement, ValidationError, never>
 
   /** See {@link EventStream.measureSnapshot}. */

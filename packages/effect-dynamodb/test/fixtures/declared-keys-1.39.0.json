@@ -1,0 +1,685 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "shapes": {
+  "Option(Number)": {
+   "put": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_some(5)"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#deleted#f_some(5)#2026-11-08T19:09:01.538Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:09:01.538Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#some(5)"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_[object object]"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#some(5)"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    }
+   ]
+  },
+  "Option(BigIntFromString)": {
+   "put": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_some(\"5\")"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "S": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#deleted#f_some(\"5\")#2026-11-08T19:09:01.614Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:09:01.614Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "S": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#some(\"5\")"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "S": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_[object object]"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       },
+       "value": {
+        "S": "5"
+       },
+       "_tag": {
+        "S": "Some"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#some(\"5\")"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    }
+   ]
+  },
+  "Array(Option(Number))": {
+   "put": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_some(5)"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "M": {
+         "_op": {
+          "S": "Some"
+         },
+         "~effect/Option": {
+          "M": {}
+         },
+         "value": {
+          "N": "5"
+         },
+         "_tag": {
+          "S": "Some"
+         }
+        }
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#deleted#f_some(5)#2026-11-08T19:09:01.679Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:09:01.679Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "M": {
+         "_op": {
+          "S": "Some"
+         },
+         "~effect/Option": {
+          "M": {}
+         },
+         "value": {
+          "N": "5"
+         },
+         "_tag": {
+          "S": "Some"
+         }
+        }
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#some(5)"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "f": {
+      "L": [
+       {
+        "M": {
+         "_op": {
+          "S": "Some"
+         },
+         "~effect/Option": {
+          "M": {}
+         },
+         "value": {
+          "N": "5"
+         },
+         "_tag": {
+          "S": "Some"
+         }
+        }
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_[object object]"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "L": [
+       {
+        "M": {
+         "_op": {
+          "S": "Some"
+         },
+         "~effect/Option": {
+          "M": {}
+         },
+         "value": {
+          "N": "5"
+         },
+         "_tag": {
+          "S": "Some"
+         }
+        }
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#some(5)"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    }
+   ]
+  },
+  "Duration": {
+   "put": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_1000 millis"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "~effect/Duration": {
+        "S": "~effect/Duration"
+       },
+       "value": {
+        "M": {
+         "millis": {
+          "N": "1000"
+         },
+         "_tag": {
+          "S": "Millis"
+         }
+        }
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    }
+   ],
+   "seeded": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#deleted#f_1000 millis#2026-11-08T19:09:01.742Z"
+     },
+     "deletedAt": {
+      "S": "2026-11-08T19:09:01.742Z"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "~effect/Duration": {
+        "S": "~effect/Duration"
+       },
+       "value": {
+        "M": {
+         "millis": {
+          "N": "1000"
+         },
+         "_tag": {
+          "S": "Millis"
+         }
+        }
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#1000 millis"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique"
+     },
+     "id": {
+      "S": "b"
+     },
+     "pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "f": {
+      "M": {
+       "~effect/Duration": {
+        "S": "~effect/Duration"
+       },
+       "value": {
+        "M": {
+         "millis": {
+          "N": "1000"
+         },
+         "_tag": {
+          "S": "Millis"
+         }
+        }
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Unique"
+     }
+    }
+   ],
+   "afterRestoreAndDelete": [
+    {
+     "sk": {
+      "S": "$declared#v1#soft#f_[object object]"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$declared#v1#soft#id_a"
+     },
+     "f": {
+      "M": {
+       "~effect/Duration": {
+        "S": "~effect/Duration"
+       },
+       "value": {
+        "M": {
+         "millis": {
+          "N": "1000"
+         },
+         "_tag": {
+          "S": "Millis"
+         }
+        }
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Soft"
+     }
+    },
+    {
+     "sk": {
+      "S": "$declared#v1#unique.byf"
+     },
+     "_entity_sk": {
+      "S": "$declared#v1#unique"
+     },
+     "pk": {
+      "S": "$declared#v1#unique.byf#1000 millis"
+     },
+     "_entity_pk": {
+      "S": "$declared#v1#unique#id_b"
+     },
+     "__edd_e__": {
+      "S": "Unique._unique.byF"
+     }
+    }
+   ]
+  }
+ }
+}

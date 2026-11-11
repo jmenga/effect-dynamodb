@@ -17,6 +17,7 @@
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
+import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   ConcurrentModification,
   type ConditionalCheckFailed,
@@ -25,8 +26,20 @@ import {
   ProjectionSourceConflict,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
-import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
+  keyFormLiterals,
+  keyFormValueKind,
+} from "@effect-dynamodb/schema/internal/CompositeCodec.js"
+import {
+  readingStreamValues,
+  writingTuplePositions,
+} from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
+import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
+import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
+import {
+  type Context,
   DateTime,
   Duration as Dur,
   type Duration,
@@ -46,14 +59,21 @@ import { resolveTtlAttributeName, type TableConfig } from "../Table.js"
 import * as Capacity from "./Capacity.js"
 import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
+import { handlerOf } from "./Rekey.js"
+import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
+  addProjectionLayout,
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
-  generateTimestampPrimitive,
   KEY_TEXT,
+  marshalOrFail,
+  type ProjectionRole,
+  projectionTtlChecked,
+  projectionTtlConflict,
   OUTBOX_ROW_PK as ROW_PK,
   OUTBOX_ROW_SK as ROW_SK,
+  serializeSparseOrFail,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
 
@@ -138,6 +158,7 @@ export interface EngineEntity {
   readonly create: (input: any) => any
   readonly _tableTag: any
   readonly _renameToDynamo: (item: Record<string, unknown>) => void
+  readonly _serializeSparseFields: (item: Record<string, unknown>) => void
   readonly _attachPrototype?: ((decoded: any) => any) | undefined
   readonly _multiItemWriteFeatures?: ReadonlyArray<string> | undefined
   readonly schemas: any
@@ -197,6 +218,18 @@ export interface EngineOutbox {
   readonly sk: string
   readonly index: { readonly name: string; readonly pk: string; readonly sk: string } | undefined
   readonly claimFor: Duration.Duration
+}
+
+/**
+ * @internal Where a projection's outbox items are, as its read model keeps it (`_projectionOutboxes`,
+ * one per projection): on the row table when `table` is undefined (under the row's own key
+ * attributes), else on `table` under `pk` / `sk`, with the sparse `index` keys they carry.
+ */
+export interface ProjectionOutboxLayout {
+  readonly table: { readonly Tag: any } | undefined
+  readonly pk: string
+  readonly sk: string
+  readonly index: { readonly name: string; readonly pk: string; readonly sk: string } | undefined
 }
 
 /** @internal */
@@ -310,7 +343,326 @@ interface Row {
   readonly createdAt: unknown
 }
 
-/** @internal */
+/** A table's service, as an entity or an outbox names it. */
+type TableTag = Context.Service<TableConfig, TableConfig>
+
+/** A projection's outbox on another table, as its read model records it (#171). */
+type RemoteOutbox = ProjectionOutboxLayout & { readonly table: { readonly Tag: TableTag } }
+
+/**
+ * @internal The outboxes on other tables of the read model's projections (`_projectionOutboxes`,
+ * the entries with a `table`): several projections of one read model may each have one. A local
+ * outbox is on the read model's own table, where its rows are.
+ */
+export const remoteOutboxesOf = (entity: unknown): ReadonlyArray<RemoteOutbox> =>
+  (
+    (entity as { readonly _projectionOutboxes?: ReadonlyArray<ProjectionOutboxLayout> })
+      ._projectionOutboxes ?? []
+  ).filter((outbox): outbox is RemoteOutbox => outbox.table !== undefined)
+
+/**
+ * @internal The physical name of the table `tag` names, the one requests are sent to:
+ * `undefined` when the context doesn't provide it.
+ */
+export const physicalTableName = (tag: TableTag): Effect.Effect<string | undefined> =>
+  Effect.map(Effect.serviceOption(tag), (config) =>
+    Option.isSome(config) ? config.value.name : undefined,
+  )
+
+/**
+ * What a composite of `model` can be in a key (`KeyComposer.CompositeValues`), by its schema, as
+ * one side sees it:
+ *
+ * - `"written"`, the keys its rows are written under: the key text of its literals (a literal
+ *   union), of `true` and `false` (a boolean), or a number's or bigint's key text; any other field
+ *   (a string, a field the model doesn't declare) may hold any text, `#` included.
+ * - `"read"`, the keys `rekey`'s reader takes as its rows' (`KeyText136.readIndexKeys`): a number,
+ *   a bigint or a boolean only as text its value composes again, and a literal composite as any
+ *   text, which it reads as a string.
+ */
+const compositeValues =
+  (model: unknown, side: "written" | "read") =>
+  (composite: string): KeyComposer.CompositeValues => {
+    if (model === undefined || model === null) return "open"
+    const schema = isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top)
+    const fields = getSchemaFields(schema)
+    if (fields === undefined || !Object.hasOwn(fields, composite)) return "open"
+    const field = fields[composite]!
+    const literals = keyFormLiterals(field)
+    if (side === "written" && literals !== undefined) return { values: literals }
+    const kind = keyFormValueKind(field)
+    if (kind === "number" || kind === "bigint") return "number"
+    if (kind === "boolean") return { values: [true, false] }
+    return "open"
+  }
+
+/** The key spaces of an entity's rows, each half's (`KeyComposer.composeKeySpace`). */
+type KeySpace = { readonly pk: KeyComposer.KeySpace; readonly sk: KeyComposer.KeySpace }
+
+/**
+ * The key space an entity's rows are under: the text its primary key's partition and sort keys
+ * start with, the composites' labels, and what each composite's value can be, composed by the call
+ * its writes make (`KeyComposer.composeKeySpace`): the schema's name and version, the primary
+ * collection (or the entity type), under a collection the entity type and its version, and each
+ * composite's name. Each value is what its type can compose (`compositeValues`), by `view`:
+ *
+ * - `"plain"`, the keys its rows are written under with values that hold no `#`: every composite is
+ *   walked, to the end of the key, under the schema's setting.
+ * - `"written"` and `"read"`, the keys `rekey` meets on its table, under any setting: the walk
+ *   stops at the first composite whose value may hold `#` (`"open"`), and anything follows it.
+ *
+ * `undefined` for an entity on no table.
+ */
+const keySpaceOf = (entity: unknown, view: "plain" | "written" | "read"): KeySpace | undefined => {
+  const member = entity as {
+    readonly entityType?: string
+    readonly _entityVersion?: number
+    readonly indexes?: { readonly primary?: IndexDefinition }
+    readonly _schema?: DynamoSchema.DynamoSchema
+    readonly model?: unknown
+  }
+  const primary = member.indexes?.primary
+  if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
+    return undefined
+  }
+  const values = compositeValues(member.model, view === "read" ? "read" : "written")
+  try {
+    return KeyComposer.composeKeySpace(
+      member._schema,
+      member.entityType,
+      member._entityVersion ?? 1,
+      primary,
+      view === "plain"
+        ? (composite) => {
+            const of = values(composite)
+            return of === "open" ? "text" : of
+          }
+        : values,
+      { everyForm: view !== "plain" },
+    )
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The key space of a read model's outbox items: its rows' partition keys, and its rows' sort keys
+ * followed by `#outbox#` (`<rowSk>#outbox#<revision>#<n>`), so any text after a whole sort key.
+ */
+const outboxSpaceOf = (space: KeySpace): KeySpace => {
+  const { sk } = space
+  if (sk.open) return space
+  const last = sk.after.length - 1
+  return {
+    pk: space.pk,
+    sk:
+      last < 0
+        ? { text: `${sk.text}#outbox#`, after: [], values: [], open: true }
+        : { ...sk, after: [...sk.after.slice(0, last), `${sk.after[last]}#outbox#`], open: true },
+  }
+}
+
+/** Whether a key of one key space can be a key of the other, in both halves. */
+const spacesMeet = (a: KeySpace, b: KeySpace): boolean =>
+  KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
+
+/**
+ * Whether the outbox items of one entity can be read by `rekey` as the other's, either way round:
+ * the keys one's are written under (`"written"`) against the keys the other's reader takes
+ * (`"read"`).
+ */
+const readAsEachOther = (a: unknown, b: unknown): boolean => {
+  const meet = (writer: unknown, reader: unknown) => {
+    const written = keySpaceOf(writer, "written")
+    const read = keySpaceOf(reader, "read")
+    return (
+      written !== undefined &&
+      read !== undefined &&
+      spacesMeet(outboxSpaceOf(written), outboxSpaceOf(read))
+    )
+  }
+  return meet(a, b) || meet(b, a)
+}
+
+/**
+ * Whether two entities compose every key the same way: one schema (name, version, casing,
+ * `escapeKeys`), entity type and version, primary key composites, casing and collection, and each
+ * composite of one type. Then either one's reader moves a row as the other's would.
+ */
+const sameKeys = (a: unknown, b: unknown): boolean => {
+  type Member = {
+    readonly entityType?: string
+    readonly _entityVersion?: number
+    readonly indexes?: { readonly primary?: IndexDefinition }
+    readonly _schema?: DynamoSchema.DynamoSchema
+    readonly model?: unknown
+  }
+  const x = a as Member
+  const y = b as Member
+  const px = x.indexes?.primary
+  const py = y.indexes?.primary
+  const sx = x._schema
+  const sy = y._schema
+  if (px === undefined || py === undefined || sx === undefined || sy === undefined) return false
+  const fieldsOf = (model: unknown) =>
+    model === undefined || model === null
+      ? undefined
+      : getSchemaFields(
+          isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top),
+        )
+  const fx = fieldsOf(x.model)
+  const fy = fieldsOf(y.model)
+  const typeOf = (fields: ReturnType<typeof getSchemaFields>, composite: string) => {
+    if (fields === undefined || !Object.hasOwn(fields, composite)) return undefined
+    const field = fields[composite]!
+    return JSON.stringify([keyFormValueKind(field), keyFormLiterals(field)])
+  }
+  const same = (u: ReadonlyArray<string>, v: ReadonlyArray<string>) =>
+    u.length === v.length && u.every((name, i) => name === v[i])
+  return (
+    x.entityType === y.entityType &&
+    (x._entityVersion ?? 1) === (y._entityVersion ?? 1) &&
+    sx.name === sy.name &&
+    sx.version === sy.version &&
+    sx.casing === sy.casing &&
+    (sx.escapeKeys === true) === (sy.escapeKeys === true) &&
+    same(px.pk.composite, py.pk.composite) &&
+    same(px.sk.composite, py.sk.composite) &&
+    px.casing === py.casing &&
+    JSON.stringify(px.collection) === JSON.stringify(py.collection) &&
+    px.type === py.type &&
+    [...px.pk.composite, ...px.sk.composite].every((composite) => {
+      const t = typeOf(fx, composite)
+      return t !== undefined && t === typeOf(fy, composite)
+    })
+  )
+}
+
+/**
+ * @internal `[EDD-9134]`: among `members` (each named as `site`'s message shows it), a read model
+ * whose projection's outbox is on another table, where another read model in the same key space
+ * has its outbox too. Tables are compared by the physical name the context resolves (two handles
+ * on one table are one table), and by service when one isn't provided. The problem, or `undefined`.
+ *
+ * Two questions, by `scope`:
+ *
+ * - `"plain"` (where read models are bound: `DynamoClient.make`, `EventStore.processBatch`): can a
+ *   key of one be a key of the other with values that hold no `#`, each value what its type can
+ *   compose? Then their items overwrite each other whenever their values match, in normal
+ *   operation. Read models whose keys meet only through a value holding `#` bind and run, as on
+ *   1.39.0, as do two whose keys part where a value of one can't hold the other's text (a number
+ *   beside a label).
+ * - a table (`rekey` of it): can `rekey` read an item of one as the other's at all, a string value
+ *   holding `#` included, and a literal composite read as any text, as its reader reads it? Then it
+ *   couldn't tell whose an item on that table is. Only outboxes on that table are looked at. The
+ *   table's own members (`scope.members`) are looked at too: an entity claims the outbox items of
+ *   its entity type on its table (its own projections' outbox there), so one that can read a read
+ *   model's items as its own would move them by its key. One whose keys are composed exactly as
+ *   the read model's (`sameKeys`) moves them where the read model would, and isn't refused.
+ *
+ * Read models that never meet at a site that sees several at once can't be checked: their key
+ * spaces must be kept apart by whoever defines them.
+ */
+export const sharedOutboxKeySpace = (
+  site: string,
+  members: ReadonlyArray<readonly [name: string, entity: unknown]>,
+  scope:
+    | "plain"
+    | {
+        readonly key: string
+        readonly name: string
+        /** The table's members, each named as the message shows it. */
+        readonly members: ReadonlyArray<readonly [name: string, member: unknown]>
+      },
+): Effect.Effect<string | undefined> =>
+  Effect.gen(function* () {
+    const plain = scope === "plain"
+    // Every table a member's outbox is on, by its physical name.
+    const names = new Map<string, string | undefined>()
+    for (const [, entity] of members) {
+      for (const { table } of remoteOutboxesOf(entity)) {
+        if (!names.has(table.Tag.key)) {
+          names.set(table.Tag.key, yield* physicalTableName(table.Tag))
+        }
+      }
+    }
+    const oneTable = (a: TableTag, b: TableTag): boolean => {
+      if (a.key === b.key) return true
+      const name = names.get(a.key)
+      return name !== undefined && name === names.get(b.key)
+    }
+    const startOf = (space: KeySpace) =>
+      `(partition keys starting "${space.pk.text}", sort keys starting "${space.sk.text}": the ` +
+      "same schema name and version, primary collection, entity type and first composite)"
+    for (const [name, entity] of members) {
+      const space = keySpaceOf(entity, plain ? "plain" : "written")
+      if (space === undefined) continue
+      for (const outbox of remoteOutboxesOf(entity)) {
+        const into = outbox.table.Tag
+        if (!plain && into.key !== scope.key && names.get(into.key) !== scope.name) continue
+        const physical = names.get(into.key)
+        for (const [otherName, other] of members) {
+          if (other === entity) continue
+          if (!remoteOutboxesOf(other).some((o) => oneTable(o.table.Tag, into))) continue
+          if (plain) {
+            const otherSpace = keySpaceOf(other, "plain")
+            if (
+              otherSpace === undefined ||
+              !spacesMeet(outboxSpaceOf(space), outboxSpaceOf(otherSpace))
+            ) {
+              continue
+            }
+          } else if (!readAsEachOther(entity, other)) continue
+          return (
+            `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
+            `table${physical === undefined ? "" : ` ("${physical}")`}, where ${otherName} ` +
+            `writes its own under the same key space ${startOf(space)}. ` +
+            (plain
+              ? "Their items would overwrite each other whenever their keys match, and rekey " +
+                "couldn't tell whose an item is. "
+              : "rekey reads an item's key back by its key space, and couldn't tell whose an " +
+                "item on this table is. ") +
+            "Give one of them its own entity type, collection, schema or key composites."
+          )
+        }
+        if (plain) continue
+        // The members of the table being rekeyed that claim this read model's outbox items.
+        for (const [memberName, member] of scope.members) {
+          if (member === entity) continue
+          const claims = handlerOf(member)?.types.includes(`${readModelType(entity)}#outbox`)
+          if (claims !== true || sameKeys(member, entity) || !readAsEachOther(entity, member)) {
+            continue
+          }
+          return (
+            `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
+            `table${physical === undefined ? "" : ` ("${physical}")`}, whose member ` +
+            `${memberName} claims the outbox items of its entity type there under the same key ` +
+            `space ${startOf(space)}, and composes its keys differently. rekey reads an item's ` +
+            "key back by its key space, and couldn't tell whose an item on this table is. Give " +
+            "one of them its own entity type, collection, schema or key composites."
+          )
+        }
+      }
+    }
+    return undefined
+  })
+
+/** An entity's type, as its rows' `__edd_e__` names it. */
+const readModelType = (entity: unknown): string | undefined =>
+  (entity as { readonly entityType?: string }).entityType
+
+/**
+ * @internal `[EDD-9134]` ({@link sharedOutboxKeySpace}) as a defect, from the sites that define
+ * what runs (`DynamoClient.make`, `EventStore.processBatch`), before anything runs.
+ */
+export const refuseSharedOutboxKeySpace = (
+  site: string,
+  members: ReadonlyArray<readonly [name: string, entity: unknown]>,
+): Effect.Effect<void> =>
+  Effect.flatMap(sharedOutboxKeySpace(site, members, "plain"), (problem) =>
+    problem === undefined ? Effect.void : Effect.die(new Error(problem)),
+  )
+
 export const makeEngine = (config: EngineConfig) => {
   const { readModel } = config
   const entityType = readModel.entityType
@@ -346,24 +698,59 @@ export const makeEngine = (config: EngineConfig) => {
     return [...kept]
   })()
 
-  // Resolved when it runs: an entity's table is set when it is registered on
-  // one, which may come after the projection is defined.
-  // Rows may be tombstones (#154): the entity's `create` takes one's place,
-  // keeping these fields — the checkpoints — and the revision one higher.
-  if (config.removal !== undefined) {
-    ;(readModel as { _projectionTombstones?: unknown })._projectionTombstones = {
-      kept: keptFields.filter((f) => f !== config.revision?.field),
-      revision: config.revision?.field,
+  // Each attribute the projection keeps on a row, with its role: the checkpoints, then the
+  // revision, as a tombstone stores them. An attribute in two roles is listed in each, and refused
+  // (`[EDD-9133]`, `addProjectionLayout`) when the read model's rows may be tombstones.
+  const roles: Array<readonly [string, ProjectionRole]> = []
+  const giveRole = (field: string, role: ProjectionRole) => {
+    if (!roles.some(([named, held]) => named === field && held === role)) roles.push([field, role])
+  }
+  if (config.checkpoints.kind === "scalar") giveRole(config.checkpoints.field, "checkpoint")
+  else {
+    if (config.checkpoints.map !== undefined) giveRole(config.checkpoints.map, "checkpoint map")
+    for (const f of Object.values(config.checkpoints.fields)) {
+      giveRole(f.field, "checkpoint")
+      giveRole(f.instanceField, "checkpoint owner")
     }
   }
+  if (config.revision !== undefined) giveRole(config.revision.field, "revision")
 
-  // An outbox on another table: that table's `rekey` moves its items (#171).
-  if (config.outbox?.table !== undefined) {
-    ;(readModel as { _projectionOutbox?: unknown })._projectionOutbox = {
+  // Recorded beside the layouts of the read model's other projections, whether or not it has
+  // `removal`, for the checks of `[EDD-9133]`. Rows may be tombstones (#154) when one has
+  // `removal`: the entity's `create` takes one's place, keeping the checkpoints of the projection
+  // with `removal` that wrote it, with its revision one higher (`overTombstone`).
+  addProjectionLayout(readModel, {
+    label: config.label,
+    roles,
+    removal: config.removal !== undefined,
+    ttl: config.removal?.ttl !== undefined,
+  })
+
+  // Every projection's outbox, kept on the read model, one entry per distinct layout, the one defined
+  // last at the end: a second projection doesn't hide the first's, which stays callable, and one
+  // defined again adds nothing. One on another table (`table`) is moved by that table's `rekey`
+  // (#171). Wherever it is, an aggregate declaring `ownsRows` is checked against its items at bind
+  // (DESIGN.md §7 "Which rows in its partition are an aggregate's"), with the index keys it writes
+  // on them.
+  if (config.outbox !== undefined) {
+    const holder = readModel as { _projectionOutboxes?: ReadonlyArray<ProjectionOutboxLayout> }
+    const layout: ProjectionOutboxLayout = {
       table: config.outbox.table,
       pk: config.outbox.pk,
       sk: config.outbox.sk,
+      index: config.outbox.index,
     }
+    const same = (other: ProjectionOutboxLayout) =>
+      other.table?.Tag === layout.table?.Tag &&
+      other.pk === layout.pk &&
+      other.sk === layout.sk &&
+      other.index?.name === layout.index?.name &&
+      other.index?.pk === layout.index?.pk &&
+      other.index?.sk === layout.index?.sk
+    holder._projectionOutboxes = [
+      ...(holder._projectionOutboxes ?? []).filter((other) => !same(other)),
+      layout,
+    ]
   }
 
   const tableName = Effect.suspend(() =>
@@ -600,6 +987,11 @@ export const makeEngine = (config: EngineConfig) => {
 
   const pad = (n: number, width: number) => String(n).padStart(width, "0")
 
+  const outboxReadBack =
+    config.outbox === undefined
+      ? undefined
+      : readBackOf(config.outbox.schema, () => readingStreamValues(config.outbox!.schema))
+
   const outboxItems = (
     rowKey: Record<string, unknown>,
     revision: number,
@@ -609,7 +1001,16 @@ export const makeEngine = (config: EngineConfig) => {
     Effect.forEach(enqueued, (e, i) =>
       Effect.gen(function* () {
         const outbox = config.outbox!
-        const encoded = yield* S.encodeUnknownEffect(outbox.schema)(e.effect).pipe(
+        const encoded = yield* S.encodeUnknownEffect(
+          writingTuplePositions(outbox.schema) as S.Codec<unknown>,
+        )(e.effect).pipe(
+          Effect.tap((wire) =>
+            outboxReadBack === undefined
+              ? Effect.void
+              : outboxReadBack(wire).pipe(
+                  Effect.mapError((issue) => notReadBack("The outbox effect", issue)),
+                ),
+          ),
           Effect.mapError(
             (cause) =>
               new ValidationError({ entityType, operation: `${config.label}.outbox`, cause }),
@@ -636,7 +1037,9 @@ export const makeEngine = (config: EngineConfig) => {
           item[outbox.index.pk] = outboxMarker(entityType)
           item[outbox.index.sk] = `${rowPk}#${sk}`
         }
-        return toAttributeMap(item)
+        return yield* marshalOrFail(entityType, `${config.label}.outbox`, () =>
+          toAttributeMap(item),
+        )
       }),
     )
 
@@ -688,21 +1091,20 @@ export const makeEngine = (config: EngineConfig) => {
             (DateTime.toEpochMillis(now) + Dur.toMillis(config.removal.ttl)) / 1000,
           )
         }
-        rowItem = toAttributeMap(tomb)
+        // A sparse-map key is refused as the row's own write refuses it. The check flattens a
+        // copy: what's stored is the tombstone as 1.39.0 stored it, an empty map whole.
+        yield* serializeSparseOrFail(readModel, { ...tomb }, `${config.label}.write`)
+        rowItem = yield* marshalOrFail(entityType, `${config.label}.write`, () =>
+          toAttributeMap(tomb),
+        )
       } else if (enqueued.length > 0) {
         const built = yield* validateAndBuildPutItem(
           readModel as any,
           target.value,
           `${config.label}.write`,
+          { createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined },
         )
-        const item = { ...built.item }
-        if (createdAtField !== null && DateTime.isDateTime(createdAt)) {
-          item[dbName(createdAtField)] = generateTimestampPrimitive(
-            DateTime.toUtc(createdAt),
-            readModel.systemFields.createdAtEncoding as any,
-          )
-        }
-        rowItem = toAttributeMap(item)
+        rowItem = toAttributeMap(built.item)
       }
 
       if (rowItem === undefined) {
@@ -789,6 +1191,33 @@ export const makeEngine = (config: EngineConfig) => {
           `${to}: a strongly consistent read did not return them. Was the stream written ` +
           "outside `append`?",
       }),
+    )
+
+  /**
+   * `[EDD-9133]` once the table's TTL attribute is known: an attribute a projection keeps on the
+   * read model's rows that is stored as the TTL attribute, which a projection's tombstones set. The
+   * two would overwrite each other, and a row could expire. Every entry point that writes a row
+   * runs it before it sends anything, whatever the data: `applyRow` for each row, and `catchUp` and
+   * `rebuild` first (`operation` names the entry point). The drains write no row and don't run it:
+   * a worker providing only its outbox's table delivers as on 1.39.0.
+   */
+  const preflight = (operation: string): Effect.Effect<void, ValidationError, any> =>
+    Effect.suspend(() =>
+      // The table is resolved only when there is something to check.
+      !projectionTtlChecked(readModel)
+        ? Effect.void
+        : Effect.flatMap(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => {
+            const problem = projectionTtlConflict(readModel, resolveTtlAttributeName(tc))
+            return problem === undefined
+              ? Effect.void
+              : Effect.fail(
+                  new ValidationError({
+                    entityType,
+                    operation: `${config.label}.${operation}`,
+                    cause: problem,
+                  }),
+                )
+          }),
     )
 
   const withRetry = <X>(attempt: Effect.Effect<X, any, any>): Effect.Effect<X, any, any> =>
@@ -1181,7 +1610,7 @@ export const makeEngine = (config: EngineConfig) => {
         failed,
       }
     })
-    return withRetry(attempt)
+    return Effect.andThen(preflight("apply"), withRetry(attempt))
   }
 
   /** The fields the library owns, re-applied after `toItem`. */
@@ -1194,6 +1623,12 @@ export const makeEngine = (config: EngineConfig) => {
   // -------------------------------------------------------------------------
   // Outbox drain (#155)
   // -------------------------------------------------------------------------
+
+  // A decode that dies on an absent attribute fails as 1.39.0's did (`decodingAsBefore`).
+  const decodeEffect = decodingAsBefore(
+    readingStreamValues(config.outbox?.schema ?? S.Unknown),
+    config.outbox?.schema ?? S.Unknown,
+  )
 
   /**
    * Deliver a row's pending effects in order: claim the head item, deliver it,
@@ -1248,7 +1683,7 @@ export const makeEngine = (config: EngineConfig) => {
           )
         // Another drainer holds the head: it delivers in order; stop here.
         if (!claimed) return { delivered, undelivered: Option.none() }
-        const effect = yield* S.decodeUnknownEffect(outbox.schema)(raw.effect).pipe(
+        const effect = yield* decodeEffect(raw.effect).pipe(
           Effect.mapError(
             (cause) =>
               new ValidationError({ entityType, operation: `${config.label}.drain`, cause }),
@@ -1347,7 +1782,24 @@ export const makeEngine = (config: EngineConfig) => {
       return { delivered, undelivered }
     })
 
-  return { readRow, applyRow, drain, drainPending, call }
+  return {
+    readRow,
+    // A key the row can't compose is that row's failure, not the batch's.
+    applyRow: (
+      key: unknown,
+      work: ReadonlyArray<InstanceWork>,
+      options?: { readonly fromScratch?: boolean | undefined },
+    ): Effect.Effect<RowResult, any, any> =>
+      Capacity.refusalsFail(
+        `${config.label}.apply`,
+        { target: entityType },
+        applyRow(key, work, options),
+      ),
+    drain,
+    drainPending,
+    preflight,
+    call,
+  }
 }
 
 /** What `deliver` is told about an effect. */

@@ -8,13 +8,13 @@
  * (`EntityRefInputType`, exercised in `Entity.types.test.ts`).
  *
  * Uses vitest's `expectTypeOf` to verify compile-time type relationships.
- * These assertions are compile-time only; the runtime schema deliberately
- * builds `Schema.String` for id fields (brands are compile-time phantoms).
+ * These assertions are compile-time only; the runtime schema takes each id field
+ * as the entity's key composite's own schema (`refIdInput`), the brand included.
  */
 
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Schema } from "effect"
+import { DateTime, Schema } from "effect"
 import { describe, expectTypeOf, it } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
 import * as Entity from "../src/Entity.js"
@@ -303,5 +303,218 @@ describe("aggregate write error unions are exported (#134)", () => {
     expectTypeOf<
       Extract<AggregateWriteError, { readonly _tag: "TransactionCancelled" }>
     >().not.toBeNever()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Dates the library stamps: optional on the input, per node, and only with `timestamps`
+// ---------------------------------------------------------------------------
+
+describe("Aggregate input: dates the library stamps", () => {
+  const Dates = { createdAt: Schema.DateTimeUtc, updatedAt: Schema.DateTimeUtc }
+  const base = {
+    table: MainTable,
+    schema: AppSchema,
+    pk: { field: "pk", composite: ["id"] },
+    collection: { name: "stamped" },
+    root: { entityType: "Stamped" },
+  } as const
+  const Root = Schema.Struct({ id: Schema.String, title: Schema.String, ...Dates })
+  const Rooted = Aggregate.make(Root, { ...base, edges: {}, timestamps: true })
+  const Bare = Aggregate.make(Root, { ...base, edges: {} })
+  type RootedInput = Aggregate.Input<typeof Rooted>
+  type BareInput = Aggregate.Input<typeof Bare>
+
+  it("a root's are optional with `timestamps`", () => {
+    const left: RootedInput = { title: "t" }
+    const given: RootedInput = {
+      title: "t",
+      createdAt: DateTime.makeUnsafe(0),
+      updatedAt: DateTime.makeUnsafe(0),
+    }
+    expectTypeOf(left).toExtend<RootedInput>()
+    expectTypeOf(given).toExtend<RootedInput>()
+    // @ts-expect-error `title` isn't stamped: it's still required
+    const _noTitle: RootedInput = {}
+    const _wrong: RootedInput = {
+      title: "t",
+      // @ts-expect-error a stamped date is still a date
+      createdAt: "yesterday",
+    }
+  })
+
+  it("and required without", () => {
+    // @ts-expect-error no `timestamps`: nothing stamps them
+    const _left: BareInput = { title: "t" }
+    expectTypeOf<BareInput["createdAt"]>().toEqualTypeOf<DateTime.Utc>()
+  })
+
+  it("under another name, a field of the default name is the caller's", () => {
+    const Updated = Aggregate.make(Root, {
+      ...base,
+      edges: {},
+      timestamps: { updated: { field: "changed" } },
+    })
+    type Input = Aggregate.Input<typeof Updated>
+    const left: Input = { title: "t", updatedAt: DateTime.makeUnsafe(0) }
+    expectTypeOf(left).toExtend<Input>()
+    // @ts-expect-error the stamp is `changed`, so `updatedAt` is the caller's
+    const _left: Input = { title: "t" }
+  })
+
+  it("under a configured name", () => {
+    const Named = Schema.Struct({ id: Schema.String, made: Schema.DateTimeUtc, ...Dates })
+    const Custom = Aggregate.make(Named, {
+      ...base,
+      edges: {},
+      timestamps: { created: { field: "made" } },
+    })
+    type Input = Aggregate.Input<typeof Custom>
+    const left: Input = {
+      createdAt: DateTime.makeUnsafe(0),
+      updatedAt: DateTime.makeUnsafe(0),
+    }
+    expectTypeOf(left).toExtend<Input>()
+    // @ts-expect-error `createdAt` isn't the stamp here
+    const _left: Input = {}
+  })
+
+  it("a field of that name of another type stays required", () => {
+    const Owned = Schema.Struct({ id: Schema.String, createdAt: Schema.String })
+    const Own = Aggregate.make(Owned, { ...base, edges: {}, timestamps: true })
+    type Input = Aggregate.Input<typeof Own>
+    const given: Input = { createdAt: "mine" }
+    expectTypeOf(given).toExtend<Input>()
+    // @ts-expect-error the caller's
+    const _left: Input = {}
+  })
+
+  it("a root field of that name of another type turns the stamp off below it too", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const Sub = Aggregate.make(Child, { root: { entityType: "Sub" }, edges: {} })
+    const Nested = Schema.Struct({ id: Schema.String, createdAt: Schema.String, sub: Child })
+    const Own = Aggregate.make(Nested, {
+      ...base,
+      edges: { sub: Sub.with({ discriminator: { slot: "a" } }) },
+      timestamps: true,
+    })
+    type Input = Aggregate.Input<typeof Own>
+    const given: Input = {
+      createdAt: "mine",
+      sub: { name: "n", createdAt: DateTime.makeUnsafe(0) },
+    }
+    expectTypeOf(given).toExtend<Input>()
+    // @ts-expect-error `createdAt` isn't stamped on any row, so the sub-aggregate's is required
+    const _left: Input = { createdAt: "mine", sub: { name: "n" } }
+  })
+
+  it("a one edge with an entity takes its id; with none, optional or not, the value", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const ChildEntity = Entity.make({
+      model: Child,
+      entityType: "Child",
+      primaryKey: {
+        pk: { field: "pk", composite: ["name"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const Model = Schema.Struct({
+      id: Schema.String,
+      owned: Child,
+      spare: Schema.optional(Child),
+      fetched: Child,
+    })
+    const Own = Aggregate.make(Model, {
+      ...base,
+      edges: {
+        owned: Aggregate.one({ entityType: "Owned" }),
+        spare: Aggregate.one({ entityType: "Spare" }),
+        fetched: Aggregate.one({ entityType: "Fetched", entity: ChildEntity }),
+      },
+      timestamps: true,
+    })
+    type Input = Aggregate.Input<typeof Own>
+    const given: Input = { owned: { name: "n" }, fetchedId: "f" }
+    expectTypeOf(given).toExtend<Input>()
+    const spare: Input = { owned: { name: "n" }, spare: { name: "s" }, fetchedId: "f" }
+    expectTypeOf(spare).toExtend<Input>()
+    // @ts-expect-error an edge with an entity is fetched by its id
+    const _fetched: Input = { owned: { name: "n" }, fetched: { name: "f" } }
+    // @ts-expect-error `name` isn't stamped
+    const _noName: Input = { owned: { name: "n" }, spare: {}, fetchedId: "f" }
+    // @ts-expect-error an edge with no entity has nothing to fetch by id
+    const _spareId: Input = { owned: { name: "n" }, spareId: "s", fetchedId: "f" }
+  })
+
+  it("a keyed many edge's values, as a custom decompose takes them", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const Model = Schema.Struct({ id: Schema.String, lines: Schema.Record(Schema.String, Child) })
+    const edges = {
+      lines: Aggregate.many({
+        entityType: "Line",
+        sk: { composite: ["name"] },
+        decompose: (value) => Object.values(value as object),
+        assemble: (items) => items,
+      }),
+    }
+    const Stamped = Aggregate.make(Model, { ...base, edges, timestamps: true })
+    const Unstamped = Aggregate.make(Model, { ...base, edges })
+    type Input = Aggregate.Input<typeof Stamped>
+    const given: Input = { lines: { a: { name: "n" } } }
+    expectTypeOf(given).toExtend<Input>()
+    // @ts-expect-error `name` isn't stamped
+    const _noName: Input = { lines: { a: {} } }
+    // @ts-expect-error nothing stamps them without `timestamps`
+    const _unstamped: Aggregate.Input<typeof Unstamped> = { lines: { a: { name: "n" } } }
+  })
+
+  it("a many element and a sub-aggregate root's too; a one edge with no entity takes the value", () => {
+    const Child = Schema.Struct({ name: Schema.String, ...Dates })
+    const Sub = Aggregate.make(Child, { root: { entityType: "Sub" }, edges: {} })
+    const Nested = Schema.Struct({
+      id: Schema.String,
+      venue: Child,
+      lines: Schema.Array(Child),
+      sub: Child,
+    })
+    const edges = {
+      venue: Aggregate.one({ entityType: "Venue" }),
+      lines: Aggregate.many({ entityType: "Line", sk: { composite: ["name"] } }),
+      sub: Sub.with({ discriminator: { slot: "a" } }),
+    }
+    const Stamped = Aggregate.make(Nested, { ...base, edges, timestamps: true })
+    const Unstamped = Aggregate.make(Nested, { ...base, edges })
+    type Input = Aggregate.Input<typeof Stamped>
+    type UnstampedInput = Aggregate.Input<typeof Unstamped>
+    const left: Input = {
+      venue: { name: "n" },
+      lines: [{ name: "n" }],
+      sub: { name: "n" },
+    }
+    expectTypeOf(left).toExtend<Input>()
+    const _venueId: Input = {
+      // @ts-expect-error a one edge with no entity has nothing to fetch by id
+      venueId: "v",
+      lines: [],
+      sub: { name: "n" },
+    }
+    const _noVenue: Input = {
+      // @ts-expect-error `name` isn't stamped
+      venue: {},
+      lines: [],
+      sub: { name: "n" },
+    }
+    const _noName: Input = {
+      venue: { name: "n" },
+      lines: [],
+      // @ts-expect-error `name` isn't stamped
+      sub: {},
+    }
+    const _unstamped: UnstampedInput = {
+      venue: { name: "n", createdAt: DateTime.makeUnsafe(0), updatedAt: DateTime.makeUnsafe(0) },
+      lines: [],
+      // @ts-expect-error nothing stamps them
+      sub: { name: "n" },
+    }
   })
 })

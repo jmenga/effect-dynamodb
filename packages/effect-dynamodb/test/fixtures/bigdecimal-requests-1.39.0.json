@@ -1,0 +1,533 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "requests": {
+  "top": [
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "M": {
+       "value": {
+        "N": "150"
+       },
+       "scale": {
+        "N": "2"
+       },
+       "~effect/BigDecimal": {
+        "S": "~effect/BigDecimal"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    }
+   },
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "M": {
+       "value": {
+        "N": "150"
+       },
+       "scale": {
+        "N": "2"
+       },
+       "~effect/BigDecimal": {
+        "S": "~effect/BigDecimal"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    },
+    "ExpressionAttributeValues": {
+     ":e1": {
+      "M": {
+       "value": {
+        "N": "150"
+       },
+       "scale": {
+        "N": "2"
+       },
+       "~effect/BigDecimal": {
+        "S": "~effect/BigDecimal"
+       }
+      }
+     }
+    },
+    "ConditionExpression": "#e0 = :e1"
+   },
+   {
+    "op": "updateItem",
+    "ExpressionAttributeValues": {
+     ":u0": {
+      "M": {
+       "value": {
+        "N": "150"
+       },
+       "scale": {
+        "N": "2"
+       },
+       "~effect/BigDecimal": {
+        "S": "~effect/BigDecimal"
+       }
+      }
+     }
+    },
+    "ConditionExpression": "attribute_exists(#exists)",
+    "UpdateExpression": "SET #u0 = :u0"
+   }
+  ],
+  "nested": [
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "M": {
+       "a": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    }
+   },
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "M": {
+       "a": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    },
+    "ExpressionAttributeValues": {
+     ":e1": {
+      "M": {
+       "a": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      }
+     }
+    },
+    "ConditionExpression": "#e0 = :e1"
+   },
+   {
+    "op": "updateItem",
+    "ExpressionAttributeValues": {
+     ":u0": {
+      "M": {
+       "a": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      }
+     }
+    },
+    "ConditionExpression": "attribute_exists(#exists)",
+    "UpdateExpression": "SET #u0 = :u0"
+   }
+  ],
+  "list": [
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "L": [
+       {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       {
+        "M": {
+         "value": {
+          "N": "-12345"
+         },
+         "scale": {
+          "N": "3"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    }
+   },
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "L": [
+       {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       {
+        "M": {
+         "value": {
+          "N": "-12345"
+         },
+         "scale": {
+          "N": "3"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      ]
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    },
+    "ExpressionAttributeValues": {
+     ":e1": {
+      "L": [
+       {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       {
+        "M": {
+         "value": {
+          "N": "-12345"
+         },
+         "scale": {
+          "N": "3"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      ]
+     }
+    },
+    "ConditionExpression": "#e0 = :e1"
+   },
+   {
+    "op": "updateItem",
+    "ExpressionAttributeValues": {
+     ":u0": {
+      "L": [
+       {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       {
+        "M": {
+         "value": {
+          "N": "-12345"
+         },
+         "scale": {
+          "N": "3"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       }
+      ]
+     }
+    },
+    "ConditionExpression": "attribute_exists(#exists)",
+    "UpdateExpression": "SET #u0 = :u0"
+   }
+  ],
+  "option": [
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "M": {
+       "value": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       },
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    }
+   },
+   {
+    "op": "putItem",
+    "Item": {
+     "id": {
+      "S": "a"
+     },
+     "f": {
+      "M": {
+       "value": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       },
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "Row"
+     },
+     "pk": {
+      "S": "$bd#v1#row#id_a"
+     },
+     "sk": {
+      "S": "$bd#v1#row"
+     }
+    },
+    "ExpressionAttributeValues": {
+     ":e1": {
+      "M": {
+       "value": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       },
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       }
+      }
+     }
+    },
+    "ConditionExpression": "#e0 = :e1"
+   },
+   {
+    "op": "updateItem",
+    "ExpressionAttributeValues": {
+     ":u0": {
+      "M": {
+       "value": {
+        "M": {
+         "value": {
+          "N": "150"
+         },
+         "scale": {
+          "N": "2"
+         },
+         "~effect/BigDecimal": {
+          "S": "~effect/BigDecimal"
+         }
+        }
+       },
+       "_tag": {
+        "S": "Some"
+       },
+       "_op": {
+        "S": "Some"
+       },
+       "~effect/Option": {
+        "M": {}
+       }
+      }
+     }
+    },
+    "ConditionExpression": "attribute_exists(#exists)",
+    "UpdateExpression": "SET #u0 = :u0"
+   }
+  ]
+ }
+}

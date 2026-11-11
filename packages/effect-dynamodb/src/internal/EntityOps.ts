@@ -125,13 +125,16 @@ export interface SparseRemoveEntriesOp {
   readonly keys: ReadonlyArray<string>
 }
 
+/** What DynamoDB's `ADD` takes: a number adds, a set unions. */
+export type AddOperand = number | ReadonlySet<string> | ReadonlySet<number>
+
 /** @internal */
 export interface UpdateState {
   readonly updates: unknown
   readonly expectedVersion: number | undefined
   readonly condition: Expr | ConditionInput | undefined
   readonly remove: ReadonlyArray<string> | undefined
-  readonly add: globalThis.Record<string, number> | undefined
+  readonly add: globalThis.Record<string, AddOperand> | undefined
   readonly subtract: globalThis.Record<string, number> | undefined
   readonly append: globalThis.Record<string, ReadonlyArray<unknown>> | undefined
   readonly deleteFromSet: globalThis.Record<string, unknown> | undefined
@@ -170,6 +173,12 @@ export interface UpdateState {
    * one as `ConditionalCheckFailed` (its documented contract).
    */
   readonly patch?: boolean | undefined
+  /**
+   * An upsert of an item it has read: the write merges the input over the stored item and composes
+   * every index key from the result. `fill` holds, in wire form, what the upsert sets only where
+   * nothing is stored (an immutable field, `createdAt`).
+   */
+  readonly upsertOver?: { readonly fill: globalThis.Record<string, unknown> } | undefined
 }
 
 /** @internal Path-based SET operation */

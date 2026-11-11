@@ -1,11 +1,22 @@
 /**
  * @internal Exact sizes by DynamoDB's own accounting (#144), the one measure
- * the library uses: `Batch.write` chunks its versioned-put transactions by
- * it, and the failure-time diagnosis of DynamoDB's write limits
+ * the library uses: `Batch.write` splits its requests by it and an
+ * aggregate's `rekey` its transactions ({@link packRequests}), and the
+ * failure-time diagnosis of DynamoDB's write limits
  * (`internal/WriteDiagnosis.ts`) names the item at fault by it. Nothing here
  * refuses a write: DynamoDB's own limits are never pre-checked.
  *
- * The rules were measured on DynamoDB Local from the `Payload Size` its 4 MB
+ * Two measures, for two kinds of limit:
+ *
+ * - **Item size** ({@link itemBytes}, {@link transactItemBytes}): what the
+ *   400 KB item and 4 MB transaction limits count. Rules below.
+ * - **Request body** ({@link jsonBytes}): what the 16 MB limit on one
+ *   request counts — the JSON text the AWS SDK sends, where a control
+ *   character in a string is 6 bytes (`\u0000`), a quote or backslash 2, and
+ *   binary is base64. Item size counts 1 byte for each, so 25 items within
+ *   400 KB can still be over 16 MB on the wire. See {@link REQUEST_MAX_BYTES}.
+ *
+ * The item-size rules were measured on DynamoDB Local from the `Payload Size` its 4 MB
  * rejection reports, and confirmed at the exact boundaries: an item of
  * 409,600 bytes is accepted and 409,601 rejected; a transaction of 4,194,304
  * bytes is accepted and 4,194,305 rejected.
@@ -20,7 +31,8 @@
  *   each of its expressions — see {@link transactItemBytes}.
  */
 
-import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
+import type { AttributeValue, TransactWriteItem, WriteRequest } from "@aws-sdk/client-dynamodb"
+import { TRANSACT_WRITE_ITEMS_LIMIT } from "@effect-dynamodb/schema/Errors.js"
 
 /**
  * DynamoDB's limit on the size of one `TransactWriteItems` request: 4 MB, in
@@ -155,3 +167,224 @@ export const transactItemBytes = (item: TransactWriteItem): number => {
 /** A `TransactWriteItems` request's size: the sum of its actions' contributions. */
 export const transactionBytes = (items: ReadonlyArray<TransactWriteItem>): number =>
   items.reduce((sum, item) => sum + transactItemBytes(item), 0)
+
+// ---------------------------------------------------------------------------
+// Request body: the 16 MB limit
+// ---------------------------------------------------------------------------
+
+/**
+ * The 16 MB limit on one request's body: 16,777,216 bytes of the JSON the AWS
+ * SDK sends, measured by {@link jsonBytes}.
+ *
+ * AWS documents 16 MB for `BatchWriteItem` ("up to 16 MB of data over the
+ * network"). DynamoDB Local rejects any request whose body is over 16 MiB:
+ * measured, 16,777,216 bytes accepted and 16,777,217 rejected, by every
+ * operation (`BatchWriteItem`, `TransactWriteItems`, `PutItem`, reads alike),
+ * with HTTP 413, before the request is read. The bytes are the raw body's —
+ * UTF-8 bytes, not characters. How AWS measures it, and whether it applies the
+ * limit to other operations, is unverified.
+ */
+export const REQUEST_MAX_BYTES = 16 * 1024 * 1024
+
+/** DynamoDB's limit on the write requests of one `BatchWriteItem` request. */
+export const BATCH_WRITE_REQUESTS_LIMIT = 25
+
+/**
+ * The UTF-8 bytes of `JSON.stringify(text)`, quotes included, without building
+ * either: `"` and `\` escape to 2 bytes; a control character to 2 (`\b`, `\t`,
+ * `\n`, `\f`, `\r`) or 6 (`\u0000`); a lone surrogate to 6 (`\ud800`); any
+ * other character is its UTF-8 bytes (U+2028 and U+2029 are not escaped).
+ */
+export const jsonStringBytes = (text: string): number => {
+  let bytes = 2
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    if (c < 0x20) {
+      bytes += c === 0x08 || c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d ? 2 : 6
+    } else if (c === 0x22 || c === 0x5c) {
+      bytes += 2
+    } else if (c < 0x80) {
+      bytes += 1
+    } else if (c < 0x800) {
+      bytes += 2
+    } else if (c >= 0xd800 && c <= 0xdbff) {
+      const next = text.charCodeAt(i + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4
+        i++
+      } else {
+        bytes += 6
+      }
+    } else if (c >= 0xdc00 && c <= 0xdfff) {
+      bytes += 6
+    } else {
+      bytes += 3
+    }
+  }
+  return bytes
+}
+
+/**
+ * The UTF-8 bytes of the JSON the AWS SDK sends for `value`: `JSON.stringify`'s
+ * output — a property whose value is `undefined` left out — with binary
+ * (`Uint8Array`) as a base64 string. A request's body is `jsonBytes` of its
+ * input, plus, for `TransactWriteItems`, the `ClientRequestToken` the SDK fills
+ * in ({@link transactWriteBodyBytes}). Checked against the body the SDK builds
+ * (`test/RequestSize.test.ts`).
+ */
+export const jsonBytes = (value: unknown): number => {
+  if (typeof value === "string") return jsonStringBytes(value)
+  if (typeof value === "number") return Number.isFinite(value) ? String(value).length : 4
+  if (typeof value === "boolean") return value ? 4 : 5
+  if (value === null || typeof value !== "object") return 4
+  if (value instanceof Uint8Array) return 2 + 4 * Math.ceil(value.byteLength / 3)
+  if (Array.isArray(value)) {
+    let bytes = value.length === 0 ? 2 : 1 + value.length
+    for (const element of value) bytes += jsonBytes(element)
+    return bytes
+  }
+  let bytes = 1
+  let entries = 0
+  for (const key of Object.keys(value)) {
+    const element = (value as Record<string, unknown>)[key]
+    if (element === undefined || typeof element === "function" || typeof element === "symbol") {
+      continue
+    }
+    bytes += jsonStringBytes(key) + 1 + jsonBytes(element)
+    entries++
+  }
+  return bytes + Math.max(entries, 1)
+}
+
+/**
+ * Stands in for the `ClientRequestToken` the AWS SDK fills on a
+ * `TransactWriteItems` whose input has none: a UUID, 36 characters.
+ */
+const SDK_TRANSACTION_TOKEN = "00000000-0000-0000-0000-000000000000"
+
+/** Request-level fields sent beside a request's items: `ReturnConsumedCapacity`. */
+export type RequestFields = { readonly ReturnConsumedCapacity?: "TOTAL" | "INDEXES" | undefined }
+
+/** A `BatchWriteItem` request's body as sent: its input, measured by {@link jsonBytes}. */
+export const batchWriteBodyBytes = (input: {
+  readonly RequestItems?: Record<string, ReadonlyArray<WriteRequest>> | undefined
+}): number => jsonBytes(input)
+
+/**
+ * A `TransactWriteItems` request's body as sent: its input, and the
+ * `ClientRequestToken` the AWS SDK fills when the input has none (60 bytes).
+ */
+export const transactWriteBodyBytes = (input: {
+  readonly TransactItems?: ReadonlyArray<TransactWriteItem> | undefined
+  readonly ClientRequestToken?: string | undefined
+}): number =>
+  jsonBytes(
+    input.ClientRequestToken === undefined
+      ? { ...input, ClientRequestToken: SDK_TRANSACTION_TOKEN }
+      : input,
+  )
+
+// ---------------------------------------------------------------------------
+// Splitting the library's own requests
+// ---------------------------------------------------------------------------
+
+/**
+ * What one unit adds to a request: a `BatchWriteItem` write request, or the
+ * actions that must share one transaction (a `rekey` move's Put and Delete).
+ */
+export type RequestUnit = {
+  /** Its write requests or actions, against the request's count limit. */
+  readonly count: number
+  /** Its item size ({@link transactionBytes}), against a transaction's 4 MB; 0 for a batch. */
+  readonly bytes: number
+  /** Its body bytes ({@link jsonBytes}), each entry's separating comma included. */
+  readonly wire: number
+  /**
+   * Body shared by every unit with the same `key`, sent once per request: a
+   * `BatchWriteItem` table's `"<name>":[]` and its comma.
+   */
+  readonly shared?: { readonly key: string; readonly wire: number } | undefined
+}
+
+/** One kind of request: its limits, and its body before any unit. */
+export type RequestShape = {
+  readonly count: number
+  /** A transaction's 4 MB of item size; none for a batch. */
+  readonly bytes?: number | undefined
+  /** The body with no unit in it, less one comma (the first entry has none). */
+  readonly envelope: number
+}
+
+/** A `BatchWriteItem` request, sent with `fields` beside its items. */
+export const batchWriteShape = (fields: RequestFields): RequestShape => ({
+  count: BATCH_WRITE_REQUESTS_LIMIT,
+  envelope: batchWriteBodyBytes({ RequestItems: {}, ...fields }) - 1,
+})
+
+/** A `TransactWriteItems` request, sent with `fields` beside its items. */
+export const transactWriteShape = (fields: RequestFields): RequestShape => ({
+  count: TRANSACT_WRITE_ITEMS_LIMIT,
+  bytes: TRANSACT_WRITE_MAX_BYTES,
+  envelope: transactWriteBodyBytes({ TransactItems: [], ...fields }) - 1,
+})
+
+/** A write request to `tableName`, as a unit of a `BatchWriteItem` request. */
+export const batchWriteUnit = (tableName: string, request: WriteRequest): RequestUnit => ({
+  count: 1,
+  bytes: 0,
+  wire: jsonBytes(request) + 1,
+  shared: { key: tableName, wire: jsonStringBytes(tableName) + 3 },
+})
+
+/** Actions that must share one transaction, as a unit of a `TransactWriteItems` request. */
+export const transactWriteUnit = (items: ReadonlyArray<TransactWriteItem>): RequestUnit => ({
+  count: items.length,
+  bytes: transactionBytes(items),
+  wire: items.reduce((sum, item) => sum + jsonBytes(item) + 1, 0),
+})
+
+/**
+ * Split `units`, in order, into requests within every limit DynamoDB applies to
+ * one: `shape.count` entries, `shape.bytes` of item size, and
+ * {@link REQUEST_MAX_BYTES} of body. Greedy: a request takes the next unit
+ * while it fits, and always at least one — a unit over a limit on its own goes
+ * alone, for DynamoDB to reject and the diagnosis to name. It picks request
+ * boundaries and refuses nothing. Units within every limit are split exactly
+ * as by their count alone.
+ */
+export const packRequests = <U>(
+  units: ReadonlyArray<U>,
+  unitOf: (unit: U) => RequestUnit,
+  shape: RequestShape,
+): Array<Array<U>> => {
+  const requests: Array<Array<U>> = []
+  let request: Array<U> = []
+  let count = 0
+  let bytes = 0
+  let wire = shape.envelope
+  let shared = new Set<string>()
+  for (const unit of units) {
+    const sized = unitOf(unit)
+    const sharedWire = (open: ReadonlySet<string>) =>
+      sized.shared === undefined || open.has(sized.shared.key) ? 0 : sized.shared.wire
+    const fits =
+      count + sized.count <= shape.count &&
+      (shape.bytes === undefined || bytes + sized.bytes <= shape.bytes) &&
+      wire + sharedWire(shared) + sized.wire <= REQUEST_MAX_BYTES
+    if (request.length > 0 && !fits) {
+      requests.push(request)
+      request = []
+      count = 0
+      bytes = 0
+      wire = shape.envelope
+      shared = new Set()
+    }
+    wire += sharedWire(shared) + sized.wire
+    if (sized.shared !== undefined) shared.add(sized.shared.key)
+    count += sized.count
+    bytes += sized.bytes
+    request.push(unit)
+  }
+  if (request.length > 0) requests.push(request)
+  return requests
+}

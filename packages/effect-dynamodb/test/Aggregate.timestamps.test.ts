@@ -2,7 +2,7 @@ import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
-import { Duration, Effect, Layer, Schema } from "effect"
+import { DateTime, Duration, Effect, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { beforeEach, vi } from "vitest"
 import * as Aggregate from "../src/Aggregate.js"
@@ -361,7 +361,7 @@ describe("Aggregate timestamps", () => {
         yield* TestClock.adjust(Duration.millis(FROZEN_MS))
         mockTransactWrite.mockResolvedValue({})
 
-        yield* TrackedAggregate.create({
+        const created = yield* TrackedAggregate.create({
           matchId: "m-9",
           name: "Tracked",
           updated: new Date(0),
@@ -369,8 +369,10 @@ describe("Aggregate timestamps", () => {
 
         const stored = writtenItems()
         // Model encoding (epoch millis) wins over the ISO-string default, and the
-        // caller-supplied value is replaced by the generated one.
+        // caller-supplied value is replaced by the generated one, as up to 1.39.0,
+        // where the input had to hold one. What's returned is what's stored.
         expect(stored[0]!.updated.N).toBe(String(FROZEN_MS))
+        expect(DateTime.toEpochMillis(created.updated as never)).toBe(FROZEN_MS)
 
         mockQuery.mockResolvedValueOnce({ Items: stored, LastEvaluatedKey: undefined })
         const read = yield* TrackedAggregate.get({ matchId: "m-9" })
@@ -378,11 +380,79 @@ describe("Aggregate timestamps", () => {
         expect(read.updated).toBeDefined()
       }).pipe(Effect.provide(TestLayer)),
     )
+
+    it.effect("stamps it when it isn't supplied, and returns what it stored", () =>
+      Effect.gen(function* () {
+        yield* TestClock.adjust(Duration.millis(FROZEN_MS))
+        mockTransactWrite.mockResolvedValue({})
+
+        const created = yield* TrackedAggregate.create({ matchId: "m-9", name: "Tracked" })
+
+        expect(writtenItems()[0]!.updated.N).toBe(String(FROZEN_MS))
+        expect(DateTime.toEpochMillis(created.updated as never)).toBe(FROZEN_MS)
+      }).pipe(Effect.provide(TestLayer)),
+    )
   })
 
   // -------------------------------------------------------------------------
   // EDD-9044 (shared with Entity — see #97)
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // EDD-9121: a key holding `updatedAt` would move on every write
+  // -------------------------------------------------------------------------
+
+  describe("a key over `updatedAt`", () => {
+    class Keyed extends Schema.Class<Keyed>("Keyed")({
+      updatedAt: Schema.DateTimeUtc,
+      name: Schema.String,
+    }) {}
+    class Lined extends Schema.Class<Lined>("Lined")({
+      matchId: Schema.String,
+      lines: Schema.Array(Schema.Struct({ sku: Schema.String, updatedAt: Schema.DateTimeUtc })),
+    }) {}
+    const keyed = (timestamps: boolean | undefined) =>
+      Aggregate.make(
+        Keyed as never,
+        {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["updatedAt"] },
+          collection: { name: "keyed" },
+          root: { entityType: "KeyedItem" },
+          edges: {},
+          ...(timestamps === undefined ? {} : { timestamps }),
+        } as never,
+      )
+    const lined = (timestamps: boolean | undefined) =>
+      Aggregate.make(
+        Lined as never,
+        {
+          table: MainTable,
+          schema: AppSchema,
+          pk: { field: "pk", composite: ["matchId"] },
+          collection: { name: "lined" },
+          root: { entityType: "LinedItem" },
+          edges: {
+            lines: Aggregate.many({ entityType: "LineItem", sk: { composite: ["updatedAt"] } }),
+          },
+          ...(timestamps === undefined ? {} : { timestamps }),
+        } as never,
+      )
+
+    it("refuses a partition key over it", () => {
+      expect(() => keyed(true)).toThrow(/EDD-9121/)
+    })
+
+    it("refuses a many edge's sort key over it", () => {
+      expect(() => lined(true)).toThrow(/EDD-9121/)
+    })
+
+    it("allows either where the library doesn't stamp it", () => {
+      expect(() => keyed(undefined)).not.toThrow()
+      expect(() => lined(undefined)).not.toThrow()
+    })
+  })
 
   it("rejects a timestamps schema with no DynamoEncoding annotation", () => {
     expect(() =>

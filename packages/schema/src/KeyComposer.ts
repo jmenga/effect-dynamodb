@@ -17,7 +17,7 @@ import {
   KEY_DELIMITER,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
-import { encodeBigInt, encodeNumber } from "./internal/NumericKey.js"
+import { encodeBigInt, encodeNumber, isStoredNaN } from "./internal/NumericKey.js"
 import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
 import {
   concatBytes,
@@ -120,8 +120,9 @@ export type KeyValue = string | Uint8Array
  * - `"preserve"` — noop (leave the stored key for this half untouched). The
  *   stored value may go stale until either (a) the next write that touches
  *   this half supplies enough composites to recompose, or (b) a composite of
- *   this half is named in `Entity.remove([...])` — the cascade override
- *   then REMOVEs this half's key.
+ *   this half is named in `Entity.remove([...])` (`.set({ f: undefined })`
+ *   reaches this composer as the same thing) — the cascade override then
+ *   REMOVEs this half's key.
  *
  * Halves not declared in `indexPolicy` default to `"preserve"`. See
  * `DESIGN.md §7 Policy-Aware GSI Composition` for the full decision rules
@@ -526,6 +527,7 @@ const serializeWith = (
   if (typeof value === "string") return value
   if (typeof value === "number") return number(value)
   if (typeof value === "bigint") return bigint(value)
+  if (isStoredNaN(value)) return number(Number.NaN)
   if (typeof value === "boolean") return value ? "true" : "false"
   // DateTime types → ISO string (Zoned normalized to UTC for sort order)
   if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
@@ -570,11 +572,23 @@ export const serializeValue136 = (value: unknown): string =>
     (n) => String(n).padStart(38, "0"),
   )
 
-/** A composite value's serialized text under the schema's setting, before casing and escaping. */
-export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string =>
-  schema.escapeKeys === true || schema.numericKeyText === true
-    ? serializeValue(value)
-    : serializeValue136(value)
+/**
+ * A composite value's serialized text under the schema's setting, before casing and escaping. A
+ * `number`'s `NaN` has no place in key order under any setting, and no stored form: `[EDD-9096]`.
+ * With `escapeKeys` off every other value keeps the text 1.36 gave it. That includes the `NaN` of a
+ * number its field stores as a string (`NumericKey.STORED_NAN`, which the composite key form hands
+ * on for a `Schema.NumberFromString`): a row holds it under `0000000000000NaN`, as 1.39.0 wrote
+ * it, and is read, updated and deleted by that key. With `escapeKeys` on it's refused like any
+ * `NaN`. {@link DynamoSchema.DynamoSchema.text136} composes 1.36's text for a `number`'s `NaN` too,
+ * for `rekey` to find a row stored under it.
+ */
+export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string => {
+  if (schema.escapeKeys === true || schema.numericKeyText === true) return serializeValue(value)
+  if (schema.text136 !== true && typeof value === "number" && Number.isNaN(value)) {
+    return serializeValue(value)
+  }
+  return serializeValue136(value)
+}
 
 /** The highest code point a key composite's text escapes: `%`. */
 const ESCAPED_MAX = 0x25
@@ -1122,6 +1136,31 @@ export const tryComposeIndexKeys = (
 }
 
 /**
+ * The halves of a secondary index `record` holds every value of, for a write that leaves what it
+ * doesn't name as it's stored (an upsert). A half missing a value is left out, never truncated; a
+ * sharded index's partition half also needs what it hashes.
+ */
+export const composeKnownHalves = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  record: Record<string, unknown>,
+): Record<string, KeyValue> => {
+  const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
+  const complete = (composite: ReadonlyArray<string>) =>
+    composite.every((attr) => hasValue(record[attr]))
+  return {
+    ...(complete([...index.pk.composite, ...shardSource])
+      ? { [index.pk.field]: composePk(schema, entityType, index, record) }
+      : {}),
+    ...(complete(index.sk.composite)
+      ? { [index.sk.field]: composeSkValue(schema, entityType, entityVersion, index, record) }
+      : {}),
+  }
+}
+
+/**
  * Compose keys for all indexes of an entity.
  * Returns a flat record of all key field -> value mappings.
  */
@@ -1354,6 +1393,212 @@ const classifyZOrderHalf = (
 const hasValue = (value: unknown): boolean => value !== undefined && value !== null
 
 /**
+ * How a stored index key differs from what its row's values compose (`rekey-repair.md`):
+ *
+ * - `missing` — every composite is on the row, and no key.
+ * - `truncated` — every composite is on the row, and the key stops at a leading run of them.
+ * - `lagging` — the key holds anything else: other values, or values the row no longer has.
+ */
+export type IndexKeyDrift = "missing" | "truncated" | "lagging"
+
+/**
+ * What {@link judgeIndexHalf} says of one half of a stored row:
+ *
+ * - `fine` — nothing to do, or nothing can be said.
+ * - `ambiguous` — a `sparse` half with no key and two or more composites outside the primary key
+ *   on the row. A writer naming only a later composite drops the row on purpose (`DESIGN.md` §7),
+ *   and that leaves exactly these bytes, so it can't be told from damage. Reported, never written.
+ * - `set` — the key to write. `remove` — a `sparse` half whose values compose no key, holding one.
+ */
+export type IndexKeyVerdict =
+  | { readonly kind: "fine" }
+  | { readonly kind: "ambiguous" }
+  | { readonly kind: "set"; readonly drift: IndexKeyDrift; readonly value: KeyValue }
+  | { readonly kind: "remove" }
+
+/** What judging a row's index keys needs of its entity. */
+export interface IndexKeyJudging {
+  readonly schema: DynamoSchema.DynamoSchema
+  readonly entityType: string
+  readonly entityVersion: number
+  /** Every text a key can be under, for telling a truncated key from any other. */
+  readonly forms: ReadonlyArray<{
+    readonly pk: DynamoSchema.DynamoSchema
+    readonly sk: DynamoSchema.DynamoSchema
+  }>
+  /** The primary key's composites. */
+  readonly primaryComposites: ReadonlySet<string>
+  /**
+   * Composites the library writes itself (`createdAt`, `updatedAt`, `version`). No writer leaves one
+   * out, so none makes a half with no key ambiguous.
+   */
+  readonly stamped: ReadonlySet<string>
+  /**
+   * `timestamps.updated`: a key holding it may lag the row's value, and that's no difference
+   * (`DESIGN.md` §7, "Composites the library stamps").
+   */
+  readonly lagTolerated: string | null
+}
+
+const FINE: IndexKeyVerdict = { kind: "fine" }
+
+const sameKeyValue = (a: KeyValue, b: KeyValue): boolean => {
+  if (typeof a === "string" || typeof b === "string") return a === b
+  return a.length === b.length && a.every((byte, i) => byte === b[i])
+}
+
+/** Is `stored` a leading run of `composites`' text, under any form? */
+const isLeadingRun = (
+  judging: IndexKeyJudging,
+  index: IndexDefinition,
+  half: "pk" | "sk",
+  composites: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+  stored: KeyValue,
+): boolean => {
+  if (typeof stored !== "string") return false
+  for (const form of judging.forms) {
+    for (let length = 0; length < composites.length; length++) {
+      try {
+        const text =
+          half === "pk"
+            ? composePkPrefixUpTo(form.pk, judging.entityType, index, record, length)
+            : composeSkPrefixUpTo(
+                form.sk,
+                judging.entityType,
+                judging.entityVersion,
+                index,
+                record,
+                length,
+              )
+        if (text === stored) return true
+      } catch {
+        // No text under this form: `NaN` under `escapeKeys: true`.
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * Whether `stored` differs from what `record` composes only in the text of `attr`, the composite
+ * whose key may lag. An update that can't compose a half holding it leaves the key, so this is what
+ * a healthy row looks like, and comparing the whole key would rewrite it on every run after any
+ * write. Everything around the segment has to match exactly, and the segment has to be one segment.
+ * A Z-order address has no segments to read apart, so any address it holds will do.
+ */
+const differsOnlyInLaggingText = (
+  judging: IndexKeyJudging,
+  index: IndexDefinition,
+  half: "pk" | "sk",
+  composites: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+  stored: KeyValue,
+  attr: string,
+): boolean => {
+  if (half === "sk" && isZOrderHalf(index.sk)) return true
+  if (typeof stored !== "string") return false
+  const { schema, entityType, entityVersion } = judging
+  const blank = { ...record, [attr]: "" }
+  const position = composites.indexOf(attr) + 1
+  const head =
+    half === "pk"
+      ? composePkPrefixUpTo(schema, entityType, index, blank, position)
+      : composeSkPrefixUpTo(schema, entityType, entityVersion, index, blank, position)
+  const whole =
+    half === "pk"
+      ? composePk(schema, entityType, index, blank)
+      : composeSkValue(schema, entityType, entityVersion, index, blank)
+  if (typeof whole !== "string") return false
+  const tail = whole.slice(head.length)
+  if (stored.length <= head.length + tail.length) return false
+  if (!stored.startsWith(head) || !stored.endsWith(tail)) return false
+  return !stored.slice(head.length, stored.length - tail.length).includes("#")
+}
+
+/**
+ * Judge one half of a stored row's index against what its values compose, for `rekey`'s report and
+ * `repairIndexKeys` (`rekey-repair.md`). Reads nothing and writes nothing. `stored` is what the
+ * half's attribute holds as read; `record` is the row's key form.
+ *
+ * A half with every composite on the row should hold what a `put` of them writes: the same
+ * composers, so a Z-order half is all or nothing and compares bytes, and a value within one
+ * quantization level is no difference. A half with one missing is the update path's business: under
+ * `preserve` it's left whatever it holds, which is what the policy promises; under `sparse` it holds
+ * what the structural rule composes (a trailing composite absent is a truncation, shape 3), or
+ * nothing. A half with no key whose index a `put` wouldn't have written whole has nothing missing.
+ *
+ * A half holding `updatedAt` is compared without that composite's text, so a key that only lags
+ * stays `fine` and a key that holds anything else is rewritten once, from the row's value, and is
+ * `fine` from then on, whatever later writes do to `updatedAt`.
+ *
+ * Not judged, so `fine`: values that compose no key (`NaN`, a Z-order value a dimension can't place,
+ * a shard it can't compute), which a `put` refuses too; and a sharded partition key that's stored,
+ * since `rekey` already rewrites or reports those.
+ */
+export const judgeIndexHalf = (
+  judging: IndexKeyJudging,
+  index: IndexDefinition,
+  half: "pk" | "sk",
+  stored: KeyValue | undefined,
+  record: Record<string, unknown>,
+): IndexKeyVerdict => {
+  const { schema, entityType, entityVersion, primaryComposites, stamped, lagTolerated } = judging
+  const composites = half === "pk" ? index.pk.composite : index.sk.composite
+  if (half === "pk" && index.shards !== undefined && stored !== undefined) return FINE
+  const shardSource = index.shards === undefined ? [] : boundShardSource(index, index.shards)
+  const policy = resolveIndexPolicy(index.indexPolicy)[half]
+  try {
+    if (composites.every((attr) => hasValue(record[attr]))) {
+      const full =
+        half === "pk"
+          ? composePk(schema, entityType, index, record)
+          : composeSkValue(schema, entityType, entityVersion, index, record)
+      if (stored !== undefined) {
+        if (sameKeyValue(stored, full)) return FINE
+        if (
+          lagTolerated !== null &&
+          composites.includes(lagTolerated) &&
+          differsOnlyInLaggingText(judging, index, half, composites, record, stored, lagTolerated)
+        ) {
+          return FINE
+        }
+        return {
+          kind: "set",
+          drift: isLeadingRun(judging, index, half, composites, record, stored)
+            ? "truncated"
+            : "lagging",
+          value: full,
+        }
+      }
+      // `put` writes an index whole or not at all.
+      const wholeIndex = [...index.pk.composite, ...index.sk.composite, ...shardSource].every(
+        (attr) => hasValue(record[attr]),
+      )
+      if (!wholeIndex) return FINE
+      const outsidePrimary = new Set(
+        composites.filter((attr) => !primaryComposites.has(attr) && !stamped.has(attr)),
+      )
+      if (policy === "sparse" && outsidePrimary.size >= 2) return { kind: "ambiguous" }
+      return { kind: "set", drift: "missing", value: full }
+    }
+    if (policy === "preserve" || stored === undefined) return FINE
+    if (half === "sk" && isZOrderHalf(index.sk)) return { kind: "remove" }
+    const outcome = classifyHalf(composites, record, "sparse", false)
+    if (outcome.kind !== "set") return { kind: "remove" }
+    const truncated =
+      half === "pk"
+        ? composePkPrefixUpTo(schema, entityType, index, record, outcome.length)
+        : composeSkPrefixUpTo(schema, entityType, entityVersion, index, record, outcome.length)
+    return sameKeyValue(stored, truncated)
+      ? FINE
+      : { kind: "set", drift: "lagging", value: truncated }
+  } catch {
+    return FINE
+  }
+}
+
+/**
  * The per-half gate's question for a half with composites: does this writer name
  * none of them, while the half can't be recomposed from what it knows? Then the
  * half belongs to some other writer, and its stored key stays as it is.
@@ -1365,6 +1610,27 @@ const writerLeavesHalf = (
 ): boolean =>
   composites.every((attr) => !(attr in updatePayload)) &&
   composites.some((attr) => !hasValue(keyRecord[attr]))
+
+/**
+ * Whether a write leaves a half holding a value it stamps itself (`DESIGN.md` §7, "Composites the
+ * library stamps"). Every update stamps it, so the stamp says nothing about who owns the half, and
+ * asking the skip-predicate would make every unrelated update "touch" it: under `sparse` that drops
+ * the row, the bug #183 stopped. Only the half's other composites count. All of them known: the
+ * half moves with the write. One unknown: the key lags until a write can compose it, under either
+ * policy. A composite the writer explicitly clears isn't left: that's the structural rule's.
+ */
+const writerLeavesStampedHalf = (
+  composites: ReadonlyArray<string>,
+  stamped: Record<string, unknown>,
+  updatePayload: Record<string, unknown>,
+  keyRecord: Record<string, unknown>,
+): boolean => {
+  const others = composites.filter((attr) => !(attr in stamped))
+  return (
+    others.some((attr) => !hasValue(updatePayload[attr]) && !hasValue(keyRecord[attr])) &&
+    others.every((attr) => !(attr in updatePayload) || hasValue(updatePayload[attr]))
+  )
+}
 
 /**
  * The PK half's outcome on a sharded index, from what {@link classifyHalf} says
@@ -1535,11 +1801,21 @@ export const composeGsiKeysForUpdatePolicyAware = (
      * write (see `docs/designs/gsi-write-sharding.md` §5).
      */
     readonly onMissingShardSource?: "fail" | "keep"
+    /**
+     * What this write stamps, in key form: `timestamps.updated` and, on a `retain` entity, the
+     * version. A half holding one follows {@link writerLeavesStampedHalf}, not the skip-predicate.
+     */
+    readonly stamped?: Record<string, unknown>
   },
 ): GsiUpdateResult => {
   const sets: Record<string, KeyValue> = {}
   const removes: Array<string> = []
   const removedSet = options?.removedSet
+  const stamped = options?.stamped
+  const leavesHalf = (composites: ReadonlyArray<string>): boolean =>
+    stamped !== undefined && composites.some((attr) => attr in stamped)
+      ? writerLeavesStampedHalf(composites, stamped, updatePayload, keyRecord)
+      : writerLeavesHalf(composites, updatePayload, keyRecord)
 
   for (const [indexName, index] of Object.entries(indexes)) {
     if (indexName === "primary") continue
@@ -1584,15 +1860,12 @@ export const composeGsiKeysForUpdatePolicyAware = (
     // An empty PK half is a constant prefix, unless `by` makes its marker vary.
     const skipPk =
       (pkComposites.length > 0
-        ? !pkHasRemoved && writerLeavesHalf(pkComposites, updatePayload, keyRecord)
+        ? !pkHasRemoved && leavesHalf(pkComposites)
         : by.length > 0 && by.some((attr) => !hasValue(keyRecord[attr]))) &&
       !byTouched &&
       !byCleared &&
       !byRemoved
-    const skipSk =
-      skComposites.length > 0 &&
-      !skHasRemoved &&
-      writerLeavesHalf(skComposites, updatePayload, keyRecord)
+    const skipSk = skComposites.length > 0 && !skHasRemoved && leavesHalf(skComposites)
 
     if (skipPk && skipSk) continue
 
@@ -1615,6 +1888,7 @@ export const composeGsiKeysForUpdatePolicyAware = (
         delete merged[attr]
       }
     }
+    Object.assign(merged, stamped)
 
     const policy = resolveIndexPolicy(index.indexPolicy)
     // A Z-order half is never a `by` source, so only a text half can disagree.
@@ -1816,6 +2090,238 @@ export const composeSortKeyBeginsWith = (
  * a composite's label, and no label reaches U+FFFF.
  */
 export const SORT_KEY_MAX = "\uFFFF"
+
+/**
+ * @internal What a composite's values can be in a key, for {@link composeKeySpace}: `"open"`, any
+ * text, the key delimiter included (the walk stops there); `"text"`, any text without the
+ * delimiter; `"number"`, a number's or a bigint's key text; or exactly the key text of `values`
+ * (a literal union, `true` and `false`).
+ */
+export type CompositeValues =
+  | "open"
+  | "text"
+  | "number"
+  | { readonly values: ReadonlyArray<unknown> }
+
+/**
+ * @internal A walked composite's value in a {@link KeySpace}: any text without the delimiter, the
+ * empty text included (`text`); a number's or a bigint's key text under any setting (`number`:
+ * digits and `-+.:;)*`, never the delimiter, and of letters only `e` and those of `Infinity`, as
+ * 1.36's text spells them, in any casing; it starts with a digit, `-`, `:` or `;`); or one of
+ * `texts`.
+ */
+export type KeyValueText =
+  | { readonly kind: "text" }
+  | { readonly kind: "number" }
+  | { readonly kind: "oneOf"; readonly texts: ReadonlyArray<string> }
+
+/**
+ * @internal The keys of one half of an index, as text: `text`, what the composer writes before the
+ * first composite's value, that composite's label included, or the whole key of a half with no
+ * composite. Then, for each leading composite whose value can't hold the key delimiter, what that
+ * value can be (`values`, one per entry of `after`; `text` when absent) and the text written after
+ * it (`after`): the next composite's label, or the end of the key. `open` says any text follows:
+ * the value of the first composite that can hold the delimiter, and everything after it.
+ */
+export interface KeySpace {
+  readonly text: string
+  readonly after: ReadonlyArray<string>
+  readonly values?: ReadonlyArray<KeyValueText>
+  readonly open: boolean
+}
+
+/**
+ * @internal The key spaces of an index's partition and sort keys ({@link KeySpace}), as {@link composePk} and
+ * {@link composeSk} write them. Each walked composite's value is composed as U+FFFF, which no
+ * casing or escaping changes and no label holds, and the text is cut there. The walk goes on past a
+ * composite whose values `valuesOf` says can't hold the delimiter: its value ends where the next
+ * label starts. It stops at the first that can (`"open"`): a partition key's values aren't
+ * escaped, so text after one can always match another key's. Without `valuesOf`, at the first
+ * composite. A composite limited to `values` is their key text under the schema's setting, or
+ * with `everyForm` under every setting a row can have been written under (`escapeKeys` on, off,
+ * and the 1.37 numeric text): the fixed text is the same under all of them.
+ */
+export const composeKeySpace = (
+  schema: DynamoSchema.DynamoSchema,
+  entityType: string,
+  entityVersion: number,
+  index: IndexDefinition,
+  valuesOf: (composite: string) => CompositeValues = () => "open",
+  options?: { readonly everyForm?: boolean | undefined } | undefined,
+): { readonly pk: KeySpace; readonly sk: KeySpace } => {
+  const casing = index.casing ?? schema.casing
+  const forms: ReadonlyArray<DynamoSchema.DynamoSchema> =
+    options?.everyForm === true
+      ? [
+          { ...schema, escapeKeys: true },
+          { ...schema, escapeKeys: false },
+          { ...schema, escapeKeys: false, numericKeyText: true },
+        ]
+      : [schema]
+  const valueText = (values: Exclude<CompositeValues, "open">): KeyValueText => {
+    if (values === "text") return { kind: "text" }
+    if (values === "number") return { kind: "number" }
+    const texts = new Set<string>()
+    for (const value of values.values) {
+      for (const form of forms) {
+        try {
+          // The composer cases the whole key again, which leaves cased text as it is.
+          texts.add(applyCasing(keyValueText(form, value, casing), casing))
+        } catch {
+          // A value no key can hold (`NaN`) is no key's.
+        }
+      }
+    }
+    return { kind: "oneOf", texts: [...texts] }
+  }
+  const half = (
+    composite: ReadonlyArray<string>,
+    compose: (walked: ReadonlyArray<string>, record: Record<string, unknown>) => string,
+  ): KeySpace => {
+    const walked: Array<string> = []
+    const values: Array<KeyValueText> = []
+    let open = false
+    for (const name of composite) {
+      walked.push(name)
+      const of = valuesOf(name)
+      if (of === "open") {
+        open = true
+        break
+      }
+      values.push(valueText(of))
+    }
+    if (walked.length === 0) return { text: compose([], {}), after: [], values: [], open: false }
+    const record: Record<string, unknown> = Object.create(null)
+    for (const name of walked) record[name] = SORT_KEY_MAX
+    const [text = "", ...rest] = compose(walked, record).split(SORT_KEY_MAX)
+    // The text after an open value isn't the key's: anything follows it.
+    return { text, after: open ? rest.slice(0, -1) : rest, values, open }
+  }
+  return {
+    pk: half(index.pk.composite, (composite, record) =>
+      composePk(
+        schema,
+        entityType,
+        { ...index, pk: { ...index.pk, composite: [...composite] } },
+        record,
+      ),
+    ),
+    sk: half(index.sk.composite, (composite, record) =>
+      composeSk(
+        schema,
+        entityType,
+        entityVersion,
+        { ...index, sk: { ...index.sk, composite: [...composite] } },
+        record,
+      ),
+    ),
+  }
+}
+
+/** A set of characters, or every character but those (`negated`). */
+interface CharClass {
+  readonly chars: string
+  readonly negated: boolean
+}
+
+const ANY_CHARACTER: CharClass = { chars: "", negated: true }
+const NOT_DELIMITER: CharClass = { chars: KEY_DELIMITER, negated: true }
+/** The first character of a number's or a bigint's key text, under any setting. */
+const NUMBER_FIRST: CharClass = { chars: "0123456789-:;", negated: false }
+/** Any other character of it: `NumericKey`'s, and 1.36's (`1e+21`, `Infinity`), in any casing. */
+const NUMBER_REST: CharClass = { chars: "0123456789-+.:;)*eEiInNfFtTyY", negated: false }
+
+/** Whether some character is in both. */
+const classesMeet = (a: CharClass, b: CharClass): boolean => {
+  if (a.negated && b.negated) return true
+  if (!a.negated && !b.negated) return [...a.chars].some((char) => b.chars.includes(char))
+  const [set, not] = a.negated ? [b, a] : [a, b]
+  return [...set.chars].some((char) => !not.chars.includes(char))
+}
+
+/**
+ * The keys of a {@link KeySpace} as an automaton: `edges[state]` are the moves on one character,
+ * `empty[state]` those on none. It starts at state 0 and accepts at `accept`.
+ */
+const keyAutomaton = (
+  space: KeySpace,
+): {
+  readonly edges: ReadonlyArray<ReadonlyArray<readonly [CharClass, number]>>
+  readonly empty: ReadonlyArray<ReadonlyArray<number>>
+  readonly accept: number
+} => {
+  const edges: Array<Array<readonly [CharClass, number]>> = []
+  const empty: Array<Array<number>> = []
+  const state = (): number => {
+    edges.push([])
+    empty.push([])
+    return edges.length - 1
+  }
+  let at = state()
+  /** The characters of `text`, one by one, from `from`: the state after them. */
+  const spell = (from: number, text: string): number => {
+    let to = from
+    for (const char of text) {
+      const next = state()
+      edges[to]!.push([{ chars: char, negated: false }, next])
+      to = next
+    }
+    return to
+  }
+  at = spell(at, space.text)
+  space.after.forEach((text, i) => {
+    const value = space.values?.[i] ?? { kind: "text" }
+    const end = state()
+    if (value.kind === "text") {
+      const loop = state()
+      empty[at]!.push(loop)
+      edges[loop]!.push([NOT_DELIMITER, loop])
+      empty[loop]!.push(end)
+    } else if (value.kind === "number") {
+      const digits = state()
+      edges[at]!.push([NUMBER_FIRST, digits])
+      edges[digits]!.push([NUMBER_REST, digits])
+      empty[digits]!.push(end)
+    } else {
+      for (const option of value.texts) empty[spell(at, option)]!.push(end)
+    }
+    at = spell(end, text)
+  })
+  if (space.open) edges[at]!.push([ANY_CHARACTER, at])
+  return { edges, empty, accept: at }
+}
+
+/**
+ * @internal Whether a key of one {@link KeySpace} can be a key of the other. Each is literal text
+ * with values between, each value what its {@link KeyValueText} allows, and an open space ends in
+ * any text at all. The two are read character against character, together, until both can end.
+ */
+export const keySpacesMeet = (a: KeySpace, b: KeySpace): boolean => {
+  const x = keyAutomaton(a)
+  const y = keyAutomaton(b)
+  const width = y.edges.length
+  const seen = new Set<number>()
+  const queue: Array<readonly [number, number]> = []
+  const visit = (i: number, j: number) => {
+    const key = i * width + j
+    if (seen.has(key)) return
+    seen.add(key)
+    queue.push([i, j])
+  }
+  visit(0, 0)
+  for (let k = 0; k < queue.length; k++) {
+    const [i, j] = queue[k]!
+    if (i === x.accept && j === y.accept) return true
+    for (const to of x.empty[i]!) visit(to, j)
+    for (const to of y.empty[j]!) visit(i, to)
+    for (const [left, toLeft] of x.edges[i]!) {
+      for (const [right, toRight] of y.edges[j]!) {
+        if (classesMeet(left, right)) visit(toLeft, toRight)
+      }
+    }
+  }
+  return false
+}
 
 /**
  * The condition selecting a complete sort key prefix on a secondary index, with

@@ -1,0 +1,494 @@
+{
+  "generatedFrom": "effect-dynamodb@1.39.0",
+  "cases": {
+    "defaults created": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dr#v1#defaults"
+          },
+          "id": {
+            "S": "created"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#created"
+          },
+          "__edd_e__": {
+            "S": "Defaults"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#defaultsenc#0000000000000005"
+          },
+          "lineId": {
+            "S": "e1"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#created"
+          },
+          "f": {
+            "N": "0.5"
+          },
+          "__edd_e__": {
+            "S": "DefaultsEnc"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#defaultspass#0000000000000050"
+          },
+          "lineId": {
+            "S": "p1"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#created"
+          },
+          "f": {
+            "N": "5"
+          },
+          "__edd_e__": {
+            "S": "DefaultsPass"
+          }
+        }
+      ],
+      "read": {
+        "id": "created",
+        "pass": [
+          {
+            "lineId": "p1",
+            "f": 50
+          }
+        ],
+        "enc": [
+          {
+            "lineId": "e1",
+            "f": 5
+          }
+        ]
+      }
+    },
+    "defaults added before": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dr#v1#defaults"
+          },
+          "id": {
+            "S": "added"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#added"
+          },
+          "__edd_e__": {
+            "S": "Defaults"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#defaultsenc#0000000000000050"
+          },
+          "lineId": {
+            "S": "e1"
+          },
+          "note": {
+            "S": "keep me"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#added"
+          },
+          "f": {
+            "N": "5"
+          },
+          "__edd_e__": {
+            "S": "DefaultsEnc"
+          }
+        }
+      ],
+      "read": {
+        "id": "added",
+        "pass": [],
+        "enc": [
+          {
+            "lineId": "e1",
+            "f": 50,
+            "note": "keep me"
+          }
+        ]
+      }
+    },
+    "defaults added after": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dr#v1#defaults"
+          },
+          "id": {
+            "S": "added"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#added"
+          },
+          "__edd_e__": {
+            "S": "Defaults"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#defaultsenc#0000000000000005"
+          },
+          "lineId": {
+            "S": "e2"
+          },
+          "note": {
+            "S": "new line"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#added"
+          },
+          "f": {
+            "N": "0.5"
+          },
+          "__edd_e__": {
+            "S": "DefaultsEnc"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#defaultsenc#0000000000000050"
+          },
+          "lineId": {
+            "S": "e1"
+          },
+          "note": {
+            "S": "keep me"
+          },
+          "pk": {
+            "S": "$dr#v1#defaults#added"
+          },
+          "f": {
+            "N": "5"
+          },
+          "__edd_e__": {
+            "S": "DefaultsEnc"
+          }
+        }
+      ],
+      "read": {
+        "id": "added",
+        "pass": [],
+        "enc": [
+          {
+            "lineId": "e2",
+            "f": 5,
+            "note": "new line"
+          },
+          {
+            "lineId": "e1",
+            "f": 50,
+            "note": "keep me"
+          }
+        ]
+      }
+    },
+    "overlaps created": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dr#v1#overlaps"
+          },
+          "id": {
+            "S": "created"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#created"
+          },
+          "__edd_e__": {
+            "S": "Overlaps"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#overlapsenc#0000000000000005"
+          },
+          "lineId": {
+            "S": "e1"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#created"
+          },
+          "f": {
+            "N": "0.5"
+          },
+          "__edd_e__": {
+            "S": "OverlapsEnc"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#overlapspass#0000000000000050"
+          },
+          "lineId": {
+            "S": "p1"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#created"
+          },
+          "f": {
+            "N": "5"
+          },
+          "__edd_e__": {
+            "S": "OverlapsPass"
+          }
+        }
+      ],
+      "read": {
+        "id": "created",
+        "pass": [
+          {
+            "lineId": "p1",
+            "f": 50
+          }
+        ],
+        "enc": [
+          {
+            "lineId": "e1",
+            "f": 5
+          }
+        ]
+      }
+    },
+    "overlaps added before": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dr#v1#overlaps"
+          },
+          "id": {
+            "S": "added"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#added"
+          },
+          "__edd_e__": {
+            "S": "Overlaps"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#overlapsenc#0000000000000050"
+          },
+          "lineId": {
+            "S": "e1"
+          },
+          "note": {
+            "S": "keep me"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#added"
+          },
+          "f": {
+            "N": "5"
+          },
+          "__edd_e__": {
+            "S": "OverlapsEnc"
+          }
+        }
+      ],
+      "read": {
+        "id": "added",
+        "pass": [],
+        "enc": [
+          {
+            "lineId": "e1",
+            "f": 50,
+            "note": "keep me"
+          }
+        ]
+      }
+    },
+    "overlaps added after": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dr#v1#overlaps"
+          },
+          "id": {
+            "S": "added"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#added"
+          },
+          "__edd_e__": {
+            "S": "Overlaps"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#overlapsenc#0000000000000005"
+          },
+          "lineId": {
+            "S": "e2"
+          },
+          "note": {
+            "S": "new line"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#added"
+          },
+          "f": {
+            "N": "0.5"
+          },
+          "__edd_e__": {
+            "S": "OverlapsEnc"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#overlapsenc#0000000000000050"
+          },
+          "lineId": {
+            "S": "e1"
+          },
+          "note": {
+            "S": "keep me"
+          },
+          "pk": {
+            "S": "$dr#v1#overlaps#added"
+          },
+          "f": {
+            "N": "5"
+          },
+          "__edd_e__": {
+            "S": "OverlapsEnc"
+          }
+        }
+      ],
+      "read": {
+        "id": "added",
+        "pass": [],
+        "enc": [
+          {
+            "lineId": "e2",
+            "f": 5,
+            "note": "new line"
+          },
+          {
+            "lineId": "e1",
+            "f": 50,
+            "note": "keep me"
+          }
+        ]
+      }
+    },
+    "moves created": {
+      "rows": [
+        {
+          "sk": {
+            "S": "$dr#v1#moves"
+          },
+          "id": {
+            "S": "a b"
+          },
+          "pk": {
+            "S": "$dr#v1#moves#a b"
+          },
+          "__edd_e__": {
+            "S": "Moves"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#movesenc#0000000000000050"
+          },
+          "lineId": {
+            "S": "e1"
+          },
+          "pk": {
+            "S": "$dr#v1#moves#a b"
+          },
+          "f": {
+            "N": "5"
+          },
+          "__edd_e__": {
+            "S": "MovesEnc"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#movesenc#0000000000000060"
+          },
+          "lineId": {
+            "S": "e2"
+          },
+          "pk": {
+            "S": "$dr#v1#moves#a b"
+          },
+          "f": {
+            "N": "6"
+          },
+          "__edd_e__": {
+            "S": "MovesEnc"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#movespass#0000000000000500"
+          },
+          "lineId": {
+            "S": "p1"
+          },
+          "pk": {
+            "S": "$dr#v1#moves#a b"
+          },
+          "f": {
+            "N": "50"
+          },
+          "__edd_e__": {
+            "S": "MovesPass"
+          }
+        },
+        {
+          "sk": {
+            "S": "$dr#v1#movespass#0000000000000600"
+          },
+          "lineId": {
+            "S": "p2"
+          },
+          "pk": {
+            "S": "$dr#v1#moves#a b"
+          },
+          "f": {
+            "N": "60"
+          },
+          "__edd_e__": {
+            "S": "MovesPass"
+          }
+        }
+      ],
+      "read": {
+        "id": "a b",
+        "pass": [
+          {
+            "lineId": "p1",
+            "f": 500
+          },
+          {
+            "lineId": "p2",
+            "f": 600
+          }
+        ],
+        "enc": [
+          {
+            "lineId": "e1",
+            "f": 50
+          },
+          {
+            "lineId": "e2",
+            "f": 60
+          }
+        ]
+      }
+    }
+  }
+}

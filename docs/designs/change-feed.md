@@ -161,7 +161,10 @@ stream image decoders already accept.
 `InternalServerError` to `InternalServerError`. Every `DescribeStream`,
 `GetShardIterator` and `GetRecords` call retries those two without limit, on a
 jittered exponential backoff (`backoff: { initial: 100 ms, max: 10 s }` by
-default). One reader per shard per feed. AWS advises at most two simultaneous readers of a shard, and every reader of the stream counts — each feed `consumer`, Lambda event source mapping or Pipe — so keep the stream to two of them in total; more are throttled (and back off), not refused. An idle shard (an empty `GetRecords` on an open shard) polls again
+default). A request timeout the application configured on the client's HTTP
+handler is retried the same way, after the SDK's own attempts. A dropped or
+refused connection isn't, though Node's handler names a dropped one
+`TimeoutError` too: it tells them apart by `code`. One reader per shard per feed. AWS advises at most two simultaneous readers of a shard, and every reader of the stream counts — each feed `consumer`, Lambda event source mapping or Pipe — so keep the stream to two of them in total; more are throttled (and back off), not refused. An idle shard (an empty `GetRecords` on an open shard) polls again
 after `pollInterval` (default 1 s).
 
 ## 6. The lease (single consumer per stream)
@@ -174,14 +177,47 @@ processes from consuming the same feed by accident:
   `renewEvery` must be less than half of `duration` — `changeFeed` throws
   `[EDD-9083]` otherwise — so that a renewal the store fails to write has
   `duration − 2 × renewEvery` to be retried in before the deadline below;
-- released when the stream ends;
+- released when the stream ends, or when an attempt to take it was interrupted
+  or failed, since that attempt may still have written it. A release that gets
+  no answer holds the end of the feed for `renewEvery` at most, and is aborted;
 - a second consumer fails with `ChangeFeedLeaseHeld { owner, expiresAt }`, or
   with `lease: { onHeld: "wait" }` retries until the lease is free or expires;
 - a renewal the store fails to write (`CheckpointStoreError`) is retried on
-  the backoff until `renewEvery` before the lease would lapse (the last
-  successful renewal + `duration` − `renewEvery`), then fails the feed with
-  that error; a renewal refused because another owner took over fails the feed
-  with `ChangeFeedLeaseLost`;
+  the backoff until the deadline, `renewEvery` before the lease would lapse,
+  then fails the feed with that error; a renewal refused because another owner
+  took over fails the feed with `ChangeFeedLeaseLost`;
+- the deadline is the time read before the last write that took or renewed the
+  lease + `duration` − `renewEvery`, so it can't fall after the lease's expiry
+  however slowly the store answers; renewals are due `renewEvery` after the
+  previous one started, for the same reason;
+- a renewal call left unanswered is abandoned and tried again at once. Each
+  attempt waits `renewEvery` at most, and until one has gone unanswered it also
+  leaves a quarter of the time left for that retry: at the default ratio the
+  window is exactly `renewEvery`, so a first attempt given all of it could never
+  be followed by a second. A retry needs little, a fresh connection and a normal
+  answer, and a slow store that is still answering needs the rest. So the bound
+  is `min(renewEvery, ¾ × left)` until an attempt goes unanswered and
+  `min(renewEvery, left)` after, which is `min(renewEvery, left)` throughout once
+  `renewEvery` ≤ 0.3 × `duration`. At the default ratio a call that takes over
+  ¾ × `renewEvery` is aborted where it would once have been waited for;
+- abandoning a call interrupts it, which on `DynamoClient` aborts the request
+  and closes its connection (the release's too). The feed doesn't wait for it to
+  end, since a custom store's call may not be interruptible. A call still
+  unanswered at the deadline fails the feed with `ChangeFeedLeaseLost`. A store
+  whose calls time out by themselves has those failures retried as above. A call
+  starting past the deadline, after the process stalled, gets `renewEvery`: the
+  lease may still be unclaimed;
+- aborting ends the wait, not the request, so an abandoned renewal can still
+  land. It is conditional on `owner`, so it can't take the lease from a rival or
+  recreate a released one (both checked against DynamoDB Local). Landing after a
+  newer renewal, it does move the holder's own expiry back, by the age of the
+  attempt. That older expiry is still after the holder's next renewal, which puts
+  it right, and the next renewal is due `renewEvery` after the last one started,
+  whatever happened. Only if that whole next round of renewals fails too can a
+  rival take the lease before the holder gives up on it, by at most the gap
+  between the attempts less `renewEvery`. The worst outcome is the one the
+  section below already accepts: checkpoint writes are not fenced by the lease,
+  and delivery stays at least once;
 - either way the lease counts as lost from then on: an acknowledgement still
   in flight fails with `ChangeFeedLeaseLost` instead of committing.
 

@@ -1,6 +1,6 @@
 ---
 title: "Upgrading"
-description: "Key text in 1.x: nothing to do from 1.36, rekey from 1.37.0 or 1.38.0, and how to turn escapeKeys on over existing data with rekey."
+description: "Key text in 1.x: nothing to do from 1.36, rekey from 1.37.0 or 1.38.0, rekey for entities keyed by a codec in 1.40.0, and how to turn escapeKeys on over existing data with rekey."
 ---
 
 import { Aside } from "@astrojs/starlight/components"
@@ -32,7 +32,7 @@ A new table has no rows under other text, so setting `escapeKeys: true` on one n
 
 ## From 1.36 or earlier
 
-Nothing to do. The default composes the key text 1.36 composed, for strings and numbers, so every row is where the library looks for it. Upgrade and deploy.
+Nothing to do, unless an entity is [keyed by a codec](#entities-keyed-by-a-codec-1400): the default composes the key text 1.36 composed, for strings and numbers, so every row is where the library looks for it. Upgrade and deploy.
 
 ## From 1.37.0 or 1.38.0
 
@@ -53,13 +53,47 @@ An [inverted index](#what-1370-and-1380-did-to-an-inverted-index) needs `rekey` 
 
 The `legacyKeys` option and the key fallback those releases had are gone, along with `ItemNotMoved` (`EDD-9097`). Remove `legacyKeys` from `DynamoSchema.make`. An instance of either release still running writes their text, so run `rekey` again once the last one has gone.
 
+## Entities keyed by a codec (1.40.0)
+
+1.40.0 corrects the key of an entity whose key composite is a codec that `encode` takes on its own output. **Run `rekey` on every table holding one before it serves traffic on 1.40.0, whatever `escapeKeys` says**, from 1.39.0 or any earlier release.
+
+These are the codecs whose `encode` takes what it returns and changes it again: `Schema.StringFromBase64`, `StringFromBase64Url`, `StringFromHex` and `StringFromUriComponent`, and a custom codec such as one that prepends a prefix and whose `decode` strips it, or one that scales a number. Every other codec keeps its keys: one whose `encode` gives back what it's given, such as `Schema.Trim`, and one whose `encode` refuses its own output, such as `Schema.NumberFromString` or a date codec.
+
+`put` stores such a value encoded. Up to 1.39.0 it keyed the row by that stored text encoded once more: a badge `"b7"` under a codec that prepends `badge:` was stored `badge:b7` and keyed `badge:badge:b7`. Only the entity's own `get`, `update` and `delete` found it. Queries, collections, history, batch and transaction operations and projections composed `badge:b7`, and found nothing. From 1.40.0 every path keys it `badge:b7`.
+
+```typescript region="codec" example="guide-upgrade.ts"
+// 1.39.0 keyed the badge "b7" by `badge:badge:b7`, and 1.40.0 keys it `badge:b7`:
+// its rows aren't found until `rekey` has moved them, whatever `escapeKeys` says.
+const notYet = yield* before.entities.Badges.get({ badgeId: "b7" }).pipe(Effect.flip)
+// notYet._tag → "ItemNotFound"
+const codecRun = yield* before.tables.MainTable.rekey({ streams: [Default.Calibrations] })
+// codecRun.moved → { item: 1, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
+const badge = yield* before.entities.Badges.get({ badgeId: "b7" })
+// badge.holder → "ana"
+```
+
+Until `rekey` has run, a `get`, `update` or `delete` of a row 1.39.0 wrote finds nothing, and a `put` of the same key writes a second row beside it, which `rekey` then reports as `bothKeys` and leaves. `rekey` moves every kind of row 1.39.0 keyed this way, to where a write puts it now:
+
+- live items' table keys;
+- index keys, Z-order prefix segments included, and vector and geo partitions, rewritten in place;
+- version snapshots and soft-delete tombstones;
+- time-series events;
+- a projection's read-model rows.
+
+Unique-constraint sentinels, and a projection's row tombstones and outbox items, already held the stored text, and keep their keys. So does an aggregate keyed by such a codec: only its own operations compose its keys, each from the value it holds, encoded once. A projection row whose new key holds the tombstone 1.39.0 wrote for it is reported `taken` and left: on 1.39.0, a removal tombstoned the stored text's key and left the row beside it, so the tombstone is the projection's state, and the row is left over. Turning `escapeKeys` on in the same pass moves the tombstone and the row to one key: the tombstone takes it, whichever `rekey` reaches first, and so does the row a write put beside one 1.39.0 wrote, which leaves 1.39.0's reported `bothKeys`.
+
+**One `rekey` pass handles both changes.** Turning `escapeKeys` on in the same release moves each row straight to the escaped text of the value it stores.
+
 ## Turning `escapeKeys` on over existing data
 
-1. **Set `escapeKeys: true`** in a build, and don't serve traffic from it yet.
-2. **Dry run** `rekey` to see what would move, and any conflicts.
-3. **Run it.** It is resumable and idempotent: bound it to a time slot, stop it, and run it again as often as you like.
-4. **Run it again.** A rerun that moves nothing, with no conflicts, means the table is done.
-5. **Serve traffic.**
+1. **Set `escapeKeys: true`** in a build, and deploy it everywhere without serving traffic from it yet.
+2. **Stop every write to the table**, from instances under either setting, and keep writes stopped until step 5 is done.
+3. **Dry run** `rekey` to see what would move, and any conflicts.
+4. **Run it.** It is resumable and idempotent: bound it to a time slot, stop it, and run it again as often as you like.
+5. **Run it again.** A rerun that moves nothing, with no conflicts, means the table is done.
+6. **Serve traffic**, writes included.
+
+**Run `rekey` before any writer runs under the new setting, and with none still running under the old one.** A write in between leaves a row under each text, and `rekey` can't tell which to keep. An entity's row written beside its old one is the conflict `bothKeys`. An aggregate whose `update` wrote an edge's line under the new text, beside the row under the old text, has two rows that compose one sort key. `rekey` reports the aggregate as `failed`, with a `message` naming the edge and the key: `AggregateDecompositionError: "lines" and "lines" both compose the sort key "…", so one would overwrite the other`. None of its rows move, as on 1.39.0. To repair either one, read the partition with the raw `DynamoClient`, delete the row you don't want (usually the one under the old text, unless the write in between is the one to drop), and run `rekey` again (see [Conflicts](#conflicts)).
 
 <Aside type="caution" title="Until rekey finishes">
 Nothing is promised to an operation on a table whose rows are under other text. With a value whose key text changed:
@@ -89,7 +123,7 @@ const missing = yield* db.entities.Sensors.get({ siteId: "north", sensorId: -3 }
 const plan = yield* db.tables.MainTable.rekey({ dryRun: true, streams: [Calibrations] })
 // plan.moved      → { item: 1, snapshot: 3, tombstone: 1, outbox: 0, event: 0, aggregate: 0, stream: 0 }
 // plan.conflicts  → []  (rows under both keys, or whose current key is taken)
-// plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0 }
+// plan.skipped    → { notLibrary: 0, unregistered: 0, unrecognizedKey: 0, rootNotSeen: 0 }
 ```
 
 Each row of the table goes to the member that owns it, by its `__edd_e__`: the entities and aggregates the client was made with (the table's own, and those listed in `DynamoClient.make`), and the event streams passed in `streams`. `DynamoClient.make` doesn't register event streams, so list every stream on the table there. A stream on another table is ignored.
@@ -103,8 +137,9 @@ The report counts:
 | `moved` | Rows moved to their current keys (in a dry run, that would move), by kind: `item`, `snapshot`, `tombstone`, `outbox`, `event`, `aggregate`, `stream` |
 | `indexKeysRewritten` | Items at their current table key whose index keys or vector partitions held other text, rewritten in place |
 | `sentinelsMoved` | Unique-constraint sentinels moved to their current keys |
+| `indexKeys` | Index keys of an item at its current table key that aren't what its values compose: `missing`, `truncated`, `lagging` and `ambiguous`, on every run, and `repaired` and `skipped` with `repairIndexKeys` (see [Repairing index keys](#repairing-index-keys)) |
 | `conflicts` | Rows left where they are, and why, each listed once per run (see [Conflicts](#conflicts)) |
-| `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)) |
+| `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs, or whose read model the client doesn't know), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)), `rootNotSeen` (an aggregate row with no root in its partition, met by a run that didn't read the whole table; a run over the whole table judges it) |
 | `byMember` | The same counts per entity type, aggregate and stream name |
 | `capacity` | What the run consumed: capacity units (read and write), requests |
 | `resume` | `Some(token)` to go on from, when the run stopped before the end of the table; `None` when it covered the whole table |
@@ -132,6 +167,7 @@ const report = yield* db.tables.MainTable.rekey({
 | Option | Default | Description |
 |--------|---------|-------------|
 | `dryRun` | `false` | Count what would move, reading but writing nothing |
+| `repairIndexKeys` | `false` | Write the index keys `indexKeys` counts (see [Repairing index keys](#repairing-index-keys)) |
 | `segments` | `1` | Parallel scan segments, each scanned by its own fiber |
 | `concurrency` | `4` | Rows of one scan page handled at once, per segment |
 | `pageSize` | DynamoDB's (1 MB pages) | The scan's `Limit` |
@@ -139,6 +175,7 @@ const report = yield* db.tables.MainTable.rekey({
 | `resume` | none | A `resume` token (the string) from an earlier run, or the last one `onProgress` received |
 | `streams` | `[]` | The event streams on the table, bound or not |
 | `onProgress` | none | Called after each scan page, once every row of it is handled |
+| `writesStopped` | `false` | Nothing else writes to the table: a row nothing proves unchanged moves under the strongest guard that fits, instead of being reported `unguarded` |
 
 A request that fails fails the run with its `DynamoClientError` (a throttled request is retried by the AWS SDK first). Resume from the last token `onProgress` delivered: the run redoes at most the pages that were in flight, and redoing a page moves nothing twice.
 
@@ -167,7 +204,7 @@ do {
 
 A token holds the table name and each segment's position. Its segment count wins over the default: a token from a run with `segments: 4` resumes four segments, and passing a different `segments` with it fails. A token of another table, a malformed token, or a `segments`, `concurrency`, `pageSize` or `maxPages` that isn't a positive integer fails with a `ValidationError` (`EDD-9098`) before anything is read.
 
-Every count is of the run that returned it: add up the reports of a resumed run's slices yourself. Aggregate edge rows with no root in their partition are judged at the end of each run, so a run stopped early can count one whose root a later page brings in.
+Every count is of the run that returned it: add up the reports of a resumed run's slices yourself. Aggregate edge rows with no root in their partition are judged at the end of each run. A run that didn't read the whole table can't say a later page wouldn't bring the root in, so it counts them in `skipped.rootNotSeen`, and only a run over the whole table counts them in `skipped.unrecognizedKey`.
 
 ## Rerun
 
@@ -196,21 +233,23 @@ Going back gives up what the setting gave you, and a set of rows that were told 
 
 ## What moves, and how
 
-`rekey` recognises a row by composing the keys its own values had under each text: the 1.36 text (the default's), that of 1.37.0 and 1.38.0 (partition key as it is, sort key escaped, numeric text) and `escapeKeys: true`'s. Each kind of row moves so that it ends up exactly where a write of it would put it. Every write is conditioned on what the move read: a row is put only where nothing is (a stream's snapshot only over an older one, a stream row also over one whose TTL has passed), and deleted or rewritten only while it is as read.
+`rekey` recognises a row by composing the keys its own values had under each text: the 1.36 text (the default's), that of 1.37.0 and 1.38.0 (partition key as it is, sort key escaped, numeric text) and `escapeKeys: true`'s, each also with a [codec key composite](#entities-keyed-by-a-codec-1400)'s stored text encoded once more, as up to 1.39.0. Each kind of row moves so that it ends up exactly where a write of it would put it. Every write is conditioned on what the move read: a row is put only where nothing is (a stream's snapshot only over an older one, a stream row also over one whose TTL has passed), and deleted or rewritten only while it is as read.
+
+**A key that stored both numeric kinds.** A key composite declared `Schema.Union([Schema.Number, Schema.BigInt])` before 1.40.0 composed each value's own kind's text: `5` as 16 digits, `5n` as 38. 1.40.0 refuses that union in a key (`EDD-9128`), so you declare the one kind the field holds, and a row written with the other kind is then under text its value doesn't compose. A row whose key isn't its current text is also read with its numeric values as the other kind, and `rekey` moves such a row, whatever kind of row it is, to the text of the value as it reads back. It does the same for a row whose `Schema.Unknown` key holds a `bigint` below 2^53, which reads back as a number. A row already under its key costs nothing more. Two items whose values read back as one, such as `3` and `3n`, are both left and reported as `bothKeys`. Two rows of an aggregate's `many` edge that read back as one element compose one sort key, so the aggregate is `failed` with the decomposition error a write gets, as 1.39.0 fails any edge elements composing one sort key, and nothing moves: read the partition with the raw client, delete the row you don't want, and run `rekey` again. A row holding a number the kind you declare can't hold exactly, a `bigint` past 2^53 once you declare `Schema.Number` or a fraction once you declare `Schema.BigInt`, reads as no value of that kind. It's reported as the conflict `uncomposable` and left where it is with its unique sentinels, never moved to the key of a rounded value. 1.39.0 left it too, counting the `bigint` as `unrecognizedKey` and the fraction as unchanged.
 
 **Nothing is overwritten or merged when keys spell each other's.** `foo bar` under `escapeKeys: true` belongs where `foo%20bar` was stored. So `foo%20bar`'s old row moves first, to `foo%2520bar`, and then `foo bar`'s moves to `foo%20bar`, whichever the scan reached first. Going back, it's the reverse. A dry run and a rerun agree.
 
 | Row | What `rekey` does |
 |-----|-------------------|
-| Item under other text | One transaction puts it at its current key, with every index key recomposed under its [index policy](/effect-dynamodb/guides/index-policy/), and deletes the old row only if it is still as read. Its unique-constraint sentinels move with it. Another value's row stored at its current key is moved out of the way first. A truncated sort key the move can't recompose is rewritten in the same run, so a rerun has nothing left to do |
-| Item at its current key whose index keys hold other text | Rewrites those index keys and vector partitions in place with one `UpdateItem`, conditioned on each still holding that text. A sort key truncated under 1.36 (its trailing composites absent) is rewritten to the current text of the composites it holds. A half its index policy kept behind its values isn't touched. A Z-order index's partition key is rewritten like any other, and its sort key where only a prefix value's text differs; the address keeps its bytes |
+| Item under other text | One transaction puts it at its current key, with every index key recomposed under its [index policy](/effect-dynamodb/guides/index-policy/) (a half that went without a key on purpose stays without one), and deletes the old row only if it is still as read. Its unique-constraint sentinels move with it. Another value's row stored at its current key is moved out of the way first. A truncated sort key the move can't recompose is rewritten in the same run, so a rerun has nothing left to do |
+| Item at its current key whose index keys hold other text | Rewrites those index keys and vector partitions in place with one `UpdateItem`, conditioned on each still holding that text. A sort key truncated under 1.36 (its trailing composites absent) is rewritten to the current text of the composites it holds. A half its index policy kept behind its values isn't touched here ([`repairIndexKeys`](#repairing-index-keys) is what writes it). A Z-order index's partition key is rewritten like any other, and its sort key where only a prefix value's text differs; the address keeps its bytes |
 | Unique-constraint sentinel under other text | Moved to its current key, still naming its item |
 | Version snapshot, soft-delete tombstone | Moved as a row: a Put at its current key and a Delete of the old row in one transaction. The version number and the timestamp keep their bytes. A history row an earlier release wrote without an item segment keeps that layout. A snapshot whose current key already holds the same snapshot (the same version, incarnation and `updatedAt`) is a copy: the old one is deleted, and counted as moved |
 | Unique-constraint sentinels a soft-deleted item kept (`softDelete: { preserveUnique: true }`) | They name the item's key, not the tombstone's, so `restore` can take them back: each moves to its current key and names the item's current key — in the tombstone's transaction, or in its own when the tombstone's key didn't change. Afterwards the values stay taken and the item restores |
-| Time-series event | Moved as a row, to `<current sort key>#e#<orderBy text>` |
-| Aggregate | Read whole, under both partition keys, and every row under other text moved to its current key: a Put where nothing is and a Delete of the old row while it is as read, in transactions of up to 100 items, keeping its `created` and `updated` timestamps; a root's list keys are recomposed. When one row's current key is another's old key (an edge label `a b` beside one spelled `a%20b`), the other moves first. The root moves last, so a run cut short leaves it where the next run finds the aggregate |
+| Time-series event | Moved as a row, to `<current sort key>#e#<orderBy text>`, the text of the `orderBy` value `append` stored |
+| Aggregate | Read whole, under both partition keys, and every row under other text moved to its current key: a Put where nothing is and a Delete of the old row while it is as read, in transactions of up to 100 items and 4 MB, keeping its `created` and `updated` timestamps; a root's list keys are recomposed. A custom `decompose`'s row moves as stored, with only its keys replaced. When one row's current key is another's old key (an edge label `a b` beside one spelled `a%20b`), the other moves first. The root moves last, so a run cut short leaves it where the next run finds the aggregate. The rows moved are the ones its value keys, with [`ownsRows`](/effect-dynamodb/guides/aggregates/#which-rows-are-the-aggregates-ownsrows) or without it |
 | Event stream | Moved whole: copied, flipped, then deleted ([below](#event-streams)) |
-| Projection row tombstone, outbox item | Moved as a row to the read-model row's current key, by the read model's entity: a tombstone keeps its checkpoints and revision; an outbox item keeps its place in the row's order and names the row's current key, in its sparse index too. They hold no values, so their key is read back as the text their `__edd_kt__` attribute names: one whose key reads as more than one set of values is `unrecognizedKey`. An outbox on a table of its own moves with that table's `rekey` (pass the table to `DynamoClient.make({ tables })`), for a projection defined in the program that runs it; otherwise its items are `unregistered`. An outbox item a drainer is delivering is left, reported `contended`, and moves on a later run if it is still there |
+| Projection row tombstone, outbox item | Moved as a row to the read-model row's current key, by the read model's entity: a tombstone keeps its checkpoints and revision; an outbox item keeps its place in the row's order and names the row's current key, in its sparse index too. They hold no values, so their key is read back as the text their `__edd_kt__` attribute names: one whose key reads as more than one set of values is `unrecognizedKey`. An outbox on a table of its own moves with that table's `rekey` (pass the table to `DynamoClient.make({ tables })`), for each projection defined in the program that runs it whose read model the client knows: in `entities`, or a member of any table in `tables`. Otherwise its items are `unregistered`. The outbox's table is the physical one: rekeying another handle your layer gives the same name moves it too. Read models of one entity type in different schemas or primary collections may share an outbox table: each item moves by the read model its key names. Two whose items that table's `rekey` could read as each other's (the same schema name and version, primary collection and entity type, and leading composites that are the same, or the same literal, or a number followed by the same name), and a member of that table with the read model's entity type that could read its items as its own and whose primary key isn't the read model's, are refused by that `rekey` with a `ValidationError`, before it sends anything (`EDD-9134`); two whose keys can be the same, for values that hold no `#` and that their types can compose, are refused when the client is made, and by `EventStore.processBatch`. An outbox item a drainer is delivering is left, reported `contended`, and moves on a later run if it is still there |
 
 `moved` counts rows: an aggregate of five rows is `moved.aggregate: 5`, and a stream of forty events and a snapshot is `moved.stream: 41`.
 
@@ -234,7 +273,8 @@ A stream's rows are recognized by their stored stream id. A stream id of several
 | `taken` | Another row holds its current key: one `rekey` doesn't recognize as another value's old row, or one that can't move itself | Look at the row that holds it. A row `rekey` can move out of the way is moved first |
 | `contended` | Concurrent writes changed it on every attempt, a drainer is delivering an outbox item, or an event another stream id's write landed on its partition follows its last | Run `rekey` again. For an event that landed, read the partition with the raw client and move or delete that event by hand |
 | `failed` | It can't be moved as stored: its values no longer decode or place a key, a stream id reads as two different ids, or a write was refused | `message` says why: fix the row, then run `rekey` again |
-| `uncomposable` | Its key on a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) is from another layout, and its values can't compose a current one (a `by` attribute was cleared) | Give it the missing values, or remove them from the index with `.remove()`, then run `rekey` again |
+| `unguarded` | Too wide for one condition to prove it unchanged when it moves (DynamoDB's limits on one expression), with no version or `updatedAt` the library stamps to stand in. Nothing of it is written, nor of an aggregate or stream holding it while nothing of that has moved. One already part-moved is finished, as 1.39.0 finished it | Stop writes to the table, then run `rekey({ writesStopped: true })` |
+| `uncomposable` | Its values can't compose its key: its own key holds `NaN`, which has no key text with `escapeKeys: true`, or a key composite holds a value no form of its schema takes, such as a stored number its declared kind can't hold exactly (`EDD-9050`, in `message`). Or its key on a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) is from another layout, and its values can't compose a current one (a `by` attribute was cleared) | Write the value with an `update` (for a number its kind can't hold, one it can, or declare a kind that holds it), or give it the missing values, or remove them from the index with `.remove()`, then run `rekey` again |
 
 Until a conflicting row moves, no read finds it.
 
@@ -246,19 +286,83 @@ Every row is moved or counted. These are counted on every run, and left as they 
 |-----|------------|
 | A key that isn't any text its row's values composed | `skipped.unrecognizedKey`, when it's the row's table key |
 | A unique-constraint sentinel with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel | `skipped.unrecognizedKey` |
-| An aggregate's edge row with no root in its partition, including a 1.37.0 or 1.38.0 run cut short after moving the root and before the edges | `skipped.unrecognizedKey` |
-| An aggregate root under no text its values composed | `skipped.unrecognizedKey` |
+| An aggregate's edge row with no root in its partition, including a 1.37.0 or 1.38.0 run cut short after moving the root and before the edges | `skipped.unrecognizedKey`; a run bounded by `maxPages` or started from `resume` says `skipped.rootNotSeen` instead, since the root could be on a page it didn't read |
+| An aggregate root under no text its values composed, such as one 1.39.0 created with a key composite of `Schema.Option` of a transformation, which reads back as another value than the one its key was composed from (`get` with that value still finds it) | `skipped.unrecognizedKey` |
+| An aggregate's row its value doesn't key: one a custom `decompose` left under a key it no longer composes, or an edge row its `assemble` drops | `unchanged`, left in the old partition, as on 1.39.0. With [`ownsRows`](/effect-dynamodb/guides/aggregates/#which-rows-are-the-aggregates-ownsrows) it still isn't moved, since where it goes can't be told from what's stored: the aggregate is `failed`, with nothing moved, when that row's own partition key changes, and the row is `unrecognizedKey` otherwise |
 | A projection tombstone or outbox item whose key reads as more than one set of values | `skipped.unrecognizedKey` |
-| A row holding `NaN` in a key, under `escapeKeys: true` (it has no key text there) | `skipped.unrecognizedKey` |
+| A row whose own key holds `NaN` with `escapeKeys: true` (it has no key text there), or one of whose key composites holds a value no form of its schema takes, such as a number its declared kind can't hold exactly | `conflicts`, `uncomposable` |
 | A row whose Z-order value no longer places a key | `conflicts`, `failed` |
 | A stream id whose rows read as two different ids | `conflicts`, `failed` |
 | A stream with another stream id's event right after its last, from a write that landed on it before `rekey` | `conflicts`, `contended` |
 
-An **index key** that isn't any text its row's values composed isn't a conflict: a row may have cleared one of the key's composites, or the key may lag them. Nothing on the row says what the key's text meant, so `rekey` leaves it with no count. A pin misses the row if the key's text changed, though a broader query or `get` still finds it. Writing the composites again puts it back. See [A key that no longer matches its row's values](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index).
+An **index key** that isn't any text its row's values composed isn't a conflict: a row may have cleared one of the key's composites, or the key may lag them. It's counted in `indexKeys`, on every run, and left unless you ask for [`repairIndexKeys`](#repairing-index-keys). A pin misses the row if the key's text changed, though a broader query or `get` still finds it. See [A key that no longer matches its row's values](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index).
+
+## Repairing index keys
+
+From v1.7.2 through 1.38, an update naming no composite of an index half that mixed a primary key composite with another field could damage its key. On `primaryKey: [channel, deviceId]`, a plain `.set({ status })` did this:
+
+| Index half | Policy | What the update left |
+|------------|--------|----------------------|
+| `sk: [zone, deviceId]` | `sparse` | No key: the row left the index |
+| `sk: [deviceId, zone]` | `preserve` | The key cut after `deviceId`: a pin on `zone` misses the row |
+| `pk: [channel, zone]` | `preserve` | The key cut after `channel`: the row is in another partition |
+
+1.39 stops new damage. Rows already damaged stay that way until a write names the half's composites, the item is put again, or you repair them. A key can also lag its values without damage: `.set({ b })` on `sk: [a, b]` under `preserve` leaves the key at the old `b`.
+
+**Every run counts these**, in `report.indexKeys` and for each member, from the row the scan already read. With `repairIndexKeys: true` it writes them too. Dry run first: it reports the same numbers and writes nothing.
+
+```typescript region="repair" example="guide-upgrade.ts"
+// `rekey` counts index keys that aren't what their row's values compose.
+// `repairIndexKeys` writes them: dry run first, to see what it would write.
+const repairs = yield* db.tables.MainTable.rekey({
+  dryRun: true,
+  repairIndexKeys: true,
+  streams: [Calibrations],
+})
+// repairs.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 }
+
+const repaired = yield* db.tables.MainTable.rekey({
+  repairIndexKeys: true,
+  streams: [Calibrations],
+})
+// repaired.indexKeys → the same, and the row is back in its index
+```
+
+The correct key is what a `put` of the row's values writes now, composed the same way. Each half of each secondary index is judged by itself:
+
+| Count | The row has | With `repairIndexKeys` |
+|-------|-------------|------------------------|
+| `missing` | No key, and every composite of the whole index | Writes it |
+| `truncated` | A key that's the start of what its composites compose | Writes it |
+| `lagging` | Any other key that differs: behind its values, or under `sparse` a key its values no longer compose | Writes it, or under `sparse` removes it or writes the part that composes |
+| `ambiguous` | No key on a `sparse` half with two or more composites outside the primary key, and all of them on the row | **Leaves it** |
+| `repaired` | | Keys written, or in a dry run keys that would be |
+| `skipped` | | Keys left to a writer that changed the row, twice |
+
+**A `sparse` row counted `ambiguous` may be that way on purpose.** A writer naming `timestamp` and not `alertState` on `sk: [alertState, timestamp]` takes the row out of the index and leaves both values on it: a current-alerts query shouldn't list it, whatever `alertState` still says. Two writers each naming one composite leave the same bytes. Nothing tells them apart, so they're counted and left. A write naming every composite of the half puts such a row back.
+
+**Keys over a value the library stamps are judged too.** An earlier release's `put` composed its keys before stamping, so a row with `sk: [createdAt]` or `[updatedAt]`, or a `retain` entity's `[version]`, went without a key unless the caller supplied the value: on any index holding one, the row was silently missing from every query. They're counted as `missing`, and repairing brings them in. Under `sparse`, `[status, region, updatedAt]` with both values on the row and no key is `ambiguous`, as for any half with two or more composites outside the primary key.
+
+**`lagging` is repaired under `preserve`.** A key behind its values isn't promised to stay there: it's stale until the next write that can compose it. If your application relies on a pin on the old value finding the row, that pin stops finding it: check the dry run's count first.
+
+These are left, and aren't counted:
+
+- A half missing a composite under `preserve`, whatever its key holds. That's what the policy promises.
+- A sort key cut before composites the row really doesn't have, on a hierarchy like `[country, city]`. It's what the update path writes.
+- A half with no key where the other half of its index can't compose: `put` writes no entry there.
+- A key holding `updatedAt` that's behind its value, with everything else in the key as the row says. An update that can't compose the half [leaves it](/effect-dynamodb/guides/index-policy/#keys-over-values-the-library-stamps), so that's a healthy row. A key under another status, say, is rewritten once from the row's `updatedAt`, and a later run has nothing to do.
+- A half stored in an attribute of the table's primary key: no write ever names one.
+- Values that compose no key (`NaN` with `escapeKeys: true`, a Z-order value a dimension can't place). A `put` would refuse them too.
+
+A Z-order half is all or nothing and compares bytes, so a value within one quantization level writes nothing. Only an item at its current table key is judged: snapshots, tombstones and events have no index keys, sentinels have none, and aggregates compose their own rows and never had this damage. An item `rekey` moves is judged where it lands.
+
+**A writer always wins.** Each repair is one `UpdateItem` a row, conditioned on each key it writes and each composite those keys come from, as read, or on their absence. If a writer changes one of them first, `rekey` reads the item again, judges it again and tries once more. Lost a second time, the keys are counted in `skipped`, and a later run picks them up. A key DynamoDB refuses (over its length limit) is the conflict `failed`, and the run goes on.
 
 ## Cost
 
-`rekey` scans the whole table, so a run reads every row once (an eventually consistent scan: half a read unit per 4 KB). Each row that moves costs strongly consistent reads of it and of its current key (an item one more, the move's own) and a two-item transaction (twice the write units of each item), plus its sentinels; a stream costs reading it, its copy, the flip and the deletes. An item under its current key costs nothing more, unless its index keys hold other text (one `UpdateItem`) or a unique value's sentinel text changed (strongly consistent reads of its old and current sentinels per such constraint). A soft-deleted item that kept its sentinels costs the same reads for each constraint whose value's text, or whose item key's text, changed: the sentinels name the item's key. Every aggregate is read whole, under both partition keys when its key text changed, moved or not, and one that moves costs a two-item write per row that moves (twice the write units), in transactions of up to 100 items. A sentinel costs one or two reads to find its row. A dry run makes the same reads, and writes nothing.
+`rekey` scans the whole table, so a run reads every row once (an eventually consistent scan: half a read unit per 4 KB). Each row that moves costs strongly consistent reads of it and of its current key (an item one more, the move's own) and a two-item transaction (twice the write units of each item), plus its sentinels; a stream costs reading it, its copy, the flip and the deletes. An item under its current key costs nothing more, unless its index keys hold other text (one `UpdateItem`) or a unique value's sentinel text changed (strongly consistent reads of its old and current sentinels per such constraint). A soft-deleted item that kept its sentinels costs the same reads for each constraint whose value's text, or whose item key's text, changed: the sentinels name the item's key. Every aggregate is read whole, under both partition keys when its key text changed, moved or not, and one that moves costs a two-item write per row that moves (twice the write units), in transactions of up to 100 items and 4 MB. A sentinel costs one or two reads to find its row. A dry run makes the same reads, and writes nothing.
+
+Counting `indexKeys` costs nothing beyond the scan, and so does `repairIndexKeys` on a table with nothing to repair: judging is composing strings from a row already read. A row with keys to repair costs one `UpdateItem`, and a strongly consistent read and a second `UpdateItem` if a writer got there first.
 
 `report.capacity` holds what the run consumed. It is always measured, whether or not [consumed-capacity reporting](/effect-dynamodb/guides/consumed-capacity/) is on, and with a `ConsumedCapacity` layer the run is reported as one `Table.rekey` operation. Use `segments` and `concurrency` to trade speed against the capacity left for your application, and `maxPages` to spread the run out.
 
@@ -266,11 +370,22 @@ An **index key** that isn't any text its row's values composed isn't a conflict:
 `rekey` moves the rows of the members the client knows. A table shared with a service that registers other entities, aggregates or streams reports their rows as `unregistered`: run `rekey` there too, with a client that knows them.
 </Aside>
 
+## An aggregate's `create` is typed in 1.40
+
+`create`'s type now refuses inputs that 1.39.0 accepted at compile time but failed on at run time. Its parameter was `Record<string, unknown>`, so nothing was checked; it is now derived from the model and the edges ([Aggregates](/effect-dynamodb/guides/aggregates/#create--decompose-and-write)). An input that worked on 1.39.0 still compiles, and an input typed with a string index signature (`Record<string, unknown>`, parsed JSON) is taken as it is and judged at run time, as before.
+
 ## What 1.37.0 and 1.38.0 did to an inverted index
 
 An inverted index over strings is broken in 1.37.0 and 1.38.0: a value with a space, `%` or another character a sort key escapes overwrites a table key, with each attribute holding the text of the half that wrote it last. **1.39.0 fixes it:** both roles build one text under either setting. `rekey` recognises the row those releases left and moves it, an escape in each half included.
 
 Index keys belong in [dedicated attributes](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute): an inverted index is supported, not encouraged.
+
+## Changes to `rekey` in 1.40
+
+- **A write that adds a declared attribute to an aggregate row cancels its move.** The move is guarded on the row as read, as in 1.39.0, and now also on each attribute the row's entity type declares that the row didn't hold still being absent, so a write that sets one between `rekey`'s read and its move is moved with the row, as an entity's item already was. With no such attribute the request is 1.39.0's.
+- **`unguarded`**: a row too wide for one condition to prove it unchanged, with no version or `updatedAt` the library stamps on it, is left where it is and reported as the conflict `unguarded`. 1.39.0 moved it under a partial guard, and could lose a write that landed during the move. An aggregate row whose node declares its own `updatedAt` other than a date holds the caller's value there, so it is one: 1.39.0 stored its stamp over that value and couldn't read the aggregate back (or, the field optional, read it without the value). An aggregate or event stream part of which has already moved is finished as 1.39.0 finished it. To move the row, stop writes to the table and run `rekey` with `writesStopped: true`.
+- **`writesStopped`**: tells `rekey` nothing else writes to the table, so it moves such a row under the strongest guard that fits, as 1.39.0 did. Set it only while writes are stopped.
+- **What a move still doesn't see, as in 1.39.0:** a write that only adds an attribute the library can't list from the member's declarations (one written outside the library, a sparse map's entry, a field of an aggregate node declared as an annotated class or a union); and, on a row guarded by its version or `updatedAt`, a write that leaves them as they were, such as `reembed`, one landing within the stamp's resolution, or one from outside the library. The move puts the row back as it read it, without that write. To rule these out, stop writes to the table for the run.
 
 ## Definitions refused in 1.39
 
@@ -282,3 +397,22 @@ These rules run at load from 1.39.0. If a definition throws `EDD-9106` or `EDD-9
 - **`EDD-9112`**: an aggregate's list key or collection sort key stored in an attribute of the table's primary key. Give it its own attribute.
 
 An update also refuses a `.remove()` of a primary key composite, as it refuses a `.set()` of one. It refuses `.remove()`, `.set()` and the other update operations naming an attribute of the table's primary key by its stored name, with a `ValidationError`, and writes nothing.
+
+## Definitions refused in 1.40
+
+- **`EDD-9140`**: an entity storing an attribute under one the library writes itself: a model field named (even under a rename) or renamed `__edd_e__`, or a system timestamp or version field so named; a model field named or stored as a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`); or an attribute the entity writes that a row's reader takes as a sparse map's entry (`<prefix>#` and a non-empty key, so `data#x`, `data##` and `data#x#y` for a map `data`, but not `data#`). That covers a key attribute (the table's, a secondary index's or a vector index's), a model field by the attribute it's stored in, a sparse map renamed into another's prefix (`field: "data#shadow"`), the timestamps (`timestamps: { created: "data#created" }`) and the version by the attribute they're stored in, and the table's TTL attribute (`ttlAttributeName: "data#expires"`) for an entity that writes one (a retained version's, a soft-deleted row's, a time series event's), which `DynamoClient.make` refuses when it binds the table. Every row holds its entity type in `__edd_e__`, and every read filters on it: the field and the type replaced each other, so a row could drop out of queries. A key attribute read as a sparse entry put a phantom entry in every row read, `clearMap` removed it, and a `put` of that entry replaced the key. A timestamp or a field stored there left the row unreadable, a version read as an entry and the row's version as 0, and a TTL read as an entry, or for a time series event was never stored. A field named in the map's prefix and stored outside it (`data#x#y` stored as `counter`) still loads. Give the field another stored name with `DynamoModel.configure`, or the map another prefix.
+- **`EDD-9109`**, which refused a value stored in a table key attribute, now covers every key attribute the entity writes: a model attribute, a system timestamp or a version field stored in a secondary index's partition or sort key attribute (a local index's sort key, a Z-order address and a `refs` cascade index's included), by a `field` rename or by its own name. The value and the key the library composes there replaced each other, so the item fell out of the index or the field read back as key text. It also refuses a model attribute named as any key attribute and stored under another name: a write composes the keys before it renames the fields, so the rename moved the key into the field's attribute and the row lost it. Give the field another name, or the index's key attributes other names.
+
+## Sparse map entries in 1.40
+
+- **A write of an entry checks its key as it did on 1.39.0**, and sends the same requests. `put` refuses an empty key, one holding `#`, and an attribute name (`<prefix>#<key>`) over 255 bytes. An update's `.set()` and `upsert` refuse an empty key and one holding `#`. An operation naming an entry's attribute (`pathSet`, `pathAdd` or `.add()` of `data#2026-01`) checks nothing. An update refuses the key before it reads anything, including the reads that hydrate a ref, where it refuses that update whatever the row holds. An immutable map's value in an `upsert` isn't written into a row that's there, so its keys aren't judged then. An `upsert` that reads the row first writes a row that isn't there as a `put` and one that is as an update, and refuses a key before the read where both refuse it, in the `put`'s words. Over a row that's there, 1.39.0 read the row first and refused an empty key or one holding `#` with `invalid key`.
+- **A retained entity's update no longer mixes up a field and an entry of the same name.** With a field named `data#x` and stored as `counter` beside a sparse `data`, any `.set()`, `.add()` or `.remove()` on a `versioned: { retain: true }` entity wrote the field's value over the entry `x` and dropped the field, on 1.39.0 too. It now keeps both. A retained update also writes back an entry it read under a key a `put` refuses (one named by its attribute, such as `data#x#y`), where it used to fail.
+- **A retained entity's `.add()`, `.subtract()`, `.append()` and `.deleteFromSet()` of an entry now change it.** Naming a sparse map's entry by its attribute (`.add({ "data#views": 1 })`) on a `versioned: { retain: true }` entity reported success and left the entry as it was, on 1.39.0 too. A retained `.deleteFromSet()` also no longer shrinks the set in the snapshot of the version before it.
+- **`clearMap` removes exactly the entries a row's reader reads.** On 1.39.0 it also removed an attribute named `<prefix>#` itself, which is no entry and can be a key attribute, and the update then failed.
+- **`removeEntries` takes any key the reader reads**, one holding `#` included. It still refuses the empty key, which names no entry.
+
+## What reads back changed in 1.40
+
+`Schema.Duration`, `Schema.BigDecimal`, the time zones, `Schema.Cookie`, `Schema.UrlParams`, `Schema.SemVer` and the network types read back as real instances, where 1.39 handed back the map each is stored as. Nothing has to move: rows already stored read the same way. Code of yours that inspects one of these values on a read (a `.check()`, a transformation, a declaration holding it) now sees the instance, so a check written against the map's shape answers differently.
+
+Two things change for a cookie. A real `Cookie`'s expiry is now stored as ISO text wherever it's written, untyped fields included; 1.39 stored an empty map and lost it. And a condition on a cookie that has an expiry no longer matches a row 1.39 wrote for it, since that row's expiry was lost. A cookie 1.39 stored with an expiry still reads back as the map it's stored as, as in 1.39, and so does a value holding properties of its own inside a cookie or a jar, so writing what was read stores the row unchanged.

@@ -24,10 +24,11 @@ export interface SearchConfig<A> {
     readonly indexes: Record<string, KeyComposer.IndexDefinition>
     readonly schemas: { readonly recordSchema: Schema.Codec<any> }
     /**
-     * The entity's composite key-form normaliser. Search composes GSI keys for
-     * rows written by `Entity.put`, so both sides must use the same one (#111).
+     * The key form of a DOMAIN record (`Entity._domainKeyForm`). Search composes
+     * GSI keys for rows written by `Entity.put`, so it composes the key form of
+     * the values `put` stores for its domain values (#111).
      */
-    readonly _keyForm: (record: Record<string, unknown>) => Record<string, unknown>
+    readonly _domainKeyForm: (record: Record<string, unknown>) => Record<string, unknown>
   }
   readonly indexDef: KeyComposer.IndexDefinition
   readonly coordinates: (item: A) => Coordinates | undefined
@@ -120,61 +121,69 @@ export const nearby = <A>(
     // multiple search cells may map to the same parent cell at parentResolution
     const parentResolution = fields.parentCell.resolution
 
-    const queryConfigs = timePartitions.flatMap((partition) =>
-      sortedChunks
-        .map((chunk) => {
-          const firstCell = chunk[0]
-          const lastCell = chunk[chunk.length - 1]
-          if (!firstCell || !lastCell) return undefined
+    // `pkFilter` is the caller's: a value no key can hold is a ValidationError.
+    const composeQueryConfigs = () =>
+      timePartitions.flatMap((partition) =>
+        sortedChunks
+          .map((chunk) => {
+            const firstCell = chunk[0]
+            const lastCell = chunk[chunk.length - 1]
+            if (!firstCell || !lastCell) return undefined
 
-          // Compute parent cell: if search resolution > parent resolution, use cellToParent.
-          // Otherwise, the search cell IS at or below parent resolution — use it directly.
-          const parentCell =
-            searchResolution > parentResolution
-              ? H3.computeParentCell(firstCell, parentResolution)
-              : firstCell
-          const lowerCell = H3.cellToCenterChild(firstCell, H3_RESOLUTION_PRECISE)
-          const upperCell = H3.cellToUpperBound(lastCell, H3_RESOLUTION_PRECISE)
+            // Compute parent cell: if search resolution > parent resolution, use cellToParent.
+            // Otherwise, the search cell IS at or below parent resolution — use it directly.
+            const parentCell =
+              searchResolution > parentResolution
+                ? H3.computeParentCell(firstCell, parentResolution)
+                : firstCell
+            const lowerCell = H3.cellToCenterChild(firstCell, H3_RESOLUTION_PRECISE)
+            const upperCell = H3.cellToUpperBound(lastCell, H3_RESOLUTION_PRECISE)
 
-          // Build PK composites: geo fields + any extra filter composites.
-          // `pkFilter` is a DOMAIN record supplied by the caller, and geo rows
-          // are written through `Entity.put` — so it must go through the same
-          // composite key form the write used. Latent while every composite is
-          // a string on both sides, but a `timePartition: Schema.NumberFromString`
-          // (a natural choice, since `computeTimePartition` returns a decimal
-          // string) would compose an unpadded key the write never wrote (#111).
-          const pkCompositesKeyForm: Record<string, unknown> = entity._keyForm({
-            ...pkFilter,
-            [fields.parentCell.field]: parentCell,
-            [fields.timePartition.field]: partition,
+            // Build PK composites: geo fields + any extra filter composites.
+            // `pkFilter` is a DOMAIN record supplied by the caller, and geo rows
+            // are written through `Entity.put` — so it must go through the same
+            // composite key form the write used. Latent while every composite is
+            // a string on both sides, but a `timePartition: Schema.NumberFromString`
+            // (a natural choice, since `computeTimePartition` returns a decimal
+            // string) would compose an unpadded key the write never wrote (#111).
+            const pkCompositesKeyForm: Record<string, unknown> = entity._domainKeyForm({
+              ...pkFilter,
+              [fields.parentCell.field]: parentCell,
+              [fields.timePartition.field]: partition,
+            })
+
+            const pkValue = KeyComposer.composePk(
+              entity._schema,
+              entity.entityType,
+              indexDef,
+              pkCompositesKeyForm,
+            )
+
+            // Compose full SK values with schema prefix (must match stored SK format)
+            const lower = KeyComposer.composeSk(
+              entity._schema,
+              entity.entityType,
+              1,
+              indexDef,
+              entity._domainKeyForm({ [fields.cell.field]: lowerCell }),
+            )
+            const upper = KeyComposer.composeSk(
+              entity._schema,
+              entity.entityType,
+              1,
+              indexDef,
+              entity._domainKeyForm({ [fields.cell.field]: upperCell }),
+            )
+
+            return { pkValue, lower, upper }
           })
-
-          const pkValue = KeyComposer.composePk(
-            entity._schema,
-            entity.entityType,
-            indexDef,
-            pkCompositesKeyForm,
-          )
-
-          // Compose full SK values with schema prefix (must match stored SK format)
-          const lower = KeyComposer.composeSk(
-            entity._schema,
-            entity.entityType,
-            1,
-            indexDef,
-            entity._keyForm({ [fields.cell.field]: lowerCell }),
-          )
-          const upper = KeyComposer.composeSk(
-            entity._schema,
-            entity.entityType,
-            1,
-            indexDef,
-            entity._keyForm({ [fields.cell.field]: upperCell }),
-          )
-
-          return { pkValue, lower, upper }
-        })
-        .filter((q): q is NonNullable<typeof q> => q !== undefined),
+          .filter((q): q is NonNullable<typeof q> => q !== undefined),
+      )
+    const queryConfigs = yield* Query.orRefusal(
+      { name: "GeoIndex.nearby", target: entity.entityType },
+      () => Effect.succeed(composeQueryConfigs()),
+      (refusal): Effect.Effect<ReturnType<typeof composeQueryConfigs>, ValidationError> =>
+        Effect.fail(refusal),
     )
 
     // Step 8: Build and execute all queries in parallel

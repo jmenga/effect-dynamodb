@@ -516,6 +516,54 @@ describe("definition attribute names are typed from the model", () => {
       })
     })
 
+    it("a many sk over a record's values, as a custom decompose takes them", () => {
+      const Line = Schema.Struct({ sku: Schema.String, qty: Schema.Number })
+      const base = {
+        table,
+        schema: AppSchema,
+        pk: { field: "pk", composite: ["id"] },
+        collection: { index: "lsi1", name: "keyed", sk: { field: "lsi1sk", composite: [] } },
+        root: { entityType: "Keyed" },
+      } as const
+      const ByRecord = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Record(Schema.String, Line),
+      })
+      const ByStruct = Schema.Struct({
+        id: Schema.String,
+        lines: Schema.Struct({ first: Line, second: Line }),
+      })
+      const ByText = Schema.Struct({ id: Schema.String, lines: Schema.String })
+      Aggregate.make(ByRecord, {
+        ...base,
+        edges: { lines: Aggregate.many({ entityType: "L", sk: { composite: ["sku"] } }) },
+      })
+      // Its rows are what its `decompose` makes: nothing here says what they hold.
+      Aggregate.make(ByStruct, {
+        ...base,
+        edges: { lines: Aggregate.many({ entityType: "L", sk: { composite: ["anything"] } }) },
+      })
+      const typeOnly = (_: () => unknown) => undefined
+      typeOnly(() =>
+        Aggregate.make(ByRecord, {
+          ...base,
+          edges: {
+            // @ts-expect-error a record's value has no `skuu`
+            lines: Aggregate.many({ entityType: "L", sk: { composite: ["skuu"] } }),
+          },
+        }),
+      )
+      typeOnly(() =>
+        Aggregate.make(ByText, {
+          ...base,
+          edges: {
+            // @ts-expect-error a string has no rows
+            lines: Aggregate.many({ entityType: "L", sk: { composite: ["sku"] } }),
+          },
+        }),
+      )
+    })
+
     it("a misspelled name in each position", () => {
       const base = {
         table,
@@ -693,6 +741,142 @@ describe("definition attribute names are typed from the model", () => {
       ).toThrow("[EDD-9102]")
     })
 
+    describe("a key over a value the library changes on every write (EDD-9121)", () => {
+      class Revision extends Schema.Class<Revision>("Revision")({
+        id: Schema.String,
+        owner: Schema.String,
+        price: Schema.Number,
+        version: Schema.Number,
+        rev: Schema.Number,
+      }) {}
+      const byId = {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      } as const
+
+      it("`retain` knows the value, and without `versioned` it's any field", () => {
+        Entity.make({
+          model: Revision,
+          entityType: "Revision",
+          primaryKey: byId,
+          versioned: { retain: true },
+          indexes: {
+            byVersion: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["owner"] },
+              sk: { field: "gsi1sk", composite: ["version"] },
+            },
+          },
+        })
+        Entity.make({
+          model: Revision,
+          entityType: "Revision",
+          primaryKey: byId,
+          indexes: {
+            byVersion: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["owner"] },
+              sk: { field: "gsi1sk", composite: ["version"] },
+            },
+          },
+        })
+        // `versioned` keeps it elsewhere, so `version` is the model's.
+        Entity.make({
+          model: Revision,
+          entityType: "Revision",
+          primaryKey: byId,
+          versioned: { field: "rev" },
+          indexes: {
+            byVersion: {
+              name: "gsi1",
+              pk: { field: "gsi1pk", composite: ["owner"] },
+              sk: { field: "gsi1sk", composite: ["version"] },
+            },
+          },
+        })
+      })
+
+      it("a half over it without `retain` is the error, on that half", () => {
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: true,
+            indexes: {
+              byVersion: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["owner"] },
+                // @ts-expect-error `versioned` adds one to it on every write, without reading it
+                sk: { field: "gsi1sk", composite: ["version"] },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: { field: "rev" },
+            indexes: {
+              byRev: {
+                name: "gsi1",
+                // @ts-expect-error `versioned` keeps its version here
+                pk: { field: "gsi1pk", composite: ["rev"] },
+                sk: { field: "gsi1sk", composite: ["owner"] },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+      })
+
+      it("a Z-order entry over it, dimension or prefix", () => {
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: true,
+            indexes: {
+              search: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["owner"] },
+                sk: {
+                  field: "gsi1sk",
+                  zorder: [
+                    { field: "price", min: 0, max: 9 },
+                    // @ts-expect-error `versioned` adds one to it on every write, without reading it
+                    { field: "version", min: 0, max: 9 },
+                  ],
+                },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+        expect(() =>
+          Entity.make({
+            model: Revision,
+            entityType: "Revision",
+            primaryKey: byId,
+            versioned: true,
+            indexes: {
+              search: {
+                name: "gsi1",
+                pk: { field: "gsi1pk", composite: ["owner"] },
+                sk: {
+                  field: "gsi1sk",
+                  // @ts-expect-error `versioned` adds one to it on every write, without reading it
+                  prefix: ["version"],
+                  zorder: [{ field: "price", min: 0, max: 9 }],
+                },
+              },
+            },
+          }),
+        ).toThrow(/EDD-9121/)
+      })
+    })
+
     it("refuses shards on the primary key", () => {
       expect(() =>
         Entity.make({
@@ -702,6 +886,143 @@ describe("definition attribute names are typed from the model", () => {
           primaryKey: { ...byListingId, shards: 8 },
         }),
       ).toThrow("[EDD-9099]")
+    })
+  })
+})
+
+// Every such input compiles and loads, as on 1.39.0: an append that can't compose the index's key
+// fails with EDD-9100 when it's made.
+describe("timeSeries.appendInput against a sharded index", () => {
+  class Series extends Schema.Class<Series>("FieldNamesSeries")({
+    id: Schema.String,
+    at: Schema.Number,
+    tenant: Schema.String,
+    region: Schema.optional(Schema.String),
+    group: Schema.optional(Schema.String),
+  }) {}
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const indexes = {
+    byTenant: {
+      name: "gsi",
+      indexPolicy: { pk: "preserve", sk: "preserve" },
+      pk: { field: "gpk", composite: ["tenant"] },
+      sk: { field: "gsk", composite: ["region", "group"] },
+      shards: { count: 4, by: ["group"] },
+    },
+  } as const
+
+  it("the whole key compiles", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          region: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
+  })
+
+  it("`by` without the composite before it compiles and loads", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
+  })
+
+  it("an optional `by` compiles and loads: an append may leave it out", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          group: Schema.optional(Schema.String),
+        }),
+      },
+    })
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          group: Schema.UndefinedOr(Schema.String),
+        }),
+      },
+    })
+  })
+
+  it("an optional composite after a gap compiles and loads: an append may leave it out", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes: {
+        byTenant: {
+          name: "gsi",
+          indexPolicy: { pk: "preserve", sk: "preserve" },
+          pk: { field: "gpk", composite: ["tenant"] },
+          sk: { field: "gsk", composite: ["group", "region"] },
+          shards: { count: 4, by: ["group"] },
+        },
+      },
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
+  })
+
+  it("a required `by` after a composite no append holds, beside optional ones, compiles and loads", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.optional(Schema.Number),
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      },
     })
   })
 })

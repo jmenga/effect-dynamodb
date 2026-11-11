@@ -23,7 +23,7 @@ const mockEntity: GeoIndex.GeoEntity<any, any> = {
   schemas: { recordSchema: {} as any },
   // Identity normaliser — no test in this file drives the search path that
   // consults it (#111); `enrich` and `make` validation are what is exercised.
-  _keyForm: (record) => record,
+  _domainKeyForm: (record) => record,
   put: () => undefined as any,
 }
 

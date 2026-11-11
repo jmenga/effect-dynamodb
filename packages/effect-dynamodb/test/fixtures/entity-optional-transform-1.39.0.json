@@ -1,0 +1,5749 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from the published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 (with effect@4.1.2), installed outside the repo and run by a scratch script against DynamoDB Local at a clock fixed at 1700000000000 ms: for an entity with timestamps: true declaring createdAt (and updatedAt) as Schema.optional over a date transform schema carrying a storedAs encoding of the other wire kind (DynamoModel.DateString storedAs DateEpochSeconds, DynamoModel.DateEpochMs storedAs DateString), each write path (put, create, update after a put, upsert twice, Transaction.transactWrite put, Batch.write put, time-series append twice), with a value supplied for each declared date (the epoch, a DateTime.Utc) and with none, then a get: each step's outcome (a date as {\"date\": epoch ms}) and the table's rows after it. Never regenerate it or edit it to match a later release.",
+ "clock": 1700000000000,
+ "scenarios": {
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | put | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | put | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | create | a value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | create | no value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | update | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | update | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | upsert | a value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | upsert | no value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | transactWrite put | a value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | transactWrite put | no value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | Batch.write put | a value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | Batch.write put | no value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | append | a value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1,
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2,
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2,
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      },
+      "updatedAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt and updatedAt | append | no value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | put | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | put | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | create | a value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | create | no value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | update | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | update | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | upsert | a value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | upsert | no value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | transactWrite put | a value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | transactWrite put | no value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | Batch.write put | a value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | Batch.write put | no value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | append | a value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1,
+       "createdAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2,
+       "createdAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2,
+      "createdAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "S": "1970-01-01T00:00:00.000Z"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   }
+  ],
+  "DateString storedAs DateEpochSeconds | createdAt | append | no value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | put | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | put | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | create | a value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | create | no value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | update | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | update | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | upsert | a value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | upsert | no value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | transactWrite put | a value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | transactWrite put | no value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | Batch.write put | a value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | Batch.write put | no value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n"
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | append | a value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1,
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2,
+       "createdAt": {
+        "date": 0
+       },
+       "updatedAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2,
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      },
+      "updatedAt": {
+       "N": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt and updatedAt | append | no value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | put | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | put | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | create | a value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | create | no value supplied": [
+   {
+    "step": "create",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | update | a value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | update | no value supplied": [
+   {
+    "step": "put",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "update, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | upsert | a value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | upsert | no value supplied": [
+   {
+    "step": "upsert",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "upsert, 5 s later",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "updatedAt": {
+       "date": 1700000005000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:25.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | transactWrite put | a value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | transactWrite put | no value supplied": [
+   {
+    "step": "transactWrite put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | Batch.write put | a value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "createdAt": {
+       "date": 0
+      },
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | Batch.write put | no value supplied": [
+   {
+    "step": "Batch.write put",
+    "outcome": {
+     "ok": "done"
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "n",
+      "updatedAt": {
+       "date": 1700000000000
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      },
+      "updatedAt": {
+       "S": "2023-11-14T22:13:20.000Z"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | append | a value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1,
+       "createdAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2,
+       "createdAt": {
+        "date": 0
+       }
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2,
+      "createdAt": {
+       "date": 0
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "createdAt": {
+       "N": "0"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   }
+  ],
+  "DateEpochMs storedAs DateString | createdAt | append | no value supplied": [
+   {
+    "step": "append",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "n",
+       "at": 1
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     }
+    ]
+   },
+   {
+    "step": "append, 5 s later",
+    "outcome": {
+     "ok": {
+      "current": {
+       "id": "a",
+       "name": "o",
+       "at": 2
+      }
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   },
+   {
+    "step": "get",
+    "outcome": {
+     "ok": {
+      "id": "a",
+      "name": "o",
+      "at": 2
+     }
+    },
+    "rows": [
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "1"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "n"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000001"
+      }
+     },
+     {
+      "__edd_e__": {
+       "S": "Row"
+      },
+      "at": {
+       "N": "2"
+      },
+      "id": {
+       "S": "a"
+      },
+      "name": {
+       "S": "o"
+      },
+      "pk": {
+       "S": "$kept#v1#row#id_a"
+      },
+      "sk": {
+       "S": "$kept#v1#row#e#0000000000000002"
+      }
+     }
+    ]
+   }
+  ]
+ }
+}

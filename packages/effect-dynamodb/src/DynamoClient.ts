@@ -130,7 +130,10 @@ import {
   compositeKeyFormKind,
   type KeyFormValueKind,
   keyFormValueKind,
+  keyFormValueKindOf,
+  makeCompositeDomainKeyForm,
   makeCompositeKeyForm,
+  refuseInexact,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
@@ -163,7 +166,7 @@ import {
 } from "effect"
 import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
-import { bind as aggregateBind } from "./Aggregate.js"
+import { bind as aggregateBind, ownershipConflict } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
 import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
 import {
@@ -180,6 +183,12 @@ import {
   makeBoundVectorQuery,
 } from "./internal/BoundVectorQuery.js"
 import * as Capacity from "./internal/Capacity.js"
+import {
+  acquireSdkClient,
+  type ClientOptions,
+  type ClientOptionsFromConfig,
+  readClientOptions,
+} from "./internal/ClientOptions.js"
 import { redactCredentialRefusal } from "./internal/CredentialRefusal.js"
 import { createConditionOps, type Expr, ExprTag } from "./internal/Expr.js"
 import {
@@ -190,6 +199,12 @@ import {
   unregisteredCodecError,
 } from "./internal/Packed.js"
 import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
+import {
+  physicalTableName,
+  refuseSharedOutboxKeySpace,
+  remoteOutboxesOf,
+  sharedOutboxKeySpace,
+} from "./internal/ProjectionEngine.js"
 import {
   canonicalJson,
   compareUtf8,
@@ -559,6 +574,8 @@ const planCompositeWithin = <A>(args: {
   readonly indexDef: IndexDefinition
   readonly encoderSource: Schema.Top
   readonly compositeKeyForm: CompositeKeyForm
+  /** A bound's key form: the key form of the value `put` stores for it. */
+  readonly domainKeyForm: CompositeKeyForm
   /** The accessor's composites, in key form. */
   readonly pinnedKeyForm: Record<string, unknown>
   readonly pkValue: string
@@ -566,7 +583,7 @@ const planCompositeWithin = <A>(args: {
   readonly bounds: Record<string, unknown>
   readonly options: WithinOptions | undefined
 }): Query.Query<A> => {
-  const { entityLike, accessor, indexDef, compositeKeyForm, pinnedKeyForm } = args
+  const { entityLike, accessor, indexDef, domainKeyForm, pinnedKeyForm } = args
   const sk = indexDef.sk.composite
   const n = sk.length
   const p = sk.findIndex((attr) => pinnedKeyForm[attr] === undefined)
@@ -638,8 +655,8 @@ const planCompositeWithin = <A>(args: {
     }
     const expected = kindOf(field)
     const keyForm = (value: unknown): unknown => {
-      const converted = compositeKeyForm(field, value)
-      if (expected !== undefined && typeof converted !== expected) {
+      const converted = domainKeyForm(field, value)
+      if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
         return refuse(
           `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
             `the composite's key form is a ${expected}.`,
@@ -983,10 +1000,11 @@ const withinEnds = (
  *   where it doesn't (numbers stored as strings, zoned dates, a `literals`
  *   selection too large for `IN`) and for hashed prefix values (collisions).
  *
- * Throws `[EDD-9093]` for misuse from untyped code, `[EDD-9050]` for a value
- * that doesn't reach key form and `[EDD-9092]` for one no level holds — at
- * `.within()`, so every terminal (and `explain`) has a valid box. `{}` plans
- * nothing: the query is returned as it is.
+ * Throws `[EDD-9093]` for misuse from untyped code and `[EDD-9050]` for a value
+ * that doesn't reach key form, at `.within()`, so every terminal (and `explain`)
+ * has a valid box. A value no level holds throws `ZOrderValueError` (`[EDD-9092]`),
+ * which `.within()` turns into the query's `ValidationError`. `{}` plans nothing:
+ * the query is returned as it is.
  */
 const planZOrderWithin = <A>(args: {
   readonly entityLike: EntityLike
@@ -994,13 +1012,15 @@ const planZOrderWithin = <A>(args: {
   readonly indexDef: IndexDefinition
   readonly encoderSource: Schema.Top
   readonly compositeKeyForm: CompositeKeyForm
+  /** A bound's key form: the key form of the value `put` stores for it. */
+  readonly domainKeyForm: CompositeKeyForm
   readonly pkValue: string
   readonly plans: ZOrderPlans
   readonly query: Query.Query<A>
   readonly bounds: Record<string, unknown>
   readonly options: WithinOptions | undefined
 }): Query.Query<A> => {
-  const { entityLike, accessor, indexDef, compositeKeyForm } = args
+  const { entityLike, accessor, indexDef, domainKeyForm } = args
   const refuse = (why: string): never => {
     throw new Error(
       `[EDD-9093] .within() on index "${accessor}" of entity "${entityLike.entityType}": ${why}`,
@@ -1019,10 +1039,10 @@ const planZOrderWithin = <A>(args: {
   const fields = getSchemaFields(args.encoderSource)
   /** `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type. */
   const keyForm = (field: string, value: unknown): unknown => {
-    const converted = compositeKeyForm(field, value)
+    const converted = domainKeyForm(field, value)
     const schema = fields?.[field]
     const expected = schema === undefined ? undefined : keyFormValueKind(schema)
-    if (expected !== undefined && typeof converted !== expected) {
+    if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
       return refuse(
         `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
           `the field's key form is a ${expected}.`,
@@ -1178,27 +1198,21 @@ const planZOrderWithin = <A>(args: {
     return Array.from({ length: Math.max(0, hi - lo + 1) }, (_, i) => lo + i)
   }
   const { box, selections } = (() => {
-    try {
-      const quantized = ZOrderCurve.quantizeBounds(
-        layout,
-        Object.fromEntries(
-          dimensions
-            .filter((dim) => bounded.has(dim.field))
-            .map((dim) => [dim.field, quantizable(dim)]),
-        ),
-      )
-      const selected = new Map(
+    const quantized = ZOrderCurve.quantizeBounds(
+      layout,
+      Object.fromEntries(
         dimensions
-          .filter((dim) => dim.spec.kind === "literals" && bounded.has(dim.field))
-          .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.keyForm)]),
-      )
-      const none = [...selected.values()].some((members) => members.length === 0)
-      return { box: none ? ("empty" as const) : quantized, selections: selected }
-    } catch (error) {
-      // A value that reaches key form but no level (§3.3): thrown, like EDD-9050.
-      if (ZOrderCurve.isZOrderValueError(error)) throw new Error(error.message)
-      throw error
-    }
+          .filter((dim) => bounded.has(dim.field))
+          .map((dim) => [dim.field, quantizable(dim)]),
+      ),
+    )
+    const selected = new Map(
+      dimensions
+        .filter((dim) => dim.spec.kind === "literals" && bounded.has(dim.field))
+        .map((dim) => [dim.field, literalSelection(dim, bounded.get(dim.field)!.keyForm)]),
+    )
+    const none = [...selected.values()].some((members) => members.length === 0)
+    return { box: none ? ("empty" as const) : quantized, selections: selected }
   })()
 
   // -- exact bounds (§11): a FilterExpression where DynamoDB's order agrees, else row checks --
@@ -1393,16 +1407,18 @@ const planZOrderWithin = <A>(args: {
 }
 
 /**
- * The composite key form for an arbitrary entity-like value — the same rule
- * `Entity` applies to its own keys (`internal/CompositeCodec.ts`).
+ * The key form of a caller's DOMAIN record for an arbitrary entity-like value —
+ * the key `put` wrote for those values (`internal/CompositeCodec.ts`,
+ * `makeCompositeDomainKeyForm`), as `Entity._domainKeyForm` composes it.
  */
-const entityKeyForm = (
+const entityDomainKeyForm = (
   entityLike: { readonly model?: unknown; readonly schemas?: { readonly inputSchema?: unknown } },
   record: Record<string, unknown>,
 ): Record<string, unknown> => {
   const source = (entityLike.schemas?.inputSchema ?? entityLike.model) as Schema.Top | undefined
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value) => {
+  const form = makeCompositeDomainKeyForm(source, (attr, value, reason) => {
+    if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
         `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode.`,
@@ -1635,7 +1651,7 @@ export interface DynamoClientService {
 }
 
 /** Static client configuration accepted by {@link DynamoClient.layer}. */
-type ClientConfig = {
+type ClientConfig = ClientOptions & {
   readonly region: string
   readonly endpoint?: string | undefined
   readonly credentials?:
@@ -1644,7 +1660,7 @@ type ClientConfig = {
 }
 
 /** Config-provider client configuration accepted by {@link DynamoClient.layerConfig}. */
-type ClientConfigFromConfig = {
+type ClientConfigFromConfig = ClientOptionsFromConfig & {
   readonly region: Config.Config<string>
   readonly endpoint?: Config.Config<string> | undefined
   readonly credentials?:
@@ -1685,6 +1701,13 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - AWS region
    * @param config.endpoint - Optional endpoint override (e.g., for DynamoDB Local)
    * @param config.credentials - Optional static credentials
+   * @param config.requestHandler - Optional HTTP handler, or the options of the
+   *   runtime's handler (`{ socketTimeout: 5000 }`), passed to the SDK client.
+   *   None is set by default, so without one a connection that stays open and
+   *   never answers keeps a call waiting until it is interrupted. A handler you
+   *   pass is destroyed with the layer.
+   * @param config.maxAttempts - Optional attempts per request, the first
+   *   included, passed to the SDK client (its default is 3)
    * @param config.compressors - Optional compressors for packed storage
    *   (`DynamoModel.Packed` with `compression`). When given, the layer also
    *   provides the `Compression` service built from them. That reaches whatever
@@ -1715,7 +1738,10 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
     ): Layer.Layer<DynamoClient>
   } = (config: ClientConfig & { readonly compressors?: ReadonlyArray<Compressor> | undefined }) =>
     withCompressors(
-      Layer.effect(DynamoClient, buildService(config.region, config.endpoint, config.credentials)),
+      Layer.effect(
+        DynamoClient,
+        buildService(config.region, config.endpoint, config.credentials, config),
+      ),
       config.compressors,
     ) as never
 
@@ -1726,6 +1752,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
    * @param config.region - Config for AWS region
    * @param config.endpoint - Optional Config for endpoint override
    * @param config.credentials - Optional Config for static credentials
+   * @param config.requestHandler - Optional Config for each of the handler's
+   *   timeouts (`connectionTimeout`, `socketTimeout`, `requestTimeout`,
+   *   `throwOnRequestTimeout`), which an operator tunes per environment, or an
+   *   HTTP handler, which is code and is passed as itself. A timeout missing
+   *   from the provider stays unset.
+   * @param config.maxAttempts - Optional Config for the attempts per request
    * @param config.compressors - Optional compressors for packed storage; when
    *   given, the layer also provides the `Compression` service (see {@link layer}
    *   for why a separate `Compression.layer([...])` is the recommended form).
@@ -1756,10 +1788,12 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
           const credentials = config.credentials
             ? yield* Config.option(config.credentials)
             : undefined
+          const options = yield* readClientOptions(config)
           return yield* buildService(
             region,
             endpoint && endpoint._tag === "Some" ? endpoint.value : undefined,
             credentials && credentials._tag === "Some" ? credentials.value : undefined,
+            options,
           )
         }),
       ),
@@ -1790,7 +1824,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
   static readonly make: {
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
-      TAggregates extends Record<string, AggregateType<any, any, any>>,
+      TAggregates extends Record<string, AggregateType<any, any, any, any>>,
       TTables extends Record<string, TableLike>,
     >(config: {
       readonly entities: TEntities
@@ -1807,7 +1841,7 @@ export class DynamoClient extends Context.Service<DynamoClient, DynamoClientServ
 
     <
       TEntities extends Record<string, { readonly _tag: "Entity" }>,
-      TAggregates extends Record<string, AggregateType<any, any, any>>,
+      TAggregates extends Record<string, AggregateType<any, any, any, any>>,
     >(config: {
       readonly entities: TEntities
       readonly aggregates: TAggregates
@@ -1967,7 +2001,7 @@ export interface CollectionQuery<TResult> {
  */
 export type TypedClient<
   TEntities extends Record<string, { readonly _tag: "Entity" }>,
-  TAggregates extends Record<string, AggregateType<any, any, any>> = Record<string, never>,
+  TAggregates extends Record<string, AggregateType<any, any, any, any>> = Record<string, never>,
   TTables extends Record<string, TableLike> = Record<string, TableLike>,
 > = {
   /**
@@ -1997,10 +2031,11 @@ export type TypedClient<
       infer TS,
       infer GenId,
       infer VI,
-      infer P
+      infer P,
+      infer Un
     >
       ? Resolve<
-          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
+          BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
             /** Scan this entity. Returns a BoundQuery for building scan queries. */
             readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
               PathModel<Schema.Schema.Type<M>, P>,
@@ -2023,10 +2058,11 @@ export type TypedClient<
             infer TS,
             infer GenId,
             infer VI,
-            infer P
+            infer P,
+            infer Un
           >
         ? Resolve<
-            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P> & {
+            BoundEntity<M, I, R, ResolveKey<M, I>, TS, Ts, V, GenId, VI, P, Un> & {
               /** Scan this entity. Returns a BoundQuery for building scan queries. */
               readonly scan: () => import("./internal/BoundQuery.js").BoundQuery<
                 PathModel<Schema.Schema.Type<M>, P>,
@@ -2044,9 +2080,10 @@ export type TypedClient<
     readonly [K in keyof TAggregates]: TAggregates[K] extends AggregateType<
       infer S,
       infer TKey,
-      infer TInput
+      infer TInput,
+      infer TCreate
     >
-      ? BoundAggregate<S, TKey, TInput>
+      ? BoundAggregate<S, TKey, TInput, TCreate>
       : never
   }
 
@@ -2372,6 +2409,8 @@ interface EntityLike {
     | undefined
   readonly _schema: DynamoSchema.DynamoSchema
   readonly _tableTag: Context.Service<TableConfig, TableConfig>
+  /** `[EDD-9140]` for the attributes the table's configuration names (its TTL attribute). */
+  readonly _refuseTableAttributes?: ((tableConfig: TableConfig) => void) | undefined
   /** Where a stored row's values key it in an index now (#171). */
   readonly _injectIndex: (name: string, def: IndexDefinition) => void
   readonly _decodeRecord: (raw: Record<string, unknown>) => Effect.Effect<any, any>
@@ -2436,7 +2475,7 @@ const packedFieldConfigs = (
 
 const makeFromConfig = (config: {
   readonly entities: Record<string, EntityType>
-  readonly aggregates?: Record<string, AggregateType<any, any, any>>
+  readonly aggregates?: Record<string, AggregateType<any, any, any, any>>
   readonly tables?: Record<string, TableLike>
   readonly crypto?: SecureRandom.SecureRandom["Service"]
   readonly embedder?: EmbedderService
@@ -2507,6 +2546,15 @@ const makeFromConfig = (config: {
     const provide = <A, E>(
       effect: Effect.Effect<A, E, DynamoClient | TableConfig | SecureRandom.SecureRandom>,
     ): Effect.Effect<A, E, never> => Effect.provide(effect, ctx)
+
+    // A table's TTL attribute is named by its configuration, so an entity that sets it is checked
+    // here, where the table is bound: a row's reader may not take it as a sparse map's entry
+    // (`[EDD-9140]`, as `Entity.make` checks every name the definition supplies).
+    for (const rawEntity of Object.values(config.entities)) {
+      const entityLike = rawEntity as unknown as EntityLike
+      const tableConfig = Option.getOrUndefined(Context.getOption(baseCtx, entityLike._tableTag))
+      if (tableConfig !== undefined) entityLike._refuseTableAttributes?.(tableConfig)
+    }
 
     // Dimension agreement between the Embedder and every bound vector index is
     // a construction-time invariant — a mismatch would otherwise surface as a
@@ -2586,7 +2634,14 @@ const makeFromConfig = (config: {
       // composing keys. The raw model is not equivalent — entity derivation
       // substitutes date/Redacted fields with their wire transforms.
       const encoderSource = entityLike.schemas.inputSchema ?? entityLike.model
-      const compositeKeyForm = makeCompositeKeyForm(encoderSource, (attr, value) => {
+      const unencodable = (attr: string, value: unknown, reason?: string): never => {
+        if (reason !== undefined) {
+          return refuseInexact(
+            `Composite "${attr}" on index "${_indexName}" of entity "${entityLike.entityType}"`,
+            value,
+            reason,
+          )
+        }
         throw new Error(
           `[EDD-9050] Composite "${attr}" on index "${_indexName}" of entity ` +
             `"${entityLike.entityType}" could not be encoded to its stored form. The ` +
@@ -2594,7 +2649,11 @@ const makeFromConfig = (config: {
             `the ENCODED value, but ${JSON.stringify(String(value))} encodes under neither ` +
             `encode nor decode->encode. Supply a value of the attribute's own type.`,
         )
-      })
+      }
+      const compositeKeyForm = makeCompositeKeyForm(encoderSource, unencodable)
+      // The caller's composites and bounds are DOMAIN values: the key `put` wrote for one is
+      // the key form of the value it stores (`Entity._domainKeyForm`).
+      const domainKeyForm = makeCompositeDomainKeyForm(encoderSource, unencodable)
 
       // A Z-order sort key (#171) is a binary address: its prefix composites
       // and dimensions are bounded with `.within()`, never pinned by the
@@ -2609,7 +2668,7 @@ const makeFromConfig = (config: {
         : undefined
       const zorderPlans = zorderLayout === undefined ? undefined : makeZOrderPlans(zorderLayout)
 
-      return (rawComposites: Record<string, unknown>) => {
+      const accessor = (rawComposites: Record<string, unknown>) => {
         if (zorder) {
           const misplaced = indexDef.sk.composite.filter(
             (attr) => rawComposites[attr] !== undefined,
@@ -2624,7 +2683,7 @@ const makeFromConfig = (config: {
           }
         }
         validateQueryComposites(_indexName, accessorDef, rawComposites)
-        const compositesKeyForm = toCompositeKeyRecord(compositeKeyForm, rawComposites)
+        const compositesKeyForm = toCompositeKeyRecord(domainKeyForm, rawComposites)
         // One partition, or a sharded index's several (#183).
         const read = KeyComposer.composeReadPartitions(
           entityLike._schema,
@@ -2813,7 +2872,7 @@ const makeFromConfig = (config: {
             },
             prefixText,
             targetAttr,
-            mapBound(condition, (value) => compositeKeyForm(targetAttr, value)),
+            mapBound(condition, (value) => domainKeyForm(targetAttr, value)),
             { clampToPrefix: pinnedCount > 0 },
           )
         }
@@ -2835,6 +2894,7 @@ const makeFromConfig = (config: {
                     indexDef,
                     encoderSource,
                     compositeKeyForm,
+                    domainKeyForm,
                     pkValue,
                     plans: zorderPlans!,
                     query: q,
@@ -2850,6 +2910,7 @@ const makeFromConfig = (config: {
                     indexDef,
                     encoderSource,
                     compositeKeyForm,
+                    domainKeyForm,
                     pinnedKeyForm: compositesKeyForm,
                     pkValue,
                     query: q,
@@ -2862,6 +2923,26 @@ const makeFromConfig = (config: {
           operation: { name: "Entity.query", target: entityLike.entityType, index: _indexName },
         }
         return new BoundQueryImpl(pinnedQuery, bqConfig)
+      }
+
+      return (rawComposites: Record<string, unknown>) => {
+        const operation = {
+          name: "Entity.query",
+          target: entityLike.entityType,
+          index: _indexName,
+        }
+        return Query.orRefusal(
+          operation,
+          () => accessor(rawComposites) as BoundQueryImpl<unknown, unknown, unknown>,
+          (refusal) =>
+            new BoundQueryImpl(Query.refused(indexDef.index, refusal), {
+              pathBuilder: createPathBuilder(),
+              conditionOps: createConditionOps(),
+              provide,
+              ...entityNaming(entityLike._resolveDbName),
+              operation,
+            }),
+        )
       }
     }
 
@@ -2930,7 +3011,7 @@ const makeFromConfig = (config: {
           )
         }
         const vqConfig: BoundVectorQueryConfig = {
-          keyForm: (record: Record<string, unknown>) => entityKeyForm(entityLike, record),
+          keyForm: (record: Record<string, unknown>) => entityDomainKeyForm(entityLike, record),
           entityType: entityLike.entityType,
           logicalName,
           definition,
@@ -2992,7 +3073,7 @@ const makeFromConfig = (config: {
         members.map((m) => ({ key: m.entityKey, index: m.indexDef })),
       )
 
-      boundCollections[collName] = (composites: Record<string, unknown>) => {
+      const collectionAccessor = (composites: Record<string, unknown>) => {
         // Use the first member for PK composition — verified above to agree
         // with every other member.
         const firstMember = members[0]!
@@ -3040,7 +3121,7 @@ const makeFromConfig = (config: {
           firstMember.entityLike._schema,
           firstMember.entityLike.entityType,
           indexDef,
-          entityKeyForm(firstMember.entityLike, composites),
+          entityDomainKeyForm(firstMember.entityLike, composites),
           { prune: false },
         )
 
@@ -3128,6 +3209,87 @@ const makeFromConfig = (config: {
         }
         return new BoundQueryImpl(query, bqConfig)
       }
+
+      boundCollections[collName] = (composites: Record<string, unknown>) => {
+        const operation = { name: "Collection.query", target: collName }
+        return Query.orRefusal(
+          operation,
+          () => collectionAccessor(composites) as BoundQueryImpl<unknown, unknown, unknown>,
+          (refusal) =>
+            new BoundQueryImpl(Query.refused(members[0]!.indexDef.index, refusal), {
+              pathBuilder: createPathBuilder(),
+              conditionOps: createConditionOps(),
+              provide,
+              operation,
+            }),
+        )
+      }
+    }
+
+    // An aggregate declaring `ownsRows` takes every row of its types in its partition. Refused when
+    // another member this client can see can write such a row there (DESIGN.md §7 "Which rows in
+    // its partition are an aggregate's"): those its table declares, those the client binds, and
+    // those of every table the client binds, on the same physical table (by table, or by the
+    // name it resolves to here). A writer it doesn't see, here or in another process, isn't checked.
+    const tableNameOf = (table: unknown): string | undefined => {
+      // A table's tag is a function.
+      if (
+        table === null ||
+        (typeof table !== "object" && typeof table !== "function") ||
+        !("key" in table)
+      ) {
+        return undefined
+      }
+      return Option.getOrUndefined(
+        Context.getOption(baseCtx, table as Context.Key<TableConfig, TableConfig>),
+      )?.name
+    }
+    // Every entity the client sees: those it binds, then those of every table it binds, named as a
+    // refusal names them. A member may reach the client only as another bound table's.
+    const visible: ReadonlyArray<readonly [name: string, entity: unknown]> = [
+      ...Object.entries(config.entities),
+      ...Object.entries(config.tables ?? {}).flatMap(([tableKey, table]) =>
+        Object.entries(table.entities).map(
+          ([key, entity]) => [`${tableKey}.${key}`, entity] as const,
+        ),
+      ),
+    ]
+    // And every aggregate it sees, the same way.
+    const visibleAggregates: ReadonlyArray<readonly [name: string, aggregate: unknown]> = [
+      ...Object.entries(config.aggregates ?? {}),
+      ...Object.entries(config.tables ?? {}).flatMap(([tableKey, table]) =>
+        Object.entries(
+          (table as { readonly aggregates?: Record<string, unknown> }).aggregates ?? {},
+        ).map(([key, aggregate]) => [`${tableKey}.${key}`, aggregate] as const),
+      ),
+    ]
+    const visibleMembers = [...visible, ...visibleAggregates].map(([name, member]) => ({
+      name,
+      member,
+    }))
+    // The owners checked are the aggregates it sees, from the same list: `rekey` runs the handler of
+    // a table's aggregate the client doesn't bind itself. Each once, by the first name it has.
+    const checked = new Set<unknown>()
+    for (const [key, aggregate] of visibleAggregates) {
+      if ((aggregate as { readonly _ownsRows?: boolean })._ownsRows !== true) continue
+      if (checked.has(aggregate)) continue
+      checked.add(aggregate)
+      const own = (aggregate as { readonly _tableTag?: { readonly key: string } })._tableTag
+      const ownName = tableNameOf(own)
+      const conflict = ownershipConflict(aggregate, visibleMembers, (table) => {
+        if (table === own) return true
+        const keyOf = (t: unknown) => (t as { readonly key?: unknown } | undefined)?.key
+        if (keyOf(table) !== undefined && keyOf(table) === keyOf(own)) return true
+        return ownName !== undefined && tableNameOf(table) === ownName
+      })
+      if (conflict !== undefined) {
+        throw new Error(
+          `[EDD-9130] Aggregate "${key}" declares \`ownsRows\`, but "${conflict.member}" can write ` +
+            `a row of type "${conflict.type}" into its partition (${conflict.channel}). ` +
+            `\`ownsRows\` would take that row for the aggregate's: leave it off, or keep ` +
+            `"${conflict.member}"'s rows out of the aggregate's partition.`,
+        )
+      }
     }
 
     // 4. Bind aggregates
@@ -3144,53 +3306,102 @@ const makeFromConfig = (config: {
     const client = yield* DynamoClient
     const tables: Record<string, TableOperations> = {}
 
+    // The entities the client sees (`visible`) are where `rekey` finds the outboxes of their
+    // projections. `entities` comes first, so the read models it found before keep their order.
+    const visibleEntities: ReadonlyArray<unknown> = visible.map(([, entity]) => entity)
+    const named = visible.map(([name, entity]) => [`"${name}"`, entity] as const)
+    yield* refuseSharedOutboxKeySpace("DynamoClient.make", named)
+
     // `rekey` (#171) hands each row to the member owning it: the table's
     // entities and aggregates, those the client binds on the same table, and
     // the streams the caller passes (`DynamoClient.make` binds no streams).
     const rekeyFor =
       (tableName: string, tagKey: string, registered: ReadonlyArray<unknown>) =>
-      (options?: RekeyOptions): Effect.Effect<RekeyReport, DynamoClientError | ValidationError> => {
-        const onTable = (member: unknown) =>
-          (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key === tagKey
-        const handlers = new Set<Rekey.RekeyMember>()
-        for (const member of [
-          ...registered,
-          ...Object.values(config.entities).filter(onTable),
-          ...Object.values(config.aggregates ?? {}).filter(onTable),
-          ...(options?.streams ?? []),
-        ]) {
-          const handler = Rekey.handlerOf(member)
-          if (handler !== undefined) handlers.add(handler)
-        }
-        // A projection's outbox on this table, of a read model on another (#171).
-        const outboxOf = new Set<unknown>()
-        for (const entity of [...registered, ...Object.values(config.entities)]) {
-          const outbox = (
-            entity as {
-              readonly _projectionOutbox?: {
-                readonly table: { readonly Tag: { readonly key: string } }
-                readonly pk: string
-                readonly sk: string
-              }
+      (options?: RekeyOptions): Effect.Effect<RekeyReport, DynamoClientError | ValidationError> =>
+        provide(
+          Effect.gen(function* () {
+            const onTable = (member: unknown) =>
+              (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key ===
+              tagKey
+            const handlers = new Set<Rekey.RekeyMember>()
+            const tableMembers = [
+              ...registered,
+              ...Object.values(config.entities).filter(onTable),
+              ...Object.values(config.aggregates ?? {}).filter(onTable),
+            ]
+            for (const member of [...tableMembers, ...(options?.streams ?? [])]) {
+              const handler = Rekey.handlerOf(member)
+              if (handler !== undefined) handlers.add(handler)
             }
-          )._projectionOutbox
-          if (outbox === undefined || outbox.table.Tag.key !== tagKey || outboxOf.has(entity)) {
-            continue
-          }
-          outboxOf.add(entity)
-          const readModel = entity as unknown as Pick<
-            EntityType,
-            "entityType" | "_rekeyProjectionRow"
-          >
-          handlers.add({
-            name: readModel.entityType,
-            types: [`${readModel.entityType}#outbox`],
-            row: (row, ctx) =>
-              readModel._rekeyProjectionRow(row, ctx, { pk: outbox.pk, sk: outbox.sk }),
-          })
-        }
-        return provide(Rekey.run({ tableName, members: [...handlers], options }))
-      }
+            // The read models whose outboxes are on this table are checked before anything is
+            // sent: `rekey` reads an item's key back by its key space, so two whose keys could be
+            // read as each other's are refused here, where `DynamoClient.make` refuses only those
+            // whose items would overwrite each other in normal operation, and so is a member of
+            // this table that would read a read model's items as its own. Projections are defined
+            // when the program runs them, so one defined after the client was made has its outbox
+            // recorded only now. A run's refusal is the run's `ValidationError`.
+            const shared = yield* sharedOutboxKeySpace("rekey", named, {
+              key: tagKey,
+              name: tableName,
+              members: [...new Set(tableMembers)].map(
+                (member) =>
+                  [
+                    named.find(([, entity]) => entity === member)?.[0] ??
+                      `"${(member as { readonly entityType?: string }).entityType}"`,
+                    member,
+                  ] as const,
+              ),
+            })
+            if (shared !== undefined) {
+              return yield* new ValidationError({
+                entityType: "Table",
+                operation: "rekey",
+                cause: shared,
+              })
+            }
+            // The outboxes on this table of a read model on another (#171): every projection's, so
+            // a second projection of one read model doesn't hide the first's items, named by this
+            // table's service or by another handle on the same physical table. A read model's
+            // projections may have one each, on tables of their own.
+            const outboxOf = new Set<unknown>()
+            for (const entity of [...registered, ...visibleEntities]) {
+              if (outboxOf.has(entity)) continue
+              outboxOf.add(entity)
+              // Their key attributes, once each.
+              const layouts = new Map<string, { readonly pk: string; readonly sk: string }>()
+              for (const outbox of remoteOutboxesOf(entity)) {
+                if (
+                  outbox.table.Tag.key !== tagKey &&
+                  (yield* physicalTableName(outbox.table.Tag)) !== tableName
+                ) {
+                  continue
+                }
+                layouts.set(`${outbox.pk}\u0000${outbox.sk}`, { pk: outbox.pk, sk: outbox.sk })
+              }
+              if (layouts.size === 0) continue
+              const keys = [...layouts.values()]
+              const readModel = entity as unknown as Pick<
+                EntityType,
+                "entityType" | "_rekeyProjectionRow"
+              >
+              handlers.add({
+                name: readModel.entityType,
+                types: [`${readModel.entityType}#outbox`],
+                // A table has one key schema, so its items are under the layout whose attributes
+                // they hold.
+                row: (row, ctx) =>
+                  readModel._rekeyProjectionRow(
+                    row,
+                    ctx,
+                    keys.find(
+                      (key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined,
+                    ) ?? keys[0]!,
+                  ),
+              })
+            }
+            return yield* Rekey.run({ tableName, members: [...handlers], options })
+          }),
+        )
 
     if (config.tables) {
       for (const [tableKey, table] of Object.entries(config.tables)) {
@@ -3243,7 +3454,7 @@ const makeFromConfig = (config: {
         {
           tag: EntityLike["_tableTag"]
           entities: EntityLike[]
-          aggregates: AggregateType<any, any, any>[]
+          aggregates: AggregateType<any, any, any, any>[]
         }
       >()
       for (const [, entity] of Object.entries(config.entities)) {
@@ -3619,170 +3830,178 @@ const buildService = (
   region: string,
   endpoint: string | undefined,
   credentials: { readonly accessKeyId: string; readonly secretAccessKey: string } | undefined,
+  options: ClientOptions,
 ) =>
   Effect.gen(function* () {
     const clientConfig: ConstructorParameters<typeof DynamoDBClient>[0] = { region }
     if (endpoint !== undefined) clientConfig.endpoint = endpoint
     if (credentials !== undefined) clientConfig.credentials = credentials
-    const client = yield* Effect.acquireRelease(
-      Effect.sync(() => new DynamoDBClient(clientConfig)),
-      (c) => Effect.sync(() => c.destroy()),
-    )
+    if (options.requestHandler !== undefined) clientConfig.requestHandler = options.requestHandler
+    if (options.maxAttempts !== undefined) clientConfig.maxAttempts = options.maxAttempts
+    const client = yield* acquireSdkClient(() => new DynamoDBClient(clientConfig))
     return {
       createTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new CreateTableCommand(input)),
+          try: (signal) => client.send(new CreateTableCommand(input), { abortSignal: signal }),
           catch: classifyError("CreateTable"),
         }),
       deleteTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DeleteTableCommand(input)),
+          try: (signal) => client.send(new DeleteTableCommand(input), { abortSignal: signal }),
           catch: classifyError("DeleteTable"),
         }),
       describeTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeTableCommand(input)),
+          try: (signal) => client.send(new DescribeTableCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeTable"),
         }),
       putItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new PutItemCommand(input)),
+          try: (signal) => client.send(new PutItemCommand(input), { abortSignal: signal }),
           catch: classifyError("PutItem"),
         }),
       getItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new GetItemCommand(input)),
+          try: (signal) => client.send(new GetItemCommand(input), { abortSignal: signal }),
           catch: classifyError("GetItem"),
         }),
       deleteItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DeleteItemCommand(input)),
+          try: (signal) => client.send(new DeleteItemCommand(input), { abortSignal: signal }),
           catch: classifyError("DeleteItem"),
         }),
       updateItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateItemCommand(input)),
+          try: (signal) => client.send(new UpdateItemCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateItem"),
         }),
       query: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new QueryCommand(input)),
+          try: (signal) => client.send(new QueryCommand(input), { abortSignal: signal }),
           catch: classifyError("Query"),
         }),
       scan: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ScanCommand(input)),
+          try: (signal) => client.send(new ScanCommand(input), { abortSignal: signal }),
           catch: classifyError("Scan"),
         }),
       searchVectors: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new SearchVectorsCommand(input)),
+          try: (signal) => client.send(new SearchVectorsCommand(input), { abortSignal: signal }),
           catch: classifyError("SearchVectors"),
         }),
       batchGetItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new BatchGetItemCommand(input)),
+          try: (signal) => client.send(new BatchGetItemCommand(input), { abortSignal: signal }),
           catch: classifyError("BatchGetItem"),
         }),
       batchWriteItem: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new BatchWriteItemCommand(input)),
+          try: (signal) => client.send(new BatchWriteItemCommand(input), { abortSignal: signal }),
           catch: classifyError("BatchWriteItem"),
         }),
       transactGetItems: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new TransactGetItemsCommand(input)),
+          try: (signal) => client.send(new TransactGetItemsCommand(input), { abortSignal: signal }),
           catch: classifyError("TransactGetItems"),
         }),
       transactWriteItems: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new TransactWriteItemsCommand(input)),
+          try: (signal) =>
+            client.send(new TransactWriteItemsCommand(input), { abortSignal: signal }),
           catch: classifyError("TransactWriteItems"),
         }),
       // --- Table management ---
       updateTable: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateTableCommand(input)),
+          try: (signal) => client.send(new UpdateTableCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateTable"),
         }),
       listTables: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ListTablesCommand(input)),
+          try: (signal) => client.send(new ListTablesCommand(input), { abortSignal: signal }),
           catch: classifyError("ListTables"),
         }),
       // --- Backup ---
       createBackup: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new CreateBackupCommand(input)),
+          try: (signal) => client.send(new CreateBackupCommand(input), { abortSignal: signal }),
           catch: classifyError("CreateBackup"),
         }),
       deleteBackup: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DeleteBackupCommand(input)),
+          try: (signal) => client.send(new DeleteBackupCommand(input), { abortSignal: signal }),
           catch: classifyError("DeleteBackup"),
         }),
       listBackups: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ListBackupsCommand(input)),
+          try: (signal) => client.send(new ListBackupsCommand(input), { abortSignal: signal }),
           catch: classifyError("ListBackups"),
         }),
       restoreTableFromBackup: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new RestoreTableFromBackupCommand(input)),
+          try: (signal) =>
+            client.send(new RestoreTableFromBackupCommand(input), { abortSignal: signal }),
           catch: classifyError("RestoreTableFromBackup"),
         }),
       // --- PITR ---
       describeContinuousBackups: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeContinuousBackupsCommand(input)),
+          try: (signal) =>
+            client.send(new DescribeContinuousBackupsCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeContinuousBackups"),
         }),
       updateContinuousBackups: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateContinuousBackupsCommand(input)),
+          try: (signal) =>
+            client.send(new UpdateContinuousBackupsCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateContinuousBackups"),
         }),
       restoreTableToPointInTime: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new RestoreTableToPointInTimeCommand(input)),
+          try: (signal) =>
+            client.send(new RestoreTableToPointInTimeCommand(input), { abortSignal: signal }),
           catch: classifyError("RestoreTableToPointInTime"),
         }),
       // --- Export ---
       exportTableToPointInTime: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ExportTableToPointInTimeCommand(input)),
+          try: (signal) =>
+            client.send(new ExportTableToPointInTimeCommand(input), { abortSignal: signal }),
           catch: classifyError("ExportTableToPointInTime"),
         }),
       describeExport: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeExportCommand(input)),
+          try: (signal) => client.send(new DescribeExportCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeExport"),
         }),
       // --- TTL ---
       updateTimeToLive: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UpdateTimeToLiveCommand(input)),
+          try: (signal) => client.send(new UpdateTimeToLiveCommand(input), { abortSignal: signal }),
           catch: classifyError("UpdateTimeToLive"),
         }),
       describeTimeToLive: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new DescribeTimeToLiveCommand(input)),
+          try: (signal) =>
+            client.send(new DescribeTimeToLiveCommand(input), { abortSignal: signal }),
           catch: classifyError("DescribeTimeToLive"),
         }),
       // --- Tags ---
       tagResource: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new TagResourceCommand(input)),
+          try: (signal) => client.send(new TagResourceCommand(input), { abortSignal: signal }),
           catch: classifyError("TagResource"),
         }),
       untagResource: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new UntagResourceCommand(input)),
+          try: (signal) => client.send(new UntagResourceCommand(input), { abortSignal: signal }),
           catch: classifyError("UntagResource"),
         }),
       listTagsOfResource: (input) =>
         Effect.tryPromise({
-          try: () => client.send(new ListTagsOfResourceCommand(input)),
+          try: (signal) =>
+            client.send(new ListTagsOfResourceCommand(input), { abortSignal: signal }),
           catch: classifyError("ListTagsOfResource"),
         }),
     } satisfies DynamoClientService

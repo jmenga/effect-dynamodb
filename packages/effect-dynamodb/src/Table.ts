@@ -920,9 +920,16 @@ export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
  *   or it is an outbox item on another table than its read model's, of a
  *   projection not defined where `rekey` runs
  * - `unrecognizedKey` — its member's, but stored neither under the key its
- *   values compose now nor under the one 1.36 composed for them
+ *   values compose now nor under the one 1.36 composed for them. When several
+ *   members claim its `__edd_e__` (read models of one entity type in different
+ *   schemas or primary collections, whose outboxes share a table), none of them
+ *   reads its key back
+ * - `rootNotSeen` — a row of an aggregate with no root in its partition, met by
+ *   a run that didn't read the whole table (`maxPages` or `resume`). A root at
+ *   its old key on a page the run didn't read could still claim it, so nothing
+ *   is said of it. A run over the whole table judges it: a dry run will do
  */
-export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
+export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" | "rootNotSeen"
 
 /**
  * A row `rekey` did not move, and why. A row is moved only where nothing is
@@ -937,19 +944,55 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey"
  * - `failed` — it could not be moved as stored (its values no longer decode,
  *   a stream id reads as more than one id, or a write was refused);
  *   `message` says why
- * - `uncomposable` — its key on a sharded index is from another layout, and its
- *   values can't compose a current one (a `by` attribute was cleared) (#183)
+ * - `uncomposable` — its values can't compose a current key: a composite holds a
+ *   value with no key text (`NaN`) or one no form of its schema takes
+ *   (`EDD-9050`); `message` says which. Or its key on a sharded index is from
+ *   another layout, and its values can't compose a current one (a `by`
+ *   attribute was cleared) (#183)
+ * - `unguarded` — it can't be proven unchanged when it moves: guarded whole, it's
+ *   over DynamoDB's limits on one expression, and it has no version or
+ *   `updatedAt` to stand in (its member is neither `versioned` nor `timestamps`,
+ *   or it's a stream's row or a projection's row tombstone or outbox item). A
+ *   write landing between the read and the move would be lost, so it's left, in
+ *   a dry run too (for an aggregate or a stream nothing of which has moved, every
+ *   row of it; one already part-moved is finished under the strongest guard that
+ *   fits, as on 1.39.0). Stop writes to the table and run with
+ *   {@link RekeyOptions.writesStopped}
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */
   readonly member: string
   readonly kind: RekeyRowKind
-  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable"
+  readonly reason: "bothKeys" | "taken" | "contended" | "failed" | "uncomposable" | "unguarded"
   /** The row's primary key, as stored. */
   readonly key: Readonly<Record<string, unknown>>
   /** Its current key: where it would move. */
   readonly target: Readonly<Record<string, unknown>> | undefined
   readonly message: string
+}
+
+/**
+ * The index keys of live items that aren't what a `put` of their stored values writes (#185). Keys,
+ * not rows: a row can count more than once. The first four are counted on every run, for no extra
+ * read, and the last two only with {@link RekeyOptions.repairIndexKeys}.
+ *
+ * - `missing` — every composite is on the row, and no key
+ * - `truncated` — every composite is on the row, and the key stops at a leading run of them
+ * - `lagging` — the key holds other values: a composite changed under `preserve`, or a `sparse` half
+ *   holds a key its values no longer compose
+ * - `ambiguous` — a `sparse` half with no key and two or more composites outside the primary key on
+ *   the row. A writer naming only a later composite takes a row out of the index on purpose, and
+ *   that leaves the same bytes, so these are never written
+ * - `repaired` — keys written, or with `dryRun`, keys that would be
+ * - `skipped` — keys a writer changed the row under, twice: the writer won
+ */
+export interface RekeyIndexKeys {
+  readonly missing: number
+  readonly truncated: number
+  readonly lagging: number
+  readonly ambiguous: number
+  readonly repaired: number
+  readonly skipped: number
 }
 
 /** One member's share of a {@link RekeyReport}. */
@@ -959,6 +1002,7 @@ export interface RekeyMemberReport {
   readonly indexKeysRewritten: number
   readonly sentinelsMoved: number
   readonly conflicts: number
+  readonly indexKeys: RekeyIndexKeys
 }
 
 /**
@@ -983,6 +1027,8 @@ export interface RekeyReport {
   readonly indexKeysRewritten: number
   /** Unique-constraint sentinels moved to their current keys. */
   readonly sentinelsMoved: number
+  /** Index keys that aren't what a `put` of their row's values writes: {@link RekeyIndexKeys}. */
+  readonly indexKeys: RekeyIndexKeys
   /** Rows left where they are — see {@link RekeyConflict}. */
   readonly conflicts: ReadonlyArray<RekeyConflict>
   /** Rows no member owns, by reason. */
@@ -1002,11 +1048,27 @@ export interface RekeyReport {
 /** Options for `db.tables.<Table>.rekey()`. */
 export interface RekeyOptions {
   /**
-   * Count what would move, reading but writing nothing. Default `false`. Each row is
-   * judged on its own, so a row whose destination is held by a row that can't move
-   * may be predicted as moved.
+   * Count what would move, reading but writing nothing. Default `false`. What holds a
+   * row's destination is judged too, so what would stop the row stops it here as well.
    */
   readonly dryRun?: boolean | undefined
+  /**
+   * Also write the index keys {@link RekeyReport.indexKeys} finds differing, except `ambiguous`
+   * ones. Default `false`: the run counts them and writes nothing new. Each row is one conditional
+   * `UpdateItem`, guarded on every key it writes and every composite it composes them from as read,
+   * so a writer changing any of them wins; on a failed condition the row is read once and judged
+   * again, then counted in `skipped`. A table with nothing to repair costs the scan alone.
+   */
+  readonly repairIndexKeys?: boolean | undefined
+  /**
+   * Writes to the table are stopped for this run. A row `rekey` can't prove unchanged when it
+   * moves (`unguarded`: too wide to guard whole, with no version or stamped `updatedAt` to stand in) then
+   * moves under the strongest guard that fits, as on 1.39.0. Default `false`: such a row is
+   * left where it is and reported `unguarded`, since a write landing between the read and the move
+   * would be lost, unless its aggregate or stream is already part-moved. Run with this only while
+   * nothing else writes to the table.
+   */
+  readonly writesStopped?: boolean | undefined
   /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */
   readonly segments?: number | undefined
   /** Rows of one scan page handled at once, per segment. Default 4. */

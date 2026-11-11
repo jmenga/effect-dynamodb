@@ -17,6 +17,7 @@ import type * as DynamoSchemaModule from "@effect-dynamodb/schema/DynamoSchema.j
 import {
   composeCollectionKey,
   composeKey,
+  composeUniqueKey,
   KEY_DELIMITER,
 } from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EntityDefinition } from "@effect-dynamodb/schema/Entity.js"
@@ -30,29 +31,46 @@ import {
   type ItemNotFound,
   isAwsTransactionCancelled,
   RefNotFound,
+  TRANSACT_WRITE_ITEMS_LIMIT,
   TransactionCancelled,
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import {
+  fieldAtPath,
+  type KindTargets,
+  kindReadingOf,
+  kindTargets,
   makeCompositeKeyForm,
+  readBackAs,
+  readBackUnsure,
+  readsBackOtherwise,
+  refuseInexact,
+  storedNaNKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import {
   buildDateTransform,
   containsWireTransform,
+  type DeepSubstitutionOptions,
   matchDateRepresentation,
   optionalField,
   resolveSystemFields,
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
+import { readingInstances } from "@effect-dynamodb/schema/internal/InstanceReads.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { KeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import { isDispatchEligible } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import {
   extractArrayElement,
+  extractKeyedValue,
   getSchemaFields,
   hasEncodingTransformation,
+  holdsCustomDeclaration,
+  refuseUnreadable,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
@@ -61,6 +79,7 @@ import {
   DateTime,
   Effect,
   Equal,
+  Exit,
   type Optic,
   Option,
   Schema,
@@ -70,6 +89,7 @@ import * as Batch from "./Batch.js"
 import type { DynamoClient, DynamoClientError, DynamoClientService } from "./DynamoClient.js"
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
 import * as Capacity from "./internal/Capacity.js"
+import { decodeKeyCursor, encodeKeyCursor } from "./internal/Cursor.js"
 import {
   type CompileResult,
   type ConditionOps,
@@ -81,11 +101,28 @@ import {
   isEmptyExpr,
   parseSimpleShorthand,
 } from "./internal/Expr.js"
-import { asReadGuard } from "./internal/ExpressionLimits.js"
+import {
+  asReadGuard,
+  preferredGuard,
+  type UnprovableRow,
+  wholeRowGuard,
+} from "./internal/ExpressionLimits.js"
+import { packRequests, transactWriteShape, transactWriteUnit } from "./internal/ItemSize.js"
 import { hasStoredForm, packItemSync, unpackItemSync, withRegistry } from "./internal/Packed.js"
 import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
-import { generateTimestampPrimitive } from "./internal/TransactableOps.js"
+import { asRead, notReadBack, notStoredForm, readBackRefusal } from "./internal/RoundTrip.js"
+import {
+  composePrimaryKeyOrFail,
+  generateTimestampPrimitive,
+  INCARNATION_TOKEN,
+  KEY_TEXT,
+  marshalOrFail,
+  OUTBOX_CLAIM,
+  OUTBOX_CLAIMED_UNTIL,
+  OUTBOX_ROW_PK,
+  OUTBOX_ROW_SK,
+} from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
   diagnosedValidationError,
@@ -96,7 +133,12 @@ import {
   transactItemTarget,
   withCause,
 } from "./internal/WriteDiagnosis.js"
-import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
+import {
+  fromAttributeMap,
+  toAttributeMap,
+  toAttributeValue,
+  type UnstorableValue,
+} from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
 export type {
@@ -132,6 +174,7 @@ export {
   unwrapModel,
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 export type {
+  AggregateCreateInputType,
   AggregateInputType,
   BoundSubAggregate,
   Input,
@@ -150,12 +193,32 @@ import type { AggregateEdge, RefEntity } from "@effect-dynamodb/schema/internal/
 import {
   deriveAggregateSchemas,
   deriveEntityFieldName,
+  elementHoldsRef,
+  given,
+  holdsRefId,
+  isEntityElement,
+  isFieldOptional,
+  manyEdgePaths,
+  manyElementFields,
+  manyElementSchema,
+  refIdField,
+  refIdValue,
+  refKeyComposite,
+  refKeyComposites,
+  refuseAggregateKeyOverMovingValue,
+  refuseAggregateKeysOverBothKinds,
+  refuseManySortKeysOverMovingValue,
+  resolveAggregateStamps,
+  unwrapModel,
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import type {
+  AggregateCreateInputType,
   AggregateEdgesConfig,
   AggregateEdgesGuard,
   AggregateInputType,
+  AggregateStampNames,
   BoundSubAggregate,
+  SchemaFieldsOf,
   SubAggregate,
 } from "@effect-dynamodb/schema/internal/AggregateTypes.js"
 import type { ModelFieldName } from "@effect-dynamodb/schema/internal/EntityTypes.js"
@@ -180,6 +243,10 @@ export type TypeId = typeof SchemaAggregateTypeId
 interface ResolvedNode {
   readonly fieldName: string | null // null for root
   readonly entityType: string
+  /** The fields of the value this node's rows hold: what they declare. */
+  readonly ownFields?: Record<string, Schema.Top> | undefined
+  /** What this node's rows do with each timestamp. Undefined without `timestamps`. */
+  readonly rowStamps?: RowStamps | undefined
   /**
    * Edge attributes stored packed (#147): the edge entity's
    * `storedAs: DynamoModel.Packed` fields that are top-level attributes of this
@@ -202,6 +269,12 @@ interface ResolvedNode {
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   /**
+   * `many` edges with a custom `decompose` only: the value that `decompose` is handed on a write,
+   * the caller's own value read as 1.39.0 read it (see {@link storedFormFirst}). Undefined where
+   * that's the value itself.
+   */
+  readonly decomposeInput?: ((written: Written) => Option.Option<unknown>) | undefined
+  /**
    * Per-attribute encoders for this node's items, applied on the WRITE path
    * (decompose) so every value with a wire form — a date, a transformed scalar,
    * or a container or hydrated ref holding one — is put into it before
@@ -210,7 +283,7 @@ interface ResolvedNode {
    * sub-aggregate's own schema. Undefined for the root, whose attributes are
    * encoded directly by `decomposeAggregate`.
    */
-  readonly attrEncoders?: Record<string, (value: unknown) => unknown> | undefined
+  readonly attrEncoders?: AttrEncoders | undefined
   /**
    * `many` edges only: the encoders whose output the edge's sort-key composites
    * are read from. These are the pre-#133 encoders, kept separate from
@@ -266,7 +339,11 @@ export interface ListOptions<Model = Record<string, unknown>> {
    * request can return nothing and the loop simply asks again.
    */
   readonly pageSize?: number
-  /** Opaque cursor from a previous list call to resume pagination */
+  /**
+   * Opaque cursor from a previous list call to resume pagination. One that
+   * can't be decoded fails with a `ValidationError` (`[EDD-9094]`,
+   * `operation: "list"`); nothing is sent.
+   */
   readonly cursor?: string
   /**
    * `FilterExpression` applied to the **root-item** query, server-side.
@@ -340,6 +417,20 @@ export type AggregateWriteError =
 export type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
 
 /**
+ * What `create` takes for an input of type `I`. An input typed with a string index signature
+ * (`Record<string, unknown>`, parsed JSON, a value built at run time) is taken as it is and judged
+ * at run time, as 1.39.0's `create` took every input. Any other input (an object literal, a value
+ * of a precise type) is checked against `TCreate`, `create`'s input type, which refuses only what
+ * 1.39.0's `create` failed on at run time. An input `TCreate` takes is taken with keys it doesn't
+ * declare, at any depth, which `create` ignores, as 1.39.0's did: in an object literal too.
+ */
+export type CreateArgument<I, TCreate> = string extends keyof I
+  ? I
+  : [I] extends [TCreate]
+    ? I
+    : TCreate
+
+/**
  * An operational aggregate — returned by `Aggregate.make` with full config.
  * Provides `get`, `create`, `update`, and `delete` for full CRUD lifecycle.
  */
@@ -347,6 +438,9 @@ export interface Aggregate<
   TSchema extends Schema.Top,
   TKey extends Record<string, unknown>,
   TInput = unknown,
+  // `any` by default, so a type written with three arguments names every aggregate, whatever
+  // its `create` takes, and code calling `create` through it compiles as before.
+  TCreate = any,
 > {
   readonly [TypeId]: TypeId
   readonly _tag: "Aggregate"
@@ -365,6 +459,18 @@ export interface Aggregate<
    * the registry it binds with (`[EDD-9078]`).
    */
   readonly _packedByType?: ReadonlyMap<string, Readonly<Record<string, DynamoModel.PackedConfig>>>
+
+  /** @internal Whether the aggregate declares `ownsRows`. */
+  readonly _ownsRows?: boolean
+
+  /**
+   * @internal The attributes this aggregate writes on its rows: what an aggregate declaring
+   * `ownsRows` checks at bind (DESIGN.md §7 "Which rows in its partition are an aggregate's").
+   */
+  readonly _attributeWriters?: ReadonlyArray<AttributeWriter>
+
+  /** @internal What `DynamoClient.make` checks this aggregate's `ownsRows` against. */
+  readonly _ownership?: Ownership
 
   /** Primary key field name (e.g., "pk") */
   readonly pkField: string
@@ -400,13 +506,16 @@ export interface Aggregate<
   >
 
   /**
-   * Create a new aggregate from input data.
-   * Ref fields accept IDs (e.g., `venueId` instead of `venue: Venue`).
-   * Refs are hydrated automatically via the `refs` config.
-   * Items are written via sub-aggregate transaction groups.
+   * Create a new aggregate from input data, typed as `create` takes it
+   * ({@link AggregateCreateInputType}): the aggregate's key composites and its fields, an edge
+   * whose entity one id names given its id (`venueId` instead of `venue: Venue`) or the entity
+   * whole. Each id is fetched and hydrated. Items are written via sub-aggregate transaction groups.
+   *
+   * An input typed with a string index signature (`Record<string, unknown>`, parsed JSON) is taken
+   * as it is and judged at run time ({@link CreateArgument}).
    */
-  readonly create: (
-    input: Record<string, unknown>,
+  readonly create: <const I = TCreate>(
+    input: CreateArgument<I, TCreate>,
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, DynamoClient | TableConfig>
 
   /**
@@ -443,7 +552,8 @@ export interface Aggregate<
    *
    * Supports cursor-based pagination via `options.limit` and `options.cursor`.
    * When `limit` is specified, returns at most that many aggregates plus a cursor
-   * for the next page. Without `limit`, returns all matching aggregates.
+   * for the next page. Without `limit`, returns all matching aggregates. A
+   * cursor that can't be decoded fails with `EDD-9094`.
    *
    * `options.filter` adds a server-side `FilterExpression` to the root-item
    * query; `limit` still means "this many aggregates", the loop accumulating
@@ -502,6 +612,9 @@ export interface BoundAggregate<
   TSchema extends Schema.Top,
   TKey extends Record<string, unknown>,
   TInput = unknown,
+  // `any` by default, so a type written with three arguments names every aggregate, whatever
+  // its `create` takes, and code calling `create` through it compiles as before.
+  TCreate = any,
 > {
   readonly schema: TSchema
 
@@ -513,8 +626,9 @@ export interface BoundAggregate<
     never
   >
 
-  readonly create: (
-    input: Record<string, unknown>,
+  /** {@link Aggregate.create}, with its services resolved. */
+  readonly create: <const I = TCreate>(
+    input: CreateArgument<I, TCreate>,
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, never>
 
   readonly update: (
@@ -664,6 +778,21 @@ interface AggregateConfig<
    * rather than `UpdateItem`.
    */
   readonly timestamps?: TimestampsConfig
+  /**
+   * Every row of this aggregate's entity types (its root's, its edges', its sub-aggregates') in its
+   * partition is its own (DESIGN.md §7 "Which rows in its partition are an aggregate's"). Off by
+   * default: `update` deletes and `rekey` moves only the rows the aggregate's value keys, as 1.39.0
+   * did, and a row a custom `decompose` left under a key it no longer composes stays.
+   *
+   * With it, after its transactions `update` also deletes every other row it read of each node that
+   * changed and that the new state doesn't write, in requests of its own (each Delete conditioned
+   * on the row being gone or still of the type read). `rekey` moves what it moves without it, and
+   * reports any other row of its types: `failed` when the row's own partition key changes,
+   * `unrecognizedKey` otherwise. `DynamoClient.make` refuses the aggregate (`EDD-9130`) when another
+   * member it can see can write a row of one of its types into its partition; a writer it doesn't
+   * bind, here or in another process, isn't seen.
+   */
+  readonly ownsRows?: boolean
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }
@@ -688,15 +817,30 @@ export function make<
   TSchema extends Schema.Top,
   const TEdges extends AggregateEdgesConfig<TSchema>,
   const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
+  const TTimestamps extends TimestampsConfig | undefined = undefined,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK> & {
     readonly edges: AggregateEdgesGuard<TSchema, TEdges>
+    readonly timestamps?: TTimestamps
   },
 ): Aggregate<
   TSchema,
   Record<string, unknown>,
-  AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>
+  AggregateInputType<
+    Schema.Schema.Type<TSchema>,
+    TEdges,
+    TPK,
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
+  >,
+  AggregateCreateInputType<
+    Schema.Schema.Type<TSchema>,
+    TEdges,
+    TPK,
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
+  >
 >
 export function make<
   TSchema extends Schema.Top,
@@ -716,7 +860,10 @@ export function make<
 export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
-): SubAggregate<TSchema> | Aggregate<TSchema, Record<string, unknown>> {
+): SubAggregate<TSchema> | Aggregate<TSchema, Record<string, unknown>, unknown, any> {
+  refuseUnreadable(`Aggregate "${config.root.entityType}"`, "aggregate", unwrapModel(schema), {
+    manyEdges: manyEdgePaths(config.edges),
+  })
   if (!("table" in config) || config.table === undefined) {
     // Sub-aggregate form
     return makeSubAggregate(schema, config as SubAggregateConfig)
@@ -758,42 +905,39 @@ type ASTNode = Record<string, unknown> & {
 }
 
 /**
- * Infer date encoding from a schema AST, handling Schema.optional() wrappers.
+ * The date encodings a schema AST holds, handling Schema.optional() wrappers: one, or one per date
+ * member of a union, in the order they're declared.
  * Optional fields have Union AST with [InnerType, Undefined] — unwrap to find dates.
  */
-const inferDateEncoding = (ast: Schema.Top["ast"]): DynamoEncoding | undefined => {
+const inferDateEncodings = (ast: Schema.Top["ast"]): ReadonlyArray<DynamoEncoding> => {
   // Try SchemaAST.resolve first (works for non-optional date fields)
   const resolved = SchemaAST.resolve(ast) as ASTNode | undefined
   if (resolved) {
     const direct = matchDateRepresentation(resolved)
-    if (direct) return direct
+    if (direct) return [direct]
   }
   // Handle optional wrapper: Union with Undefined + inner type.
   // SchemaAST.resolve returns undefined for Union ASTs, so check the raw AST.
   const rawAst = ast as unknown as ASTNode
-  if (rawAst._tag === "Union" && rawAst.types) {
-    for (const member of rawAst.types) {
-      if (member._tag === "Undefined") continue
-      // Try SchemaAST.resolve on the inner member (e.g., Declaration for Schema.Date)
-      const memberResolved = SchemaAST.resolve(member as unknown as Schema.Top["ast"]) as
-        | ASTNode
-        | undefined
-      if (memberResolved) {
-        const enc = matchDateRepresentation(memberResolved)
-        if (enc) return enc
-      }
-      // Fallback: check raw member annotations (same record shape, nested under .annotations)
-      const enc = matchDateRepresentation(member.annotations)
-      if (enc) return enc
-    }
-  }
-  return undefined
+  if (rawAst._tag !== "Union" || !rawAst.types) return []
+  return rawAst.types.flatMap((member) => {
+    if (member._tag === "Undefined") return []
+    // Try SchemaAST.resolve on the inner member (e.g., Declaration for Schema.Date)
+    const memberResolved = SchemaAST.resolve(member as unknown as Schema.Top["ast"]) as
+      | ASTNode
+      | undefined
+    // Fallback: check raw member annotations (same record shape, nested under .annotations)
+    const encoding =
+      (memberResolved ? matchDateRepresentation(memberResolved) : undefined) ??
+      matchDateRepresentation(member.annotations)
+    return encoding ? [encoding] : []
+  })
 }
 
 /**
  * A union that holds a date member alongside a member that is neither a date
  * nor `Undefined` / `Null` — `Union([DateTimeUtcFromString, Number])`.
- * `inferDateEncoding` looks through unions to find the date in `optional(date)`,
+ * `inferDateEncodings` looks through unions to find the date in `optional(date)`,
  * so it reports such a field as a date, and encoding a `5` through a date
  * transform throws. Its stored form is the union's own business: it is encoded
  * member by member through the substituted union instead.
@@ -812,7 +956,13 @@ const isMixedDateUnion = (ast: Schema.Top["ast"]): boolean => {
 /** Resolves a ref field (by schema identity) to the model it should be read as. */
 type RefResolver = (name: string, field: Schema.Top) => Schema.Top | undefined
 
-type AttrEncoders = Record<string, (value: unknown) => unknown>
+/**
+ * A field's attribute encoder. A value it can't put in its stored form is stored as given, and
+ * `asGiven` is told, so that the write can refuse it when it wouldn't read back (`EDD-9127`).
+ */
+type AttrEncoder = (value: unknown, asGiven?: () => void) => unknown
+
+type AttrEncoders = Record<string, AttrEncoder>
 
 /**
  * The date branch shared by both encoder builders: an explicit
@@ -827,33 +977,148 @@ const dateAttrEncoder = (
   options?: { readonly mixedUnions?: boolean },
 ): ((value: unknown) => unknown) | undefined => {
   if (options?.mixedUnions !== true && isMixedDateUnion(fieldSchema.ast)) return undefined
-  const encoding = DynamoModel.getEncoding(fieldSchema) ?? inferDateEncoding(fieldSchema.ast)
-  if (!encoding) return undefined
-  const encode = Schema.encodeUnknownSync(buildDateTransform(encoding) as Schema.Codec<any>)
-  return (value) => encode(value)
+  const encodings = storedDateEncodings(fieldSchema)
+  const last = encodings.at(-1)
+  if (!last) return undefined
+  // A union of dates of different kinds: a value is stored in the form of the kind it is.
+  const earlier = encodings
+    .slice(0, -1)
+    .map((encoding) =>
+      Schema.encodeUnknownOption(buildDateTransform(encoding) as Schema.Codec<any>),
+    )
+  const encode = Schema.encodeUnknownSync(buildDateTransform(last) as Schema.Codec<any>)
+  return (value) => {
+    for (const encodeEarlier of earlier) {
+      const encoded = encodeEarlier(value)
+      if (Option.isSome(encoded)) return encoded.value
+    }
+    return encode(value)
+  }
+}
+
+/**
+ * The encodings a date field's values are stored in, the last for a value of no earlier one's kind:
+ * the field's own annotation, else those its schema's dates imply. Read off the field as declared, so
+ * an annotation inside `Schema.optional`'s union isn't seen, and such a field's values are stored as
+ * its date's default, ISO text, as 1.39.0 stored them. A stamp in a field a row declares is stored
+ * the same way (`rowStampsOf`).
+ */
+const storedDateEncodings = (fieldSchema: Schema.Top): ReadonlyArray<DynamoEncoding> => {
+  const explicit = DynamoModel.getEncoding(fieldSchema)
+  return explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)
+}
+
+/** Whether a value is a date field's stored form: one its date encodings decode. */
+const storedDateForm = (fieldSchema: Schema.Top): ((value: unknown) => boolean) => {
+  const decoders = storedDateEncodings(fieldSchema).map((encoding) =>
+    Schema.decodeUnknownOption(buildDateTransform(encoding) as Schema.Codec<any>),
+  )
+  return (value) => decoders.some((decode) => Option.isSome(decode(value)))
 }
 
 /**
  * The field's own encode, with `decode -> encode` as the fallback so a caller
  * who already supplied wire form round-trips to itself (the same strategy
- * `Entity.put` uses). Neither working means the value is neither Type nor
- * Encoded for this field; it is stored unchanged rather than introducing a
- * write-time failure mode — that shape is already unreadable, and the tolerant
- * read path reports it.
+ * `Entity.put` uses). `None` when neither works: the value is neither Type nor
+ * Encoded for this field, and what's stored is the caller's to decide.
  */
-const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) => {
+const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => Option.Option<unknown>) => {
   const codec = fieldSchema as unknown as Schema.Codec<any>
   const encode = Schema.encodeUnknownOption(codec)
   const decode = Schema.decodeUnknownOption(codec)
   return (value) => {
     const direct = encode(value)
-    if (Option.isSome(direct)) return direct.value
-    const decoded = decode(value)
-    if (Option.isSome(decoded)) {
-      const reencoded = encode(decoded.value)
-      if (Option.isSome(reencoded)) return reencoded.value
-    }
-    return value
+    if (Option.isSome(direct)) return direct
+    return Option.flatMap(decode(value), encode)
+  }
+}
+
+/**
+ * A write's own value at one place in the aggregate, as the caller gave it: `create`'s input, or the
+ * state `update`'s mutation returned, before either is decoded. `present` is false where the
+ * caller left the field out.
+ */
+interface Written {
+  readonly present: boolean
+  readonly value: unknown
+  /** `update`'s new state, which holds what a mutation's plain state holds. */
+  readonly update: boolean
+}
+
+/**
+ * Whether a caller's object holds `field`: as its own property or one its class gives it (a
+ * getter, a prototype's property), as `in` says, but never as a member every object inherits
+ * (`toString`, `constructor`).
+ */
+const holdsField = (holder: object, field: string): boolean => {
+  for (
+    let at: object | null = holder;
+    at !== null && at !== Object.prototype;
+    at = Object.getPrototypeOf(at)
+  ) {
+    if (Object.hasOwn(at, field)) return true
+  }
+  return false
+}
+
+/** The caller's value of `field`, under `written`. */
+const writtenField = (written: Written | undefined, field: string): Written | undefined => {
+  if (written === undefined) return undefined
+  const holder = written.present ? written.value : undefined
+  const present = holder !== null && typeof holder === "object" && holdsField(holder, field)
+  return {
+    present,
+    value: present ? (holder as Record<string, unknown>)[field] : undefined,
+    update: written.update,
+  }
+}
+
+/**
+ * What a `many` edge's custom `decompose` is handed on a write: the caller's own value of the edge
+ * read stored form first, once, as 1.39.0 read every write's input. A write's value is otherwise
+ * taken as the domain value a caller holds, but a `decompose` written for 1.39.0 was handed this,
+ * and what it returns is stored and keyed as it is: handed the domain value instead, a `decompose`
+ * that returns a field's stored form (`f / 10` on a field that multiplies by 10) has that encoded
+ * once more, its sort key moves, and every `update` compounds the value and adds a row. Handed
+ * this, its rows store, key and read exactly as on 1.39.0, and an `update` of a row 1.39.0 wrote
+ * finds it. A `decompose` that hands such a field back unchanged stores it decoded once more, as
+ * on 1.39.0.
+ *
+ * It reads what the caller gave, never the value the write already decoded: read again, a decoding
+ * default (`5`, read as 50) or a stored form the domain side refuses (`"5"`, read as 50) would be
+ * decoded twice, to 500. Only a transformation with one type on both sides reads differently, and
+ * a class whose fields hold none reads as given, so undefined when the field holds no
+ * transformation beneath its classes: nothing is read again. What was read (update's old state,
+ * `rekey`) is handed to `decompose` as it was read, as 1.39.0 did. None where the caller's value
+ * doesn't read, and `decompose` is handed the decoded value.
+ */
+const storedFormFirst = (
+  field: string,
+  fieldSchema: Schema.Top | undefined,
+  resolveRef: RefResolver | undefined,
+): ((written: Written) => Option.Option<unknown>) | undefined => {
+  if (fieldSchema === undefined || !containsWireTransform(fieldSchema, { throughClasses: true })) {
+    return undefined
+  }
+  const reader = (update: boolean) =>
+    Schema.decodeUnknownOption(
+      substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+        tolerantTransforms: true,
+        decodeOnly: true,
+        resolveRef,
+        // A mutation's plain state holds a set as a list and an `Option` as a tagged object.
+        ...(update && { plainStateForms: true }),
+      }) as unknown as Schema.Codec<any>,
+    )
+  const readers: { create?: ReturnType<typeof reader>; update?: ReturnType<typeof reader> } = {}
+  return (written) => {
+    const which = written.update ? "update" : "create"
+    const read = readers[which] ?? reader(written.update)
+    readers[which] = read
+    return Option.map(
+      read(written.present ? { [field]: written.value } : {}),
+      (asRead) => (asRead as Record<string, unknown>)[field],
+    )
   }
 }
 
@@ -870,7 +1135,8 @@ const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) 
  *
  * Exactly ONE encoder per field, so nothing is ever encoded twice:
  *
- * 1. **A date encoding** — see {@link dateAttrEncoder}.
+ * 1. **A date encoding** — see {@link dateAttrEncoder}. With `storedDates`, a value already in
+ *    the field's stored form is stored as it is ({@link storedDateForm}).
  * 2. **Anything that holds a wire transform AT ANY DEPTH** — a leaf transform, a
  *    `Schema.Class`, and also an `Array` / `Struct` / `Union` containing one, or
  *    a self date or `Redacted` nested anywhere ({@link containsWireTransform}).
@@ -879,7 +1145,11 @@ const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) 
  *    `tolerantTransforms`, with the aggregate's ref resolver), so the stored
  *    form is exactly what assembly reads back — nested date leaves included —
  *    and a `DynamoModel.ref`-annotated field is encoded through the ref
- *    target's model. The field's own encode is the fallback.
+ *    target's model. The field's own encode is the fallback. A value none of
+ *    them takes is stored as given, and reported through `asGiven`: the write
+ *    then stores it only if its rows read back (`refuseNotReadBack`,
+ *    `EDD-9127`). A schema that can't encode a value it decodes to, such as a
+ *    transformation over itself, gets here with every value a caller holds.
  *
  *    Gating on the TOP-LEVEL node instead (as before #133) skipped every
  *    container, because an `Arrays` / `Objects` node carries no encoding of its
@@ -895,6 +1165,11 @@ const ownAttrEncoder = (fieldSchema: Schema.Top): ((value: unknown) => unknown) 
 const buildAttrEncoders = (
   fields: Record<string, Schema.Top> | undefined,
   resolveRef?: RefResolver | undefined,
+  /**
+   * A keyed (`Schema.Record`) `many` edge without an `entity` only: 1.39.0 gave it no encoders, so
+   * it stored a date its custom `decompose` returned in the field's stored form as it was.
+   */
+  storedDates = false,
 ): AttrEncoders => {
   const encoders: AttrEncoders = {}
   if (!fields) return encoders
@@ -902,10 +1177,25 @@ const buildAttrEncoders = (
   for (const field of Object.keys(fields)) {
     const fieldSchema = fields[field]!
 
-    // 1. Date encoding.
+    // 1. Date encoding. With `storedDates`, a value already in the field's stored form (a custom
+    //    `decompose` that returns the ISO text of a `DateTimeUtcFromString`) is stored as it is, as
+    //    1.39.0 stored it there; anything else is stored as given, and the write refuses it unless
+    //    it reads back. Elsewhere a value the encoding doesn't take fails the write, as on 1.39.0.
     const date = dateAttrEncoder(fieldSchema)
-    if (date) {
+    if (date && !storedDates) {
       encoders[field] = date
+      continue
+    }
+    if (date) {
+      const stored = storedDateForm(fieldSchema)
+      encoders[field] = (value, asGiven) => {
+        try {
+          return date(value)
+        } catch {
+          if (!stored(value)) asGiven?.()
+          return value
+        }
+      }
       continue
     }
 
@@ -915,17 +1205,36 @@ const buildAttrEncoders = (
     // 2. Encode through the read path's own (substituted, tolerant) schema. A
     //    one-field struct carries the field's optionality and lets `resolveRef`
     //    re-point the field itself, exactly as it does inside `decodeSchema`.
-    const substituted = substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
-      tolerantTransforms: true,
-      resolveRef,
-    }) as unknown as Schema.Codec<any>
-    const encodeSubstituted = Schema.encodeUnknownOption(substituted)
-    const own = ownAttrEncoder(fieldSchema)
-    encoders[field] = (value) => {
-      const encoded = encodeSubstituted({ [field]: value })
-      if (Option.isSome(encoded)) return (encoded.value as Record<string, unknown>)[field]
-      return own(value)
+    const encoderOver = (options: DeepSubstitutionOptions) => {
+      const encode = Schema.encodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [field]: fieldSchema }), {
+          ...options,
+          tolerantTransforms: true,
+          resolveRef,
+        }) as unknown as Schema.Codec<any>,
+      )
+      return (value: unknown) => {
+        const encoded = encode({ [field]: value })
+        return Option.isSome(encoded)
+          ? Option.some((encoded.value as Record<string, unknown>)[field])
+          : Option.none()
+      }
     }
+    const encodeSubstituted = encoderOver({})
+    // A read reaches beneath a decoding default and this doesn't, and what it takes there isn't
+    // always what the field's own schema takes: a redacted value of another label. What's stored
+    // is the first's; this only keeps such a value from being marshalled as it is.
+    const encodeAsRead = encoderOver({ decodeOnly: true })
+    const own = ownAttrEncoder(fieldSchema)
+    encoders[field] = (value, asGiven) =>
+      encodeSubstituted(value).pipe(
+        Option.orElse(() => encodeAsRead(value)),
+        Option.orElse(() => own(value)),
+        Option.getOrElse(() => {
+          asGiven?.()
+          return value
+        }),
+      )
   }
   return encoders
 }
@@ -961,7 +1270,11 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
           return value
         }
       }
-    } else if (hasEncodingTransformation(fieldSchema)) encoders[field] = ownAttrEncoder(fieldSchema)
+    } else if (hasEncodingTransformation(fieldSchema)) {
+      // A key composed from a value no encoder takes is composed from the value as it is.
+      const own = ownAttrEncoder(fieldSchema)
+      encoders[field] = (value) => Option.getOrElse(own(value), () => value)
+    }
   }
   return encoders
 }
@@ -995,21 +1308,6 @@ const unwrapOptionalField = (field: Schema.Top): Schema.Top => optionalField(fie
 const isOpaqueRefField = (field: Schema.Top): boolean => {
   const inner = unwrapOptionalField(field)
   return getSchemaFields(inner) === undefined && SchemaAST.isDeclaration(inner.ast)
-}
-
-/**
- * The fields of a `many` edge's ELEMENT, read off the parent model's array
- * field (`players: Schema.Array(PlayerSheet)` → `PlayerSheet`'s fields).
- * `undefined` when the field is not array-shaped (a custom `decompose`) or its
- * element exposes no fields (a scalar, or an opaque ref).
- */
-const manyElementFields = (
-  parentFields: Record<string, Schema.Top> | undefined,
-  edgeName: string,
-): Record<string, Schema.Top> | undefined => {
-  const field = parentFields?.[edgeName]
-  const element = field === undefined ? undefined : extractArrayElement(field)
-  return element === undefined ? undefined : getSchemaFields(element)
 }
 
 /**
@@ -1162,16 +1460,21 @@ const collectRefTargets = (
  * Apply a node's attribute encoders in place — puts each attribute into its
  * stored form before the decomposed item is marshalled (#72, #133: without
  * this, a `DateTime` marshals to a `{ epochMilliseconds, … }` map that the
- * read path cannot decode as the wire form).
+ * read path cannot decode as the wire form). Returns the fields stored as
+ * given (see {@link AttrEncoder}).
  */
 const applyNodeAttrEncoders = (
   attrs: Record<string, unknown>,
-  encoders: Record<string, (value: unknown) => unknown> | undefined,
-): void => {
-  if (!encoders) return
+  encoders: AttrEncoders | undefined,
+): ReadonlyArray<string> => {
+  const asGiven: Array<string> = []
+  if (!encoders) return asGiven
   for (const [field, encode] of Object.entries(encoders)) {
-    if (field in attrs && attrs[field] != null) attrs[field] = encode(attrs[field])
+    if (field in attrs && attrs[field] != null) {
+      attrs[field] = encode(attrs[field], () => asGiven.push(field))
+    }
   }
+  return asGiven
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,17 +1529,136 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const refTargets = collectRefTargets(schemaFields, config.edges)
   const resolveRef: RefResolver = (_name, field) => refTargets.get(field)
 
+  // System timestamps (#98). Aggregates compose their DynamoDB items directly
+  // rather than routing through Entity write ops, so Entity's timestamp
+  // machinery never reached these rows. Resolution goes through the SAME
+  // resolver as Entity, which means field names, `DynamoModel` storage
+  // annotations and the EDD-9044 guard on an un-annotated `schema` all behave
+  // identically here. Passing the root schema's fields also inherits Entity's
+  // collision rule: a date-compatible root field of the same name supplies the
+  // encoding, and a non-date one means the user owns the attribute outright, on
+  // every row. As on an entity, `Schema.optional` wraps the value that's read.
+  const resolveStampsOver = (fields: Record<string, Schema.Top> | undefined) =>
+    resolveAggregateStamps(config.timestamps, fields, `Aggregate "${aggregateName}"`)
+  const timestampFields = resolveStampsOver(schemaFields)
+  refuseAggregateKeyOverMovingValue(
+    aggregateName,
+    config.timestamps,
+    schemaFields,
+    config.pk.composite,
+  )
+  // The form a stamp is stored in: on a row declaring its field, the form the row stores any value of
+  // that field in ({@link storedDateEncodings}, as `buildAttrEncoders` reads it), else the stamp's
+  // own encoding. A row that doesn't declare it holds what the root's would.
+  const storedIn = (
+    fields: Record<string, Schema.Top> | undefined,
+    name: string | null,
+    declared: boolean,
+    encoding: DynamoEncoding | null,
+  ): DynamoEncoding | null => {
+    const field = declared && name !== null ? fields?.[name] : undefined
+    return (field === undefined ? undefined : storedDateEncodings(field).at(-1)) ?? encoding
+  }
+  const stampFields: StampFields | undefined =
+    timestampFields.createdAt !== null || timestampFields.updatedAt !== null
+      ? {
+          createdAt: timestampFields.createdAt,
+          createdEncoding: storedIn(
+            schemaFields,
+            timestampFields.createdAt,
+            timestampFields.createdAtCollision,
+            timestampFields.createdAtEncoding,
+          ),
+          updatedAt: timestampFields.updatedAt,
+          updatedEncoding: storedIn(
+            schemaFields,
+            timestampFields.updatedAt,
+            timestampFields.updatedAtCollision,
+            timestampFields.updatedAtEncoding,
+          ),
+        }
+      : undefined
+  // What the read path may drop before decoding: each node drops those its rows
+  // don't declare ({@link stampsToStrip}). Declared, it belongs to the domain object.
+  const systemAttrs: ReadonlySet<string> = new Set(
+    [timestampFields.createdAt, timestampFields.updatedAt].filter(
+      (name): name is string => name !== null,
+    ),
+  )
+
+  const requiredIn = (fields: Record<string, Schema.Top> | undefined, name: string | null) =>
+    name !== null && fields?.[name] !== undefined && !isFieldOptional(fields[name])
+  // On `create`, a stamp replaces a value the input holds, as on 1.39.0, except under a date the root
+  // declares `Schema.optional`: 1.39.0 left that field the caller's and stored a value passed for it.
+  // That is 1.39.0's verdict, the resolver's over the root's fields as declared: `Schema.optional`'s
+  // union isn't a date there, while a required date and a `Schema.optionalKey` one are the library's.
+  const asDeclared = resolveSystemFields(
+    config.timestamps,
+    undefined,
+    undefined,
+    schemaFields,
+    {},
+    `Aggregate "${aggregateName}"`,
+  )
+  const createdReplaces = !timestampFields.createdAtCollision || asDeclared.createdAtCollision
+  const updatedReplaces = !timestampFields.updatedAtCollision || asDeclared.updatedAtCollision
+
+  /**
+   * What the rows of a value with these fields do with each timestamp, as an entity's do: a date the
+   * value declares is the library's, under the field's encoding, and `create` stamps it over what the
+   * input holds unless the root declares it `Schema.optional` ({@link fillStamps}), where an `update`
+   * takes a value the mutation changed; any other field of that name is the caller's and the row
+   * isn't stamped. Undeclared, the row is stamped.
+   */
+  const rowStampsOf = (fields: Record<string, Schema.Top> | undefined): RowStamps | undefined => {
+    if (stampFields === undefined) return undefined
+    const own = resolveStampsOver(fields)
+    return {
+      createdAt: stampFields.createdAt === null ? null : own.createdAt,
+      createdEncoding: own.createdAtCollision ? own.createdAtEncoding : stampFields.createdEncoding,
+      createdStored: own.createdAtCollision
+        ? storedIn(fields, own.createdAt, true, own.createdAtEncoding)
+        : stampFields.createdEncoding,
+      createdDeclared: own.createdAtCollision,
+      createdRequired: own.createdAtCollision && requiredIn(fields, own.createdAt),
+      createdReplaces,
+      updatedAt: stampFields.updatedAt === null ? null : own.updatedAt,
+      updatedEncoding: own.updatedAtCollision ? own.updatedAtEncoding : stampFields.updatedEncoding,
+      updatedStored: own.updatedAtCollision
+        ? storedIn(fields, own.updatedAt, true, own.updatedAtEncoding)
+        : stampFields.updatedEncoding,
+      updatedDeclared: own.updatedAtCollision,
+      updatedRequired: own.updatedAtCollision && requiredIn(fields, own.updatedAt),
+      updatedReplaces,
+    }
+  }
+  refuseManySortKeysOverMovingValue(aggregateName, config.timestamps, schemaFields, config.edges)
+  refuseAggregateKeysOverBothKinds(aggregateName, schemaFields, config, config.edges)
+  const withRowStamps = (node: ResolvedNode): ResolvedNode => ({
+    ...node,
+    rowStamps: rowStampsOf(node.ownFields),
+    children: node.children.map(withRowStamps),
+  })
+
   // Build resolved graph by walking edges recursively. Each node's attribute
   // encoders come from the schema its decomposed values actually have — for a
   // `many` edge that is the aggregate model's array ELEMENT (#133).
-  const rootNode = resolveNode({
-    fieldName: null,
-    entityType: config.root.entityType,
-    cardinality: "root",
-    edges: config.edges,
-    parentFields: schemaFields,
-    resolveRef,
-  })
+  const rootNode = withRowStamps(
+    resolveNode({
+      fieldName: null,
+      entityType: config.root.entityType,
+      cardinality: "root",
+      edges: config.edges,
+      parentFields: schemaFields,
+      resolveRef,
+    }),
+  )
+  // Rows that hold a stamp in the domain object: what `update` returns has to say what it wrote.
+  const declaresStamp = (node: ResolvedNode): boolean =>
+    node.rowStamps?.createdDeclared === true ||
+    node.rowStamps?.updatedDeclared === true ||
+    node.children.some(declaresStamp)
+  const returnsStamps = declaresStamp(rootNode)
 
   // Packed edge attributes, and those read by stored form, by item entity type (#147).
   const packedByType = collectPackedByType(rootNode)
@@ -1260,22 +1682,57 @@ const makeAggregate = <TSchema extends Schema.Top>(
   //   - update re-decodes the mutated state, which carries domain `DateTime`
   //     values → accepted as-is (a strict `*FromString` decoder would reject
   //     them). It is decode-only, so making transforms tolerant is safe — the
-  //     stored wire format is still produced by the attribute encoders.
+  //     stored wire format is still produced by the attribute encoders;
+  //   - an absent attribute reads as the value it stands for: `undefined`, or an
+  //     empty set, neither of which DynamoDB can store (`absentReading`).
   // Nested edge / ref classes round-trip with their class instance identity
   // preserved (Option A). Returns the raw `schema` unchanged when it carries no
   // such leaf at all (zero overhead).
   const decodeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
+    absentReads: true,
   }) as unknown as Schema.Codec<any>
+  // What assembly decodes the rows with: `decodeSchema`, with each of Effect's look-alike
+  // declarations (a `BigDecimal`, a `Duration`, a date in an `Option`, ...) reading back as a real
+  // instance (`readingInstances`). Reads only: the plain state `update` hands a mutation
+  // (`readToPlain`) is `decodeSchema`'s.
+  //
+  // A read that dies on an absent attribute fails as 1.39.0's did, with the issue `decodeSchema`
+  // without its absent reads gives (`failingAsBefore`), built only once a read has died.
+  let asBefore: Schema.Top | undefined
+  const assembly: AssemblyDecode = {
+    schema: readingInstances(decodeSchema),
+    before: () =>
+      (asBefore ??= substituteSchemaDeep(schema, {
+        tolerantTransforms: true,
+        decodeOnly: true,
+        resolveRef,
+      })),
+  }
   // The same schema for WRITES — `create` input and `update`'s mutated state —
   // with the container `.check()` refinements the substitution rebuilds kept, so
-  // a write that breaks one is rejected (#133). Assembly keeps `decodeSchema`:
+  // a write that breaks one is rejected (#133), and a value is asked as the domain
+  // value first, since that's what a caller holds. Assembly keeps `decodeSchema`:
   // a row written while those checks were not enforced must stay readable.
   const writeSchema = substituteSchemaDeep(schema, {
     tolerantTransforms: true,
+    decodeOnly: true,
     resolveRef,
     enforceChecks: true,
+    domainValues: true,
+  }) as unknown as Schema.Codec<any>
+
+  // `update`'s mutated state: the plain state a mutation is handed holds a set as a list and
+  // an `Option` as a tagged object (`Schema.toIso`), and it can hand that straight back.
+  const mutatedStateSchema = substituteSchemaDeep(schema, {
+    tolerantTransforms: true,
+    decodeOnly: true,
+    resolveRef,
+    enforceChecks: true,
+    plainStateForms: true,
+    domainValues: true,
   }) as unknown as Schema.Codec<any>
 
   // Validate the collection index against the table's primary key. Best effort: a
@@ -1322,40 +1779,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
     )
   }
 
-  // System timestamps (#98). Aggregates compose their DynamoDB items directly
-  // rather than routing through Entity write ops, so Entity's timestamp
-  // machinery never reached these rows. Resolution goes through the SAME
-  // resolver as Entity, which means field names, `DynamoModel` storage
-  // annotations and the EDD-9044 guard on an un-annotated `schema` all behave
-  // identically here. Passing the root schema's fields also inherits Entity's
-  // collision rule: a date-compatible root field of the same name supplies the
-  // encoding, and a non-date one means the user owns the attribute outright.
-  const timestampFields = resolveSystemFields(
-    config.timestamps,
-    undefined,
-    undefined,
-    schemaFields ?? {},
-    {},
-    `Aggregate "${aggregateName}"`,
-  )
-  const stampFields: StampFields | undefined =
-    timestampFields.createdAt !== null || timestampFields.updatedAt !== null
-      ? {
-          createdAt: timestampFields.createdAt,
-          createdEncoding: timestampFields.createdAtEncoding,
-          updatedAt: timestampFields.updatedAt,
-          updatedEncoding: timestampFields.updatedAtEncoding,
-        }
-      : undefined
-  // Attributes the read path must drop before decoding. A field the root model
-  // declares itself is NOT stripped — it belongs to the domain object.
-  const systemAttrs: ReadonlySet<string> = new Set(
-    [
-      timestampFields.createdAtCollision ? null : timestampFields.createdAt,
-      timestampFields.updatedAtCollision ? null : timestampFields.updatedAt,
-    ].filter((name): name is string => name !== null),
-  )
-
   /** Read stored `created` values back, keyed by sk, so a rewrite preserves them. */
   const readExistingCreated = (
     allItems: ReadonlyArray<Record<string, unknown>>,
@@ -1376,10 +1799,27 @@ const makeAggregate = <TSchema extends Schema.Top>(
     now: DateTime.Utc,
     existingCreated: ReadonlyMap<string, unknown>,
     existingUpdated?: ReadonlyMap<string, unknown>,
+    updatedBefore?: ReadonlyMap<string, unknown>,
   ): Stamp | undefined =>
-    stampFields === undefined
-      ? undefined
-      : { fields: stampFields, now, existingCreated, existingUpdated }
+    stampFields === undefined ? undefined : { now, existingCreated, existingUpdated, updatedBefore }
+
+  /** Compose keys and marshal rows: a value it can't place is a `ValidationError`, not a defect. */
+  const composeOrFail = <A>(operation: string, compose: () => A) =>
+    marshalOrFail(aggregateName, `aggregate.${operation}`, compose)
+
+  /** The partition key `record` composes. Throws what {@link composeOrFail} turns into its failure. */
+  const collectionPkOf = (record: Record<string, unknown>): string =>
+    composeCollectionKey(
+      config.schema,
+      config.collection.name,
+      keyCompositesOrThrow(
+        aggregateName,
+        "its partition key",
+        config.schema,
+        config.pk.composite,
+        keyRecord(record),
+      ),
+    )
 
   // Build optics at construction time (once per aggregate definition)
   const classToPlain = Schema.toIso(schema) as Optic.Iso<
@@ -1408,14 +1848,27 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // domain objects, so without this a `DateEpochMs` composite would key on its
   // ISO form here and its epoch form on the entity path, and a numeric
   // composite with a string encoding would not be zero-padded on either.
-  const compositeKeyForm = makeCompositeKeyForm(schema, (attr, value) => {
-    throw new Error(
-      `[EDD-9050] Composite "${attr}" on aggregate "${aggregateName}" could not be put into ` +
-        `its key form. The attribute's schema carries an encoding transformation, but ` +
-        `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode. ` +
-        `Supply a value of the attribute's own type.`,
-    )
-  })
+  //
+  // 1.39.0's form (`text139`): a codec `encode` takes on its own output (a
+  // number scaled, `x:` prepended) is encoded whatever it's given. The
+  // aggregate's keys are its own — `create`, `get`, `list` and `rekey` all
+  // compose them here, from domain values, encoded once — so no other path
+  // missed what it wrote, and they keep every byte.
+  const compositeKeyForm = makeCompositeKeyForm(
+    schema,
+    (attr, value, reason) => {
+      if (reason !== undefined) {
+        return refuseInexact(`Composite "${attr}" on aggregate "${aggregateName}"`, value, reason)
+      }
+      throw new Error(
+        `[EDD-9050] Composite "${attr}" on aggregate "${aggregateName}" could not be put into ` +
+          `its key form. The attribute's schema carries an encoding transformation, but ` +
+          `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode. ` +
+          `Supply a value of the attribute's own type.`,
+      )
+    },
+    { text139: true },
+  )
   // Only the attributes a key is ever composed from are put into key form. The
   // rest of the record is never read off the result, and normalising it could
   // only fail: a stored value that breaks a field's `.check()` (#133) made
@@ -1457,6 +1910,40 @@ const makeAggregate = <TSchema extends Schema.Top>(
       Effect.as(unpackAggregateItems(read.allItems, dispatchByType, aggregateName), read),
     )
 
+  // A root row's partition key composites as a read takes them: decoded through their fields, as
+  // assembly decodes the root row. `create` composes the key from the value it holds, so a key
+  // composed again from a stored row (`list`, `rekey`) is composed from these, never from the
+  // stored form: a transformation that isn't its own inverse on the other side (a value stored
+  // divided by ten, an `Option` holding one) keys the stored form elsewhere.
+  const decodeRootKey = (() => {
+    const fields: Record<string, Schema.Top> = {}
+    for (const attr of config.pk.composite) {
+      const field = schemaFields?.[attr]
+      if (field !== undefined) fields[attr] = field
+    }
+    return Schema.decodeUnknownOption(
+      substituteSchemaDeep(Schema.Struct(fields), {
+        tolerantTransforms: true,
+        decodeOnly: true,
+        resolveRef,
+        absentReads: true,
+      }) as unknown as Schema.Codec<Record<string, unknown>>,
+    )
+  })()
+  /**
+   * `row` (a stored root row) with its partition key composites as a read takes them. A row whose
+   * composites a read can't take is left as it is: its key composes as the stored form does, and its
+   * read fails as assembly's does.
+   */
+  const rootKeyAsRead = (row: Record<string, unknown>): Record<string, unknown> => {
+    const composites: Record<string, unknown> = {}
+    for (const attr of config.pk.composite) {
+      if (attr in row) composites[attr] = row[attr]
+    }
+    const read = decodeRootKey(composites)
+    return Option.isSome(read) ? { ...row, ...read.value } : row
+  }
+
   /** The collection partition key `record`'s values compose under `under`. */
   const collectionPkUnder = (
     under: DynamoSchemaModule.DynamoSchema,
@@ -1477,13 +1964,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const tableConfig: TableConfig = yield* config.table.Tag
-      const composites = KeyComposer.extractKeyComposites(
-        config.schema,
-        {},
-        config.pk.composite,
-        keyRecord(key),
-      )
-      const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
+      const pkValue = yield* composeOrFail("key", () => collectionPkOf(key))
       const read = (partition: string) =>
         queryAllItems(
           client,
@@ -1500,8 +1981,255 @@ const makeAggregate = <TSchema extends Schema.Top>(
         from === undefined
           ? yield* read(pkValue)
           : [...(yield* read(from)), ...(rekeyRead?.fromOnly === true ? [] : yield* read(pkValue))]
-      return { client, tableConfig, pkValue, composites, allItems }
+      return { client, tableConfig, pkValue, allItems }
     })
+
+  const holdsCustom = holdsCustomDeclaration(schema.ast)
+
+  /**
+   * Refuses the rows of a write that wouldn't read back: the rows it's about to write, through the read
+   * path a `get` takes. Only two kinds of write pay for it: one of an aggregate holding a custom
+   * declaration (`EDD-9126`), and one that stored a value as given, which no encoder of its field
+   * takes (`asGiven`, `EDD-9127`). Every other write has nothing to do here.
+   */
+  const refuseNotReadBack = (
+    groups: ReadonlyArray<{ readonly items: ReadonlyArray<Record<string, AttributeValue>> }>,
+    key: Record<string, unknown>,
+    operation: string,
+    asGiven: ReadonlyArray<string>,
+  ): Effect.Effect<void, ValidationError> =>
+    !holdsCustom && asGiven.length === 0
+      ? Effect.void
+      : Effect.gen(function* () {
+          const rows = groups.flatMap((group) =>
+            group.items.map((item) => fromAttributeMap(item) as Record<string, unknown>),
+          )
+          yield* unpackAggregateItems(rows, dispatchByType, aggregateName)
+          yield* assembleAggregate(
+            assembly,
+            rootNode,
+            rows,
+            contextFields,
+            key,
+            aggregateName,
+            systemAttrs,
+          ).pipe(
+            Effect.mapError(
+              (error) =>
+                new ValidationError({
+                  entityType: aggregateName,
+                  operation,
+                  cause:
+                    asGiven.length > 0
+                      ? notStoredForm(asGiven, (error as ValidationError).cause ?? error)
+                      : notReadBack("The aggregate", (error as ValidationError).cause ?? error),
+                }),
+            ),
+          )
+        })
+
+  /**
+   * `[EDD-9128]`, by value: each key composite whose numeric kinds can't be read at load
+   * (`Schema.Unknown`, `Schema.Any`, a declaration, or a transformation from one), with what composes
+   * it and the test of a stored value that reads back otherwise (`readsBackOtherwise`), per node
+   * whose key composes it. A composite that's a path into a value (`nested.n`) is followed to the
+   * field it names (`fieldAtPath`). A declared one is refused at load. Empty for an aggregate with
+   * none, which pays nothing more on a write.
+   */
+  const otherKindKeys = (() => {
+    type Check = {
+      readonly path: string
+      readonly into: string
+      /** The value the refusal names and what it reads back as, `undefined` when it reads back. */
+      readonly judge: (item: DecomposedItem) => { held: unknown; readsAs: string } | undefined
+    }
+    // A composite judged by the value at its path alone.
+    const leafJudge =
+      (path: string, readsOther: (value: unknown) => string | undefined) =>
+      (item: DecomposedItem) => {
+        const held = readCompositePath(item.attributes, path)
+        const readsAs = held == null ? undefined : readsOther(held)
+        return readsAs === undefined ? undefined : { held, readsAs }
+      }
+    // A dotted composite of `node`'s sort key (`nested.n`), judged through the field holding it:
+    // the text `node` composes for it from the element written against the text composed again
+    // from the row as a read takes it, its field decoded as assembly decodes it and its key read
+    // off the result as `decompose` reads it. A transformation of what holds the value (a struct
+    // decoded to another) is a read's too, so the value at the path alone isn't what a key read
+    // back is composed from.
+    const throughFieldJudge = (
+      node: ResolvedNode,
+      fields: Record<string, Schema.Top>,
+      path: string,
+    ) => {
+      const top = path.slice(0, path.indexOf("."))
+      const decode = Schema.decodeUnknownOption(
+        substituteSchemaDeep(Schema.Struct({ [top]: fields[top]! }), {
+          tolerantTransforms: true,
+          decodeOnly: true,
+          resolveRef,
+          absentReads: true,
+        }) as unknown as Schema.Codec<any>,
+      )
+      const keyEncoder = node.keyAttrEncoders?.[top]
+      // The value at the path of a top-level value decoded, as `decompose` reads a key off it.
+      const leafOf = (value: unknown): Option.Option<unknown> =>
+        Option.map(decode({ [top]: value }), (decoded) => {
+          const held = (decoded as Record<string, unknown>)[top]
+          return readCompositePath(
+            { [top]: keyEncoder === undefined ? held : keyEncoder(held) },
+            path,
+          )
+        })
+      return (item: DecomposedItem) => {
+        const stored = item.attributes[top]
+        if (stored == null) return undefined
+        // Only a `many` element has a sort key `node` composes from it.
+        const written = item.skTextFor?.(node, path)
+        if (written === undefined) return undefined
+        let returned: unknown
+        try {
+          returned = asRead(stored)
+        } catch {
+          // A value the marshaller refuses is the write's own marshalling's to report.
+          return undefined
+        }
+        const read = Option.filter(leafOf(returned), (leaf) => leaf != null)
+        if (
+          Option.isSome(read) &&
+          isScalarComposite(read.value) &&
+          KeyComposer.keyValueText(config.schema, read.value, config.schema.casing) === written
+        ) {
+          return undefined
+        }
+        const was = Option.getOrUndefined(leafOf(stored))
+        return {
+          held: was ?? readCompositePath(item.attributes, path),
+          readsAs: readBackAs(read, was),
+        }
+      }
+    }
+    // The text the root's key composes from a composite's value, written and read back alike: the
+    // key form takes a value read back as its field reads it.
+    const rootKeyText = (path: string) => (value: unknown) => {
+      try {
+        return KeyComposer.compositeText(config.schema, compositeKeyForm(path, value))
+      } catch {
+        return undefined
+      }
+    }
+    const checksOf = (
+      fields: Record<string, Schema.Top> | undefined,
+      into: string,
+      composites: ReadonlyArray<string>,
+      root = false,
+    ): ReadonlyArray<Check> =>
+      composites.flatMap((path) => {
+        const fieldSchema = fieldAtPath(fields, path)
+        const text = rootKeyText(path)
+        const readsOther =
+          fieldSchema === undefined
+            ? undefined
+            : readsBackOtherwise(fieldSchema, {
+                asRead,
+                texts: root ? [{ written: text, read: text }] : [],
+              })
+        return readsOther === undefined ? [] : [{ path, into, judge: leafJudge(path, readsOther) }]
+      })
+    // An edge's sort key: a dotted composite is judged through the field holding it when that field's
+    // read-back can't be guaranteed at load, and any other composite by its value.
+    const edgeChecksOf = (node: ResolvedNode, composites: ReadonlyArray<string>) => {
+      const into = `edge "${node.fieldName}"'s sort key`
+      const fields = node.ownFields
+      return composites.flatMap((path): ReadonlyArray<Check> => {
+        const top = fields?.[path.slice(0, path.indexOf("."))]
+        const leaf = fieldAtPath(fields, path)
+        return fields !== undefined &&
+          top !== undefined &&
+          path.includes(".") &&
+          (readBackUnsure(top) || (leaf !== undefined && readBackUnsure(leaf)))
+          ? [{ path, into, judge: throughFieldJudge(node, fields, path) }]
+          : checksOf(fields, into, [path])
+      })
+    }
+    // Each node's own checks: a row is judged by every node assembly hands it to (`assemblyWalk`).
+    const byNode = new Map<ResolvedNode, ReadonlyArray<Check>>()
+    const add = (node: ResolvedNode, checks: ReadonlyArray<Check>) => {
+      if (checks.length > 0) byNode.set(node, checks)
+    }
+    add(rootNode, [
+      ...checksOf(schemaFields, "its partition key", config.pk.composite, true),
+      ...checksOf(
+        schemaFields,
+        "its collection sort key",
+        config.collection.sk?.composite ?? [],
+        true,
+      ),
+      ...(config.list === undefined
+        ? []
+        : [
+            ...checksOf(schemaFields, "its list partition key", config.list.pk.composite, true),
+            ...checksOf(schemaFields, "its list sort key", config.list.sk.composite, true),
+          ]),
+    ])
+    const walk = (node: ResolvedNode): void => {
+      if (node.cardinality === "many" && node.skComposite !== undefined) {
+        add(node, edgeChecksOf(node, node.skComposite))
+      }
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return byNode
+  })()
+
+  /**
+   * Refuses a write storing, for a key composite whose numeric kinds can't be read at load, a value
+   * that reads back otherwise: a stored row would compose other key text (`EDD-9128`). `groups` is
+   * the whole decomposition of the value stored, rows a diff leaves alone included: a read of the
+   * aggregate takes them all. A row is judged by the checks of each node a read hands it to
+   * (`assemblyWalk`), its composites read off its stored attributes, a path into a value followed.
+   */
+  const refuseOtherKindKeys = (
+    groups: ReadonlyArray<TransactionGroup>,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    if (otherKindKeys.size === 0) return Effect.void
+    const reached = assemblyWalk(
+      rootNode,
+      groups.flatMap((group) => group.items),
+      // An attribute as a read has it: a discriminator is matched against what's read back.
+      (node, item) =>
+        takesRow(node, item.entityType, (attr) => {
+          try {
+            return asRead(item.attributes[attr])
+          } catch {
+            return undefined
+          }
+        }),
+    )
+    for (const [node, taken] of reached) {
+      const checks = otherKindKeys.get(node)
+      if (checks === undefined) continue
+      for (const item of taken) {
+        for (const { path, into, judge } of checks) {
+          const refused = judge(item)
+          if (refused === undefined) continue
+          return Effect.fail(
+            new ValidationError({
+              entityType: aggregateName,
+              operation,
+              cause: readBackRefusal(
+                `Field "${path}" of "${item.member}" is composed into ${into}`,
+                refused.held,
+                refused.readsAs,
+              ),
+            }),
+          )
+        }
+      }
+    }
+    return Effect.void
+  }
 
   /** Shared: compose PK and query all items, a rejected read a `ValidationError`. */
   const fetchPartition = (key: Record<string, unknown>, operation: string, rekeyRead?: RekeyRead) =>
@@ -1516,10 +2244,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
       rekeyRead,
     )
 
-  const derivedSchemas = deriveAggregateSchemas(schema, config.edges, config.pk.composite)
+  const derivedSchemas = deriveAggregateSchemas(
+    schema,
+    config.edges,
+    config.pk.composite,
+    config.timestamps,
+  )
 
   /** A stored row's position: its partition and sort key. */
   const positionOf = (pk: string, sk: string): string => `${pk}\u0000${sk}`
+  type Position = { readonly pk: string; readonly sk: string }
 
   /**
    * Attributes holding index keys the aggregate composes: the collection SK mirror, the list
@@ -1553,10 +2287,246 @@ const makeAggregate = <TSchema extends Schema.Top>(
     skOther: string,
     sk: string,
     storedAt: ReadonlyMap<string, Record<string, unknown>>,
-  ): { readonly pk: string; readonly sk: string } =>
-    pk !== pkNow && !storedAt.has(positionOf(pk, skOther)) && storedAt.has(positionOf(pk, sk))
-      ? { pk, sk }
-      : { pk, sk: skOther }
+    otherKind: (pk: string) => string | undefined,
+  ): { readonly pk: string; readonly sk: string } => {
+    if (storedAt.has(positionOf(pk, skOther))) return { pk, sk: skOther }
+    if (storedAt.has(positionOf(pk, sk))) return { pk, sk: pk === pkNow ? skOther : sk }
+    // A sort key holding a numeric composite's other kind's text. Looked for only for a row at
+    // neither key: one at its current key under the other kind's text too would have been read
+    // back as a second element composing that key, which the decomposition refuses.
+    return { pk, sk: otherKind(pk) ?? skOther }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Which rows of its partition are the aggregate's (DESIGN.md §7 "Which rows in its partition
+  // are an aggregate's")
+  // ---------------------------------------------------------------------------
+
+  /** Every entity type a node of the aggregate's rows carries. */
+  const nodeTypes: ReadonlyArray<string> = (() => {
+    const types = new Set<string>()
+    const walk = (node: ResolvedNode): void => {
+      types.add(node.entityType)
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return [...types]
+  })()
+
+  /** The fixed text every partition key the aggregate composes begins with. */
+  const partitionHead = composeCollectionKey(config.schema, config.collection.name, [])
+
+  /**
+   * `ownsRows`: every row of the aggregate's types in its partition is its own, so `update` deletes
+   * the rows of them it reads beyond the ones its value keys, and `rekey` reports them.
+   */
+  const ownsRows = config.ownsRows === true
+  const ownedTypes: ReadonlySet<string> = new Set(nodeTypes)
+
+  /**
+   * Each node a row can be handed to, as `assembleNode` hands rows: its entity type and its static
+   * discriminator (an enclosing sub-aggregate's merged in at resolve time). With the transaction
+   * group its rows are written in and the discriminator values its sort key holds.
+   */
+  const nodeSlots: ReadonlyArray<{
+    readonly node: ResolvedNode
+    readonly group: string
+    readonly keyDiscriminators: DiscriminatorValues
+  }> = (() => {
+    const slots: Array<{
+      readonly node: ResolvedNode
+      readonly group: string
+      readonly keyDiscriminators: DiscriminatorValues
+    }> = [{ node: rootNode, group: "root", keyDiscriminators: { current: [], other: () => [] } }]
+    const visit = (node: ResolvedNode, parentGroup: string, parent: DiscriminatorValues): void => {
+      if (node.cardinality === "one" && node.children.length > 0) {
+        const ownName = node.fieldName ?? node.entityType
+        const group = parentGroup === "root" ? ownName : `${parentGroup}.${ownName}`
+        const own = ownDiscriminatorValues(node, config.schema)
+        const values: DiscriminatorValues = {
+          current: [...parent.current, ...own.current],
+          other: () => [...parent.other(), ...own.other()],
+        }
+        slots.push({ node, group, keyDiscriminators: values })
+        for (const child of node.children) visit(child, group, values)
+        return
+      }
+      if (node.cardinality === "one") {
+        const own = ownDiscriminatorValues(node, config.schema)
+        slots.push({
+          node,
+          group: parentGroup,
+          keyDiscriminators: {
+            current: [...parent.current, ...own.current],
+            other: () => [...parent.other(), ...own.other()],
+          },
+        })
+        return
+      }
+      slots.push({ node, group: parentGroup, keyDiscriminators: parent })
+    }
+    for (const child of rootNode.children) visit(child, "root", { current: [], other: () => [] })
+    return slots
+  })()
+
+  /** The nodes `item` is handed to by its entity type and static discriminator. */
+  const slotsOf = (item: Record<string, unknown>) =>
+    nodeSlots.filter(
+      ({ node }) =>
+        item.__edd_e__ === node.entityType &&
+        Object.entries(node.discriminator ?? {}).every(
+          ([attr, value]) =>
+            typeof value === "function" || (Object.hasOwn(item, attr) && item[attr] === value),
+        ),
+    )
+
+  /**
+   * `update`'s cleanup with `ownsRows` (DESIGN.md §7 "Which rows in its partition are an
+   * aggregate's"): the rows read of each changed node, keyed where the new value writes nothing and
+   * the update's groups delete nothing (`written`, `deleted`). A node changed when the update writes
+   * its group (`writtenGroups`) and its items of the old value and of the new one differ by the
+   * comparison that decides that ({@link sameItems}: types and attributes in order, not keys). A row
+   * is a node's as assembly hands it ({@link slotsOf}); one handed to two nodes is left. Each row
+   * once.
+   */
+  const ownedRowsLeft = (
+    allItems: ReadonlyArray<Record<string, unknown>>,
+    pkValue: string,
+    oldGroups: ReadonlyArray<TransactionGroup>,
+    newGroups: ReadonlyArray<TransactionGroup>,
+    writtenGroups: ReadonlySet<string>,
+    written: ReadonlySet<string>,
+    deleted: ReadonlyArray<string>,
+  ): ReadonlyArray<OwnedRow> => {
+    const inWrittenGroup = new Set<ResolvedNode>()
+    const byNode = (groups: ReadonlyArray<TransactionGroup>) => {
+      const items = new Map<ResolvedNode, Array<DecomposedItem>>()
+      for (const group of groups) {
+        for (const item of group.items) {
+          if (writtenGroups.has(group.name)) inWrittenGroup.add(item.node)
+          const list = items.get(item.node) ?? []
+          list.push(item)
+          items.set(item.node, list)
+        }
+      }
+      return items
+    }
+    const before = byNode(oldGroups)
+    const after = byNode(newGroups)
+    const changed = new Set(
+      nodeSlots
+        .map(({ node }) => node)
+        .filter(
+          (node) =>
+            inWrittenGroup.has(node) && !sameItems(before.get(node) ?? [], after.get(node) ?? []),
+        ),
+    )
+    if (changed.size === 0) return []
+    const taken = new Set(deleted)
+    const left: Array<OwnedRow> = []
+    for (const item of allItems) {
+      const sk = String(item.sk)
+      if (item[config.pk.field] !== pkValue || written.has(sk) || taken.has(sk)) continue
+      const slots = slotsOf(item)
+      if (slots.length !== 1 || !changed.has(slots[0]!.node)) continue
+      taken.add(sk)
+      left.push({ pk: pkValue, sk, entityType: String(item.__edd_e__) })
+    }
+    return left
+  }
+
+  /**
+   * The attributes the aggregate writes on its rows, for another aggregate declaring `ownsRows` to
+   * check at bind (DESIGN.md §7 "Which rows in its partition are an aggregate's"), as each row holds
+   * them after the last write of each: its partition key, `sk` and the collection index's sort key
+   * on every row, its list keys on its root row, its timestamps, written last, and its rows' own
+   * attributes (their fields, discriminators and context, or what a custom `decompose` returns):
+   * any name holding any text, but the ones the library writes after them.
+   */
+  const attributeWriters: ReadonlyArray<AttributeWriter> = (() => {
+    const table = config.table.Tag
+    const labelled = (type: string): RowType => ({
+      type,
+      label: composeKey(config.schema, type, []),
+    })
+    const all = nodeTypes.map(labelled)
+    const root = labelled(config.root.entityType)
+    const mirror =
+      config.collection.index !== undefined && config.collection.sk !== undefined
+        ? config.collection.sk.field
+        : undefined
+    const writers: Array<AttributeWriter> = [
+      {
+        field: config.pk.field,
+        head: partitionHead,
+        exact: config.pk.composite.length === 0,
+        types: all,
+        table,
+        channel: "its partition key",
+      },
+      ...all.map((type) => ({
+        field: "sk",
+        head: type.label,
+        types: [type],
+        table,
+        channel: "its sort key",
+      })),
+    ]
+    if (mirror !== undefined) {
+      writers.push({
+        field: mirror,
+        head: partitionHead,
+        types: [root],
+        table,
+        channel: "its collection index's sort key",
+      })
+      for (const type of all) {
+        writers.push({
+          field: mirror,
+          head: type.label,
+          types: [type],
+          table,
+          channel: "its collection index's sort key",
+        })
+      }
+    }
+    if (config.list !== undefined) {
+      const head = composeCollectionKey(config.schema, config.list.name, [])
+      for (const field of [config.list.pk.field, config.list.sk.field]) {
+        writers.push({ field, head, types: [root], table, channel: "its list index's keys" })
+      }
+    }
+    // Its timestamps, written after everything else: one named as a key replaces it.
+    for (const name of systemAttrs) {
+      writers.push({ field: name, head: undefined, types: all, table, channel: `its "${name}"` })
+    }
+    // Its rows' own attributes. Whatever a schema declares, these are any name holding any text, but
+    // the ones the library writes after them.
+    const library = [config.pk.field, "sk", "__edd_e__", ...(mirror === undefined ? [] : [mirror])]
+    writers.push({
+      field: undefined,
+      except: library,
+      head: undefined,
+      types: all,
+      table,
+      channel: "its rows' own attributes",
+    })
+    return withTypeOverwrites(writers)
+  })()
+
+  /** What `DynamoClient.make` checks an aggregate declaring `ownsRows` against. */
+  const ownership: Ownership = {
+    pkField: config.pk.field,
+    pkComposite: config.pk.composite,
+    partitionHead,
+    schema: config.schema,
+    table: config.table.Tag,
+    types: nodeTypes.map((type) => ({ type, label: composeKey(config.schema, type, []) })),
+    declared: [
+      ...Object.entries((config.table.entities ?? {}) as Record<string, unknown>),
+      ...Object.entries((config.table.aggregates ?? {}) as Record<string, unknown>),
+    ].map(([name, member]) => ({ name, member })),
+  }
 
   /**
    * `rekey`'s view of where the aggregate's rows are stored (#183, DESIGN.md §7 "`rekey`"): for
@@ -1578,13 +2548,34 @@ const makeAggregate = <TSchema extends Schema.Top>(
     for (const item of allItems) {
       storedAt.set(positionOf(String(item[config.pk.field]), String(item.sk)), item)
     }
+    /** The sort keys stored in a partition, other than `sk` ({@link oldPosition}). */
+    const partitions = new Map<string, KindTargets>()
+    const sortKeysIn = (pk: string, sk: string): KindTargets => {
+      let held = partitions.get(pk)
+      if (held === undefined) {
+        held = kindTargets(
+          allItems
+            .filter((item) => String(item[config.pk.field]) === pk)
+            .map((item) => String(item.sk)),
+        )
+        partitions.set(pk, held)
+      }
+      const inPartition = held
+      return {
+        has: (text) => text !== sk && inPartition.has(text),
+        hasPrefix: inPartition.hasPrefix,
+      }
+    }
     const rows = groups.flatMap((group, g) =>
       group.items.map((item, i) => {
         const built = composed[g]!.items[i]!
         const sk = (built.sk as { S?: string } | undefined)?.S ?? ""
         return {
           group: group.name,
+          item,
           built,
+          /** An element of a `many` edge with a custom `decompose`: its row moves as stored. */
+          custom: item.node.decompose !== undefined,
           current: { pk: pkValue, sk },
           old: oldPosition(
             from ?? pkValue,
@@ -1592,6 +2583,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             otherSortKey(config.schema, item, sk),
             sk,
             storedAt,
+            (pk) => item.otherKindSortKey?.(sortKeysIn(pk, sk)),
           ),
         }
       }),
@@ -1630,7 +2622,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
       // 1. Assemble current state
       const current = yield* assembleAggregate(
-        decodeSchema,
+        assembly,
         rootNode,
         allItems,
         contextFields,
@@ -1638,6 +2630,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         aggregateName,
         systemAttrs,
       )
+
+      const now = yield* DateTime.now
 
       // 2. Apply mutation — provide optics context for composable updates
       const state = toPlainState(current as Schema.Schema.Type<TSchema>)
@@ -1648,12 +2642,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
         current: current as Schema.Schema.Type<TSchema>,
       })
 
-      // 3. Validate the mutated state via `decodeSchema` — its tolerant date
-      //    transforms accept the domain `DateTime` values the mutation yields
-      //    for every date field (root + nested edges, Pattern A and Pattern B),
-      //    so update no longer trips the "Expected string, got DateTime" decode
-      //    that a strict `*FromString` schema would raise (#72 update path).
-      const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(updated).pipe(
+      // 3. Validate the mutated state — its tolerant transforms take the domain
+      //    values the mutation yields as what they are, for every field (root +
+      //    nested edges), so update no longer trips the "Expected string, got
+      //    DateTime" decode that a strict `*FromString` schema would raise (#72
+      //    update path), and a transformation with one type on both sides isn't
+      //    applied again to a value it already made.
+      //    A row the mutation added doesn't need the dates the library stamps.
+      const written = fillStamps(rootNode, updated, now, "required")
+      const decoded = yield* Schema.decodeUnknownEffect(mutatedStateSchema)(written).pipe(
         Effect.mapError(
           (cause) =>
             new ValidationError({
@@ -1683,6 +2680,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         rootEncoders,
         aggregateName,
         config.schema,
+        { present: true, value: written, update: true },
       )
 
       // 5. Diff at the ITEM (primary-key) level, not just the group level.
@@ -1706,47 +2704,46 @@ const makeAggregate = <TSchema extends Schema.Top>(
       }
 
       // 6. Build the full new + old DynamoDB item sets (with composed keys). The
-      //    collection SK composites only affect the LSI/GSI mirror attributes,
-      //    never the (pk, sk) identity used to PUT or DELETE, so the old set's
-      //    composites are irrelevant — we read only its (pk, sk) for deletes.
+      //    collection SK and list keys are mirror attributes, never the (pk, sk)
+      //    identity used to PUT or DELETE, and the old set is read only for its
+      //    (pk, sk) delete keys, so it composes neither and is never stamped.
       //    Rewritten rows are stamped `updated`; their stored `created` is read
       //    back off the fetched partition and re-emitted verbatim, since these are
-      //    PUTs and would otherwise clobber it. The old set is only mined for
-      //    (pk, sk) delete keys, so it is never stamped.
-      const now = yield* DateTime.now
-      const oldDynamo = buildDynamoItems(
-        oldGroups,
-        config,
-        pkValue,
-        KeyComposer.extractKeyComposites(
-          config.schema,
-          {},
-          config.collection.sk?.composite ?? [],
-          keyRecord(assembledOld),
-        ),
-        keyRecord,
-      )
+      //    PUTs and would otherwise clobber it.
+      const oldDynamo = buildDynamoItems(oldGroups, config, pkValue, undefined, keyRecord)
 
       const skOf = (item: Record<string, AttributeValue>): string =>
         (item.sk as { S?: string } | undefined)?.S ?? ""
 
       const existingCreated = new Map(readExistingCreated(allItems))
+      // Each row's declared `updated` as the mutation found it: if it changed it, it's the caller's.
+      const updatedBefore = new Map<string, unknown>()
+      if (stampFields?.updatedAt) {
+        for (const group of oldGroups) {
+          for (const item of group.items) {
+            updatedBefore.set(
+              composeKey(config.schema, item.entityType, [...item.skComposites]),
+              item.attributes[stampFields.updatedAt],
+            )
+          }
+        }
+      }
 
       // Packed AFTER the group diff above compared the decomposed values, so
       // an unchanged packed value is never rewritten (#147).
-      const newDynamo = buildDynamoItems(
-        yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update"),
-        config,
-        pkValue,
-        KeyComposer.extractKeyComposites(
-          config.schema,
-          {},
-          config.collection.sk?.composite ?? [],
-          keyRecord(assembledNew),
+      const newPacked = yield* packAggregateGroups(newGroups, packedByType, aggregateName, "update")
+      const newDynamo = yield* composeOrFail("update", () =>
+        buildDynamoItems(
+          newPacked,
+          config,
+          pkValue,
+          assembledNew,
+          keyRecord,
+          stampFor(now, existingCreated, undefined, updatedBefore),
         ),
-        keyRecord,
-        stampFor(now, existingCreated),
       )
+      yield* refuseOtherKindKeys(newGroups, "aggregate.update")
+      yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
       const oldItemsByGroup = new Map(oldDynamo.map((g) => [g.group, g.items]))
@@ -1785,6 +2782,22 @@ const makeAggregate = <TSchema extends Schema.Top>(
         groupWrites.push({ group: name, puts, deletes })
       }
 
+      // With `ownsRows`, every row of its types in the partition is the aggregate's (DESIGN.md §7
+      // "Which rows in its partition are an aggregate's"). After the update's groups, the rows read
+      // of each node whose decomposition changed that the new value doesn't write are deleted too
+      // (`ownedRowsLeft`): a node's rows are what its decomposition writes.
+      const cleanup = ownsRows
+        ? ownedRowsLeft(
+            allItems,
+            pkValue,
+            oldGroups,
+            newGroups,
+            new Set(groupWrites.map(({ group }) => group)),
+            survivingSks,
+            groupWrites.flatMap(({ deletes }) => deletes.map((item) => skOf(item))),
+          )
+        : []
+
       if (groupWrites.length > 0) {
         yield* writeTransactionGroups(
           client,
@@ -1794,12 +2807,87 @@ const makeAggregate = <TSchema extends Schema.Top>(
           groupKeys,
         )
       }
+      if (cleanup.length > 0) {
+        yield* deleteOwnedRows(client, tableConfig.name, config.pk.field, cleanup)
+      }
 
-      return decoded as Schema.Schema.Type<TSchema>
+      if (!returnsStamps) {
+        return decoded as Schema.Schema.Type<TSchema>
+      }
+      // A stamp the domain object holds: what's returned is what's stored, as `get` would read it,
+      // and no read is needed to know that. The partition as read, with these writes applied.
+      const stored = new Map(allItems.map((item) => [String(item.sk), item]))
+      for (const { sk } of cleanup) stored.delete(sk)
+      for (const { deletes, puts } of groupWrites) {
+        for (const item of deletes) stored.delete(String((item.sk as { S?: string }).S))
+        const written = puts.map((item) => fromAttributeMap(item) as Record<string, unknown>)
+        yield* unpackAggregateItems(written, dispatchByType, aggregateName)
+        for (const item of written) stored.set(String(item.sk), item)
+      }
+      return (yield* assembleAggregate(
+        assembly,
+        rootNode,
+        [...stored.values()],
+        contextFields,
+        key,
+        aggregateName,
+        systemAttrs,
+      )) as Schema.Schema.Type<TSchema>
     })
 
   /** How many times `rekey` reads an aggregate again after a write changed it in between. */
   const REKEY_ATTEMPTS = 3
+
+  /**
+   * Every attribute a row of each entity type can hold, the table key aside: its node's own fields
+   * (an edge field is its own rows'), the context fields and discriminators a row beneath the root
+   * carries, the index keys, the timestamps and `__edd_e__`. A row `rekey` moves is guarded on each
+   * one it didn't have still being absent, so a write that adds one cancels the move.
+   */
+  const writableAttributes: ReadonlyMap<string, ReadonlyArray<string>> = (() => {
+    const shared = [
+      "__edd_e__",
+      ...indexFields,
+      ...[timestampFields.createdAt, timestampFields.updatedAt].filter(
+        (name): name is string => name !== null,
+      ),
+    ]
+    const byType = new Map<string, Set<string>>()
+    const walk = (node: ResolvedNode): void => {
+      const names = byType.get(node.entityType) ?? new Set(shared)
+      const edges = new Set(node.children.map((child) => child.fieldName))
+      for (const field of Object.keys(node.ownFields ?? {})) {
+        if (!edges.has(field)) names.add(field)
+      }
+      if (node.cardinality !== "root") {
+        for (const field of contextFields) names.add(field)
+        for (const [field, value] of Object.entries(node.discriminator ?? {})) {
+          if (typeof value !== "function") names.add(field)
+        }
+      }
+      byType.set(node.entityType, names)
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return new Map([...byType].map(([entityType, names]) => [entityType, [...names].sort()]))
+  })()
+
+  /**
+   * The entity types the library stamps an `updatedAt` on, every row of every node holding them. A
+   * node declaring a field of that name other than a date holds the caller's value there
+   * (`rowStampsOf`), which a write of the library leaves as it was, so it proves nothing of the row.
+   */
+  const stampsUpdated: ReadonlySet<string> = (() => {
+    const stamped = new Set<string>()
+    const unstamped = new Set<string>()
+    const walk = (node: ResolvedNode): void => {
+      const updated = node.rowStamps?.updatedAt ?? null
+      ;(updated === null ? unstamped : stamped).add(node.entityType)
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return new Set([...stamped].filter((entityType) => !unstamped.has(entityType)))
+  })()
 
   /**
    * `rekey`'s move of the aggregate at `key` (#183, DESIGN.md §7 "`rekey`"): read from the
@@ -1808,11 +2896,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * its `created` and `updated`, beside a Delete of the old row — and a row at its current key
    * whose list or collection index key holds other text has those keys rewritten. Nothing else is
    * written, and every write is conditional: the Put only where nothing is, the Delete and the
-   * rewrite only while the row is as read (`asReadGuard`). Rows whose keys chain move in order, the
-   * one whose current key is free first, so no write lands on a row still to move, and the root
-   * moves last, so a move cut short is found by the next run. A write that loses to a concurrent
-   * one reads the aggregate again; a row stored under both keys leaves the aggregate as it is,
-   * reported. A dry run writes nothing.
+   * rewrite only while the row is as read, whole, with each attribute its entity type can hold and
+   * it didn't still absent (`wholeRowGuard`; a row too wide for that, on its `updatedAt` when the
+   * library stamps one on it, `preferredGuard`, or else as `unprovable` decides: under `"report"` an
+   * aggregate nothing of which has moved is left as it is, every row, and each such row is reported
+   * `unguarded`, dry run or not; one already part-moved is finished under the strongest guard that
+   * fits, as 1.39.0 finished it). Rows whose keys chain move in order, the one whose current key is
+   * free first, so no write lands on a row still to move, and the root moves last, so a move cut
+   * short is found by the next run. A write that loses to a concurrent one reads the aggregate
+   * again; a row stored under both keys leaves the aggregate as it is, reported. A dry run writes
+   * nothing.
    */
   const rekeyCore = (
     key: Record<string, unknown>,
@@ -1824,6 +2917,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
      * holds it, whose rows this one's move would find gone by then.
      */
     fromOnly: boolean,
+    /** What a row too wide to guard whole, with no `updatedAt` to stand in, gets. */
+    unprovable: UnprovableRow,
   ): Effect.Effect<Rekey.RekeyTally, AggregateWriteError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       let movedRows = 0
@@ -1861,7 +2956,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
 
         const current = yield* assembleAggregate(
-          decodeSchema,
+          assembly,
           rootNode,
           allItems,
           contextFields,
@@ -1878,15 +2973,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
           aggregateName,
           config.schema,
         )
-        const rootComposites = KeyComposer.extractKeyComposites(
-          config.schema,
-          {},
-          config.collection.sk?.composite ?? [],
-          keyRecord(assembled),
-        )
         const rows = locateRows(
           groups,
-          buildDynamoItems(groups, config, pkValue, rootComposites, keyRecord),
+          buildDynamoItems(groups, config, pkValue, undefined, keyRecord),
           allItems,
           pkValue,
           from,
@@ -1923,6 +3012,45 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
         }
 
+        // With `ownsRows`, every row of its types it reads is the aggregate's (DESIGN.md §7 "Which
+        // rows in its partition are an aggregate's"), and it moves exactly what it moves without the
+        // option: the rows its value decomposes to. Where any other row of its types would go can't
+        // be told from what's stored, so it isn't moved. One whose own partition key changes would
+        // be left behind in the old partition: the aggregate is left as it is, reported `failed`.
+        // Otherwise the row stays where the aggregate reads it, counted `unrecognizedKey`. Without
+        // `ownsRows`, nothing here applies.
+        const placed = new Set<string>()
+        for (const row of rows) {
+          if (row.placement === "old") placed.add(positionOf(row.old.pk, row.old.sk))
+          if (row.placement === "current") placed.add(positionOf(row.current.pk, row.current.sk))
+        }
+        const unplaced: Array<Position> = []
+        for (const item of ownsRows ? allItems : []) {
+          if (!ownedTypes.has(String(item.__edd_e__))) continue
+          const at = { pk: String(item[config.pk.field]), sk: String(item.sk) }
+          if (!placed.has(positionOf(at.pk, at.sk))) unplaced.push(at)
+        }
+        const stranded = unplaced.filter((at) => at.pk !== pkValue)
+        if (stranded.length > 0) {
+          return {
+            conflicts: stranded.map((at) => ({
+              member: aggregateName,
+              kind: "aggregate" as const,
+              reason: "failed" as const,
+              key: { [config.pk.field]: at.pk, sk: at.sk },
+              target: undefined,
+              message:
+                "The aggregate owns its rows (`ownsRows`), and this one isn't a row its value " +
+                "decomposes to, so where it goes can't be told. Moving the rest would leave it in " +
+                "the old partition: the aggregate is left as it is.",
+            })),
+          }
+        }
+        const left: Rekey.RekeyTally =
+          unplaced.length > 0 ? { skipped: { unrecognizedKey: unplaced.length } } : {}
+        const tally = (rows: number): Rekey.RekeyTally => ({ ...done(rows), ...left })
+        const counted = rows.length
+
         // Each row's write keeps the `created` and `updated` of the row it moves.
         const createdField = stampFields?.createdAt ?? null
         const updatedField = stampFields?.updatedAt ?? null
@@ -1938,26 +3066,82 @@ const makeAggregate = <TSchema extends Schema.Top>(
             keptUpdated.set(row.current.sk, was[updatedField])
           }
         }
-        const built = buildDynamoItems(
-          yield* packAggregateGroups(groups, packedByType, aggregateName, "update"),
-          config,
-          pkValue,
-          rootComposites,
-          keyRecord,
-          stampFor(yield* DateTime.now, keptCreated, keptUpdated),
-        ).flatMap((group) => group.items)
+        const packedGroups = yield* packAggregateGroups(
+          groups,
+          packedByType,
+          aggregateName,
+          "update",
+        )
+        const rekeyedAt = yield* DateTime.now
+        const built = (yield* composeOrFail("rekey", () =>
+          buildDynamoItems(
+            packedGroups,
+            config,
+            pkValue,
+            assembled,
+            keyRecord,
+            stampFor(rekeyedAt, keptCreated, keptUpdated),
+          ),
+        )).flatMap((group) => group.items)
         const storedAt = new Map(
           stored.map((item) => [
             positionOf(item[config.pk.field]?.S ?? "", item.sk?.S ?? ""),
             item,
           ]),
         )
-        const guardOf = (at: { readonly pk: string; readonly sk: string }) =>
-          asReadGuard(storedAt.get(positionOf(at.pk, at.sk)) ?? {}, config.pk.field, [
-            ...(updatedField === null ? [] : [updatedField]),
-          ])
+        // An aggregate is left as it is, reported, only while nothing of it has moved. One already
+        // part-moved, in this run or a run cut short, is finished under the strongest guard that
+        // fits, as 1.39.0 finished it: left across two keys, a read under either misses rows.
+        const partMoved =
+          movedRows > 0 ||
+          rows.some(
+            (row) =>
+              row.placement === "current" &&
+              positionOf(row.old.pk, row.old.sk) !== positionOf(row.current.pk, row.current.sk),
+          )
+        const unprovableHere: UnprovableRow = partMoved ? "strongest" : unprovable
+        // The row as read, whole, with every attribute its entity type can hold and it didn't
+        // still absent: 1.39.0's guard with those appended. A row too wide for that is guarded on
+        // its `updatedAt` when the library stamps one on it, held or absent (`preferredGuard`),
+        // with what else fits; otherwise `unprovableHere` decides, and `undefined` is a row
+        // reported.
+        const guardOf = (at: { readonly pk: string; readonly sk: string }, r: number) => {
+          const read = storedAt.get(positionOf(at.pk, at.sk)) ?? {}
+          const entityType = built[r]!.__edd_e__?.S ?? ""
+          const absent = writableAttributes.get(entityType) ?? []
+          const prefer = updatedField === null ? [] : [updatedField]
+          const whole = wholeRowGuard(read, config.pk.field, prefer, [], absent)
+          if (whole !== undefined) return whole
+          if (updatedField !== null && stampsUpdated.has(entityType)) {
+            return preferredGuard(read, config.pk.field, prefer, absent)
+          }
+          switch (unprovableHere) {
+            case "report":
+              return undefined
+            case "strongest":
+              return asReadGuard(read, config.pk.field, prefer)
+          }
+        }
         const keyOf = (at: { readonly pk: string; readonly sk: string }) =>
           toAttributeMap({ [config.pk.field]: at.pk, sk: at.sk })
+        // A custom `decompose`'s row is written as stored, its keys and its collection sort key
+        // copy replaced: decomposing the value read back needn't give the attributes it holds (one
+        // renaming a transformed field would store it decoded once more on every run).
+        const mirror =
+          config.collection.index !== undefined && config.collection.sk !== undefined
+            ? config.collection.sk.field
+            : undefined
+        const itemOf = (r: number): Record<string, AttributeValue> => {
+          const row = rows[r]!
+          if (!row.custom) return built[r]!
+          const at = row.placement === "old" ? row.old : row.current
+          return {
+            ...storedAt.get(positionOf(at.pk, at.sk)),
+            [config.pk.field]: { S: row.current.pk },
+            sk: { S: row.current.sk },
+            ...(mirror !== undefined && { [mirror]: { S: row.current.sk } }),
+          }
+        }
 
         type Move = {
           readonly from: { readonly pk: string; readonly sk: string }
@@ -1966,8 +3150,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
         const moves: Array<Move> = []
         const rewrites: Array<ReadonlyArray<TransactWriteItem>> = []
+        const unguarded: Array<Pick<Move, "from" | "to">> = []
         for (const [r, row] of rows.entries()) {
           if (row.placement === "old") {
+            const guard = guardOf(row.old, r)
+            if (guard === undefined) {
+              unguarded.push({ from: row.old, to: row.current })
+              continue
+            }
             moves.push({
               from: row.old,
               to: row.current,
@@ -1975,27 +3165,36 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 {
                   Put: {
                     TableName: tableConfig.name,
-                    Item: built[r]!,
+                    Item: itemOf(r),
                     ConditionExpression: "attribute_not_exists(#pk)",
                     ExpressionAttributeNames: { "#pk": config.pk.field },
                   },
                 },
                 {
-                  Delete: { TableName: tableConfig.name, Key: keyOf(row.old), ...guardOf(row.old) },
+                  Delete: {
+                    TableName: tableConfig.name,
+                    Key: keyOf(row.old),
+                    ...guard,
+                  },
                 },
               ],
             })
             continue
           }
           if (row.placement !== "current" || row.atCurrent === undefined) continue
-          const stale = staleIndexFields(built[r]!, row.atCurrent)
+          const item = itemOf(r)
+          const stale = staleIndexFields(item, row.atCurrent)
           if (stale.length === 0) continue
-          const guard = guardOf(row.current)
+          const guard = guardOf(row.current, r)
+          if (guard === undefined) {
+            unguarded.push({ from: row.current, to: row.current })
+            continue
+          }
           const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
           const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
           const sets = stale.map((field, i) => {
             names[`#x${i}`] = field
-            values[`:x${i}`] = built[r]![field]!
+            values[`:x${i}`] = item[field]!
             return `#x${i} = :x${i}`
           })
           rewrites.push([
@@ -2011,17 +3210,35 @@ const makeAggregate = <TSchema extends Schema.Top>(
             },
           ])
         }
-        if (moves.length === 0 && rewrites.length === 0) return done(rows.length)
+        // Nothing of it has moved (`unprovableHere`): an unguarded row leaves the aggregate as is.
+        if (unguarded.length > 0) {
+          return {
+            ...(movedRows > 0 && { moved: { aggregate: movedRows } }),
+            ...(rewrittenRows > 0 && { indexKeysRewritten: rewrittenRows }),
+            ...left,
+            conflicts: unguarded.map((row) => ({
+              member: aggregateName,
+              kind: "aggregate" as const,
+              reason: "unguarded" as const,
+              key: { [config.pk.field]: row.from.pk, sk: row.from.sk },
+              target: { [config.pk.field]: row.to.pk, sk: row.to.sk },
+              message: `${Rekey.UNGUARDED_MESSAGE} Its aggregate's other rows are left with it.`,
+            })),
+          }
+        }
+        if (moves.length === 0 && rewrites.length === 0) return tally(counted)
         if (dryRun) {
           movedRows += moves.length
           rewrittenRows += rewrites.length
-          return done(rows.length)
+          return tally(counted)
         }
 
         // In waves: a row moves once no row still to move is stored at its
         // current key, and the root once nothing else is left: while it's under the old partition
         // the next run finds the aggregate there. Each move's Put and Delete share a transaction;
-        // up to TRANSACT_LIMIT items go in one.
+        // a transaction takes the units in order while it is within DynamoDB's limits on one
+        // (`packRequests`: 100 actions, 4 MB of item size, 16 MB of body), and at least one.
+        const shape = transactWriteShape(yield* Capacity.requestFields)
         const units: Array<{
           readonly kind: "move" | "rewrite"
           readonly items: ReadonlyArray<TransactWriteItem>
@@ -2040,13 +3257,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
           if (wave.length === 0 && units.length === 0) break
           pending = pending.filter((move) => !wave.includes(move))
           units.push(...wave.map((move) => ({ kind: "move" as const, items: move.items })))
-          while (!lost && units.length > 0) {
-            const chunk: typeof units = []
-            let size = 0
-            while (units.length > 0 && size + units[0]!.items.length <= TRANSACT_LIMIT) {
-              size += units[0]!.items.length
-              chunk.push(units.shift()!)
-            }
+          const chunks = packRequests(
+            units.splice(0),
+            (unit) => transactWriteUnit(unit.items),
+            shape,
+          )
+          for (const chunk of chunks) {
             const written = yield* client
               .transactWriteItems({ TransactItems: chunk.flatMap((unit) => unit.items) })
               .pipe(
@@ -2069,9 +3285,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
         // A write landed in between: read the aggregate again.
         if (lost) continue
-        if (pending.length === 0) return done(rows.length)
+        if (pending.length === 0) return tally(counted)
         return {
-          ...done(rows.length - pending.length),
+          ...tally(counted - pending.length),
           conflicts: pending.map((move) => ({
             member: aggregateName,
             kind: "aggregate" as const,
@@ -2134,12 +3350,45 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
+   * Is `pk` a partition key a root row's values have composed: under each setting's text, and with
+   * a numeric composite as either kind (`CompositeCodec.kindReadingOf`), the other kind read from
+   * the digits the row stored. The current text comes first, and a root under it composes nothing
+   * more.
+   */
+  const holdsPartition = (
+    row: Record<string, AttributeValue>,
+    key: Record<string, unknown>,
+    pk: string,
+  ): boolean =>
+    [
+      config.schema,
+      KeyText136.schema136(config.schema),
+      KeyText136.schema137(config.schema),
+      KeyText136.schemaEscaped(config.schema),
+    ].some(
+      (under) =>
+        kindReadingOf(
+          keyRecord(key),
+          config.pk.composite,
+          (field) => row[field]?.N,
+          ({ record }) =>
+            composeCollectionKey(
+              config.schema,
+              config.collection.name,
+              KeyComposer.extractKeyComposites(under, {}, config.pk.composite, record),
+            ),
+          pk,
+        ) !== undefined,
+    )
+
+  /**
    * The root of another aggregate at `pk`, stored there under text its values no longer compose:
    * it moves first, or this move's rows would land in its partition.
    */
   const staleRootAt = (tableName: string, pk: string) =>
     Effect.map(rootItemAt(tableName, pk), ({ Item }) =>
-      Item === undefined || partitionUnder(config.schema, fromAttributeMap(Item)) === pk
+      Item === undefined ||
+      partitionUnder(config.schema, rootKeyAsRead(fromAttributeMap(Item))) === pk
         ? undefined
         : Item,
     )
@@ -2183,6 +3432,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * or be on its way to it (a run cut short moves the root last), in any order the scan met them,
    * and a dry run decides the same. Its values don't say whose it is unless the aggregate's context
    * holds them, so with no root at all there's no aggregate to move it with, and it's reported.
+   *
+   * A run that hasn't read the whole table can't say there's no root: a root at its old key, on a
+   * page this run didn't read, names this partition only when the scan reaches it. So it reports
+   * the row as unjudged, and a run over the whole table judges it.
    */
   const rekeyFinish = (
     ctx: Rekey.RekeyRowContext,
@@ -2200,7 +3453,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         })
         if (Item !== undefined) left++
       }
-      return left > 0 ? { skipped: { unrecognizedKey: left } } : {}
+      if (left === 0) return {}
+      return { skipped: ctx.sawWholeTable() ? { unrecognizedKey: left } : { rootNotSeen: left } }
     })
 
   const rekeyRow = (
@@ -2216,18 +3470,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (row.sk?.S !== rekeyRootSk || row.__edd_e__?.S !== config.root.entityType) {
         return yield* rekeyRowBelowRoot(row, pk, ctx)
       }
-      const key = fromAttributeMap(row) as Record<string, unknown>
+      const key = rootKeyAsRead(fromAttributeMap(row) as Record<string, unknown>)
       const current = partitionUnder(config.schema, key)
       // Under none of the keys its values have had: nothing here can place it.
-      if (
-        current === undefined ||
-        ![
-          current,
-          partitionUnder(KeyText136.schema136(config.schema), key),
-          partitionUnder(KeyText136.schema137(config.schema), key),
-          partitionUnder(KeyText136.schemaEscaped(config.schema), key),
-        ].includes(pk)
-      ) {
+      if (current === undefined || !holdsPartition(row, key, pk)) {
         return { skipped: { unrecognizedKey: 1 } }
       }
       const { rooted } = rekeyRunOf(ctx)
@@ -2270,7 +3516,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
               fromOnly = ctx.dryRun
             }
           }
-          const moved = yield* rekeyCore(key, ctx.dryRun, from, fromOnly).pipe(
+          const moved = yield* rekeyCore(
+            key,
+            ctx.dryRun,
+            from,
+            fromOnly,
+            Rekey.unprovableRow(ctx),
+          ).pipe(
             Effect.catch(
               (error: AggregateWriteError): Effect.Effect<Rekey.RekeyTally, DynamoClientError> => {
                 if (Rekey.isDynamoClientError(error)) return Effect.fail(error)
@@ -2280,6 +3532,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 // A root under both partition keys (its sort key is fixed, so one
                 // partition holds one): neither copy is judged.
                 const both = assembly === "Multiple root items found"
+                // What went wrong, as the error says it: a tagged error's own message is empty.
+                const detail =
+                  error._tag === "AggregateAssemblyError" ||
+                  error._tag === "AggregateDecompositionError"
+                    ? error.reason
+                    : error._tag === "ValidationError"
+                      ? String(error.cause ?? error.message)
+                      : error.message
                 return Effect.succeed({
                   conflicts: [
                     {
@@ -2290,7 +3550,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                       target: { [config.pk.field]: current, sk: rekeyRootSk },
                       message: both
                         ? "The aggregate's root is also stored under its current key."
-                        : `${error._tag}: ${String(assembly ?? (error as { message?: unknown }).message ?? "")}`,
+                        : `${error._tag}: ${detail}`,
                     },
                   ],
                 })
@@ -2316,6 +3576,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       _tag: "Aggregate",
       _tableTag: config.table.Tag,
       _packedByType: packedByType,
+      _ownsRows: ownsRows,
+      _attributeWriters: attributeWriters,
+      _ownership: ownership,
       schema,
       pkField: config.pk.field,
       collection: {
@@ -2347,7 +3610,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
 
           const result = yield* assembleAggregate(
-            decodeSchema,
+            assembly,
             rootNode,
             allItems,
             contextFields,
@@ -2364,12 +3627,22 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const tableConfig: TableConfig = yield* config.table.Tag
 
           // 1. Hydrate refs from edges
-          const hydrated = yield* hydrateAggregateRefs(input, config.edges, aggregateName)
+          const hydrated = yield* hydrateAggregateRefs(
+            // What `create`'s type takes (`CreateArgument`) is judged here, at run time.
+            input as Record<string, unknown>,
+            config.edges,
+            schemaFields,
+            aggregateName,
+          )
 
           // 2. Validate via schema decode (decodeSchema substitutes nested edge
           //    self-date/Redacted leaves — Option A — and is identical to `schema`
-          //    when no edge needs it).
-          const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(hydrated).pipe(
+          //    when no edge needs it). A date the library stamps is stamped now,
+          //    over what the input holds for it unless the root declares it
+          //    optional, so what's composed and returned is what's stored.
+          const now = yield* DateTime.now
+          const written = fillStamps(rootNode, hydrated, now, "declared")
+          const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(written).pipe(
             Effect.mapError(
               (cause) =>
                 new ValidationError({
@@ -2383,13 +3656,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const assembled = { ...(decoded as object) } as Record<string, unknown>
 
           // 3. Compose PK
-          const composites = KeyComposer.extractKeyComposites(
-            config.schema,
-            {},
-            config.pk.composite,
-            keyRecord(assembled),
-          )
-          const pkValue = composeCollectionKey(config.schema, config.collection.name, composites)
+          const pkValue = yield* composeOrFail("create", () => collectionPkOf(assembled))
 
           // 4. Decompose into items grouped by sub-aggregate transaction boundaries
           const groups = yield* decomposeAggregate(
@@ -2399,32 +3666,36 @@ const makeAggregate = <TSchema extends Schema.Top>(
             rootEncoders,
             aggregateName,
             config.schema,
+            { present: true, value: written, update: false },
           )
 
-          // 5. Compose collection SK composites for root item. Through the key
-          // form — `update` already did (see `newDynamo` / `oldDynamo` below), so
-          // leaving `create` raw made the two write paths mirror the collection SK
-          // differently for a transformed composite.
-          const collectionSkComposites = KeyComposer.extractKeyComposites(
-            config.schema,
-            {},
-            config.collection.sk?.composite ?? [],
-            keyRecord(assembled),
-          )
-
-          // 6. Build DynamoDB items with composed keys (create only ever PUTs).
+          // 5. Build DynamoDB items with composed keys (create only ever PUTs).
           //    Every row is new, so `created` has nothing to carry forward.
-          const now = yield* DateTime.now
-          const dynamoGroups = buildDynamoItems(
-            yield* packAggregateGroups(groups, packedByType, aggregateName, "create"),
-            config,
-            pkValue,
-            collectionSkComposites,
-            keyRecord,
-            stampFor(now, EMPTY_CREATED),
+          const packedGroups = yield* packAggregateGroups(
+            groups,
+            packedByType,
+            aggregateName,
+            "create",
+          )
+          const dynamoGroups = yield* composeOrFail("create", () =>
+            buildDynamoItems(
+              packedGroups,
+              config,
+              pkValue,
+              assembled,
+              keyRecord,
+              stampFor(now, EMPTY_CREATED),
+            ),
+          )
+          yield* refuseOtherKindKeys(groups, "aggregate.create")
+          yield* refuseNotReadBack(
+            dynamoGroups,
+            assembled,
+            "aggregate.create",
+            storedAsGivenIn(groups),
           )
 
-          // 7. Write via sub-aggregate transactions. The root item goes first in
+          // 6. Write via sub-aggregate transactions. The root item goes first in
           //    the first transaction, guarded by `attribute_not_exists` (#134):
           //    an existing aggregate cancels it before any edge or sub-aggregate
           //    row is written. Rows below the root need no guard of their own —
@@ -2467,6 +3738,17 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 operation: "Query",
                 cause: assemblyReadCause("delete", diagnosis, original),
               }),
+          ).pipe(
+            // Nor a key with no value: nothing to read, reported as a key that finds nothing.
+            Effect.catchTag("ValidationError", (error) =>
+              Effect.fail(
+                new AggregateAssemblyError({
+                  aggregate: aggregateName,
+                  reason: String((error.cause as { message?: unknown })?.message ?? error.cause),
+                  key,
+                }),
+              ),
+            ),
           )
 
           if (allItems.length === 0) {
@@ -2521,11 +3803,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // DOMAIN record, so it goes through the same key form the write side
           // used — otherwise `list` composes a key `create` never wrote and
           // silently returns nothing (#111).
-          const listPkComposites = KeyComposer.extractKeyComposites(
-            config.schema,
-            {},
-            listConfig.pk.composite,
-            keyRecord(filter ?? {}),
+          const listPkComposites = yield* composeOrFail("list", () =>
+            keyCompositesOrThrow(
+              aggregateName,
+              "its list partition key",
+              config.schema,
+              listConfig.pk.composite,
+              keyRecord(filter ?? {}),
+            ),
           )
 
           // Build SK prefix from contiguous filter values matching SK composites.
@@ -2600,6 +3885,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
             rootItems = limit === undefined ? merged : merged.slice(0, limit)
             nextKey = undefined
           } else {
+            // `!== undefined`, as above: an empty string is a cursor no list
+            // returned, not a way of saying "from the start".
+            const startKey =
+              options?.cursor === undefined ? undefined : decodeKeyCursor(options.cursor)
+            if (options?.cursor !== undefined && startKey === undefined) {
+              return yield* new ValidationError({
+                entityType: aggregateName,
+                operation: "list",
+                cause:
+                  `[EDD-9094] Aggregate "${aggregateName}": the cursor is not one a list returned. ` +
+                  "A cursor is opaque: pass back the text of a previous `list` result's `cursor`, " +
+                  "unchanged, to the same list. Nothing was sent.",
+              })
+            }
             const result = yield* queryListPartition(
               client,
               tableConfig,
@@ -2611,9 +3910,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 skComplete,
                 limit,
                 pageSize,
-                startKey: options?.cursor
-                  ? (JSON.parse(atob(options.cursor)) as Record<string, AttributeValue>)
-                  : undefined,
+                startKey,
                 filter: rootFilter,
                 accept: options?.filterBy,
                 reverse: options?.reverse === true,
@@ -2628,16 +3925,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // Extract PK composite values from each root item and assemble
           const aggregates: Array<Schema.Schema.Type<TSchema>> = []
           for (const rootItem of rootItems) {
-            const key: Record<string, unknown> = {}
+            const stored: Record<string, unknown> = {}
             for (const composite of config.pk.composite) {
-              key[composite] = rootItem[composite]
+              stored[composite] = rootItem[composite]
             }
+            // The key the root's values compose as a read takes them, as `create` composed it.
+            const key = rootKeyAsRead(stored)
             const assembled = yield* Effect.gen(function* () {
               const { allItems } = yield* fetchPartition(key, "list")
               if (allItems.length === 0) return undefined
 
               const result = yield* assembleAggregate(
-                decodeSchema,
+                assembly,
                 rootNode,
                 allItems,
                 contextFields,
@@ -2650,7 +3949,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             if (assembled !== undefined) aggregates.push(assembled)
           }
 
-          const cursor = nextKey ? Option.some(btoa(JSON.stringify(nextKey))) : Option.none()
+          const cursor = nextKey ? Option.some(encodeKeyCursor(nextKey)) : Option.none()
 
           return { data: aggregates, cursor }
         }),
@@ -2662,7 +3961,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
  * Each aggregate operation as a named operation for consumed-capacity
  * reports (#174); the entity ops and batches it composes nest under it.
  */
-const withOperations = <A extends Aggregate<any, any, any>>(aggregateName: string, ops: A): A => {
+const withOperations = <A extends Aggregate<any, any, any, any>>(
+  aggregateName: string,
+  ops: A,
+): A => {
   const target = { target: aggregateName }
   return {
     ...ops,
@@ -2686,9 +3988,18 @@ const withOperations = <A extends Aggregate<any, any, any>>(aggregateName: strin
  *
  * @internal Used by `DynamoClient.make()` to bind aggregates.
  */
-export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unknown>, TInput>(
-  aggregate: Aggregate<TSchema, TKey, TInput>,
-): Effect.Effect<BoundAggregate<TSchema, TKey, TInput>, never, DynamoClient | TableConfig> =>
+export const bind = <
+  TSchema extends Schema.Top,
+  TKey extends Record<string, unknown>,
+  TInput,
+  TCreate,
+>(
+  aggregate: Aggregate<TSchema, TKey, TInput, TCreate>,
+): Effect.Effect<
+  BoundAggregate<TSchema, TKey, TInput, TCreate>,
+  never,
+  DynamoClient | TableConfig
+> =>
   Effect.gen(function* () {
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const ctx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
@@ -2699,7 +4010,7 @@ export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unk
     return {
       schema: aggregate.schema,
       get: (key: TKey) => provide(aggregate.get(key)),
-      create: (input: Record<string, unknown>) => provide(aggregate.create(input)),
+      create: (input: TCreate) => provide(aggregate.create(input)),
       update: (
         key: TKey,
         mutationFn: (
@@ -2715,7 +4026,7 @@ export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unk
       createSchema: aggregate.createSchema,
       updateSchema: aggregate.updateSchema,
       provide,
-    } as BoundAggregate<TSchema, TKey, TInput>
+    } as BoundAggregate<TSchema, TKey, TInput, TCreate>
   })
 
 // ---------------------------------------------------------------------------
@@ -2733,6 +4044,16 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
     return a.every((item, i) => deepEqual(item, b[i]))
   }
   if (Array.isArray(a) || Array.isArray(b)) return false
+  // A set has no own keys: compared below, any two would be equal, and a change to one
+  // would never be written. Members are strings, numbers or binary values, by identity.
+  if (a instanceof Set || b instanceof Set) {
+    return (
+      a instanceof Set &&
+      b instanceof Set &&
+      a.size === b.size &&
+      [...a].every((member) => b.has(member))
+    )
+  }
 
   const aObj = a as Record<string, unknown>
   const bObj = b as Record<string, unknown>
@@ -2742,10 +4063,14 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
   return aKeys.every((k) => deepEqual(aObj[k], bObj[k]))
 }
 
-const deepEqualGroups = (a: TransactionGroup, b: TransactionGroup): boolean => {
-  if (a.items.length !== b.items.length) return false
-  return a.items.every((item, i) => {
-    const other = b.items[i]!
+const deepEqualGroups = (a: TransactionGroup, b: TransactionGroup): boolean =>
+  sameItems(a.items, b.items)
+
+/** Whether two decompositions are one: the same items, in order, of the same types and attributes. */
+const sameItems = (a: ReadonlyArray<DecomposedItem>, b: ReadonlyArray<DecomposedItem>): boolean => {
+  if (a.length !== b.length) return false
+  return a.every((item, i) => {
+    const other = b[i]!
     if (item.entityType !== other.entityType) return false
     return deepEqual(item.attributes, other.attributes)
   })
@@ -2768,11 +4093,14 @@ interface ResolveNodeArgs {
   readonly edges: Record<string, AggregateEdge | BoundSubAggregate<any>>
   /** Fields of the model `edges` belong to — the root schema, or a sub-aggregate's. */
   readonly parentFields?: Record<string, Schema.Top> | undefined
+  /** Fields of the value this node's rows hold, where that isn't `parentFields`. */
+  readonly ownFields?: Record<string, Schema.Top> | undefined
   /** The aggregate's ref resolver, shared with its `decodeSchema`. */
   readonly resolveRef?: RefResolver | undefined
   readonly discriminator?: Record<string, unknown> | undefined
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
+  readonly decomposeInput?: ((written: Written) => Option.Option<unknown>) | undefined
   readonly ownDiscriminator?: Record<string, unknown> | undefined
   readonly attrEncoders?: AttrEncoders | undefined
   readonly keyAttrEncoders?: AttrEncoders | undefined
@@ -2891,6 +4219,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             edges: {},
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
+            ownFields: valueFields,
             attrEncoders: buildAttrEncoders(valueFields, resolveRef),
             ...edgeStorage(
               edgePackedFields(
@@ -2917,6 +4246,13 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
         // entity's model, which is what such an element IS.
         const entityFields = fieldsOf(edge.entity?.model)
         const elementFields = manyElementFields(parentFields, field) ?? entityFields
+        const parentField = parentFields?.[field]
+        const arrayElement =
+          parentField === undefined ? undefined : extractArrayElement(parentField)
+        const keyedValue =
+          parentField === undefined || arrayElement !== undefined
+            ? undefined
+            : extractKeyedValue(parentField)
         children.push(
           resolveNode({
             fieldName: field,
@@ -2926,7 +4262,16 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator,
             assemble: edge.assemble,
             decompose: edge.decompose,
-            attrEncoders: buildAttrEncoders(elementFields, resolveRef),
+            decomposeInput:
+              edge.decompose === undefined
+                ? undefined
+                : storedFormFirst(field, parentFields?.[field], resolveRef),
+            ownFields: elementFields,
+            attrEncoders: buildAttrEncoders(
+              elementFields,
+              resolveRef,
+              keyedValue !== undefined && edge.entity === undefined,
+            ),
             // Sort-key composites keep reading the pre-#133 encoding (the entity
             // model's top-level transforms), so no stored key is re-spelled.
             keyAttrEncoders: buildKeyAttrEncoders(entityFields),
@@ -2981,16 +4326,19 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     }
   }
 
+  const ownFields = args.ownFields ?? parentFields
   return {
     fieldName,
     entityType,
     cardinality,
+    ownFields,
     // Absent optionals stay absent under `exactOptionalPropertyTypes`.
     ...(discriminator !== undefined && { discriminator }),
     ...(ownDiscriminator !== undefined && { ownDiscriminator }),
     children,
     ...(assemble !== undefined && { assemble }),
     ...(decompose !== undefined && { decompose }),
+    ...(args.decomposeInput !== undefined && { decomposeInput: args.decomposeInput }),
     ...(skComposite !== undefined && { skComposite }),
     ...(refIdentifierField !== undefined && { refIdentifierField }),
     ...(args.packed !== undefined && { packed: args.packed }),
@@ -3150,8 +4498,17 @@ const queryAllItems = <E>(
 // Internal: Assembly algorithm
 // ---------------------------------------------------------------------------
 
+/**
+ * What assembly decodes an aggregate with (`schema`), and the schema whose issue a decode that dies
+ * fails with, as 1.39.0's did (`before`, `failingAsBefore`).
+ */
+type AssemblyDecode = {
+  readonly schema: Schema.Top
+  readonly before: () => Schema.Top
+}
+
 const assembleAggregate = (
-  decodeSchema: Schema.Top,
+  assembly: AssemblyDecode,
   rootNode: ResolvedNode,
   allItems: Array<Record<string, unknown>>,
   _contextFields: ReadonlyArray<string>,
@@ -3161,8 +4518,11 @@ const assembleAggregate = (
   systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
+    const reached = assemblyWalk(rootNode, allItems, (node, item) =>
+      takesRow(node, item.__edd_e__, (attr) => item[attr]),
+    )
     // Find the root item
-    const rootItems = allItems.filter((item) => item.__edd_e__ === rootNode.entityType)
+    const rootItems = reached.get(rootNode) ?? []
 
     if (rootItems.length === 0) {
       return yield* new AggregateAssemblyError({
@@ -3186,7 +4546,7 @@ const assembleAggregate = (
     const edgeValues: Record<string, unknown> = {}
 
     for (const child of rootNode.children) {
-      const assembled = yield* assembleNode(child, allItems, key, aggregateName, systemAttrs)
+      const assembled = yield* assembleNode(child, reached, key, aggregateName, systemAttrs)
       if (child.fieldName !== null && assembled !== undefined) {
         edgeValues[child.fieldName] = assembled
       }
@@ -3211,7 +4571,7 @@ const assembleAggregate = (
       "gsi5sk",
       "lsi1sk",
       "lsi2sk",
-      ...systemAttrs,
+      ...stampsToStrip(rootNode, systemAttrs),
     ])
 
     for (const [fieldKey, value] of Object.entries(rootItem)) {
@@ -3226,43 +4586,70 @@ const assembleAggregate = (
     // Decode through `decodeSchema` — a tolerant clone of the aggregate schema
     // that lifts every date / Redacted leaf (root + nested edges) from the stored
     // wire form to its domain value in a single pass (#72 + Option A).
-    const decoded = yield* Schema.decodeUnknownEffect(decodeSchema as Schema.Codec<any>)(
+    const toValidationError = (cause: unknown) =>
+      new ValidationError({ entityType: aggregateName, operation: "aggregate.assemble", cause })
+    const decoded = yield* Schema.decodeUnknownEffect(assembly.schema as Schema.Codec<any>)(
       assembled,
     ).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ValidationError({
-            entityType: aggregateName,
-            operation: "aggregate.assemble",
-            cause,
-          }),
-      ),
+      Effect.mapError(toValidationError),
+      failingAsBefore(() => issueDecoding(assembly.before(), assembled), toValidationError),
     )
 
     return decoded
   })
 
+/**
+ * Whether assembly hands a row to `node`: the row's entity type is the node's, and so is each of
+ * the node's static discriminator values (a computed one, a function, isn't matched). A node's
+ * discriminator already holds every enclosing one (`resolveNode`). `valueOf` reads an attribute of
+ * the row as a read has it.
+ */
+const takesRow = (
+  node: ResolvedNode,
+  entityType: unknown,
+  valueOf: (attr: string) => unknown,
+): boolean => {
+  if (entityType !== node.entityType) return false
+  for (const [attr, value] of Object.entries(node.discriminator ?? {})) {
+    if (typeof value === "function") continue
+    if (valueOf(attr) !== value) return false
+  }
+  return true
+}
+
+/**
+ * Assembly's walk over an aggregate's rows: each node a read reaches, with the rows it takes
+ * (`takesRow`). A node with edges (the root, a sub-aggregate) leads to them only through its one
+ * row: one that takes none is absent, and one that takes more can't be assembled, so a read hands
+ * nothing to the nodes under it. Assembly reads each node's rows off this walk, and the write
+ * check (`EDD-9128`) judges a row only by the nodes it reaches, so the two never disagree on which
+ * node a row is.
+ */
+const assemblyWalk = <Row>(
+  rootNode: ResolvedNode,
+  rows: ReadonlyArray<Row>,
+  takes: (node: ResolvedNode, row: Row) => boolean,
+): ReadonlyMap<ResolvedNode, ReadonlyArray<Row>> => {
+  const reached = new Map<ResolvedNode, ReadonlyArray<Row>>()
+  const visit = (node: ResolvedNode): void => {
+    const taken = rows.filter((row) => takes(node, row))
+    reached.set(node, taken)
+    if (node.children.length > 0 && taken.length !== 1) return
+    for (const child of node.children) visit(child)
+  }
+  visit(rootNode)
+  return reached
+}
+
 const assembleNode = (
   node: ResolvedNode,
-  allItems: Array<Record<string, unknown>>,
+  reached: ReadonlyMap<ResolvedNode, ReadonlyArray<Record<string, unknown>>>,
   key: Record<string, unknown>,
   aggregateName: string,
   systemAttrs: ReadonlySet<string> = EMPTY_ATTRS,
 ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
   Effect.gen(function* () {
-    // Find items matching this node's entity type and discriminator
-    const matchingItems = allItems.filter((item) => {
-      if (item.__edd_e__ !== node.entityType) return false
-      // If this node has a discriminator, check that item attributes match
-      if (node.discriminator) {
-        for (const [attr, value] of Object.entries(node.discriminator)) {
-          // Skip computed discriminators (functions) — only match on static values
-          if (typeof value === "function") continue
-          if (item[attr] !== value) return false
-        }
-      }
-      return true
-    })
+    const matchingItems = reached.get(node) ?? []
 
     if (node.cardinality === "one") {
       // One-to-one: sub-aggregate root or simple one edge
@@ -3281,18 +4668,10 @@ const assembleNode = (
         const subRootItem = matchingItems[0]!
         const edgeValues: Record<string, unknown> = {}
 
+        // Its one row leads to its edges (`assemblyWalk`). Each child's discriminator already holds
+        // this node's (`resolveNode`).
         for (const child of node.children) {
-          // For children within a sub-aggregate, propagate the parent's discriminator
-          const childNode = node.discriminator
-            ? { ...child, discriminator: { ...node.discriminator, ...child.discriminator } }
-            : child
-          const assembled = yield* assembleNode(
-            childNode,
-            allItems,
-            key,
-            aggregateName,
-            systemAttrs,
-          )
+          const assembled = yield* assembleNode(child, reached, key, aggregateName, systemAttrs)
           if (child.fieldName !== null && assembled !== undefined) {
             edgeValues[child.fieldName] = assembled
           }
@@ -3301,13 +4680,14 @@ const assembleNode = (
         // Build sub-aggregate result: sub-root fields + assembled edges
         const subFields: Record<string, unknown> = {}
         const edgeFieldNames = new Set(node.children.map((c) => c.fieldName).filter(Boolean))
+        const stripped = stampsToStrip(node, systemAttrs)
 
         for (const [fieldKey, value] of Object.entries(subRootItem)) {
           // Skip DynamoDB metadata, discriminator attributes, and edge fields
           if (fieldKey === "__edd_e__") continue
           if (fieldKey.startsWith("pk") || fieldKey.startsWith("sk")) continue
           if (fieldKey.startsWith("gsi") || fieldKey.startsWith("lsi")) continue
-          if (systemAttrs.has(fieldKey)) continue
+          if (stripped.has(fieldKey)) continue
           if (edgeFieldNames.has(fieldKey)) continue
           // Skip discriminator attributes
           if (node.discriminator && fieldKey in node.discriminator) continue
@@ -3323,11 +4703,13 @@ const assembleNode = (
 
       // Return the item (stripped of DynamoDB metadata)
       const item = matchingItems[0]!
-      return stripMetadata(item, systemAttrs)
+      return stripMetadata(item, stampsToStrip(node, systemAttrs))
     }
 
     // Many edge: collect all matching items
-    const stripped = matchingItems.map((item) => stripMetadata(item, systemAttrs))
+    const stripped = matchingItems.map((item) =>
+      stripMetadata(item, stampsToStrip(node, systemAttrs)),
+    )
 
     if (node.assemble) {
       return node.assemble(stripped)
@@ -3341,6 +4723,17 @@ const assembleNode = (
 // ---------------------------------------------------------------------------
 
 const EMPTY_ATTRS: ReadonlySet<string> = new Set()
+
+/** The timestamps a node's rows hold beside its value: those its value doesn't declare. */
+const stampsToStrip = (
+  node: ResolvedNode,
+  systemAttrs: ReadonlySet<string>,
+): ReadonlySet<string> => {
+  const own = node.ownFields
+  if (own === undefined) return systemAttrs
+  const kept = [...systemAttrs].filter((name) => !(name in own))
+  return kept.length === systemAttrs.size ? systemAttrs : new Set(kept)
+}
 
 const stripMetadata = (
   item: Record<string, unknown>,
@@ -3361,22 +4754,70 @@ const stripMetadata = (
 // Internal: Ref hydration (aggregate-level, edge-driven)
 // ---------------------------------------------------------------------------
 
+/** An edge's entity as hydration fetches it: an operational entity, a pure definition promoted. */
+type RuntimeRefEntity = RefEntity & {
+  readonly get: (key: any) => any
+  readonly _unstorableKey: (
+    record: Record<string, unknown>,
+  ) => Effect.Effect<UnstorableValue | undefined, ValidationError>
+}
+
 /** A ref request collected from walking edges */
 interface RefRequest {
   readonly entity: RefEntity
-  readonly id: string
+  /** The id as given. */
+  readonly given: unknown
+  /** The id as a value of the entity's key composite (`refIdValue`); `None` when it names no item. */
+  readonly id: Option.Option<unknown>
   readonly path: ReadonlyArray<string>
   readonly fieldName: string
   readonly idFieldName: string
+  /** Where the id was given, to name it in an error: `lineId`, `lines[0].lineId`. */
+  readonly at: string
 }
+
+/** An object as given, to name it in an error, whatever its `toString` (a JSON body's may be text). */
+const describeObject = (value: object): string => {
+  try {
+    const json = JSON.stringify(value)
+    if (json !== undefined) return json
+  } catch {
+    // A cycle, or a `toJSON` that throws: named by its kind below.
+  }
+  return Object.prototype.toString.call(value)
+}
+
+/** An id as given, to name it in an error. */
+const describeId = (id: unknown): string =>
+  typeof id === "string"
+    ? JSON.stringify(id)
+    : typeof id === "bigint"
+      ? `${id}n`
+      : id instanceof Date
+        ? `a Date (${Number.isNaN(id.getTime()) ? "invalid" : id.toISOString()})`
+        : typeof id === "object" && id !== null
+          ? `an object (${describeObject(id)})`
+          : typeof id === "function"
+            ? "a function"
+            : String(id)
+
+/** An id as `RefNotFound` names it. */
+const refIdText = (id: unknown): string =>
+  typeof id === "string" ? id : id instanceof Date ? id.toISOString() : String(id)
 
 /**
  * Walk the input recursively following graph edges, collect ref IDs,
  * fetch referenced entities, and replace IDs with hydrated domain data.
+ *
+ * Every id is judged before anything is fetched: an id of an entity no one id names
+ * (`EDD-9129`), then an id that is no value of the entity's key composite, or one `put` refuses as
+ * DynamoDB can't store it (`EDD-9131`), then one with no key text (`EDD-9096`). Each is then fetched by the key `Entity.put` wrote for it,
+ * composed as `Batch.get` composes an entity's own `get` (`composePrimaryKeyOrFail`), once per key.
  */
 const hydrateAggregateRefs = (
   input: Record<string, unknown>,
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+  fields: Record<string, Schema.Top> | undefined,
   aggregateName: string,
 ): Effect.Effect<
   Record<string, unknown>,
@@ -3386,7 +4827,7 @@ const hydrateAggregateRefs = (
   Effect.gen(function* () {
     // Collect all ref IDs from the entire input hierarchy
     const refRequests: RefRequest[] = []
-    collectRefIdsFromEdges(refRequests, input, edges, [])
+    collectRefIdsFromEdges(refRequests, input, edges, fields, [], "")
 
     if (refRequests.length === 0) return input
 
@@ -3402,78 +4843,196 @@ const hydrateAggregateRefs = (
       }
     }
 
+    // An entity no one id names (its key has two composites, or none): nothing to fetch it by.
+    // 1.39.0 fetched under its identifier (or `id`), which no key composes from alone, and died.
+    for (const [entityType, { entity, reqs }] of byEntityType) {
+      if (refKeyComposite(entity) !== undefined) continue
+      const composites = refKeyComposites(entity)
+      const named = [...new Set(reqs.map((req) => req.fieldName))]
+      return yield* new ValidationError({
+        entityType: aggregateName,
+        operation: "aggregate.create",
+        cause: new Error(
+          `[EDD-9129] Aggregate "${aggregateName}": ${named.map((name) => `"${name}"`).join(", ")} ` +
+            `${named.length === 1 ? "is" : "are"} given an id of entity "${entityType}", whose ` +
+            `primary key is composed from ${
+              composites.length === 0
+                ? "no attribute"
+                : composites.map((name) => `"${name}"`).join(", ")
+            }, so no one id names one item to fetch. Give "${named[0]}" whole, or key that entity ` +
+            `by one attribute to fetch it by id. Nothing was fetched or written.`,
+        ),
+      })
+    }
+
+    // `RefEntity` is the pure structural bound (no `get` — issue #66): aggregate
+    // edges can be authored from AWS-free `@effect-dynamodb/schema` definitions,
+    // which carry no runtime `.get`/operations. Ref hydration is a runtime
+    // operation, so promote a pure edge target to a full operational Entity (a
+    // thin op-attach over its retained `_data`); runtime-authored targets already
+    // carry `.get` and pass through untouched. Mirrors `DynamoClient.make()`'s
+    // entity binding. Promoted once per distinct edge entity type per hydrate (issue #71).
+    const runtimeEntities = new Map<string, RuntimeRefEntity>()
+    for (const [entityType, { entity }] of byEntityType) {
+      runtimeEntities.set(
+        entityType,
+        (typeof (entity as { readonly get?: unknown }).get === "function"
+          ? entity
+          : entityFromDefinition(entity as unknown as EntityDefinition)) as RuntimeRefEntity,
+      )
+    }
+
+    // An id that is no value of the key composite names no item: up to 1.39.0 a string was
+    // fetched under a key no `put` writes (`lineid_5` for a number), and anything else was dropped.
+    // Nor does one `put` refuses: one that doesn't encode as the attribute is stored (an infinite
+    // number through a digits-only string codec), or one DynamoDB can't store (an infinite number,
+    // at any depth of a struct, an `Option` or a `Result`), whose key text can name an item of
+    // another value (`{ a: Infinity }` and `{ a: 5 }` compose one key), fetched in its place.
+    // An id given more than once is judged once: one composing the key text of an id already
+    // judged, and equal to it as a value of the key composite (`Schema.toEquivalence`), so three
+    // ISO strings of one instant, each decoded to a `Date` of its own, are judged once. The key
+    // text alone isn't enough: `{ a: Infinity }` composes the key of `{ a: 5 }`, and is refused.
+    // An id whose key isn't composed here is judged, and fails composing below.
+    const judged = new Map<string, Array<unknown>>()
+    const composed = new Map<RefRequest, string>()
+    for (const req of refRequests) {
+      const composite = refKeyComposite(req.entity)!
+      if (Option.isNone(req.id)) {
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.create",
+          cause: new Error(
+            `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
+              `which is no value of "${composite}", the attribute entity ` +
+              `"${req.entity.entityType}" is keyed by, so it names no item to fetch. Give an id of ` +
+              `that attribute's type. Nothing was fetched or written.`,
+          ),
+        })
+      }
+      const runtimeEntity = runtimeEntities.get(req.entity.entityType)!
+      const key = yield* Effect.exit(
+        composePrimaryKeyOrFail(
+          runtimeEntity as unknown as Parameters<typeof composePrimaryKeyOrFail>[0],
+          { [composite]: req.id.value },
+          "aggregate.create",
+        ),
+      )
+      if (Exit.isSuccess(key)) {
+        const keyText = `${req.entity.entityType}:${JSON.stringify(Object.values(key.value))}`
+        composed.set(req, keyText)
+        const same = judged.get(keyText) ?? []
+        judged.set(keyText, same)
+        const equivalent = idEquivalence(req.entity)
+        const value = req.id.value
+        if (same.some((other) => equivalent(other, value))) continue
+        same.push(value)
+      }
+      const unstorable = yield* runtimeEntity._unstorableKey({ [composite]: req.id.value }).pipe(
+        Effect.mapError(
+          (refused) =>
+            new ValidationError({
+              entityType: aggregateName,
+              operation: "aggregate.create",
+              cause: new Error(
+                `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ` +
+                  `${describeId(req.given)}, which no item of entity "${req.entity.entityType}" ` +
+                  `can be keyed by: \`put\` refuses it, as it doesn't encode as "${composite}" ` +
+                  `is stored. Give an id that does. Nothing was fetched or written.`,
+                { cause: refused },
+              ),
+            }),
+        ),
+      )
+      if (unstorable !== undefined) {
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.create",
+          cause: new Error(
+            `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
+              `which no item of entity "${req.entity.entityType}" can be keyed by: \`put\` ` +
+              `refuses it, as DynamoDB can't store it (${unstorable.describe()}). Give an id ` +
+              `DynamoDB can store. Nothing was fetched or written.`,
+          ),
+        })
+      }
+    }
+
+    // Each id's key, composed before anything is fetched: one with no key text (`NaN`,
+    // `EDD-9096`) fails here. An id fetched twice, or two ids composing one key (`"L"` and `"l"`
+    // under lowercase casing), is fetched once: `BatchGetItem` refuses a repeated key.
+    const fetches: Array<{
+      readonly entityType: string
+      readonly runtimeEntity: RuntimeRefEntity
+      readonly ops: Array<{ readonly lookupKey: string; readonly req: RefRequest }>
+    }> = []
+    const lookupKeys = new Map<RefRequest, string>()
+    for (const [entityType, { entity, reqs }] of byEntityType) {
+      const runtimeEntity = runtimeEntities.get(entityType)!
+      const composite = refKeyComposite(entity)!
+      const ops: Array<{ readonly lookupKey: string; readonly req: RefRequest }> = []
+      const seen = new Set<string>()
+      for (const req of reqs) {
+        // Composed while judging the id, unless that failed: then composing fails here.
+        let lookupKey = composed.get(req)
+        if (lookupKey === undefined) {
+          const key = yield* composePrimaryKeyOrFail(
+            runtimeEntity as unknown as Parameters<typeof composePrimaryKeyOrFail>[0],
+            { [composite]: Option.getOrThrow(req.id) },
+            "aggregate.create",
+          )
+          lookupKey = `${entityType}:${JSON.stringify(Object.values(key))}`
+        }
+        lookupKeys.set(req, lookupKey)
+        if (!seen.has(lookupKey)) {
+          seen.add(lookupKey)
+          ops.push({ lookupKey, req })
+        }
+      }
+      fetches.push({ entityType, runtimeEntity, ops })
+    }
+
     // Batch-fetch all refs — one Batch.get call per entity type
     const hydratedLookup = new Map<string, Record<string, unknown>>()
-
-    for (const [entityType, { entity, reqs }] of byEntityType) {
-      const idField = DynamoModel.getIdentifierField(entity.model)
-      const identifierName = idField?.name ?? "id"
-
-      // Deduplicate IDs for this entity type
-      const uniqueIds = [...new Set(reqs.map((r) => r.id))]
-
-      // `RefEntity` is the pure structural bound (no `get` — issue #66): aggregate
-      // edges can be authored from AWS-free `@effect-dynamodb/schema` definitions,
-      // which carry no runtime `.get`/operations. Ref hydration is a runtime
-      // operation, so promote a pure edge target to a full operational Entity (a
-      // thin op-attach over its retained `_data`); runtime-authored targets already
-      // carry `.get` and pass through untouched. Mirrors `DynamoClient.make()`'s
-      // entity binding. The promoted entity also exposes `.schemas`, used by the
-      // encode-back below (issue #72). The loop is already grouped by entity type,
-      // so this promotes once per distinct edge entity type per hydrate (issue #71).
-      const runtimeEntity = (
-        typeof (entity as { readonly get?: unknown }).get === "function"
-          ? entity
-          : entityFromDefinition(entity as unknown as EntityDefinition)
-      ) as RefEntity & {
-        readonly get: (key: any) => any
-        readonly schemas: { readonly recordSchema: Schema.Codec<any> }
-      }
-
-      // Build EntityGet intermediates for batch fetching
-      const getOps = uniqueIds.map(
-        (id) => runtimeEntity.get({ [identifierName]: id }) as EntityGet<any, any, any, any>,
+    for (const { entityType, runtimeEntity, ops } of fetches) {
+      const composite = refKeyComposite(runtimeEntity)!
+      // Build EntityGet intermediates for batch fetching: `Batch.get` composes each key as the
+      // entity's own `get` does, the key `Entity.put` wrote.
+      const getOps = ops.map(
+        ({ req }) =>
+          runtimeEntity.get({ [composite]: Option.getOrThrow(req.id) }) as EntityGet<
+            any,
+            any,
+            any,
+            any
+          >,
       )
 
       const results = yield* Batch.get(getOps)
 
       // Map results back to lookup, failing on missing refs.
-      for (let i = 0; i < uniqueIds.length; i++) {
-        const id = uniqueIds[i]!
+      for (let i = 0; i < ops.length; i++) {
+        const { lookupKey, req } = ops[i]!
         const result = results[i]
         if (result == null) {
           return yield* new RefNotFound({
             entity: aggregateName,
-            field: reqs.find((r) => r.id === id)?.fieldName ?? "",
+            field: req.fieldName,
             refEntity: entityType,
-            refId: id,
+            refId: refIdText(req.given),
           })
         }
-        // `Batch.get` returns the DECODED record — transform fields are lifted to
-        // their domain form (e.g. `Schema.DateTimeUtcFromString` → `DateTime`). The
-        // denormalized ref is spliced into `input` and decoded again by the
-        // aggregate's strict `schema`, whose nested edge field is the ORIGINAL ref
-        // class expecting the wire form. Re-encode through the ref's substituted
-        // `recordSchema` so the spliced value is wire-form and decoded exactly once
-        // (issue #72) — this also keeps it marshall-safe for decompose.
-        const wire = yield* Schema.encodeUnknownEffect(runtimeEntity.schemas.recordSchema)(
-          result,
-        ).pipe(
-          Effect.mapError(
-            (cause) =>
-              new ValidationError({
-                entityType: aggregateName,
-                operation: "aggregate.hydrateRefs.encode",
-                cause,
-              }),
-          ),
-        )
-        hydratedLookup.set(`${entityType}:${id}`, wire as Record<string, unknown>)
+        // `Batch.get` returns the decoded record: domain values, as a caller holds, and
+        // `writeSchema` takes them as that. Encoded here, a field with one type on both
+        // sides of a transformation would be taken for a domain value and encoded twice.
+        hydratedLookup.set(lookupKey, result as Record<string, unknown>)
       }
     }
 
     // Walk the input again and replace IDs with hydrated data
-    const result = replaceRefIds(input, refRequests, hydratedLookup)
+    const result = replaceRefIds(input, refRequests, (req) => {
+      const lookupKey = lookupKeys.get(req)
+      return lookupKey === undefined ? undefined : hydratedLookup.get(lookupKey)
+    })
     renameInputFields(result, edges)
     return result
   })
@@ -3506,83 +5065,130 @@ const renameInputFields = (
   }
 }
 
+/** An id given for an edge's entity: the id as given, and as a value of its key composite. */
+const refId = (entity: RefEntity, given: unknown) => ({ given, id: refIdValue(entity, given) })
+
+const idEquivalences = new WeakMap<object, (a: unknown, b: unknown) => boolean>()
+
+/**
+ * Whether two ids of `entity` are one value of its key composite (`refIdField`), by the field's
+ * own equivalence (`Schema.toEquivalence`: two `Date`s of one instant are one); `Equal.equals`
+ * where the field can't be read or derives none.
+ */
+const idEquivalence = (entity: RefEntity): ((a: unknown, b: unknown) => boolean) => {
+  const field = refIdField(entity)
+  if (field === undefined) return Equal.equals
+  const cached = idEquivalences.get(field)
+  if (cached !== undefined) return cached
+  let equivalent: (a: unknown, b: unknown) => boolean
+  try {
+    equivalent = Schema.toEquivalence(field as Schema.Schema<unknown>)
+  } catch {
+    equivalent = Equal.equals
+  }
+  idEquivalences.set(field, equivalent)
+  return equivalent
+}
+
 /**
  * Recursively walk input following graph edges to collect ref ID references.
  * Edge-driven: entity lookup comes from the edge directly, not from a refs bag.
+ *
+ * An id is anything given where the input takes one (`null` and `undefined` give none), judged
+ * by `hydrateAggregateRefs` before anything is fetched. Up to 1.39.0 only a string was taken,
+ * so a number or bigint id was dropped, and an optional edge was created without it.
  */
 const collectRefIdsFromEdges = (
   result: RefRequest[],
   input: Record<string, unknown>,
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+  /** The fields of the schema `input` is a value of: a `many` element's schema is read off it. */
+  fields: Record<string, Schema.Top> | undefined,
   path: ReadonlyArray<string>,
+  /** Where `input` is, to name an id in an error: `""` at the root, `"sub."` under `sub`. */
+  at: string,
 ): void => {
   for (const [edgeName, edge] of Object.entries(edges)) {
     if (!("_tag" in edge)) continue
 
-    if (edge._tag === "RefEdge") {
-      // RefEdge → ${field}Id in input
+    if (edge._tag === "RefEdge" || (edge._tag === "OneEdge" && edge.entity)) {
+      // RefEdge, and OneEdge with an entity → ${field}Id in input, where it holds an id `create`
+      // fetches (`holdsRefId`): a string as on 1.39.0, an id of another type only where the model's
+      // field is the entity's own model, its id isn't declared, and the entity isn't given whole.
+      const entity = edge.entity!
       const idFieldName = `${edgeName}Id`
-      const idValue = input[idFieldName]
-      if (typeof idValue === "string") {
+      const idValue = given(input, idFieldName)
+      if (holdsRefId(fields, edgeName, entity, input)) {
         result.push({
-          entity: edge.entity,
-          id: idValue,
+          entity,
+          ...refId(entity, idValue),
           path: [...path],
           fieldName: edgeName,
           idFieldName,
-        })
-      }
-    } else if (edge._tag === "OneEdge" && edge.entity) {
-      // OneEdge with entity → ${field}Id in input
-      const idFieldName = `${edgeName}Id`
-      const idValue = input[idFieldName]
-      if (typeof idValue === "string") {
-        result.push({
-          entity: edge.entity,
-          id: idValue,
-          path: [...path],
-          fieldName: edgeName,
-          idFieldName,
+          at: `${at}${idFieldName}`,
         })
       }
     } else if (edge._tag === "BoundSubAggregate") {
       const bound = edge as BoundSubAggregate<any>
-      const subInput = input[edgeName]
+      const subInput = given(input, edgeName)
       if (subInput != null && typeof subInput === "object") {
-        collectRefIdsFromEdges(result, subInput as Record<string, unknown>, bound.aggregate.edges, [
-          ...path,
-          edgeName,
-        ])
+        collectRefIdsFromEdges(
+          result,
+          subInput as Record<string, unknown>,
+          bound.aggregate.edges,
+          fieldsOf(bound.aggregate.schema),
+          [...path, edgeName],
+          `${at}${edgeName}.`,
+        )
       }
     } else if (edge._tag === "ManyEdge" && edge.entity) {
       // ManyEdge with entity → walk array elements for ref IDs
+      const entity = edge.entity
       const inputKey = edge.inputField ?? edgeName
-      const arr = input[inputKey]
+      const arr = given(input, inputKey)
       if (Array.isArray(arr)) {
-        const entityFieldName = deriveEntityFieldName(edge.entity)
+        const entityFieldName = deriveEntityFieldName(entity)
+        const element = manyElementSchema(fields, edgeName)
+        const entityElement = isEntityElement(element, entity)
         for (let i = 0; i < arr.length; i++) {
           const elem = arr[i]
-          if (typeof elem === "string") {
-            // Element IS the ref ID (e.g., Array<string> for Array<Umpire>)
+          if (elem == null) continue
+          const asId = refId(entity, elem)
+          if (
+            entityElement
+              ? Option.isSome(asId.id) || typeof elem !== "object"
+              : typeof elem === "string"
+          ) {
+            // Element IS the ref ID. Where the element is the entity (`Array<Umpire>`), an id of
+            // the entity's key composite, or a scalar given for one, which names no item. Any
+            // other element, a string, as on 1.39.0.
             result.push({
-              entity: edge.entity,
-              id: elem,
+              entity,
+              ...asId,
               path: [...path, inputKey, String(i)],
               fieldName: edgeName,
               idFieldName: String(i),
+              at: `${at}${inputKey}[${i}]`,
             })
-          } else if (elem != null && typeof elem === "object") {
-            // Element wraps entity + attributes — find the entityFieldName + "Id"
+          } else if (
+            typeof elem === "object" &&
+            elementHoldsRef(element, entity, elem as Record<string, unknown>)
+          ) {
+            // Element wraps the entity, given as `${field}Id`, where it holds an id `create`
+            // fetches (`elementHoldsRef`, the rule a `one` edge's id follows): a string as on
+            // 1.39.0, an id of another type only where the element's field of the entity's name is
+            // the entity's own model, its id isn't declared, and the entity isn't given whole.
             const elemObj = elem as Record<string, unknown>
             const idFieldName = `${entityFieldName}Id`
-            const idValue = elemObj[idFieldName]
-            if (typeof idValue === "string") {
+            const idValue = given(elemObj, idFieldName)
+            if (idValue != null) {
               result.push({
-                entity: edge.entity,
-                id: idValue,
+                entity,
+                ...refId(entity, idValue),
                 path: [...path, inputKey, String(i)],
                 fieldName: entityFieldName,
                 idFieldName,
+                at: `${at}${inputKey}[${i}].${idFieldName}`,
               })
             }
           }
@@ -3646,27 +5252,30 @@ const cloneInput = (value: unknown, seen: WeakMap<object, unknown> = new WeakMap
 const replaceRefIds = (
   input: Record<string, unknown>,
   refRequests: ReadonlyArray<RefRequest>,
-  lookup: Map<string, Record<string, unknown>>,
+  lookup: (req: RefRequest) => Record<string, unknown> | undefined,
 ): Record<string, unknown> => {
   // Deep clone the input for mutation
   const result = cloneInput(input) as Record<string, unknown>
 
   for (const req of refRequests) {
-    const lookupKey = `${req.entity.entityType}:${req.id}`
-    const data = lookup.get(lookupKey)
+    const data = lookup(req)
     if (!data) continue
+
+    // For ManyEdge elements that are direct IDs (element IS the ref), the target is the array
+    // itself: the path ends at the element, which may be an object (a `Date` id).
+    const isElementId = /^\d+$/.test(req.idFieldName)
+    const segments = isElementId ? req.path.slice(0, -1) : req.path
 
     // Navigate to the target location in the result
     let target: Record<string, unknown> = result
-    for (const segment of req.path) {
+    for (const segment of segments) {
       const next = target[segment]
       if (next == null || typeof next !== "object") break
       target = next as Record<string, unknown>
     }
 
-    // For ManyEdge elements that are direct IDs (element IS the ref),
-    // the target is the array itself — replace the element at the index
-    if (Array.isArray(target) && /^\d+$/.test(req.idFieldName)) {
+    // Replace the element at the index
+    if (Array.isArray(target) && isElementId) {
       target[Number(req.idFieldName)] = data
     } else {
       // Replace: remove ${field}Id, add ${field}: data
@@ -3698,8 +5307,28 @@ interface DecomposedItem {
    * them. Asked for only there: a value that setting refuses (`NaN`) stops nothing else.
    */
   readonly skCompositesOther: () => ReadonlyArray<string>
+  /**
+   * A `many` element's sort key with some numeric values as the other kind, in either setting's
+   * text, that is one of `targets`: a field that stored both composed each value's own kind's text
+   * (`EDD-9128`), and `rekey` looks for a row there too. Found value by value
+   * (`CompositeCodec.kindReadingOf`), never by composing each combination; `undefined` when none
+   * is. A value a setting refuses (`NaN`) gives none there.
+   */
+  readonly otherKindSortKey?: ((targets: KindTargets) => string | undefined) | undefined
+  /**
+   * A `many` element only: the text `node`'s sort key composes for the composite `path` from the
+   * element, as `node`'s decomposition composes it (`EDD-9128` judges each node a read hands the
+   * row to); `undefined` when `node` composes none from it.
+   */
+  readonly skTextFor?: ((node: ResolvedNode, path: string) => string | undefined) | undefined
   /** Edge field name (entity type for the root) — used to name the culprit in errors. */
   readonly member: string
+  /** What the row does with each timestamp. */
+  readonly rowStamps: RowStamps | undefined
+  /** The fields stored as given, which no encoder of theirs takes (see {@link AttrEncoder}). */
+  readonly storedAsGiven: ReadonlyArray<string>
+  /** The node that decomposed it. */
+  readonly node: ResolvedNode
 }
 
 /** A group of items to write in a single transaction */
@@ -3707,6 +5336,17 @@ interface TransactionGroup {
   readonly name: string
   readonly items: ReadonlyArray<DecomposedItem>
 }
+
+/** Each field a decomposition stored as given, once, as `"field" of "member"` (`EDD-9127`). */
+const storedAsGivenIn = (groups: ReadonlyArray<TransactionGroup>): ReadonlyArray<string> => [
+  ...new Set(
+    groups.flatMap((group) =>
+      group.items.flatMap((item) =>
+        item.storedAsGiven.map((field) => `"${field}" of "${item.member}"`),
+      ),
+    ),
+  ),
+]
 
 /**
  * A node's two encoder sets: `stored` puts every attribute into its stored
@@ -3734,12 +5374,22 @@ const decomposeAggregate = (
   encoders: NodeEncoders,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
+  /**
+   * A write's own value (`create`'s input, the state `update`'s mutation returned), before it was
+   * decoded: a custom `decompose` is handed it read as on 1.39.0. Undefined for what was read.
+   */
+  written?: Written | undefined,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
-    const encodeWith = (set: AttrEncoders, field: string, value: unknown): unknown => {
+    const encodeWith = (
+      set: AttrEncoders,
+      field: string,
+      value: unknown,
+      asGiven?: () => void,
+    ): unknown => {
       const encode = set[field]
-      return encode && value != null ? encode(value) : value
+      return encode && value != null ? encode(value, asGiven) : value
     }
 
     // Extract context values from the root, encoded for DynamoDB storage.
@@ -3756,9 +5406,11 @@ const decomposeAggregate = (
     const edgeFieldNames = new Set(rootNode.children.map((c) => c.fieldName).filter(Boolean))
     const rootAttrs: Record<string, unknown> = {}
     const rootKeyAttrs: Record<string, unknown> = {}
+    // A context field is a root field, so this names it too.
+    const rootAsGiven: Array<string> = []
     for (const [key, value] of Object.entries(assembled)) {
       if (edgeFieldNames.has(key)) continue
-      rootAttrs[key] = encodeWith(encoders.stored, key, value)
+      rootAttrs[key] = encodeWith(encoders.stored, key, value, () => rootAsGiven.push(key))
       rootKeyAttrs[key] = encodeWith(encoders.key, key, value)
     }
 
@@ -3770,6 +5422,9 @@ const decomposeAggregate = (
       skComposites: [],
       skCompositesOther: () => [],
       member: rootNode.entityType,
+      rowStamps: rootNode.rowStamps,
+      storedAsGiven: rootAsGiven,
+      node: rootNode,
     })
 
     // Decompose each edge
@@ -3784,6 +5439,7 @@ const decomposeAggregate = (
         { current: [], other: () => [] },
         aggregateName,
         schema,
+        writtenField(written, child.fieldName!),
       )
     }
 
@@ -3837,6 +5493,408 @@ const mergeContextValues = (
   for (const [key, value] of Object.entries(contextValues)) {
     attrs[key] = value
   }
+}
+
+/**
+ * An entity type a row carries, and the fixed text its sort keys begin with, cased as they are.
+ * `any`: the row can carry any type, because its member stores another attribute under
+ * `__edd_e__` (`via` names it).
+ */
+interface RowType {
+  readonly type: string
+  readonly label: string
+  readonly any?: { readonly via: string } | undefined
+}
+
+/**
+ * A channel through which a member of a table writes an attribute (DESIGN.md §7 "Which rows in its
+ * partition are an aggregate's"), as the row holds it after the last write of each: the attribute
+ * (`field`; undefined, any attribute but `except`), the fixed text its value begins with (`head`,
+ * `$<schema>#v<version>#<label>` cased as the key is; undefined, any text), whether the value is
+ * exactly that text (`exact`: true, exactly it; false, it continued after `#`; undefined, either),
+ * the rows it's written on (`types`), the table it writes (`table`, a table's tag), and what it is,
+ * for a refusal to name (`channel`).
+ */
+export interface AttributeWriter {
+  readonly field: string | undefined
+  readonly except?: ReadonlyArray<string>
+  readonly head: string | undefined
+  readonly exact?: boolean | undefined
+  readonly types: ReadonlyArray<RowType>
+  readonly table: unknown
+  readonly channel: string
+}
+
+/** What an aggregate declaring `ownsRows` is checked against at bind. */
+export interface Ownership {
+  readonly pkField: string
+  readonly pkComposite: ReadonlyArray<string>
+  readonly partitionHead: string
+  readonly schema: DynamoSchemaModule.DynamoSchema
+  readonly table: unknown
+  readonly types: ReadonlyArray<RowType>
+  /** The members the aggregate's table declares. */
+  readonly declared: ReadonlyArray<{ readonly name: string; readonly member: unknown }>
+}
+
+/**
+ * Whether two keys beginning with these fixed texts can be one text: the texts are equal, or one
+ * continues the other after a `#`. A composite value is taken to be any text (with `escapeKeys`
+ * off one may hold `#`), so this never misses a key that can be the other's.
+ */
+const headsOverlap = (a: string, b: string): boolean =>
+  a === b || a.startsWith(`${b}#`) || b.startsWith(`${a}#`)
+
+/**
+ * Whether a writer's text can be the aggregate's partition key: any text can, and composed text
+ * can when it and the key can be one text ({@link headsOverlap}). The aggregate's partition key is
+ * its head continued after `#` when it has composites, and exactly its head when it has none (a
+ * singleton): text that continues its own head can be that only when its head and a `#` begin it.
+ */
+const canBePartitionKey = (writer: AttributeWriter, ownership: Ownership): boolean => {
+  const head = writer.head
+  if (head === undefined) return true
+  const partition = ownership.partitionHead
+  if (ownership.pkComposite.length === 0) {
+    const equal = head === partition
+    const continued = partition.startsWith(`${head}#`)
+    return writer.exact === true ? equal : writer.exact === false ? continued : equal || continued
+  }
+  return writer.exact === true ? head.startsWith(`${partition}#`) : headsOverlap(head, partition)
+}
+
+/**
+ * Whether a row of `theirs` can be taken for a row of `ours`: it can carry any type, it's the same
+ * type, or keys of the two can be one text, each cased as its member's keys are. A bind-time
+ * comparison only: ownership and assembly match `__edd_e__` exactly.
+ */
+const typesCollide = (theirs: RowType, ours: RowType): boolean =>
+  theirs.any !== undefined || theirs.type === ours.type || headsOverlap(theirs.label, ours.label)
+
+/**
+ * A member's writers, every row type of them made any when one stores an attribute under
+ * `__edd_e__` other than the library's marker, or any attribute: its rows can carry any type. An
+ * aggregate's timestamp so named does, since it's written last. An entity can't (`EDD-9140`).
+ */
+const withTypeOverwrites = (
+  writers: ReadonlyArray<AttributeWriter>,
+): ReadonlyArray<AttributeWriter> => {
+  const marker = writers.find(
+    (writer) =>
+      writer.field === "__edd_e__" ||
+      (writer.field === undefined && writer.except?.includes("__edd_e__") !== true),
+  )
+  if (marker === undefined) return writers
+  const any = { via: `${marker.channel}, stored under "__edd_e__"` }
+  return writers.map((writer) => ({
+    ...writer,
+    types: writer.types.map((type) => ({ ...type, any })),
+  }))
+}
+
+/**
+ * The attributes an entity writes (DESIGN.md §7 "Which rows in its partition are an aggregate's"),
+ * as each row holds them after the last write of each:
+ * - its primary key on every row it writes under it: live rows, version snapshots, soft-delete
+ *   tombstones, time-series events, projection tombstones and outbox items;
+ * - each secondary index's partition key on its live rows, and each vector index's partition;
+ * - its unique sentinels, under their own key, with back-pointers to the owning row's key;
+ * - any sort key, its timestamps, `deletedAt`, and the attributes a projection writes on its
+ *   tombstones and outbox items, as any text;
+ * - its model attributes, on its rows and kept on its projection tombstones: any name holding any
+ *   text, but `__edd_e__` and its table key attributes, which it writes after them (`EDD-9109` and
+ *   `EDD-9140` refuse a model attribute stored under them).
+ * None of its rows is an aggregate node's: it composes each composite with its field's name
+ * (`id_p`), which an aggregate never does, and its primary key has at least one. An entity whose
+ * keys can't be read is taken to write any attribute.
+ */
+const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
+  const e = entity as {
+    readonly entityType: string
+    readonly indexes: Record<string, KeyComposer.IndexDefinition>
+    readonly unique?: Record<string, unknown> | undefined
+    readonly softDelete?: unknown
+    readonly systemFields?: {
+      readonly createdAt: string | null
+      readonly updatedAt: string | null
+    }
+    readonly _vectorIndexes?: Record<
+      string,
+      {
+        readonly partitionField: string
+        readonly compose: unknown
+        readonly casing?: DynamoSchemaModule.Casing
+      }
+    >
+    readonly _projectionTombstones?: unknown
+    /** Every projection's outbox on this read model, one per projection defined on it. */
+    readonly _projectionOutboxes?: ReadonlyArray<{
+      /** Undefined: on the row table, under the row's own key attributes. */
+      readonly table: { readonly Tag: unknown } | undefined
+      readonly pk: string
+      readonly sk: string
+      readonly index?: { readonly pk: string; readonly sk: string } | undefined
+    }>
+    readonly _schema: DynamoSchemaModule.DynamoSchema
+    readonly _tableTag: unknown
+  }
+  const type = e.entityType
+  const table = e._tableTag
+  try {
+    const schema = e._schema
+    const typed = (name: string, casing?: DynamoSchemaModule.Casing): RowType => ({
+      type: name,
+      label: composeKey(schema, name, [], { casing }),
+    })
+    const labelOf = (index: KeyComposer.IndexDefinition): string => {
+      const collection = index.collection
+      return collection === undefined
+        ? type
+        : Array.isArray(collection)
+          ? collection[0]!
+          : (collection as string)
+    }
+    // A partition key with composites, or a shard, continues its head after `#`.
+    const exactOf = (index: KeyComposer.IndexDefinition): false | undefined =>
+      index.pk.composite.length > 0 || index.shards !== undefined ? false : undefined
+    const primary = e.indexes.primary!
+    const tableKeys = [
+      primary.pk.field,
+      ...(primary.sk?.field === undefined ? [] : [primary.sk.field]),
+    ]
+    const stamps = [e.systemFields?.createdAt, e.systemFields?.updatedAt].filter(
+      (name): name is string => typeof name === "string",
+    )
+    const writers: Array<AttributeWriter> = []
+    const anyText = (
+      fields: ReadonlyArray<string>,
+      types: ReadonlyArray<RowType>,
+      on: unknown,
+      channel: (field: string) => string,
+    ): void => {
+      for (const field of fields) {
+        writers.push({ field, head: undefined, types, table: on, channel: channel(field) })
+      }
+    }
+    const projectionTypes: Array<RowType> = []
+    for (const [name, index] of Object.entries(e.indexes)) {
+      const head = composeKey(schema, labelOf(index), [], { casing: index.casing })
+      const exact = exactOf(index)
+      const own = typed(type, index.casing)
+      if (name !== "primary") {
+        // A half on a table key attribute holds the primary key's text (an inverted index): two
+        // halves of one entity share an attribute only with the same fields (`EDD-9106`).
+        if (!tableKeys.includes(index.pk.field)) {
+          writers.push({
+            field: index.pk.field,
+            head,
+            exact,
+            types: [own],
+            table,
+            channel: `its index "${name}"`,
+          })
+        }
+        if (index.sk?.field !== undefined && !tableKeys.includes(index.sk.field)) {
+          writers.push({
+            field: index.sk.field,
+            head: undefined,
+            types: [own],
+            table,
+            channel: `its index "${name}"'s sort key`,
+          })
+        }
+        continue
+      }
+      // Its live rows, version snapshots, soft-delete tombstones, time-series events and projection
+      // rows. None is an aggregate node's row: an entity composes each composite with its field's
+      // name (`id_p`), which an aggregate never does, and its primary key has at least one.
+      const tombstone =
+        e._projectionTombstones !== undefined ? typed(`${type}#tombstone`, index.casing) : undefined
+      const outboxConfigs = e._projectionOutboxes ?? []
+      const outboxHere = outboxConfigs.some((outbox) => outbox.table === undefined)
+        ? typed(`${type}#outbox`, index.casing)
+        : undefined
+      if (tombstone !== undefined) projectionTypes.push(tombstone)
+      const rows = [
+        own,
+        ...(tombstone === undefined ? [] : [tombstone]),
+        ...(outboxHere === undefined ? [] : [outboxHere]),
+      ]
+      writers.push({
+        field: index.pk.field,
+        head,
+        exact,
+        types: rows,
+        table,
+        channel: "its primary key",
+      })
+      if (index.sk?.field !== undefined) {
+        writers.push({
+          field: index.sk.field,
+          head: undefined,
+          types: rows,
+          table,
+          channel: "its sort key",
+        })
+      }
+      if (e.softDelete !== undefined && e.softDelete !== false) {
+        anyText(["deletedAt"], [own], table, () => "its soft-delete tombstones' `deletedAt`")
+      }
+      if (tombstone !== undefined) {
+        anyText(
+          ["__edd_removed__", KEY_TEXT],
+          [tombstone],
+          table,
+          (field) => `its projection tombstones' "${field}"`,
+        )
+      }
+      for (const constraint of Object.keys(e.unique ?? {})) {
+        const sentinel = composeUniqueKey(schema, type, constraint, [], {
+          casing: index.casing,
+        }).sk
+        const rowType = { type: `${type}._unique.${constraint}`, label: sentinel }
+        const channel = `its unique constraint "${constraint}"`
+        writers.push({
+          field: index.pk.field,
+          head: sentinel,
+          exact: false,
+          types: [rowType],
+          table,
+          channel,
+        })
+        if (index.sk?.field !== undefined) {
+          writers.push({
+            field: index.sk.field,
+            head: sentinel,
+            exact: true,
+            types: [rowType],
+            table,
+            channel,
+          })
+        }
+        // Written after the sentinel's key: one named as a key attribute replaces it.
+        writers.push({
+          field: "_entity_pk",
+          head,
+          exact,
+          types: [rowType],
+          table,
+          channel: `${channel}'s back-pointer "_entity_pk"`,
+        })
+        anyText(["_entity_sk"], [rowType], table, () => `${channel}'s back-pointer "_entity_sk"`)
+      }
+      // Each projection's outbox items: under the row's partition key, on the row table or another.
+      const outboxes = outboxConfigs.map((outbox) =>
+        outbox.table === undefined
+          ? { on: table, pk: index.pk.field, sk: index.sk?.field, index: outbox.index }
+          : { on: outbox.table.Tag, pk: outbox.pk, sk: outbox.sk, index: outbox.index },
+      )
+      for (const outbox of outboxes) {
+        const outboxType = typed(`${type}#outbox`, index.casing)
+        const channel = "its projection outbox"
+        for (const field of [outbox.pk, OUTBOX_ROW_PK]) {
+          writers.push({ field, head, exact, types: [outboxType], table: outbox.on, channel })
+        }
+        anyText(
+          [
+            ...(outbox.sk === undefined ? [] : [outbox.sk]),
+            OUTBOX_ROW_SK,
+            "effect",
+            "source",
+            "streamId",
+            "eventType",
+            KEY_TEXT,
+            OUTBOX_CLAIM,
+            OUTBOX_CLAIMED_UNTIL,
+            ...(outbox.index === undefined ? [] : [outbox.index.pk, outbox.index.sk]),
+          ],
+          [outboxType],
+          outbox.on,
+          (field) => `${channel}'s "${field}"`,
+        )
+      }
+    }
+    for (const [name, vector] of Object.entries(e._vectorIndexes ?? {})) {
+      writers.push({
+        field: vector.partitionField,
+        head:
+          vector.compose === undefined
+            ? composeKey(schema, type, [], { casing: vector.casing })
+            : undefined,
+        types: [typed(type)],
+        table,
+        channel: `its vector index "${name}"`,
+      })
+    }
+    anyText([...stamps, INCARNATION_TOKEN], [typed(type)], table, (field) => `its "${field}"`)
+    // Its model attributes: on its rows, and kept on its projection tombstones. Whatever its model
+    // declares, these are any name holding any text, but the ones it writes after them.
+    writers.push({
+      field: undefined,
+      except: ["__edd_e__", ...tableKeys],
+      head: undefined,
+      types: [typed(type), ...projectionTypes],
+      table,
+      channel: "its model attributes",
+    })
+    return withTypeOverwrites(writers)
+  } catch {
+    return [
+      {
+        field: undefined,
+        head: undefined,
+        types: [{ type, label: type, any: { via: "its keys can't be read" } }],
+        table,
+        channel: "its keys, which can't be read",
+      },
+    ]
+  }
+}
+
+/**
+ * The first member that can write a row of one of the aggregate's types into its partition, if
+ * any (DESIGN.md §7 "Which rows in its partition are an aggregate's"): `DynamoClient.make` refuses
+ * an aggregate declaring `ownsRows` for it (`EDD-9130`). A member can when one of its attribute
+ * writers ({@link entityWriters}, an aggregate's own) writes the aggregate's `pk.field` on the same
+ * physical table (`sameTable`), with text that can be the aggregate's partition key
+ * ({@link canBePartitionKey}), on a row whose type collides with one of the aggregate's
+ * ({@link typesCollide}). The aggregate itself isn't one.
+ */
+export const ownershipConflict = (
+  aggregate: unknown,
+  members: ReadonlyArray<{ readonly name: string; readonly member: unknown }>,
+  sameTable: (table: unknown) => boolean,
+): { readonly member: string; readonly type: string; readonly channel: string } | undefined => {
+  const ownership = (aggregate as { readonly _ownership?: Ownership })._ownership
+  if (ownership === undefined) return undefined
+  const seen = new Set<unknown>([aggregate])
+  for (const { name, member } of [...ownership.declared, ...members]) {
+    if (member === null || typeof member !== "object" || seen.has(member)) continue
+    seen.add(member)
+    const writers =
+      (member as { readonly _attributeWriters?: ReadonlyArray<AttributeWriter> })
+        ._attributeWriters ??
+      ((member as { readonly _tag?: unknown })._tag === "Entity" ? entityWriters(member) : [])
+    for (const writer of writers) {
+      if (!sameTable(writer.table)) continue
+      if (
+        writer.field === undefined
+          ? writer.except?.includes(ownership.pkField) === true
+          : writer.field !== ownership.pkField
+      ) {
+        continue
+      }
+      if (!canBePartitionKey(writer, ownership)) continue
+      for (const theirs of writer.types) {
+        const ours = ownership.types.find((type) => typesCollide(theirs, type))
+        if (ours === undefined) continue
+        return theirs.any === undefined
+          ? { member: name, type: theirs.type, channel: writer.channel }
+          : { member: name, type: ours.type, channel: `${writer.channel}; ${theirs.any.via}` }
+      }
+    }
+  }
+  return undefined
 }
 
 /** Discriminator `name#value` pairs for a sort key: its text, and the other setting's. */
@@ -3896,6 +5954,8 @@ const decomposeNode = (
   parentDiscriminators: DiscriminatorValues,
   aggregateName: string,
   schema: DynamoSchemaModule.DynamoSchema,
+  /** The caller's own value here, on a write (see {@link Written}). */
+  written: Written | undefined,
 ): Effect.Effect<void, AggregateDecompositionError> =>
   Effect.gen(function* () {
     // Optional edges may have null/undefined values — skip decomposition
@@ -3927,7 +5987,7 @@ const decomposeNode = (
       }
 
       // Serialize this node's own date fields to their wire primitive (#72).
-      applyNodeAttrEncoders(subRootAttrs, node.attrEncoders)
+      const storedAsGiven = applyNodeAttrEncoders(subRootAttrs, node.attrEncoders)
 
       // Inject context and discriminator
       mergeContextValues(subRootAttrs, contextValues.stored)
@@ -3944,6 +6004,9 @@ const decomposeNode = (
         skComposites: discValues.current,
         skCompositesOther: discValues.other,
         member: node.fieldName ?? node.entityType,
+        rowStamps: node.rowStamps,
+        storedAsGiven,
+        node,
       })
 
       // Decompose children within this sub-aggregate
@@ -3958,13 +6021,14 @@ const decomposeNode = (
           discValues,
           aggregateName,
           schema,
+          writtenField(written, child.fieldName!),
         )
       }
     } else if (node.cardinality === "one") {
       // Simple one-to-one edge (no children)
       const attrs = { ...(value as Record<string, unknown>) }
       // Serialize this edge entity's own date fields to their wire primitive (#72).
-      applyNodeAttrEncoders(attrs, node.attrEncoders)
+      const storedAsGiven = applyNodeAttrEncoders(attrs, node.attrEncoders)
       mergeContextValues(attrs, contextValues.stored)
       if (node.discriminator) {
         for (const [k, v] of Object.entries(node.discriminator)) {
@@ -3982,11 +6046,18 @@ const decomposeNode = (
         skComposites: [...parentDiscriminators.current, ...own.current],
         skCompositesOther: () => [...parentDiscriminators.other(), ...own.other()],
         member: node.fieldName ?? node.entityType,
+        rowStamps: node.rowStamps,
+        storedAsGiven,
+        node,
       })
     } else {
       // Many edge
+      const handed =
+        written === undefined || node.decomposeInput === undefined
+          ? value
+          : Option.getOrElse(node.decomposeInput(written), () => value)
       const arrayItems = node.decompose
-        ? node.decompose(value)
+        ? node.decompose(handed)
         : Array.isArray(value)
           ? (value as ReadonlyArray<unknown>)
           : []
@@ -4005,7 +6076,7 @@ const decomposeNode = (
         // The element's attributes in their STORED form — every nested date,
         // transformed scalar and hydrated ref encoded (#72, #133).
         const attrs = { ...(elem as Record<string, unknown>) }
-        applyNodeAttrEncoders(attrs, node.attrEncoders)
+        const storedAsGiven = applyNodeAttrEncoders(attrs, node.attrEncoders)
         withContext(attrs, contextValues.stored)
 
         // The sort key is read from the element as the pre-#133 encoders left
@@ -4030,7 +6101,55 @@ const decomposeNode = (
             ...parentDiscriminators.other(),
             ...values.map((value) => otherKeyText(schema, value)),
           ],
+          otherKindSortKey: (targets) => {
+            const slots = values.map((_, i) => String(i))
+            const settings: ReadonlyArray<
+              readonly [() => ReadonlyArray<string>, (value: unknown) => string]
+            > = [
+              [
+                () => parentDiscriminators.current,
+                (value) => KeyComposer.keyValueText(schema, value, schema.casing),
+              ],
+              [() => parentDiscriminators.other(), (value) => otherKeyText(schema, value)],
+            ]
+            for (const [parents, text] of settings) {
+              const sortKey = (record: Record<string, unknown>) =>
+                composeKey(schema, node.entityType, [
+                  ...parents(),
+                  ...slots.map((slot) => text(record[slot])),
+                ])
+              const reading = kindReadingOf(
+                { ...values },
+                slots,
+                () => undefined,
+                ({ record }) => sortKey(record),
+                targets,
+              )
+              if (reading !== undefined && reading.asOther.size > 0) return sortKey(reading.record)
+            }
+            return undefined
+          },
+          skTextFor: (taker, path) => {
+            try {
+              let from = keyAttrs
+              if (taker !== node) {
+                from = { ...(elem as Record<string, unknown>) }
+                applyNodeAttrEncoders(from, taker.keyAttrEncoders)
+                mergeContextValues(from, contextValues.key)
+              }
+              const value = readCompositePath(from, path)
+              return value == null || !isScalarComposite(value)
+                ? undefined
+                : KeyComposer.keyValueText(schema, value, schema.casing)
+            } catch {
+              // What `taker` can't compose a key from isn't a key it writes.
+              return undefined
+            }
+          },
           member: node.fieldName ?? node.entityType,
+          rowStamps: node.rowStamps,
+          storedAsGiven,
+          node,
         })
       }
     }
@@ -4125,7 +6244,10 @@ const manyEdgeSkComposites = (
       })
     }
 
-    return values
+    // A number its field stores as a string holds its `NaN` in key form, as the root's key does.
+    return values.map((value, i) =>
+      storedNaNKeyForm(fieldAtPath(node.ownFields, declared[i]!), value),
+    )
   })
 
 /**
@@ -4186,7 +6308,7 @@ const hashToShard = (value: string, cardinality: number): number => {
 // Internal: Compose DynamoDB items from decomposed data
 // ---------------------------------------------------------------------------
 
-/** Resolved timestamp attribute names + storage for one aggregate. */
+/** Resolved timestamp attribute names, and the form the root's rows store each stamp in. */
 interface StampFields {
   readonly createdAt: string | null
   readonly createdEncoding: DynamoEncoding | null
@@ -4194,9 +6316,140 @@ interface StampFields {
   readonly updatedEncoding: DynamoEncoding | null
 }
 
-/** A single write's stamp: what to write, when, and what `created` to preserve. */
+/**
+ * What a node's rows do with each timestamp: see `rowStampsOf`. A null name isn't stamped. The
+ * encoding is the form `create`'s input takes the stamp in, which the field's schema decodes; the
+ * stored form is what's written.
+ */
+interface RowStamps {
+  readonly createdAt: string | null
+  readonly createdEncoding: DynamoEncoding | null
+  readonly createdStored: DynamoEncoding | null
+  readonly createdDeclared: boolean
+  readonly createdRequired: boolean
+  readonly createdReplaces: boolean
+  readonly updatedAt: string | null
+  readonly updatedEncoding: DynamoEncoding | null
+  readonly updatedStored: DynamoEncoding | null
+  readonly updatedDeclared: boolean
+  readonly updatedRequired: boolean
+  readonly updatedReplaces: boolean
+}
+
+/**
+ * A `many` value's rows, each through `fill`, put back in the shape the value has. A custom
+ * `decompose` says what the rows are, and only its `assemble` can put them back: with no `assemble`,
+ * a value that isn't an array has no way back, so its rows can't be filled. This runs before the
+ * input is decoded, so a value they can't take apart or put back is left for the schema to report.
+ */
+const fillRows = (
+  child: ResolvedNode,
+  value: unknown,
+  fill: (row: unknown) => unknown,
+): unknown => {
+  const filledOf = (rows: ReadonlyArray<unknown>) => {
+    const filled = rows.map(fill)
+    return filled.some((row, i) => row !== rows[i]) ? filled : undefined
+  }
+  if (child.decompose !== undefined && child.assemble !== undefined) {
+    try {
+      const filled = value === undefined ? undefined : filledOf(child.decompose(value))
+      return filled === undefined ? value : child.assemble(filled)
+    } catch {
+      return value
+    }
+  }
+  return Array.isArray(value) ? (filledOf(value) ?? value) : value
+}
+
+/**
+ * `value` with the dates its rows declare, walking the graph. `"declared"` (`create`) stamps every one
+ * the input lacks, and one it holds unless the root declares that date `Schema.optional` (`replaces`):
+ * up to 1.39.0 the input had to hold a date the root required, which the stamp then replaced, so a
+ * value there is a placeholder; 1.39.0 stamped one the root declares `Schema.optionalKey` over a value
+ * passed, and one it declares `Schema.optional` was the caller's to store. `"required"`
+ * (`update`) fills only one the mutated state lacks and a schema requires; one it doesn't require a
+ * rewrite stamps anyway: a mutation that changes nothing still has nothing to write. A value with
+ * nothing to add comes back as it is.
+ */
+const fillStamps = (
+  node: ResolvedNode,
+  value: unknown,
+  now: DateTime.Utc,
+  which: "declared" | "required",
+): unknown => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value
+  const given = value as Record<string, unknown>
+  const added: Record<string, unknown> = {}
+  const row = node.rowStamps
+  const fill = (
+    name: string | null,
+    declared: boolean,
+    required: boolean,
+    replaces: boolean,
+    encoding: DynamoEncoding | null,
+  ) => {
+    if (name === null || (given[name] !== undefined && (which === "required" || !replaces))) return
+    if (which === "declared" ? declared : required) {
+      added[name] = generateTimestampPrimitive(now, encoding)
+    }
+  }
+  if (row !== undefined) {
+    fill(
+      row.createdAt,
+      row.createdDeclared,
+      row.createdRequired,
+      row.createdReplaces,
+      row.createdEncoding,
+    )
+    fill(
+      row.updatedAt,
+      row.updatedDeclared,
+      row.updatedRequired,
+      row.updatedReplaces,
+      row.updatedEncoding,
+    )
+  }
+  for (const child of node.children) {
+    const current = given[child.fieldName!]
+    const next =
+      child.cardinality === "many"
+        ? fillRows(child, current, (row) => fillStamps(child, row, now, which))
+        : fillStamps(child, current, now, which)
+    if (next !== current) added[child.fieldName!] = next
+  }
+  return Object.keys(added).length === 0 ? value : { ...given, ...added }
+}
+
+/**
+ * A key's composites, in key text. One with no value has no key text, so this throws: `[EDD-9123]`,
+ * a `KeyValueError` that `composeKeysOrFail` makes a `ValidationError` before anything is written.
+ * Only for a key the aggregate can't do without: a list's keys are sparse (`buildDynamoItems`).
+ */
+const keyCompositesOrThrow = (
+  aggregateName: string,
+  key: string,
+  schema: DynamoSchemaModule.DynamoSchema,
+  composite: ReadonlyArray<string>,
+  record: Record<string, unknown>,
+): ReadonlyArray<string> => {
+  const absent = composite.filter((attr) => record[attr] === undefined || record[attr] === null)
+  if (absent.length > 0) {
+    const names = absent.map((attr) => `"${attr}"`).join(", ")
+    throw new KeyValueError({
+      value: undefined,
+      reason: `no value for ${names}`,
+      message:
+        `[EDD-9123] Aggregate "${aggregateName}": ${key} is composed from ${names}, which has no ` +
+        `value here. An aggregate can't be read without this key, so nothing was sent. Supply it, ` +
+        `or compose the key from a field that always has one.`,
+    })
+  }
+  return KeyComposer.extractKeyComposites(schema, {}, composite, record)
+}
+
+/** A single write's stamp: when, and what `created` to preserve. */
 interface Stamp {
-  readonly fields: StampFields
   readonly now: DateTime.Utc
   readonly existingCreated: ReadonlyMap<string, unknown>
   /**
@@ -4204,9 +6457,13 @@ interface Stamp {
    * changing them (#171). Absent — every other write — stamps `now`.
    */
   readonly existingUpdated?: ReadonlyMap<string, unknown> | undefined
+  /** Each row's declared `updated` before an `update`'s mutation, by sk. */
+  readonly updatedBefore?: ReadonlyMap<string, unknown> | undefined
 }
 
 const EMPTY_CREATED: ReadonlyMap<string, unknown> = new Map()
+
+const hasKeyValue = (value: unknown): boolean => value !== undefined && value !== null
 
 /**
  * Convert decomposed items into DynamoDB attribute maps with composed keys.
@@ -4221,7 +6478,11 @@ const buildDynamoItems = (
   groups: ReadonlyArray<TransactionGroup>,
   config: AggregateConfig<any>,
   pkValue: string,
-  rootCollectionSkComposites: ReadonlyArray<string>,
+  /**
+   * The root's value, the collection sort key's composites read from. Undefined: the caller wants
+   * each row's identity (`pk`, `sk`) only, and neither that key nor the list keys are composed.
+   */
+  rootValue: Record<string, unknown> | undefined,
   /**
    * The aggregate's composite key-form normaliser. Required, not optional: the
    * list-GSI keys composed below have to be spelled exactly as `Aggregate.list`
@@ -4245,6 +6506,32 @@ const buildDynamoItems = (
       // SK: entity-type specific
       attrs.sk = composeKey(config.schema, item.entityType, [...item.skComposites])
 
+      // System timestamps. Written last, so a generated value wins over the same-named field
+      // propagated onto edge items via `context`; known first, so a key over one holds what the row
+      // holds. A date the row declares holds what the row does: on `create` the stamp `fillStamps`
+      // put there, on `update` a value the mutation changed, and `created` stays what's stored
+      // whatever the mutation did to it.
+      const stamped: Record<string, unknown> = {}
+      const row = item.rowStamps
+      if (stamp && row !== undefined) {
+        const { existingCreated, now } = stamp
+        const sk = attrs.sk as string
+        if (row.createdAt !== null) {
+          const held = row.createdDeclared ? item.attributes[row.createdAt] : undefined
+          stamped[row.createdAt] =
+            existingCreated.get(sk) ?? held ?? generateTimestampPrimitive(now, row.createdStored)
+        }
+        if (row.updatedAt !== null) {
+          const held = row.updatedDeclared ? item.attributes[row.updatedAt] : undefined
+          const before = stamp.updatedBefore
+          const supplied =
+            held !== undefined && !(before?.has(sk) && deepEqual(before.get(sk), held))
+          stamped[row.updatedAt] =
+            stamp.existingUpdated?.get(sk) ??
+            (supplied ? held : generateTimestampPrimitive(now, row.updatedStored))
+        }
+      }
+
       // Collection SK mirror — only written when an index is actually provisioned.
       // Root items get the collection key; every other item's value is a verbatim copy
       // of its own `sk`. With no index there is nothing to sort, so the attribute is
@@ -4252,63 +6539,71 @@ const buildDynamoItems = (
       const isRootItem =
         item.entityType === config.root.entityType && item.skComposites.length === 0
       const collectionSk = config.collection.sk
-      if (config.collection.index !== undefined && collectionSk !== undefined) {
+      if (
+        rootValue !== undefined &&
+        config.collection.index !== undefined &&
+        collectionSk !== undefined
+      ) {
         attrs[collectionSk.field] = isRootItem
-          ? composeCollectionKey(config.schema, config.collection.name, rootCollectionSkComposites)
+          ? composeCollectionKey(
+              config.schema,
+              config.collection.name,
+              keyCompositesOrThrow(
+                config.root.entityType,
+                "its collection sort key",
+                config.schema,
+                collectionSk.composite,
+                keyRecord({ ...rootValue, ...stamped }),
+              ),
+            )
           : composeKey(config.schema, item.entityType, [...item.skComposites])
       }
 
-      // List collection GSI keys (root items only)
-      if (isRootItem && config.list) {
-        const listPkComposites = KeyComposer.extractKeyComposites(
-          config.schema,
-          {},
-          config.list.pk.composite,
-          keyRecord(item.keyAttributes ?? item.attributes),
-        )
-        if (config.list.cardinality) {
-          const shard = hashToShard(pkValue, config.list.cardinality)
-          attrs[config.list.pk.field] = composeCollectionKey(config.schema, config.list.name, [
-            ...listPkComposites,
-            String(shard),
-          ])
-        } else {
-          attrs[config.list.pk.field] = composeCollectionKey(
+      // List collection GSI keys (root items only). Sparse, as an entity index is: a row with no
+      // value for a composite isn't in the list, whole index or nothing, and a later write that
+      // gives it one puts it there. Every aggregate write is a whole-row Put, so leaving both
+      // attributes off is also what takes it out.
+      if (rootValue !== undefined && isRootItem && config.list) {
+        const listKeyValues = keyRecord({
+          ...(item.keyAttributes ?? item.attributes),
+          ...stamped,
+        })
+        const listComposites = [...config.list.pk.composite, ...config.list.sk.composite]
+        if (listComposites.every((attr) => hasKeyValue(listKeyValues[attr]))) {
+          const listPkComposites = KeyComposer.extractKeyComposites(
+            config.schema,
+            {},
+            config.list.pk.composite,
+            listKeyValues,
+          )
+          if (config.list.cardinality) {
+            const shard = hashToShard(pkValue, config.list.cardinality)
+            attrs[config.list.pk.field] = composeCollectionKey(config.schema, config.list.name, [
+              ...listPkComposites,
+              String(shard),
+            ])
+          } else {
+            attrs[config.list.pk.field] = composeCollectionKey(
+              config.schema,
+              config.list.name,
+              listPkComposites,
+            )
+          }
+          const listSkComposites = KeyComposer.extractKeyComposites(
+            config.schema,
+            {},
+            config.list.sk.composite,
+            listKeyValues,
+          )
+          attrs[config.list.sk.field] = composeCollectionKey(
             config.schema,
             config.list.name,
-            listPkComposites,
+            listSkComposites,
           )
         }
-        const listSkComposites = KeyComposer.extractKeyComposites(
-          config.schema,
-          {},
-          config.list.sk.composite,
-          keyRecord(item.keyAttributes ?? item.attributes),
-        )
-        attrs[config.list.sk.field] = composeCollectionKey(
-          config.schema,
-          config.list.name,
-          listSkComposites,
-        )
       }
 
-      // System timestamps — last, so a generated value wins over the same-named
-      // field propagated onto edge items via `context`.
-      if (stamp) {
-        const { existingCreated, fields, now } = stamp
-        const sk = attrs.sk as string
-        if (fields.createdAt !== null) {
-          const prior = existingCreated.get(sk)
-          attrs[fields.createdAt] = prior ?? generateTimestampPrimitive(now, fields.createdEncoding)
-        }
-        if (fields.updatedAt !== null) {
-          attrs[fields.updatedAt] =
-            stamp.existingUpdated?.get(sk) ??
-            generateTimestampPrimitive(now, fields.updatedEncoding)
-        }
-      }
-
-      return toAttributeMap(attrs)
+      return toAttributeMap({ ...attrs, ...stamped })
     }),
   }))
 
@@ -4498,12 +6793,74 @@ function writeTransactionGroups(
   })
 }
 
+/** A row `update`'s cleanup deletes with `ownsRows`: its key, and the type it was read with. */
+interface OwnedRow {
+  readonly pk: string
+  readonly sk: string
+  readonly entityType: string
+}
+
+/**
+ * `update`'s cleanup Deletes with `ownsRows` (DESIGN.md §7 "Which rows in its partition are an
+ * aggregate's"), sent after the update's groups have committed, up to {@link TRANSACT_WRITE_ITEMS_LIMIT} to a
+ * request: Deletes of keys already stored reach no other limit of a transaction. Each holds while
+ * its row is gone or still of the type read, so a row another write removed in between is fine,
+ * and one replaced with a row of another type is left. A cancelled request is sent once more
+ * without the Deletes whose condition failed; the mutation isn't run again and nothing is read
+ * again. A failure is reported as a later group's is: the update's groups have committed, and the
+ * rows it didn't delete stay until the next update of their node.
+ */
+const deleteOwnedRows = (
+  client: DynamoClientService,
+  tableName: string,
+  pkField: string,
+  rows: ReadonlyArray<OwnedRow>,
+): Effect.Effect<void, DynamoClientError | TransactionCancelled> =>
+  Effect.gen(function* () {
+    const deleteOf = (row: OwnedRow): TransactWriteItem => ({
+      Delete: {
+        TableName: tableName,
+        Key: toAttributeMap({ [pkField]: row.pk, sk: row.sk }),
+        ConditionExpression: "attribute_not_exists(#pk) OR #e = :e",
+        ExpressionAttributeNames: { "#pk": pkField, "#e": "__edd_e__" },
+        ExpressionAttributeValues: { ":e": { S: row.entityType } },
+      },
+    })
+    for (let start = 0; start < rows.length; start += TRANSACT_WRITE_ITEMS_LIMIT) {
+      const chunk = rows.slice(start, start + TRANSACT_WRITE_ITEMS_LIMIT)
+      const reasons = yield* client
+        .transactWriteItems({ TransactItems: chunk.map((row) => deleteOf(row)) })
+        .pipe(
+          Effect.as(undefined),
+          Effect.catch((error: DynamoClientError) =>
+            isAwsTransactionCancelled(error.cause)
+              ? Effect.succeed(error.cause.CancellationReasons ?? [])
+              : Effect.fail(error),
+          ),
+        )
+      if (reasons === undefined) continue
+      const rest = chunk.filter((_, i) => reasons[i]?.Code !== "ConditionalCheckFailed")
+      if (rest.length === 0) continue
+      yield* client.transactWriteItems({ TransactItems: rest.map((row) => deleteOf(row)) }).pipe(
+        Effect.mapError((error) =>
+          isAwsTransactionCancelled(error.cause)
+            ? new TransactionCancelled({
+                operation: "TransactWriteItems",
+                reasons: (error.cause.CancellationReasons ?? []).map((r) => ({
+                  code: r?.Code,
+                  message: r?.Message,
+                })),
+                cause: error.cause,
+              })
+            : error,
+        ),
+      )
+    }
+  })
+
 // ---------------------------------------------------------------------------
 // Internal: Rows under other key text (#171, #183)
 // ---------------------------------------------------------------------------
-
-/** DynamoDB's limit on the items of one `TransactWriteItems`. */
-const TRANSACT_LIMIT = 100
 
 /**
  * Where an aggregate's row is stored (#171): under its current key, its 1.36
@@ -4593,7 +6950,8 @@ const deleteAllItems = (
     // Chunk into batches of 25 (DynamoDB batchWriteItem limit). Items DynamoDB
     // leaves unprocessed (throttling) are retried with exponential backoff, as
     // `Batch.write` retries them; a bounded number of retries, then a clear
-    // failure — never a silent partial delete (#134).
+    // failure — never a silent partial delete (#134). By count alone: 25 stored keys (at most
+    // 2048 + 1024 bytes each, so at most about 0.5 MB as JSON) can't reach the 16 MB request limit.
     for (let i = 0; i < deleteRequests.length; i += 25) {
       let pending: ReadonlyArray<unknown> = deleteRequests.slice(i, i + 25)
       let retries = 0

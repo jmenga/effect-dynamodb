@@ -22,6 +22,7 @@ import {
   StreamRecordIdentifierMissing,
   type ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
+import { refuseUnreadable } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   Duration,
   Effect,
@@ -52,6 +53,7 @@ import {
   type OutboxMeta,
   type RemoveRow,
   type RowResult,
+  refuseSharedOutboxKeySpace,
   retrySchedule,
   type SkipEvent,
 } from "./ProjectionEngine.js"
@@ -703,6 +705,14 @@ export type EventProjectionTypeId = typeof EventProjectionTypeId
 export const ProjectionRoutes: unique symbol = Symbol.for("effect-dynamodb/EventProjection/Routes")
 
 /**
+ * @internal The read model a projection writes, for the sites that check several projections'
+ * read models together (`EventStore.processBatch`, `[EDD-9134]`).
+ */
+export const ProjectionReadModelKey: unique symbol = Symbol.for(
+  "effect-dynamodb/EventProjection/ReadModel",
+)
+
+/**
  * A change-feed projection: one source stream folded into read-model rows —
  * see {@link projection}. Its operations need `DynamoClient | TableConfig`
  * (the stream's table and the read model's) and `evolve`'s requirements;
@@ -723,6 +733,8 @@ export interface EventProjection<
   readonly [EventProjectionTypeId]: EventProjectionTypeId
   /** The source stream. */
   readonly stream: EventStream<A, TStreamIdFields, any, any, any, any, any>
+  /** @internal See {@link ProjectionReadModelKey}. */
+  readonly [ProjectionReadModelKey]: unknown
   /** @internal See {@link ProjectionRoutes}. */
   readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route>
   /** The read model's entity type. */
@@ -893,19 +905,26 @@ export const refuseReadModel = (
   }
 }
 
-/** @internal An outbox config, resolved. */
-export const resolveOutbox = (outbox: ProjectionOutboxConfig<any, any, any> | undefined) =>
-  outbox === undefined
-    ? undefined
-    : {
-        schema: outbox.schema,
-        effects: outbox.effects,
-        table: outbox.table,
-        pk: outbox.keys?.pk ?? "pk",
-        sk: outbox.keys?.sk ?? "sk",
-        index: outbox.index,
-        claimFor: Duration.fromInputUnsafe(outbox.claimFor ?? "30 seconds"),
-      }
+/**
+ * @internal An outbox config, resolved. An effect holding a map would be committed with the row, then
+ * fail every drain from the head of the row's queue, so it's refused here with the other stored sides.
+ */
+export const resolveOutbox = (
+  label: string,
+  outbox: ProjectionOutboxConfig<any, any, any> | undefined,
+) => {
+  if (outbox === undefined) return undefined
+  refuseUnreadable(`${label}, outbox schema`, "schema", outbox.schema, { whole: "the effect" })
+  return {
+    schema: outbox.schema,
+    effects: outbox.effects,
+    table: outbox.table,
+    pk: outbox.keys?.pk ?? "pk",
+    sk: outbox.keys?.sk ?? "sk",
+    index: outbox.index,
+    claimFor: Duration.fromInputUnsafe(outbox.claimFor ?? "30 seconds"),
+  }
+}
 
 /**
  * Define a change-feed projection of `stream` into `readModel` — rows keyed by
@@ -918,7 +937,9 @@ export const resolveOutbox = (outbox: ProjectionOutboxConfig<any, any, any> | un
  * version), `softDelete` (removal is `removal` tombstones) and `timeSeries`
  * read models throw `[EDD-9081]`, as do a field the model lacks, a
  * non-integer offset, `removal` / `outbox` on a read model with `unique`
- * constraints, and `outbox` without `revision`.
+ * constraints, and `outbox` without `revision`. When a projection on the read
+ * model has `removal`, a checkpoint attribute that is also this projection's
+ * revision throws `[EDD-9133]`.
  *
  * @example
  * ```ts
@@ -1008,7 +1029,7 @@ export const projection = <
                 ? undefined
                 : Duration.fromInputUnsafe(config.removal.ttl),
           },
-    outbox: resolveOutbox(config.outbox),
+    outbox: resolveOutbox(label, config.outbox),
   })
 
   const keyOf = (streamId: Id, event: Ev): Effect.Effect<Option.Option<K>, ValidationError> =>
@@ -1193,6 +1214,7 @@ export const projection = <
     streamId: Id,
   ): Effect.Effect<ProjectionCaughtUp<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
+      yield* engine.preflight("catchUp")
       // The latest event that addresses a row — usually the head, one page.
       const pages = yield* Query.paginate(
         stream.query
@@ -1248,6 +1270,7 @@ export const projection = <
     streamId: Id,
   ): Effect.Effect<ProjectionRebuilt<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
+      yield* engine.preflight("rebuild")
       const events = (yield* stream.read(streamId, { consistentRead: true })) as Array<Ev>
       const delivered = new Set(events.map((e) => e.version))
       const rows = new Map<string, { key: K; events: Array<Ev> }>()
@@ -1331,6 +1354,7 @@ export const projection = <
     },
     stream,
     entityType: readModel.entityType,
+    [ProjectionReadModelKey]: readModel,
     [ProjectionRoutes]: (name: string): ReadonlyArray<Route> => [
       {
         name,
@@ -1676,19 +1700,33 @@ export const processBatch: {
     ProjectionRequirementsOf<Projections[keyof Projections]>
   >
 } = (records: ReadonlyArray<unknown>, options: any): any =>
-  Capacity.operation(
-    "EventStore.processBatch",
-    undefined,
-    runBatch(
+  Effect.andThen(
+    // `[EDD-9134]`: the read models of the projections it's handed, before anything runs.
+    Effect.suspend(() =>
+      refuseSharedOutboxKeySpace(
+        "EventStore.processBatch",
+        Object.entries(
+          options.projections as Record<string, { readonly [ProjectionReadModelKey]: unknown }>,
+        ).map(
+          ([name, projection]) =>
+            [`the read model of "${name}"`, projection[ProjectionReadModelKey]] as const,
+        ),
+      ),
+    ),
+    Capacity.operation(
       "EventStore.processBatch",
-      records,
-      options,
-      Object.entries(
-        options.projections as Record<
-          string,
-          { readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route> }
-        >,
-      ).flatMap(([name, projection]) => projection[ProjectionRoutes](name)),
-      Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
+      undefined,
+      runBatch(
+        "EventStore.processBatch",
+        records,
+        options,
+        Object.entries(
+          options.projections as Record<
+            string,
+            { readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route> }
+          >,
+        ).flatMap(([name, projection]) => projection[ProjectionRoutes](name)),
+        Object.entries((options.streams ?? {}) as Record<string, DecodableStream>),
+      ),
     ),
   )

@@ -20,16 +20,27 @@ import type { Schema } from "effect"
 import type * as DynamoSchemaModule from "./DynamoSchema.js"
 import type { DiscriminatorConfig } from "./internal/AggregateCursor.js"
 import type { AggregateEdge } from "./internal/AggregateEdges.js"
-import { deriveAggregateSchemas } from "./internal/AggregateSchemas.js"
+import {
+  deriveAggregateSchemas,
+  getSchemaFields,
+  manyEdgePaths,
+  refuseAggregateKeyOverMovingValue,
+  refuseAggregateKeysOverBothKinds,
+  refuseManySortKeysOverMovingValue,
+  unwrapModel,
+} from "./internal/AggregateSchemas.js"
 import type {
   AggregateEdgesConfig,
   AggregateEdgesGuard,
   AggregateInputType,
+  AggregateStampNames,
   BoundSubAggregate,
+  SchemaFieldsOf,
   SubAggregate,
 } from "./internal/AggregateTypes.js"
 import type { TimestampsConfig } from "./internal/EntityConfig.js"
 import type { ModelFieldName } from "./internal/EntityTypes.js"
+import { refuseUnreadable } from "./internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "./internal/SharedKeyAttribute.js"
 
 export type { Cursor, DiscriminatorConfig, UpdateContext } from "./internal/AggregateCursor.js"
@@ -60,6 +71,7 @@ export {
   unwrapModel,
 } from "./internal/AggregateSchemas.js"
 export type {
+  AggregateCreateInputType,
   AggregateInputType,
   BoundSubAggregate,
   Input,
@@ -133,6 +145,12 @@ interface AggregateConfig<
    * `effect-dynamodb`, which owns the write path that stamps them.
    */
   readonly timestamps?: TimestampsConfig
+  /**
+   * Every row of the aggregate's entity types in its partition is its own. Accepted here for parity
+   * with the operational `Aggregate.make` in `effect-dynamodb`, whose `update` and `rekey` act on
+   * it.
+   */
+  readonly ownsRows?: boolean
   readonly root: { readonly entityType: string }
   readonly edges: TEdges
 }
@@ -211,12 +229,23 @@ export function make<
   TSchema extends Schema.Top,
   const TEdges extends AggregateEdgesConfig<TSchema>,
   const TPK extends ReadonlyArray<ModelFieldName<TSchema>>,
+  const TTimestamps extends TimestampsConfig | undefined = undefined,
 >(
   schema: TSchema,
   config: AggregateConfig<TSchema, TEdges, TPK> & {
     readonly edges: AggregateEdgesGuard<TSchema, TEdges>
+    readonly timestamps?: TTimestamps
   },
-): AggregateDefinition<TSchema, AggregateInputType<Schema.Schema.Type<TSchema>, TEdges, TPK>>
+): AggregateDefinition<
+  TSchema,
+  AggregateInputType<
+    Schema.Schema.Type<TSchema>,
+    TEdges,
+    TPK,
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
+  >
+>
 export function make<
   TSchema extends Schema.Top,
   const TEdges extends AggregateEdgesConfig<TSchema>,
@@ -236,6 +265,9 @@ export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
 ): SubAggregate<TSchema> | AggregateDefinition<TSchema> {
+  refuseUnreadable(`Aggregate "${config.root.entityType}"`, "aggregate", unwrapModel(schema), {
+    manyEdges: manyEdgePaths(config.edges),
+  })
   if (!("table" in config) || config.table === undefined) {
     return makeSubAggregate(schema, config as SubAggregateConfig)
   }
@@ -279,7 +311,30 @@ const makeAggregateDefinition = <TSchema extends Schema.Top>(
           ]),
     ],
   )
-  const derivedSchemas = deriveAggregateSchemas(schema, config.edges, config.pk.composite)
+  refuseAggregateKeyOverMovingValue(
+    config.root.entityType,
+    config.timestamps,
+    getSchemaFields(schema),
+    config.pk.composite,
+  )
+  refuseManySortKeysOverMovingValue(
+    config.root.entityType,
+    config.timestamps,
+    getSchemaFields(schema),
+    config.edges,
+  )
+  refuseAggregateKeysOverBothKinds(
+    config.root.entityType,
+    getSchemaFields(schema),
+    config,
+    config.edges,
+  )
+  const derivedSchemas = deriveAggregateSchemas(
+    schema,
+    config.edges,
+    config.pk.composite,
+    config.timestamps,
+  )
 
   return {
     [TypeId]: TypeId,

@@ -2,7 +2,9 @@
  * @internal Failure-time diagnosis of DynamoDB's rejections (#144).
  *
  * The library does not pre-check limits or request rules DynamoDB enforces
- * itself — the 400 KB item, the 4 MB and 100-item transaction, the 2048-byte
+ * itself — the 400 KB item, the 4 MB and 100-item transaction, the 16 MB
+ * request body (on a caller's own request; the library splits its own
+ * batches to fit, `ItemSize.packRequests`), the 2048-byte
  * partition key and 1024-byte sort key, one operation per item, the limits on
  * one expression, an `IN ()` with no operands, an empty key value, a reversed
  * `BETWEEN`, a consistent read of a GSI, a table's vector index limits, a
@@ -12,13 +14,14 @@
  * 1. **recognises** the rejection by a stable fragment of its message (a
  *    request-wide `ValidationException` or `LimitExceededException`, or a
  *    `TransactionCanceledException` whose positional reason carries
- *    `Code: "ValidationError"`);
+ *    `Code: "ValidationError"`), or a request body over 16 MB by its HTTP 413;
  * 2. **confirms** it against the request the site sent — an item count, a
  *    key's UTF-8 bytes, an expression's length or operators, two entries
  *    naming one item, an empty key value, the order of two bounds (each
  *    confirmed only when the request breaks the rule), or, for item and
  *    transaction sizes, by checking the request holds something the message
- *    can apply to and measuring it exactly (`ItemSize.ts`);
+ *    can apply to and measuring it exactly (`ItemSize.ts`), and for a request
+ *    body, by measuring the body over its limit;
  * 3. **attributes** it to the culprit, using the targets the site built.
  *
  * A site turns the {@link Diagnosis} into its own tagged error with
@@ -64,11 +67,17 @@ import {
 } from "./ExpressionLimits.js"
 import {
   attributeBytes,
+  batchWriteBodyBytes,
   ITEM_MAX_BYTES,
   itemBytes,
+  jsonBytes,
+  REQUEST_MAX_BYTES,
   TRANSACT_WRITE_MAX_BYTES,
   transactItemBytes,
+  transactionBytes,
+  transactWriteBodyBytes,
 } from "./ItemSize.js"
+import * as SentRequest from "./SentRequest.js"
 
 /** DynamoDB's limit on a partition (hash) key value, in UTF-8 bytes. */
 export const PARTITION_KEY_MAX_BYTES = 2048
@@ -157,6 +166,10 @@ export const transactItemTarget = (
  * `callerCondition` is the caller's own `.condition()` on the entry at an
  * index (the rest of its `ConditionExpression` is the library's guard), to
  * say how much of an expression rejected for its size is the caller's.
+ *
+ * `input` is the request input as sent: the object the client received,
+ * after `Capacity` added `ReturnConsumedCapacity`. {@link diagnoseFailure}
+ * fills it from the failure (`SentRequest`); a site leaves it out.
  */
 export type SentWrite =
   | {
@@ -164,17 +177,20 @@ export type SentWrite =
       readonly item: TransactWriteItem
       readonly target: () => TransactItemTarget
       readonly callerCondition?: (() => string | undefined) | undefined
+      readonly input?: Readonly<Record<string, unknown>> | undefined
     }
   | {
       readonly _tag: "Transaction"
       readonly items: ReadonlyArray<TransactWriteItem>
       readonly targets: () => ReadonlyArray<TransactItemTarget>
       readonly callerCondition?: ((index: number) => string | undefined) | undefined
+      readonly input?: Readonly<Record<string, unknown>> | undefined
     }
   | {
       readonly _tag: "Batch"
       readonly items: ReadonlyArray<TransactWriteItem>
       readonly targets: () => ReadonlyArray<TransactItemTarget>
+      readonly input?: Readonly<Record<string, unknown>> | undefined
     }
   | {
       readonly _tag: "TransactGet"
@@ -266,6 +282,25 @@ export type Diagnosis =
        */
       readonly measured: number
       /** The largest contributors, largest first (at most three). */
+      readonly largest: ReadonlyArray<{
+        readonly target: TransactItemTarget
+        readonly bytes: number
+      }>
+    }
+  | {
+      /** A request whose body is over DynamoDB's 16 MB, by the JSON sent. */
+      readonly _tag: "RequestTooLarge"
+      /** What was sent: a transaction, a batch request, or a single-item write. */
+      readonly request: "TransactWriteItems" | "BatchWriteItem" | "item"
+      /**
+       * The request's body by the library's measure (`ItemSize.jsonBytes`):
+       * what the site sent, before any field the client adds (at most a few
+       * dozen bytes), so always over the limit here.
+       */
+      readonly measured: number
+      /** The same request by item size — the measure of the 400 KB and 4 MB limits. */
+      readonly itemSize: number
+      /** The largest entries by body bytes, largest first (at most three). */
       readonly largest: ReadonlyArray<{
         readonly target: TransactItemTarget
         readonly bytes: number
@@ -388,6 +423,13 @@ const ITEM_SIZE_UPDATE = /Item size to update has exceeded/i
 const ITEM_COUNT = /length less than or equal to 100\b/i
 const PAYLOAD = /payload size cannot exceed 4\s?MB/i
 const PAYLOAD_SIZE = /Payload Size:\s*(\d+)/i
+// A request body over 16 MB. DynamoDB Local refuses it before reading it:
+// HTTP 413 with an empty message, which the AWS SDK reports as "UnknownError".
+// AWS documents "The total request size exceeds 16 MB" among BatchWriteItem's
+// ValidationException reasons; its wording and status are unverified here.
+// Recognised by either, and confirmed by measuring the request.
+const REQUEST_SIZE =
+  /request entity too large|total request size|request size[^.]*exceed|exceeds?\s+16\s?MB/i
 // A key value over its limit. DynamoDB Local words a table key's (partition
 // and sort key in one message: "Hash primary key values must be under 2048
 // bytes, and range primary key values must be under 1024 bytes") and an index
@@ -458,7 +500,12 @@ type CancellationReason = {
 }
 
 type Failure =
-  | { readonly _tag: "Request"; readonly message: string }
+  | {
+      readonly _tag: "Request"
+      readonly message: string
+      /** The request was refused for its size: HTTP 413. */
+      readonly tooLarge: boolean
+    }
   | { readonly _tag: "Cancelled"; readonly reasons: ReadonlyArray<CancellationReason | undefined> }
 
 const messageOf = (cause: unknown): string => {
@@ -475,11 +522,18 @@ const isAwsLimitExceeded = (cause: unknown): boolean =>
   "name" in cause &&
   (cause as { name: unknown }).name === "LimitExceededException"
 
+/** An AWS SDK error whose HTTP response was 413: the request was refused for its size. */
+const isRequestTooLarge = (cause: unknown): boolean =>
+  cause != null &&
+  typeof cause === "object" &&
+  "$metadata" in cause &&
+  (cause as { $metadata?: { httpStatusCode?: unknown } }).$metadata?.httpStatusCode === 413
+
 /**
  * The failure a site's error carries, if it is one this module can read: a
  * DynamoDB `ValidationException` or `LimitExceededException` (however the
- * client classified it), a `TransactionCanceledException`, or a site's
- * `TransactionCancelled`.
+ * client classified it), a request refused for its size (HTTP 413), a
+ * `TransactionCanceledException`, or a site's `TransactionCancelled`.
  */
 const readFailure = (error: unknown): Failure | undefined => {
   if (error === null || typeof error !== "object" || !("_tag" in error)) return undefined
@@ -494,8 +548,8 @@ const readFailure = (error: unknown): Failure | undefined => {
   }
   if (tagged._tag !== "DynamoError" && tagged._tag !== "DynamoValidationError") return undefined
   const cause = tagged.cause
-  if (isAwsValidationError(cause) || isAwsLimitExceeded(cause)) {
-    return { _tag: "Request", message: messageOf(cause) }
+  if (isAwsValidationError(cause) || isAwsLimitExceeded(cause) || isRequestTooLarge(cause)) {
+    return { _tag: "Request", message: messageOf(cause), tooLarge: isRequestTooLarge(cause) }
   }
   if (isAwsTransactionCancelled(cause)) {
     return {
@@ -890,11 +944,69 @@ const emptyKey = (message: string, sent: SentWrite): Diagnosis | undefined => {
   return undefined
 }
 
+/**
+ * A request rejected for its body, confirmed: the body of the request as sent
+ * (`sent.input`, `ReturnConsumedCapacity` included) measures over
+ * {@link REQUEST_MAX_BYTES}. Without a recorded input (a client the library
+ * did not instrument), the body is rebuilt from the site's entries.
+ */
+const oversizedRequest = (sent: SentWrite): Diagnosis | undefined => {
+  if (sent._tag === "TransactGet" || sent._tag === "BatchGet") return undefined
+  const entries = entriesOf(sent)
+  if (entries.length === 0) return undefined
+  const request =
+    sent._tag === "Transaction"
+      ? ("TransactWriteItems" as const)
+      : sent._tag === "Batch"
+        ? ("BatchWriteItem" as const)
+        : ("item" as const)
+  const input = sent.input
+  const measured =
+    request === "TransactWriteItems"
+      ? transactWriteBodyBytes(input ?? { TransactItems: entries })
+      : request === "BatchWriteItem"
+        ? batchWriteBodyBytes(input ?? { RequestItems: batchRequestItems(entries) })
+        : jsonBytes(input ?? entries[0]!.Put ?? entries[0]!.Update ?? entries[0]!.Delete)
+  if (measured <= REQUEST_MAX_BYTES) return undefined
+  const sized = entries.map((item, index) => ({
+    index,
+    bytes:
+      request === "BatchWriteItem"
+        ? jsonBytes(batchRequestOf(item))
+        : request === "item"
+          ? measured
+          : jsonBytes(item),
+  }))
+  const targets = targetsOf(sent)
+  return {
+    _tag: "RequestTooLarge",
+    request,
+    measured,
+    itemSize:
+      request === "TransactWriteItems"
+        ? transactionBytes(entries)
+        : entries.reduce((sum, item) => sum + (putBytes(item) ?? transactItemBytes(item)), 0),
+    largest: [...sized]
+      .sort((a, b) => b.bytes - a.bytes)
+      .slice(0, 3)
+      .flatMap(({ index, bytes }) => {
+        const target = targets[index]
+        return target === undefined ? [] : [{ target, bytes }]
+      }),
+  }
+}
+
 const diagnoseRequest = (
-  message: string,
+  failure: { readonly message: string; readonly tooLarge: boolean },
   sent: SentWrite,
   keys: KeyAttributes,
 ): Diagnosis | undefined => {
+  const message = failure.message
+  if (failure.tooLarge) return oversizedRequest(sent)
+  if (REQUEST_SIZE.test(message)) {
+    const found = oversizedRequest(sent)
+    if (found !== undefined) return found
+  }
   if (REPEATED.test(message) || REPEATED_BATCH.test(message)) return repeatedItem(sent)
   if (ITEM_COUNT.test(message)) {
     const count =
@@ -1153,7 +1265,7 @@ export const diagnoseRejection = (
       return failure._tag === "Request" ? diagnoseSearch(failure.message, sent) : undefined
     default:
       return failure._tag === "Request"
-        ? diagnoseRequest(failure.message, sent, keys)
+        ? diagnoseRequest(failure, sent, keys)
         : diagnoseCancellation(failure.reasons, sent, keys)
   }
 }
@@ -1234,6 +1346,32 @@ export const explainDiagnosis = (
           .join("; ") +
         ". A put of a retain entity counts twice: its item and its version snapshot. " +
         `Split the operations into smaller transactions. ${outcome}`
+      )
+    }
+    case "RequestTooLarge": {
+      const what =
+        diagnosis.request === "TransactWriteItems"
+          ? "transaction"
+          : diagnosis.request === "BatchWriteItem"
+            ? "batch request"
+            : "request"
+      return (
+        `${operation}: DynamoDB rejected the ${what} for exceeding its limit of ` +
+        `${REQUEST_MAX_BYTES} bytes (16 MB) on one request's body; the library measures the ` +
+        `body it sent at ${diagnosis.measured} bytes. The body is the request's JSON text, where ` +
+        "a control character in a string takes 6 bytes (\\u0000), a quote or backslash 2, and " +
+        "binary is base64, though each counts 1 byte toward DynamoDB's item-size limits: by " +
+        `those, the ${what} is ${diagnosis.itemSize} bytes. The largest: ` +
+        diagnosis.largest
+          .map(({ target, bytes }) => `${named(target)} (${bytes} bytes)`)
+          .join("; ") +
+        "." +
+        (diagnosis.request === "TransactWriteItems"
+          ? " Split the operations into smaller transactions."
+          : diagnosis.request === "BatchWriteItem"
+            ? " Write fewer items per request."
+            : " Shorten the item or its condition.") +
+        ` ${outcome}`
       )
     }
     case "KeyTooLong": {
@@ -1392,6 +1530,7 @@ export const diagnosedEntityType = (diagnosis: Diagnosis, fallback: string): str
     case "RepeatedItem":
       return diagnosis.first.entityType
     case "TransactionTooLarge":
+    case "RequestTooLarge":
       return diagnosis.largest[0]?.target.entityType ?? fallback
     default:
       return fallback
@@ -1417,6 +1556,13 @@ export const diagnosedValidationError = (
 // Wiring
 // ---------------------------------------------------------------------------
 
+/** `sent`, carrying the request input as sent when the failure recorded it. */
+const asSent = (sent: Sent, input: Readonly<Record<string, unknown>> | undefined): Sent =>
+  input !== undefined &&
+  (sent._tag === "Item" || sent._tag === "Transaction" || sent._tag === "Batch")
+    ? { ...sent, input }
+    : sent
+
 /**
  * Wrap a site's request so that, on failure only, a diagnosable error is read
  * against what was sent and — when confirmed — rewritten by `rewrite`.
@@ -1441,7 +1587,11 @@ export const diagnoseFailure =
   <A, E, R>(self: Effect.Effect<A, E, R>): Effect.Effect<A, E | E2, R> =>
     Effect.catch(self, (error: E): Effect.Effect<never, E | E2> => {
       if (!isDiagnosable(error)) return Effect.fail(error)
-      const diagnosis = diagnoseRejection(error, options.sent(), options.keys?.() ?? NO_KEYS)
+      const diagnosis = diagnoseRejection(
+        error,
+        asSent(options.sent(), SentRequest.inputOf(error)),
+        options.keys?.() ?? NO_KEYS,
+      )
       if (diagnosis === undefined) return Effect.fail(error)
       if (options.only !== undefined && !options.only.includes(diagnosis._tag)) {
         return Effect.fail(error)
@@ -1492,6 +1642,26 @@ export const batchEntries = (
       return []
     }),
   )
+
+/** One transact-entry-form entry ({@link batchEntries}) as the write request it came from. */
+const batchRequestOf = (item: TransactWriteItem): WriteRequest =>
+  item.Put !== undefined
+    ? { PutRequest: { Item: item.Put.Item ?? {} } }
+    : { DeleteRequest: { Key: item.Delete?.Key ?? {} } }
+
+/** {@link batchEntries} reversed: the `BatchWriteItem` request map the entries came from. */
+const batchRequestItems = (
+  entries: ReadonlyArray<TransactWriteItem>,
+): Record<string, Array<WriteRequest>> => {
+  const requestItems: Record<string, Array<WriteRequest>> = {}
+  for (const item of entries) {
+    const tableName = item.Put?.TableName ?? item.Delete?.TableName ?? ""
+    const requests = requestItems[tableName] ?? []
+    requests.push(batchRequestOf(item))
+    requestItems[tableName] = requests
+  }
+  return requestItems
+}
 
 /**
  * The key attributes an entity writes, by kind: its primary key's and each

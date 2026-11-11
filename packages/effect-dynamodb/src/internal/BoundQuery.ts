@@ -22,7 +22,7 @@ import * as Query from "../Query.js"
 import * as Capacity from "./Capacity.js"
 import type { ConditionOps, ConditionShorthand, Expr } from "./Expr.js"
 import { ExprTag, parseSimpleShorthand } from "./Expr.js"
-import type { PackedPath, Path, PathBuilder } from "./PathBuilder.js"
+import { type PackedPath, type Path, type PathBuilder, storedPath } from "./PathBuilder.js"
 
 /**
  * An expression with every attribute path's top-level field renamed to its
@@ -34,8 +34,10 @@ const renamePaths = (node: unknown, resolve: (name: string) => string): unknown 
   const record = node as { readonly _tag?: unknown; readonly segments?: unknown }
   if (record._tag === "value") return node
   if ((record._tag === "path" || record._tag === "size") && Array.isArray(record.segments)) {
-    const [head, ...rest] = record.segments as ReadonlyArray<string | number>
-    return { ...record, segments: [typeof head === "string" ? resolve(head) : head, ...rest] }
+    return {
+      ...record,
+      segments: storedPath(record.segments as ReadonlyArray<string | number>, resolve),
+    }
   }
   // Spread keeps the symbol-keyed Expr brand; string keys are walked.
   const copy: globalThis.Record<string | symbol, unknown> = { ...record }
@@ -714,7 +716,7 @@ export const collectionNaming = (
       for (const m of members) {
         for (const path of paths) {
           if (!has(m, String(path[0]))) continue
-          const renamed = [m.resolve(String(path[0])), ...path.slice(1)]
+          const renamed = storedPath(path, (head) => m.resolve(head))
           stored.set(JSON.stringify(renamed), renamed)
         }
       }
@@ -806,21 +808,19 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     ) as SkRemaining
     const { ops, targetField } = makeSkConditionOps()
     const condition = fn(skAccessor, ops as SkConditionOps<SkRemaining>)
-    const finalCondition = this._config.composeSkCondition
-      ? this._config.composeSkCondition(condition, targetField())
-      : serializeRawCondition(condition)
-    if (finalCondition === undefined) {
-      return new BoundQueryImpl<Model, never, A>(
-        Query.planEmpty(this._query),
-        this._config,
-        "where",
-      )
-    }
-    return new BoundQueryImpl<Model, never, A>(
-      Query.whereUnderPins(this._query, finalCondition),
-      this._config,
-      "where",
+    const query = Query.orRefusal(
+      this._config.operation,
+      () => {
+        const finalCondition = this._config.composeSkCondition
+          ? this._config.composeSkCondition(condition, targetField())
+          : serializeRawCondition(condition)
+        return finalCondition === undefined
+          ? Query.planEmpty(this._query)
+          : Query.whereUnderPins(this._query, finalCondition)
+      },
+      (refusal) => Query.refuse(this._query, refusal),
     )
+    return new BoundQueryImpl<Model, never, A>(query, this._config, "where")
   }
 
   // --- within ---
@@ -828,10 +828,13 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     bounds: Record<string, unknown>,
     options?: WithinOptions,
   ): BoundQueryImpl<Model, never, A> {
-    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._applied !== undefined) {
       refuseWithin(this._applied === "where" ? "within() after .where()" : "a second .within()")
     }
+    if (Query.isRefused(this._query)) {
+      return new BoundQueryImpl<Model, never, A>(this._query, this._config, "within")
+    }
+    Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     const maxSkips = options?.maxSkips
     if (maxSkips !== undefined && !(Number.isInteger(maxSkips) && maxSkips >= 0)) {
       throw new Error(
@@ -842,7 +845,11 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
     const plan = this._config.planWithin
     if (plan === undefined) refuseWithin("within() on a query without sort key composites to bound")
     return new BoundQueryImpl<Model, never, A>(
-      plan!(this._query, bounds, options),
+      Query.orRefusal(
+        this._config.operation,
+        () => plan!(this._query, bounds, options),
+        (refusal) => Query.refuse(this._query, refusal),
+      ),
       this._config,
       "within",
     )
@@ -850,6 +857,7 @@ export class BoundQueryImpl<Model, SkRemaining, A> {
 
   // --- zorder ---
   zorder(options: Query.ZOrderOptions): BoundQueryImpl<Model, SkRemaining, A> {
+    if (Query.isRefused(this._query)) return this
     Query.refuseShardedPlan(this._query as Query.Query<unknown>)
     if (this._config.zorder !== true) {
       throw new Error(

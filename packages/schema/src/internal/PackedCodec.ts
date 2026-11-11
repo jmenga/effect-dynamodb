@@ -34,7 +34,7 @@
  * {@link CompressionRegistry}.
  */
 
-import { Effect, Schema, SchemaAST } from "effect"
+import { DateTime, Effect, Schema, SchemaAST } from "effect"
 import type { CompressionRegistry } from "../Compression.js"
 import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
@@ -228,27 +228,66 @@ const isPlainObject = (value: object): boolean => {
   return proto === Object.prototype || proto === null
 }
 
-const check = (value: unknown, path: string, stack: Set<object>): void => {
+/** The marker a marshalled `DateTime` carries. */
+export const DATE_MARKER = "~effect/DateTime"
+/** The marker it carried on Effect's betas and early rcs. */
+export const BETA_DATE_MARKER = "~effect/time/DateTime"
+export const ZONE_MARKER = "~effect/DateTime/TimeZone"
+
+const isRealDate = (value: unknown): value is DateTime.DateTime =>
+  DateTime.isDateTime(value) && !isPlainObject(value)
+
+/**
+ * What a real date is stored as, packed: the map a native write stores, with its keys in the order
+ * DynamoDB Local hands that map back, which is what a date read back from one has always been packed
+ * as. `toJSON` would give ISO text, which a date's declaration refuses on read.
+ */
+const storedDate = (date: DateTime.DateTime): object => {
+  if (DateTime.isUtc(date)) {
+    return { epochMilliseconds: date.epochMilliseconds, [DATE_MARKER]: DATE_MARKER, _tag: "Utc" }
+  }
+  const zone = date.zone
+  return {
+    [DATE_MARKER]: DATE_MARKER,
+    epochMilliseconds: date.epochMilliseconds,
+    zone:
+      zone._tag === "Named"
+        ? { format: {}, id: zone.id, [ZONE_MARKER]: ZONE_MARKER, _tag: "Named" }
+        : { offset: zone.offset, [ZONE_MARKER]: ZONE_MARKER, _tag: "Offset" },
+    _tag: "Zoned",
+  }
+}
+
+/** `JSON.stringify` has called `toJSON` by the time a replacer sees a value, so this reads the holder. */
+function storingDates(this: Record<string, unknown>, key: string, value: unknown): unknown {
+  const held = this[key]
+  return isRealDate(held) ? storedDate(held) : value
+}
+
+/** Refuses what JSON can't hold, and says whether a real date is in there for {@link storingDates}. */
+const check = (value: unknown, path: string, stack: Set<object>): boolean => {
   switch (typeof value) {
     case "string":
     case "boolean":
-      return
+      return false
     case "number":
       if (!Number.isFinite(value)) throw new NotJson(path, describe(value))
-      return
+      return false
     case "object": {
-      if (value === null) return
+      if (value === null) return false
       if (stack.has(value)) throw new NotJson(path, "a circular reference")
+      let dates = false
       if (Array.isArray(value)) {
         stack.add(value)
         for (let i = 0; i < value.length; i++) {
           const element = value[i]
           if (element === undefined) throw new NotJson(`${path}[${i}]`, "undefined")
-          check(element, `${path}[${i}]`, stack)
+          if (check(element, `${path}[${i}]`, stack)) dates = true
         }
         stack.delete(value)
-        return
+        return dates
       }
+      if (isRealDate(value)) return true
       if (!isPlainObject(value) || typeof (value as { toJSON?: unknown }).toJSON === "function") {
         throw new NotJson(path, describe(value))
       }
@@ -257,10 +296,11 @@ const check = (value: unknown, path: string, stack: Set<object>): void => {
         const v = (value as Record<string, unknown>)[key]
         // Omitted by JSON.stringify, as removeUndefinedValues omits it from a map.
         if (v === undefined) continue
-        check(v, IDENTIFIER.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`, stack)
+        const at = IDENTIFIER.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`
+        if (check(v, at, stack)) dates = true
       }
       stack.delete(value)
-      return
+      return dates
     }
     default:
       throw new NotJson(path, describe(value))
@@ -272,14 +312,14 @@ const check = (value: unknown, path: string, stack: Set<object>): void => {
  * bigint, binary (`Uint8Array`, `ArrayBuffer`, typed arrays), `Set`, `Map`,
  * `Date`, any other non-plain object (including one with `toJSON`), non-finite
  * numbers, `undefined` array elements, symbols, functions and cycles.
- * `undefined` object properties are omitted.
+ * `undefined` object properties are omitted. A real `DateTime` is the exception:
+ * it's written in its stored form (see {@link storedDate}), as a date read back
+ * from storage has always been.
  *
  * @throws an `Error` naming the path (rooted at `root`) and the JS type.
  */
-export const stringifyStrict = (value: unknown, root = "value"): string => {
-  check(value, root, new Set())
-  return JSON.stringify(value)
-}
+export const stringifyStrict = (value: unknown, root = "value"): string =>
+  check(value, root, new Set()) ? JSON.stringify(value, storingDates) : JSON.stringify(value)
 
 // ---------------------------------------------------------------------------
 // Pack / unpack

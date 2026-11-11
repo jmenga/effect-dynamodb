@@ -1,0 +1,3434 @@
+{
+ "generatedFrom": "effect-dynamodb@1.39.0",
+ "note": "Captured once from published effect-dynamodb 1.39.0 on DynamoDB Local. Never regenerate it.",
+ "shapes": {
+  "prefix": {
+   "off": {
+    "create": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "x:Mi X"
+            },
+            "title": {
+             "S": "t1"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 1"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 1"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 2"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 2"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "label": {
+             "S": "p"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "Part"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#part#side#0000000000000001"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:D 1"
+            },
+            "qty": {
+             "N": "3"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "PartLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 1"
+       },
+       "code": {
+        "S": "x:C 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi x"
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 1"
+       },
+       "code": {
+        "S": "x:C 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi x"
+         }
+        }
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "x:Mi X"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 2"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 2"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 3"
+            },
+            "qty": {
+             "N": "9"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 3"
+            }
+           }
+          }
+         },
+         {
+          "Delete": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 1"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 3"
+       },
+       "code": {
+        "S": "x:C 3"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get after update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi x"
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 3"
+       },
+       "code": {
+        "S": "x:C 3"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi x"
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "delete": {
+     "result": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi x"
+         }
+        }
+       }
+      },
+      {
+       "op": "batchWriteItem",
+       "input": {
+        "RequestItems": {
+         "<table>": [
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#part#side#0000000000000001"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheet"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c 2"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c 3"
+             }
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     ],
+     "rows": []
+    },
+    "get after delete": {
+     "result": {
+      "failed": "AggregateAssemblyError",
+      "message": ""
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi x"
+         }
+        }
+       }
+      }
+     ],
+     "rows": []
+    }
+   },
+   "on": {
+    "create": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "x:Mi X"
+            },
+            "title": {
+             "S": "t1"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 1"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%201"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 2"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%202"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "label": {
+             "S": "p"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "Part"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#part#side#0000000000000001"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:D 1"
+            },
+            "qty": {
+             "N": "3"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "PartLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%201"
+       },
+       "code": {
+        "S": "x:C 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi%20x"
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%201"
+       },
+       "code": {
+        "S": "x:C 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi%20x"
+         }
+        }
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "x:Mi X"
+            },
+            "title": {
+             "S": "t2"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 2"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%202"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "x:C 3"
+            },
+            "qty": {
+             "N": "9"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%203"
+            }
+           }
+          }
+         },
+         {
+          "Delete": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$aggcodec#v1#sheet#x:mi%20x"
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%201"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%203"
+       },
+       "code": {
+        "S": "x:C 3"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get after update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi%20x"
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "x:D 1"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "x:Mi X"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "x:C 2"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%203"
+       },
+       "code": {
+        "S": "x:C 3"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#x:mi%20x"
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "delete": {
+     "result": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi%20x"
+         }
+        }
+       }
+      },
+      {
+       "op": "batchWriteItem",
+       "input": {
+        "RequestItems": {
+         "<table>": [
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi%20x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#part#side#0000000000000001"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi%20x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi%20x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheet"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi%20x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c%202"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#x:mi%20x"
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c%203"
+             }
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     ],
+     "rows": []
+    },
+    "get after delete": {
+     "result": {
+      "failed": "AggregateAssemblyError",
+      "message": ""
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#x:mi%20x"
+         }
+        }
+       }
+      }
+     ],
+     "rows": []
+    }
+   }
+  },
+  "base64": {
+   "off": {
+    "create": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "TWkgWA=="
+            },
+            "title": {
+             "S": "t1"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAx"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 1"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAy"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 2"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "label": {
+             "S": "p"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "Part"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#part#side#0000000000000001"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "RCAx"
+            },
+            "qty": {
+             "N": "3"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "PartLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 1"
+       },
+       "code": {
+        "S": "QyAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 1"
+       },
+       "code": {
+        "S": "QyAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "TWkgWA=="
+            },
+            "title": {
+             "S": "t2"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAy"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 2"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAz"
+            },
+            "qty": {
+             "N": "9"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 3"
+            }
+           }
+          }
+         },
+         {
+          "Delete": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c 1"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 3"
+       },
+       "code": {
+        "S": "QyAz"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get after update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 2"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c 3"
+       },
+       "code": {
+        "S": "QyAz"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "delete": {
+     "result": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      },
+      {
+       "op": "batchWriteItem",
+       "input": {
+        "RequestItems": {
+         "<table>": [
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#part#side#0000000000000001"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#partline#side#0000000000000001#d 1"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheet"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c 2"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c 3"
+             }
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     ],
+     "rows": []
+    },
+    "get after delete": {
+     "result": {
+      "failed": "AggregateAssemblyError",
+      "message": ""
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      }
+     ],
+     "rows": []
+    }
+   },
+   "on": {
+    "create": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "TWkgWA=="
+            },
+            "title": {
+             "S": "t1"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAx"
+            },
+            "qty": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%201"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAy"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%202"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "label": {
+             "S": "p"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "Part"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#part#side#0000000000000001"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "RCAx"
+            },
+            "qty": {
+             "N": "3"
+            },
+            "side": {
+             "N": "1"
+            },
+            "__edd_e__": {
+             "S": "PartLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%201"
+       },
+       "code": {
+        "S": "QyAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t1",
+       "lines": [
+        {
+         "code": "C 1",
+         "qty": 1
+        },
+        {
+         "code": "C 2",
+         "qty": 2
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t1"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%201"
+       },
+       "code": {
+        "S": "QyAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "1"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      },
+      {
+       "op": "transactWriteItems",
+       "input": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "sheetId": {
+             "S": "TWkgWA=="
+            },
+            "title": {
+             "S": "t2"
+            },
+            "__edd_e__": {
+             "S": "Sheet"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheet"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAy"
+            },
+            "qty": {
+             "N": "2"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%202"
+            }
+           }
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "code": {
+             "S": "QyAz"
+            },
+            "qty": {
+             "N": "9"
+            },
+            "__edd_e__": {
+             "S": "SheetLine"
+            },
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%203"
+            }
+           }
+          }
+         },
+         {
+          "Delete": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$aggcodec#v1#sheet#twkgwa=="
+            },
+            "sk": {
+             "S": "$aggcodec#v1#sheetline#c%201"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%203"
+       },
+       "code": {
+        "S": "QyAz"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "get after update": {
+     "result": {
+      "ok": {
+       "sheetId": "Mi X",
+       "title": "t2",
+       "lines": [
+        {
+         "code": "C 2",
+         "qty": 2
+        },
+        {
+         "code": "C 3",
+         "qty": 9
+        }
+       ],
+       "part": {
+        "label": "p",
+        "lines": [
+         {
+          "code": "D 1",
+          "qty": 3
+         }
+        ]
+       }
+      }
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      }
+     ],
+     "rows": [
+      {
+       "sk": {
+        "S": "$aggcodec#v1#part#side#0000000000000001"
+       },
+       "side": {
+        "N": "1"
+       },
+       "label": {
+        "S": "p"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "__edd_e__": {
+        "S": "Part"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+       },
+       "side": {
+        "N": "1"
+       },
+       "code": {
+        "S": "RCAx"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "3"
+       },
+       "__edd_e__": {
+        "S": "PartLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheet"
+       },
+       "sheetId": {
+        "S": "TWkgWA=="
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "title": {
+        "S": "t2"
+       },
+       "__edd_e__": {
+        "S": "Sheet"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%202"
+       },
+       "code": {
+        "S": "QyAy"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "2"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      },
+      {
+       "sk": {
+        "S": "$aggcodec#v1#sheetline#c%203"
+       },
+       "code": {
+        "S": "QyAz"
+       },
+       "pk": {
+        "S": "$aggcodec#v1#sheet#twkgwa=="
+       },
+       "qty": {
+        "N": "9"
+       },
+       "__edd_e__": {
+        "S": "SheetLine"
+       }
+      }
+     ]
+    },
+    "delete": {
+     "result": {
+      "ok": null
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      },
+      {
+       "op": "batchWriteItem",
+       "input": {
+        "RequestItems": {
+         "<table>": [
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#part#side#0000000000000001"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#partline#side#0000000000000001#d%201"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheet"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c%202"
+             }
+            }
+           }
+          },
+          {
+           "DeleteRequest": {
+            "Key": {
+             "pk": {
+              "S": "$aggcodec#v1#sheet#twkgwa=="
+             },
+             "sk": {
+              "S": "$aggcodec#v1#sheetline#c%203"
+             }
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     ],
+     "rows": []
+    },
+    "get after delete": {
+     "result": {
+      "failed": "AggregateAssemblyError",
+      "message": ""
+     },
+     "requests": [
+      {
+       "op": "query",
+       "input": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk",
+        "ExpressionAttributeNames": {
+         "#pk": "pk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$aggcodec#v1#sheet#twkgwa=="
+         }
+        }
+       }
+      }
+     ],
+     "rows": []
+    }
+   }
+  }
+ }
+}

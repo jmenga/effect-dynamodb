@@ -66,8 +66,13 @@ const RECORD_TAKING = [
   "composeGsiKeysForUpdatePolicyAware",
   "composeVectorPartition",
   "tryComposeVectorPartition",
+  "judgeIndexHalf",
   "extractComposites",
   "tryExtractComposites",
+  "composeReadPartitions",
+  "composeStoredPk",
+  "composeKnownHalves",
+  "composeSkPrefixUpTo",
 ] as const
 
 /** The `KeyText136` function taking a record: `rekey` composing a key at another text. */
@@ -139,8 +144,89 @@ describe("key-form invariant — Entity.ts normaliser shape", () => {
 
   it("no call site reaches for the raw composite codec directly", () => {
     // `makeCompositeKeyForm` / `toCompositeKeyRecord` are plumbing for the two
-    // normalisers above; using them anywhere else re-opens the bypass.
-    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBeLessThanOrEqual(2)
-    expect(src.match(/toCompositeKeyRecord\(/g)?.length ?? 0).toBeLessThanOrEqual(2)
+    // normalisers above, and for `keyForm139`, the key form 1.39.0 composed,
+    // which only `rekey` composes; using them anywhere else re-opens the bypass.
+    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBeLessThanOrEqual(3)
+    expect(src.match(/toCompositeKeyRecord\(/g)?.length ?? 0).toBeLessThanOrEqual(3)
+    expect(src.match(/text139: true/g)?.length ?? 0).toBe(1)
+  })
+
+  it("only rekey composes 1.39.0's key form, to find the rows it stored", () => {
+    expect(src.match(/keyForm139\(/g)?.length ?? 0).toBe(1)
+    const rowKeyForms = src.slice(src.indexOf("const rowKeyForms = ("))
+    expect(rowKeyForms.slice(0, rowKeyForms.indexOf("\n  }\n"))).toMatch(/keyForm139\(/)
+  })
+})
+
+/**
+ * A key composed from values a CALLER gives (an accessor's composites, a `.where()` / `.within()`
+ * bound, a collection's, vector index's or geo search's partition, a multi-item op's key, a query
+ * builder's key) is the key `put` wrote for them: the key form of the value `put` stores
+ * (`makeCompositeDomainKeyForm`, `Entity._domainKeyForm`). The plain key form takes a value as it is
+ * stored; given a domain value whose codec `encode` takes its own output, it composes a key no `put`
+ * writes, and up to 1.39.0 every one of these paths did, finding nothing.
+ */
+describe("key-form invariant — a caller's values compose the key put wrote", () => {
+  const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8")
+
+  it("collections compose through the domain key form", () => {
+    const src = read("../src/Collection.ts")
+    expect(src).not.toMatch(/makeCompositeKeyForm\(/)
+    expect(src).toMatch(/makeCompositeDomainKeyForm\(/)
+  })
+
+  it("accessors, bounds, collections and vector partitions compose through the domain key form", () => {
+    const src = read("../src/DynamoClient.ts")
+    // The accessor's plain form reads stored values (row checks, a dimension's filter) only.
+    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBe(1)
+    expect(src).not.toMatch(/toCompositeKeyRecord\(compositeKeyForm/)
+    expect(src).not.toMatch(/mapBound\([^)]*compositeKeyForm\(/)
+    expect(src).toMatch(/toCompositeKeyRecord\(domainKeyForm, rawComposites\)/)
+  })
+
+  it("geo search composes through the domain key form", () => {
+    expect(read("../../effect-dynamodb-geo/src/GeoSearch.ts")).not.toMatch(/\._keyForm\(/)
+  })
+
+  it("a multi-item op's key composes through the domain key form", () => {
+    const src = read("../src/internal/TransactableOps.ts")
+    const body = src.slice(src.indexOf("export const composePrimaryKeyOrFail"))
+    expect(body.slice(0, body.indexOf("\n}\n"))).toMatch(/_domainKeyForm\(/)
+  })
+
+  it("a projection keys its row, tombstone and outbox items as the read model's put keys the row", () => {
+    const ops = read("../src/internal/TransactableOps.ts")
+    const body = ops.slice(ops.indexOf("export const composePrimaryKey ="))
+    expect(body.slice(0, body.indexOf("\n\n"))).toMatch(/_domainKeyForm\(/)
+    const src = read("../src/internal/ProjectionEngine.ts")
+    expect(src).not.toMatch(/_keyForm\(/)
+    const entity = read("../src/Entity.ts")
+    const mark = entity.slice(entity.indexOf("    _keyTextMark: ("))
+    expect(mark.slice(0, mark.indexOf("\n    ),\n"))).toMatch(/domainKeyForm\(key\)/)
+  })
+
+  it("the entity's query builders compose a caller's key through the domain key form", () => {
+    const src = read("../src/Entity.ts")
+    expect(src).not.toMatch(/keyFormFor\(entityInternals, key/)
+    // A history `.where()` bound on the orderBy: encoded as `append` encodes it (`encodeOrderBy`),
+    // then put into key form, as `append` composes the event's key from what it stores.
+    expect(src).toMatch(/entity\._keyForm\(\{ \[orderBy\]: encodeOrderBy\(v\) \}\)/)
+    expect(src).toMatch(/const encoded = encodeOrderBy\(v\)/)
+    expect(src).toMatch(/entity\._keyForm\(\{ \[orderBy\]: encoded \}\)/)
+  })
+})
+
+/**
+ * An aggregate's keys are its own: `create`, `get`, `list` and `rekey` compose them all through one
+ * key form, from domain values, so no other path missed what it wrote on 1.39.0. It keeps 1.39.0's
+ * form, a codec `encode` takes on its own output encoded once, and every byte with it.
+ */
+describe("key-form invariant — an aggregate keys as 1.39.0 did", () => {
+  it("its one key form is 1.39.0's", () => {
+    const src = readFileSync(fileURLToPath(new URL("../src/Aggregate.ts", import.meta.url)), "utf8")
+    expect(src.match(/makeCompositeKeyForm\(/g)?.length ?? 0).toBe(1)
+    expect(src).not.toMatch(/makeCompositeDomainKeyForm\(/)
+    const form = src.slice(src.indexOf("const compositeKeyForm = makeCompositeKeyForm("))
+    expect(form.slice(0, form.indexOf("\n  )\n"))).toMatch(/\{ text139: true \}/)
   })
 })

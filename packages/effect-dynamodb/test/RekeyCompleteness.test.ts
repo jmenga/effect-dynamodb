@@ -9,8 +9,9 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
+import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -18,6 +19,7 @@ import * as EventStore from "../src/EventStore.js"
 import { toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import * as RekeyChains from "./helpers/RekeyChains.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 
 class Stop extends Schema.Class<Stop>("Stop")({
@@ -353,126 +355,30 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
   })
 })
 
-describe.each(SETTINGS)("a dry run follows the chain, %s", (_direction, escapeKeys) => {
-  const w = world(escapeKeys)
-  const other = world(!escapeKeys)
-  const { moving, holder } = chainOf(escapeKeys)
-  const logged = [new Logged({ note: "n" })]
-
-  it.effect("a sentinel's key held by one that can't move: neither moves", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.entities.Accounts.put({ id: "a", email: moving }).asEffect()
-        yield* db.entities.Accounts.put({ id: "b", email: holder }).asEffect()
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      // A duplicate of the holder's value, landed before `rekey`: its sentinel's current key is taken.
-      yield* db.entities.Accounts.put({ id: "c", email: holder }).asEffect()
-      const before = keysOf(table)
-      const { dry, real } = yield* dryThenReal(db)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(real.sentinelsMoved).toBe(0)
-      expect(real.conflicts.map((conflict) => conflict.reason)).toEqual(["taken", "taken"])
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
-
-  it.effect("a sentinel's key held by one that can move: both move", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.entities.Accounts.put({ id: "a", email: moving }).asEffect()
-        yield* db.entities.Accounts.put({ id: "b", email: holder }).asEffect()
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      const { dry, real } = yield* dryThenReal(db)
-      expect(real.conflicts).toEqual([])
-      expect(real.sentinelsMoved).toBe(2)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-    }).pipe(on(w, table))
-  })
-
-  it.effect("a stream's partition held by one that can't move: neither moves", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        yield* other.Logs.append({ id: moving }, logged, 0)
-        yield* other.Logs.append({ id: holder }, logged, 0)
-      }).pipe(on(other, table))
-      // Rows of no stream we know, where the holder belongs.
-      const known = new Set(table.items.keys())
-      yield* w.Logs.append({ id: holder }, logged, 0)
-      for (const [stored, item] of [...table.items.entries()]) {
-        if (!known.has(stored)) table.items.set(stored, { ...item, streamId: { S: "zzz" } })
-      }
-      const db = yield* w.client
-      const before = keysOf(table)
-      const { dry, real } = yield* dryThenReal(db, { streams: [w.Logs] })
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(real.moved.stream).toBe(0)
-      expect(real.conflicts.map((conflict) => conflict.reason).sort()).toEqual([
-        "bothKeys",
-        "taken",
-      ])
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
-
-  it.effect("a stream's partition held by one that can move: both move", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        yield* other.Logs.append({ id: moving }, logged, 0)
-        yield* other.Logs.append({ id: holder }, logged, 0)
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      const { dry, real } = yield* dryThenReal(db, { streams: [w.Logs] })
-      expect(real.conflicts).toEqual([])
-      expect(real.moved.stream).toBe(2)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-    }).pipe(on(w, table))
-  })
-
-  it.effect("an aggregate's partition held by one that can't move: neither moves", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.aggregates.Routes.create({ id: moving, name: "n", stops: [] })
-        yield* db.aggregates.Routes.create({ id: holder, name: "n", stops: [] })
-      }).pipe(on(other, table))
-      // It can't be assembled, so it can't be moved.
-      const held = [...table.items.entries()].find(([, item]) => item.id?.S === holder)!
-      const { name: _name, ...undecodable } = held[1]
-      table.items.set(held[0], undecodable)
-      const db = yield* w.client
-      const before = keysOf(table)
-      const { dry, real } = yield* dryThenReal(db)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect(real.moved.aggregate).toBe(0)
-      expect(real.conflicts.map((conflict) => conflict.reason).sort()).toEqual(["failed", "taken"])
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
-
-  it.effect("an aggregate's partition held by one that can move: both move", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      yield* Effect.gen(function* () {
-        const db = yield* other.client
-        yield* db.aggregates.Routes.create({ id: moving, name: "n", stops: [] })
-        yield* db.aggregates.Routes.create({ id: holder, name: "n", stops: [] })
-      }).pipe(on(other, table))
-      const db = yield* w.client
-      const { dry, real } = yield* dryThenReal(db)
-      expect(real.conflicts).toEqual([])
-      expect(real.moved.aggregate).toBe(2)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-    }).pipe(on(w, table))
-  })
+describe("a dry run follows the chain", () => {
+  // The same scenarios run on DynamoDB Local (`connected.rekey-chains.test.ts`), where both scan
+  // orders are met. A table here scans in key order.
+  const harness: RekeyChains.Harness = {
+    on: (chainWorld, body) => {
+      const table = tableOf()
+      const provideOn = (member: RekeyChains.ChainWorld) =>
+        Layer.merge(table.layer, member.MainTable.layer({ name: "t" }))
+      return body({
+        seed: (row) => Effect.sync(() => store(table, row)),
+        remove: (row) =>
+          Effect.sync(() => {
+            table.items.delete(`${row.pk!.S}|${row.sk!.S}`)
+          }),
+        rows: () => Effect.sync(() => [...table.items.values()]),
+        as: (member, effect) => effect.pipe(Effect.provide(provideOn(member))) as never,
+      }).pipe(Effect.provide(provideOn(chainWorld))) as never
+    },
+  }
+  for (const scenario of RekeyChains.chainScenarios) {
+    it.effect(scenario.name, () =>
+      Effect.asVoid(scenario.run(harness, RekeyChains.chainOf(scenario.escapeKeys), 1)),
+    )
+  }
 })
 
 describe.each(SETTINGS)("a value landing on another's old rows, %s", (_direction, escapeKeys) => {
@@ -503,38 +409,130 @@ describe.each(SETTINGS)("a value landing on another's old rows, %s", (_direction
 })
 
 describe("a NaN in a key", () => {
-  // `NaN` has 1.36's text under off, as it always did, and no key text at all under on.
-  const values = { id: "a", level: Number.NaN }
-  const stored = (schema: DynamoSchema.DynamoSchema, index: KeyComposer.IndexDefinition) => ({
-    [index.pk.field]: KeyComposer.composePk(schema, "Reading", index, values),
-    [index.sk.field]: KeyComposer.composeSk(schema, "Reading", 1, index, values),
-  })
-
-  it.effect("off: the row is where off composes it, and nothing moves", () => {
-    const w = world(false)
-    const table = tableOf()
-    seed(table, {
-      id: "a",
-      level: "NaN",
-      ...stored(w.schema, w.Readings.indexes.primary),
-      ...stored(w.schema, w.Readings.indexes.byLevel),
-      __edd_e__: "Reading",
+  // Only a `NumberFromString` holds a `NaN` (a `Schema.Number` never reached the table), under
+  // 1.36's text. With `escapeKeys` off that is still its key, as up to 1.39.0: the row is where the
+  // entity composes it, and nothing moves. With it on `NaN` has no key text, so there's no text to
+  // move the row to, and it's reported.
+  const nanWorld = (escapeKeys: boolean) => {
+    const schema = DynamoSchema.make({ name: "nanrows", version: 1, escapeKeys })
+    const Keyed = Entity.make({
+      model: Schema.Struct({ id: Schema.String, level: Schema.NumberFromString }),
+      entityType: "Keyed",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: ["level"] },
+      },
     })
-    return Effect.gen(function* () {
-      const db = yield* w.client
-      const before = [...table.items.values()]
-      const report = yield* db.tables.MainTable.rekey()
-      expect(report.moved.item).toBe(0)
-      expect(report.indexKeysRewritten).toBe(0)
-      expect([...table.items.values()]).toEqual(before)
-    }).pipe(on(w, table))
-  })
+    const Indexed = Entity.make({
+      model: Schema.Struct({ id: Schema.String, level: Schema.NumberFromString }),
+      entityType: "Indexed",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+      indexes: {
+        byLevel: {
+          name: "gsi1",
+          pk: { field: "gsi1pk", composite: ["id"] },
+          sk: { field: "gsi1sk", composite: ["level"] },
+        },
+      },
+    })
+    const entities = { Keyed, Indexed }
+    const MainTable = Table.make({ schema, entities })
+    return {
+      schema,
+      Indexed,
+      MainTable,
+      client: DynamoClient.make({ entities, tables: { MainTable } }),
+    }
+  }
+  const values = { id: "a", level: Number.NaN }
 
-  it("on: its text is refused, so a write can't store one", () => {
-    const w = world(true)
-    expect(() =>
-      KeyComposer.composeSk(w.schema, "Reading", 1, w.Readings.indexes.byLevel, values),
-    ).toThrow(/EDD-9096/)
+  describe.each(SETTINGS)("%s", (_d, escapeKeys) => {
+    const seeded = (w: ReturnType<typeof nanWorld>) => {
+      const table = tableOf()
+      const old = KeyText136.schema136(w.schema)
+      seed(table, {
+        pk: "$nanrows#v1#keyed#id_a",
+        sk: "$nanrows#v1#keyed#level_0000000000000nan",
+        id: "a",
+        level: "NaN",
+        __edd_e__: "Keyed",
+      })
+      const index = w.Indexed.indexes.byLevel
+      seed(table, {
+        pk: "$nanrows#v1#indexed#id_b",
+        sk: "$nanrows#v1#indexed",
+        gsi1pk: KeyComposer.composePk(old, "Indexed", index, { ...values, id: "b" }),
+        gsi1sk: KeyComposer.composeSk(old, "Indexed", 1, index, { ...values, id: "b" }),
+        id: "b",
+        level: "NaN",
+        __edd_e__: "Indexed",
+      })
+      return table
+    }
+    const provide = <A, E>(
+      w: ReturnType<typeof nanWorld>,
+      table: ReturnType<typeof tableOf>,
+      effect: Effect.Effect<A, E, any>,
+    ) =>
+      effect.pipe(
+        Effect.provide(Layer.merge(table.layer, w.MainTable.layer({ name: "t" }))),
+      ) as Effect.Effect<A, E>
+
+    it.each([
+      ["a plain run", {}],
+      ["a repair", { repairIndexKeys: true }],
+    ])(`%s ${escapeKeys ? "reports what it can't place and" : "finds the rows in place and"} leaves the rows`, (_name, options) => {
+      const w = nanWorld(escapeKeys)
+      const table = seeded(w)
+      return Effect.runPromise(
+        provide(
+          w,
+          table,
+          Effect.gen(function* () {
+            const db: any = yield* w.client
+            const before = [...table.items.values()]
+            const report = yield* db.tables.MainTable.rekey(options)
+            // On: the row whose own key holds it is reported, as a row it couldn't move; the row
+            // whose index key does has no difference to judge. Off: both are where they belong.
+            expect(report.conflicts).toEqual(
+              escapeKeys
+                ? [
+                    {
+                      member: "Keyed",
+                      kind: "item",
+                      reason: "uncomposable",
+                      key: {
+                        pk: "$nanrows#v1#keyed#id_a",
+                        sk: "$nanrows#v1#keyed#level_0000000000000nan",
+                      },
+                      target: undefined,
+                      message: expect.stringMatching(/^Its values compose no key: \[EDD-9096\]/),
+                    },
+                  ]
+                : [],
+            )
+            expect(report.byMember.Keyed?.conflicts ?? 0).toBe(escapeKeys ? 1 : 0)
+            expect(report.skipped.unrecognizedKey).toBe(0)
+            expect(report.unchanged).toBe(escapeKeys ? 1 : 2)
+            expect(report.moved.item).toBe(0)
+            expect(report.indexKeysRewritten).toBe(0)
+            expect(report.indexKeys.lagging).toBe(0)
+            expect(report.indexKeys.repaired).toBe(0)
+            expect([...table.items.values()]).toEqual(before)
+          }),
+        ),
+      )
+    })
+
+    it("a number's own NaN composes no key, whatever the setting", () => {
+      const w = nanWorld(escapeKeys)
+      expect(() =>
+        KeyComposer.composeSk(w.schema, "Indexed", 1, w.Indexed.indexes.byLevel, values),
+      ).toThrow(/EDD-9096/)
+    })
   })
 })
 
@@ -680,6 +678,154 @@ describe.each(SETTINGS)("an aggregate's move, %s", (_direction, escapeKeys) => {
     },
   )
 
+  // A run cut short left the edges at the current key with the root still at the old one, and the
+  // scan meets the edges first. The value decides the order: a table scans in key order here.
+  const edgesFirst = escapeKeys ? "%z" : "r 1"
+  const bounded = {
+    ...route,
+    id: edgesFirst,
+  }
+  /** The bounded run's rows: edges where the move put them, root where it was. */
+  const halfMoved = (table: ReturnType<typeof tableOf>, id = edgesFirst) => {
+    const pkFor = (schema: DynamoSchema.DynamoSchema) =>
+      DynamoSchema.composeCollectionKey(schema, "routes", [
+        KeyComposer.keyText(schema, id, "lowercase"),
+      ])
+    const entry = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+    table.items.delete(entry[0])
+    store(table, { ...entry[1], pk: { S: pkFor(old) } })
+    const rows = [...table.items.values()].map((row) => row.pk?.S).sort()
+    expect(rows[0]).toBe(pkFor(id === edgesFirst ? w.schema : old))
+    expect(rows.at(-1)).toBe(pkFor(id === edgesFirst ? old : w.schema))
+  }
+
+  it.effect("a run that stopped before the root says nothing of the edges it met", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        maxPages: 1,
+      })
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        pageSize: 1,
+        maxPages: 1,
+      })
+      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+      expect(report.scanned).toBe(1)
+      expect(report.resume._tag).toBe("Some")
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(report.skipped.rootNotSeen).toBe(1)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run over the whole table judges them, with no read for a rooted edge", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+      })
+      expect(dry.skipped.unrecognizedKey).toBe(0)
+      expect(dry.skipped.rootNotSeen).toBe(0)
+      const report: Table.RekeyReport = yield* db.tables.MainTable.rekey({ pageSize: 1 })
+      expect(report.skipped.unrecognizedKey).toBe(0)
+      expect(report.skipped.rootNotSeen).toBe(0)
+      expect(report.moved.aggregate).toBe(1)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run resumed part way can't judge them either, whichever page held the root", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      halfMoved(table)
+      // A dry run moves nothing, so what it learned of the root on an earlier page is gone.
+      const pages: Array<Table.RekeyReport> = []
+      let resume: string | undefined
+      do {
+        const page: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+          dryRun: true,
+          pageSize: 1,
+          maxPages: 1,
+          ...(resume === undefined ? {} : { resume }),
+        })
+        pages.push(page)
+        resume = page.resume._tag === "Some" ? page.resume.value : undefined
+      } while (resume !== undefined)
+      expect(pages.length).toBeGreaterThan(1)
+      expect(pages.map((page) => page.skipped.unrecognizedKey)).toEqual(pages.map(() => 0))
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a run resumed to the end of the table didn't read what came before its token", () => {
+    const table = tableOf()
+    // The other order: the root's old key sorts first, so an earlier page held it.
+    const rootFirst = escapeKeys ? "r 1" : "%z"
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create({ ...route, id: rootFirst })
+      halfMoved(table, rootFirst)
+      const first: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        maxPages: 1,
+      })
+      expect(first.scanned).toBe(1)
+      const rest: Table.RekeyReport = yield* db.tables.MainTable.rekey({
+        dryRun: true,
+        pageSize: 1,
+        resume: Option.getOrThrow(first.resume),
+      })
+      expect(rest.resume._tag).toBe("None")
+      expect(rest.skipped.unrecognizedKey).toBe(0)
+      expect(rest.skipped.rootNotSeen).toBe(2)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("a real orphan stays unjudged in a bounded run and is counted over the table", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      const root = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+      table.items.delete(root[0])
+      const part: Table.RekeyReport = yield* db.tables.MainTable.rekey({ pageSize: 1, maxPages: 1 })
+      expect(part.skipped.unrecognizedKey).toBe(0)
+      expect(part.skipped.rootNotSeen).toBe(1)
+      const whole: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      expect(whole.skipped.unrecognizedKey).toBe(2)
+      expect(whole.skipped.rootNotSeen).toBe(0)
+    }).pipe(on(w, table))
+  })
+
+  it.effect("the fix adds no read to a run over the whole table", () => {
+    const table = tableOf()
+    return Effect.gen(function* () {
+      const db = yield* w.client
+      yield* db.aggregates.Routes.create(bounded)
+      const root = [...table.items.entries()].find(([, item]) => item.__edd_e__?.S === "RouteItem")!
+      table.items.delete(root[0])
+      table.take()
+      yield* db.tables.MainTable.rekey()
+      // Two edges: the root's read for each as the scan meets it, and each edge read again after.
+      expect(table.take().map((request) => request.command)).toEqual([
+        "Scan",
+        "GetItem",
+        "GetItem",
+        "GetItem",
+        "GetItem",
+      ])
+    }).pipe(on(w, table))
+  })
+
   it.effect("segments meeting one aggregate move it once, and edges wait for the move", () => {
     const table = tableOf()
     return Effect.gen(function* () {
@@ -724,5 +870,184 @@ describe.each(SETTINGS)("a Z-order index's text, %s", (_direction, escapeKeys) =
       expect(Array.from(row!.gsi2sk!.B as Uint8Array)).toEqual(Array.from(current))
       expect((yield* db.tables.MainTable.rekey()).indexKeysRewritten).toBe(0)
     }).pipe(on(w, table))
+  })
+})
+
+describe("a failed aggregate's conflict says what went wrong", () => {
+  // Created keyed by `lid`, then read by a declaration keying the edge by `note`, which both lines
+  // share: decomposing the value read composes one sort key twice. A tagged error's own message is
+  // empty, so the conflict gives its reason.
+  const Line = Schema.Struct({ lid: Schema.String, note: Schema.String })
+  const Order = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+  const schema = DynamoSchema.make({ name: "failed", version: 1 })
+  const MainTable = Table.make({ schema, entities: {} })
+  const orders = (sk: "lid" | "note") =>
+    Aggregate.make(Order, {
+      table: MainTable,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "orders" },
+      root: { entityType: "Order" },
+      edges: { lines: Aggregate.many({ entityType: "Line", sk: { composite: [sk] } }) },
+    })
+
+  it.effect("a decomposition error's reason, in the dry run too", () => {
+    const table = tableOf()
+    const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" }))),
+      ) as Effect.Effect<A, E>
+    return Effect.gen(function* () {
+      const created = yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Orders: orders("lid") },
+        tables: { MainTable },
+      })
+      yield* created.aggregates.Orders.create({
+        id: "o",
+        lines: [
+          { lid: "a", note: "same" },
+          { lid: "b", note: "same" },
+        ],
+      })
+      const before = keysOf(table)
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Orders: orders("note") },
+        tables: { MainTable },
+      })
+      const { dry, real } = yield* dryThenReal(db)
+      for (const report of [dry, real]) {
+        expect(report.conflicts.map((conflict) => [conflict.reason, conflict.message])).toEqual([
+          [
+            "failed",
+            'AggregateDecompositionError: "lines" and "lines" both compose the sort key ' +
+              '"$failed#v1#line#same", so one would overwrite the other. Give the "lines" edge a ' +
+              "declared sort key naming attributes that differ between its elements: lines: " +
+              "Aggregate.many({ …, sk: { composite: [...] } }).",
+          ],
+        ])
+      }
+      expect(keysOf(table)).toEqual(before)
+    }).pipe(provide)
+  })
+
+  // One line is stored where the new declaration keys both: a row under the key's text, and a
+  // second element composing it whose row isn't. Two elements, not one element's rows under two
+  // keys, so it's the decomposition error, as for the lines stored elsewhere.
+  it.effect("a decomposition error's reason when one element's row is at the key", () => {
+    const table = tableOf()
+    const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      effect.pipe(
+        Effect.provide(Layer.merge(table.layer, MainTable.layer({ name: "t" }))),
+      ) as Effect.Effect<A, E>
+    return Effect.gen(function* () {
+      const created = yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Orders: orders("lid") },
+        tables: { MainTable },
+      })
+      yield* created.aggregates.Orders.create({
+        id: "o",
+        lines: [
+          { lid: "same", note: "same" },
+          { lid: "b", note: "same" },
+        ],
+      })
+      const before = keysOf(table)
+      const db = yield* DynamoClient.make({
+        entities: {},
+        aggregates: { Orders: orders("note") },
+        tables: { MainTable },
+      })
+      const { dry, real } = yield* dryThenReal(db)
+      for (const report of [dry, real]) {
+        expect(report.conflicts.map((conflict) => [conflict.reason, conflict.message])).toEqual([
+          [
+            "failed",
+            'AggregateDecompositionError: "lines" and "lines" both compose the sort key ' +
+              '"$failed#v1#line#same", so one would overwrite the other. Give the "lines" edge a ' +
+              "declared sort key naming attributes that differ between its elements: lines: " +
+              "Aggregate.many({ …, sk: { composite: [...] } }).",
+          ],
+        ])
+      }
+      expect(keysOf(table)).toEqual(before)
+    }).pipe(provide)
+  })
+})
+
+/**
+ * An aggregate whose edge rows are also an entity member's type: the entity can't read their keys
+ * back, the aggregate moves them. Each row is counted once, by the aggregate; before, the entity
+ * counted the edges `unrecognizedKey` as well, so the report's totals came to more than `scanned`.
+ */
+describe.each(
+  SETTINGS,
+)("rows one member moves and another can't read back, %s", (_d, escapeKeys) => {
+  const sharedType = (escape: boolean) => {
+    const schema = DynamoSchema.make({ name: "complete", version: 1, escapeKeys: escape })
+    const Stops = Entity.make({
+      model: Stop,
+      entityType: "RouteStop",
+      primaryKey: {
+        pk: { field: "pk", composite: ["label"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const MainTable = Table.make({ schema, entities: { Stops } })
+    const Routes = Aggregate.make(Route, {
+      table: MainTable,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "routes" },
+      root: { entityType: "RouteItem" },
+      edges: {
+        stops: Aggregate.many({ entityType: "RouteStop", sk: { composite: ["label"] } }),
+      },
+    })
+    const client = DynamoClient.make({
+      entities: { Stops },
+      aggregates: { Routes },
+      tables: { MainTable },
+    })
+    return { MainTable, client }
+  }
+
+  it.effect("are counted once, by the member that moves them", () => {
+    const table = tableOf()
+    const written = sharedType(!escapeKeys)
+    const now = sharedType(escapeKeys)
+    return Effect.gen(function* () {
+      const before = yield* written.client
+      yield* before.aggregates.Routes.create({
+        id: "r 1",
+        name: "n",
+        stops: [new Stop({ label: "a b", note: "1" }), new Stop({ label: "c d", note: "2" })],
+      })
+      const db = yield* now.client
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ dryRun: true })
+      const real: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      for (const report of [dry, real]) {
+        expect(report.scanned).toBe(3)
+        // Three rows, three moves.
+        expect(report.moved.aggregate).toBe(3)
+        expect(report.skipped.unrecognizedKey).toBe(0)
+        expect(report.conflicts).toEqual([])
+      }
+      const found = yield* db.aggregates.Routes.get({ id: "r 1" })
+      expect(found.stops.map((stop) => stop.label).sort()).toEqual(["a b", "c d"])
+      const again: Table.RekeyReport = yield* db.tables.MainTable.rekey()
+      expect(again.moved.aggregate).toBe(0)
+      expect(again.skipped.unrecognizedKey).toBe(0)
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          table.layer,
+          written.MainTable.layer({ name: "t" }),
+          now.MainTable.layer({ name: "t" }),
+        ),
+      ),
+    )
   })
 })

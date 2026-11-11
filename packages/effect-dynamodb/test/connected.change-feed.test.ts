@@ -23,7 +23,7 @@ import { it } from "@effect/vitest"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Config, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Config, Duration, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import {
   type ChangeFeedBatch,
@@ -38,6 +38,13 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import * as Table from "../src/Table.js"
+import {
+  hang,
+  type LocalServer,
+  localServer,
+  passThrough,
+  type SeenRequest,
+} from "./helpers/LocalServer.js"
 
 // ---------------------------------------------------------------------------
 // Skip when DynamoDB Local isn't reachable
@@ -348,6 +355,195 @@ describeConnected("change feed (connected)", () => {
       expect(next!.records.length).toBeGreaterThan(0)
     }).pipe(provide),
   )
+
+  /** A client whose requests go through `server`, on its way to DynamoDB Local. */
+  const storeThrough = (server: LocalServer) =>
+    CheckpointStore.layerDynamoDB({ tableName: checkpointTableName }).pipe(
+      Layer.provide(
+        DynamoClient.layer({ region: "us-east-1", endpoint: server.endpoint, credentials }),
+      ),
+    )
+
+  const leaseOf = (consumer: string) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      const { Item } = yield* client.getItem({
+        TableName: checkpointTableName,
+        Key: { pk: { S: `${consumer}#${streamArn}` }, sk: { S: "lease" } },
+        ConsistentRead: true,
+      })
+      return Item === undefined
+        ? undefined
+        : { owner: Item.owner?.S, expiresAt: Number(Item.expiresAt?.N) }
+    })
+
+  it.live("every renewal hung on the wire is aborted, and the next process takes over", () =>
+    Effect.gen(function* () {
+      yield* Accounts.append({ accountId: "h1" }, [new Opened({ owner: "hal" })], 0)
+      // Between the checkpoint store and DynamoDB Local: an UpdateItem (the renewal) goes
+      // unanswered, everything else passes through.
+      const server = yield* localServer(
+        (seen) => (seen.operation === "UpdateItem" ? hang : passThrough),
+        { upstream: ENDPOINT },
+      )
+      const startedAt = Date.now()
+      // Inside the layer: destroying the client would close the connections anyway.
+      yield* Effect.gen(function* () {
+        const exit = yield* changeFeed({
+          ...feedOptions("hung-renewal"),
+          lease: { owner: "hung", duration: "2 seconds", renewEvery: "500 millis" },
+        }).pipe(Stream.runDrain, Effect.exit)
+        expect(String(Exit.isFailure(exit) ? exit.cause : "")).toContain("ChangeFeedLeaseLost")
+        // At the deadline and not before it, with each attempt aborted.
+        expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1490)
+        const renewals = server.of("UpdateItem")
+        expect(renewals.length).toBeGreaterThanOrEqual(1)
+        yield* server.until(() => renewals.every((renewal) => renewal.connectionClosed))
+        expect(renewals.some((renewal) => renewal.answered)).toBe(false)
+      }).pipe(Effect.provide(storeThrough(server)))
+      // The release reached the table, though the feed need not wait for its answer, and
+      // the next process takes the lease at once.
+      yield* eventually(Effect.map(leaseOf("hung-renewal"), (lease) => lease === undefined))
+      const [next] = yield* changeFeed(feedOptions("hung-renewal")).pipe(takeOne)
+      expect(next!.records.length).toBeGreaterThan(0)
+    }).pipe(provide),
+  )
+
+  it.live(
+    "the first renewal hung on the wire is retried: the lease survives, the feed goes on",
+    () =>
+      Effect.gen(function* () {
+        yield* Accounts.append({ accountId: "h2" }, [new Opened({ owner: "hope" })], 0)
+        let renewals = 0
+        const server = yield* localServer(
+          (seen) => (seen.operation === "UpdateItem" && ++renewals === 1 ? hang : passThrough),
+          { upstream: ENDPOINT },
+        )
+        const consumer = "hung-once"
+        yield* Effect.gen(function* () {
+          const committed: Array<ChangeFeedBatch> = []
+          const fiber = yield* changeFeed({
+            ...feedOptions(consumer),
+            lease: { owner: "survivor", duration: "4 seconds", renewEvery: "1 second" },
+          }).pipe(
+            Stream.runForEach((batch) =>
+              batch.commit().pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    committed.push(batch)
+                  }),
+                ),
+              ),
+            ),
+            Effect.forkChild,
+          )
+          yield* server.until(() => server.of("UpdateItem").length === 1)
+          const first = server.of("UpdateItem")[0]!
+          yield* server.until(() => first.connectionClosed)
+          expect(first.answered).toBe(false)
+          yield* server.until(() => server.of("UpdateItem")[1]?.answered === true)
+          // The retry reached the table, and the row is still the holder's.
+          expect(yield* leaseOf(consumer)).toMatchObject({ owner: "survivor" })
+          // The next renewal, past the first attempt's deadline, comes with the feed still up.
+          yield* server.until(() => server.of("UpdateItem")[2]?.answered === true)
+          expect(fiber.pollUnsafe()).toBeUndefined()
+          // A record written after the hang is delivered and committed.
+          const before = committed.length
+          yield* Accounts.append({ accountId: "h2" }, [new Deposited({ amount: 1 })], 1)
+          yield* eventually(Effect.sync(() => committed.length > before))
+          // A rival is still refused.
+          const store = yield* CheckpointStore
+          const rival = yield* Effect.flip(
+            store.acquireLease({ streamArn, consumer }, "rival", Duration.seconds(4)),
+          )
+          expect(rival).toMatchObject({ _tag: "ChangeFeedLeaseHeld", owner: "survivor" })
+          yield* Fiber.interrupt(fiber)
+        }).pipe(Effect.provide(storeThrough(server)))
+        yield* eventually(Effect.map(leaseOf(consumer), (lease) => lease === undefined))
+      }).pipe(provide),
+  )
+
+  describe("a renewal that lands after the feed gave up on it", () => {
+    it.live("can move the expiry back, and the holder's next renewal puts it right", () =>
+      Effect.gen(function* () {
+        yield* Accounts.append({ accountId: "h3" }, [new Opened({ owner: "ian" })], 0)
+        let renewals = 0
+        const server = yield* localServer(
+          (seen) => (seen.operation === "UpdateItem" && ++renewals === 1 ? hang : passThrough),
+          { upstream: ENDPOINT },
+        )
+        const consumer = "late-renewal"
+        const duration = 4000
+        const every = 1000
+        const expiryIn = (seen: SeenRequest) =>
+          Number(JSON.parse(seen.body).ExpressionAttributeValues[":expiresAt"].N)
+        yield* Effect.gen(function* () {
+          const fiber = yield* changeFeed({
+            ...feedOptions(consumer),
+            lease: {
+              owner: "holder",
+              duration: Duration.millis(duration),
+              renewEvery: Duration.millis(every),
+            },
+          }).pipe(Stream.runDrain, Effect.forkChild)
+          yield* server.until(() => server.of("UpdateItem")[1]?.answered === true)
+          const [abandoned, retried] = server.of("UpdateItem")
+          // The abandoned request reaches the table now, as a delayed packet would. It is
+          // the holder's own row, so the condition passes and its older expiry is written.
+          const landed = yield* server.land(abandoned!)
+          expect(landed.status).toBe(200)
+          expect(expiryIn(abandoned!)).toBeLessThan(expiryIn(retried!))
+          const after = yield* leaseOf(consumer)
+          expect(after?.owner).toBe("holder")
+          expect(after!.expiresAt).toBeGreaterThanOrEqual(expiryIn(abandoned!))
+          // The holder renews `every` after the retry started, before that older expiry.
+          const retriedAt = expiryIn(retried!) - duration
+          expect(retriedAt + every).toBeLessThan(expiryIn(abandoned!))
+          // That renewal puts the expiry right, and the feed never noticed.
+          yield* server.until(() => server.of("UpdateItem")[2]?.answered === true)
+          expect((yield* leaseOf(consumer))!.expiresAt).toBeGreaterThan(expiryIn(retried!))
+          expect(fiber.pollUnsafe()).toBeUndefined()
+          yield* Fiber.interrupt(fiber)
+        }).pipe(Effect.provide(storeThrough(server)))
+      }).pipe(provide),
+    )
+
+    it.live("can't recreate a released lease or take one back from a rival", () =>
+      Effect.gen(function* () {
+        yield* Accounts.append({ accountId: "h4" }, [new Opened({ owner: "joy" })], 0)
+        const server = yield* localServer(
+          (seen) => (seen.operation === "UpdateItem" ? hang : passThrough),
+          { upstream: ENDPOINT },
+        )
+        const consumer = "late-after-loss"
+        const exit = yield* changeFeed({
+          ...feedOptions(consumer),
+          lease: { owner: "gone", duration: "2 seconds", renewEvery: "500 millis" },
+        }).pipe(Stream.runDrain, Effect.provide(storeThrough(server)), Effect.exit)
+        expect(String(Exit.isFailure(exit) ? exit.cause : "")).toContain("ChangeFeedLeaseLost")
+        yield* eventually(Effect.map(leaseOf(consumer), (lease) => lease === undefined))
+        const [one, two] = server.of("UpdateItem")
+        expect(two).toBeDefined()
+
+        // Released: the condition on `owner` finds no row, and writes none.
+        const onReleased = yield* server.land(one!)
+        expect(onReleased.status).toBe(400)
+        expect(onReleased.body).toContain("ConditionalCheckFailedException")
+        expect(yield* leaseOf(consumer)).toBeUndefined()
+
+        // Taken: the condition finds the rival, and its expiry stands.
+        const store = yield* CheckpointStore
+        yield* store.acquireLease({ streamArn, consumer }, "rival", Duration.minutes(5))
+        const taken = yield* leaseOf(consumer)
+        const onTaken = yield* server.land(two!)
+        expect(onTaken.status).toBe(400)
+        expect(onTaken.body).toContain("ConditionalCheckFailedException")
+        expect(yield* leaseOf(consumer)).toEqual(taken)
+        expect(taken?.owner).toBe("rival")
+        yield* store.releaseLease({ streamArn, consumer }, "rival")
+      }).pipe(provide),
+    )
+  })
 
   it.live("drains a closed shard, checkpoints it as finished, and ends with the stream", () =>
     Effect.gen(function* () {

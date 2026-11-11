@@ -6,7 +6,8 @@
  *
  * - by strategies that pick a request that fits — `Entity`'s wide-update split
  *   and its strongest-guard fallback ({@link expressionFits}), the guard on a
- *   1.36 row's move ({@link asReadGuard}) — refusing nothing;
+ *   1.36 row's move ({@link asReadGuard}), the whole-row guard that proves a
+ *   row unchanged or isn't sent ({@link wholeRowGuard}) — refusing nothing;
  * - by `WriteDiagnosis.ts`, to confirm DynamoDB's rejection of an expression
  *   against the request that was sent and name it.
  *
@@ -17,6 +18,7 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import { attributeBytes, utf8Bytes } from "./ItemSize.js"
 
 /** DynamoDB's limit on one expression's length, in characters. */
 export const EXPRESSION_MAX_LENGTH = 4096
@@ -24,6 +26,11 @@ export const EXPRESSION_MAX_LENGTH = 4096
 export const EXPRESSION_MAX_OPERATORS = 300
 /** DynamoDB's limit on the operands of one `IN`. */
 export const IN_MAX_OPERANDS = 100
+/**
+ * DynamoDB's limit on all of one expression's substitution variables: its `ExpressionAttributeNames`
+ * and `ExpressionAttributeValues` together.
+ */
+export const EXPRESSION_MAX_SUBSTITUTION_BYTES = 2 * 1024 * 1024
 
 /**
  * The tokens of a compiled expression. Names and values are placeholders
@@ -98,6 +105,31 @@ export const expressionFits = (
 }
 
 /**
+ * The size of an expression's substitution variables as {@link EXPRESSION_MAX_SUBSTITUTION_BYTES}
+ * measures it, counted generously: each placeholder's own text with the name's UTF-8 bytes, or with
+ * the value's size by the exact item size model.
+ */
+export const substitutionBytes = (
+  names: Readonly<Record<string, string>>,
+  values: Readonly<Record<string, AttributeValue>>,
+): number => {
+  let bytes = 0
+  for (const [placeholder, name] of Object.entries(names)) {
+    bytes += utf8Bytes(placeholder) + utf8Bytes(name)
+  }
+  for (const [placeholder, value] of Object.entries(values)) {
+    bytes += utf8Bytes(placeholder) + attributeBytes(value)
+  }
+  return bytes
+}
+
+/** Whether substitution variables are within DynamoDB's limit for one expression. */
+export const substitutionsFit = (
+  names: Readonly<Record<string, string>>,
+  values: Readonly<Record<string, AttributeValue>>,
+): boolean => substitutionBytes(names, values) <= EXPRESSION_MAX_SUBSTITUTION_BYTES
+
+/**
  * The condition that a stored row is still as it was read (#171): it exists,
  * and every attribute but its table key (`pkField`, `sk`) holds the value
  * read — `prefer`'s first (an `updatedAt`), then the rest by name, as many as
@@ -127,6 +159,8 @@ export const asReadGuard = (
   const attrs = [...new Set([...prefer, ...Object.keys(stored).sort()])].filter(
     (attr) => attr !== pkField && attr !== "sk" && stored[attr] !== undefined,
   )
+  // Its substitutions stay far below EXPRESSION_MAX_SUBSTITUTION_BYTES: a row's names and values
+  // are at most 400 KB, and an expression that fits names at most a few hundred placeholders.
   for (const [i, attr] of attrs.entries()) {
     const clause = `#g${i} = :g${i}`
     if (!expressionFits(`${expression} AND ${clause}`)) continue
@@ -140,3 +174,106 @@ export const asReadGuard = (
     ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
   }
 }
+
+/**
+ * The condition that a stored row is still exactly the row read, or undefined when it doesn't fit
+ * DynamoDB's limits on one expression whole: never weakened to fit, so a caller that can't prove the
+ * row unchanged leaves it alone. It is {@link asReadGuard}'s condition, byte for byte, with none of
+ * its terms left out (`prefer` first, `absent` the read didn't have still absent, then every other
+ * attribute but the table key holding the value read), followed by each of `extra` the read didn't
+ * have still absent: the attributes a write to the row could add. With none to add it is the
+ * request 1.39.0 sent.
+ */
+export const wholeRowGuard = (
+  stored: Record<string, AttributeValue>,
+  pkField: string,
+  prefer: ReadonlyArray<string>,
+  absent: ReadonlyArray<string>,
+  extra: ReadonlyArray<string>,
+):
+  | {
+      readonly ConditionExpression: string
+      readonly ExpressionAttributeNames: Record<string, string>
+      readonly ExpressionAttributeValues?: Record<string, AttributeValue>
+    }
+  | undefined => {
+  const keyed = (attr: string) => attr !== pkField && attr !== "sk"
+  const held = new Set([...prefer, ...Object.keys(stored)].filter((attr) => keyed(attr)))
+  const guard = asReadGuard(stored, pkField, prefer, absent)
+  const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
+  const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
+  // `asReadGuard` leaves out what doesn't fit: whole, it named every attribute the read had.
+  const named = Object.keys(names).filter((placeholder) => /^#g\d+$/.test(placeholder)).length
+  if (named !== [...held].filter((attr) => stored[attr] !== undefined).length) return undefined
+  const inGuard = new Set(Object.values(names))
+  let expression = guard.ConditionExpression
+  const missing = [...new Set(extra)].filter(
+    (attr) => keyed(attr) && stored[attr] === undefined && !inGuard.has(attr),
+  )
+  for (const [i, attr] of missing.entries()) {
+    names[`#gx${i}`] = attr
+    expression = `${expression} AND attribute_not_exists(#gx${i})`
+  }
+  if (!expressionFits(expression) || !substitutionsFit(names, values)) return undefined
+  return {
+    ConditionExpression: expression,
+    ExpressionAttributeNames: names,
+    ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+  }
+}
+
+/**
+ * The guard on a row too wide to guard whole ({@link wholeRowGuard}) of a member that stamps
+ * `prefer` (an `updatedAt`): {@link asReadGuard}'s condition with `prefer` first, held or, when
+ * the read didn't have it, still absent (for a row holding it, the request 1.39.0 sent, byte for
+ * byte: then as many other attributes as fit), followed by as many of `absent` the read didn't
+ * have still absent as fit DynamoDB's limits on one expression. A write that changes `prefer`
+ * cancels the move; one that changes only what's left out, and not `prefer`, isn't seen.
+ */
+export const preferredGuard = (
+  stored: Record<string, AttributeValue>,
+  pkField: string,
+  prefer: ReadonlyArray<string>,
+  absent: ReadonlyArray<string>,
+): {
+  readonly ConditionExpression: string
+  readonly ExpressionAttributeNames: Record<string, string>
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue>
+} => {
+  const guard = asReadGuard(stored, pkField, prefer, prefer)
+  const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
+  const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
+  let expression = guard.ConditionExpression
+  const missing = [...new Set(absent)].filter(
+    (attr) =>
+      attr !== pkField && attr !== "sk" && stored[attr] === undefined && !prefer.includes(attr),
+  )
+  for (const [i, attr] of missing.entries()) {
+    const clause = `attribute_not_exists(#gx${i})`
+    if (!expressionFits(`${expression} AND ${clause}`)) continue
+    if (!substitutionsFit({ ...names, [`#gx${i}`]: attr }, values)) continue
+    names[`#gx${i}`] = attr
+    expression = `${expression} AND ${clause}`
+  }
+  return {
+    ConditionExpression: expression,
+    ExpressionAttributeNames: names,
+    ...(Object.keys(values).length > 0 && { ExpressionAttributeValues: values }),
+  }
+}
+
+/**
+ * What `rekey`'s move does with a row it can't prove unchanged: one whose whole guard ({@link
+ * wholeRowGuard}) doesn't fit DynamoDB's limits on one expression, with no version or `updatedAt`
+ * the library stamps to stand in (its member is neither `versioned` nor `timestamps`, it's an
+ * aggregate row whose node declares its own `updatedAt` other than a date, or it's a stream's row or
+ * a projection's row tombstone or outbox item). Every move that meets such a row switches on it, so
+ * a new answer is a type error at each:
+ *
+ * - `"report"` — the default: the row isn't moved, and is reported `unguarded`. An aggregate or a
+ *   stream already part-moved is finished as under `"strongest"`.
+ * - `"strongest"` — with `writesStopped`, as 1.39.0: the strongest guard that fits is sent, so a
+ *   concurrent write changing only what it leaves out would land unseen. A soft, retain or unique
+ *   delete always sends it.
+ */
+export type UnprovableRow = "report" | "strongest"

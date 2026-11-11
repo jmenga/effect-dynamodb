@@ -19,8 +19,13 @@ import type {
   Capacity as SdkCapacity,
   ConsumedCapacity as SdkConsumedCapacity,
 } from "@aws-sdk/client-dynamodb"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { isKeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
+import { isShardSourceError } from "@effect-dynamodb/schema/internal/Shards.js"
+import { isZOrderValueError } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import { Cause, Context, Effect, Exit, Stream, Tracer } from "effect"
 import { DynamoClient, type DynamoClientService } from "../DynamoClient.js"
+import * as SentRequest from "./SentRequest.js"
 
 // ---------------------------------------------------------------------------
 // Public types (re-exported by ConsumedCapacity.ts)
@@ -517,10 +522,54 @@ const runIn = <A, E, R>(
 }
 
 /**
- * Run `effect` as the named library operation. With reporting off — or
- * inside an observer — `effect` runs unchanged.
+ * A value the library refuses to compose into a key, thrown where there's no error channel to fail
+ * into: no key text (`[EDD-9096]`), no Z-order level (`[EDD-9092]`), no shard source (`[EDD-9100]`).
+ * A value DynamoDB can't store is `Marshaller.UnstorableValue`, which every path that marshals a
+ * caller's value refuses itself, naming the field (`marshalOrFail`).
  */
-export const operation = <A, E, R>(
+export const isRefusedValue = (u: unknown): boolean =>
+  isKeyValueError(u) || isZOrderValueError(u) || isShardSourceError(u)
+
+/** The `ValidationError` for a {@link isRefusedValue} a cause dies of, if it dies of one. */
+const refusalOf = (
+  name: string,
+  options: OperationOptions | undefined,
+  cause: Cause.Cause<unknown>,
+): ValidationError | undefined => {
+  const died = cause.reasons.find(
+    (reason) => reason._tag === "Die" && isRefusedValue(reason.defect),
+  )
+  return died === undefined
+    ? undefined
+    : new ValidationError({
+        entityType: options?.target ?? name,
+        operation: name,
+        cause: (died as Cause.Die).defect,
+      })
+}
+
+/**
+ * A caller's value that can't be composed is the caller's error, on every path, never a defect:
+ * anything thrown below an operation fails it with a `ValidationError`, which each operation that
+ * takes a value has in its error channel. Thrown by the composer, it means nothing was sent for that
+ * item.
+ */
+export const refusalsFail = <A, E, R>(
+  name: string,
+  options: OperationOptions | undefined,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.catchCause(effect, (cause) => {
+    const refusal = refusalOf(name, options, cause)
+    return refusal === undefined ? Effect.failCause(cause) : (Effect.fail(refusal) as never)
+  })
+
+/**
+ * Run `effect` as a named operation of the caller's own (`ConsumedCapacity.withOperation`):
+ * it fails and dies as it would have. With reporting off — or inside an observer — `effect`
+ * runs unchanged.
+ */
+export const scoped = <A, E, R>(
   name: string,
   options: OperationOptions | undefined,
   effect: Effect.Effect<A, E, R>,
@@ -538,6 +587,14 @@ export const operation = <A, E, R>(
     if (current === SUPPRESSED) return effect
     return runScope(name, options, settings, liveScope(current), effect)
   })
+
+/** Run `effect` as the named library operation: {@link scoped}, with {@link refusalsFail}. */
+export const operation = <A, E, R>(
+  name: string,
+  options: OperationOptions | undefined,
+  effect: Effect.Effect<A, E, R>,
+  captured?: Settings | undefined,
+): Effect.Effect<A, E, R> => scoped(name, options, refusalsFail(name, options, effect), captured)
 
 /**
  * Run `body` as the named library operation with reporting on whatever the
@@ -574,14 +631,16 @@ export const delegate = <A, E, R>(
   name: string,
   options: OperationOptions | undefined,
   effect: Effect.Effect<A, E, R>,
-): Effect.Effect<A, E, R> =>
-  Effect.withFiber((fiber) => {
+): Effect.Effect<A, E, R> => {
+  const body = refusalsFail(name, options, effect)
+  return Effect.withFiber((fiber) => {
     const settings = fiber.getRef(Reporting)
-    if (!settings.enabled) return effect
+    if (!settings.enabled) return body
     const current = fiber.getRef(CurrentOperation)
-    if (current === SUPPRESSED || liveScope(current) !== undefined) return effect
-    return runScope(name, options, settings, undefined, effect)
+    if (current === SUPPRESSED || liveScope(current) !== undefined) return body
+    return runScope(name, options, settings, undefined, body)
   })
+}
 
 /**
  * The stream form, as an effect to run where the stream is BUILT — inside a
@@ -915,19 +974,26 @@ const instrumentedCache = new WeakMap<DynamoClientService, DynamoClientService>(
 
 type AnyMethod = (input: Record<string, unknown>) => Effect.Effect<unknown, unknown>
 
+/**
+ * `raw(input)`, its failure recorded with the input it was sent with
+ * (`SentRequest`): the failure-time diagnosis measures the request as sent.
+ */
+const sendAs = (raw: AnyMethod, input: Record<string, unknown>) =>
+  raw(input).pipe(Effect.tapError((error) => Effect.sync(() => SentRequest.remember(error, input))))
+
 const send = (command: Command, raw: AnyMethod, input: Record<string, unknown>) =>
   Effect.withFiber((fiber) => {
     const settings = fiber.getRef(Reporting)
-    if (!settings.enabled) return raw(input)
+    if (!settings.enabled) return sendAs(raw, input)
     const current = fiber.getRef(CurrentOperation)
-    if (current === SUPPRESSED) return raw(input)
+    if (current === SUPPRESSED) return sendAs(raw, input)
     const flagged =
       input.ReturnConsumedCapacity !== undefined
         ? input
         : { ...input, ReturnConsumedCapacity: settings.level === "indexes" ? "INDEXES" : "TOTAL" }
     const recorded = Effect.withFiber((inner) => {
       const scope = liveScope(inner.getRef(CurrentOperation))
-      return raw(flagged).pipe(
+      return sendAs(raw, flagged).pipe(
         Effect.onExit((exit) =>
           scope !== undefined ? record(scope, command, input, exit) : Effect.void,
         ),
@@ -939,6 +1005,22 @@ const send = (command: Command, raw: AnyMethod, input: Record<string, unknown>) 
       ? recorded
       : runScope(`DynamoClient.${command}`, undefined, settings, undefined, recorded)
   })
+
+/**
+ * The request-level field {@link send} adds to a data-plane request sent from
+ * this fiber now, when the request has none: `ReturnConsumedCapacity` while
+ * reporting is on. A request packer counts it toward the request's body.
+ */
+export const requestFields: Effect.Effect<{
+  readonly ReturnConsumedCapacity?: "TOTAL" | "INDEXES"
+}> = Effect.withFiber((fiber) => {
+  const settings = fiber.getRef(Reporting)
+  if (!settings.enabled || fiber.getRef(CurrentOperation) === SUPPRESSED) return Effect.succeed({})
+  return Effect.succeed({
+    ReturnConsumedCapacity:
+      settings.level === "indexes" ? ("INDEXES" as const) : ("TOTAL" as const),
+  })
+})
 
 /**
  * The instrumented view of a client: the data-plane methods record their
@@ -968,6 +1050,50 @@ export const instrument = (service: DynamoClientService): DynamoClientService =>
 export const client: Effect.Effect<DynamoClientService, never, DynamoClient> = Effect.suspend(() =>
   Effect.map(Effect.service(DynamoClient), instrument),
 )
+
+/** A data-plane request {@link withoutRequests} refused. */
+export interface RefusedRequest {
+  readonly command: Command
+  readonly input: Record<string, unknown>
+}
+
+/**
+ * Run `effect` with a client that sends nothing, for code that builds a
+ * request only to measure it. Each data-plane request fails locally, is not
+ * counted or reported as a request, and the first one is returned beside the
+ * exit — kept on the side, so it survives however `effect` mapped the failure.
+ */
+export const withoutRequests = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<
+  { readonly exit: Exit.Exit<A, E>; readonly refused: RefusedRequest | undefined },
+  never,
+  Exclude<R, DynamoClient>
+> =>
+  Effect.suspend(() => {
+    let refused: RefusedRequest | undefined
+    const refusing: Record<string, AnyMethod> = {}
+    for (const [method, command] of DATA_PLANE) {
+      refusing[method] = (input) =>
+        Effect.suspend(() => {
+          refused ??= { command, input }
+          return Effect.fail(
+            markNotSent(
+              new DynamoError({ operation: command, cause: "not sent: only measuring a request" }),
+            ),
+          )
+        })
+    }
+    return Effect.exit(effect).pipe(
+      Effect.provideService(DynamoClient, refusing as unknown as DynamoClientService),
+      Effect.provideService(CurrentOperation, SUPPRESSED),
+      Effect.map((exit) => ({ exit, refused })),
+    ) as Effect.Effect<
+      { readonly exit: Exit.Exit<A, E>; readonly refused: RefusedRequest | undefined },
+      never,
+      Exclude<R, DynamoClient>
+    >
+  })
 
 // ---------------------------------------------------------------------------
 // Operation names carried by op builders

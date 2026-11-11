@@ -41,8 +41,12 @@ const failure = <E>(exit: Exit.Exit<unknown, E>): E => {
 }
 
 describe("StorageEncoding.limits", () => {
-  it("are DynamoDB's item and transaction limits", () => {
-    expect(StorageEncoding.limits).toEqual({ item: 409_600, transaction: 4_194_304 })
+  it("are DynamoDB's item, transaction and request body limits", () => {
+    expect(StorageEncoding.limits).toEqual({
+      item: 409_600,
+      transaction: 4_194_304,
+      request: 16_777_216,
+    })
   })
 })
 

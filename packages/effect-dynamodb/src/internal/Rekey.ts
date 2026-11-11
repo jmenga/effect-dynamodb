@@ -26,6 +26,7 @@ import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
 import type {
   RekeyConflict,
   RekeyCounts,
+  RekeyIndexKeys,
   RekeyMemberReport,
   RekeyOptions,
   RekeyReport,
@@ -42,6 +43,7 @@ import {
   toBase64Url,
   type WireValue,
 } from "./Cursor.js"
+import type { UnprovableRow } from "./ExpressionLimits.js"
 
 type Item = Record<string, AttributeValue>
 
@@ -49,6 +51,16 @@ type Item = Record<string, AttributeValue>
 export interface RekeyRowContext {
   readonly tableName: string
   readonly dryRun: boolean
+  /** Write the index keys that differ ({@link RekeyOptions.repairIndexKeys}), or only count them. */
+  readonly repairIndexKeys: boolean
+  /** Writes to the table are stopped ({@link RekeyOptions.writesStopped}): see {@link unprovableRow}. */
+  readonly writesStopped: boolean
+  /**
+   * Whether this run has read every page of the table: it started at the beginning and is past the
+   * end. A run bounded by `maxPages`, or started from `resume`, hasn't, so what it didn't find says
+   * nothing. Only meaningful in {@link RekeyMember.finish}.
+   */
+  readonly sawWholeTable: () => boolean
   /**
    * Claim a unit of rows that move together — an aggregate, an event stream —
    * for this run: `true` for the first row that claims it, `false` after.
@@ -66,6 +78,20 @@ export interface RekeyRowContext {
 }
 
 /**
+ * What a move does with a row it can't prove unchanged ({@link UnprovableRow}): with writes to the
+ * table stopped, nothing can change it, so it moves under the strongest guard that fits; otherwise
+ * it's left and reported `unguarded`, unless its aggregate or stream is already part-moved.
+ */
+export const unprovableRow = (ctx: RekeyRowContext): UnprovableRow =>
+  ctx.writesStopped ? "strongest" : "report"
+
+/** A row left where it is because nothing proves it unchanged when it moves ({@link unprovableRow}). */
+export const UNGUARDED_MESSAGE =
+  "It can't be proven unchanged in one condition: guarded whole, it's over DynamoDB's limits on " +
+  "one expression, and it has no version or updatedAt the library stamps to stand in. It's left " +
+  "where it is: stop writes to the table, then run rekey with writesStopped: true."
+
+/**
  * How many rows still to move a row's own move goes through first: one chain, `foo%20bar`'s row
  * where `foo bar`'s belongs and so on. Past it the row is reported, and the next run goes on.
  */
@@ -77,9 +103,17 @@ export interface RekeyTally {
   readonly moved?: Partial<Record<RekeyRowKind, number>> | undefined
   readonly indexKeysRewritten?: number | undefined
   readonly sentinelsMoved?: number | undefined
+  readonly indexKeys?: Partial<RekeyIndexKeys> | undefined
   readonly conflicts?: ReadonlyArray<RekeyConflict> | undefined
   readonly skipped?: Partial<Record<RekeySkipReason, number>> | undefined
 }
+
+/** A tally saying only that the member couldn't read the row's key back. */
+const onlyUnrecognized = (tally: RekeyTally): boolean =>
+  Object.keys(tally).length === 1 &&
+  tally.skipped !== undefined &&
+  Object.keys(tally.skipped).length === 1 &&
+  (tally.skipped.unrecognizedKey ?? 0) > 0
 
 /** A member's part in a run: the rows it may own, and its handler. */
 export interface RekeyMember {
@@ -147,6 +181,7 @@ const SKIP_REASONS: ReadonlyArray<RekeySkipReason> = [
   "notLibrary",
   "unregistered",
   "unrecognizedKey",
+  "rootNotSeen",
 ]
 
 type MutableCounts = { -readonly [K in RekeyRowKind]: number }
@@ -161,11 +196,32 @@ const zeroCounts = (): MutableCounts => ({
   stream: 0,
 })
 
+type MutableIndexKeys = { -readonly [K in keyof RekeyIndexKeys]: number }
+
+const INDEX_KEY_COUNTS: ReadonlyArray<keyof RekeyIndexKeys> = [
+  "missing",
+  "truncated",
+  "lagging",
+  "ambiguous",
+  "repaired",
+  "skipped",
+]
+
+const zeroIndexKeys = (): MutableIndexKeys => ({
+  missing: 0,
+  truncated: 0,
+  lagging: 0,
+  ambiguous: 0,
+  repaired: 0,
+  skipped: 0,
+})
+
 interface MutableMember {
   unchanged: number
   moved: MutableCounts
   indexKeysRewritten: number
   sentinelsMoved: number
+  indexKeys: MutableIndexKeys
   conflicts: number
 }
 
@@ -176,12 +232,14 @@ class Totals {
   moved = zeroCounts()
   indexKeysRewritten = 0
   sentinelsMoved = 0
+  indexKeys = zeroIndexKeys()
   conflicts: Array<RekeyConflict> = []
   private readonly conflicted = new Set<string>()
   skipped: { -readonly [R in RekeySkipReason]: number } = {
     notLibrary: 0,
     unregistered: 0,
     unrecognizedKey: 0,
+    rootNotSeen: 0,
   }
   byMember = new Map<string, MutableMember>()
 
@@ -196,6 +254,7 @@ class Totals {
               moved: zeroCounts(),
               indexKeysRewritten: 0,
               sentinelsMoved: 0,
+              indexKeys: zeroIndexKeys(),
               conflicts: 0,
             }
             this.byMember.set(member, fresh)
@@ -215,6 +274,11 @@ class Totals {
     const sentinels = tally.sentinelsMoved ?? 0
     this.sentinelsMoved += sentinels
     if (into !== undefined) into.sentinelsMoved += sentinels
+    for (const count of INDEX_KEY_COUNTS) {
+      const n = tally.indexKeys?.[count] ?? 0
+      this.indexKeys[count] += n
+      if (into !== undefined) into.indexKeys[count] += n
+    }
     for (const conflict of tally.conflicts ?? []) {
       // A row that can't move is met again by what wants its key, and by the scan.
       const row = `${conflict.member}\u0000${conflict.kind}\u0000${JSON.stringify(conflict.key)}`
@@ -240,6 +304,7 @@ class Totals {
         moved: { ...m.moved },
         indexKeysRewritten: m.indexKeysRewritten,
         sentinelsMoved: m.sentinelsMoved,
+        indexKeys: { ...m.indexKeys },
         conflicts: m.conflicts,
       }
     }
@@ -250,6 +315,7 @@ class Totals {
       moved: { ...this.moved } as RekeyCounts,
       indexKeysRewritten: this.indexKeysRewritten,
       sentinelsMoved: this.sentinelsMoved,
+      indexKeys: { ...this.indexKeys },
       conflicts: [...this.conflicts],
       skipped: { ...this.skipped },
       byMember,
@@ -347,6 +413,7 @@ export const run = (args: {
       } else {
         positions = Array.from({ length: options.segments ?? 1 }, (): Position => 0)
       }
+      const startedAtTheBeginning = positions.every((position) => position === 0)
 
       // Members by the `__edd_e__` values they claim, in registration order.
       const byType = new Map<string, Array<RekeyMember>>()
@@ -366,6 +433,9 @@ export const run = (args: {
       const ctx: RekeyRowContext = {
         tableName,
         dryRun,
+        repairIndexKeys: options.repairIndexKeys === true,
+        writesStopped: options.writesStopped === true,
+        sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
         claim: (unit) => {
           if (claimed.has(unit)) return false
           claimed.add(unit)
@@ -393,10 +463,23 @@ export const run = (args: {
             ...(byType.get(type) ?? []),
             ...prefixed.filter((p) => type.startsWith(p.prefix)).map((p) => p.member),
           ]
+          // A member that can't read the row's key back (`unrecognizedKey`) isn't its owner: the
+          // key names another member's key space. The search goes on, so the order members are
+          // listed in doesn't choose one, and the row is counted unrecognized only when no member
+          // recognises it.
+          let unrecognized: { readonly member: RekeyMember; readonly tally: RekeyTally } | undefined
           for (const member of candidates) {
             const tally = yield* member.row(row, ctx)
             if (tally === undefined) continue
+            if (onlyUnrecognized(tally)) {
+              unrecognized ??= { member, tally }
+              continue
+            }
             totals.add(member.name, tally)
+            return
+          }
+          if (unrecognized !== undefined) {
+            totals.add(unrecognized.member.name, unrecognized.tally)
             return
           }
           totals.add(undefined, { skipped: { unregistered: 1 } })
@@ -468,6 +551,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
   const moved: Partial<Record<RekeyRowKind, number>> = {}
   const skipped: Partial<Record<RekeySkipReason, number>> = {}
   const conflicts: Array<RekeyConflict> = []
+  const indexKeys: Partial<MutableIndexKeys> = {}
   let unchanged = 0
   let indexKeysRewritten = 0
   let sentinelsMoved = 0
@@ -475,6 +559,10 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     unchanged += tally.unchanged ?? 0
     indexKeysRewritten += tally.indexKeysRewritten ?? 0
     sentinelsMoved += tally.sentinelsMoved ?? 0
+    for (const count of INDEX_KEY_COUNTS) {
+      const n = tally.indexKeys?.[count]
+      if (n !== undefined) indexKeys[count] = (indexKeys[count] ?? 0) + n
+    }
     for (const kind of ROW_KINDS) {
       const n = tally.moved?.[kind]
       if (n !== undefined) moved[kind] = (moved[kind] ?? 0) + n
@@ -490,6 +578,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     ...(Object.keys(moved).length > 0 && { moved }),
     ...(indexKeysRewritten > 0 && { indexKeysRewritten }),
     ...(sentinelsMoved > 0 && { sentinelsMoved }),
+    ...(Object.keys(indexKeys).length > 0 && { indexKeys }),
     ...(conflicts.length > 0 && { conflicts }),
     ...(Object.keys(skipped).length > 0 && { skipped }),
   }

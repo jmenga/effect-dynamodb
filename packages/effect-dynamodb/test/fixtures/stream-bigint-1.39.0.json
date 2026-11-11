@@ -1,0 +1,427 @@
+{
+  "writtenBy": {
+    "effect-dynamodb": "1.39.0",
+    "effect": "4.1.2"
+  },
+  "rows": [
+    {
+      "metadata": {
+        "M": {
+          "m": {
+            "N": "5"
+          }
+        }
+      },
+      "streamId": {
+        "S": "stored"
+      },
+      "data": {
+        "M": {
+          "amount": {
+            "N": "1152921504606846976"
+          },
+          "set": {
+            "NS": [
+              "1152921504606846976"
+            ]
+          },
+          "_tag": {
+            "S": "Paid"
+          },
+          "optional": {
+            "N": "1152921504606846976"
+          },
+          "byName": {
+            "M": {
+              "a": {
+                "N": "1152921504606846976"
+              }
+            }
+          },
+          "list": {
+            "L": [
+              {
+                "N": "1152921504606846976"
+              },
+              {
+                "N": "1152921504606846976"
+              }
+            ]
+          },
+          "key": {
+            "N": "1152921504606846976"
+          },
+          "orNull": {
+            "N": "1152921504606846976"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "1152921504606846976"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "__edd_e__": {
+        "S": "ledger.event"
+      },
+      "sk": {
+        "S": "$bigints#v1#ledger.event_1#0000000001"
+      },
+      "pk": {
+        "S": "$bigints#v1#ledger#stored"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "1"
+      },
+      "timestamp": {
+        "S": "2026-11-07T10:03:13.626Z"
+      }
+    },
+    {
+      "metadata": {
+        "M": {
+          "m": {
+            "N": "5"
+          }
+        }
+      },
+      "streamId": {
+        "S": "stored"
+      },
+      "data": {
+        "M": {
+          "amount": {
+            "N": "2305843009213693952"
+          },
+          "set": {
+            "NS": [
+              "1152921504606846976",
+              "2305843009213693952"
+            ]
+          },
+          "_tag": {
+            "S": "Paid"
+          },
+          "optional": {
+            "N": "2305843009213693952"
+          },
+          "byName": {
+            "M": {
+              "a": {
+                "N": "2305843009213693952"
+              }
+            }
+          },
+          "list": {
+            "L": [
+              {
+                "N": "2305843009213693952"
+              },
+              {
+                "N": "1152921504606846976"
+              }
+            ]
+          },
+          "key": {
+            "N": "2305843009213693952"
+          },
+          "orNull": {
+            "N": "2305843009213693952"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "2305843009213693952"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "__edd_e__": {
+        "S": "ledger.event"
+      },
+      "sk": {
+        "S": "$bigints#v1#ledger.event_1#0000000002"
+      },
+      "pk": {
+        "S": "$bigints#v1#ledger#stored"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "2"
+      },
+      "timestamp": {
+        "S": "2026-11-07T10:03:13.626Z"
+      }
+    },
+    {
+      "metadata": {
+        "M": {
+          "m": {
+            "N": "5"
+          }
+        }
+      },
+      "streamId": {
+        "S": "stored"
+      },
+      "data": {
+        "M": {
+          "amount": {
+            "N": "5"
+          },
+          "set": {
+            "NS": [
+              "5",
+              "1152921504606846976"
+            ]
+          },
+          "_tag": {
+            "S": "Paid"
+          },
+          "optional": {
+            "N": "5"
+          },
+          "byName": {
+            "M": {
+              "a": {
+                "N": "5"
+              }
+            }
+          },
+          "list": {
+            "L": [
+              {
+                "N": "5"
+              },
+              {
+                "N": "1152921504606846976"
+              }
+            ]
+          },
+          "key": {
+            "N": "5"
+          },
+          "orNull": {
+            "N": "5"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "5"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "__edd_e__": {
+        "S": "ledger.event"
+      },
+      "sk": {
+        "S": "$bigints#v1#ledger.event_1#0000000003"
+      },
+      "pk": {
+        "S": "$bigints#v1#ledger#stored"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "3"
+      },
+      "timestamp": {
+        "S": "2026-11-07T10:03:13.626Z"
+      }
+    },
+    {
+      "metadata": {
+        "M": {
+          "m": {
+            "N": "5"
+          }
+        }
+      },
+      "streamId": {
+        "S": "stored"
+      },
+      "data": {
+        "M": {
+          "amount": {
+            "N": "4611686018427387904"
+          },
+          "set": {
+            "NS": [
+              "1152921504606846976",
+              "4611686018427387904"
+            ]
+          },
+          "_tag": {
+            "S": "Paid"
+          },
+          "optional": {
+            "N": "4611686018427387904"
+          },
+          "byName": {
+            "M": {
+              "a": {
+                "N": "4611686018427387904"
+              }
+            }
+          },
+          "list": {
+            "L": [
+              {
+                "N": "4611686018427387904"
+              },
+              {
+                "N": "1152921504606846976"
+              }
+            ]
+          },
+          "key": {
+            "N": "4611686018427387904"
+          },
+          "orNull": {
+            "N": "4611686018427387904"
+          },
+          "option": {
+            "M": {
+              "_op": {
+                "S": "Some"
+              },
+              "~effect/Option": {
+                "M": {}
+              },
+              "value": {
+                "N": "4611686018427387904"
+              },
+              "_tag": {
+                "S": "Some"
+              }
+            }
+          }
+        }
+      },
+      "__edd_e__": {
+        "S": "ledger.event"
+      },
+      "sk": {
+        "S": "$bigints#v1#ledger.event_1#0000000004"
+      },
+      "pk": {
+        "S": "$bigints#v1#ledger#stored"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "4"
+      },
+      "timestamp": {
+        "S": "2026-11-07T10:03:13.626Z"
+      }
+    },
+    {
+      "streamId": {
+        "S": "stored"
+      },
+      "asOfVersion": {
+        "N": "4"
+      },
+      "__edd_e__": {
+        "S": "ledger.snapshot"
+      },
+      "sk": {
+        "S": "$bigints#v1#ledger.snapshot"
+      },
+      "pk": {
+        "S": "$bigints#v1#ledger#stored"
+      },
+      "state": {
+        "M": {
+          "total": {
+            "N": "5"
+          },
+          "n": {
+            "N": "4"
+          }
+        }
+      },
+      "timestamp": {
+        "S": "2026-11-07T10:03:13.633Z"
+      }
+    }
+  ],
+  "outbox": [
+    {
+      "__edd_row_pk__": {
+        "S": "$bigints#v1#summary#id_outboxed"
+      },
+      "streamId": {
+        "S": "outboxed"
+      },
+      "__edd_e__": {
+        "S": "Summary#outbox"
+      },
+      "effect": {
+        "M": {
+          "total": {
+            "N": "5"
+          }
+        }
+      },
+      "sk": {
+        "S": "$bigints#v1#summary#outbox#000000000001#0000"
+      },
+      "pk": {
+        "S": "$bigints#v1#summary#id_outboxed"
+      },
+      "source": {
+        "S": "projection"
+      },
+      "eventType": {
+        "S": "Paid"
+      },
+      "version": {
+        "N": "1"
+      },
+      "__edd_row_sk__": {
+        "S": "$bigints#v1#summary"
+      }
+    }
+  ]
+}

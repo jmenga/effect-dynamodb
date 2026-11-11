@@ -145,7 +145,7 @@ yield* db.entities.Pages.update({ pageId: "p-1" }).set({
 })
 ```
 
-`null` in record-style input is **NOT** interpreted as REMOVE. Removal is always explicit via `.removeEntries(field, keys)`.
+`null` in record-style input is **NOT** interpreted as REMOVE. Removal is always explicit via `.removeEntries(field, keys)`. `undefined` merges no entries, so `.set({ tags: undefined })` leaves them where they are. `.remove(["tags"])` is refused with a `ValidationError` naming `.removeEntries` and `.clearMap`, as is a `.remove` or `pathRemove` of one entry's stored name.
 
 ## Path-style writes — per-leaf within a bucket
 
