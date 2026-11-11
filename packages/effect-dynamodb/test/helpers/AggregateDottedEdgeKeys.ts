@@ -24,7 +24,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Cause, Duration, Effect, Exit, Schema, SchemaGetter } from "effect"
+import { Cause, Duration, Effect, Exit, Layer, Schema, SchemaGetter } from "effect"
 import { TestClock } from "effect/testing"
 import { describe, expect } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
@@ -173,6 +173,8 @@ const rekeyed = (outcome: any) => ({
 type Session = {
   readonly db: any
   readonly step: (name: string, make: () => any) => Effect.Effect<Step>
+  /** A client whose first `TransactWriteItems` runs `write` first, through `db`. */
+  readonly racedBy: (write: () => Effect.Effect<unknown, unknown>) => Effect.Effect<any, never, any>
 }
 const session = <A>(
   harness: Harness,
@@ -201,7 +203,30 @@ const session = <A>(
             rows: sorted(yield* harness.rows(tableName)),
           }
         })
-      return yield* body({ db, step })
+      const racedBy = (write: () => Effect.Effect<unknown, unknown>) =>
+        Effect.gen(function* () {
+          const raw = yield* DynamoClient
+          let landed = false
+          const racing = new Proxy(raw, {
+            get: (target, property, receiver) =>
+              property === "transactWriteItems"
+                ? (input: any) =>
+                    Effect.gen(function* () {
+                      if (!landed) {
+                        landed = true
+                        yield* Effect.orDie(write())
+                      }
+                      return yield* target.transactWriteItems(input)
+                    })
+                : Reflect.get(target, property, receiver),
+          })
+          return yield* DynamoClient.make({
+            entities: { Dots: defs.Dots },
+            aggregates: { Dotted: defs.Agg },
+            tables: { Main: defs.Main },
+          }).pipe(Effect.provide(Layer.succeed(DynamoClient, racing)))
+        })
+      return yield* body({ db, step, racedBy })
     }).pipe(Effect.provide(defs.Main.layer({ name: tableName }))),
   )
 
@@ -385,6 +410,46 @@ export const dottedSuite = (
           expect(update.requests.flatMap((r) => r.input.TransactItems ?? [])).not.toContainEqual(
             expect.objectContaining({ Delete: expect.anything() }),
           )
+        }),
+    )
+
+    it.effect(
+      "under escapeKeys: true, an update moving the group between rekey's read and its write: rekey's move is cancelled, and reading again it finds the rows moved",
+      () =>
+        Effect.gen(function* () {
+          const d1 = seededOn.filter((row) => row.pk?.S === PK.d1)
+          const [rekey, again] = yield* session(harness, ON, d1, ({ db, step, racedBy }) =>
+            Effect.gen(function* () {
+              const racing = yield* racedBy(() =>
+                db.aggregates.Dotted.update({ id: "d1" }, retitled),
+              )
+              return [
+                yield* step("rekey", () => racing.tables.Main.rekey()),
+                yield* step("rekey again", () => db.tables.Main.rekey({ dryRun: true })),
+              ] as const
+            }),
+          )
+          // The update's transaction, then rekey's, cancelled by it; rekey then reads again.
+          const writes = rekey.requests.filter((r) => r.command === "TransactWriteItems")
+          expect(writes).toHaveLength(2)
+          expect(rekeyed(rekey.outcome)).toEqual({ moved: 0, conflicts: [] })
+          expect(sks(rekey.rows, PK.d1)).toEqual([
+            "$dots#v1#bycode#b",
+            "$dots#v1#bycode#c",
+            "$dots#v1#bynested#0000000000000005",
+            "$dots#v1#bynested#0000000000000012",
+          ])
+          const root = rekey.rows.find(
+            (row) => row.pk?.S === PK.d1 && row.sk?.S === "$dots#v1#dotted",
+          )
+          expect(root?.title).toEqual({ S: "t2" })
+          for (const row of rekey.rows.filter((r) => r.pk?.S === PK.d1 && r.dotId !== undefined)) {
+            const from = d1.find(
+              (r) => r.__edd_e__?.S === row.__edd_e__?.S && r.dotId?.S === row.dotId?.S,
+            )!
+            expect(row.createdAt).toEqual(from.createdAt)
+          }
+          expect(rekeyed(again.outcome)).toEqual({ moved: 0, conflicts: [] })
         }),
     )
 
