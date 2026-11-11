@@ -400,14 +400,14 @@ const dateEncodingOf = (
  *   text, which it reads as a string.
  */
 const compositeValues =
-  (model: unknown, side: "written" | "read") =>
+  (model: unknown, side: "written" | "read", dates = true) =>
   (composite: string): KeyComposer.CompositeValues => {
     if (model === undefined || model === null) return "open"
     const schema = isConfiguredModel(model) ? (model.model as Schema.Top) : (model as Schema.Top)
     const fields = getSchemaFields(schema)
     if (fields === undefined || !Object.hasOwn(fields, composite)) return "open"
     const field = fields[composite]!
-    if (side === "written") {
+    if (side === "written" && dates) {
       const configured = isConfiguredModel(model) ? model.attributes : undefined
       const date = dateEncodingOf(
         field,
@@ -442,13 +442,19 @@ type KeySpace = { readonly pk: KeyComposer.KeySpace; readonly sk: KeyComposer.Ke
  * composite's name. Each value is what its type can compose (`compositeValues`), by `view`:
  *
  * - `"plain"`, the keys its rows are written under with values that hold no `#`: every composite is
- *   walked, to the end of the key, under the schema's setting.
+ *   walked, to the end of the key, under the schema's setting. `"plain140"` is the same, a date
+ *   taken as any text without `#`, as 1.40.0 took it.
  * - `"written"` and `"read"`, the keys `rekey` meets on its table, under any setting: the walk
  *   stops at the first composite whose value may hold `#` (`"open"`), and anything follows it.
+ * - `"owned"`, exactly the keys its rows can be written under, under any setting: every composite
+ *   is walked, to the end of the key, a value that may hold `#` as any text.
  *
  * `undefined` for an entity on no table.
  */
-const keySpaceOf = (entity: unknown, view: "plain" | "written" | "read"): KeySpace | undefined => {
+const keySpaceOf = (
+  entity: unknown,
+  view: "plain" | "plain140" | "written" | "read" | "owned",
+): KeySpace | undefined => {
   const member = entity as {
     readonly entityType?: string
     readonly _entityVersion?: number
@@ -460,20 +466,25 @@ const keySpaceOf = (entity: unknown, view: "plain" | "written" | "read"): KeySpa
   if (member._schema === undefined || member.entityType === undefined || primary === undefined) {
     return undefined
   }
-  const values = compositeValues(member.model, view === "read" ? "read" : "written")
+  const values = compositeValues(
+    member.model,
+    view === "read" ? "read" : "written",
+    view !== "plain140",
+  )
+  const plain = view === "plain" || view === "plain140"
   try {
     return KeyComposer.composeKeySpace(
       member._schema,
       member.entityType,
       member._entityVersion ?? 1,
       primary,
-      view === "plain"
+      plain
         ? (composite) => {
             const of = values(composite)
             return of === "open" ? "text" : of
           }
         : values,
-      { everyForm: view !== "plain" },
+      { everyForm: !plain, walkOpen: view === "owned" },
     )
   } catch {
     return undefined
@@ -500,6 +511,25 @@ const outboxSpaceOf = (space: KeySpace): KeySpace => {
 /** Whether a key of one key space can be a key of the other, in both halves. */
 const spacesMeet = (a: KeySpace, b: KeySpace): boolean =>
   KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
+
+/**
+ * Whether two read models' outbox items can overwrite each other, as `DynamoClient.make` and
+ * `processBatch` ask (`"plain"`): a key of one can be a key of the other with values that hold no
+ * `#`. A date's key text is its own (`"plain"`), so a date beside a label it can't spell is apart,
+ * where 1.40.0 took a date as any text (`"plain140"`) and refused them. Such a pair is apart only
+ * when no key one writes can be a key the other writes at all (`"owned"`), `#` included: a drainer
+ * tells its own items from the other's by that (`drainPending`), so each delivers exactly its own.
+ * Otherwise they're refused, as on 1.40.0.
+ */
+const overwriteEachOther = (a: unknown, b: unknown): boolean => {
+  const meet = (view: "plain" | "plain140" | "owned") => {
+    const x = keySpaceOf(a, view)
+    const y = keySpaceOf(b, view)
+    return x !== undefined && y !== undefined && spacesMeet(outboxSpaceOf(x), outboxSpaceOf(y))
+  }
+  if (meet("plain")) return true
+  return meet("plain140") && meet("owned")
+}
 
 /**
  * Whether the outbox items of one entity can be read by `rekey` as the other's, either way round:
@@ -647,13 +677,7 @@ export const sharedOutboxKeySpace = (
           if (other === entity) continue
           if (!remoteOutboxesOf(other).some((o) => oneTable(o.table.Tag, into))) continue
           if (plain) {
-            const otherSpace = keySpaceOf(other, "plain")
-            if (
-              otherSpace === undefined ||
-              !spacesMeet(outboxSpaceOf(space), outboxSpaceOf(otherSpace))
-            ) {
-              continue
-            }
+            if (!overwriteEachOther(entity, other)) continue
           } else if (!readAsEachOther(entity, other)) continue
           return (
             `[EDD-9134] ${site}: ${name} writes its projection's outbox items into another ` +
@@ -1782,14 +1806,16 @@ export const makeEngine = (config: EngineConfig) => {
 
   /**
    * Whether an outbox item's row (`__edd_row_pk__`, `__edd_row_sk__`) is a row of this read model:
-   * its key is in the read model's key space as `rekey`'s reader takes it (`keySpaceOf`, `"read"`),
-   * under every setting a row can have been written under. The outbox index is keyed by entity
-   * type alone, so read models of one entity type sharing it (another schema or primary
-   * collection, say) list each other's items there. Every row when the read model's key space
-   * can't be composed.
+   * its key is one the read model's composer writes, under every setting a row can have been
+   * written under, for values of its composites' kinds (`keySpaceOf`, `"owned"`): a date's ISO
+   * text or epoch, a number's key text, a literal's, any text for a string. What its reader would
+   * take (a date or a literal as any text) isn't enough. The outbox index is keyed by entity type
+   * alone, so read models of one entity type sharing it (another schema or primary collection,
+   * say) list each other's items there. Every row when the read model's key space can't be
+   * composed.
    */
   const ownRowOf = (): ((pk: string, sk: string) => boolean) => {
-    const space = keySpaceOf(readModel, "read")
+    const space = keySpaceOf(readModel, "owned")
     if (space === undefined) return () => true
     const whole = (text: string): KeyComposer.KeySpace => ({ text, after: [], open: false })
     return (pk, sk) => spacesMeet(space, { pk: whole(pk), sk: whole(sk) })

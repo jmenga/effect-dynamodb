@@ -1003,7 +1003,13 @@ values match, and both are defects. Read models whose keys meet only through a
 value holding `#` (`ida_x` and `ida_x#idb_y`) bind and run, as on 1.39.0, as do
 two whose keys part where one's value can't spell the other's text (`n_7`, a
 number, beside `n_x_q`; `at_2026-11-11t08:00:00.000z`, a date, beside
-`at_x_q`, which 1.40.0 refused). By the outbox table's `rekey`, before it sends
+`at_x_q`, which 1.40.0 refused). A pair apart only because a date's text is
+modelled (1.40.0 took a date as any text without `#`) is admitted only when no
+key one writes can be a key the other writes at all, a string holding `#`
+included, so each drainer can tell its items from the other's
+(`drainPending`): `at` beside `at_x`, but not `shop` then `at` beside `shop`
+then `at_x`, which stays refused, as on 1.40.0, nor a zoned date (whose text
+goes on in any text) beside `at_1`. By the outbox table's `rekey`, before it sends
 anything: can `rekey` read an item of one as the other's at all? Its reader
 (`KeyText136.readIndexKeys`) takes a number, a bigint or a boolean only as text
 its value composes again, but a literal composite as any text, as it takes a
@@ -7444,9 +7450,17 @@ instance).
   drains after the write; `drainPending` sweeps through a sparse
   `outbox.index`. The index is keyed by entity type alone, so read models of one
   entity type sharing it (another schema or primary collection) list each
-  other's items: `drainPending` drains only the rows in its read model's key
-  space, as `rekey`'s reader takes it under every setting, and leaves the
-  others' items unclaimed for their drainers. Its requests are the ones 1.40.0
+  other's items: `drainPending` drains only the rows whose keys its read
+  model's composer writes, under every setting a row can have been written
+  under, for values of its composites' kinds (a date's ISO text or epoch, a
+  number's key text, a literal's, any text for a string, `#` included:
+  `KeyComposer.composeKeySpace` with `walkOpen`), and leaves the others'
+  items unclaimed for their drainers. What its reader would take isn't
+  enough: a date's reader takes `x_q` as a date's text, which no date writes.
+  Read models whose keys meet only through a string value holding `#`
+  (`shop_x` and `shop_x#branch_y`), which bind as on 1.39.0, can each be
+  written by the other's keys: such an item is drained by both drainers, as
+  on 1.40.0, where each drained every item of the index. Its requests are the ones 1.40.0
   sent. On 1.39.0 and 1.40.0 it claimed another read model's head item, failed
   to decode it with its own schema, and left the claim, so that read model's
   drainer stopped there until the claim expired.

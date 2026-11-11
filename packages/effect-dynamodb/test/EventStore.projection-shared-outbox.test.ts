@@ -6,8 +6,10 @@
  */
 
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Schema } from "effect"
+import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
@@ -165,4 +167,153 @@ describe("drainPending on an outbox index shared by read models of one entity ty
       expect(outboxRows()).toEqual([])
     }).pipe(Effect.provide(layer))
   })
+})
+
+/**
+ * A read model keyed by a date beside one keyed by a label whose text a date's can't spell
+ * (`at_2026-…` beside `at_x_q`) binds since a date's key text is modelled (#237). Each drainer
+ * takes as its own only the keys its read model's composer writes: a date's reader would take
+ * `x_q` as the date's text, which no date writes. Every date schema beside every label shape the
+ * bind check admits, under either setting: each `drainPending` delivers exactly its own item, and
+ * a pair it refuses is one 1.40.0 refused too.
+ */
+describe("drainPending, a read model keyed by a date beside one keyed by a label", () => {
+  const datesSchemas = [
+    ["DynamoModel.DateString", DynamoModel.DateString],
+    ["Schema.DateTimeUtc", Schema.DateTimeUtc],
+    ["Schema.Date", Schema.Date],
+    ["DynamoModel.UnsafeDateString", DynamoModel.UnsafeDateString],
+    ["DynamoModel.DateTimeZoned", DynamoModel.DateTimeZoned],
+    ["DynamoModel.DateEpochSeconds", DynamoModel.DateEpochSeconds],
+    ["DynamoModel.DateEpochMs", DynamoModel.DateEpochMs],
+    ["an optional DynamoModel.DateString", Schema.optional(DynamoModel.DateString)],
+  ] as const
+  // Labels a date's text may or may not spell: a letter, a digit, a letter of an ISO text.
+  const labels = ["at_x", "at_1", "at_t"] as const
+  const at = DateTime.makeUnsafe("2026-11-11T08:00:00.000Z")
+  const valueOf = (schema: Schema.Top) =>
+    schema === Schema.Date
+      ? new Date("2026-11-11T08:00:00.000Z")
+      : schema === DynamoModel.UnsafeDateString
+        ? "2026-11-11T08:00:00.000Z"
+        : schema === DynamoModel.DateTimeZoned
+          ? DateTime.makeZonedUnsafe(at, { timeZone: "Europe/London" })
+          : at
+
+  const world = (
+    dateSchema: Schema.Top,
+    label: string,
+    escapeKeys: boolean,
+    lead: ReadonlyArray<string> = [],
+  ) => {
+    const schema = DynamoSchema.make({ name: "dates", version: 1, escapeKeys })
+    const Outbox = Table.make({ schema, entities: {} })
+    const Model = Schema.Struct({
+      at: dateSchema as typeof Schema.DateTimeUtc,
+      [label]: Schema.String,
+      shop: Schema.String,
+      total: Schema.Number,
+      cp: Schema.optional(Schema.Number),
+      rev: Schema.optional(Schema.Number),
+    } as unknown as { at: typeof Schema.DateTimeUtc; total: typeof Schema.Number })
+    const key = { at: valueOf(dateSchema), [label]: "q", shop: "s" }
+    const sides = (["at", label] as const).map((composite, i) => {
+      const Ledgers = Entity.make({
+        model: Model as unknown as Schema.Struct<any>,
+        entityType: "Ledger",
+        primaryKey: {
+          pk: { field: "pk", composite: [...lead, composite] },
+          sk: { field: "sk", composite: [] },
+        },
+      } as any)
+      const ReadTable = Table.make({ schema, entities: { Ledgers } })
+      const Notifying = EventStore.projection({
+        stream: Orders,
+        readModel: Ledgers,
+        key: () => key,
+        initial: () => ({ ...key, total: 0 }),
+        evolve: (state: any, event: any) =>
+          Effect.succeed({ ...state, total: state.total + event.data.amount }),
+        checkpoint: "cp",
+        revision: "rev",
+        outbox: {
+          schema: Schema.String,
+          effects: () => [i === 0 ? "date" : "label"],
+          table: Outbox,
+          index,
+        },
+      } as any)
+      return { Ledgers, ReadTable, Notifying: Notifying as any, name: `read${i}` }
+    })
+    const table = makeRecordingTable({ indexes: { outbox: { pk: index.pk, sk: index.sk } } })
+    const layer = Layer.mergeAll(
+      table.layer,
+      EventsTable.layer({ name: "events" }),
+      Outbox.layer({ name: "outbox" }),
+      ...sides.map((side) => side.ReadTable.layer({ name: side.name })),
+    )
+    const bound = DynamoClient.make({
+      entities: { A: sides[0]!.Ledgers, B: sides[1]!.Ledgers },
+      tables: { Outbox, R0: sides[0]!.ReadTable, R1: sides[1]!.ReadTable },
+    } as any).pipe(
+      Effect.as("binds"),
+      Effect.catchDefect((cause) => Effect.succeed(String(cause))),
+    )
+    return { sides, layer, bound }
+  }
+
+  it.effect(
+    "after a string, a date beside a label stays refused, as on 1.40.0",
+    () =>
+      Effect.gen(function* () {
+        for (const escapeKeys of [false, true]) {
+          const w = world(Schema.DateTimeUtc, "at_x", escapeKeys, ["shop"])
+          // `shop_s#at_x_q#at_2026-…` is a key of both: `shop` can be `s#at_x_q`.
+          expect(yield* w.bound.pipe(Effect.provide(w.layer))).toContain(
+            "[EDD-9134] DynamoClient.make:",
+          )
+        }
+      }) as Effect.Effect<void, unknown>,
+  )
+
+  for (const escapeKeys of [false, true]) {
+    it.effect.each(datesSchemas)(
+      `%s beside each label (escapeKeys ${escapeKeys}): each drainer delivers its own`,
+      ([, dateSchema]) =>
+        Effect.gen(function* () {
+          const outcomes: Array<string> = []
+          for (const label of labels) {
+            const w = world(dateSchema, label, escapeKeys)
+            const result = yield* Effect.gen(function* () {
+              const bound = yield* w.bound
+              if (bound !== "binds") {
+                expect(bound).toContain("[EDD-9134] DynamoClient.make:")
+                return "refused"
+              }
+              const id = `${label}-${escapeKeys}`
+              yield* Orders.append({ id }, [new Placed({ amount: 2 })], 0)
+              const events = yield* Orders.read({ id })
+              for (const side of w.sides) yield* side.Notifying.applyBatch(events)
+              const delivered: Array<ReadonlyArray<unknown>> = []
+              for (const side of w.sides) {
+                const seen: Array<unknown> = []
+                yield* side.Notifying.drainPending((effect: unknown) =>
+                  Effect.sync(() => void seen.push(effect)),
+                )
+                delivered.push(seen)
+              }
+              expect(delivered).toEqual([["date"], ["label"]])
+              return "drains its own"
+            }).pipe(Effect.provide(w.layer))
+            outcomes.push(`${label}: ${result}`)
+          }
+          // A zoned date's text goes on in any text: only a label it can't start is apart.
+          expect(outcomes).toEqual(
+            dateSchema === DynamoModel.DateTimeZoned
+              ? ["at_x: drains its own", "at_1: refused", "at_t: drains its own"]
+              : labels.map((label) => `${label}: drains its own`),
+          )
+        }) as Effect.Effect<void, unknown>,
+    )
+  }
 })

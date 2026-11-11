@@ -2166,7 +2166,8 @@ export type CompositeValues =
 
 /**
  * @internal A walked composite's value in a {@link KeySpace}: any text without the delimiter, the
- * empty text included (`text`); a number's or a bigint's key text under any setting (`number`:
+ * empty text included (`text`); any text at all, the delimiter included (`any`: a value walked past
+ * with `walkOpen`); a number's or a bigint's key text under any setting (`number`:
  * digits and `-+.:;)*`, never the delimiter, and of letters only `e` and those of `Infinity`, as
  * 1.36's text spells them, in any casing; it starts with a digit, `-`, `:` or `;`); a date's ISO
  * text under any setting and casing (`date`: it starts with a digit, or the sign of a year past
@@ -2175,6 +2176,7 @@ export type CompositeValues =
  */
 export type KeyValueText =
   | { readonly kind: "text" }
+  | { readonly kind: "any" }
   | { readonly kind: "number" }
   | { readonly kind: "date"; readonly zoned: boolean }
   | { readonly kind: "oneOf"; readonly texts: ReadonlyArray<string> }
@@ -2203,7 +2205,10 @@ export interface KeySpace {
  * escaped, so text after one can always match another key's. Without `valuesOf`, at the first
  * composite. A composite limited to `values` is their key text under the schema's setting, or
  * with `everyForm` under every setting a row can have been written under (`escapeKeys` on, off,
- * and the 1.37 numeric text): the fixed text is the same under all of them.
+ * and the 1.37 numeric text): the fixed text is the same under all of them. With `walkOpen` the
+ * walk goes on past a composite that can hold the delimiter too, its value any text (`any`), so
+ * the space is exactly the keys the composer writes for values of those kinds, to the end of the
+ * key.
  */
 export const composeKeySpace = (
   schema: DynamoSchema.DynamoSchema,
@@ -2211,7 +2216,9 @@ export const composeKeySpace = (
   entityVersion: number,
   index: IndexDefinition,
   valuesOf: (composite: string) => CompositeValues = () => "open",
-  options?: { readonly everyForm?: boolean | undefined } | undefined,
+  options?:
+    | { readonly everyForm?: boolean | undefined; readonly walkOpen?: boolean | undefined }
+    | undefined,
 ): { readonly pk: KeySpace; readonly sk: KeySpace } => {
   const casing = index.casing ?? schema.casing
   const forms: ReadonlyArray<DynamoSchema.DynamoSchema> =
@@ -2251,6 +2258,10 @@ export const composeKeySpace = (
     for (const name of composite) {
       walked.push(name)
       const of = valuesOf(name)
+      if (of === "open" && options?.walkOpen === true) {
+        values.push({ kind: "any" })
+        continue
+      }
       if (of === "open") {
         open = true
         break
@@ -2343,10 +2354,10 @@ const keyAutomaton = (
   space.after.forEach((text, i) => {
     const value = space.values?.[i] ?? { kind: "text" }
     const end = state()
-    if (value.kind === "text") {
+    if (value.kind === "text" || value.kind === "any") {
       const loop = state()
       empty[at]!.push(loop)
-      edges[loop]!.push([NOT_DELIMITER, loop])
+      edges[loop]!.push([value.kind === "any" ? ANY_CHARACTER : NOT_DELIMITER, loop])
       empty[loop]!.push(end)
     } else if (value.kind === "number") {
       const digits = state()

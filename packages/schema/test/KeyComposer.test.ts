@@ -3787,6 +3787,43 @@ describe("composeKeySpace", () => {
     expect(meet(["shop"], ["shop", "idB"])).toBe(true)
   })
 
+  it("with walkOpen, is every key the composer writes, a value holding the delimiter as any text", () => {
+    const valuesOf = (name: string): KeyComposer.CompositeValues =>
+      name === "at" ? "date" : "open"
+    const space = (pk: ReadonlyArray<string>) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, []), valuesOf, {
+        everyForm: true,
+        walkOpen: true,
+      }).pk
+    const any = { kind: "any" }
+    expect(space(["shop", "at"])).toEqual({
+      text: "$a#v1#ledger#shop_",
+      after: ["#at_", ""],
+      values: [any, { kind: "date", zoned: false }],
+      open: false,
+    })
+    const key = (text: string) => ({ text: `$a#v1#ledger#${text}`, after: [], open: false })
+    const owns = (pk: ReadonlyArray<string>, text: string) =>
+      KeyComposer.keySpacesMeet(space(pk), key(text))
+    // A date's text, after a string holding the delimiter.
+    expect(owns(["shop", "at"], "shop_s#at_2026-11-11t08:00:00.000z")).toBe(true)
+    expect(owns(["shop", "at"], "shop_s#x#at_2026-11-11t08:00:00.000z")).toBe(true)
+    // What no date writes, though a reader would take it as the date's text.
+    expect(owns(["shop", "at"], "shop_s#at_x_q")).toBe(false)
+    expect(owns(["at"], "at_x_q")).toBe(false)
+    // A string reads past the next label: the longer key is the shorter's too.
+    expect(owns(["shop"], "shop_s#branch_b")).toBe(true)
+    // Without walkOpen the walk stops at the string, and anything follows it.
+    expect(
+      KeyComposer.keySpacesMeet(
+        KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop", "at"], []), valuesOf, {
+          everyForm: true,
+        }).pk,
+        key("shop_s#at_x_q"),
+      ),
+    ).toBe(true)
+  })
+
   it("meets another when either could start the other", () => {
     const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>) =>
       KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk))
