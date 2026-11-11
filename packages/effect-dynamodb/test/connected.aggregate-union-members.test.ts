@@ -2,7 +2,8 @@
  * `AggregateUnionMembers.test.ts` against DynamoDB Local: each shape in
  * `helpers/UnionMemberShapes.ts` sends, stores and returns what published 1.39.0 did there
  * (`fixtures/aggregate-union-members-1.39.0.json`, generated once from the published package:
- * don't regenerate or "fix" it). DynamoDB Local hands a row's attributes back in its own order, so
+ * don't regenerate or "fix" it), and `create` returns what it did for the shapes
+ * `fixtures/aggregate-create-result-1.39.0.json` holds. DynamoDB Local hands a row's attributes back in its own order, so
  * this also sees an element read back in that order instead of its member's.
  *
  * Prerequisites:
@@ -16,12 +17,13 @@ import { Config, Effect, Layer } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import {
-  createLineUnclassed,
+  compareCreateResult,
+  createResultFieldShapes,
   elementShapes,
   fieldShapes,
   judged,
-  judgedUnclassed,
   type Recorded,
+  renameShapes,
   runShape,
   sortedRows,
 } from "./helpers/UnionMemberShapes.js"
@@ -50,6 +52,13 @@ const fixture = JSON.parse(
 ) as {
   readonly elements: Record<string, Recorded>
   readonly fields: Record<string, Recorded>
+}
+
+const createResults = JSON.parse(
+  readFileSync(new URL("./fixtures/aggregate-create-result-1.39.0.json", import.meta.url), "utf8"),
+) as {
+  readonly fields: Record<string, Recorded>
+  readonly renames: Record<string, Recorded>
 }
 
 let tables = 0
@@ -123,9 +132,7 @@ describeConnected(
             const actual = yield* runShape(define, place).pipe(Effect.ensuring(Effect.ignore(drop)))
             const expected = fixture[group][label]!
             for (const step of ["create", "get", "update", "getAfterUpdate"] as const) {
-              const judge =
-                step === "create" && createLineUnclassed(label) ? judgedUnclassed : judged
-              expect({ step, ...judge(actual[step]) }).toEqual({ step, ...judge(expected[step]) })
+              expect({ step, ...judged(actual[step]) }).toEqual({ step, ...judged(expected[step]) })
             }
             expect(actual.requests).toEqual(expected.requests)
             expect(actual.rows).toEqual(expected.rows)
@@ -137,3 +144,20 @@ describeConnected(
     }
   },
 )
+
+describeConnected("an aggregate's create returns what 1.39.0 did, on DynamoDB Local", () => {
+  for (const [group, shapes] of [
+    ["fields", createResultFieldShapes()],
+    ["renames", renameShapes()],
+  ] as const) {
+    for (const [label, define] of Object.entries(shapes)) {
+      it.effect(`${label}: create returns what 1.39.0 did`, () =>
+        Effect.gen(function* () {
+          const { place, drop } = yield* onDynamoDbLocal
+          const actual = yield* runShape(define, place).pipe(Effect.ensuring(Effect.ignore(drop)))
+          compareCreateResult(group, label, actual, createResults[group][label]!)
+        }),
+      )
+    }
+  }
+})

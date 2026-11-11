@@ -15,9 +15,10 @@
  * A field transformed to `Unknown` given a value its transformation can't store was stored as given;
  * 1.39.0 refused it.
  *
- * Twelve element shapes (`createLineUnclassed`) return a plain object for the `Line` 1.39.0 returned
- * as an instance from `create`, by a release-branch change this fix leaves alone; their `create` is
- * compared without class names.
+ * `create` given a value in the form a transformation to `Unknown` stores also returned what 1.39.0
+ * did not: a field's value undecoded, and a `Line` as a plain object where 1.39.0 returned the
+ * instance. `fixtures/aggregate-create-result-1.39.0.json` holds 1.39.0's for those fields, and for
+ * the element shapes of a union whose other member renames a field (`compareCreateResult`).
  */
 import { readFileSync } from "node:fs"
 import { it } from "@effect/vitest"
@@ -25,12 +26,13 @@ import { Effect } from "effect"
 import { describe, expect } from "vitest"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import {
-  createLineUnclassed,
+  compareCreateResult,
+  createResultFieldShapes,
   elementShapes,
   fieldShapes,
   judged,
-  judgedUnclassed,
   type Recorded,
+  renameShapes,
   runShape,
   sortedRows,
 } from "./helpers/UnionMemberShapes.js"
@@ -41,6 +43,14 @@ const fixture = JSON.parse(
   readonly generatedFrom: string
   readonly elements: Record<string, Recorded>
   readonly fields: Record<string, Recorded>
+}
+
+const createResults = JSON.parse(
+  readFileSync(new URL("./fixtures/aggregate-create-result-1.39.0.json", import.meta.url), "utf8"),
+) as {
+  readonly generatedFrom: string
+  readonly fields: Record<string, Recorded>
+  readonly renames: Record<string, Recorded>
 }
 
 const onRecordingTable = () => {
@@ -57,10 +67,9 @@ const onRecordingTable = () => {
   }
 }
 
-const compare = (label: string, actual: Recorded, expected: Recorded) => {
+const compare = (actual: Recorded, expected: Recorded) => {
   for (const step of ["create", "get", "update", "getAfterUpdate"] as const) {
-    const judge = step === "create" && createLineUnclassed(label) ? judgedUnclassed : judged
-    expect({ step, ...judge(actual[step]) }).toEqual({ step, ...judge(expected[step]) })
+    expect({ step, ...judged(actual[step]) }).toEqual({ step, ...judged(expected[step]) })
   }
   expect(actual.requests).toEqual(expected.requests)
   expect(actual.rows).toEqual(expected.rows)
@@ -86,7 +95,32 @@ describe("an aggregate's union elements and fields transformed to Unknown, as 1.
       it.effect(`${label}: sends, stores and returns what 1.39.0 did`, () =>
         Effect.gen(function* () {
           const actual = yield* runShape(define, onRecordingTable())
-          compare(label, actual, fixture[group][label]!)
+          compare(actual, fixture[group][label]!)
+        }),
+      )
+    }
+  }
+})
+
+describe("an aggregate's create returns what 1.39.0 did", () => {
+  const fields = createResultFieldShapes()
+  const renames = renameShapes()
+
+  it("the fixture is published 1.39.0's, and holds every shape", () => {
+    expect(createResults.generatedFrom).toBe("effect-dynamodb@1.39.0")
+    expect(Object.keys(createResults.fields).sort()).toEqual(Object.keys(fields).sort())
+    expect(Object.keys(createResults.renames).sort()).toEqual(Object.keys(renames).sort())
+  })
+
+  for (const [group, shapes] of [
+    ["fields", fields],
+    ["renames", renames],
+  ] as const) {
+    for (const [label, define] of Object.entries(shapes)) {
+      it.effect(`${label}: create returns what 1.39.0 did`, () =>
+        Effect.gen(function* () {
+          const actual = yield* runShape(define, onRecordingTable())
+          compareCreateResult(group, label, actual, createResults[group][label]!)
         }),
       )
     }

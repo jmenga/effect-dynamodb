@@ -834,10 +834,11 @@ const isTolerantLeaf = (schema: Schema.Top): boolean => {
  * `plainForm` also takes what a mutation's plain state holds for that domain (see `plainStateForms`),
  * asked before the stored side: a set held as a list is a domain value, even where what's stored is a list.
  *
- * `domainStored`: for a type side that takes anything (`takesAnything`), a value the transform can't
- * read as stored is a domain value only where the transform stores it. `Unknown` takes another union
- * member's value, or a `many` element its ref fetch changed; 1.39.0 read those through the member's
- * own struct, or refused them.
+ * `domainStored`: for a type side that takes anything (`takesAnything`), any value it takes is a
+ * domain value only where the transform stores it, whether or not the transform also reads it as
+ * stored. `Unknown` takes another union member's value, a `many` element its ref fetch changed, or a
+ * field's stored form; 1.39.0 read those through the member's own struct or the transform, or refused
+ * them, and `create` returns what it did.
  */
 const buildTolerantTransform = (
   schema: Schema.Top,
@@ -860,12 +861,7 @@ const buildTolerantTransform = (
   }
   const validateDomain = (value: unknown): Option.Option<unknown> => {
     const typed = validateType(value)
-    return domainStored &&
-      typed._tag === "Some" &&
-      decodeWire(value)._tag === "None" &&
-      !stores(typed.value)
-      ? Option.none()
-      : typed
+    return domainStored && typed._tag === "Some" && !stores(typed.value) ? Option.none() : typed
   }
   const bigintDomain = SchemaAST.isBigInt(SchemaAST.toType(schema.ast))
   const decodePlain =
