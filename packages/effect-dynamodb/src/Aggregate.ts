@@ -999,10 +999,10 @@ type AttrEncoders = Record<string, AttrEncoder>
  */
 const dateAttrEncoder = (
   fieldSchema: Schema.Top,
-  options?: { readonly mixedUnions?: boolean },
+  options?: { readonly mixedUnions?: boolean; readonly keyText?: boolean },
 ): ((value: unknown) => unknown) | undefined => {
   if (options?.mixedUnions !== true && isMixedDateUnion(fieldSchema.ast)) return undefined
-  const encodings = storedDateEncodings(fieldSchema)
+  const encodings = storedDateEncodings(fieldSchema, options?.keyText === true)
   const last = encodings.at(-1)
   if (!last) return undefined
   // A union of dates of different kinds: a value is stored in the form of the kind it is.
@@ -1023,14 +1023,31 @@ const dateAttrEncoder = (
 
 /**
  * The encodings a date field's values are stored in, the last for a value of no earlier one's kind:
- * the field's own annotation, else those its schema's dates imply. Read off the field as declared, so
- * an annotation inside `Schema.optional`'s union isn't seen, and such a field's values are stored as
- * its date's default, ISO text, as 1.39.0 stored them. A stamp in a field a row declares is stored
- * the same way (`rowStampsOf`).
+ * the field's own annotation, or under `Schema.optional` its value's, as an entity's write reads it,
+ * else those its schema's dates imply. A stamp in a field a row declares is stored the same way
+ * (`rowStampsOf`).
+ *
+ * `keyText`: the encodings key text is composed from, read off the field as declared, so an
+ * annotation inside `Schema.optional`'s union isn't seen there and such a field's key text is its
+ * date's default, ISO text, as 1.39.0 and 1.40.0 composed it (they stored its values that way too,
+ * #241). A key never moves with a stored form.
  */
-const storedDateEncodings = (fieldSchema: Schema.Top): ReadonlyArray<DynamoEncoding> => {
-  const explicit = DynamoModel.getEncoding(fieldSchema)
+const storedDateEncodings = (
+  fieldSchema: Schema.Top,
+  keyText = false,
+): ReadonlyArray<DynamoEncoding> => {
+  const explicit =
+    DynamoModel.getEncoding(fieldSchema) ??
+    (keyText ? undefined : encodingUnderOptional(fieldSchema))
   return explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)
+}
+
+/** The encoding annotated on the value of a `Schema.optional` field, if that value is one schema. */
+const encodingUnderOptional = (fieldSchema: Schema.Top): DynamoEncoding | undefined => {
+  const optional = optionalField(fieldSchema)
+  return optional === undefined || optional.union !== undefined
+    ? undefined
+    : DynamoModel.getEncoding(optional.inner)
 }
 
 /** Whether a value is a date field's stored form: one its date encodings decode. */
@@ -1283,7 +1300,7 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
   if (!fields) return encoders
   for (const field of Object.keys(fields)) {
     const fieldSchema = fields[field]!
-    const date = dateAttrEncoder(fieldSchema, { mixedUnions: true })
+    const date = dateAttrEncoder(fieldSchema, { mixedUnions: true, keyText: true })
     if (date) {
       // Before, a value this encoder rejects (the `5` of a mixed date union)
       // threw and failed the write, so there is no stored key to stay
@@ -1617,15 +1634,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
   )
   // The form a stamp is stored in: on a row declaring its field, the form the row stores any value of
   // that field in ({@link storedDateEncodings}, as `buildAttrEncoders` reads it), else the stamp's
-  // own encoding. A row that doesn't declare it holds what the root's would.
+  // own encoding. A row that doesn't declare it holds what the root's would. With `keyText`, the form
+  // a key over it reads it in, as `buildKeyAttrEncoders` does.
   const storedIn = (
     fields: Record<string, Schema.Top> | undefined,
     name: string | null,
     declared: boolean,
     encoding: DynamoEncoding | null,
+    keyText = false,
   ): DynamoEncoding | null => {
     const field = declared && name !== null ? fields?.[name] : undefined
-    return (field === undefined ? undefined : storedDateEncodings(field).at(-1)) ?? encoding
+    return (
+      (field === undefined ? undefined : storedDateEncodings(field, keyText).at(-1)) ?? encoding
+    )
   }
   const stampFields: StampFields | undefined =
     timestampFields.createdAt !== null || timestampFields.updatedAt !== null
@@ -1637,12 +1658,26 @@ const makeAggregate = <TSchema extends Schema.Top>(
             timestampFields.createdAtCollision,
             timestampFields.createdAtEncoding,
           ),
+          createdKey: storedIn(
+            schemaFields,
+            timestampFields.createdAt,
+            timestampFields.createdAtCollision,
+            timestampFields.createdAtEncoding,
+            true,
+          ),
           updatedAt: timestampFields.updatedAt,
           updatedEncoding: storedIn(
             schemaFields,
             timestampFields.updatedAt,
             timestampFields.updatedAtCollision,
             timestampFields.updatedAtEncoding,
+          ),
+          updatedKey: storedIn(
+            schemaFields,
+            timestampFields.updatedAt,
+            timestampFields.updatedAtCollision,
+            timestampFields.updatedAtEncoding,
+            true,
           ),
         }
       : undefined
@@ -1687,6 +1722,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       createdStored: own.createdAtCollision
         ? storedIn(fields, own.createdAt, true, own.createdAtEncoding)
         : stampFields.createdEncoding,
+      createdKey: own.createdAtCollision
+        ? storedIn(fields, own.createdAt, true, own.createdAtEncoding, true)
+        : stampFields.createdKey,
       createdDeclared: own.createdAtCollision,
       createdRequired: own.createdAtCollision && requiredIn(fields, own.createdAt),
       createdReplaces,
@@ -1695,6 +1733,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
       updatedStored: own.updatedAtCollision
         ? storedIn(fields, own.updatedAt, true, own.updatedAtEncoding)
         : stampFields.updatedEncoding,
+      updatedKey: own.updatedAtCollision
+        ? storedIn(fields, own.updatedAt, true, own.updatedAtEncoding, true)
+        : stampFields.updatedKey,
       updatedDeclared: own.updatedAtCollision,
       updatedRequired: own.updatedAtCollision && requiredIn(fields, own.updatedAt),
       updatedReplaces,
@@ -6966,25 +7007,30 @@ const hashToShard = (value: string, cardinality: number): number => {
 interface StampFields {
   readonly createdAt: string | null
   readonly createdEncoding: DynamoEncoding | null
+  /** The form key text reads the root's `created` in (see `storedDateEncodings`). */
+  readonly createdKey: DynamoEncoding | null
   readonly updatedAt: string | null
   readonly updatedEncoding: DynamoEncoding | null
+  readonly updatedKey: DynamoEncoding | null
 }
 
 /**
  * What a node's rows do with each timestamp: see `rowStampsOf`. A null name isn't stamped. The
  * encoding is the form `create`'s input takes the stamp in, which the field's schema decodes; the
- * stored form is what's written.
+ * stored form is what's written, and the key form what a key over it reads.
  */
 interface RowStamps {
   readonly createdAt: string | null
   readonly createdEncoding: DynamoEncoding | null
   readonly createdStored: DynamoEncoding | null
+  readonly createdKey: DynamoEncoding | null
   readonly createdDeclared: boolean
   readonly createdRequired: boolean
   readonly createdReplaces: boolean
   readonly updatedAt: string | null
   readonly updatedEncoding: DynamoEncoding | null
   readonly updatedStored: DynamoEncoding | null
+  readonly updatedKey: DynamoEncoding | null
   readonly updatedDeclared: boolean
   readonly updatedRequired: boolean
   readonly updatedReplaces: boolean
@@ -7156,6 +7202,59 @@ const EMPTY_CREATED: ReadonlyMap<string, unknown> = new Map()
 const hasKeyValue = (value: unknown): boolean => value !== undefined && value !== null
 
 /**
+ * A stamp in the date form `to`: as it is when it's in that form already, else the instant it holds
+ * in the form `from`, written in `to`'s. A row written before #241 holds a date under
+ * `Schema.optional` as ISO text where its field declares another encoding; that is the only pair of
+ * forms that differ, and with `to` and `from` the same this is the value as it is. Anything neither
+ * form takes is as it is.
+ */
+const inStampForm = (
+  value: unknown,
+  to: DynamoEncoding | null,
+  from: DynamoEncoding | null,
+): unknown => {
+  if (
+    value === undefined ||
+    to === null ||
+    from === null ||
+    (to.storage === from.storage && to.domain === from.domain)
+  ) {
+    return value
+  }
+  const forms = stampForms(to, from)
+  if (Option.isSome(forms.inTo(value))) return value
+  return Option.match(forms.fromInstant(value), {
+    onNone: () => value,
+    onSome: (instant) => Option.getOrElse(forms.toWire(instant), () => value),
+  })
+}
+
+const stampFormCache = new Map<
+  string,
+  {
+    readonly inTo: (value: unknown) => Option.Option<unknown>
+    readonly fromInstant: (value: unknown) => Option.Option<unknown>
+    readonly toWire: (value: unknown) => Option.Option<unknown>
+  }
+>()
+
+/** The decoders and encoder `inStampForm` uses for a pair of forms, built once per pair. */
+const stampForms = (to: DynamoEncoding, from: DynamoEncoding) => {
+  const id = `${to.storage}:${to.domain}<${from.storage}:${from.domain}`
+  const cached = stampFormCache.get(id)
+  if (cached !== undefined) return cached
+  const strict = (encoding: DynamoEncoding) =>
+    buildDateTransform(encoding, { strictWireKind: true }) as Schema.Codec<any>
+  const forms = {
+    inTo: Schema.decodeUnknownOption(strict(to)),
+    fromInstant: Schema.decodeUnknownOption(strict(from)),
+    toWire: Schema.encodeUnknownOption(buildDateTransform(to) as Schema.Codec<any>),
+  }
+  stampFormCache.set(id, forms)
+  return forms
+}
+
+/**
  * Convert decomposed items into DynamoDB attribute maps with composed keys.
  *
  * `stamp` is applied HERE rather than in `decomposeAggregate` on purpose: update
@@ -7218,25 +7317,45 @@ const buildDynamoItems = (
       // propagated onto edge items via `context`; known first, so a key over one holds what the row
       // holds. A date the row declares holds what the row does: on `create` the stamp `fillStamps`
       // put there, on `update` a value the mutation changed, and `created` stays what's stored
-      // whatever the mutation did to it.
+      // whatever the mutation did to it. One kept from the stored row is written in the row's form
+      // (a row written before #241 holds a date under `Schema.optional` as ISO text), and a key over
+      // one reads it in the key's form, so a key never moves with a stored form (`keyed`).
       const stamped: Record<string, unknown> = {}
+      const keyed: Record<string, unknown> = {}
       const row = item.rowStamps
       if (stamp && row !== undefined) {
         const { existingCreated, now } = stamp
         const sk = attrs.sk as string
         if (row.createdAt !== null) {
           const held = row.createdDeclared ? item.attributes[row.createdAt] : undefined
+          const kept = existingCreated.get(sk)
           stamped[row.createdAt] =
-            existingCreated.get(sk) ?? held ?? generateTimestampPrimitive(now, row.createdStored)
+            kept !== undefined
+              ? inStampForm(kept, row.createdStored, row.createdKey)
+              : (held ?? generateTimestampPrimitive(now, row.createdStored))
+          keyed[row.createdAt] = inStampForm(
+            stamped[row.createdAt],
+            row.createdKey,
+            row.createdStored,
+          )
         }
         if (row.updatedAt !== null) {
           const held = row.updatedDeclared ? item.attributes[row.updatedAt] : undefined
           const before = stamp.updatedBefore
           const supplied =
             held !== undefined && !(before?.has(sk) && deepEqual(before.get(sk), held))
+          const kept = stamp.existingUpdated?.get(sk)
           stamped[row.updatedAt] =
-            stamp.existingUpdated?.get(sk) ??
-            (supplied ? held : generateTimestampPrimitive(now, row.updatedStored))
+            kept !== undefined
+              ? inStampForm(kept, row.updatedStored, row.updatedKey)
+              : supplied
+                ? held
+                : generateTimestampPrimitive(now, row.updatedStored)
+          keyed[row.updatedAt] = inStampForm(
+            stamped[row.updatedAt],
+            row.updatedKey,
+            row.updatedStored,
+          )
         }
       }
 
@@ -7261,7 +7380,7 @@ const buildDynamoItems = (
                 AGGREGATE_KEY.collectionSort,
                 schema,
                 collectionSk.composite,
-                keyRecord({ ...rootValue, ...stamped }),
+                keyRecord({ ...rootValue, ...keyed }),
               ),
             )
           : composeKey(config.schema, item.entityType, [...item.skComposites])
@@ -7274,7 +7393,7 @@ const buildDynamoItems = (
       if (rootValue !== undefined && isRootItem && config.list) {
         const listKeyValues = keyRecord({
           ...(item.keyAttributes ?? item.attributes),
-          ...stamped,
+          ...keyed,
         })
         const listComposites = [...config.list.pk.composite, ...config.list.sk.composite]
         if (listComposites.every((attr) => hasKeyValue(listKeyValues[attr]))) {
