@@ -736,6 +736,12 @@ export const RESOLVED: ReadonlyMap<
     "unchecked: pathAppend to a union of lists, of elements no list takes",
     ["refuses what wouldn't read"],
   ],
+  // The row lacks `meta.optional`: the operand would be stored there.
+  ["refused: pathIfNotExists", ["refused where stored"]],
+  [
+    "refused: pathIfNotExists holding a copy's properties, of a value its schema refuses",
+    ["refused where stored"],
+  ],
 ])
 
 /** A case's name: its key without the entity's kind and how it was sent. */

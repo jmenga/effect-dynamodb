@@ -7,9 +7,10 @@
 import { readdirSync, readFileSync, statSync } from "node:fs"
 import { join, relative } from "node:path"
 import { fileURLToPath } from "node:url"
+import type { UpdateItemCommandInput } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
-import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
+import { DynamoError, ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { holdsCustomDeclaration } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   Cause,
@@ -49,7 +50,11 @@ const FromStruct = Schema.Struct({ x: Schema.Number, y: Schema.Number }).pipe(
 )
 class Located extends Schema.Class<Located>("Located")({ x: Schema.Number }) {}
 
-/** A client whose writes are recorded and whose reads find a row that holds nothing of note. */
+/**
+ * A client whose writes are recorded and whose reads find a row that holds nothing of note. An
+ * update requiring an attribute (`attribute_exists(#fb0)`, a `pathIfNotExists` whose operand would
+ * be refused where stored, #236) is refused as DynamoDB refuses it on that row, writing nothing.
+ */
 const recording = () => {
   const writes: Array<string> = []
   const write = (name: string) => () =>
@@ -61,7 +66,25 @@ const recording = () => {
   const orderRoot = toAttributeMap({ pk: "p", sk: "s", __edd_e__: "Order", id: "a" })
   const layer = mockDynamoClientLayer({
     putItem: write("putItem"),
-    updateItem: write("updateItem"),
+    updateItem: (input: UpdateItemCommandInput) => {
+      const required = input.ExpressionAttributeNames?.["#fb0"]
+      if (
+        input.ConditionExpression?.includes("attribute_exists(#fb0)") === true &&
+        required !== undefined &&
+        !Object.hasOwn(row, required)
+      ) {
+        return Effect.fail(
+          new DynamoError({
+            operation: "UpdateItem",
+            cause: Object.assign(new Error("The conditional request failed"), {
+              name: "ConditionalCheckFailedException",
+              Item: row,
+            }),
+          }),
+        ) as never
+      }
+      return write("updateItem")()
+    },
     deleteItem: write("deleteItem"),
     transactWriteItems: write("transactWriteItems"),
     batchWriteItem: write("batchWriteItem"),

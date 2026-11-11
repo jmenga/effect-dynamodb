@@ -11,7 +11,9 @@
  * - where 1.39.0 sent a write, this source sends the same requests, byte for byte, and the update
  *   ends as it ended (written and read back, or written and then failing to decode);
  * - where 1.39.0 refused the operand, this source refuses it with the same error, and sends
- *   nothing: 1.39.0 had read first on a retained entity and in a transaction;
+ *   nothing: 1.39.0 had read first on a retained entity and in a transaction. But a
+ *   `pathIfNotExists` operand is refused only where the row lacks its path (#236), as the row
+ *   these cases seed lacks `meta.optional`: after the read or the guarded write that finds it;
  * - no operand 1.39.0 wrote is refused, and no operand it refused is written;
  * - but where 1.39.0 wrote a row that didn't read, at a position the read schema resolves exactly
  *   (#236: `RESOLVED`), an operand none of the position's readers reads is refused with nothing
@@ -81,12 +83,17 @@ describe("what the fixture holds", () => {
     // The ones the timing changes: 1.39.0 had sent a read before it refused.
     expect(refused.filter(([, was]) => was.requests.length > 0).length).toBeGreaterThan(40)
   })
-  it("every case resolved since is one 1.39.0 wrote and then couldn't read", () => {
-    for (const name of RESOLVED.keys()) {
+  it("every case resolved since is one 1.39.0 wrote and then couldn't read, or refused", () => {
+    for (const [name, [since]] of RESOLVED) {
       const each = matrix.filter((one) => nameOf(one.key) === name)
       expect(each.length).toBeGreaterThan(0)
       for (const one of each) {
         const was = fixture.cases[one.key]!
+        if (since === "refused where stored") {
+          // A `pathIfNotExists` operand 1.39.0 refused before reading the row.
+          expect(refusedOperand(was)).toBe(true)
+          continue
+        }
         expect(wrote(was)).toBe(true)
         expect(was.reads).toBe(false)
       }

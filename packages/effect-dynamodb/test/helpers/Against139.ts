@@ -91,6 +91,16 @@ export const wrote = (outcome: Outcome): boolean =>
  *   The same requests are sent, holding the operand as its reader reads it back (`"7"`, not `7`:
  *   `stored` names the two forms), and the row reads.
  *
+ * And for a `pathIfNotExists` operand that 1.39.0 refused, or that it wrote where the row then
+ * didn't read (#236): it is refused only where its path is absent, since only there would it be
+ * stored. The update finds out by the request {@link fallbackDecided} names:
+ *
+ * - `"refused where stored"`: the case's row lacks the path. The operand is refused with the error
+ *   1.39.0 refused it with (or, where 1.39.0 wrote it, as an operand that wouldn't read), and
+ *   nothing is written;
+ * - `"kept where present"`: the row holds the path, so DynamoDB keeps the stored value and the
+ *   operand is never stored. The update is written and succeeds, and the row reads.
+ *
  * And for every case: an update that wrote a row its reader then couldn't decode failed with a
  * `ValidationError` whose operation was `decode`; the release branch reports the same failure as
  * operation `update`, saying the update was applied.
@@ -101,6 +111,8 @@ export type Since139 =
   | "names the property"
   | "refuses what wouldn't read"
   | "stores what reads"
+  | "refused where stored"
+  | "kept where present"
 
 /** An update that was written and whose row then didn't decode, in either release's words. */
 const writtenUnreadable = (outcome: Outcome): boolean =>
@@ -125,6 +137,50 @@ const differences = (was: unknown, got: unknown): ReadonlyArray<readonly [unknow
   return keys.flatMap((key) => differences(was[key], got[key]))
 }
 
+/** A consistent read of a row. */
+const readsRow = (request: Request | undefined): boolean =>
+  request?.command === "GetItem" && (request.input as any)?.ConsistentRead === true
+
+/** An update sent requiring `pathIfNotExists` paths, beside the row's own guard. */
+const guardedUpdate = (request: Request | undefined): boolean => {
+  const input = request?.input as Record<string, any> | undefined
+  return (
+    request?.command === "UpdateItem" &&
+    /^attribute_exists\(#exists\)( AND attribute_exists\(#fb\d+((\.#fb\d+)|\[\d+\])*\))+$/.test(
+      String(input?.ConditionExpression),
+    ) &&
+    input?.ReturnValuesOnConditionCheckFailure === "ALL_OLD"
+  )
+}
+
+/**
+ * Whether `requests` find a `pathIfNotExists` path absent or present before writing it: a
+ * consistent read of the row (a retained entity's update, a transaction's plan) before any write,
+ * or, for an update that reads nothing, its write sent requiring the path, so that DynamoDB's
+ * refusal returns the row without it.
+ */
+export const fallbackDecided = (requests: ReadonlyArray<Request>): boolean => {
+  const firstWrite = requests.findIndex((request) => request.command !== "GetItem")
+  if (firstWrite === -1) return readsRow(requests.at(-1))
+  return guardedUpdate(requests[firstWrite]) || readsRow(requests[firstWrite - 1])
+}
+
+/** An update request without the `attribute_exists(<path>)` guards {@link fallbackDecided} names. */
+const unguarded = (request: Request | undefined): unknown => {
+  if (request?.command !== "UpdateItem") return request
+  const input = { ...(request.input as Record<string, any>) }
+  input.ConditionExpression = String(input.ConditionExpression).replace(
+    / AND attribute_exists\(#fb\d+((\.#fb\d+)|\[\d+\])*\)/g,
+    "",
+  )
+  input.ExpressionAttributeNames = Object.fromEntries(
+    Object.entries(input.ExpressionAttributeNames as Record<string, string>).filter(
+      ([name]) => !/^#fb\d+$/.test(name),
+    ),
+  )
+  return { command: request.command, input }
+}
+
 /** How an update ended. */
 const ending = (outcome: Outcome): unknown =>
   writtenUnreadable(outcome) ? "written, and the row doesn't decode" : (outcome.failure ?? "ok")
@@ -142,6 +198,30 @@ export const expectAs139 = (
     expect(got.requests).toEqual(
       JSON.parse(JSON.stringify(was.requests).replace(/("#ps\d+"):"renamed"/g, '$1:"count"')),
     )
+    return
+  }
+  if (since === "refused where stored" || since === "kept where present") {
+    // 1.39.0 refused it, or wrote it and left a row that didn't read.
+    expect(refusedOperand(was) || (wrote(was) && !was.reads)).toBe(true)
+    expect(fallbackDecided(got.requests)).toBe(true)
+    const guarded = got.requests.find(guardedUpdate)
+    if (guarded !== undefined && wrote(was)) {
+      // The update 1.39.0 sent, requiring the path.
+      expect(unguarded(guarded)).toEqual(
+        was.requests.find((request) => request.command === "UpdateItem"),
+      )
+    }
+    if (since === "refused where stored") {
+      // Reads, or the guarded update DynamoDB refuses: nothing else is sent.
+      const writes = got.requests.filter((request) => request.command !== "GetItem")
+      expect(writes.length === 0 || (writes.length === 1 && guardedUpdate(writes[0]))).toBe(true)
+      expect(refusedOperand(got)).toBe(true)
+      if (refusedOperand(was)) expect(got.failure).toEqual(was.failure)
+    } else {
+      expect(wrote(got)).toBe(true)
+      expect(got.ok).toBe(true)
+    }
+    expect(got.reads).toBe(true)
     return
   }
   if (since === "refuses what wouldn't read" || since === "stores what reads") {

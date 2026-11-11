@@ -158,13 +158,19 @@ describeConnected("an update with an operand, on DynamoDB Local", () => {
                 const got = yield* send(db, row, n, transaction, each.apply, each.seeded, world)
                 const since = RESOLVED.get(nameOf(each.key))?.[0]
                 if (since !== undefined) {
-                  const refusing = since === "refuses what wouldn't read"
+                  // A `pathIfNotExists` operand is refused where the row lacks its path, which
+                  // the case's row does: with the error 1.39.0 refused it with.
+                  const refusing =
+                    since === "refuses what wouldn't read" || since === "refused where stored"
                   expect(`${each.key}: ${Exit.isSuccess(got.exit)}`).toBe(
                     `${each.key}: ${!refusing}`,
                   )
                   expect(`${each.key}: ${Exit.isSuccess(got.read)}`).toBe(`${each.key}: true`)
                   if (refusing) {
                     expect(failureOf(got.exit)).toMatchObject({ error: "ValidationError" })
+                    if (since === "refused where stored" && refusedOperand(was)) {
+                      expect(failureOf(got.exit)).toEqual(was.failure)
+                    }
                     expect(got.after).toEqual(got.before)
                   }
                   continue

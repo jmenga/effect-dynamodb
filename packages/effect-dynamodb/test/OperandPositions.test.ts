@@ -16,6 +16,9 @@
  * - where 1.39.0 wrote a row that didn't read, at a position the read schema resolves exactly
  *   (#236: `RESOLVED`), the operand none of the position's readers reads is refused with nothing
  *   sent, and one only its encoded form is valid for is stored as its reader reads it;
+ * - a `pathIfNotExists` operand either of those refuses is refused only where the row lacks its
+ *   path, where it would be stored: the row a case seeds lacks the position, but for a leaf
+ *   without an `absent` one, which the seed holds (`"refused where stored"`, `"kept where present"`);
  * - nothing else changes: no other position 1.39.0 didn't check is checked, and no operand is
  *   encoded otherwise than 1.39.0 encoded it.
  */
@@ -32,7 +35,7 @@ import {
   type Since139,
   wrote,
 } from "./helpers/Against139.js"
-import { capture, kinds, matrix } from "./helpers/OperandPositions.js"
+import { type Case, capture, kinds, matrix } from "./helpers/OperandPositions.js"
 
 const read = (name: string) =>
   (
@@ -75,13 +78,37 @@ const RESOLVED: ReadonlyMap<string, ReadonlySet<string>> = new Map([
   ["a sparse map's entry keyed `hasOwnProperty`", invalid],
 ])
 
+/** Whether the row a case seeds holds the path its operation names (`field#entry` an entry). */
+const holdsPath = (each: Case): boolean => {
+  const own = (at: unknown, key: string | number): { readonly at: unknown } | undefined =>
+    typeof at === "object" && at !== null && Object.hasOwn(at, key)
+      ? { at: (at as Record<string | number, unknown>)[key] }
+      : undefined
+  let held: { readonly at: unknown } | undefined = { at: { target: each.kind.seed } }
+  for (const segment of each.segments) {
+    const [field, ...entry] = typeof segment === "string" ? segment.split("#") : [segment]
+    held = held === undefined ? undefined : own(held.at, field!)
+    if (entry.length > 0) held = held === undefined ? undefined : own(held.at, entry.join("#"))
+  }
+  return held !== undefined
+}
+
 /** What this source does otherwise than 1.39.0 for a case, if anything. */
-const since = (kind: string, operand: string, was: Outcome): Since139 | undefined => {
+const since = (each: Case, was: Outcome): Since139 | undefined => {
+  const kind = each.kind.name
+  const operand = each.operand
+  const unreadable = RESOLVED.get(kind)?.has(operand) === true && wrote(was) && !was.reads
+  if (
+    each.op === "pathIfNotExists" &&
+    (refusedOperand(was) || (unreadable && operand === "invalid"))
+  ) {
+    return holdsPath(each) ? "kept where present" : "refused where stored"
+  }
   // The release branch reads a row 1.39.0 wrote here and then couldn't decode.
   if (kind === "a decoding default" && operand === "valid only encoded") return "reads"
   // It reads an entry keyed `__proto__`, which 1.39.0's read dropped.
   if (kind.endsWith("keyed `__proto__`") && operand === "invalid") return "reads the entry"
-  if (RESOLVED.get(kind)?.has(operand) === true && wrote(was) && !was.reads) {
+  if (unreadable) {
     return operand === "invalid" ? "refuses what wouldn't read" : "stores what reads"
   }
   return undefined
@@ -109,11 +136,7 @@ describe("the matrix of operand positions against published 1.39.0", () => {
         it.effect(`${each.op} / ${each.operand} / ${each.sending}`, () =>
           Effect.gen(function* () {
             const was = fixture.cases[each.key]!
-            expectAs139(
-              yield* capture(Lib as never, each),
-              was,
-              since(kind.name, each.operand, was),
-            )
+            expectAs139(yield* capture(Lib as never, each), was, since(each, was))
           }),
         )
       }
@@ -129,11 +152,18 @@ describe("the matrix of operand positions against published 1.39.0", () => {
             (each) =>
               each.kind.name === name &&
               each.operand === operand &&
-              since(name, operand, fixture.cases[each.key]!) !== undefined,
+              since(each, fixture.cases[each.key]!) !== undefined,
           ),
         ).toBe(true)
       }
     }
+  })
+
+  it("a pathIfNotExists operand a check refuses: refused where the row lacks its path, else kept", () => {
+    // The cases `since` names, so a change to the rule shows here as well as in each case.
+    const outcomes = matrix.map((each) => since(each, fixture.cases[each.key]!))
+    expect(outcomes.filter((outcome) => outcome === "refused where stored").length).toBe(93)
+    expect(outcomes.filter((outcome) => outcome === "kept where present").length).toBe(6)
   })
 
   it("a retained entity's update read the row before 1.39.0 refused its operand", () => {

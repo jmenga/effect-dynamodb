@@ -3380,10 +3380,11 @@ a dynamic key of an untyped value) are passed through. Each such operand is
 encoded and checked against the schema at its path once, in `prepareUpdate`
 (`encodeOperands`), and written as encoded there: one the schema refuses fails
 the update with a `ValidationError` (`operation` `update.append`,
-`update.pathSet`, `update.pathAppend`, `update.pathPrepend` or
-`update.pathIfNotExists`) before it reads or sends anything, alone or in a
-`transactWrite`. It used to be decided as the write was built, after the reads
-of an update that reads first, so a failed read was reported in its place.
+`update.pathSet`, `update.pathAppend` or `update.pathPrepend`) before it reads
+or sends anything, alone or in a `transactWrite`. It used to be decided as the
+write was built, after the reads of an update that reads first, so a failed read
+was reported in its place. A `pathIfNotExists` operand is the exception: it is
+refused only where it would be stored (below).
 A copy (`pathSet` or `pathSubtract` naming another attribute, `isPath`) holds no
 operand: its `value` isn't written, so nothing reads it, encodes it or checks
 that it would store or read back.
@@ -3396,6 +3397,32 @@ as it read and built the write: a missing item (`ItemNotFound`), a stale
 another value on a retained entity (`ValidationError` `update`), a ref whose
 target isn't there (`RefNotFound`), a packed value with no compressor
 (`ValidationError` `update.packed`).
+
+**A `pathIfNotExists` operand is refused only where it would be stored (#236).**
+DynamoDB stores `if_not_exists(<path>, :v)`'s operand only where the row lacks
+the path; where the row has it, the stored value stays. So an operand a check
+refuses (the schema at its path, the read where it resolves the position, a
+custom declaration's read-back, `EDD-9126`) is not refused before reading:
+`encodeOperands` records it (`fallbacks`), and `fallbackRefusal` (`Entity.ts`),
+the one decision, refuses it with that check's error where the row as stored
+lacks the path (`pathPresent`, the path as `compilePath` resolves it). An update
+that reads its row decides on that read, before sending: a retained entity's,
+one restating a packed immutable, one clearing a sparse map, and every update
+`transactWrite` plans (`planned`'s `refuse`). One that reads nothing sends its
+write requiring the path, `attribute_exists(<path>)` beside its own
+`attribute_exists(#exists)`, and decides on the row DynamoDB's refusal returns
+(`ALL_OLD`); a missing parent fails that condition too, and is refused the same
+way. Where the row has the path the update is written and the stored value
+kept. A version the update expects and the row isn't at is refused first
+(`OptimisticLockError`), on every path, whether the row has the path or not. An
+operand the checks accept is sent as 1.40.0 sent it, with no condition added.
+1.40.0 refused these operands before sending (after a retained entity's read)
+at a position the write schema's walk knows, even where DynamoDB would have kept
+the stored value, and with `ValidationError` before `OptimisticLockError`; at a
+sparse map's entry, which it didn't check, it stored them where the row lacked
+the path, leaving a row that no longer read. `PathIfNotExistsFallback.test.ts`
+and `connected.path-if-not-exists.test.ts` pin both outcomes on every path,
+alone and in a transaction, each beside what 1.40.0 did there.
 
 **Where the read resolves the position (#236): exact or absent.** The write
 schema's walk above doesn't know every position: a sparse map's entry (named by
@@ -4640,8 +4667,9 @@ that takes the map keeps writing. A value the marshaller refuses is left to
 `marshalOrFail` (`EDD-9124`). The choke points are `encodeForWrite` and
 `_refuseNotReadBack` on an entity (`validateAndBuildPutItem` for Batch and
 `TransactWriteOps`), `notReadBackOperand` for an update's stored operands
-(`.append`, `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists`; `.add`,
-`.subtract` and `.deleteFromSet` apply a value, they don't store it),
+(`.append`, `pathSet`, `pathAppend`, `pathPrepend`; `.add`, `.subtract` and
+`.deleteFromSet` apply a value, they don't store it; a `pathIfNotExists`
+operand is refused only where it would be stored, `fallbackRefusal`),
 `refuseNotReadBack` on an aggregate, which runs the real `assembleAggregate` over the
 marshalled groups so a custom `decompose` and packed edges are covered,
 `encodeToWire` on a stream and `outboxItems` for an outbox. A member holding no custom
