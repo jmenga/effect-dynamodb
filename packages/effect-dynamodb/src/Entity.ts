@@ -2452,10 +2452,11 @@ const makeImpl = <
   /**
    * DynamoDB's refusal of an update expression reading an attribute (`#f - :v`,
    * `list_append(#f, :v)`, `ADD`, `DELETE`) on a row without it, or holding a value of a kind the
-   * expression doesn't take (`fits`): what a retained entity's update, which applies the record operation
-   * to the row it read, answers where the same operation sent as an expression would be
-   * refused. In DynamoDB's own words, as the `TransactWriteItems` the update sends would be.
-   * `undefined` when the expression applies.
+   * expression doesn't take (`fits`): what an update that applies the record operation to the row
+   * it read (a retained entity's, one changing a unique field, one computing an index composite)
+   * answers where the same operation sent as an expression would be refused. In DynamoDB's own
+   * words, named `TransactWriteItems`, the request a retained update sends. `undefined` when the
+   * expression applies.
    */
   const expressionRefusal = (before: unknown, fits: boolean): DynamoValidationError | undefined =>
     fits

@@ -1,15 +1,15 @@
 /**
  * DynamoDB's arithmetic and set algebra on values as a read returns them (#236).
  *
- * A retained entity's update (and a unique entity's that writes the row whole) applies `.add()`,
- * `.subtract()` and `.deleteFromSet()` to the row it read, where every other update sends `ADD`,
- * `SET #f = #f - :v` and `DELETE` for DynamoDB to apply. DynamoDB computes on decimal numbers of
- * up to 38 significant digits, exactly, and compares set members by value. A read returns a number
- * as a JavaScript `number`, or as a `bigint` past `Number.MAX_SAFE_INTEGER`, and a bigint field's
- * operand is a `bigint`. So the sum is taken on the numbers' decimal text, and given back as a read
- * would give the stored result: `5 + 2n` is `7`, `0.2 + 0.1` is `0.3`, and `(2^53 + 1) + 2` is
- * `9007199254740995n`. A result DynamoDB can't hold (39 significant digits) is written as it is,
- * for DynamoDB to refuse, as it refuses the expression.
+ * A retained entity's update, one changing a unique field and one computing an index composite
+ * apply `.add()`, `.subtract()` and `.deleteFromSet()` to the row they read, where every other
+ * update sends `ADD`, `SET #f = #f - :v` and `DELETE` for DynamoDB to apply. DynamoDB computes on
+ * decimal numbers of up to 38 significant digits, exactly, and compares set members by value. A
+ * read returns a number as a JavaScript `number`, or as a `bigint` past `Number.MAX_SAFE_INTEGER`,
+ * and a bigint field's operand is a `bigint`. So the sum is taken on the numbers' decimal text, and
+ * given back as a read would give the stored result: `5 + 2n` is `7`, `0.2 + 0.1` is `0.3`, and
+ * `(2^53 + 1) + 2` is `9007199254740995n`. A result DynamoDB can't hold (39 significant digits) is
+ * written as it is, for DynamoDB to refuse, as it refuses the expression.
  */
 
 /** A decimal number: `digits × 10^-scale`, `scale >= 0`. */

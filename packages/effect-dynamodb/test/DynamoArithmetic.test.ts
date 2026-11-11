@@ -1,10 +1,12 @@
 /**
- * DynamoDB's arithmetic and set algebra as a retained entity's update applies them (#236).
+ * DynamoDB's arithmetic and set algebra as an update that reads the row first applies them (#236):
+ * a retained entity's, one changing a unique field, one computing an index composite
+ * (`helpers/ReadFirstUpdates.ts`).
  *
  * `helpers/RetainedArithmetic.ts` holds each case with the attribute DynamoDB stores for it when
  * the update is sent as an expression (`connected.retained-arithmetic.test.ts` checks every case
- * against DynamoDB Local, both paths side by side). Here the retained update, alone and in a
- * transaction, stores exactly that attribute; where DynamoDB refuses the number (39 significant
+ * against DynamoDB Local, both paths side by side). Here the update that reads first, alone and
+ * in a transaction, stores exactly that attribute; where DynamoDB refuses the number (39 significant
  * digits), the update sends it as it is, for DynamoDB to refuse. A bigint field's `.add()` and
  * `.subtract()` died mixing a bigint with a number read back (also on 1.39.0); a fraction was a
  * JavaScript float (`0.30000000000000004`); a bigint or binary set's members were compared by
@@ -21,6 +23,7 @@ import * as Entity from "../src/Entity.js"
 import { numberSum, setDifference, setUnion } from "../src/internal/DynamoArithmetic.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { READ_FIRST, type ReadFirstUpdate } from "./helpers/ReadFirstUpdates.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { arithmeticCases, arithmeticModel, sorted } from "./helpers/RetainedArithmetic.js"
 
@@ -67,13 +70,17 @@ describe("setUnion and setDifference compare members by value", () => {
   })
 })
 
-/** Runs a case on a retained entity: how it ended, and what it stored or sent for its attribute. */
-const run = (transaction: boolean, each: (typeof arithmeticCases)[number]) => {
+/** Runs a case on an update that reads first: how it ended, and what it stored for its attribute. */
+const run = (
+  config: ReadFirstUpdate,
+  transaction: boolean,
+  each: (typeof arithmeticCases)[number],
+) => {
   const E = Entity.make({
     model: arithmeticModel,
     entityType: "E",
     primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
-    versioned: { retain: true },
+    ...config.entity,
   } as never) as any
   const Main = Table.make({
     schema: DynamoSchema.make({ name: "arith", version: 1 }),
@@ -85,7 +92,7 @@ const run = (transaction: boolean, each: (typeof arithmeticCases)[number]) => {
     yield* db.entities.E.put({ id: "a", ...each.seed }).asEffect()
     yield* db.entities.E.put({ id: "b" }).asEffect()
     table.take()
-    const op = each.apply(db.entities.E.update({ id: "a" }))
+    const op = each.apply(config.prefix(db.entities.E.update({ id: "a" })))
     const exit = yield* Effect.exit(
       transaction
         ? Transaction.transactWrite([db.entities.E.update({ id: "b" }).set({ n: 1 }), op])
@@ -101,12 +108,14 @@ const run = (transaction: boolean, each: (typeof arithmeticCases)[number]) => {
   >
 }
 
-describe("a retained entity's update stores what DynamoDB stores for the expression", () => {
+describe.each(
+  READ_FIRST,
+)("$name: the update stores what DynamoDB stores for the expression", (config) => {
   for (const transaction of [false, true]) {
     for (const each of arithmeticCases) {
       it.effect(`${each.name}, ${transaction ? "in a transaction" : "alone"}`, () =>
         Effect.gen(function* () {
-          const got = yield* run(transaction, each)
+          const got = yield* run(config, transaction, each)
           if (Exit.isFailure(got.exit)) expect(Cause.pretty(got.exit.cause)).toBe("")
           // A number DynamoDB can't hold is sent as it is, for DynamoDB to refuse: this table
           // stores what it's sent.

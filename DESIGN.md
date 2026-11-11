@@ -3433,11 +3433,14 @@ bump, timestamps, GSI recomposition, `expectedVersion`, user condition) as the
 the version read. DynamoDB therefore applies the path semantics itself — parity
 by construction, never emulated — and a rejected expression writes no snapshot.
 The record operations (`.subtract()`, `.append()`, `.add()`, `.deleteFromSet()`)
-are applied to the row read, as DynamoDB applies their expressions: where it
-refuses one (`#f - :v` or `list_append` on an attribute the row lacks, or any of
-them on a value of another kind: a string, a set of the other kind, `NULL`), the
-update fails with `DynamoValidationError` (`operation` `TransactWriteItems`,
-DynamoDB's own words) and writes nothing (`expressionRefusal`, #236). It used to
+are applied to the row read, here and in the other updates that read the row
+first (one changing a unique field, one computing an index composite), as
+DynamoDB applies their expressions: where it refuses one (`#f - :v` or
+`list_append` on an attribute the row lacks, or any of them on a value of
+another kind: a string, a set of the other kind, `NULL`), the update fails with
+`DynamoValidationError` (DynamoDB's own words, `operation` `TransactWriteItems`)
+and writes nothing (`expressionRefusal`, #236), as the same update of an entity
+without the configuration fails. It used to
 store `-v` or the operand alone, append a string's characters (a row that no
 longer read), add a number to a string, and die on `NaN`. Where DynamoDB applies
 one, the result is DynamoDB's (`internal/DynamoArithmetic.ts`): a sum or

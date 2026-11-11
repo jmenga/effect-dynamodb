@@ -1,10 +1,12 @@
 /**
- * A retained entity's arithmetic against DynamoDB Local, beside the same update of an entity that
- * isn't retained (#236): for each case of `helpers/RetainedArithmetic.ts`, alone and in a
- * transaction, both paths store the same attribute, the one the case names, or are both refused
- * by DynamoDB with nothing written. A bigint field's value is computed exactly on both sides of
- * 2^53, where the retained update died mixing a bigint with a number; a number's fraction as
- * DynamoDB computes it (`0.3`, not `0.30000000000000004`); a set's members by value.
+ * The arithmetic of an update that reads the row first (`helpers/ReadFirstUpdates.ts`: a retained
+ * entity's, one changing a unique field, one computing an index composite) against DynamoDB Local,
+ * beside the same update of an entity without the configuration (#236): for each case of
+ * `helpers/RetainedArithmetic.ts`, alone and in a transaction, both paths store the same
+ * attribute, the one the case names, or are both refused by DynamoDB with nothing written. A
+ * bigint field's value is computed exactly on both sides of 2^53, where the update that reads
+ * first died mixing a bigint with a number; a number's fraction as DynamoDB computes it (`0.3`,
+ * not `0.30000000000000004`); a set's members by value.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -16,6 +18,7 @@ import { it } from "@effect/vitest"
 import { Cause, Config, Effect, Exit, Layer } from "effect"
 import { describe, expect } from "vitest"
 import * as Lib from "../src/index.js"
+import { READ_FIRST, type ReadFirstUpdate } from "./helpers/ReadFirstUpdates.js"
 import { arithmeticCases, arithmeticModel, sorted } from "./helpers/RetainedArithmetic.js"
 
 const ENDPOINT = Effect.runSync(
@@ -38,9 +41,13 @@ const raw = new DynamoDBClient({ region: "us-east-1", endpoint: ENDPOINT, creden
 const ClientLayer = Lib.DynamoClient.layer({ region: "us-east-1", endpoint: ENDPOINT, credentials })
 
 let tables = 0
-/** How an update of `a` ended, and the attribute it's about as stored afterwards. */
+/**
+ * How an update of `a` ended, and the attribute it's about as stored afterwards, on an entity with
+ * `config` (`configured`) or without it, with `config`'s update besides the case's.
+ */
 const outcome = (
-  retained: boolean,
+  config: ReadFirstUpdate,
+  configured: boolean,
   transaction: boolean,
   seed: Record<string, unknown>,
   apply: (u: any) => any,
@@ -50,7 +57,7 @@ const outcome = (
     model: arithmeticModel,
     entityType: "E",
     primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
-    ...(retained ? { versioned: { retain: true } } : {}),
+    ...(configured ? config.entity : {}),
   } as never) as any
   const Main = Lib.Table.make({
     schema: Lib.DynamoSchema.make({ name: "arith", version: 1 }),
@@ -78,7 +85,7 @@ const outcome = (
         const db: any = yield* Lib.DynamoClient.make({ entities: { E }, tables: { Main } } as never)
         yield* db.entities.E.put({ id: "a", ...seed }).asEffect()
         yield* db.entities.E.put({ id: "b" }).asEffect()
-        const op = apply(db.entities.E.update({ id: "a" }))
+        const op = apply(config.prefix(db.entities.E.update({ id: "a" })))
         const exit = yield* Effect.exit(
           transaction
             ? Lib.Transaction.transactWrite([db.entities.E.update({ id: "b" }).set({ n: 1 }), op])
@@ -115,25 +122,42 @@ const outcome = (
   >
 }
 
-describeConnected("a retained entity's arithmetic stores what DynamoDB's does", () => {
-  for (const transaction of [false, true]) {
-    for (const each of arithmeticCases) {
-      it.effect(`${each.name}, ${transaction ? "in a transaction" : "alone"}`, () =>
-        Effect.gen(function* () {
-          const plain = yield* outcome(false, transaction, each.seed, each.apply, each.attribute)
-          const retained = yield* outcome(true, transaction, each.seed, each.apply, each.attribute)
-          // DynamoDB stores what the case says, or refuses the update.
-          if (each.stored === undefined) {
-            expect(plain.ok).toBe(false)
-            expect(plain.error).toBe("DynamoValidationError")
-          } else {
-            expect(plain.ok).toBe(true)
-            expect(plain.stored).toEqual(sorted(each.stored))
-          }
-          // The retained update ends the same way.
-          expect(retained).toEqual(plain)
-        }),
-      )
+describeConnected.each(READ_FIRST)(
+  "$name: the arithmetic stores what DynamoDB's does",
+  (config) => {
+    for (const transaction of [false, true]) {
+      for (const each of arithmeticCases) {
+        it.effect(`${each.name}, ${transaction ? "in a transaction" : "alone"}`, () =>
+          Effect.gen(function* () {
+            const plain = yield* outcome(
+              config,
+              false,
+              transaction,
+              each.seed,
+              each.apply,
+              each.attribute,
+            )
+            const retained = yield* outcome(
+              config,
+              true,
+              transaction,
+              each.seed,
+              each.apply,
+              each.attribute,
+            )
+            // DynamoDB stores what the case says, or refuses the update.
+            if (each.stored === undefined) {
+              expect(plain.ok).toBe(false)
+              expect(plain.error).toBe("DynamoValidationError")
+            } else {
+              expect(plain.ok).toBe(true)
+              expect(plain.stored).toEqual(sorted(each.stored))
+            }
+            // The retained update ends the same way.
+            expect(retained).toEqual(plain)
+          }),
+        )
+      }
     }
-  }
-})
+  },
+)

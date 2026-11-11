@@ -1,10 +1,11 @@
 /**
  * Record operations that compute a value from the row's own: `.add()` of a number or a set,
- * `.subtract()` and `.deleteFromSet()`. An entity without `retain` sends each as an expression
- * (`ADD`, `SET #f = #f - :v`, `DELETE`) and DynamoDB computes it; a retained entity's update
- * computes it from the row it read (#236). Each case is one input, and `stored` is the attribute
- * DynamoDB stores for it (`undefined`: DynamoDB refuses the write), checked against DynamoDB
- * Local by `connected.retained-arithmetic.test.ts`, which runs both paths.
+ * `.subtract()` and `.deleteFromSet()`. An update sends each as an expression (`ADD`,
+ * `SET #f = #f - :v`, `DELETE`) and DynamoDB computes it, except one that reads the row first
+ * (`helpers/ReadFirstUpdates.ts`: a retained entity's, one changing a unique field, one computing
+ * an index composite), which computes it from the row it read (#236). Each case is one input, and
+ * `stored` is the attribute DynamoDB stores for it (`undefined`: DynamoDB refuses the write),
+ * checked against DynamoDB Local by `connected.retained-arithmetic.test.ts`, which runs both paths.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -12,6 +13,10 @@ import { Schema } from "effect"
 
 export const arithmeticModel = Schema.Struct({
   id: Schema.String,
+  // What `helpers/ReadFirstUpdates.ts`'s configurations name.
+  name: Schema.optional(Schema.String),
+  email: Schema.optional(Schema.String),
+  rank: Schema.optional(Schema.Number),
   big: Schema.optional(Schema.BigInt),
   n: Schema.optional(Schema.Number),
   bigs: Schema.optional(Schema.ReadonlySet(Schema.BigInt)),
