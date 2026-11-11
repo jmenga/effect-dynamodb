@@ -3,7 +3,8 @@
  * `Kept139.test.ts`. Each scenario replays its steps and compares them with what 1.39.0 did
  * (`fixtures/*-1.39.0.json`, captured once, never regenerated).
  * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`,
- * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`.
+ * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
+ * `helpers/OptionalTransformDates.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -24,6 +25,7 @@ import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
+import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
 
 const ENDPOINT = Effect.runSync(
@@ -87,3 +89,10 @@ describeConnected("an aggregate create over a field the rows declare a stamp in"
 describeConnected("the form an aggregate stores its stamps in", () => {
   aggregateStampFormsSuite(openTable)
 })
+
+describeConnected(
+  "an entity's Schema.optional date over a transform stored as the other kind",
+  () => {
+    optionalTransformDatesSuite(openTable)
+  },
+)

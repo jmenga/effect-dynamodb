@@ -2719,23 +2719,31 @@ export const validateNoTransformOverride = (
       throw new Error(conflictMessage(name))
     }
 
-    // 2. DynamoModel.storedAs() modifier on the schema itself? The modifier
-    //    applies a `DynamoEncoding` annotation to the AST. Detect a conflict
-    //    by comparing the annotation's storage with the transform's actual
-    //    wire format (resolved via `transformWireKind`, which walks the typed
-    //    `Base.encoding` chain to its leaf). Granularity: we can distinguish
-    //    "string" vs "number" wire forms; we cannot distinguish epochMs vs
-    //    epochSeconds at this layer. The string-vs-number mismatch covers the
-    //    most common breaking case.
-    const annotated = getEncoding(schema)
-    if (annotated === undefined) continue
-    const transformWire = transformWireKind(schema)
-    if (transformWire === undefined) continue
-    const annotatedKind = annotated.storage === "string" ? "string" : "number"
-    if (transformWire !== annotatedKind) {
+    // 2. DynamoModel.storedAs() modifier on the schema itself?
+    if (storedAsOverTransform(schema)) {
       throw new Error(conflictMessage(name))
     }
   }
+}
+
+/**
+ * Whether a date transform schema carries a `DynamoModel.storedAs(...)` annotation of the other wire
+ * kind: one {@link validateNoTransformOverride} refuses. The modifier applies a `DynamoEncoding`
+ * annotation to the AST; it conflicts when its storage disagrees with the transform's actual wire
+ * format (resolved via `transformWireKind`, which walks the typed `Base.encoding` chain to its leaf).
+ * Granularity: "string" vs "number" wire forms; epochMs vs epochSeconds can't be told apart at this
+ * layer. The string-vs-number mismatch covers the most common breaking case. Such a field stores the
+ * transform's form, so a value in the annotation's form can't be read back from it.
+ *
+ * @internal Also read by `Entity.make`: a `Schema.optional` date of this kind isn't a stamp.
+ */
+export const storedAsOverTransform = (schema: Schema.Top): boolean => {
+  if (!isDateTransform(schema)) return false
+  const annotated = getEncoding(schema)
+  if (annotated === undefined) return false
+  const transformWire = transformWireKind(schema)
+  if (transformWire === undefined) return false
+  return transformWire !== (annotated.storage === "string" ? "string" : "number")
 }
 
 /**

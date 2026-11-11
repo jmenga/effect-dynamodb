@@ -2,8 +2,8 @@
  * Behaviour published 1.39.0 had, kept: each scenario replays its steps on a recording table and
  * compares them with what 1.39.0 did (`fixtures/*-1.39.0.json`, captured once, never regenerated).
  * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`,
- * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`. Connected twin:
- * `connected.kept-1.39.0.test.ts`.
+ * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
+ * `helpers/OptionalTransformDates.ts`. Connected twin: `connected.kept-1.39.0.test.ts`.
  */
 
 import { describe } from "vitest"
@@ -11,6 +11,7 @@ import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { openRecordingTable } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
+import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
 
 describe("an appendInput that may leave a sharded index's composite out", () => {
@@ -27,4 +28,8 @@ describe("an aggregate create over a field the rows declare a stamp in", () => {
 
 describe("the form an aggregate stores its stamps in", () => {
   aggregateStampFormsSuite(openRecordingTable)
+})
+
+describe("an entity's Schema.optional date over a transform stored as the other kind", () => {
+  optionalTransformDatesSuite(openRecordingTable)
 })
