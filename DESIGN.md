@@ -1126,10 +1126,12 @@ finds every moved row current and moves nothing.
 
 **The chain, in either direction.** Keys spell each other's: under `escapeKeys: true` `foo bar`
 belongs where `foo%20bar` was stored. So a row in the way that is another value's old row moves
-first (`clearTarget`, up to `DISPLACE_DEPTH` deep), whichever the scan reached first: `foo%20bar`'s
-old row to `foo%2520bar`, then `foo bar`'s to `foo%20bar`. With the flag off it's the reverse. Nothing
-is overwritten or merged. A row whose holder can't move stops retrying and reports `taken`
-(`cantMoveHolder`), and `RekeyReport.conflicts` lists a row once per run.
+first (`clearTarget`, judging the holder as its own unit through `RekeyRowContext.judge`, however
+long the chain), whichever the scan reached first: `foo%20bar`'s old row to `foo%2520bar`, then
+`foo bar`'s to `foo%20bar`. With the flag off it's the reverse. Nothing is overwritten or merged. A
+row whose holder can't move stops retrying and reports `taken` (`cantMoveHolder`), or `contended`
+when the holder waits on it in a loop, and `RekeyReport.conflicts` lists a row once per run. Up to
+1.40.0 a chain went `DISPLACE_DEPTH` (4) rows deep and the rest were left for the next run.
 
 **Resume token.** `rk1.` + base64url JSON `{ t: tableName, s: positions }`, one
 position per segment: `0` not started, `1` done, or the segment's
