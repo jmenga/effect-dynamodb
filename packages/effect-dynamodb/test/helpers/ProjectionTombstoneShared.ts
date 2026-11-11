@@ -1118,6 +1118,7 @@ export const since: Record<string, Since> = {
     items: { "$race#v1#race#id_r2": { ra: { N: "2" } } },
   },
   "roles: A's data field is B's checkpoint, A's row removed and written again": { why: absentRead },
+  "one projection: a sparse checkpoint map a field-mapped source leaves empty": { why: absentRead },
   "roles: A's data field is B's checkpoint, create over A's tombstone with its own value": {
     why: absentRead,
   },

@@ -2865,6 +2865,378 @@
         ]
       ]
     },
+    "one projection: a sparse checkpoint map a field-mapped source leaves empty": {
+      "requests": [
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x"
+              },
+              "total": {
+                "N": "2"
+              },
+              "revision": {
+                "N": "1"
+              },
+              "aV": {
+                "N": "1"
+              },
+              "aOwner": {
+                "S": "x"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+            "ExpressionAttributeNames": {
+              "#e0": "pk",
+              "#e1": "sk"
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              },
+              "__edd_e__": {
+                "S": "Read#tombstone"
+              },
+              "__edd_removed__": {
+                "S": "1970-01-01T00:00:00.000Z"
+              },
+              "revision": {
+                "N": "2"
+              },
+              "checkpoints": {
+                "M": {}
+              },
+              "aV": {
+                "N": "2"
+              },
+              "aOwner": {
+                "S": "x"
+              }
+            },
+            "ConditionExpression": "#g = :g",
+            "ExpressionAttributeNames": {
+              "#g": "revision"
+            },
+            "ExpressionAttributeValues": {
+              ":g": {
+                "N": "1"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x"
+              },
+              "total": {
+                "N": "10"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              },
+              "checkpoints": {
+                "M": {}
+              },
+              "aV": {
+                "N": "2"
+              },
+              "aOwner": {
+                "S": "x"
+              },
+              "revision": {
+                "N": "3"
+              }
+            },
+            "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+            "ExpressionAttributeNames": {
+              "#e0": "__edd_e__",
+              "#e2": "__edd_removed__"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "S": "Read#tombstone"
+              },
+              ":e3": {
+                "S": "1970-01-01T00:00:00.000Z"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConsistentRead": true
+          }
+        },
+        {
+          "operation": "putItem",
+          "input": {
+            "TableName": "read",
+            "Item": {
+              "id": {
+                "S": "x"
+              },
+              "total": {
+                "N": "13"
+              },
+              "revision": {
+                "N": "4"
+              },
+              "aV": {
+                "N": "3"
+              },
+              "aOwner": {
+                "S": "x"
+              },
+              "__edd_e__": {
+                "S": "Read"
+              },
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            },
+            "ConditionExpression": "#e0 = :e1",
+            "ExpressionAttributeNames": {
+              "#e0": "revision"
+            },
+            "ExpressionAttributeValues": {
+              ":e1": {
+                "N": "3"
+              }
+            }
+          }
+        },
+        {
+          "operation": "getItem",
+          "input": {
+            "TableName": "read",
+            "Key": {
+              "pk": {
+                "S": "$sparsefm#v1#read#id_x"
+              },
+              "sk": {
+                "S": "$sparsefm#v1#read"
+              }
+            }
+          }
+        }
+      ],
+      "items": [
+        {
+          "__edd_e__": {
+            "S": "Read"
+          },
+          "aOwner": {
+            "S": "x"
+          },
+          "aV": {
+            "N": "3"
+          },
+          "id": {
+            "S": "x"
+          },
+          "pk": {
+            "S": "$sparsefm#v1#read#id_x"
+          },
+          "revision": {
+            "N": "4"
+          },
+          "sk": {
+            "S": "$sparsefm#v1#read"
+          },
+          "total": {
+            "N": "13"
+          }
+        }
+      ],
+      "results": [
+        [
+          "applies",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "removes",
+          [
+            {
+              "tag": "Applied",
+              "removed": true,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "create",
+          {
+            "id": "x",
+            "total": 10,
+            "checkpoints": {},
+            "revision": 3,
+            "aV": 2,
+            "aOwner": "x"
+          }
+        ],
+        [
+          "late removal",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 0,
+                  "alreadyApplied": 1
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "next event",
+          [
+            {
+              "tag": "Applied",
+              "removed": false,
+              "instances": [
+                {
+                  "applied": 1,
+                  "alreadyApplied": 0
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "get",
+          {
+            "id": "x",
+            "total": 13,
+            "checkpoints": {},
+            "revision": 4,
+            "aV": 3,
+            "aOwner": "x"
+          }
+        ]
+      ]
+    },
     "roles: A's data field is B's checkpoint, create over A's tombstone with its own value": {
       "requests": [
         {

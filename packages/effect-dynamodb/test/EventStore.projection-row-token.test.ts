@@ -6,7 +6,8 @@
  * other projections that have written the row, and an attribute holding two meanings on such a row
  * is refused (`EDD-9144`). A read model with one projection layout carries no token: without
  * `removal` it sends and stores what 1.40.0 did, and with `removal` and no revision its write over a
- * tombstone it read names the tombstone, so it can't replace a row `create` wrote there.
+ * tombstone it read names the tombstone, so it can't replace a row `create` wrote there. With
+ * `removal`, a projection's write for a row it read absent never replaces a tombstone written since.
  */
 
 import { describe, expect, it } from "@effect/vitest"
@@ -341,6 +342,27 @@ describe("a read model with one projection layout", () => {
       const exit = yield* Effect.exit(A.apply(next))
       expect(String(exit)).toContain("ConcurrentModification")
       expect(untokened(row("x"))).toMatchObject({ total: 10, a: 2 })
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("a write for a row read absent doesn't replace a tombstone written since", () => {
+    const { A, layer, row, between } = setup(
+      { checkpoint: "a", revision: "ra", removal: true },
+      undefined,
+    )
+    return Effect.gen(function* () {
+      yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 }), new Cancelled({})], 0)
+      const orders = yield* Orders.read({ id: "x" })
+      // Another worker applies both events, the removal included, after this one's read.
+      between(A.applyBatch(orders))
+      // 1.39.0 and 1.40.0: `create` replaced the tombstone with the row at event 1, keeping the
+      // tombstone's checkpoint 2, so the removal was lost and its redelivery was `alreadyApplied`.
+      const exit = yield* Effect.exit(A.apply(orders[0]!))
+      expect(String(exit)).toContain("ConcurrentModification")
+      expect(row("x")).toMatchObject({ __edd_e__: "Row#tombstone", a: 2 })
+      const again = yield* A.apply(orders[0]!)
+      expect(again.alreadyApplied).toHaveLength(1)
+      expect(row("x")?.__edd_e__).toBe("Row#tombstone")
     }).pipe(Effect.provide(layer))
   })
 

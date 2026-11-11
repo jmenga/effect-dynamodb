@@ -77,6 +77,7 @@ import {
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
   freshRowToken,
+  hasProjectionTombstones,
   KEY_TEXT,
   layoutTag,
   marshalOrFail,
@@ -1610,6 +1611,10 @@ export const makeEngine = (config: EngineConfig) => {
           ? tombstoneTerm
           : undefined
       const term = andRaw(tokenTerm, overRead)
+      // A write for a row read absent, on a read model whose rows may be tombstones, proves the
+      // key still holds nothing, as the transaction's put does: `create` never takes the place
+      // of a tombstone written since, which 1.39.0 and 1.40.0 replaced, the removal lost (#237).
+      const absent = Option.isNone(row) && hasProjectionTombstones(readModel)
       const createdAt = Option.isSome(row) ? row.value.createdAt : undefined
       // A tombstone or outbox item holds no values, so its key alone says which text it is for
       // `rekey` (`KEY_TEXT`): one under the text of `escapeKeys: true`, where that isn't off's, is
@@ -1672,14 +1677,14 @@ export const makeEngine = (config: EngineConfig) => {
         // the token's term (without one, the tombstone's); a `create` for a row read absent never
         // takes a tombstone's place.
         const run =
-          condition.input === undefined && token === undefined && overRead === undefined
+          condition.input === undefined && token === undefined && overRead === undefined && !absent
             ? (op.asEffect() as Effect.Effect<unknown, any, any>)
             : (op as EntityPutImpl<any, any, any, any>)._builder("model", {
                 condition: (op as EntityPutImpl<any, any, any, any>)._condition,
                 withVectors: (op as EntityPutImpl<any, any, any, any>)._withVectors,
                 putKind: (op as EntityPutImpl<any, any, any, any>)._putKind,
                 createdAt: DateTime.isDateTime(createdAt) ? DateTime.toUtc(createdAt) : undefined,
-                ...((token !== undefined || overRead !== undefined) && {
+                ...((token !== undefined || overRead !== undefined || absent) && {
                   projectionWrite: {
                     attributes:
                       token === undefined
@@ -1687,7 +1692,7 @@ export const makeEngine = (config: EngineConfig) => {
                         : { ...carry.attributes, [ROW_TOKEN]: token },
                     fill: carry.fill,
                     condition: Option.isSome(row) ? term : undefined,
-                    expectAbsent: token !== undefined && Option.isNone(row),
+                    expectAbsent: Option.isNone(row),
                   },
                 }),
               })
