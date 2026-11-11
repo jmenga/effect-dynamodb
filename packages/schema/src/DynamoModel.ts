@@ -447,14 +447,14 @@ export const TTL = DateEpochSeconds
  * DynamoModel.DateTimeZoned.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs))
  * ```
  */
-export const storedAs = <A>(
-  storageSchema: Schema.Schema<A>,
-): (<S extends Schema.Schema<A>>(fieldSchema: S) => S) => {
+export const storedAs = <T extends Schema.Top>(
+  storageSchema: T,
+): (<S extends Schema.Schema<T["Type"]>>(fieldSchema: S) => S & StoredAs<T["Encoded"]>) => {
   const storageEncoding = getEncoding(storageSchema as Schema.Top)
   if (!storageEncoding) {
     throw new Error("storedAs: target schema has no DynamoEncoding annotation")
   }
-  return <S extends Schema.Schema<A>>(fieldSchema: S): S => {
+  return <S extends Schema.Schema<T["Type"]>>(fieldSchema: S): S & StoredAs<T["Encoded"]> => {
     const currentEncoding = getEncoding(fieldSchema as Schema.Top)
     return (fieldSchema as Schema.Top).pipe(
       Schema.annotate({
@@ -463,8 +463,19 @@ export const storedAs = <A>(
           domain: currentEncoding?.domain ?? storageEncoding.domain,
         } satisfies DynamoEncoding,
       }),
-    ) as unknown as S
+    ) as unknown as S & StoredAs<T["Encoded"]>
   }
+}
+
+/**
+ * What the type of a schema {@link storedAs} returns carries: the encoded type of the storage
+ * schema it was given (`number` for `DateEpochSeconds`, `string` for `DateString`). It exists only
+ * in the type, never at run time. The entity types read it to tell a `Schema.optional` date whose
+ * `storedAs` names the other wire kind than its transform's, which is the caller's and never
+ * stamped, from a date the library stamps (#236).
+ */
+export interface StoredAs<W> {
+  readonly "~effect-dynamodb/storedAs": W
 }
 
 // ---------------------------------------------------------------------------
