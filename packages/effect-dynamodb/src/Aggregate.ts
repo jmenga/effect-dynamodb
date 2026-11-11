@@ -58,6 +58,7 @@ import {
   substituteSchemaDeep,
   validateNoTransformOverride,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import { readingInstances } from "@effect-dynamodb/schema/internal/InstanceReads.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { KeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
@@ -1645,7 +1646,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // declarations (a `BigDecimal`, a `Duration`, a date in an `Option`, ...) reading back as a real
   // instance (`readingInstances`). Reads only: the plain state `update` hands a mutation
   // (`readToPlain`) is `decodeSchema`'s.
-  const assemblySchema = readingInstances(decodeSchema)
+  //
+  // A read that dies on an absent attribute fails as 1.39.0's did, with the issue `decodeSchema`
+  // without its absent reads gives (`failingAsBefore`), built only once a read has died.
+  let asBefore: Schema.Top | undefined
+  const assembly: AssemblyDecode = {
+    schema: readingInstances(decodeSchema),
+    before: () =>
+      (asBefore ??= substituteSchemaDeep(schema, {
+        tolerantTransforms: true,
+        decodeOnly: true,
+        resolveRef,
+      })),
+  }
   // The same schema for WRITES — `create` input and `update`'s mutated state —
   // with the container `.check()` refinements the substitution rebuilds kept, so
   // a write that breaks one is rejected (#133), and a value is asked as the domain
@@ -1931,7 +1944,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           )
           yield* unpackAggregateItems(rows, dispatchByType, aggregateName)
           yield* assembleAggregate(
-            assemblySchema,
+            assembly,
             rootNode,
             rows,
             contextFields,
@@ -2547,7 +2560,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
       // 1. Assemble current state
       const current = yield* assembleAggregate(
-        assemblySchema,
+        assembly,
         rootNode,
         allItems,
         contextFields,
@@ -2750,7 +2763,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         for (const item of written) stored.set(String(item.sk), item)
       }
       return (yield* assembleAggregate(
-        assemblySchema,
+        assembly,
         rootNode,
         [...stored.values()],
         contextFields,
@@ -2823,7 +2836,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
 
         const current = yield* assembleAggregate(
-          assemblySchema,
+          assembly,
           rootNode,
           allItems,
           contextFields,
@@ -3412,7 +3425,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           }
 
           const result = yield* assembleAggregate(
-            assemblySchema,
+            assembly,
             rootNode,
             allItems,
             contextFields,
@@ -3738,7 +3751,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
               if (allItems.length === 0) return undefined
 
               const result = yield* assembleAggregate(
-                assemblySchema,
+                assembly,
                 rootNode,
                 allItems,
                 contextFields,
@@ -4300,8 +4313,17 @@ const queryAllItems = <E>(
 // Internal: Assembly algorithm
 // ---------------------------------------------------------------------------
 
+/**
+ * What assembly decodes an aggregate with (`schema`), and the schema whose issue a decode that dies
+ * fails with, as 1.39.0's did (`before`, `failingAsBefore`).
+ */
+type AssemblyDecode = {
+  readonly schema: Schema.Top
+  readonly before: () => Schema.Top
+}
+
 const assembleAggregate = (
-  decodeSchema: Schema.Top,
+  assembly: AssemblyDecode,
   rootNode: ResolvedNode,
   allItems: Array<Record<string, unknown>>,
   _contextFields: ReadonlyArray<string>,
@@ -4379,17 +4401,13 @@ const assembleAggregate = (
     // Decode through `decodeSchema` — a tolerant clone of the aggregate schema
     // that lifts every date / Redacted leaf (root + nested edges) from the stored
     // wire form to its domain value in a single pass (#72 + Option A).
-    const decoded = yield* Schema.decodeUnknownEffect(decodeSchema as Schema.Codec<any>)(
+    const toValidationError = (cause: unknown) =>
+      new ValidationError({ entityType: aggregateName, operation: "aggregate.assemble", cause })
+    const decoded = yield* Schema.decodeUnknownEffect(assembly.schema as Schema.Codec<any>)(
       assembled,
     ).pipe(
-      Effect.mapError(
-        (cause) =>
-          new ValidationError({
-            entityType: aggregateName,
-            operation: "aggregate.assemble",
-            cause,
-          }),
-      ),
+      Effect.mapError(toValidationError),
+      failingAsBefore(() => issueDecoding(assembly.before(), assembled), toValidationError),
     )
 
     return decoded

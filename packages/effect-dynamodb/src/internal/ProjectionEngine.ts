@@ -29,6 +29,7 @@ import {
   readingStreamValues,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import {
   DateTime,
@@ -1242,8 +1243,10 @@ export const makeEngine = (config: EngineConfig) => {
   // Outbox drain (#155)
   // -------------------------------------------------------------------------
 
-  const decodeEffect = S.decodeUnknownEffect(
-    readingStreamValues(config.outbox?.schema ?? S.Unknown) as S.Codec<unknown>,
+  // A decode that dies on an absent attribute fails as 1.39.0's did (`decodingAsBefore`).
+  const decodeEffect = decodingAsBefore(
+    readingStreamValues(config.outbox?.schema ?? S.Unknown),
+    config.outbox?.schema ?? S.Unknown,
   )
 
   /**
