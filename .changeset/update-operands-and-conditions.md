@@ -1,0 +1,21 @@
+---
+"effect-dynamodb": patch
+"@effect-dynamodb/schema": patch
+"@effect-dynamodb/geo": patch
+"@effect-dynamodb/language-service": patch
+---
+
+**An update's path operand is checked where a row's read resolves its position.** `pathSet`, `pathAppend`, `pathPrepend`, `pathIfNotExists` and a record `.append()` sent their operand as given at the positions the write's own check didn't reach: a sparse map's entry named by its stored name (`target#a`), a union's members, a list of a union, a suspended or branded schema. A value no read decodes was written there, and the row couldn't be read afterwards (a standalone update failed decoding its own result, a transaction reported success). Now, where the read schema resolves the position exactly, an operand a row holding it reads is sent as before, one stored in another form a reader reads (the position's own encoding) is written in that form, and one no reader reads is refused with a `ValidationError`, before anything is read or sent. Where the read doesn't resolve the position exactly (an `Option`, a transformed or checked node above it, a decoding default, a hidden or packed attribute, an entry keyed `__proto__`, a tuple position that depends on the list's length) the operand is sent as 1.40.0 sent it. An operand 1.40.0 stored in a row it reads back is never refused or changed. Also on 1.39.0.
+
+**A planned update's or delete's condition with an empty part is refused in `Transaction.transactWrite`.** An `or()` with no parts or a `NaN` operand in the condition of an update, or of a retained entity's delete, made the transaction die with a defect (`compileExpr: or() has no parts`), sometimes after a `GetItem`. It's now refused with a `ValidationError` (`transactWrite.condition`) before any op of the transaction reads or sends anything, as the same write alone is. Also on 1.39.0.
+
+**A retained entity's record operation is refused where DynamoDB refuses its expression.** An entity with `versioned: { retain: true }` applies `.subtract()`, `.append()`, `.add()` and `.deleteFromSet()` to the row it read, where any other entity sends them as an expression. Where DynamoDB refuses that expression, the retained update now fails the same way, with `DynamoValidationError` (`TransactWriteItems`, DynamoDB's own message) and nothing written:
+
+- on a value of another kind: `.append()` to a string (it wrote the string's characters as a list, a row that couldn't be read), `.subtract()` from a string (a defect on `NaN`), `.add()` of a number or set to a string (`"abc2"`), of a number to a set or of a set of another kind, and `.deleteFromSet()` from a string;
+- `.subtract()` or `.append()` on an attribute or sparse map entry the row doesn't hold, which stored `-v` or the operand alone. Such an update of any other entity is refused by DynamoDB, so it now ends the same way on both.
+
+Each also on 1.39.0.
+
+**An update sets or clears a `Schema.optional` date stored as the other wire kind.** Under `timestamps: true`, `createdAt: Schema.optional(DynamoModel.DateString.pipe(DynamoModel.storedAs(DynamoModel.DateEpochSeconds)))` is the caller's field: nothing stamps it, and an update stores the value given. The update types took it for a stamp, so `.set({ createdAt })`, `.remove(["createdAt"])` and `.remove(["updatedAt"])` didn't compile, though each runs. `DynamoModel.storedAs` now carries its storage schema's encoded type in the type it returns (`DynamoModel.StoredAs<W>`, type-level only), and the update and `.remove` types leave such a field the caller's. A date whose `storedAs` names the same wire kind, or one without a transform, is still stamped and still refused. Also on 1.39.0.
+
+**`Transaction.check` with a compiled condition names the attribute a renamed field is stored in.** `Expression.condition` has no entity to rename by, so with `count` stored as `renamed`, `Transaction.check(db.entities.E.get(key), Expression.condition({ eq: { count: 1 } }))` named `count`, which no row holds: the check failed whatever the row held, and an `attributeNotExists` held whatever it held. A name used as an attribute (not as a property below one) that is a renamed model field now names its stored attribute. Every other name is sent as given. Also on 1.39.0.
