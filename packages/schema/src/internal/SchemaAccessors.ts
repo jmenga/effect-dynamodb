@@ -1459,7 +1459,16 @@ type End =
 type Way = {
   readonly end: End
   readonly structs: ReadonlyArray<SchemaAST.Objects | undefined>
+  /**
+   * Whether the way passed a record 1.40.0 didn't model (several index signatures, or a key
+   * that's a template literal), which 1.40.0 judged nothing below ({@link lengthsAlone}).
+   */
+  readonly since140?: true
 }
+
+/** Whether 1.40.0 modelled a record: one index signature, keyed by plain `Schema.String`. */
+const recordOf140 = (signatures: ReadonlyArray<SchemaAST.IndexSignature>): boolean =>
+  signatures.length === 1 && signatures[0]!.parameter._tag === "String"
 
 const waysOf = (
   ast: SchemaAST.AST,
@@ -1467,39 +1476,48 @@ const waysOf = (
   ways: Array<Way>,
   structs: ReadonlyArray<SchemaAST.Objects | undefined> = [],
   seen: ReadonlySet<SchemaAST.AST> = new Set(),
+  since140?: true,
 ): void => {
   const node = seen.has(ast) ? undefined : modelled(ast)
+  const mark = since140 === undefined ? {} : { since140 }
   if (node === undefined) {
-    ways.push({ end: { _tag: "Unknown" }, structs })
+    ways.push({ end: { _tag: "Unknown" }, structs, ...mark })
     return
   }
   if (node._tag === "Union" || node._tag === "Suspend") {
     const within = new Set(seen).add(ast)
     for (const member of node._tag === "Union" ? node.members : [node.suspended]) {
-      waysOf(member, segments, ways, structs, within)
+      waysOf(member, segments, ways, structs, within, since140)
     }
     return
   }
   const here = [...structs, node._tag === "Struct" ? node.ast : undefined]
   const [head, ...rest] = segments
   if (head === undefined) {
-    ways.push({ end: { _tag: "At", node }, structs: here })
+    ways.push({ end: { _tag: "At", node }, structs: here, ...mark })
     return
   }
   if (node._tag === "Struct" && typeof head === "string") {
     const property = node.ast.propertySignatures.find((signature) => signature.name === head)
-    if (property === undefined) ways.push({ end: { _tag: "Unread" }, structs: here })
-    else waysOf(property.type, rest, ways, here)
+    if (property === undefined) ways.push({ end: { _tag: "Unread" }, structs: here, ...mark })
+    else waysOf(property.type, rest, ways, here, new Set(), since140)
   } else if (node._tag === "Record" && typeof head === "string") {
     // A key every matching signature reads: each is a way, and a value there is one all of them
     // read, so a removal any of them refuses leaves a row the record refuses. Judging them as
     // alternatives asks more than that, never less.
+    const record = recordOf140(node.signatures) ? since140 : true
     const reading = node.signatures.filter((signature) => keyMatches(signature.parameter, head))
-    if (reading.length === 0) ways.push({ end: { _tag: "Unread" }, structs: here })
-    for (const signature of reading) waysOf(signature.type, rest, ways, here)
+    if (reading.length === 0) {
+      ways.push({
+        end: { _tag: "Unread" },
+        structs: here,
+        ...(record === undefined ? {} : { since140: record }),
+      })
+    }
+    for (const signature of reading) waysOf(signature.type, rest, ways, here, new Set(), record)
   } else if (node._tag === "List" && typeof head === "number") {
     const element = node.ast.elements[head] ?? node.ast.rest[0]
-    if (element !== undefined) waysOf(element, rest, ways, here)
+    if (element !== undefined) waysOf(element, rest, ways, here, new Set(), since140)
   }
 }
 
@@ -1731,6 +1749,53 @@ const positionRemoval = (
 }
 
 /**
+ * Removing list position `position` as 1.40.0 judged it, by the lists' lengths alone: required
+ * when no list one shorter than a length some list takes is a length some list takes. A way
+ * through a record 1.40.0 didn't model is `unknown`, as it was. What this reads of the row is the
+ * list's length, which an update's other clauses on the list change too, so this is only the
+ * answer {@link pathIsRequired} gives where they make the full judgement's answer unknown: as
+ * 1.40.0 answered.
+ */
+const lengthsAlone = (ways: ReadonlyArray<Way>, position: number): Removal => {
+  if (ways.some(({ end, since140 }) => end._tag === "Unknown" || since140 === true)) {
+    return "unknown"
+  }
+  if (ways.some(({ end }) => end._tag === "Unread")) return "readable"
+  const lengths: Array<{ readonly min: number; readonly max: number }> = []
+  for (const { end } of ways) {
+    if (end._tag !== "At" || end.node._tag !== "List") continue
+    if (end.node.ast.elements.some((element) => mayReadMissingKey(element))) return "unknown"
+    lengths.push(lengthsOf(end.node.ast))
+  }
+  if (lengths.length === 0) return "unheld"
+  if (lengths.some((list) => list.min <= position)) return "readable"
+  const shorter = (list: { readonly min: number; readonly max: number }) =>
+    lengths.some((other) => other.min <= list.max - 1 && list.min - 1 <= other.max)
+  return lengths.some(shorter) ? "readable" : "required"
+}
+
+/**
+ * Whether another clause of the same update, writing or removing `other` (a path inside the same
+ * field, `[]` for all of it), changes what the judgement of removing list position `segments`
+ * reads: the list itself (its length, its elements: `other` names another of its positions, or
+ * something below one), what's beside the path where a struct holds it ({@link besideDisjoint}:
+ * `other` names a sibling of a property on the way, or something below one), or the path itself
+ * (`other` names it, a path above it or one below it, which DynamoDB refuses beside a removal).
+ * Another element of a list further up isn't read.
+ */
+const touches = (
+  other: ReadonlyArray<string | number>,
+  segments: ReadonlyArray<string | number>,
+  ways: ReadonlyArray<Way>,
+): boolean => {
+  const depth = segments.findIndex((segment, i) => i >= other.length || other[i] !== segment)
+  if (depth === -1 || depth >= other.length) return true
+  if (depth === segments.length - 1) return true
+  if (typeof segments[depth] === "number") return false
+  return ways.some(({ structs }) => structs[depth] !== undefined)
+}
+
+/**
  * Whether removing `segments`, a path inside this field, leaves a value the field's schema
  * refuses, for every value it reads that holds the path, while none that holds what's above it
  * is without it. Refused only when the walk from the field passes through nodes it models exactly
@@ -1749,20 +1814,43 @@ const positionRemoval = (
  * `{ kind: "b", p: [string] }`. `f[0]` of a `[string, string?]`, either position of
  * `Union([[string, string], [string]])` and an array's element aren't.
  *
+ * The removal is judged against the update as a whole. A list position's judgement reads the
+ * row's list and what's beside the path, which the update's other clauses (`update.beside`) may
+ * write or remove in the same request: `f.kind = "b"` beside the removal of `f.p[0]` above makes
+ * what's left the other member's, and `f.p[2] = "third"` (DynamoDB appends past the end) leaves a
+ * list as long as before. Where another clause changes what it reads ({@link touches}), the
+ * position is judged as 1.40.0 judged it ({@link lengthsAlone}), and below a sparse map's entry,
+ * which 1.40.0 didn't judge, not at all. A property's judgement reads nothing of the row, so
+ * another clause leaves it as it is.
+ *
  * `false` means the schema can't say every such row breaks: a record's keys, a list's elements,
  * a path no value holds (DynamoDB refuses it, as on 1.39.0), and anything the walk doesn't model.
  */
 export const pathIsRequired = (
   field: Schema.Top,
   segments: ReadonlyArray<string | number>,
+  update: {
+    /**
+     * What the update's other clauses write or remove inside the same field, each a path inside
+     * it (`[]` for all of it).
+     */
+    readonly beside?: ReadonlyArray<ReadonlyArray<string | number>> | undefined
+    /** Whether 1.40.0 judged this path at all: not below a sparse map's entry. */
+    readonly judgedBefore?: boolean | undefined
+  } = {},
 ): boolean => {
   const last = segments[segments.length - 1]
   if (last === undefined) return false
   const ways: Array<Way> = []
   waysOf(field.ast, segments.slice(0, -1), ways)
-  const removal =
-    typeof last === "number" ? positionRemoval(ways, last, segments) : propertyRemoval(ways, last)
-  return removal === "required"
+  // A property's verdict reads nothing of the row: no other clause changes it, short of one on
+  // the path or above it, beside which DynamoDB refuses the removal.
+  if (typeof last === "string") return propertyRemoval(ways, last) === "required"
+  if (!(update.beside ?? []).some((other) => touches(other, segments, ways))) {
+    return positionRemoval(ways, last, segments) === "required"
+  }
+  // Another clause changes what the judgement reads: answered as 1.40.0 answered (#238).
+  return update.judgedBefore !== false && lengthsAlone(ways, last) === "required"
 }
 
 /**

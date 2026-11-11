@@ -4206,7 +4206,25 @@ const makeImpl = <
       `pathRemove on "${segments.map((s) => String(s)).join(".")}": the model requires it, so a ` +
       "row without it could not be read. Make it optional in the model, or write a new value " +
       "with .pathSet(). Nothing was sent."
-    for (const segments of uState.pathRemoves ?? []) {
+    // Read only where a removal is judged, so an update without one reads its payload as before.
+    let clauses: ReturnType<typeof clausesOf> | undefined
+    const clausesOnce = () => {
+      if (clauses === undefined) clauses = clausesOf(uState)
+      return clauses
+    }
+    // What the update's other clauses write or remove where the removal at `index` is: in the
+    // attribute it names, or in all of a sparse map whose entry that is (#238).
+    const besideOf = (index: number, at: string, map?: string) =>
+      clausesOnce().flatMap((clause) =>
+        clause.removal === index
+          ? []
+          : clause.at === at
+            ? [clause.path]
+            : map !== undefined && clause.at === `map:${map}`
+              ? [[]]
+              : [],
+      )
+    for (const [index, segments] of (uState.pathRemoves ?? []).entries()) {
       const head = segments[0]
       if (typeof head !== "string") continue
       const built = entryOfPath(segments)
@@ -4215,9 +4233,16 @@ const makeImpl = <
         // entry's key, then the rest, against the map's own schema (#238). One `.entry()` built
         // is that entry, whatever field its attribute spells.
         const entry = segments.length > 1 ? readEntryOf(head, built) : undefined
+        if (entry === undefined) continue
+        const beside = besideOf(index, clauseAt(segments), entry.field).map((path) => [
+          entry.key,
+          ...path,
+        ])
         if (
-          entry !== undefined &&
-          pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...segments.slice(1)])
+          pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...segments.slice(1)], {
+            beside,
+            judgedBefore: false,
+          })
         ) {
           return required(segments)
         }
@@ -4230,9 +4255,101 @@ const makeImpl = <
         continue
       }
       if (derivedFrom(head) !== undefined) continue
-      if (pathIsRequired(modelFieldSchemas[head]!, segments.slice(1))) return required(segments)
+      const beside = besideOf(index, clauseAt(segments))
+      if (pathIsRequired(modelFieldSchemas[head]!, segments.slice(1), { beside })) {
+        return required(segments)
+      }
     }
     return undefined
+  }
+
+  /**
+   * Where a path operation writes or removes: `field:<name>` for a model field, by its domain
+   * name, or `attribute:<name>` for an attribute no field is named as (a sparse map's entry,
+   * `m#k`). An entry `.entry()` built is that entry's attribute, whatever field it spells.
+   */
+  const clauseAt = (segments: ReadonlyArray<string | number>): string => {
+    const built = entryOfPath(segments)
+    if (built !== undefined && Object.hasOwn(sparseFields, built.field)) {
+      return `attribute:${sparseFields[built.field]!.prefix}#${built.key}`
+    }
+    const head = String(segments[0])
+    return isModelField(head) ? `field:${head}` : `attribute:${head}`
+  }
+
+  /**
+   * Where a record operation (`.set()`, `.remove()`, `.add()`, …) of `name` writes or removes,
+   * all of it: a field ({@link clauseAt}), a ref's id the ref's field, each entry a sparse map's
+   * value names (and, for a map a `field:` rename stores whole, the field), or every entry of the
+   * map (`map:<name>`) where the value names none.
+   */
+  const recordClausesAt = (name: string, value: unknown): ReadonlyArray<string> => {
+    const ref = resolvedRefs.find((r) => r.idFieldName === name)
+    if (ref !== undefined) return [`field:${ref.fieldName}`]
+    if (Object.hasOwn(sparseFields, name)) {
+      if (value === null || typeof value !== "object") return [`map:${name}`]
+      const { prefix } = sparseFields[name]!
+      return [
+        ...Object.keys(value).map((key) => `attribute:${prefix}#${key}`),
+        ...(Object.hasOwn(data.fieldRenames, name) ? [`field:${name}`] : []),
+      ]
+    }
+    return [isModelField(name) ? `field:${name}` : `attribute:${name}`]
+  }
+
+  /**
+   * Every clause of an update: where it writes or removes ({@link clauseAt},
+   * {@link recordClausesAt}), and the path inside there (`[]` for all of it). A `pathRemove`
+   * carries its index, so a removal's judgement leaves itself out.
+   */
+  const clausesOf = (
+    uState: UpdateState,
+  ): ReadonlyArray<{
+    readonly at: string
+    readonly path: ReadonlyArray<string | number>
+    readonly removal?: number
+  }> => {
+    const out: Array<{
+      readonly at: string
+      readonly path: ReadonlyArray<string | number>
+      readonly removal?: number
+    }> = []
+    const record = (entries: ReadonlyArray<readonly [string, unknown]>) => {
+      for (const [name, value] of entries) {
+        for (const at of recordClausesAt(name, value)) out.push({ at, path: [] })
+      }
+    }
+    const updates = uState.updates
+    if (updates !== null && typeof updates === "object") {
+      record(Object.entries(updates as globalThis.Record<string, unknown>))
+    }
+    record((uState.remove ?? []).map((name) => [name, undefined] as const))
+    record(Object.entries(uState.add ?? {}))
+    record(Object.entries(uState.subtract ?? {}))
+    record(Object.entries(uState.append ?? {}))
+    record(Object.entries(uState.deleteFromSet ?? {}))
+    for (const ops of [
+      uState.pathSets,
+      uState.pathAdds,
+      uState.pathSubtracts,
+      uState.pathAppends,
+      uState.pathPrepends,
+      uState.pathIfNotExists,
+      uState.pathDeletes,
+    ]) {
+      for (const { segments } of ops ?? []) {
+        out.push({ at: clauseAt(segments), path: segments.slice(1) })
+      }
+    }
+    for (const [removal, segments] of (uState.pathRemoves ?? []).entries()) {
+      out.push({ at: clauseAt(segments), path: segments.slice(1), removal })
+    }
+    for (const { field, keys } of uState.sparseRemoveEntries ?? []) {
+      const prefix = Object.hasOwn(sparseFields, field) ? sparseFields[field]!.prefix : field
+      for (const key of keys) out.push({ at: `attribute:${prefix}#${key}`, path: [] })
+    }
+    for (const field of uState.sparseClearFields ?? []) out.push({ at: `map:${field}`, path: [] })
+    return out
   }
 
   /**

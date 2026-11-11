@@ -5,11 +5,12 @@
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
- * `helpers/SelectBesideSparseMaps.ts` (the last two against 1.40.0). Connected twin:
+ * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts` (the last three against 1.40.0). Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
 import { describe } from "vitest"
+import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
@@ -73,4 +74,8 @@ describe("a select naming a sparse map field", () => {
 
 describe("a select naming a sparse map beside other paths", () => {
   selectBesideSparseMapsSuite(openRecordingTable, { dynamodb: false })
+})
+
+describe("a pathRemove beside another clause in the same field", () => {
+  accompaniedClearsSuite(openRecordingTable)
 })

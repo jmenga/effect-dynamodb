@@ -16,6 +16,6 @@ A `pathRemove` that leaves a row no read can decode is refused in more places, w
 - A list position whose shortened list only a member its tag rules out reads: `p[0]` of `{ kind: "a", p: [string, string] }` beside `{ kind: "b", p: [string] }`.
 - Below a record with several index signatures, judged by the signatures its key matches: on `{ [open-*]: [string, string?], [fixed-*]: [string, string] }`, `["fixed-k", 0]` is refused and `["open-k", 0]` is sent. A record keyed by a template literal of strings is judged too.
 
-Anything the guard can't model exactly is still sent, as before.
+Anything the guard can't model exactly is still sent, as before. A removal is judged against the update as a whole: where another clause of the same update writes or removes what a list position's judgement reads (another position of the list, a tag beside it), the position is judged as 1.40.0 judged it, so `f.kind = "b"` beside the removal of `f.p[0]` above is sent and reads back as `{ kind: "b", p: ["second"] }`, as on 1.40.0.
 
 A condition or filter comparing the path builder itself (`eq(t, 1)`, `t.size()`) is refused with a `ValidationError` before anything is sent (`EDD-9149`), as an empty part under `or()` is. It names the whole item, not an attribute. 1.40.0 sent it as `( = :e0)` and DynamoDB rejected it with a `DynamoValidationError`. 1.39.0 did the same for a condition, and its filter died with a `TypeError`.

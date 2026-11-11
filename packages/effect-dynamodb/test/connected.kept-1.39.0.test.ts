@@ -6,7 +6,7 @@
  * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`,
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
- * `helpers/SelectBesideSparseMaps.ts` (the last two against 1.40.0).
+ * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts` (the last three against 1.40.0).
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -23,6 +23,7 @@ import { Config, Effect } from "effect"
 import { describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
+import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
@@ -138,4 +139,8 @@ describeConnected("a select naming a sparse map field", () => {
 
 describeConnected("a select naming a sparse map beside other paths", () => {
   selectBesideSparseMapsSuite(openTable, { dynamodb: true })
+})
+
+describeConnected("a pathRemove beside another clause in the same field", () => {
+  accompaniedClearsSuite(openTable)
 })

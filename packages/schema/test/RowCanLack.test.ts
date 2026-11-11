@@ -837,6 +837,69 @@ describe("pathIsRequired", () => {
   }
 })
 
+describe("pathIsRequired, against the update's other clauses in the field (#238)", () => {
+  const T2 = Schema.Tuple([Schema.String, Schema.String])
+  const tagged = Schema.Struct({
+    f: Schema.Union([
+      Schema.Struct({ kind: Schema.Literal("b"), p: Schema.Tuple([Schema.String]) }),
+      Schema.Struct({ kind: Schema.Literal("a"), p: T2 }),
+    ]),
+  })
+  const shifted = Schema.Tuple([Schema.String, Schema.optional(Schema.Number)])
+  const records = Schema.StructWithRest(Schema.Struct({}), [
+    Schema.Record(
+      Schema.TemplateLiteral(["open-", Schema.String]),
+      Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+    ),
+    Schema.Record(Schema.TemplateLiteral(["fixed-", Schema.String]), T2),
+  ])
+  const nested = Schema.Array(Schema.Struct({ p: T2, q: Schema.String }))
+  type Case = readonly [
+    name: string,
+    field: Schema.Top,
+    path: ReadonlyArray<string | number>,
+    beside: ReadonlyArray<ReadonlyArray<string | number>>,
+    expected: boolean,
+  ]
+  const CASES: ReadonlyArray<Case> = [
+    // The tag beside the list: another clause writing it changes which member reads what's left.
+    ["the tag, written beside p[0]", tagged, ["f", "p", 0], [["f", "kind"]], false],
+    ["nothing beside p[0]", tagged, ["f", "p", 0], [], true],
+    // Another position of the list: DynamoDB appends past the end, or closes up another gap.
+    ["another position of the list", shifted, [0], [[1]], false],
+    ["below another position of the list", nested, [0, "p", 0], [[0, "p", 1]], true],
+    ["another element of a list further up", nested, [0, "p", 0], [[1, "q"]], true],
+    // A sibling of a property on the way, where a struct holds it.
+    ["a sibling where a struct holds the list", nested, [0, "p", 0], [[0, "q"]], true],
+    // As 1.40.0 judged it, by length alone: [string, string] one shorter is no length it takes.
+    ["the path itself, beside a removal 1.40.0 refused", T2, [0], [[0]], true],
+    ["the field, written whole, beside one 1.40.0 refused", T2, [0], [[]], true],
+    ["another position, beside one 1.40.0 refused", T2, [0], [[2]], true],
+    // A record's other key isn't read, so the judgement stands; its own list's other position
+    // makes it 1.40.0's, which didn't model a record keyed by template literals.
+    ["a record's other key", records, ["fixed-k", 0], [["open-j"]], true],
+    ["the same key's other position", records, ["fixed-k", 0], [["fixed-k", 2]], false],
+    // A property's judgement reads nothing of the row.
+    [
+      "a property, beside its sibling",
+      Schema.Struct({ x: Schema.Number, y: Schema.String }),
+      ["x"],
+      [["y"]],
+      true,
+    ],
+  ]
+  for (const [name, field, path, beside, expected] of CASES) {
+    it(`${name}: ${expected}`, () => expect(pathIsRequired(field, path, { beside })).toBe(expected))
+  }
+
+  it("below a sparse map's entry, which 1.40.0 didn't judge, another clause leaves it unjudged", () => {
+    const entry = Schema.Record(Schema.String, T2)
+    expect(pathIsRequired(entry, ["k", 0], { beside: [], judgedBefore: false })).toBe(true)
+    expect(pathIsRequired(entry, ["k", 0], { beside: [["k", 2]], judgedBefore: false })).toBe(false)
+    expect(pathIsRequired(entry, ["k", 0], { beside: [["k", 2]] })).toBe(true)
+  })
+})
+
 describe("the derived update schema", () => {
   class Item extends Schema.Class<Item>("RCLItem")({
     id: Schema.String,
