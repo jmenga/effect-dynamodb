@@ -2873,6 +2873,23 @@ const makeAggregate = <TSchema extends Schema.Top>(
   })()
 
   /**
+   * The entity types the library stamps an `updatedAt` on, every row of every node holding them. A
+   * node declaring a field of that name other than a date holds the caller's value there
+   * (`rowStampsOf`), which a write of the library leaves as it was, so it proves nothing of the row.
+   */
+  const stampsUpdated: ReadonlySet<string> = (() => {
+    const stamped = new Set<string>()
+    const unstamped = new Set<string>()
+    const walk = (node: ResolvedNode): void => {
+      const updated = node.rowStamps?.updatedAt ?? null
+      ;(updated === null ? unstamped : stamped).add(node.entityType)
+      for (const child of node.children) walk(child)
+    }
+    walk(rootNode)
+    return new Set([...stamped].filter((entityType) => !unstamped.has(entityType)))
+  })()
+
+  /**
    * `rekey`'s move of the aggregate at `key` (#183, DESIGN.md §7 "`rekey`"): read from the
    * partition its root was found in and its current one, and placed ({@link locateRows}). Each row
    * under its old key moves — a Put of the row `update` would write at its current key, keeping
@@ -2881,7 +2898,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * written, and every write is conditional: the Put only where nothing is, the Delete and the
    * rewrite only while the row is as read, whole, with each attribute its entity type can hold and
    * it didn't still absent (`wholeRowGuard`; a row too wide for that, on its `updatedAt` when the
-   * aggregate stamps one, `preferredGuard`, or else as `unprovable` decides: under `"report"` an
+   * library stamps one on it, `preferredGuard`, or else as `unprovable` decides: under `"report"` an
    * aggregate nothing of which has moved is left as it is, every row, and each such row is reported
    * `unguarded`, dry run or not; one already part-moved is finished under the strongest guard that
    * fits, as 1.39.0 finished it). Rows whose keys chain move in order, the one whose current key is
@@ -3085,15 +3102,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
         const unprovableHere: UnprovableRow = partMoved ? "strongest" : unprovable
         // The row as read, whole, with every attribute its entity type can hold and it didn't
         // still absent: 1.39.0's guard with those appended. A row too wide for that is guarded on
-        // its `updatedAt` when the aggregate stamps one, held or absent (`preferredGuard`), with
-        // what else fits; otherwise `unprovableHere` decides, and `undefined` is a row reported.
+        // its `updatedAt` when the library stamps one on it, held or absent (`preferredGuard`),
+        // with what else fits; otherwise `unprovableHere` decides, and `undefined` is a row
+        // reported.
         const guardOf = (at: { readonly pk: string; readonly sk: string }, r: number) => {
           const read = storedAt.get(positionOf(at.pk, at.sk)) ?? {}
-          const absent = writableAttributes.get(built[r]!.__edd_e__?.S ?? "") ?? []
+          const entityType = built[r]!.__edd_e__?.S ?? ""
+          const absent = writableAttributes.get(entityType) ?? []
           const prefer = updatedField === null ? [] : [updatedField]
           const whole = wholeRowGuard(read, config.pk.field, prefer, [], absent)
           if (whole !== undefined) return whole
-          if (updatedField !== null) return preferredGuard(read, config.pk.field, prefer, absent)
+          if (updatedField !== null && stampsUpdated.has(entityType)) {
+            return preferredGuard(read, config.pk.field, prefer, absent)
+          }
           switch (unprovableHere) {
             case "report":
               return undefined

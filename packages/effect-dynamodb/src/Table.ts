@@ -1062,7 +1062,7 @@ export interface RekeyOptions {
   readonly repairIndexKeys?: boolean | undefined
   /**
    * Writes to the table are stopped for this run. A row `rekey` can't prove unchanged when it
-   * moves (`unguarded`: too wide to guard whole, with no version or `updatedAt` to stand in) then
+   * moves (`unguarded`: too wide to guard whole, with no version or stamped `updatedAt` to stand in) then
    * moves under the strongest guard that fits, as on 1.39.0. Default `false`: such a row is
    * left where it is and reported `unguarded`, since a write landing between the read and the move
    * would be lost, unless its aggregate or stream is already part-moved. Run with this only while

@@ -1,6 +1,6 @@
 /**
- * An aggregate row too wide to guard whole, with no `updatedAt`, and an update landing after
- * `rekey` read it, against DynamoDB Local: real limits on the item, the transaction and the guard.
+ * An aggregate row too wide to guard whole, with no `updatedAt` or one the caller owns, and an
+ * update landing after `rekey` read it, against DynamoDB Local: real limits on the item, the transaction and the guard.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -37,9 +37,9 @@ const ClientLayer = DynamoClient.layer({
 let tables = 0
 
 describeConnected(
-  "rekey of an aggregate row too wide to guard whole, with no updatedAt, on DynamoDB",
+  "rekey of an aggregate row too wide to guard whole, with no updatedAt it stamps, on DynamoDB",
   () => {
-    for (const [name, toEscaped, writesStopped] of RekeyWideAggregate.CASES) {
+    for (const [name, toEscaped, writesStopped, ownUpdatedAt] of RekeyWideAggregate.CASES) {
       it.live(name, () =>
         Effect.gen(function* () {
           const client = yield* DynamoClient
@@ -58,7 +58,13 @@ describeConnected(
               ],
             }),
             () =>
-              RekeyWideAggregate.wideAggregatePin({ client, tableName, toEscaped, writesStopped }),
+              RekeyWideAggregate.wideAggregatePin({
+                client,
+                tableName,
+                toEscaped,
+                writesStopped,
+                ownUpdatedAt,
+              }),
             () => Effect.ignore(client.deleteTable({ TableName: tableName })),
           )
         }).pipe(Effect.provide(ClientLayer)),

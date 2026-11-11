@@ -88,8 +88,8 @@ export const unprovableRow = (ctx: RekeyRowContext): UnprovableRow =>
 /** A row left where it is because nothing proves it unchanged when it moves ({@link unprovableRow}). */
 export const UNGUARDED_MESSAGE =
   "It can't be proven unchanged in one condition: guarded whole, it's over DynamoDB's limits on " +
-  "one expression, and it has no version or updatedAt to stand in. It's left where it is: stop " +
-  "writes to the table, then run rekey with writesStopped: true."
+  "one expression, and it has no version or updatedAt the library stamps to stand in. It's left " +
+  "where it is: stop writes to the table, then run rekey with writesStopped: true."
 
 /**
  * How many rows still to move a row's own move goes through first: one chain, `foo%20bar`'s row

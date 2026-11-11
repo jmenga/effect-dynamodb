@@ -1227,9 +1227,9 @@ guarded, when its member stamps an `updatedAt`, on that stamp, held or still
 absent, then on as many of its other attributes as fit: an entity's in
 `deleteGuard`'s fallback order, an aggregate row's as 1.39.0 sent them, followed
 by as many of the absent ones as fit (`preferredGuard`). Whether the stamp
-proves the row is the member's configuration, not the row's: a timestamped
-member's row written before it stamped one is guarded on `updatedAt` still
-absent. In that fallback an `updatedAt` stored under another name (`field:`) is
+proves the row is the member's configuration (an aggregate's, for each node),
+not the row's: a timestamped member's row written before it stamped one is
+guarded on `updatedAt` still absent. In that fallback an `updatedAt` stored under another name (`field:`) is
 guarded by the attribute it's stored in, as a version is by the attribute
 `versioned: { field }` names. A row its whole guard fits holds the stamp among
 the attributes it was read with, and the request is 1.39.0's.
@@ -1245,12 +1245,16 @@ read it, so a write it doesn't see is lost, as on 1.39.0:
   `updatedAt`), a write that leaves the stamp as it was: `reembed`, which sets
   the vector alone; one landing within the stamp's resolution (the same
   millisecond, or the same second for an `updatedAt` stored as epoch seconds);
-  one from outside the library; and, on an aggregate row whose node declares its
-  own `updatedAt` field, any write (the field is the caller's, not a stamp).
+  and one from outside the library.
 
-A wide row of a member with no `updatedAt` (and no version), and a stream row or
-a projection's row tombstone or outbox item too wide to guard whole, is one
-nothing proves unchanged. `Rekey.unprovableRow` decides it, by
+A wide row with no version and no `updatedAt` the library stamps on it, and a
+stream row or a projection's row tombstone or outbox item too wide to guard
+whole, is one nothing proves unchanged. That covers an aggregate row whose node
+declares its own `updatedAt` other than a date (`rowStampsOf`): it holds the
+caller's value, which a write of the library leaves as it was. 1.39.0 stored its
+stamp over that value, so declared required the aggregate couldn't be read and
+`rekey` reported it `failed`, and declared optional it read back without the
+value (`test/fixtures/rekey-guards-1.39.0.json`). `Rekey.unprovableRow` decides it, by
 `RekeyOptions.writesStopped`:
 
 - **Writes going on** (the default): the row is left where it is and reported

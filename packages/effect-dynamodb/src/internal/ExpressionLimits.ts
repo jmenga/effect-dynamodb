@@ -265,8 +265,9 @@ export const preferredGuard = (
 /**
  * What `rekey`'s move does with a row it can't prove unchanged: one whose whole guard ({@link
  * wholeRowGuard}) doesn't fit DynamoDB's limits on one expression, with no version or `updatedAt`
- * to stand in (its member is neither `versioned` nor `timestamps`, or it's a stream's row or a
- * projection's row tombstone or outbox item). Every move that meets such a row switches on it, so
+ * the library stamps to stand in (its member is neither `versioned` nor `timestamps`, it's an
+ * aggregate row whose node declares its own `updatedAt` other than a date, or it's a stream's row or
+ * a projection's row tombstone or outbox item). Every move that meets such a row switches on it, so
  * a new answer is a type error at each:
  *
  * - `"report"` — the default: the row isn't moved, and is reported `unguarded`. An aggregate or a

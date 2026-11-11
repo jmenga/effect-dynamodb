@@ -6,6 +6,11 @@
  * conflict. With writes going on the aggregate, nothing of which has moved, is now left as it is,
  * reported `unguarded`, and the update kept; with writes stopped it moves.
  *
+ * The same holds for a timestamped aggregate whose row declares its own `updatedAt` as a string
+ * (`ownUpdatedAt`): the caller's value is stored there, which an update leaves as it was, so it
+ * proves nothing of the row. 1.39.0 stored its stamp over that value and couldn't read the
+ * aggregate back (`fixtures/rekey-guards-1.39.0.json`).
+ *
  * Run on a recording table (`RekeyWideAggregate.test.ts`) and on DynamoDB Local
  * (`connected.rekey-wide-aggregate.test.ts`).
  */
@@ -22,19 +27,22 @@ const fields = Object.fromEntries(
 const values = Object.fromEntries(Object.keys(fields).map((name) => [name, "x"]))
 const Line = Schema.Struct({ ...fields, lid: Schema.String, zzPayload: Schema.String })
 const Root = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
+const StampedLine = Schema.Struct({ ...Line.fields, updatedAt: Schema.String })
+const StampedRoot = Schema.Struct({ id: Schema.String, lines: Schema.Array(StampedLine) })
 
 const PAYLOAD = "x".repeat(360_000)
 const UPDATED = "y".repeat(360_000)
 
-const world = (escapeKeys: boolean) => {
+const world = (escapeKeys: boolean, ownUpdatedAt: boolean) => {
   const schema = DynamoSchema.make({ name: "wide213", version: 1, escapeKeys })
   const Main = Table.make({ schema, entities: {} } as never) as any
-  const A = (Aggregate.make as any)(Root, {
+  const A = (Aggregate.make as any)(ownUpdatedAt ? StampedRoot : Root, {
     schema,
     table: Main,
     pk: { field: "pk", composite: ["id"] },
     collection: { name: "roots" },
     root: { entityType: "Root" },
+    ...(ownUpdatedAt && { timestamps: true }),
     edges: { lines: Aggregate.many({ entityType: "Line", sk: { composite: ["lid"] } }) },
   })
   return {
@@ -67,14 +75,23 @@ export const wideAggregatePin = (options: {
   readonly tableName: string
   readonly toEscaped: boolean
   readonly writesStopped: boolean
+  /** A timestamped aggregate whose row declares its own `updatedAt` as a string. */
+  readonly ownUpdatedAt: boolean
 }) =>
   Effect.gen(function* () {
-    const { client, tableName, toEscaped, writesStopped } = options
-    const before = on(world(!toEscaped), tableName, client)
+    const { client, tableName, toEscaped, writesStopped, ownUpdatedAt } = options
+    const before = on(world(!toEscaped, ownUpdatedAt), tableName, client)
     yield* before((db) =>
       db.aggregates.A.create({
         id: "p q",
-        lines: [{ ...values, lid: "leaf", zzPayload: PAYLOAD }],
+        lines: [
+          {
+            ...values,
+            lid: "leaf",
+            zzPayload: PAYLOAD,
+            ...(ownUpdatedAt && { updatedAt: "the caller's" }),
+          },
+        ],
       }),
     )
     const rows = () =>
@@ -113,7 +130,7 @@ export const wideAggregatePin = (options: {
         }
       },
     })
-    const after = on(world(toEscaped), tableName, rekeying)
+    const after = on(world(toEscaped, ownUpdatedAt), tableName, rekeying)
 
     if (!writesStopped) {
       for (const dryRun of [true, false]) {
@@ -154,14 +171,17 @@ export const wideAggregatePin = (options: {
   })
 
 export const CASES: ReadonlyArray<
-  readonly [name: string, toEscaped: boolean, writesStopped: boolean]
-> = [true, false].flatMap((toEscaped) =>
-  [false, true].map(
-    (writesStopped) =>
-      [
-        `${toEscaped ? "to on" : "to off"}, ${writesStopped ? "writes stopped: it moves" : "writes going on: left as it is, unguarded, the update kept"}`,
-        toEscaped,
-        writesStopped,
-      ] as const,
+  readonly [name: string, toEscaped: boolean, writesStopped: boolean, ownUpdatedAt: boolean]
+> = [false, true].flatMap((ownUpdatedAt) =>
+  [true, false].flatMap((toEscaped) =>
+    [false, true].map(
+      (writesStopped) =>
+        [
+          `${ownUpdatedAt ? "its own updatedAt, a string, " : ""}${toEscaped ? "to on" : "to off"}, ${writesStopped ? "writes stopped: it moves" : "writes going on: left as it is, unguarded, the update kept"}`,
+          toEscaped,
+          writesStopped,
+          ownUpdatedAt,
+        ] as const,
+    ),
   ),
 )
