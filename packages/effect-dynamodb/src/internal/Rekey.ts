@@ -43,6 +43,7 @@ import type {
   RekeyConflict,
   RekeyCountName,
   RekeyCounts,
+  RekeyGuardGapRow,
   RekeyGuardGaps,
   RekeyIndexKeys,
   RekeyJournal,
@@ -212,6 +213,8 @@ export interface RekeyTally {
   readonly reservations?: ReadonlyArray<RekeyReservation> | undefined
   /** Rows moved under a guard that can miss a write ({@link RekeyGuardGaps}). */
   readonly guardGaps?: Partial<RekeyGuardGaps> | undefined
+  /** The rows counted in {@link guardGaps}, named ({@link guardGap}). */
+  readonly guardGapRows?: ReadonlyArray<RekeyGuardGapRow> | undefined
   readonly conflicts?: ReadonlyArray<RekeyConflict> | undefined
   readonly skipped?: Partial<Record<RekeySkipReason, number>> | undefined
   /**
@@ -356,7 +359,33 @@ const zeroGuardGaps = (): MutableGuardGaps => ({ stamp: 0, sparse: 0, strongest:
 export const guardGap = (
   ctx: RekeyRowContext,
   gap: keyof RekeyGuardGaps | undefined,
-): RekeyTally => (gap === undefined || ctx.writesStopped ? {} : { guardGaps: { [gap]: 1 } })
+  /** The row: the report names it ({@link RekeyGuardGapRow}). */
+  row: Omit<RekeyGuardGapRow, "gap">,
+): RekeyTally =>
+  gap === undefined || ctx.writesStopped
+    ? {}
+    : { guardGaps: { [gap]: 1 }, guardGapRows: [{ ...row, gap }] }
+
+/** How many rows {@link RekeyReport.guardGaps} names: the first by member, kind and key. */
+const GUARD_GAP_ROWS = 100
+
+const guardGapRowOrder = (row: RekeyGuardGapRow): ReadonlyArray<string> => [
+  row.member,
+  row.kind,
+  stableText(row.key),
+  row.gap,
+  stableText(row.target),
+]
+
+/** The first {@link GUARD_GAP_ROWS} of `rows` by {@link guardGapRowOrder}. */
+const firstGuardGapRows = (
+  rows: ReadonlyArray<RekeyGuardGapRow>,
+): ReadonlyArray<RekeyGuardGapRow> =>
+  rows
+    .map((row) => ({ row, order: guardGapRowOrder(row) }))
+    .sort((a, b) => compareOrders(a.order, b.order))
+    .slice(0, GUARD_GAP_ROWS)
+    .map(({ row }) => row)
 
 type MutableReservations = { -readonly [K in keyof RekeyReservationCounts]: number }
 
@@ -451,6 +480,8 @@ class Totals {
   guardGaps = zeroGuardGaps()
   /** One entry per sentinel: a sentinel is its own unit, judged once a run. */
   private readonly reservationEntries: Array<RekeyReservation> = []
+  /** The rows counted in `guardGaps`, kept to the first {@link GUARD_GAP_ROWS} as they come. */
+  private guardGapRows: ReadonlyArray<RekeyGuardGapRow> = []
   /** One conflict per row (member, kind, key): the first by {@link REASON_ORDER}, then by text. */
   private readonly conflicts = new Map<string, RekeyConflict>()
   skipped: { -readonly [R in RekeySkipReason]: number } = {
@@ -502,6 +533,11 @@ class Totals {
       const n = tally.guardGaps?.[gap] ?? 0
       this.guardGaps[gap] += n
       if (into !== undefined) into.guardGaps[gap] += n
+    }
+    if (tally.guardGapRows !== undefined && tally.guardGapRows.length > 0) {
+      const rows = [...this.guardGapRows, ...tally.guardGapRows]
+      // Bounded: sorted and cut once twice the list has come in, so memory stays flat.
+      this.guardGapRows = rows.length > 2 * GUARD_GAP_ROWS ? firstGuardGapRows(rows) : rows
     }
     for (const entry of tally.reservations ?? []) {
       this.reservationEntries.push(entry)
@@ -563,7 +599,7 @@ class Totals {
           .sort((a, b) => compareOrders(a.order, b.order))
           .map(({ entry }) => entry),
       },
-      guardGaps: { ...this.guardGaps },
+      guardGaps: { ...this.guardGaps, rows: firstGuardGapRows(this.guardGapRows) },
       conflicts,
       skipped: { ...this.skipped },
       byMember,
@@ -1847,6 +1883,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
   const reservations: Array<RekeyReservation> = []
   const indexKeys: Partial<MutableIndexKeys> = {}
   const guardGaps: Partial<MutableGuardGaps> = {}
+  const guardGapRows: Array<RekeyGuardGapRow> = []
   let unchanged = 0
   let indexKeysRewritten = 0
   let sentinelsMoved = 0
@@ -1874,6 +1911,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     }
     for (const conflict of tally.conflicts ?? []) conflicts.push(conflict)
     for (const entry of tally.reservations ?? []) reservations.push(entry)
+    for (const row of tally.guardGapRows ?? []) guardGapRows.push(row)
   }
   return {
     ...(unchanged > 0 && { unchanged }),
@@ -1883,6 +1921,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     ...(Object.keys(indexKeys).length > 0 && { indexKeys }),
     ...(reservations.length > 0 && { reservations }),
     ...(Object.keys(guardGaps).length > 0 && { guardGaps }),
+    ...(guardGapRows.length > 0 && { guardGapRows }),
     ...(conflicts.length > 0 && { conflicts }),
     ...(Object.keys(skipped).length > 0 && { skipped }),
     ...(worked && { worked }),

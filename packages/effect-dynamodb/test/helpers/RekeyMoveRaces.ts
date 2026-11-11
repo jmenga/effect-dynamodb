@@ -152,6 +152,24 @@ export interface RaceScenario {
   readonly run: (harness: Harness) => Effect.Effect<void, unknown>
 }
 
+/**
+ * The row `guardGaps.rows` names for a wide row moved under its `updatedAt`: its member, its key
+ * as seeded and its key once moved.
+ */
+const stampedRow = (kind: string, seed: ReadonlyArray<Row>, after: ReadonlyArray<Row>) => {
+  const wide = seed.find((row) => Object.keys(row).length > 100)!
+  const moved = after.find(
+    (row) => row.__edd_e__?.S === wide.__edd_e__?.S && Object.keys(row).length > 100,
+  )!
+  return {
+    member: kind === "entity" ? "Item" : "Order",
+    kind: kind === "entity" ? "item" : "aggregate",
+    gap: "stamp",
+    key: { pk: wide.pk.S, sk: wide.sk.S },
+    target: { pk: moved.pk.S, sk: moved.sk.S },
+  }
+}
+
 export const CASES = Object.keys(fixture.cases).map((name) => name.replace(/^escape /, ""))
 export const LOST = lost
 
@@ -219,9 +237,14 @@ export const scenarios = (setting: Setting): ReadonlyArray<RaceScenario> =>
             // write leaving `updatedAt` as it was isn't seen. With writes stopped there's none. A
             // dry run counts what the run does.
             const stamped = !setting.writesStopped && width === "wide" && stamps === "timestamps"
-            expect(report.guardGaps).toEqual({ stamp: stamped ? 1 : 0, sparse: 0, strongest: 0 })
-            expect(dry.guardGaps).toEqual(report.guardGaps)
             const rows = yield* table.rows()
+            expect(report.guardGaps).toEqual({
+              stamp: stamped ? 1 : 0,
+              sparse: 0,
+              strongest: 0,
+              rows: stamped ? [stampedRow(kind!, stored.seed, rows)] : [],
+            })
+            expect(dry.guardGaps).toEqual(report.guardGaps)
             const [attribute, value] = writeOf(name)
             const kept = rows.some(
               (row: Row) => row[attribute]?.S === value && row.__edd_e__?.S !== "Order",
@@ -277,16 +300,17 @@ export const unstampedScenarios: ReadonlyArray<RaceScenario> = (["entity", "aggr
           const report = yield* db.tables.MainTable.rekey(setting)
           expect(landed).toBeGreaterThan(0)
           expect(report.conflicts).toEqual([])
+          const rows = yield* table.rows()
           expect(report.guardGaps).toEqual({
             stamp: setting.writesStopped ? 0 : 1,
             sparse: 0,
             strongest: 0,
+            rows: setting.writesStopped ? [] : [stampedRow(kind, stored.seed, rows)],
           })
           const transactions = table
             .requests()
             .filter((request) => request.command === "transactWriteItems")
           expect(transactions.length).toBeGreaterThan(1)
-          const rows = yield* table.rows()
           const moved = rows.filter((row: Row) => ["Item", "Line"].includes(row.__edd_e__?.S))
           expect(moved).toHaveLength(1)
           expect(moved[0]!.sk.S).toContain("a%20b")

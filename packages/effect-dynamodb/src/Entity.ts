@@ -14161,7 +14161,12 @@ const makeImpl = <
           return Rekey.mergeTallies(
             countMove(ctx, "item", to, tally),
             { sentinelsMoved: sentinels.moved },
-            Rekey.guardGap(ctx, moveGap(guard)),
+            Rekey.guardGap(ctx, moveGap(guard), {
+              member: entityType,
+              kind: "item",
+              key: from,
+              target: to,
+            }),
             Object.keys(left.sets).length === 0 ? {} : { indexKeysRewritten: 1 },
             heldBackIndexKeys(to, left.uncomposable),
             repair.tally,
@@ -14188,7 +14193,12 @@ const makeImpl = <
           return Rekey.mergeTallies(
             countMove(ctx, "item", to, tally),
             { sentinelsMoved: sentinels.moved },
-            Rekey.guardGap(ctx, moveGap(guard)),
+            Rekey.guardGap(ctx, moveGap(guard), {
+              member: entityType,
+              kind: "item",
+              key: from,
+              target: to,
+            }),
           )
         }
         // Something changed between the reads and the write: judge it again.

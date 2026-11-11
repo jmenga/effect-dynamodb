@@ -1335,15 +1335,21 @@ the attributes it was read with, and the request is 1.39.0's.
 A guard sees a write only through its terms. The move puts the row back as it
 read it, so a write it doesn't see is lost, as on 1.39.0:
 
-- a write that only adds an attribute the library can't enumerate: one no
-  declaration names (written outside the library), or a sparse map's entry;
+- a write that only adds an attribute the guard doesn't hold absent: on an
+  entity's item or an aggregate's row, one no declaration names (written
+  outside the library), or a sparse map's entry; on an event stream's row, any
+  (written outside the library); on a projection's row tombstone or outbox
+  item, any but a drainer's claim (likewise);
 - on a wide row guarded on its `updatedAt`, a write that leaves the stamp as it
   was and changes an attribute the guard leaves out: one landing within the
   stamp's resolution (the same millisecond, or the same second for an
   `updatedAt` stored as epoch seconds), a `reembed` (which stamps nothing), and
   one from outside the library;
-- on a versioned item, a write from outside the library that leaves the version
-  as it was.
+- on a versioned item's row (live, snapshot or tombstone), a write from outside
+  the library that leaves the version, the incarnation token and the vector
+  attributes as they were;
+- on a unique sentinel (guarded on the row it names), a write from outside the
+  library that leaves that as it was.
 
 Up to 1.40.0 two more were lost (#240), each now a term of the guard the move
 already sends: a `reembed` landing on a versioned item (its vector attributes
@@ -1360,8 +1366,14 @@ item of an entity with a sparse map guarded whole (`deleteGuard`'s `by`, `row`:
 a library write adding an entry is unseen unless it changes a stamp the guard
 holds, so with timestamps only one within the stamp's resolution); `strongest`,
 a row of a part-moved aggregate or stream finished under the strongest guard
-that fits. A write from outside the library adding an undeclared attribute can
-land on any row and isn't counted. With `writesStopped: true` nothing is
+that fits. A row is counted only where a library write can be missed: a
+tombstone or time-series event guarded on its `updatedAt` isn't (no library
+write changes one), and a write from outside the library, which can land on
+any row, isn't counted for. `report.guardGaps.rows` names the rows counted
+(`RekeyGuardGapRow`: member, kind, count, stored key, target), at most 100,
+the first by member, kind and key, so the list is the same whatever order the
+run meets them in; the counts stay exact. `Rekey.guardGap` takes the row, so a
+new path that counts a gap names it. With `writesStopped: true` nothing is
 counted: stopping writes closes every case. Counting reads and writes nothing.
 
 A wide row with no version and no `updatedAt` the library stamps on it, and a

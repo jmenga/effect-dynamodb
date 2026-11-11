@@ -5559,7 +5559,14 @@ export const makeStream = <
         Rekey.mergeTallies(
           ...rows
             .filter((row) => wholeRowGuard(row, "pk", [], [], []) === undefined)
-            .map(() => Rekey.guardGap(ctx, "strongest")),
+            .map((row) =>
+              Rekey.guardGap(ctx, "strongest", {
+                member: config.streamName,
+                kind: "stream",
+                key: { pk: from, sk: skOf(row) },
+                target: { pk: to, sk: skOf(row) },
+              }),
+            ),
         )
       /**
        * With writes going on (`unprovable`), the rows of a stream nothing of which has moved that

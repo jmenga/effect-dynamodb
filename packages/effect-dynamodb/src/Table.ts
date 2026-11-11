@@ -1018,14 +1018,48 @@ export interface RekeyIndexKeys {
  * - `strongest` — a row of an aggregate or stream already part-moved, too wide to guard whole and
  *   finished under the strongest guard that fits: a write to an attribute it leaves out isn't seen.
  *
- * A write from outside the library that only adds an attribute no declaration names is never seen,
- * on any row, and isn't counted. Stopping writes and running with `writesStopped: true` closes
- * every one of these.
+ * A row is counted only where a library write can be missed. A write from outside the library is
+ * seen only through the guard's terms, so these are never seen, on any row moved with writes going
+ * on, counted or not:
+ *
+ * - on a versioned item's row (live, snapshot or tombstone), one that leaves the version, the
+ *   incarnation token and the vector attributes as they were, whatever else it changes;
+ * - on a unique sentinel, one that leaves the row it names as it was;
+ * - on an entity's other rows and an aggregate's rows, one that only adds attributes the member
+ *   doesn't declare; on an event stream's row, one that only adds attributes; on a projection's row
+ *   tombstone or outbox item, one that only adds attributes other than a drainer's claim;
+ * - on a row counted here, what its count says; and on a tombstone or time-series event too wide to
+ *   guard whole, guarded on its `updatedAt` and not counted (no library write changes one), one
+ *   that leaves `updatedAt` as it was and changes an attribute the guard leaves out.
+ *
+ * Stopping writes and running with `writesStopped: true` closes every one of these.
  */
 export interface RekeyGuardGaps {
   readonly stamp: number
   readonly sparse: number
   readonly strongest: number
+}
+
+/** A row counted in {@link RekeyGuardGaps}, named so it can be checked. */
+export interface RekeyGuardGapRow {
+  /** The entity type, aggregate or stream name. */
+  readonly member: string
+  readonly kind: RekeyRowKind
+  /** The count it's in. */
+  readonly gap: keyof RekeyGuardGaps
+  /** The row's primary key, as stored when the run read it. */
+  readonly key: Readonly<Record<string, unknown>>
+  /** Its current key: where the run moved it (a dry run: where it would). */
+  readonly target: Readonly<Record<string, unknown>>
+}
+
+/** {@link RekeyGuardGaps}, and the rows counted. */
+export interface RekeyGuardGapReport extends RekeyGuardGaps {
+  /**
+   * The rows counted, by member, kind and key: at most 100, the first in that order, so the list
+   * is the same whatever order the run met them in. The counts are exact.
+   */
+  readonly rows: ReadonlyArray<RekeyGuardGapRow>
 }
 
 /**
@@ -1133,8 +1167,8 @@ export interface RekeyReport {
   readonly indexKeys: RekeyIndexKeys
   /** Unique sentinels no row holds, and ones that couldn't be judged: {@link RekeyReservations}. */
   readonly reservations: RekeyReservations
-  /** Rows moved under a guard that can miss a write: {@link RekeyGuardGaps}. */
-  readonly guardGaps: RekeyGuardGaps
+  /** Rows moved under a guard that can miss a write, and up to 100 of them: {@link RekeyGuardGapReport}. */
+  readonly guardGaps: RekeyGuardGapReport
   /** Rows left where they are — see {@link RekeyConflict}. */
   readonly conflicts: ReadonlyArray<RekeyConflict>
   /** Rows no member owns, by reason. */

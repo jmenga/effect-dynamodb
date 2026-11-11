@@ -3404,11 +3404,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // a transaction takes the units in order while it is within DynamoDB's limits on one
         // (`packRequests`: 100 actions, 4 MB of item size, 16 MB of body), and at least one.
         const shape = transactWriteShape(yield* Capacity.requestFields)
-        const units: Array<{
-          readonly kind: "move" | "rewrite"
-          readonly items: ReadonlyArray<TransactWriteItem>
-          readonly gap?: "stamp" | "strongest" | undefined
-        }> = rewrites.map((items) => ({ kind: "rewrite" as const, items }))
+        const units: Array<
+          | {
+              readonly kind: "move"
+              readonly items: ReadonlyArray<TransactWriteItem>
+              readonly gap?: "stamp" | "strongest" | undefined
+              readonly from: Move["from"]
+              readonly to: Move["to"]
+            }
+          | { readonly kind: "rewrite"; readonly items: ReadonlyArray<TransactWriteItem> }
+        > = rewrites.map((items) => ({ kind: "rewrite" as const, items }))
         let pending = moves
         let lost = false
         while (!lost && (pending.length > 0 || units.length > 0)) {
@@ -3423,7 +3428,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
           if (wave.length === 0 && units.length === 0) break
           pending = pending.filter((move) => !wave.includes(move))
           units.push(
-            ...wave.map((move) => ({ kind: "move" as const, items: move.items, gap: move.gap })),
+            ...wave.map((move) => ({
+              kind: "move" as const,
+              items: move.items,
+              gap: move.gap,
+              from: move.from,
+              to: move.to,
+            })),
           )
           const chunks = packRequests(
             units.splice(0),
@@ -3450,7 +3461,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
             for (const unit of chunk) {
               if (unit.kind === "move") {
                 movedRows++
-                gaps = Rekey.mergeTallies(gaps, Rekey.guardGap(ctx, unit.gap))
+                gaps = Rekey.mergeTallies(
+                  gaps,
+                  Rekey.guardGap(ctx, unit.gap, {
+                    member: aggregateName,
+                    kind: "aggregate",
+                    key: { [config.pk.field]: unit.from.pk, sk: unit.from.sk },
+                    target: { [config.pk.field]: unit.to.pk, sk: unit.to.sk },
+                  }),
+                )
               } else rewrittenRows++
             }
           }

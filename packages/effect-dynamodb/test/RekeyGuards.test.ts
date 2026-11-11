@@ -56,12 +56,24 @@ describe("rows moved under a guard that can miss a write are reported, writes go
   for (const name of CASES) {
     it.effect(name, () =>
       Effect.gen(function* () {
-        expect(yield* guardGapsOf(Lib as never, name)).toEqual({
-          stamp: 0,
-          sparse: 0,
-          strongest: 0,
-          ...counted[name],
-        })
+        const { rows, ...counts } = (yield* guardGapsOf(Lib as never, name)) as {
+          readonly rows: ReadonlyArray<{ readonly gap: string }>
+        }
+        const expected = { stamp: 0, sparse: 0, strongest: 0, ...counted[name] }
+        expect(counts).toEqual(expected)
+        // Each row counted is named, once, with its stored key and the key it moved to.
+        expect(rows.map((row) => row.gap).sort()).toEqual(
+          Object.entries(expected).flatMap(([gap, n]) => Array.from({ length: n }, () => gap)),
+        )
+        for (const row of rows) {
+          expect(row).toEqual({
+            member: expect.any(String),
+            kind: expect.stringMatching(/^(item|aggregate|stream)$/),
+            gap: row.gap,
+            key: { pk: expect.any(String), sk: expect.any(String) },
+            target: { pk: expect.any(String), sk: expect.any(String) },
+          })
+        }
       }),
     )
   }

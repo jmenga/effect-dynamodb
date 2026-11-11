@@ -28,7 +28,7 @@ import type { Harness } from "./RekeyRepair.js"
 
 type Row = Record<string, any>
 
-const NO_GAPS = { stamp: 0, sparse: 0, strongest: 0 }
+const NO_GAPS = { stamp: 0, sparse: 0, strongest: 0, rows: [] }
 
 export interface UnseenWriteScenario {
   readonly name: string
@@ -303,7 +303,23 @@ export const sparseScenarios: ReadonlyArray<UnseenWriteScenario> = [false, true]
           for (const row of written) yield* table.seed(row)
           const db = yield* on.client
           const dry = yield* db.tables.MainTable.rekey({ writesStopped, dryRun: true })
-          expect(dry.guardGaps).toEqual({ ...NO_GAPS, sparse: writesStopped ? 0 : 1 })
+          // The row is named: its stored key, and the key it moves to.
+          const gaps = writesStopped
+            ? NO_GAPS
+            : {
+                ...NO_GAPS,
+                sparse: 1,
+                rows: [
+                  {
+                    member: "Tagged",
+                    kind: "item",
+                    gap: "sparse",
+                    key: { pk: written[0]!.pk.S, sk: written[0]!.sk.S },
+                    target: { pk: expect.stringContaining("a%20b"), sk: written[0]!.sk.S },
+                  },
+                ],
+              }
+          expect(dry.guardGaps).toEqual(gaps)
           let landed = 0
           if (!writesStopped) {
             table.beforeTransact(() => (landed++ === 0 ? table.seed(raced[0]!) : Effect.void))
@@ -311,8 +327,10 @@ export const sparseScenarios: ReadonlyArray<UnseenWriteScenario> = [false, true]
           const report = yield* db.tables.MainTable.rekey({ writesStopped })
           expect(report.conflicts).toEqual([])
           expect(report.moved.item).toBe(1)
-          expect(report.guardGaps).toEqual({ ...NO_GAPS, sparse: writesStopped ? 0 : 1 })
-          expect(report.byMember.Tagged!.guardGaps).toEqual(report.guardGaps)
+          expect(report.guardGaps).toEqual(gaps)
+          // Per member, the counts.
+          const { rows: _, ...counts } = report.guardGaps
+          expect(report.byMember.Tagged!.guardGaps).toEqual(counts)
           const rows = yield* table.rows()
           expect(rows).toHaveLength(1)
           expect(rows[0]!.pk.S).toContain("a%20b")

@@ -139,7 +139,7 @@ The report counts:
 | `sentinelsMoved` | Unique-constraint sentinels moved to their current keys |
 | `indexKeys` | Index keys of an item at its current table key that aren't what its values compose: `missing`, `truncated`, `lagging` and `ambiguous`, on every run, and `repaired` and `skipped` with `repairIndexKeys` (see [Repairing index keys](#repairing-index-keys)) |
 | `reservations` | Unique-constraint sentinels no row holds, with the `reservations` option: `orphaned` and `undecided`, and `released`, `skipped` and `raced` with `releaseOrphanedReservations`, with an entry for each (see [Releasing orphaned reservations](#releasing-orphaned-reservations)). Without the option, every count is 0 |
-| `guardGaps` | Rows moved, with writes going on, under a guard that can miss a write: `stamp`, `sparse` and `strongest` (see [Writes during a run](#writes-during-a-run)) |
+| `guardGaps` | Rows moved, with writes going on, under a guard that can miss a write: `stamp`, `sparse` and `strongest`, and `rows` naming up to 100 of them (see [Writes during a run](#writes-during-a-run)). `byMember` holds the counts |
 | `conflicts` | Rows left where they are, and why, each listed once per run (see [Conflicts](#conflicts)) |
 | `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs, or whose read model the client doesn't know), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)), `rootNotSeen` (an aggregate row with no root in its partition, met by a run that didn't read the whole table; a run over the whole table judges it) |
 | `byMember` | The same counts per entity type, aggregate and stream name |
@@ -270,19 +270,33 @@ A stream's rows are recognized by their stored stream id. A stream id of several
 
 ## Writes during a run
 
-`rekey` can run while your application writes. Each move deletes the old row only while it is as `rekey` read it, so a write that lands between the read and the move cancels the move, and `rekey` reads the row again and moves it with the write. The condition holds a versioned item's version, with its vector attributes (`reembed` writes them without bumping the version). Any other row it holds whole: every attribute the row holds, and each attribute its member declares that the row doesn't hold still absent.
+`rekey` can run while your application writes. Each move deletes the old row only while it is as `rekey` read it, so a write that lands between the read and the move cancels the move, and `rekey` reads the row again and moves it with the write. What the condition holds depends on the row:
+
+- A versioned item's row (live, a snapshot or a tombstone): its version and incarnation token, and its vector attributes (`reembed` writes them without bumping the version).
+- A unique sentinel: the row it names.
+- An entity's other rows and an aggregate's rows: the whole row, every attribute it holds, and each attribute its member declares that it doesn't hold still absent.
+- An event stream's row: every attribute it holds. A projection's row tombstone or outbox item: every attribute it holds, and a drainer's claim still absent.
 
 A row too wide for that condition (DynamoDB's limits on one expression) is held by its `updatedAt` and as much else as fits. A row with neither, with writes going on, isn't moved at all: it's the conflict `unguarded`.
 
-Some writes no condition on the move can see. The move puts the row back as it read it, so such a write is lost. `rekey` counts each row it moved where one could have been, in `report.guardGaps` and for each member:
+Some writes no condition on the move can see. The move puts the row back as it read it, so such a write is lost. `rekey` counts each row it moved where one could have been, in `report.guardGaps` and for each member, and names them in `report.guardGaps.rows`: each row's member, kind, which count it's in, its stored `key` and the `target` it moved to. The list holds at most 100 rows, the first by member, kind and key, so it's the same whatever order the run met them in; the counts are exact.
 
-| Count | The row | A write it can't see |
-|-------|---------|----------------------|
-| `stamp` | Too wide to guard whole, guarded on its `updatedAt` | One that leaves `updatedAt` as it was and changes an attribute the condition leaves out: a library write in the same millisecond (the same second, for an `updatedAt` stored as epoch seconds), a `reembed`, or a write from outside the library |
-| `sparse` | An item of an entity with a [sparse map](/effect-dynamodb/guides/sparse-maps/), guarded whole | One that only adds an entry to the map: its attribute is named by the entry's key, which no declaration names. With timestamps, a library write changes `updatedAt` and is seen, so only one in the same millisecond isn't |
-| `strongest` | A row of an aggregate or stream already part-moved, too wide to guard whole, finished under the strongest condition that fits | One to an attribute the condition leaves out |
+| Count | The row | A write it can't see | What to do |
+|-------|---------|----------------------|------------|
+| `stamp` | Too wide to guard whole, guarded on its `updatedAt` | One that leaves `updatedAt` as it was and changes an attribute the condition leaves out: a library write in the same millisecond (the same second, for an `updatedAt` stored as epoch seconds), a `reembed`, or a write from outside the library | Check the row at its `target` for a write made while the run was going. Run `reembed` again for an entity with a vector index |
+| `sparse` | An item of an entity with a [sparse map](/effect-dynamodb/guides/sparse-maps/), guarded whole | One that only adds an entry to the map: its attribute is named by the entry's key, which no declaration names. With timestamps, a library write changes `updatedAt` and is seen, so only one in the same millisecond isn't | Check the map at its `target` for an entry added while the run was going, and add a missing one again |
+| `strongest` | A row of an aggregate or stream already part-moved, too wide to guard whole, finished under the strongest condition that fits | One to an attribute the condition leaves out | Check the row at its `target` for a write made while the run was going |
 
-A write from outside the library that only adds an attribute the member doesn't declare is never seen, on any row, and isn't counted. To close every case, stop writes to the table for the run and pass `writesStopped: true`: nothing is counted then, and no row is `unguarded`.
+A count says a write could have been lost, not that one was: nothing is counted when no write could be. Running `rekey` again doesn't bring one back, since the row has already moved. To leave nothing to check, stop writes to the table for the run and pass `writesStopped: true`: nothing is counted then, and no row is `unguarded`.
+
+A row is counted only where a library write can be missed. A write from outside the library is seen only through the condition's terms above, so these are never seen, on any row moved with writes going on, counted or not:
+
+- On a versioned item's row, one that leaves the version, the incarnation token and the vector attributes as they were, whatever else it changes.
+- On a unique sentinel, one that leaves the row it names as it was.
+- On an entity's other rows and an aggregate's rows, one that only adds attributes the member doesn't declare. On an event stream's row, one that only adds attributes. On a projection's row tombstone or outbox item, one that only adds attributes other than a drainer's claim.
+- On a row counted above, what its count says. On a tombstone or time-series event too wide to hold whole, held by its `updatedAt` and not counted (no library write changes one), one that leaves `updatedAt` as it was and changes an attribute the condition leaves out.
+
+Any other write from outside the library changes what the condition holds, so it cancels the move like a library write. `writesStopped: true` covers these too.
 
 ## Conflicts
 

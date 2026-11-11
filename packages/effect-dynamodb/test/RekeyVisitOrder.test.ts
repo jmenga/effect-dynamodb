@@ -14,6 +14,7 @@
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
+import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Layer, Schema } from "effect"
 import { TestClock } from "effect/testing"
@@ -427,5 +428,102 @@ describe("rekey from a table a run cut short left part-moved finishes it in one 
         )
       }
     }
+  }
+})
+
+// ---------------------------------------------------------------------------
+// guardGaps names the rows it counts
+// ---------------------------------------------------------------------------
+
+/** Items with a sparse map: each is guarded whole, so a write adding an entry isn't seen. */
+const taggedWorld = (escapeKeys: boolean) => {
+  const schema = DynamoSchema.make({ name: "gaps", version: 1, escapeKeys })
+  const Tagged = Entity.make({
+    model: DynamoModel.configure(
+      Schema.Struct({ id: Schema.String, tags: Schema.Record(Schema.String, Schema.String) }),
+      { tags: { storedAs: DynamoModel.SparseMap() } },
+    ),
+    entityType: "Tagged",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+  })
+  const MainTable = Table.make({ schema, entities: { Tagged } })
+  return { MainTable, client: DynamoClient.make({ entities: { Tagged }, tables: { MainTable } }) }
+}
+
+/** More items than the report names, and than it holds before cutting the list, written off. */
+const TAGGED = 250
+
+const taggedRows = Effect.gen(function* () {
+  const table = makeRecordingTable()
+  const off = taggedWorld(false)
+  yield* Effect.gen(function* () {
+    const db = yield* off.client
+    for (let i = 0; i < TAGGED; i++) {
+      yield* db.entities.Tagged.put({ id: `a b ${String(i).padStart(3, "0")}`, tags: { a: "1" } })
+    }
+  }).pipe(Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))))
+  return [...table.items.values()]
+})
+
+describe("guardGaps names the rows it counts: the first 100 by key, whatever the order", () => {
+  let first: unknown
+  const runs = [
+    ...[1, 3].flatMap((segments) =>
+      [0, 1, 2].flatMap((seed) =>
+        [1, 4].map((concurrency) => ({ segments, seed, concurrency, writesStopped: false })),
+      ),
+    ),
+    { segments: 3, seed: 1, concurrency: 4, writesStopped: true },
+  ]
+  for (const { segments, seed, concurrency, writesStopped } of runs) {
+    const label = writesStopped ? ", writes stopped" : ""
+    it.effect(`${segments} segment(s), order ${seed}, ${concurrency} at once${label}`, () =>
+      Effect.gen(function* () {
+        const rows = yield* taggedRows
+        const table = makeRecordingTable()
+        for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+        const on = taggedWorld(true)
+        const layer = Layer.merge(
+          gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+          on.MainTable.layer({ name: "t" }),
+        )
+        const options = { segments, concurrency, pageSize: 7, writesStopped }
+        const { dry, real } = yield* Effect.gen(function* () {
+          const db = yield* on.client
+          const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
+          const real = yield* db.tables.MainTable.rekey(options)
+          return { dry, real }
+        }).pipe(Effect.provide(layer))
+        expect(real.moved.item).toBe(TAGGED)
+        expect(real.conflicts).toEqual([])
+        expect(dry.guardGaps).toEqual(real.guardGaps)
+        if (writesStopped) {
+          expect(real.guardGaps).toEqual({ stamp: 0, sparse: 0, strongest: 0, rows: [] })
+          return
+        }
+        // Every row is counted, and the first 100 by key are named.
+        expect(real.byMember.Tagged!.guardGaps).toEqual({ stamp: 0, sparse: TAGGED, strongest: 0 })
+        const { rows: named, ...counts } = real.guardGaps
+        expect(counts).toEqual({ stamp: 0, sparse: TAGGED, strongest: 0 })
+        const keys = rows.map((row) => row.pk!.S!).sort()
+        expect(named.map((row) => row.key.pk)).toEqual(keys.slice(0, 100))
+        const stored = new Set([...table.items.keys()])
+        for (const row of named) {
+          const before = rows.find((r) => r.pk!.S === row.key.pk)!
+          expect(row).toEqual({
+            member: "Tagged",
+            kind: "item",
+            gap: "sparse",
+            key: { pk: before.pk!.S, sk: before.sk!.S },
+            target: { pk: expect.any(String), sk: expect.any(String) },
+          })
+          // Its current key: where the run moved it.
+          expect(row.target).not.toEqual(row.key)
+          expect(stored.has(`${row.target.pk}|${row.target.sk}`)).toBe(true)
+        }
+        first ??= real.guardGaps
+        expect(real.guardGaps).toEqual(first)
+      }),
+    )
   }
 })
