@@ -8,6 +8,7 @@ import { expect } from "vitest"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import * as RekeyMoveRaces from "./helpers/RekeyMoveRaces.js"
 import * as RekeyRepair from "./helpers/RekeyRepair.js"
+import * as RekeyUnseenWrites from "./helpers/RekeyUnseenWrites.js"
 
 // The fixture's tables: a table key and nothing else, as on DynamoDB Local.
 const harness = RekeyRepair.harnessOn(() => {
@@ -31,6 +32,13 @@ describe("rekey's move of a row a write changed after rekey read it", () => {
     })
   }
   for (const scenario of RekeyMoveRaces.unstampedScenarios) {
+    it.live(scenario.name, () => scenario.run(harness))
+  }
+  for (const scenario of [
+    ...RekeyUnseenWrites.reembedScenarios,
+    ...RekeyUnseenWrites.nodeNameScenarios,
+    ...RekeyUnseenWrites.sparseScenarios,
+  ]) {
     it.live(scenario.name, () => scenario.run(harness))
   }
 })

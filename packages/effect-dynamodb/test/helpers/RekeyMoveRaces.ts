@@ -209,11 +209,18 @@ export const scenarios = (setting: Setting): ReadonlyArray<RaceScenario> =>
             if (unguarded) return yield* leftUnguarded(w, table, stored.seed)
             for (const row of stored.seed) yield* table.seed(row)
             const db: any = yield* w.client
+            const dry = yield* db.tables.MainTable.rekey({ ...setting, dryRun: true })
             let landed = 0
             table.beforeTransact(() => (landed++ === 0 ? table.seed(stored.raced) : Effect.void))
             const report = yield* db.tables.MainTable.rekey(setting)
             expect(landed).toBeGreaterThan(0)
             expect(report.conflicts).toEqual([])
+            // A wide row is guarded on its `updatedAt`, and with writes going on that's reported: a
+            // write leaving `updatedAt` as it was isn't seen. With writes stopped there's none. A
+            // dry run counts what the run does.
+            const stamped = !setting.writesStopped && width === "wide" && stamps === "timestamps"
+            expect(report.guardGaps).toEqual({ stamp: stamped ? 1 : 0, sparse: 0, strongest: 0 })
+            expect(dry.guardGaps).toEqual(report.guardGaps)
             const rows = yield* table.rows()
             const [attribute, value] = writeOf(name)
             const kept = rows.some(
@@ -270,6 +277,11 @@ export const unstampedScenarios: ReadonlyArray<RaceScenario> = (["entity", "aggr
           const report = yield* db.tables.MainTable.rekey(setting)
           expect(landed).toBeGreaterThan(0)
           expect(report.conflicts).toEqual([])
+          expect(report.guardGaps).toEqual({
+            stamp: setting.writesStopped ? 0 : 1,
+            sparse: 0,
+            strongest: 0,
+          })
           const transactions = table
             .requests()
             .filter((request) => request.command === "transactWriteItems")

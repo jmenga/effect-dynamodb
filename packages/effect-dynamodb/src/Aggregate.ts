@@ -245,6 +245,11 @@ interface ResolvedNode {
   readonly entityType: string
   /** The fields of the value this node's rows hold: what they declare. */
   readonly ownFields?: Record<string, Schema.Top> | undefined
+  /**
+   * The attributes this node's rows can hold, where its value exposes no `.fields` (an annotated
+   * class, a union's members): walked from its schema ({@link storedFieldNames}).
+   */
+  readonly storedNames?: ReadonlyArray<string> | undefined
   /** What this node's rows do with each timestamp. Undefined without `timestamps`. */
   readonly rowStamps?: RowStamps | undefined
   /**
@@ -1293,6 +1298,49 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
 const fieldsOf = (schema: unknown): Record<string, Schema.Top> | undefined => {
   const source = DynamoModel.isConfiguredModel(schema) ? schema.model : schema
   return (source as { readonly fields?: Record<string, Schema.Top> } | undefined)?.fields
+}
+
+/** The schema of an edge entity's model, a `DynamoModel.configure` wrapper unwrapped. */
+const modelOf = (model: unknown): Schema.Top | undefined =>
+  model === undefined
+    ? undefined
+    : ((DynamoModel.isConfiguredModel(model) ? model.model : model) as Schema.Top)
+
+/**
+ * The attribute names a value of `schema` can be stored under, for a node whose value exposes no
+ * `.fields` (#240): an object's properties, on its type side and its encoded side, every member of
+ * a union, what a declaration (an annotated class) is built from, a suspended schema's body once.
+ * Read by `rekey`'s guard, which holds each one a row didn't have still absent.
+ */
+const storedFieldNames = (schema: Schema.Top): ReadonlyArray<string> => {
+  const names = new Set<string>()
+  const seen = new Set<SchemaAST.AST>()
+  const walk = (ast: SchemaAST.AST): void => {
+    if (seen.has(ast)) return
+    seen.add(ast)
+    switch (ast._tag) {
+      case "Objects":
+        for (const property of ast.propertySignatures) {
+          if (typeof property.name === "string") names.add(property.name)
+        }
+        walk(SchemaAST.toEncoded(ast))
+        return
+      case "Union":
+        for (const member of ast.types) walk(member)
+        return
+      case "Suspend":
+        walk(ast.thunk())
+        return
+      case "Declaration":
+        for (const parameter of ast.typeParameters) walk(parameter)
+        walk(SchemaAST.toEncoded(ast))
+        return
+      default:
+        return
+    }
+  }
+  walk(schema.ast)
+  return [...names].sort()
 }
 
 /** The value schema of a struct field, with any `optionalKey` / `optional` wrapper removed. */
@@ -2909,7 +2957,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
     const walk = (node: ResolvedNode): void => {
       const names = byType.get(node.entityType) ?? new Set(shared)
       const edges = new Set(node.children.map((child) => child.fieldName))
-      for (const field of Object.keys(node.ownFields ?? {})) {
+      for (const field of [...Object.keys(node.ownFields ?? {}), ...(node.storedNames ?? [])]) {
         if (!edges.has(field)) names.add(field)
       }
       if (node.cardinality !== "root") {
@@ -2972,12 +3020,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const unprovable = Rekey.unprovableRow(ctx)
       let movedRows = 0
       let rewrittenRows = 0
+      // Rows moved under a guard that can miss a write ({@link Table.RekeyGuardGaps}).
+      let gaps: Rekey.RekeyTally = {}
       // Whether the aggregates holding this one's current keys have been judged first.
       let yielded = false
       // The aggregate left as it is, reported: with what it moved before it found that.
       const leftAsIs = (conflicts: Rekey.RekeyTally["conflicts"] & {}): Rekey.RekeyTally => ({
         ...(movedRows > 0 && { moved: { aggregate: movedRows } }),
         ...(rewrittenRows > 0 && { indexKeysRewritten: rewrittenRows }),
+        ...gaps,
         conflicts,
       })
       for (let attempt = 0; attempt < REKEY_ATTEMPTS; attempt++) {
@@ -2992,6 +3043,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             ...(unchanged > 0 && { unchanged }),
             ...(movedRows > 0 && { moved: { aggregate: movedRows } }),
             ...(rewrittenRows > 0 && { indexKeysRewritten: rewrittenRows }),
+            ...gaps,
           }
         }
         // Gone since the scan read it: deleted by a write.
@@ -3216,6 +3268,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // its `updatedAt` when the library stamps one on it, held or absent (`preferredGuard`),
         // with what else fits; otherwise `unprovableHere` decides, and `undefined` is a row
         // reported.
+        // What a move under each guard can miss ({@link Table.RekeyGuardGaps}), by position.
+        const gapAt = new Map<string, "stamp" | "strongest">()
         const guardOf = (at: { readonly pk: string; readonly sk: string }, r: number) => {
           const read = storedAt.get(positionOf(at.pk, at.sk)) ?? {}
           const entityType = built[r]!.__edd_e__?.S ?? ""
@@ -3224,12 +3278,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const whole = wholeRowGuard(read, config.pk.field, prefer, [], absent)
           if (whole !== undefined) return whole
           if (updatedField !== null && stampsUpdated.has(entityType)) {
+            gapAt.set(positionOf(at.pk, at.sk), "stamp")
             return preferredGuard(read, config.pk.field, prefer, absent)
           }
           switch (unprovableHere) {
             case "report":
               return undefined
             case "strongest":
+              gapAt.set(positionOf(at.pk, at.sk), "strongest")
               return asReadGuard(read, config.pk.field, prefer)
           }
         }
@@ -3258,6 +3314,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           readonly from: { readonly pk: string; readonly sk: string }
           readonly to: { readonly pk: string; readonly sk: string }
           readonly items: ReadonlyArray<TransactWriteItem>
+          readonly gap?: "stamp" | "strongest" | undefined
         }
         const moves: Array<Move> = []
         const rewrites: Array<ReadonlyArray<TransactWriteItem>> = []
@@ -3272,6 +3329,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             moves.push({
               from: row.old,
               to: row.current,
+              gap: gapAt.get(positionOf(row.old.pk, row.old.sk)),
               items: [
                 {
                   Put: {
@@ -3348,6 +3406,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         const units: Array<{
           readonly kind: "move" | "rewrite"
           readonly items: ReadonlyArray<TransactWriteItem>
+          readonly gap?: "stamp" | "strongest" | undefined
         }> = rewrites.map((items) => ({ kind: "rewrite" as const, items }))
         let pending = moves
         let lost = false
@@ -3362,7 +3421,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // none reach here — reported below if one ever does.
           if (wave.length === 0 && units.length === 0) break
           pending = pending.filter((move) => !wave.includes(move))
-          units.push(...wave.map((move) => ({ kind: "move" as const, items: move.items })))
+          units.push(
+            ...wave.map((move) => ({ kind: "move" as const, items: move.items, gap: move.gap })),
+          )
           const chunks = packRequests(
             units.splice(0),
             (unit) => transactWriteUnit(unit.items),
@@ -3386,8 +3447,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
               break
             }
             for (const unit of chunk) {
-              if (unit.kind === "move") movedRows++
-              else rewrittenRows++
+              if (unit.kind === "move") {
+                movedRows++
+                gaps = Rekey.mergeTallies(gaps, Rekey.guardGap(ctx, unit.gap))
+              } else rewrittenRows++
             }
           }
         }
@@ -3409,6 +3472,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       return {
         ...(movedRows > 0 && { moved: { aggregate: movedRows } }),
         ...(rewrittenRows > 0 && { indexKeysRewritten: rewrittenRows }),
+        ...gaps,
         conflicts: [
           {
             member: aggregateName,
@@ -4294,6 +4358,8 @@ interface ResolveNodeArgs {
   readonly parentFields?: Record<string, Schema.Top> | undefined
   /** Fields of the value this node's rows hold, where that isn't `parentFields`. */
   readonly ownFields?: Record<string, Schema.Top> | undefined
+  /** The schema of the value this node's rows hold, read for names where it has no `.fields`. */
+  readonly valueSchema?: Schema.Top | undefined
   /** The aggregate's ref resolver, shared with its `decodeSchema`. */
   readonly resolveRef?: RefResolver | undefined
   readonly discriminator?: Record<string, unknown> | undefined
@@ -4419,6 +4485,9 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
             ownFields: valueFields,
+            valueSchema:
+              modelOf(edge.entity?.model) ??
+              (parentField === undefined ? undefined : unwrapOptionalField(parentField)),
             attrEncoders: buildAttrEncoders(valueFields, resolveRef),
             ...edgeStorage(
               edgePackedFields(
@@ -4466,6 +4535,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
                 ? undefined
                 : storedFormFirst(field, parentFields?.[field], resolveRef),
             ownFields: elementFields,
+            valueSchema: manyElementSchema(parentFields, field) ?? modelOf(edge.entity?.model),
             attrEncoders: buildAttrEncoders(
               elementFields,
               resolveRef,
@@ -4526,11 +4596,16 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
   }
 
   const ownFields = args.ownFields ?? parentFields
+  const storedNames =
+    ownFields === undefined && args.valueSchema !== undefined
+      ? storedFieldNames(args.valueSchema)
+      : undefined
   return {
     fieldName,
     entityType,
     cardinality,
     ownFields,
+    ...(storedNames !== undefined && { storedNames }),
     // Absent optionals stay absent under `exactOptionalPropertyTypes`.
     ...(discriminator !== undefined && { discriminator }),
     ...(ownDiscriminator !== undefined && { ownDiscriminator }),

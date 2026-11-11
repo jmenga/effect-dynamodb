@@ -1218,9 +1218,13 @@ for byte (`updatedAt` first; a drainer's claim still absent), followed by each
 absent attribute; with none it is the request 1.39.0 sent. An aggregate row's
 are its node's fields, the context fields and discriminators a row beneath the
 root carries, the index keys, the timestamps and `__edd_e__`
-(`writableAttributes`); a stream row's and a projection row's, none more. A
-versioned entity's item is guarded on its version and incarnation, as 1.39.0
-guarded it.
+(`writableAttributes`); a node whose value exposes no `.fields` (an annotated
+class, a union's members) names every property its schema can store, on its type
+and encoded sides (`storedFieldNames`); a stream row's and a projection row's,
+none more. A versioned entity's item is guarded on its version and incarnation,
+as 1.39.0 guarded it, and with vector indexes on its vector attributes as read
+too, where they fit (`itemMoveGuard`): `reembed` sets them alone, bumping no
+version.
 
 A row too wide for its whole guard (DynamoDB's limits on one expression) is
 guarded, when its member stamps an `updatedAt`, on that stamp, held or still
@@ -1238,14 +1242,33 @@ A guard sees a write only through its terms. The move puts the row back as it
 read it, so a write it doesn't see is lost, as on 1.39.0:
 
 - a write that only adds an attribute the library can't enumerate: one no
-  declaration names (written outside the library), a sparse map's entry, or a
-  field of an aggregate node the walk doesn't read (an annotated class, a
-  union's members);
-- on a row guarded by its stamp (a versioned item, or a wide row guarded on its
-  `updatedAt`), a write that leaves the stamp as it was: `reembed`, which sets
-  the vector alone; one landing within the stamp's resolution (the same
-  millisecond, or the same second for an `updatedAt` stored as epoch seconds);
-  and one from outside the library.
+  declaration names (written outside the library), or a sparse map's entry;
+- on a wide row guarded on its `updatedAt`, a write that leaves the stamp as it
+  was and changes an attribute the guard leaves out: one landing within the
+  stamp's resolution (the same millisecond, or the same second for an
+  `updatedAt` stored as epoch seconds), a `reembed` (which stamps nothing), and
+  one from outside the library;
+- on a versioned item, a write from outside the library that leaves the version
+  as it was.
+
+Up to 1.40.0 two more were lost (#240), each now a term of the guard the move
+already sends: a `reembed` landing on a versioned item (its vector attributes
+are held as read beside the version), and a write adding a field of an
+aggregate node whose value exposes no `.fields` (the names its schema can store
+are held absent). `test/helpers/RekeyUnseenWrites.ts` races each, on a
+recording table and on DynamoDB Local.
+
+The rest can't be closed by a condition on the write `rekey` sends, so with
+writes going on each row moved under a guard that can miss one is counted in
+`report.guardGaps` and each member's (`RekeyGuardGaps`, `Rekey.guardGap`):
+`stamp`, a wide row guarded on its `updatedAt`, held or absent; `sparse`, an
+item of an entity with a sparse map guarded whole (`deleteGuard`'s `by`, `row`:
+a library write adding an entry is unseen unless it changes a stamp the guard
+holds, so with timestamps only one within the stamp's resolution); `strongest`,
+a row of a part-moved aggregate or stream finished under the strongest guard
+that fits. A write from outside the library adding an undeclared attribute can
+land on any row and isn't counted. With `writesStopped: true` nothing is
+counted: stopping writes closes every case. Counting reads and writes nothing.
 
 A wide row with no version and no `updatedAt` the library stamps on it, and a
 stream row or a projection's row tombstone or outbox item too wide to guard

@@ -5496,7 +5496,7 @@ export const makeStream = <
             ],
           ),
         )
-        return { moved: { stream: rows.length } }
+        return Rekey.mergeTallies({ moved: { stream: rows.length } }, strongestGaps(rows))
       }
       /**
        * Copy `row` to `to`: where nothing is (or only a row whose TTL has
@@ -5527,6 +5527,17 @@ export const makeStream = <
        */
       const guardOfRow = (row: Record<string, AttributeValue>) =>
         wholeRowGuard(row, "pk", [], [], []) ?? asReadGuard(row, "pk", [])
+      /**
+       * The rows of `rows` too wide to guard whole, moved under the strongest guard that fits
+       * (`guardOfRow`): with writes going on, a write to an attribute it leaves out isn't seen
+       * ({@link RekeyGuardGaps} `strongest`).
+       */
+      const strongestGaps = (rows: ReadonlyArray<Record<string, AttributeValue>>) =>
+        Rekey.mergeTallies(
+          ...rows
+            .filter((row) => wholeRowGuard(row, "pk", [], [], []) === undefined)
+            .map(() => Rekey.guardGap(ctx, "strongest")),
+        )
       /**
        * With writes going on (`unprovable`), the rows of a stream nothing of which has moved that
        * are too wide to guard whole, each reported `unguarded`, before anything is copied: its rows
@@ -5608,7 +5619,7 @@ export const makeStream = <
         for (const row of ordered) {
           if (!(yield* remove(row))) return undefined
         }
-        return { moved: { stream: left.length } } satisfies Rekey.RekeyTally
+        return Rekey.mergeTallies({ moved: { stream: left.length } }, strongestGaps(left))
       })
 
       const tally: Rekey.RekeyTally = {}

@@ -139,6 +139,7 @@ The report counts:
 | `sentinelsMoved` | Unique-constraint sentinels moved to their current keys |
 | `indexKeys` | Index keys of an item at its current table key that aren't what its values compose: `missing`, `truncated`, `lagging` and `ambiguous`, on every run, and `repaired` and `skipped` with `repairIndexKeys` (see [Repairing index keys](#repairing-index-keys)) |
 | `reservations` | Unique-constraint sentinels no row holds: `orphaned` and `undecided`, on every run, and `released` and `skipped` with `releaseOrphanedReservations`, with an entry for each (see [Releasing orphaned reservations](#releasing-orphaned-reservations)) |
+| `guardGaps` | Rows moved, with writes going on, under a guard that can miss a write: `stamp`, `sparse` and `strongest` (see [Writes during a run](#writes-during-a-run)) |
 | `conflicts` | Rows left where they are, and why, each listed once per run (see [Conflicts](#conflicts)) |
 | `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs, or whose read model the client doesn't know), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)), `rootNotSeen` (an aggregate row with no root in its partition, met by a run that didn't read the whole table; a run over the whole table judges it) |
 | `byMember` | The same counts per entity type, aggregate and stream name |
@@ -177,7 +178,7 @@ const report = yield* db.tables.MainTable.rekey({
 | `resume` | none | A `resume` token (the string) from an earlier run, or the last one `onProgress` received |
 | `streams` | `[]` | The event streams on the table, bound or not |
 | `onProgress` | none | Called after each scan page, once every row of it is handled |
-| `writesStopped` | `false` | Nothing else writes to the table: a row nothing proves unchanged moves under the strongest guard that fits, instead of being reported `unguarded` |
+| `writesStopped` | `false` | Nothing else writes to the table: a row nothing proves unchanged moves under the strongest guard that fits, instead of being reported `unguarded`, and `guardGaps` counts nothing (see [Writes during a run](#writes-during-a-run)) |
 
 A request that fails fails the run with its `DynamoClientError` (a throttled request is retried by the AWS SDK first). Resume from the last token `onProgress` delivered: the run redoes at most the pages that were in flight, and redoing a page moves nothing twice.
 
@@ -264,6 +265,22 @@ A stream whose stream id's key text changed (a number passed as a stream id, or 
 3. **Delete.** Rows under the old key are deleted, each only while it is as read: the events from the head down and the first event last. Rows left after the flip — a run stopped part-way — are moved the same way by the next run.
 
 A stream's rows are recognized by their stored stream id. A stream id of several composites is stored joined by `#`, and a string composite may hold `#` itself, so every way to split it is tried; if two readings of it disagree on where the stream belongs, the row is reported `failed` and left.
+
+## Writes during a run
+
+`rekey` can run while your application writes. Each move deletes the old row only while it is as `rekey` read it, so a write that lands between the read and the move cancels the move, and `rekey` reads the row again and moves it with the write. The condition holds a versioned item's version, with its vector attributes (`reembed` writes them without bumping the version). Any other row it holds whole: every attribute the row holds, and each attribute its member declares that the row doesn't hold still absent.
+
+A row too wide for that condition (DynamoDB's limits on one expression) is held by its `updatedAt` and as much else as fits. A row with neither, with writes going on, isn't moved at all: it's the conflict `unguarded`.
+
+Some writes no condition on the move can see. The move puts the row back as it read it, so such a write is lost. `rekey` counts each row it moved where one could have been, in `report.guardGaps` and for each member:
+
+| Count | The row | A write it can't see |
+|-------|---------|----------------------|
+| `stamp` | Too wide to guard whole, guarded on its `updatedAt` | One that leaves `updatedAt` as it was and changes an attribute the condition leaves out: a library write in the same millisecond (the same second, for an `updatedAt` stored as epoch seconds), a `reembed`, or a write from outside the library |
+| `sparse` | An item of an entity with a [sparse map](/effect-dynamodb/guides/sparse-maps/), guarded whole | One that only adds an entry to the map: its attribute is named by the entry's key, which no declaration names. With timestamps, a library write changes `updatedAt` and is seen, so only one in the same millisecond isn't |
+| `strongest` | A row of an aggregate or stream already part-moved, too wide to guard whole, finished under the strongest condition that fits | One to an attribute the condition leaves out |
+
+A write from outside the library that only adds an attribute the member doesn't declare is never seen, on any row, and isn't counted. To close every case, stop writes to the table for the run and pass `writesStopped: true`: nothing is counted then, and no row is `unguarded`.
 
 ## Conflicts
 

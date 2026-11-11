@@ -1002,6 +1002,33 @@ export interface RekeyIndexKeys {
 }
 
 /**
+ * Rows `rekey` moved under a guard that can miss a write landing between its read and the move,
+ * with writes to the table going on (counted only without {@link RekeyOptions.writesStopped}). The
+ * move puts the row back as it read it, so a write the guard doesn't see is lost (DESIGN.md §7,
+ * "What 'as read' proves"):
+ *
+ * - `stamp` — a row too wide to guard whole, guarded on its `updatedAt` (held, or absent) and what
+ *   else fits: a write that leaves `updatedAt` as it was isn't seen when it changes an attribute
+ *   the guard leaves out. A library write within the stamp's resolution (the same millisecond, or
+ *   second for epoch seconds) is one; so is a `reembed`, which stamps nothing.
+ * - `sparse` — an item of an entity with a sparse map (`storedAs: DynamoModel.SparseMap()`),
+ *   guarded whole: a write that only adds an entry adds an attribute no declaration names, so the
+ *   guard can't hold it absent. A library write stamps `updatedAt`, which the guard holds, so with
+ *   timestamps only one within the stamp's resolution goes unseen.
+ * - `strongest` — a row of an aggregate or stream already part-moved, too wide to guard whole and
+ *   finished under the strongest guard that fits: a write to an attribute it leaves out isn't seen.
+ *
+ * A write from outside the library that only adds an attribute no declaration names is never seen,
+ * on any row, and isn't counted. Stopping writes and running with `writesStopped: true` closes
+ * every one of these.
+ */
+export interface RekeyGuardGaps {
+  readonly stamp: number
+  readonly sparse: number
+  readonly strongest: number
+}
+
+/**
  * What `rekey` did with a unique sentinel no row holds, or one it couldn't judge
  * ({@link RekeyReservation}):
  *
@@ -1064,6 +1091,7 @@ export interface RekeyMemberReport {
   readonly conflicts: number
   readonly indexKeys: RekeyIndexKeys
   readonly reservations: RekeyReservationCounts
+  readonly guardGaps: RekeyGuardGaps
 }
 
 /**
@@ -1100,6 +1128,8 @@ export interface RekeyReport {
   readonly indexKeys: RekeyIndexKeys
   /** Unique sentinels no row holds, and ones that couldn't be judged: {@link RekeyReservations}. */
   readonly reservations: RekeyReservations
+  /** Rows moved under a guard that can miss a write: {@link RekeyGuardGaps}. */
+  readonly guardGaps: RekeyGuardGaps
   /** Rows left where they are — see {@link RekeyConflict}. */
   readonly conflicts: ReadonlyArray<RekeyConflict>
   /** Rows no member owns, by reason. */

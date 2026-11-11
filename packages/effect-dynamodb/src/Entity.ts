@@ -130,6 +130,7 @@ import {
   asReadGuard,
   countOperators,
   expressionFits,
+  substitutionsFit,
   type UnprovableRow,
   wholeRowGuard,
 } from "./internal/ExpressionLimits.js"
@@ -5424,6 +5425,11 @@ const makeImpl = <
      * soft, retain or unique delete sends it anyway, as 1.39.0 did (`UnprovableRow` `"strongest"`).
      */
     readonly proves: boolean
+    /**
+     * What it holds: the `version` (and incarnation), the whole `row`, or — too wide for that — its
+     * `stamp` (`updatedAt`) and what else fits, or `none` of those, only what fits.
+     */
+    readonly by: "version" | "row" | "stamp" | "none"
   } => {
     // Whether a guard fits beside `others` within DynamoDB's real limits.
     const fits = (guard: string) =>
@@ -5445,7 +5451,14 @@ const makeImpl = <
       }
       const incarnation = incarnationGuard(read, names, values)
       if (incarnation !== undefined) parts.push(incarnation)
-      return { expression: parts.join(" AND "), names, values, inputs: [], proves: true }
+      return {
+        expression: parts.join(" AND "),
+        names,
+        values,
+        inputs: [],
+        proves: true,
+        by: "version",
+      }
     }
     names["#dpk"] = pkField
     parts.push("attribute_exists(#dpk)")
@@ -5470,7 +5483,9 @@ const makeImpl = <
       return `#dg${i} = :dg${i}`
     }
     const full = [...parts, ...attrs.map(guardOf)].join(" AND ")
-    if (fits(full)) return { expression: full, names, values, inputs: attrs, proves: true }
+    if (fits(full)) {
+      return { expression: full, names, values, inputs: attrs, proves: true, by: "row" }
+    }
     // Too wide to guard attribute by attribute (a sparse map with hundreds of
     // entries): the strongest guard that fits. Every library write sets
     // `updatedAt`, so with timestamps it alone detects any library update;
@@ -5508,7 +5523,8 @@ const makeImpl = <
       // `updatedAt` goes first: guarded, held or absent, it proves the row as far as a stamp does.
       // Without it, no stamp a write changes is guarded.
       const proves = updatedAttr !== null && inputs.includes(updatedAttr)
-      return { expression, names, values, inputs, proves }
+      const by: "stamp" | "none" = proves ? "stamp" : "none"
+      return { expression, names, values, inputs, proves, by }
     }
     return strongest()
   }
@@ -13857,6 +13873,38 @@ const makeImpl = <
    * `from` while it is as read, and brings its unique sentinels along ({@link sentinelRekeys}).
    * A sentinel that can't come leaves the item where it is, in a dry run too.
    */
+  /**
+   * The guard on a moving item's Delete: {@link deleteGuard}'s, and on a versioned entity with
+   * vector indexes its vector attributes as read too. `reembed` writes them alone, stamping neither
+   * the version nor `updatedAt`, so the version doesn't prove them unchanged, and a move copying the
+   * old ones lost its write (#240). Added only where they fit; otherwise the guard is as before.
+   */
+  const itemMoveGuard = (read: StoredRow): ReturnType<typeof deleteGuard> => {
+    const guard = deleteGuard(read, "item", undefined)
+    const fields = vectorKeyFields()
+    if (guard.by !== "version" || fields.length === 0) return guard
+    const names: globalThis.Record<string, string> = { ...guard.names }
+    const values: globalThis.Record<string, AttributeValue> = { ...guard.values }
+    const terms = fields.map((field, i) => {
+      names[`#dv${i}`] = field
+      const value = read[field]
+      if (value === undefined) return `attribute_not_exists(#dv${i})`
+      values[`:dv${i}`] = value
+      return `#dv${i} = :dv${i}`
+    })
+    const expression = [guard.expression, ...terms].join(" AND ")
+    if (!expressionFits(expression) || !substitutionsFit(names, values)) return guard
+    return { ...guard, expression, names, values }
+  }
+
+  /**
+   * Whether a move under `guard` can miss a write landing in between ({@link RekeyGuardGaps}): one
+   * guarded on its `updatedAt` misses a write within the stamp's resolution; one guarded whole
+   * misses a write that only adds an entry to a sparse map, which no declaration names.
+   */
+  const moveGap = (guard: ReturnType<typeof deleteGuard>): "stamp" | "sparse" | undefined =>
+    guard.by === "stamp" ? "stamp" : guard.by === "row" && hasSparseFields ? "sparse" : undefined
+
   const moveItem = (
     ctx: Rekey.RekeyRowContext,
     from: StoredKey,
@@ -13879,7 +13927,7 @@ const makeImpl = <
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
         // Its Delete is guarded on the item as read: one nothing proves unchanged is the context's.
-        const guard = deleteGuard(read!, "item", undefined)
+        const guard = itemMoveGuard(read!)
         if (!guard.proves) {
           switch (Rekey.unprovableRow(ctx)) {
             case "report":
@@ -13949,6 +13997,7 @@ const makeImpl = <
           return Rekey.mergeTallies(
             countMove(ctx, "item", to, tally),
             { sentinelsMoved: sentinels.moved },
+            Rekey.guardGap(ctx, moveGap(guard)),
             Object.keys(left.sets).length === 0 ? {} : { indexKeysRewritten: 1 },
             heldBackIndexKeys(to, left.uncomposable),
             repair.tally,
@@ -13972,9 +14021,11 @@ const makeImpl = <
         )
         if (done._tag === "Failed") return failed(done.error)
         if (done._tag === "Done") {
-          return Rekey.mergeTallies(countMove(ctx, "item", to, tally), {
-            sentinelsMoved: sentinels.moved,
-          })
+          return Rekey.mergeTallies(
+            countMove(ctx, "item", to, tally),
+            { sentinelsMoved: sentinels.moved },
+            Rekey.guardGap(ctx, moveGap(guard)),
+          )
         }
         // Something changed between the reads and the write: judge it again.
       }
