@@ -25,7 +25,25 @@ import * as IpNetwork from "effect/net/IpNetwork"
 import * as NetAddress from "effect/net/NetAddress"
 import * as SemVer from "effect/SemVer"
 import * as SemVerRange from "effect/SemVerRange"
-import { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./PackedCodec.js"
+import {
+  BETA_DATE_MARKER,
+  BIG_DECIMAL_MARKER as BIG_DECIMAL,
+  COOKIE_MARKER as COOKIE,
+  COOKIE_PROTO,
+  COOKIES_MARKER as COOKIES,
+  DATE_MARKER,
+  DNS_RECORD_MARKER as DNS_RECORD,
+  DURATION_MARKER as DURATION,
+  expiryText,
+  HOST_MARKER as HOST,
+  IP_INTERFACE_MARKER as IP_INTERFACE,
+  IP_NETWORK_MARKER as IP_NETWORK,
+  NET_ADDRESS_MARKER as NET_ADDRESS,
+  SEMVER_MARKER as SEMVER,
+  SEMVER_RANGE_MARKER as SEMVER_RANGE,
+  URL_PARAMS_MARKER as URL_PARAMS,
+  ZONE_MARKER,
+} from "./StoredForm.js"
 
 /** Which of Effect's declarations a node is: the rebuild it takes, and the rules it's held to. */
 export type InstanceKind =
@@ -197,19 +215,6 @@ const exactInteger = (value: unknown): bigint | undefined =>
 const isUint32 = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff
 
-const BIG_DECIMAL = "~effect/BigDecimal"
-const DURATION = "~effect/Duration"
-const COOKIE = "~effect/http/Cookies/Cookie"
-const COOKIES = "~effect/http/Cookies"
-const URL_PARAMS = "~effect/http/UrlParams"
-const SEMVER = "~effect/SemVer"
-const SEMVER_RANGE = "~effect/SemVerRange"
-const NET_ADDRESS = "~effect/net/NetAddress"
-const IP_NETWORK = "~effect/net/IpNetwork"
-const IP_INTERFACE = "~effect/net/IpInterface"
-const HOST = "~effect/net/Host"
-const DNS_RECORD = "~effect/net/Dns/DnsRecord"
-
 /**
  * A stored `normalized` is left where it is, in the map: on an instance it's the slot
  * `BigDecimal.normalize` caches in, and a map there would be handed out as the normalized decimal.
@@ -299,8 +304,6 @@ const rebuildDateTime = (value: unknown): DateTime.DateTime | undefined =>
 
 const rebuildTimeZone = (value: unknown): DateTime.TimeZone | undefined =>
   markedBy(value, ZONE_MARKER) ? reviveTimeZone(value) : undefined
-
-const COOKIE_PROTO: object = Object.getPrototypeOf(Cookies.makeCookieUnsafe("a", "b"))
 
 /** An expiry as it's stored, ISO text, back as the `Date` it was written from. */
 const expiryOf = (text: string): Date | undefined => {
@@ -573,14 +576,8 @@ const optionsWriteAs = (options: unknown, stored: unknown): boolean => {
     properties.length === Object.keys(stored).length &&
     properties.every(([key, property]) => {
       if (!Object.hasOwn(stored, key)) return false
-      const dated =
-        key === "expires" &&
-        property instanceof Date &&
-        !Number.isNaN(property.getTime()) &&
-        writtenProperties(property).length === 0
-      return dated
-        ? stored[key] === (property as Date).toISOString()
-        : writesAs(property, stored[key])
+      const expiry = key === "expires" ? expiryText(property) : undefined
+      return expiry !== undefined ? stored[key] === expiry : writesAs(property, stored[key])
     })
   )
 }

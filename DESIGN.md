@@ -2711,7 +2711,7 @@ EventStore.makeStream({ …, storedAs: { data: Packed(…) }, snapshot: { schema
 | `S` | `JSON.parse` |
 | `B` | byte 0 header `vvv ff ccc` (layout version `001`; format `00` json, `01` binary reserved; codec `000` none, `001` gzip, `010` brotli, `011` zstd) → decompress → `JSON.parse` |
 
-A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, dates as objects — are refused at write). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
+A packed value is the attribute's wire form exactly as map storage would write it, as JSON (non-JSON values — bigint, binary, sets, a `Date` or any other class instance — are refused at write; one of Effect's own instances a native attribute stores as a map, a `DateTime`, a look-alike, an `Option` or a `Result`, is written as that map, `storedFormOf`). Compression runs only when the JSON's UTF-8 length is ≥ `threshold` (default 1024) **and** the compressed value plus header is smaller; otherwise the value is stored as `S`.
 
 **Compressors.** Pluggable synchronous `Compressor { codec, compress, decompress }` implementations, registered through the `Compression` service — `Compression.layer(...)` merged into the application layer (recommended), `DynamoClient.make({ compressors })`, or `DynamoClient.layer({ compressors })` (whose `Compression` output does not survive a wrapper layer that consumes it through `Layer.provide`) — and read with `Effect.serviceOption`, so no operation gains an `R`. `node:zlib`-backed implementations ship from `effect-dynamodb/compression/zlib`; any runtime can register its own. A codec a `Packed` config names is checked where the registry is first resolvable: `DynamoClient.make` (every bound entity and aggregate edge) and `EventStore.bind` fail at bind, and an unbound stream on its first operation per registry, with the `[EDD-9078]` configuration defect. Past that, a value that needs an unregistered codec (an unbound entity write over the threshold, or a read of a `B` whose header names a codec the config no longer does) fails with a `ValidationError` whose `cause` is the tagged `CompressorNotRegistered` (naming the codec, direction and attribute), so no error channel widens.
 
@@ -4971,8 +4971,8 @@ A real date then has to be accepted wherever a read date was. Under
 `DynamoModel.Packed`, `stringifyStrict` refused an instance and let the plain
 look-alike through, so a read date packed and a new one was refused; `JSON.stringify`
 would call its `toJSON` and store ISO text, which the declaration refuses on read.
-So `check` accepts a real `DateTime` and `storingDates` stores it as `storedDate`:
-the same keys, in the order DynamoDB Local hands the map back, so what's packed from
+So `check` accepts a real `DateTime` and `stringifyStrict` stores it as `storedDate`
+(`internal/StoredForm.ts`): the same keys, in the order DynamoDB Local hands the map back, so what's packed from
 a date a read returned doesn't move by a byte (`fixtures/stream-dates-1.39.0.json`,
 stored by the published 1.39.0, pins this). Real DynamoDB's map order isn't
 guaranteed, so that text was never fixed on that path. Anything else JSON can't
@@ -5023,6 +5023,42 @@ writing a row again stores what was read. A schema holding none of these is retu
 as the same object. `effectDeclarationOf` recognises a declaration by its parse
 function, so a `.check()`, an annotation and a brand keep it, and a `Schema.declare`
 of one's own doesn't have it.
+
+**Effect's instances in a packed value (1.41.0).** A packed write refused every class
+instance but a `DateTime` ("an instance of Object"), so a `Duration`, a `BigDecimal`, a
+zone, a cookie, a `UrlParams`, a version or range, an address, a DNS record, an `Option`
+or a `Result` couldn't be written in a packed struct, a packed `Schema.Unknown`, event
+data or a snapshot state, though a native attribute stores each as a map and reads it
+back. `storedFormOf` (`internal/StoredForm.ts`, schema package) is the one function that
+says what packed storage writes for one of Effect's instances, and `stringifyStrict` is
+the one place that calls it, so every packed write takes it: entity fields, aggregate
+edges, event data, snapshots and `StorageEncoding`. It's the map the marshaller stores:
+each enumerable property, its prototype's included, without a function, `undefined` or a
+decimal's cached normalized form (`isCachedNormal`, which `Marshaller.ts` imports from
+there, so a native and a packed write leave out the same property). Inside a look-alike
+(an instance carrying, on its prototype, one of the markers `EffectInstances` rebuilds
+by) every value is the library's, so it's what the unmarshaller hands back: a
+safe-integer bigint as a number, a cookie's expiry as the ISO text `datingCookies`
+writes (`expiryText`, which `optionsWriteAs` uses too), a named zone's formatter as the
+empty map. An `Option` or a `Result` holds the caller's value, which is left as it is
+and packed by the rules every packed value follows: a bigint, a `Date` or bytes in it is
+refused where it is, and an instance in it is its stored map. Each map is put in the
+order DynamoDB Local hands a stored map back (`inStoredOrder`: Java `HashMap` bucket
+order, ties in write order, a table sized for the keys and doubled past three quarters
+full), measured against every map 1.39.0 stored for a look-alike, so a real instance
+packs to exactly the bytes 1.40.0 packed for the map a native read hands back for it
+(`fixtures/packed-lookalikes-1.40.0.json`, captured from the published 1.40.0, pins
+both that and every value 1.40.0 packed). A date keeps `storedDate`, which gives the
+same bytes. What JSON can't hold is left in place for `check` to refuse at its path: a
+`MacAddress`'s or a TLSA record's bytes, a `BigDecimal` or a `Duration` past 2^53, as
+1.40.0 refused the map of each. A packed look-alike reads back through
+`readingInstances` as the instance, as a native one does, and writing what was read
+stores the bytes read; an `Option` or a `Result` is rebuilt by its own declaration; in a
+`Schema.Unknown` it's the map, as natively. A map written in another key order (by hand,
+since no read hands one back) still reads as the instance, as it did on 1.40.0, and is
+written back in this order. A top-level packed field whose encoded side is one of these
+declarations is still refused at load (`EDD-9073`), since classification also decides
+which native fields a read dispatches on.
 
 **What the marshaller does beyond marshalling** (`Marshaller.ts`). It marshals first,
 exactly as `@aws-sdk/util-dynamodb` does. Only if that throws does it look for empty

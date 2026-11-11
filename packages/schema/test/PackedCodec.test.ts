@@ -194,7 +194,7 @@ describe("stringifyStrict, a real date", () => {
     }
   })
 
-  it("is the one class instance taken", () => {
+  it("is taken with Effect's other instances a native attribute stores as a map, and no other", () => {
     class WithToJson {
       toJSON() {
         return "x"
@@ -207,7 +207,10 @@ describe("stringifyStrict, a real date", () => {
       "instance of Object",
     )
     expect(() => PackedCodec.stringifyStrict(new Date(0), "v")).toThrow("a Date")
-    expect(() => PackedCodec.stringifyStrict(named.zone, "v")).toThrow("an instance of Object")
+    // A zone is one of Effect's look-alikes, written as the map a native write stores (#242).
+    expect(PackedCodec.stringifyStrict(named.zone, "v")).toBe(
+      '{"format":{},"id":"Asia/Tokyo","~effect/DateTime/TimeZone":"~effect/DateTime/TimeZone","_tag":"Named"}',
+    )
   })
 
   it("a plain object with a date's keys is written as it is, whatever its order", () => {

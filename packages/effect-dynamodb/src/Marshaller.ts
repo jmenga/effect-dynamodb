@@ -12,8 +12,16 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { marshall, unmarshall } from "@aws-sdk/util-dynamodb"
 import type { SparseConfig } from "@effect-dynamodb/schema/DynamoModel.js"
 import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
-import { BigDecimal, Data } from "effect"
-import * as Cookies from "effect/http/Cookies"
+import {
+  COOKIE_MARKER,
+  COOKIE_PROTO,
+  cachesCycle,
+  isBigDecimalInstance,
+  isCachedNormal,
+} from "@effect-dynamodb/schema/internal/StoredForm.js"
+import { Data } from "effect"
+
+export { isCachedNormal }
 
 const MARSHALL_OPTIONS = { removeUndefinedValues: true, convertClassInstanceToMap: true } as const
 
@@ -101,52 +109,12 @@ const withoutEmptySets = (value: unknown): unknown => {
   return same ? value : Object.fromEntries(next)
 }
 
-const BIG_DECIMAL = "~effect/BigDecimal"
-
-/**
- * A `BigDecimal` itself, not the map DynamoDB hands back for one: its marker is on the prototype.
- */
-const isBigDecimalInstance = (value: object): value is BigDecimal.BigDecimal =>
-  BigDecimal.isBigDecimal(value) && !Object.hasOwn(value, BIG_DECIMAL)
-
 /** Values marshalling stores whole, which hold no `BigDecimal` to swap. */
 const isOpaque = (value: object): boolean =>
   value instanceof Set ||
   value instanceof Date ||
   ArrayBuffer.isView(value) ||
   value instanceof ArrayBuffer
-
-/**
- * An own property's value read from its descriptor, or `undefined` for an accessor: a getter is
- * never called.
- */
-const ownData = (value: object, key: string): unknown => {
-  const descriptor = Object.getOwnPropertyDescriptor(value, key)
-  return descriptor !== undefined && "value" in descriptor ? descriptor.value : undefined
-}
-
-/**
- * Whether a decimal's cached `normalized` form leads into a cycle: the one `BigDecimal.normalize`
- * caches holds itself, so following it never ends.
- */
-const cachesCycle = (decimal: BigDecimal.BigDecimal): boolean => {
-  const seen = new Set<object>()
-  let current: unknown = decimal
-  while (typeof current === "object" && current !== null && isBigDecimalInstance(current)) {
-    if (seen.has(current)) return true
-    seen.add(current)
-    current = ownData(current, "normalized")
-  }
-  return false
-}
-
-/**
- * Whether a property of an object is a decimal's cached `normalized` form, which marshalling doesn't
- * store ({@link withoutCachedNormals}): what compares two values as stored leaves it out too. Reads
- * descriptors only, so no getter is called.
- */
-export const isCachedNormal = (value: object, key: string): boolean =>
-  key === "normalized" && isBigDecimalInstance(value) && cachesCycle(value)
 
 /**
  * The enumerable data properties marshalling walks on an object, its prototypes' included, read
@@ -228,9 +196,6 @@ const withoutCachedNormals = (value: unknown, open = new Set<object>()): unknown
     open.delete(value)
   }
 }
-
-const COOKIE = "~effect/http/Cookies/Cookie"
-const COOKIE_PROTO: object = Object.getPrototypeOf(Cookies.makeCookieUnsafe("a", "b"))
 
 /** A part marshalling reached that this can't reach without running a getter, or at all. */
 const UNREACHED = Symbol("unreached")
@@ -319,7 +284,7 @@ const datingCookies = (
   const visit = (attribute: AttributeValue): void => {
     const map = attribute.M
     if (map !== undefined) {
-      if (Object.hasOwn(map, COOKIE)) date(map)
+      if (Object.hasOwn(map, COOKIE_MARKER)) date(map)
       for (const key of Object.keys(map)) {
         path.push(key)
         visit(map[key]!)

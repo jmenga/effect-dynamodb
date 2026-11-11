@@ -34,10 +34,13 @@
  * {@link CompressionRegistry}.
  */
 
-import { DateTime, Effect, Schema, SchemaAST } from "effect"
+import { Effect, Schema, SchemaAST } from "effect"
 import type { CompressionRegistry } from "../Compression.js"
 import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
+import { storedFormOf } from "./StoredForm.js"
+
+export { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./StoredForm.js"
 
 // ---------------------------------------------------------------------------
 // Header layout
@@ -228,44 +231,15 @@ const isPlainObject = (value: object): boolean => {
   return proto === Object.prototype || proto === null
 }
 
-/** The marker a marshalled `DateTime` carries. */
-export const DATE_MARKER = "~effect/DateTime"
-/** The marker it carried on Effect's betas and early rcs. */
-export const BETA_DATE_MARKER = "~effect/time/DateTime"
-export const ZONE_MARKER = "~effect/DateTime/TimeZone"
-
-const isRealDate = (value: unknown): value is DateTime.DateTime =>
-  DateTime.isDateTime(value) && !isPlainObject(value)
+/** Each of Effect's instances met in a value, with the map it's written as. */
+type Forms = Map<object, object>
 
 /**
- * What a real date is stored as, packed: the map a native write stores, with its keys in the order
- * DynamoDB Local hands that map back, which is what a date read back from one has always been packed
- * as. `toJSON` would give ISO text, which a date's declaration refuses on read.
+ * Refuses what JSON can't hold, and says whether one of Effect's instances is in there, each of
+ * which it records in `forms` with the map it's written as ({@link storedFormOf}). That map is
+ * checked as any other value is, so what it still holds that JSON can't is refused where it is.
  */
-const storedDate = (date: DateTime.DateTime): object => {
-  if (DateTime.isUtc(date)) {
-    return { epochMilliseconds: date.epochMilliseconds, [DATE_MARKER]: DATE_MARKER, _tag: "Utc" }
-  }
-  const zone = date.zone
-  return {
-    [DATE_MARKER]: DATE_MARKER,
-    epochMilliseconds: date.epochMilliseconds,
-    zone:
-      zone._tag === "Named"
-        ? { format: {}, id: zone.id, [ZONE_MARKER]: ZONE_MARKER, _tag: "Named" }
-        : { offset: zone.offset, [ZONE_MARKER]: ZONE_MARKER, _tag: "Offset" },
-    _tag: "Zoned",
-  }
-}
-
-/** `JSON.stringify` has called `toJSON` by the time a replacer sees a value, so this reads the holder. */
-function storingDates(this: Record<string, unknown>, key: string, value: unknown): unknown {
-  const held = this[key]
-  return isRealDate(held) ? storedDate(held) : value
-}
-
-/** Refuses what JSON can't hold, and says whether a real date is in there for {@link storingDates}. */
-const check = (value: unknown, path: string, stack: Set<object>): boolean => {
+const check = (value: unknown, path: string, stack: Set<object>, forms: Forms): boolean => {
   switch (typeof value) {
     case "string":
     case "boolean":
@@ -276,19 +250,27 @@ const check = (value: unknown, path: string, stack: Set<object>): boolean => {
     case "object": {
       if (value === null) return false
       if (stack.has(value)) throw new NotJson(path, "a circular reference")
-      let dates = false
+      let instances = false
       if (Array.isArray(value)) {
         stack.add(value)
         for (let i = 0; i < value.length; i++) {
           const element = value[i]
           if (element === undefined) throw new NotJson(`${path}[${i}]`, "undefined")
-          if (check(element, `${path}[${i}]`, stack)) dates = true
+          if (check(element, `${path}[${i}]`, stack, forms)) instances = true
         }
         stack.delete(value)
-        return dates
+        return instances
       }
-      if (isRealDate(value)) return true
-      if (!isPlainObject(value) || typeof (value as { toJSON?: unknown }).toJSON === "function") {
+      if (!isPlainObject(value)) {
+        const form = forms.get(value) ?? storedFormOf(value)
+        if (form === undefined) throw new NotJson(path, describe(value))
+        forms.set(value, form)
+        stack.add(value)
+        check(form, path, stack, forms)
+        stack.delete(value)
+        return true
+      }
+      if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
         throw new NotJson(path, describe(value))
       }
       stack.add(value)
@@ -297,10 +279,10 @@ const check = (value: unknown, path: string, stack: Set<object>): boolean => {
         // Omitted by JSON.stringify, as removeUndefinedValues omits it from a map.
         if (v === undefined) continue
         const at = IDENTIFIER.test(key) ? `${path}.${key}` : `${path}[${JSON.stringify(key)}]`
-        if (check(v, at, stack)) dates = true
+        if (check(v, at, stack, forms)) instances = true
       }
       stack.delete(value)
-      return dates
+      return instances
     }
     default:
       throw new NotJson(path, describe(value))
@@ -312,14 +294,25 @@ const check = (value: unknown, path: string, stack: Set<object>): boolean => {
  * bigint, binary (`Uint8Array`, `ArrayBuffer`, typed arrays), `Set`, `Map`,
  * `Date`, any other non-plain object (including one with `toJSON`), non-finite
  * numbers, `undefined` array elements, symbols, functions and cycles.
- * `undefined` object properties are omitted. A real `DateTime` is the exception:
- * it's written in its stored form (see {@link storedDate}), as a date read back
- * from storage has always been.
+ * `undefined` object properties are omitted. One of Effect's own instances that
+ * a native attribute stores as a map is the exception: a `DateTime`, one of the
+ * look-alikes a read rebuilds (a `Duration`, a `BigDecimal`, a zone, a cookie,
+ * an address, ...), an `Option` or a `Result` is written as that map
+ * ({@link storedFormOf}), as the map read back from a native row has always
+ * been.
  *
  * @throws an `Error` naming the path (rooted at `root`) and the JS type.
  */
-export const stringifyStrict = (value: unknown, root = "value"): string =>
-  check(value, root, new Set()) ? JSON.stringify(value, storingDates) : JSON.stringify(value)
+export const stringifyStrict = (value: unknown, root = "value"): string => {
+  const forms: Forms = new Map()
+  if (!check(value, root, new Set(), forms)) return JSON.stringify(value)
+  // `JSON.stringify` has called `toJSON` by the time a replacer sees a value, so this reads the
+  // holder.
+  return JSON.stringify(value, function (this: Record<string, unknown>, key, written: unknown) {
+    const held = this[key]
+    return typeof held === "object" && held !== null ? (forms.get(held) ?? written) : written
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Pack / unpack
