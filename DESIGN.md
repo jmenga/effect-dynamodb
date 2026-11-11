@@ -5144,7 +5144,14 @@ the function `update` and `upsert` write every field through). Up to 1.40.0 it
 marshalled the domain item under the ref's field name, so a `Schema.Redacted`
 became an empty map (the row then died on every read), a date its `DateTime`'s
 internals, and a renamed ref got a second attribute while keeping its stale copy
-(`fixtures/entity-ref-cascade-1.40.0.json`, `helpers/EntityRefCascade.ts`). For an
+(`fixtures/entity-ref-cascade-1.40.0.json`, `helpers/EntityRefCascade.ts`). What
+both store is what a read of the entity returns, its `DynamoModel.Hidden` fields
+left out, and the referencing entity reads its ref as that (`refHeldSchema`, on
+the hidden set `hiddenFieldNamesOf` that the entity's own read uses too): where a
+hidden field is required, the ref is the target's other fields, a plain object.
+Up to 1.40.0 the ref was read as the whole target, so a `put` naming one wrote its
+row without the field and failed (`Missing key`), as did every read of it
+(`fixtures/entity-ref-hidden-1.40.0.json`, `EntityRefHidden.test.ts`). For an
 entity whose identifier is its key, nothing a `put` sends or stores changes
 (`fixtures/entity-ref-keys-1.39.0.json`, `EntityRefKeys.test.ts`,
 `connected.entity-ref-keys.test.ts`). An entity keyed by more than one composite

@@ -2808,6 +2808,37 @@ export interface DerivedSchemas {
   readonly historyRecordSchema: Schema.Codec<any> | null
 }
 
+/**
+ * @internal The `DynamoModel.Hidden` fields of a model: a read in "model" or "record" mode leaves
+ * them out, of the entity's own items and of a ref to it ({@link refHeldSchema}).
+ */
+export const hiddenFieldNamesOf = (fields: SchemaFields): ReadonlySet<string> =>
+  new Set(Object.keys(fields).filter((name) => isHidden(fields[name] as Schema.Top)))
+
+/**
+ * @internal What a ref to an entity of model `target` holds (#241): what a read of that entity
+ * returns, which put-time hydration and a cascade store, both through `refDataOf` (the entity's
+ * own read schema encoding the item it read). A read leaves out the target's `DynamoModel.Hidden`
+ * fields ({@link hiddenFieldNamesOf}). Where one of them is required, the ref is the target's other
+ * fields, a plain object as the entity's own read decodes it: up to 1.40.0 it was the whole target,
+ * so the referencing row, stored without that field, failed every read (`Missing key`), its own
+ * `put` included, after writing it. Any other target is held as declared, a class read back as its
+ * instance, as up to 1.40.0.
+ */
+export const refHeldSchema = (target: Schema.Top, options: DeepSubstitutionOptions): Schema.Top => {
+  const fields = getSchemaFields(target)
+  if (fields === undefined) return substituteSchemaDeep(target, options)
+  const hidden = hiddenFieldNamesOf(fields)
+  const hiddenRequired = [...hidden].some(
+    (name) => optionalField(fields[name] as Schema.Top) === undefined,
+  )
+  if (!hiddenRequired) return substituteSchemaDeep(target, options)
+  return substituteSchemaDeep(
+    Schema.Struct(Object.fromEntries(Object.entries(fields).filter(([name]) => !hidden.has(name)))),
+    options,
+  )
+}
+
 export const buildDerivedSchemas = (
   modelFields: SchemaFields,
   indexes: globalThis.Record<string, IndexDefinition>,
@@ -2860,9 +2891,10 @@ export const buildDerivedSchemas = (
     const optional = optionalField(modelFields[ref.fieldName] as Schema.Top)
     const asDeclared = (target: Schema.Top) =>
       optional === undefined ? target : optional.rewrap(target)
-    fields[ref.fieldName] = asDeclared(substituteSchemaDeep(resolved, { enforceChecks: true }))
+    // What a read of the target returns (`refHeldSchema`): its required hidden fields left out.
+    fields[ref.fieldName] = asDeclared(refHeldSchema(resolved, { enforceChecks: true }))
     readFields[ref.fieldName] = asDeclared(
-      substituteSchemaDeep(resolved, {
+      refHeldSchema(resolved, {
         legacyReads: true,
         absentReads: true,
       }),
@@ -3061,10 +3093,7 @@ export const buildDerivedSchemas = (
   // --- Hidden-aware decode schemas: strip DynamoModel.Hidden fields from model/record ---
   // These are used for "model" and "record" decode modes. Hidden fields are
   // still present in "item" and "native" modes.
-  const hiddenFieldNames = new Set<string>()
-  for (const [fieldName, fieldSchema] of Object.entries(modelFields)) {
-    if (isHidden(fieldSchema)) hiddenFieldNames.add(fieldName)
-  }
+  const hiddenFieldNames = hiddenFieldNamesOf(modelFields)
   const hasHiddenFields = hiddenFieldNames.size > 0
 
   const modelVisibleSchema = hasHiddenFields
