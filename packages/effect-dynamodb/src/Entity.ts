@@ -10645,9 +10645,20 @@ const makeImpl = <
         if (entry === undefined) {
           return compilePath(segments, names, prefix, pathCounter, resolveDbName, storedBelow)
         }
-        // Below the entry, named as stored, through the map's own schema.
+        return entryPath(entry, entryForm(entry.field)!, prefix)
+      }
+      /** An entry's path in one stored form, with the segments below it named as stored. */
+      const entryPath = (
+        entry: {
+          readonly field: string
+          readonly key: string
+          readonly rest: ReadonlyArray<string | number>
+        },
+        form: "whole" | "entries",
+        prefix: string,
+      ): string => {
         const rest = storedBelow([entry.field, entry.key, ...entry.rest]).slice(1)
-        return entryForm(entry.field) === "whole"
+        return form === "whole"
           ? compilePath(
               [renamedMapAttribute(entry.field)!, entry.key, ...rest],
               names,
@@ -10661,13 +10672,31 @@ const makeImpl = <
               pathCounter,
             )
       }
+      /**
+       * A copy's source (`pathSet` / `pathSubtract` with `isPath`). It writes nothing, so it carries
+       * no form guard (#238). An entry of a renamed map spelled through the map (`.entry("a")`, or
+       * `["counts", "a"]`) reads where a read takes it, inside the map's attribute or as the entry's
+       * own, when this update holds the row; without the row it's named as 1.40.0 named it, as is a
+       * source spelled as the entry's attribute (`["counts#a"]`), which names that attribute.
+       */
+      const sourceOf = (segments: ReadonlyArray<string | number>, prefix: string): string => {
+        const entry = renamedEntryAt(segments)
+        const throughMap =
+          entry !== undefined &&
+          (entryOfPath(segments) !== undefined || segments[0] === entry.field)
+        if (!throughMap || held === undefined) {
+          return compilePath(segments, names, prefix, pathCounter, resolveDbName, storedBelow)
+        }
+        const whole = Object.hasOwn(held, renamedMapAttribute(entry.field)!)
+        return entryPath(entry, whole ? "whole" : "entries", prefix)
+      }
 
       // Path SET operations
       if (uState.pathSets) {
         for (const [i, op] of uState.pathSets.entries()) {
           const pathExpr = pathOf(op.segments, "ps")
           if (op.isPath && op.valueSegments) {
-            const srcExpr = pathOf(op.valueSegments, "ps")
+            const srcExpr = sourceOf(op.valueSegments, "ps")
             setClauses.push(`${pathExpr} = ${srcExpr}`)
           } else {
             const valKey = `:ps${pathCounter.value++}`
@@ -10682,7 +10711,7 @@ const makeImpl = <
         for (const op of uState.pathSubtracts) {
           const pathExpr = pathOf(op.segments, "psb")
           if (op.isPath && op.valueSegments) {
-            const srcExpr = pathOf(op.valueSegments, "psb")
+            const srcExpr = sourceOf(op.valueSegments, "psb")
             setClauses.push(`${pathExpr} = ${pathExpr} - ${srcExpr}`)
           } else {
             const valKey = `:psb${pathCounter.value++}`
@@ -11271,10 +11300,10 @@ const makeImpl = <
           }
           const refused = request.refuse?.(read.Item)
           if (refused !== undefined) return yield* refused
-          // An entry of a sparse map a `field:` rename stores whole is written where the row
-          // holds the map, so the op is planned again holding the row, when it holds one whole:
-          // the op made no read, so this one sends nothing (#238).
-          if ([...sparseRenames.keys()].some((attribute) => Object.hasOwn(read.Item!, attribute))) {
+          // An entry of a sparse map a `field:` rename stores whole is written, and a copy reads
+          // one spelled through its map, where the row holds the map, so the op is planned again
+          // holding the row: the op made no read, so this one sends nothing (#238).
+          if (sparseRenames.size > 0) {
             ;({ items } = yield* plan(undefined, read.Item))
           }
         }

@@ -12,6 +12,13 @@
  * did. An upsert writing no entry (`counts: {}`), and every upsert of an entity whose sparse map
  * isn't renamed, is sent as 1.40.0 sent it. `fixtures/renamed-sparse-map-upserts-1.40.0.json`
  * holds what the published 1.40.0 did in each case.
+ *
+ * A copy's source (`pathSet` / `pathSubtract` with `isPath`) writes nothing, so it carries no guard.
+ * Spelled as the entry's attribute (`["counts#a"]`) it names that attribute, as 1.40.0 did. Spelled
+ * through the map (`counts.entry("a")`, `["counts", "a"]`) it reads where a read takes the entry
+ * when the update holds the row (a retained entity's, a transaction's plan): inside `sr` on a row
+ * holding it, as `counts#a` otherwise. Without the row it's named as 1.40.0 named it.
+ * `fixtures/renamed-sparse-map-copies-1.40.0.json` holds what 1.40.0 did with each, whole requests.
  */
 
 import { readFileSync } from "node:fs"
@@ -20,10 +27,13 @@ import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Schema } from "effect"
 import { expect } from "vitest"
+import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
+import { createPathBuilder } from "../../src/internal/PathBuilder.js"
 import * as Table from "../../src/Table.js"
+import * as Transaction from "../../src/Transaction.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
-import { outcomeOf, rowsOf, sentOf } from "./RenamedSparseMap.js"
+import { normal, outcomeOf, rowsOf, sentOf } from "./RenamedSparseMap.js"
 
 interface Captured {
   readonly outcome: any
@@ -191,6 +201,189 @@ export const renamedSparseMapUpsertsSuite = (open: OpenTable) => {
               expect(was.read.ok?.counts ?? { a: 1 }).toEqual({ a: 1 })
             }),
         )
+      }
+    }
+  }
+}
+
+/** A request whole, as the captures hold it: the table's name, UUIDs and timestamps set aside. */
+export const wholeOf = (request: unknown, tableName: string): unknown => {
+  const named = (value: unknown): unknown =>
+    Array.isArray(value)
+      ? value.map(named)
+      : value !== null && typeof value === "object"
+        ? Object.fromEntries(
+            Object.entries(value).map(([name, held]) => [
+              name === tableName ? "<table>" : name,
+              named(held),
+            ]),
+          )
+        : value === tableName
+          ? "<table>"
+          : value
+  return normal(named(JSON.parse(JSON.stringify(request))))
+}
+
+const copyFixture = JSON.parse(
+  readFileSync(
+    new URL("../fixtures/renamed-sparse-map-copies-1.40.0.json", import.meta.url),
+    "utf8",
+  ),
+) as { readonly cases: Record<string, Captured> }
+
+const copyDefinitions = () => {
+  const model = DynamoModel.configure(
+    Schema.Struct({
+      id: Schema.String,
+      n: Schema.optional(Schema.Number),
+      counts: Schema.Record(Schema.String, Schema.Number),
+    }),
+    { counts: { storedAs: DynamoModel.SparseMap(), field: "sr" } } as never,
+  )
+  return {
+    Plain: Entity.make({ model, entityType: "Plain", primaryKey } as never),
+    Retained: Entity.make({
+      model,
+      entityType: "Retained",
+      primaryKey,
+      versioned: { retain: true },
+    } as never),
+  } as Record<string, any>
+}
+
+/** The row each case starts from: the map whole, as entries, or both (an entry beside `sr`). */
+const copySeeds: Record<
+  string,
+  (db: any, entity: string, tableName: string) => Effect.Effect<unknown, unknown, any>
+> = {
+  whole: (db, entity) => db.entities[entity].put({ id: "a", n: 10, counts: { a: 1 } }).asEffect(),
+  entries: (db, entity, tableName) =>
+    Effect.gen(function* () {
+      yield* db.entities[entity].put({ id: "a", n: 10, counts: {} }).asEffect()
+      yield* rawSet(entity, tableName, "SET #e = :v REMOVE #w", 1)
+    }),
+  both: (db, entity, tableName) =>
+    Effect.gen(function* () {
+      yield* db.entities[entity].put({ id: "a", n: 10, counts: { a: 1 } }).asEffect()
+      yield* rawSet(entity, tableName, "SET #e = :v", 7)
+    }),
+}
+const rawSet = (entity: string, tableName: string, expression: string, value: number) =>
+  Effect.gen(function* () {
+    const raw = yield* DynamoClient
+    yield* raw.updateItem({
+      TableName: tableName,
+      Key: {
+        pk: { S: `$sr#v1#${entity.toLowerCase()}#id_a` },
+        sk: { S: `$sr#v1#${entity.toLowerCase()}` },
+      },
+      UpdateExpression: expression,
+      ConditionExpression: "attribute_exists(pk)",
+      ExpressionAttributeNames: {
+        "#e": "counts#a",
+        ...(expression.includes("#w") ? { "#w": "sr" } : {}),
+      },
+      ExpressionAttributeValues: { ":v": { N: String(value) } },
+    })
+  })
+
+const entryOf = (key: string) =>
+  (createPathBuilder([], undefined, { counts: { prefix: "counts" } }) as any).counts.entry(key)
+    .segments as ReadonlyArray<string>
+const copies: ReadonlyArray<
+  readonly [label: string, op: (u: any) => any, through: "attribute" | "entry" | "map"]
+> = [
+  [
+    "pathSet(['n'] from ['counts#a'])",
+    (u) => u.pathSet({ segments: ["n"], valueSegments: ["counts#a"], isPath: true }),
+    "attribute",
+  ],
+  [
+    "pathSet(['n'] from counts.entry('a'))",
+    (u) => u.pathSet({ segments: ["n"], valueSegments: entryOf("a"), isPath: true }),
+    "entry",
+  ],
+  [
+    "pathSet(['n'] from ['counts', 'a'])",
+    (u) => u.pathSet({ segments: ["n"], valueSegments: ["counts", "a"], isPath: true }),
+    "map",
+  ],
+  [
+    "pathSubtract(['n'] by ['counts#a'])",
+    (u) => u.pathSubtract({ segments: ["n"], valueSegments: ["counts#a"], isPath: true }),
+    "attribute",
+  ],
+  [
+    "pathSubtract(['n'] by counts.entry('a'))",
+    (u) => u.pathSubtract({ segments: ["n"], valueSegments: entryOf("a"), isPath: true }),
+    "entry",
+  ],
+  [
+    "pathSubtract(['n'] by ['counts', 'a'])",
+    (u) => u.pathSubtract({ segments: ["n"], valueSegments: ["counts", "a"], isPath: true }),
+    "map",
+  ],
+]
+
+/** One copy case on a table of its own, every request it sent kept whole. */
+const runCopy = (open: OpenTable, entity: string, row: string, body: (db: any) => any) =>
+  Effect.gen(function* () {
+    const entities = copyDefinitions()
+    const MainTable = Table.make({
+      schema: DynamoSchema.make({ name: "sr", version: 1 }),
+      entities,
+    } as never)
+    const log: Array<unknown> = []
+    return yield* onTable(recordingRequests(open, log), 0, MainTable, { entities }, (db, table) =>
+      Effect.gen(function* () {
+        yield* copySeeds[row]!(db, entity, table.name)
+        log.length = 0
+        const exit = yield* Effect.exit(Effect.suspend(() => body(db)))
+        const sent = log.map((request) => wholeOf(request, table.name))
+        const read = yield* Effect.exit(db.entities[entity].get({ id: "a" }))
+        return {
+          outcome: outcomeOf(exit),
+          sent,
+          rows: rowsOf(yield* table.rows),
+          read: outcomeOf(read),
+        } satisfies Captured
+      }),
+    )
+  })
+
+export const renamedSparseMapCopiesSuite = (open: OpenTable) => {
+  for (const entity of ["Plain", "Retained"]) {
+    for (const row of ["whole", "entries", "both"]) {
+      for (const [label, op, through] of copies) {
+        for (const inTransaction of [false, true]) {
+          const name = `${entity}, the map ${row}: ${label}${inTransaction ? ", in a transaction" : ""}`
+          // A retained update reads the row, and so does a transaction's plan.
+          const holds = entity === "Retained" || inTransaction
+          // Read where a read takes the entry: as 1.40.0 sent the spelling that named it there.
+          const sibling =
+            through === "attribute" || !holds
+              ? name
+              : name.replace(
+                  label,
+                  label.replace(
+                    through === "entry" ? "counts.entry('a')" : "['counts', 'a']",
+                    row === "entries" ? "counts.entry('a')" : "['counts', 'a']",
+                  ),
+                )
+          it.effect(
+            sibling === name
+              ? `${name}: as 1.40.0`
+              : `${name}: reads where a read takes the entry, as 1.40.0's ${row === "entries" ? "counts.entry('a')" : "['counts', 'a']"} did`,
+            () =>
+              Effect.gen(function* () {
+                const captured = yield* runCopy(open, entity, row, (db) => {
+                  const update = op(db.entities[entity].update({ id: "a" }))
+                  return inTransaction ? Transaction.transactWrite([update]) : update.asEffect()
+                })
+                expect(captured).toEqual(copyFixture.cases[sibling])
+              }),
+          )
+        }
       }
     }
   }

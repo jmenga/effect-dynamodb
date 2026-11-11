@@ -62,7 +62,7 @@ export const openRecordingTable: OpenTable = (MainTable) =>
         },
       ]),
     )
-    const table = makeRecordingTable({ indexes })
+    const table = makeRecordingTable({ indexes, refuseInvalidUpdates: true })
     return {
       name: "t",
       layer: table.layer,

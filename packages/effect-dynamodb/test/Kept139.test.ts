@@ -23,7 +23,10 @@ import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
 import { pathClearSuite } from "./helpers/PathClears.js"
 import { renamedSparseMapSuite } from "./helpers/RenamedSparseMap.js"
-import { renamedSparseMapUpsertsSuite } from "./helpers/RenamedSparseMapWrites.js"
+import {
+  renamedSparseMapCopiesSuite,
+  renamedSparseMapUpsertsSuite,
+} from "./helpers/RenamedSparseMapWrites.js"
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
@@ -91,6 +94,10 @@ describe("a sparse map a field: rename stores whole", () => {
 
 describe("an upsert of a sparse map a field: rename stores whole", () => {
   renamedSparseMapUpsertsSuite(openRecordingTable)
+})
+
+describe("a copy from an entry of a sparse map a field: rename stores whole", () => {
+  renamedSparseMapCopiesSuite(openRecordingTable)
 })
 
 describe("a path below a struct that renames its keys as they're stored", () => {
