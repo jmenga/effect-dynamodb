@@ -301,6 +301,8 @@ Two shapes need a declaration, because nothing about the element identifies it o
 
 Without one, decomposition fails with `AggregateDecompositionError` naming the edge and the colliding sort key — rather than the DynamoDB `ValidationException` ("Transaction request cannot include multiple operations on one item") that the collision would otherwise produce.
 
+With `escapeKeys: true`, a declared `sk.composite` is composed from the element's values, as a plain edge's is: a number is padded and a date is UTC ISO text, whatever the entity stores the field as. Up to 1.40.0 an `entity:` edge composed a top-level field its entity's model encodes (`Schema.NumberFromString`, `DynamoModel.DateEpochMs`, `Schema.DateTimeZonedFromString`, a codec of your own) from the encoded text, `5` where a plain edge writes `0000000000000005`. With `escapeKeys: false` it still does, byte for byte. On an `escapeKeys: true` table the rows 1.40.0 wrote that way read as before, `delete` removes them, and a group's next changed `update` moves them to the new keys in its own transaction, each keeping its `created`. A group of more than 50 such rows can't be updated until `db.tables.<Table>.rekey()` has moved them: the moves would take its transaction over 100 items, and its `AggregateTransactionOverflow` says so. Two elements whose 1.40.0 text differed only in letter case or in a date's zone compose one key now. They read as before, `rekey` reports the aggregate `failed` and moves none of its rows, and a changed `update` of their group that keeps both is refused as any collision is; remove or change one of them through an `update` to repair it.
+
 #### Step 3: Top-Level Aggregate
 
 Bind the full domain schema to a table, schema namespace, and partition key:

@@ -920,7 +920,9 @@ has no rows under other text, and there two values never share a key: `test/Alia
 key, a number whose text they changed, or a time-series event of a string-encoded numeric `orderBy`
 needs `rekey`, under the default or with the flag set. From 1.39.0 or earlier, an entity
 with a key composite whose codec's `encode` takes its own output needs `rekey`, whatever `escapeKeys`
-says.
+says. From 1.40.0 or earlier with `escapeKeys: true`, an aggregate's `entity:` edge keyed by a field
+its entity's model encodes moves its rows on each group's next changed write, and only a group whose
+rows and rows to move exceed 100 needs `rekey` first (§11 "An `entity:` edge's sort key").
 
 `KeyText136` composes exactly the bytes 1.36 wrote for every key kind (`serializeValue136`
 through the same structural composers, and the time-series event sort key from the encoded
@@ -5178,7 +5180,52 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 | **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
 | **Union members** | `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` in every mode (`walkedContainer`), rebuilding each container kind around substituted children with the original node's annotations and `.check()` refinements (`withMetadataOf`). Under `tolerantTransforms` (aggregates) every transformed leaf is substituted; for entity derivation only self-date and `Redacted` leaves are. Union members follow the union rules in §8 (Self dates nested in containers): a self date accepts only its own wire kind, its domain or a legacy map; on a storage-kind collision only its exact canonical form, decoded first; an epoch date next to a numeric member is rejected (**EDD-9058**). The collision set propagates into nested unions. A transform date member keeps its own decode, so a stored `5` in `Union([DateTimeUtcFromString, Number])` stays a number. |
-| **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. |
+| **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. The exception is an `entity:` edge under `escapeKeys: true` (below). |
+
+**An `entity:` edge's sort key (#241).** Up to 1.40.0 an edge declaring `entity:` read its
+declared `sk.composite` through the entity model's top-level encoders, run over the element's field
+of the same name whatever that field is: `byn#5` for a `Schema.NumberFromString` `5`, where a plain
+edge composes `byn#0000000000000005` from the value. Under `escapeKeys: false` that is kept, byte for
+byte. Under `escapeKeys: true` such an edge composes its sort key from the element's own values, as a
+plain edge does (`ResolvedNode.keyAttrEncoders` is empty, `otherCompositionEncoders` the entity's).
+Only an edge whose declared composite's top-level field the entity's model encodes changes; one with
+no declared sort key (keyed by the entity's identifier) is unchanged under both settings, since a
+plain edge takes no id that isn't a string.
+
+| Field the entity's model declares | 1.40.0, `escapeKeys: true` | Now |
+|---|---|---|
+| `Schema.NumberFromString` `5` | `5` | `0000000000000005` |
+| `Schema.BigIntFromString` `5n` | `5` | 38 digits |
+| `DynamoModel.DateEpochMs`, `storedAs(DateEpochMs)` | `0001714979289000` | `2024-05-06t07:08:09.000z` |
+| `DynamoModel.DateEpochSeconds` | `0000001714979289` | `2024-05-06t07:08:09.000z` |
+| `Schema.DateTimeZonedFromString` | `2024-05-06t09:08:09.000+02:00[europe/paris]` | `2024-05-06t07:08:09.000z` |
+| A codec storing other text (`x` as `x `, `A` as `41`) | `x%20`, `41` | `x`, `a` |
+
+A `Schema.DateTimeUtcFromString` (ISO text either way), a nested path (`entry.line`), a union (never
+encoded for a key) and every other key are unchanged.
+
+Rows stored under 1.40.0's text, with `escapeKeys: true`:
+
+- **Read** as before, by the same partition `Query`: assembly hands rows to nodes by entity type and
+  discriminator, never by sort key.
+- **`update`** writes a changed group, as always, whole. Each element it read under 1.40.0's text
+  (`skCompositesOtherComposition`, which no element's current key is) is deleted in the group's own
+  transaction, unless the write puts a row there, and the element's row keeps that row's `created`
+  through the carry every update uses (`existingCreated`). A no-op writes nothing. The deletes count
+  against the transaction's 100 items: a group whose rows and such rows exceed 100 is rejected,
+  diagnosed as `AggregateTransactionOverflow` with `previousKeyText` (their count) when the group
+  fits without them, naming `rekey`; an overflow the group has anyway names none.
+- **`delete`** deletes every row of the aggregate's types it reads, under either text.
+- **`rekey`** finds a row at the other composition's text too (`oldPosition`'s `skElse`): under
+  `true` 1.40.0's escaped text, and its unescaped text as the other setting's; under `false` the text
+  `true` composes now. A dry run counts them.
+
+Two elements whose values compose one key now (letter case through a codec whose stored text keeps
+it, one instant in two zones) were two rows on 1.40.0. They read as before. A write of their group is
+refused with the error a plain edge gives (`refuseSharedSortKeys`, judged over the groups the write
+sends: an `update` decomposes the old and new values without refusing, so a write of another group
+goes ahead), and `rekey` reports the aggregate `failed` with that reason and moves nothing. An
+`update` removing or changing one of them repairs the group.
 
 **Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
 drops a `Schema.Class`'s `.fields`, so the schema walker cannot recurse into an
