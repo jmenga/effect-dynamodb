@@ -12,6 +12,7 @@ import { Effect } from "effect"
 import { dottedSuite } from "./helpers/AggregateDottedEdgeKeys.js"
 import { type Harness, suite } from "./helpers/AggregateEntityEdgeKeys.js"
 import { keyTableSuite } from "./helpers/AggregateEntityEdgeKeyTable.js"
+import { mixedWritersSuite } from "./helpers/AggregateMixedWriters.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const tables = new Map<string, ReturnType<typeof makeRecordingTable>>()
@@ -46,3 +47,4 @@ const harness: Harness = {
 suite(harness)
 dottedSuite(harness)
 keyTableSuite(harness)
+mixedWritersSuite(harness)

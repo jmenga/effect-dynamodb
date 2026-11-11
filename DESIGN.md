@@ -5298,6 +5298,32 @@ sends: an `update` decomposes the old and new values without refusing, so a writ
 goes ahead), and `rekey` reports the aggregate `failed` with that reason and moves nothing. An
 `update` removing or changing one of them repairs the group.
 
+**Writers of two releases (#241).** Under `escapeKeys: true` a 1.40.0 writer and this release
+compose different text for such an edge's sort key. 1.40.0, reading a group this release wrote,
+writes the group under its text and deletes only the keys its own decomposition of the read value
+gives, none of them this release's: each element is then stored under both texts, and an element it
+removes stays under this release's (`fixtures/aggregate-mixed-writers-1.40.0.json`, captured from
+1.40.0 over rows this release wrote). The changeset tells every writer to move together. Rows a
+1.40.0 writer left:
+
+- **Copies** (`copiesOfOneElement`, the one decision): two rows of one node that a read gives the
+  same value of, so they differ only in key text and in the timestamps a read takes off. Equal values
+  compose one key under each text, so two such rows are one element under two texts. Assembly hands
+  the element back once (`ResolvedNode.movedKeyText`); a changed `update` of the group deletes the
+  copy under 1.40.0's text through the move above, the element's row keeping its own `created`; a
+  no-op writes nothing; `rekey` deletes the copy (a row placed `both` whose two rows are copies),
+  guarded as any move.
+- **Doubles that differ** (`doubledKeys`): two items composing one key whose 1.40.0 text is one, with
+  a row of their type read at both. Which holds the element can't be told from what's stored. A
+  write holding both is refused (`refuseSharedSortKeys`, naming both rows and the way out); `rekey`
+  reports a `bothKeys` conflict per key, naming both rows, and leaves the aggregate. An `update`
+  stating the elements the group should hold, one per key, writes them under this release's text
+  and deletes every row read under 1.40.0's (`previousRows`). Any other key two items compose is a
+  collision, refused as before.
+- An element 1.40.0 removed reads again; the same `update` removes it.
+
+Pinned in `helpers/AggregateMixedWriters.ts`, on a recording table and DynamoDB Local.
+
 **A `many` element that shows no fields (#241).** An element whose schema is a union (a member
 renaming a field among them, `line` stored and `text` held), `Schema.NullOr`, or a transformation of
 the whole element (`Schema.encodeKeys`, a struct decoded to another) has no fields for

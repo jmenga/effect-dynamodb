@@ -340,6 +340,12 @@ interface ResolvedNode {
    */
   readonly otherCompositionEncoders?: Record<string, (value: unknown) => unknown> | undefined
   /**
+   * Such an edge under `escapeKeys: true` only: a 1.40.0 writer leaves an element of a group this
+   * release keyed under both texts (it writes the group under 1.40.0's beside the rows this release
+   * wrote), so a read can find two rows of one element ({@link copiesOfOneElement}).
+   */
+  readonly movedKeyText?: true | undefined
+  /**
    * Declared sort-key composites for a `many` edge (`Aggregate.many(..., { sk })`).
    * When present these are authoritative: they replace the ref-identifier
    * heuristic, so the edge's element ordering and uniqueness are the user's to
@@ -3322,11 +3328,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
           !deepEqualGroups(oldGroup, newGroup)
         )
       }
+      const readRows = new Map<string, Record<string, unknown>>()
+      for (const item of allItems) {
+        if (typeof item.sk === "string") readRows.set(item.sk, item)
+      }
       yield* refuseSharedSortKeys(
         newGroups.flatMap((group) => group.items),
         config.schema,
         aggregateName,
         (item) => groupChanged(item.transactionGroup),
+        doubledKeys(
+          newGroups.flatMap((group) => group.items),
+          config.schema,
+          (sk) => readRows.get(sk),
+        ),
       )
 
       // 6. Build the full new + old DynamoDB item sets (with composed keys). The
@@ -3677,7 +3692,46 @@ const makeAggregate = <TSchema extends Schema.Top>(
           rootEncoders,
           aggregateName,
           config.schema,
+          undefined,
+          "keep",
         )
+        // Two rows of one element that differ (#241): reported, naming both, and the aggregate left
+        // as it is. Any other key two items compose fails it as before.
+        const decomposed = groups.flatMap((group) => group.items)
+        const rowAtSk = new Map<string, Record<string, unknown>>()
+        for (const item of allItems) {
+          if (item[config.pk.field] === pkValue) rowAtSk.set(String(item.sk), item)
+        }
+        const doubled = doubledKeys(decomposed, config.schema, (sk) => rowAtSk.get(sk))
+        if (doubled.size > 0) {
+          // A write moving the group during the read shows its rows under both texts too: only
+          // while the row under 1.40.0's is still there.
+          const held = yield* Effect.forEach([...doubled.values()], (sk) =>
+            client
+              .getItem({
+                TableName: tableConfig.name,
+                Key: toAttributeMap({ [config.pk.field]: pkValue, sk }),
+                ConsistentRead: true,
+              })
+              .pipe(Effect.map(({ Item }) => Item !== undefined)),
+          )
+          if (held.some((still) => !still)) continue
+          return leftAsIs(
+            [...doubled].map(([to, from]) => ({
+              member: aggregateName,
+              kind: "aggregate" as const,
+              reason: "bothKeys" as const,
+              key: { [config.pk.field]: pkValue, sk: from },
+              target: { [config.pk.field]: pkValue, sk: to },
+              message:
+                "Two rows of one element, one under the key text 1.40.0 composed and one under " +
+                "this release's, hold different values, as a 1.40.0 writer leaves a group this " +
+                "release keyed, so which is the element can't be told: the aggregate is left as it " +
+                "is. Update it stating the elements the group should hold, one for each key.",
+            })),
+          )
+        }
+        yield* refuseSharedSortKeys(decomposed, config.schema, aggregateName)
         const rows = locateRows(
           groups,
           buildDynamoItems(groups, config, pkValue, undefined, keyRecord),
@@ -3685,13 +3739,25 @@ const makeAggregate = <TSchema extends Schema.Top>(
           pkValue,
           at,
         )
-        const doubled = rows.filter(
-          (row) => row.placement === "both" || row.placement === "ambiguous",
+        // A row under 1.40.0's text that is a copy of the element's row under this release's
+        // (#241): deleted, as the move of a row whose key is already held by itself.
+        const copies = new Set(
+          rows.flatMap((row, r) =>
+            row.placement === "both" &&
+            row.atOld !== undefined &&
+            row.atCurrent !== undefined &&
+            copiesOfOneElement(row.item.node, row.atOld, row.atCurrent, systemAttrs)
+              ? [r]
+              : [],
+          ),
         )
-        if (doubled.length > 0) {
+        const bothKeys = rows.filter(
+          (row, r) => (row.placement === "both" && !copies.has(r)) || row.placement === "ambiguous",
+        )
+        if (bothKeys.length > 0) {
           // In one partition, a move during the read shows a row at both keys too: it's
           // only under both while it's still under its old key.
-          const held = yield* Effect.forEach(doubled, (row) =>
+          const held = yield* Effect.forEach(bothKeys, (row) =>
             client
               .getItem({
                 TableName: tableConfig.name,
@@ -3702,7 +3768,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
           )
           if (held.some((still) => !still)) continue
           return leftAsIs(
-            doubled.map((row) => ({
+            bothKeys.map((row) => ({
               member: aggregateName,
               kind: "aggregate" as const,
               reason: "bothKeys" as const,
@@ -3917,6 +3983,19 @@ const makeAggregate = <TSchema extends Schema.Top>(
         const rewrites: Array<ReadonlyArray<TransactWriteItem>> = []
         const unguarded: Array<Pick<Move, "from" | "to">> = []
         for (const [r, row] of rows.entries()) {
+          if (copies.has(r)) {
+            const guard = guardOf(row.old, r)
+            if (guard === undefined) {
+              unguarded.push({ from: row.old, to: row.current })
+              continue
+            }
+            moves.push({
+              from: row.old,
+              to: row.current,
+              items: [{ Delete: { TableName: tableConfig.name, Key: keyOf(row.old), ...guard } }],
+            })
+            continue
+          }
           if (row.placement === "old") {
             const guard = guardOf(row.old, r)
             if (guard === undefined) {
@@ -5063,6 +5142,7 @@ interface ResolveNodeArgs {
   readonly rowKeys: RowKeyConfig
   readonly keyAttrEncoders?: AttrEncoders | undefined
   readonly otherCompositionEncoders?: AttrEncoders | undefined
+  readonly movedKeyText?: true | undefined
   readonly skComposite?: ReadonlyArray<string> | undefined
   readonly refIdentifierField?: string | undefined
   readonly packed?: Readonly<Record<string, DynamoModel.PackedConfig>> | undefined
@@ -5260,6 +5340,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             ...(recomposed && {
               otherCompositionEncoders: escaped ? entityKeyEncoders : {},
             }),
+            ...(recomposed && escaped && { movedKeyText: true as const }),
             // Declared sort-key composites, authoritative when present (#103).
             skComposite: edge.sk?.composite,
             refIdentifierField: edge.entity
@@ -5347,6 +5428,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(args.otherCompositionEncoders !== undefined && {
       otherCompositionEncoders: args.otherCompositionEncoders,
     }),
+    ...(args.movedKeyText === true && { movedKeyText: true as const }),
   }
 }
 
@@ -5699,7 +5781,17 @@ const assembleNode = (
       )
     }
 
-    return matchingItems.map((item) =>
+    // Two rows of one element, copies of each other: the element, once (#241).
+    const elements =
+      node.movedKeyText === true
+        ? matchingItems.filter(
+            (item, i) =>
+              !matchingItems
+                .slice(0, i)
+                .some((earlier) => copiesOfOneElement(node, earlier, item, systemAttrs)),
+          )
+        : matchingItems
+    return elements.map((item) =>
       stripMetadata(item, node.readRow, stampsToStrip(node, systemAttrs)),
     )
   })
@@ -5734,6 +5826,58 @@ const stripMetadata = (
     result[key] = value
   }
   return result
+}
+
+/**
+ * Whether two rows of an `entity:` edge whose key text this release moved ({@link
+ * ResolvedNode.movedKeyText}) are copies of one element (#241): a read gives the same value of both,
+ * so they differ only in key text and in the timestamps the library stamps beside the value. A
+ * 1.40.0 writer leaves such a copy under its text beside each row this release wrote (DESIGN.md §11
+ * "Writers of two releases"). The one decision: a read hands the element back once (`assembleNode`),
+ * and `rekey` deletes the copy under 1.40.0's text; two rows of one key that differ are refused by a
+ * write and reported by `rekey`, naming both ({@link doubledKeys}).
+ */
+const copiesOfOneElement = (
+  node: ResolvedNode,
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+  systemAttrs: ReadonlySet<string>,
+): boolean => {
+  if (node.movedKeyText !== true) return false
+  const stamps = stampsToStrip(node, systemAttrs)
+  return deepEqual(stripMetadata(a, node.readRow, stamps), stripMetadata(b, node.readRow, stamps))
+}
+
+/**
+ * The keys two items compose that hold two rows of one element, read under both key texts (#241):
+ * each item's 1.40.0 text (`otherCompositionSortKey`) is one text, and the read holds a row of its
+ * type there and at the key, as a 1.40.0 writer leaves a group this release moved. Their values
+ * differ ({@link copiesOfOneElement} hands a copy back once), so which is the element can't be told
+ * from what's stored. Maps each such key to the row under 1.40.0's text. A key two items compose
+ * otherwise is a collision (`refuseSharedSortKeys`).
+ */
+const doubledKeys = (
+  items: ReadonlyArray<DecomposedItem>,
+  schema: DynamoSchemaModule.DynamoSchema,
+  rowAt: (sk: string) => Record<string, unknown> | undefined,
+): ReadonlyMap<string, string> => {
+  const byKey = new Map<string, Array<DecomposedItem>>()
+  for (const item of items) {
+    if (item.node.movedKeyText !== true) continue
+    const sk = composeKey(schema, item.entityType, [...item.skComposites])
+    byKey.set(sk, [...(byKey.get(sk) ?? []), item])
+  }
+  const doubled = new Map<string, string>()
+  for (const [sk, sharing] of byKey) {
+    if (sharing.length < 2) continue
+    const froms = new Set(sharing.map((item) => otherCompositionSortKey(schema, item)))
+    const [from] = froms
+    if (froms.size !== 1 || from === undefined || from === sk) continue
+    const type = sharing[0]!.entityType
+    if (rowAt(sk)?.__edd_e__ !== type || rowAt(from)?.__edd_e__ !== type) continue
+    doubled.set(sk, from)
+  }
+  return doubled
 }
 
 // ---------------------------------------------------------------------------
@@ -6476,6 +6620,8 @@ const refuseSharedSortKeys = (
   schema: DynamoSchemaModule.DynamoSchema,
   aggregateName: string,
   written?: (item: DecomposedItem) => boolean,
+  /** Keys holding two rows of one element ({@link doubledKeys}), each to its row under 1.40.0's text. */
+  doubled?: ReadonlyMap<string, string>,
 ): Effect.Effect<void, AggregateDecompositionError> => {
   const seen = new Map<string, Array<DecomposedItem>>()
   for (const item of items) {
@@ -6483,6 +6629,22 @@ const refuseSharedSortKeys = (
     const prior = (seen.get(sk) ?? []).find(
       (other) => written === undefined || written(other) || written(item),
     )
+    const other = doubled?.get(sk)
+    if (prior !== undefined && other !== undefined) {
+      return Effect.fail(
+        new AggregateDecompositionError({
+          aggregate: aggregateName,
+          member: item.member,
+          reason:
+            `"${item.member}" holds two values of the element keyed "${sk}": the row stored there ` +
+            `and the row under "${other}", the key text 1.40.0 composed, hold different values, ` +
+            "as a 1.40.0 writer leaves a group this release keyed, so one would overwrite the " +
+            `other. Update the aggregate stating the elements "${item.member}" should hold, one ` +
+            "for each key: that write stores them under this release's key text and deletes the " +
+            "rows under 1.40.0's.",
+        }),
+      )
+    }
     if (prior !== undefined) {
       const hint =
         prior.member === item.member

@@ -16,6 +16,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import { dottedSuite } from "./helpers/AggregateDottedEdgeKeys.js"
 import { suite } from "./helpers/AggregateEntityEdgeKeys.js"
 import { keyTableSuite } from "./helpers/AggregateEntityEdgeKeyTable.js"
+import { mixedWritersSuite } from "./helpers/AggregateMixedWriters.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -118,3 +119,4 @@ const harness = {
 suite(harness, dynamoAvailable ? describe : describe.skip)
 dottedSuite(harness, dynamoAvailable ? describe : describe.skip)
 keyTableSuite(harness, dynamoAvailable ? describe : describe.skip)
+mixedWritersSuite(harness, dynamoAvailable ? describe : describe.skip)
