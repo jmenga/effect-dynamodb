@@ -13731,9 +13731,9 @@ const makeImpl = <
       if (!ctx.repairIndexKeys || indexKeyWorkSize(work) === 0) {
         return { tally: { indexKeys: found }, wrote: false }
       }
-      if (ctx.dryRun) {
-        return { tally: { indexKeys: { ...found, repaired: indexKeyWorkSize(work) } }, wrote: true }
-      }
+      // A dry run counts what it found — what a run repairs is the missing, truncated and lagging
+      // keys — and never a repair it didn't make.
+      if (ctx.dryRun) return { tally: { indexKeys: found }, wrote: true }
       const client = yield* Capacity.client
       let judged = row
       for (let attempt = 0; ; attempt++) {

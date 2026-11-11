@@ -985,7 +985,8 @@ export interface RekeyConflict {
  * - `ambiguous` — a `sparse` half with no key and two or more composites outside the primary key on
  *   the row. A writer naming only a later composite takes a row out of the index on purpose, and
  *   that leaves the same bytes, so these are never written
- * - `repaired` — keys written, or with `dryRun`, keys that would be
+ * - `repaired` — keys written: `missing`, `truncated` and `lagging`, less those a writer changed
+ *   first. A dry run writes none, so it counts none: what it finds is what a run would write
  * - `skipped` — keys a writer changed the row under, twice: the writer won
  */
 export interface RekeyIndexKeys {

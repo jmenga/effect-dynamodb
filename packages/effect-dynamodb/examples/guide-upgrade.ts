@@ -274,20 +274,20 @@ const program = Effect.gen(function* () {
     repairIndexKeys: true,
     streams: [Calibrations],
   })
-  // repairs.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 }
+  // repairs.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 0, skipped: 0 }
 
   const repaired = yield* db.tables.MainTable.rekey({
     repairIndexKeys: true,
     streams: [Calibrations],
   })
-  // repaired.indexKeys → the same, and the row is back in its index
+  // repaired.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 }
   // #endregion
   assertEq(
     repairs.indexKeys,
-    { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 },
-    "what the dry run says",
+    { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 0, skipped: 0 },
+    "what the dry run says: it repairs nothing",
   )
-  assertEq(repaired.indexKeys, repairs.indexKeys, "the run agrees")
+  assertEq(repaired.indexKeys, { ...repairs.indexKeys, repaired: 1 }, "the run repairs what it found")
   assertEq((yield* byPump.collect()).length, 1, "a query finds it")
   yield* Console.log(`Repaired: ${JSON.stringify(repaired.indexKeys)}`)
 

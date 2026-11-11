@@ -543,7 +543,11 @@ export const fixtureScenarios: ReadonlyArray<RepairScenario> = [
           segments: 3,
         })
         expect(real.indexKeys).toEqual({ ...damageOf(on), repaired: repairsOf(on) })
-        expect(dry.indexKeys).toEqual(real.indexKeys)
+        // A dry run finds what the run repairs, and repairs nothing (#240).
+        expect(dry.indexKeys).toEqual({ ...real.indexKeys, repaired: 0 })
+        expect(repairsOf(on)).toBe(
+          dry.indexKeys.missing + dry.indexKeys.truncated + dry.indexKeys.lagging,
+        )
         for (const row of yield* table.rows()) expectKeysAsPut(w, row)
       }),
     )
@@ -1399,7 +1403,8 @@ export const stampedScenarios: ReadonlyArray<RepairScenario> = [
             repairIndexKeys: true,
             dryRun: true,
           })
-          expect(dry.indexKeys).toEqual({ ...STAMPED_DAMAGE, repaired: 48 })
+          // What it would repair is what it found; it repaired none (#240).
+          expect(dry.indexKeys).toEqual({ ...STAMPED_DAMAGE, repaired: 0 })
           expect(yield* table.rows()).toEqual(before)
         }),
       )
