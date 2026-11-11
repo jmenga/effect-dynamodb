@@ -1,0 +1,492 @@
+{
+ "comment": "Captured from published effect-dynamodb@1.39.0 against DynamoDB Local (missing-key-reads.mjs): the rows it stored for an aggregate, a stream, a projection and an outbox, and what each read gave once a field whose transformation throws on undefined was removed from them. A record of what 1.39.0 did: never regenerate it.",
+ "version": "1.39.0",
+ "aggregate": {
+  "rows": [
+   {
+    "sk": {
+     "S": "$mk#v1#mkline#l1"
+    },
+    "pk": {
+     "S": "$mk#v1#mkroot#a"
+    },
+    "lid": {
+     "S": "l1"
+    },
+    "g": {
+     "S": "y"
+    },
+    "__edd_e__": {
+     "S": "MkLine"
+    }
+   },
+   {
+    "gsi1sk": {
+     "S": "$mk#v1#mklist#a"
+    },
+    "f": {
+     "S": "x"
+    },
+    "__edd_e__": {
+     "S": "MkRoot"
+    },
+    "gsi1pk": {
+     "S": "$mk#v1#mklist#c"
+    },
+    "sk": {
+     "S": "$mk#v1#mkroot"
+    },
+    "id": {
+     "S": "a"
+    },
+    "pk": {
+     "S": "$mk#v1#mkroot#a"
+    },
+    "customer": {
+     "S": "c"
+    }
+   }
+  ],
+  "root": {
+   "get": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"f\"]"
+   },
+   "list": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"f\"]"
+   },
+   "updateNoop": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"f\"]"
+   },
+   "updateNote": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"f\"]"
+   }
+  },
+  "line": {
+   "get": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"lines\"][0][\"g\"]"
+   },
+   "list": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"lines\"][0][\"g\"]"
+   },
+   "updateNoop": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"lines\"][0][\"g\"]"
+   },
+   "updateNote": {
+    "outcome": "ValidationError",
+    "operation": "aggregate.assemble",
+    "message": "Missing key\n  at [\"lines\"][0][\"g\"]"
+   }
+  }
+ },
+ "stream": {
+  "rows": [
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "S": "y"
+      }
+     }
+    },
+    "streamId": {
+     "S": "a"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "S": "x"
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "03f68b2ef92c862e7639d71be24aab12"
+    },
+    "__edd_e__": {
+     "S": "notes.event"
+    },
+    "sk": {
+     "S": "$mk#v1#notes.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$mk#v1#notes#a"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-11T04:38:03.883Z"
+    }
+   },
+   {
+    "metadata": {
+     "M": {
+      "m": {
+       "S": "y"
+      }
+     }
+    },
+    "streamId": {
+     "S": "a"
+    },
+    "data": {
+     "M": {
+      "f": {
+       "S": "x"
+      },
+      "_tag": {
+       "S": "Noted"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "notes.event"
+    },
+    "sk": {
+     "S": "$mk#v1#notes.event_1#0000000002"
+    },
+    "pk": {
+     "S": "$mk#v1#notes#a"
+    },
+    "eventType": {
+     "S": "Noted"
+    },
+    "version": {
+     "N": "2"
+    },
+    "timestamp": {
+     "S": "2026-11-11T04:38:03.887Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "a"
+    },
+    "asOfVersion": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "notes.snapshot"
+    },
+    "sk": {
+     "S": "$mk#v1#notes.snapshot"
+    },
+    "pk": {
+     "S": "$mk#v1#notes#a"
+    },
+    "state": {
+     "M": {
+      "count": {
+       "N": "1"
+      },
+      "s": {
+       "S": "z"
+      }
+     }
+    },
+    "timestamp": {
+     "S": "2026-11-11T04:38:03.885Z"
+    }
+   }
+  ],
+  "eventData": {
+   "read": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode",
+    "message": "Missing key\n  at [\"f\"]"
+   },
+   "readFrom": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode",
+    "message": "Missing key\n  at [\"f\"]"
+   },
+   "readLatest": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode",
+    "message": "Missing key\n  at [\"f\"]"
+   },
+   "readSnapshot": {
+    "outcome": "ok"
+   },
+   "decodeStreamImage": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode",
+    "message": "Missing key\n  at [\"f\"]"
+   }
+  },
+  "metadata": {
+   "read": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode.metadata",
+    "message": "Missing key\n  at [\"m\"]"
+   },
+   "readFrom": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode.metadata",
+    "message": "Missing key\n  at [\"m\"]"
+   },
+   "readLatest": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode.metadata",
+    "message": "Missing key\n  at [\"m\"]"
+   },
+   "readSnapshot": {
+    "outcome": "ok"
+   },
+   "decodeStreamImage": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.decode.metadata",
+    "message": "Missing key\n  at [\"m\"]"
+   }
+  },
+  "snapshotState": {
+   "read": {
+    "outcome": "ok"
+   },
+   "readFrom": {
+    "outcome": "ok"
+   },
+   "readLatest": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.readLatest",
+    "message": "Missing key\n  at [\"s\"]"
+   },
+   "readSnapshot": {
+    "outcome": "ValidationError",
+    "operation": "EventStore.readSnapshot",
+    "message": "Missing key\n  at [\"s\"]"
+   }
+  }
+ },
+ "projection": {
+  "rows": [
+   {
+    "f": {
+     "S": "init"
+    },
+    "__edd_e__": {
+     "S": "Summary"
+    },
+    "count": {
+     "N": "1"
+    },
+    "sk": {
+     "S": "$mk#v1#summary"
+    },
+    "id": {
+     "S": "a"
+    },
+    "pk": {
+     "S": "$mk#v1#summary#id_a"
+    },
+    "version": {
+     "N": "1"
+    }
+   },
+   {
+    "streamId": {
+     "S": "a"
+    },
+    "data": {
+     "M": {
+      "_tag": {
+       "S": "Counted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "a3b0bd3314b7844000f48eecae80244b"
+    },
+    "__edd_e__": {
+     "S": "counts.event"
+    },
+    "sk": {
+     "S": "$mk#v1#counts.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$mk#v1#counts#a"
+    },
+    "eventType": {
+     "S": "Counted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-11T04:38:03.959Z"
+    }
+   },
+   {
+    "streamId": {
+     "S": "a"
+    },
+    "data": {
+     "M": {
+      "_tag": {
+       "S": "Counted"
+      }
+     }
+    },
+    "__edd_e__": {
+     "S": "counts.event"
+    },
+    "sk": {
+     "S": "$mk#v1#counts.event_1#0000000002"
+    },
+    "pk": {
+     "S": "$mk#v1#counts#a"
+    },
+    "eventType": {
+     "S": "Counted"
+    },
+    "version": {
+     "N": "2"
+    },
+    "timestamp": {
+     "S": "2026-11-11T04:38:03.961Z"
+    }
+   }
+  ],
+  "apply": {
+   "outcome": "ValidationError",
+   "operation": "decodeMarshalledItem",
+   "message": "Missing key\n  at [\"f\"]"
+  },
+  "catchUp": {
+   "outcome": "ValidationError",
+   "operation": "decodeMarshalledItem",
+   "message": "Missing key\n  at [\"f\"]"
+  },
+  "applyBatch": {
+   "outcome": "ok",
+   "outcomes": [
+    {
+     "_tag": "Failed",
+     "error": "ValidationError",
+     "operation": "decodeMarshalledItem",
+     "message": "Missing key\n  at [\"f\"]"
+    }
+   ]
+  }
+ },
+ "outbox": {
+  "rows": [
+   {
+    "rev": {
+     "N": "1"
+    },
+    "__edd_e__": {
+     "S": "Summary"
+    },
+    "count": {
+     "N": "1"
+    },
+    "sk": {
+     "S": "$mk#v1#summary"
+    },
+    "id": {
+     "S": "a"
+    },
+    "pk": {
+     "S": "$mk#v1#summary#id_a"
+    },
+    "version": {
+     "N": "1"
+    }
+   },
+   {
+    "__edd_row_pk__": {
+     "S": "$mk#v1#summary#id_a"
+    },
+    "streamId": {
+     "S": "a"
+    },
+    "__edd_e__": {
+     "S": "Summary#outbox"
+    },
+    "effect": {
+     "M": {
+      "o": {
+       "S": "x"
+      }
+     }
+    },
+    "sk": {
+     "S": "$mk#v1#summary#outbox#000000000001#0000"
+    },
+    "pk": {
+     "S": "$mk#v1#summary#id_a"
+    },
+    "source": {
+     "S": "projection"
+    },
+    "eventType": {
+     "S": "Counted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "__edd_row_sk__": {
+     "S": "$mk#v1#summary"
+    }
+   },
+   {
+    "streamId": {
+     "S": "a"
+    },
+    "data": {
+     "M": {
+      "_tag": {
+       "S": "Counted"
+      }
+     }
+    },
+    "__edd_wt__": {
+     "S": "59bf0602e3650e0785139c504e33c64a"
+    },
+    "__edd_e__": {
+     "S": "counts.event"
+    },
+    "sk": {
+     "S": "$mk#v1#counts.event_1#0000000001"
+    },
+    "pk": {
+     "S": "$mk#v1#counts#a"
+    },
+    "eventType": {
+     "S": "Counted"
+    },
+    "version": {
+     "N": "1"
+    },
+    "timestamp": {
+     "S": "2026-11-11T04:38:03.991Z"
+    }
+   }
+  ],
+  "drain": {
+   "outcome": "ValidationError",
+   "operation": "EventStore.projection(\"Counts\" → \"Summary\").drain",
+   "message": "Missing key\n  at [\"o\"]"
+  }
+ }
+}

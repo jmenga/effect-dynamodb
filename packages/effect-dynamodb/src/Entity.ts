@@ -63,6 +63,7 @@ import {
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacked.js"
+import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import {
   type AbsentReading,
@@ -4588,20 +4589,19 @@ const makeImpl = <
 
   /**
    * A row's decode that died reading a field the row is without fails as 1.39.0's did, on the
-   * missing key ({@link fieldDyingOnAbsence}). Any other defect is the defect it was.
+   * missing key ({@link fieldDyingOnAbsence}, `failingAsBefore`). Any other defect is the defect
+   * it was.
    */
-  const missingKeyOnDefect =
-    (raw: globalThis.Record<string, unknown>, operation: string) =>
-    <A, R>(decode: Effect.Effect<A, ValidationError, R>): Effect.Effect<A, ValidationError, R> =>
-      Effect.catchDefect(decode, (defect) => {
+  const missingKeyOnDefect = (raw: globalThis.Record<string, unknown>, operation: string) =>
+    failingAsBefore(
+      () => {
         const field = fieldDyingOnAbsence(raw)
-        if (field === undefined) return Effect.die(defect)
-        const missing = Schema.Struct({ [field]: Schema.Never }) as unknown as Schema.Codec<unknown>
-        return Schema.decodeUnknownEffect(missing)({}).pipe(
-          Effect.mapError((cause) => new ValidationError({ entityType, operation, cause })),
-          Effect.flatMap(() => Effect.die(defect)),
-        )
-      })
+        return field === undefined
+          ? undefined
+          : issueDecoding(Schema.Struct({ [field]: Schema.Never }), {})
+      },
+      (cause) => new ValidationError({ entityType, operation, cause }),
+    )
 
   const decodeRecord = (
     raw: globalThis.Record<string, unknown>,

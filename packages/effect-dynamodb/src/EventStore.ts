@@ -75,6 +75,7 @@ import {
   readingStreamValues,
   writingTuplePositions,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import {
   isDispatchEligible,
@@ -3083,16 +3084,13 @@ export const makeStream = <
 
   const decodeEnvelope = Schema.decodeUnknownEffect(EventEnvelope)
   // `undefined` and an empty set are stored as absent attributes, in an event as
-  // anywhere else, and read back as those values.
-  const decodeEventData = Schema.decodeUnknownEffect(
-    readingStreamValues(eventUnion) as Schema.Codec<unknown>,
-  )
-  const decodeMetadata = Schema.decodeUnknownEffect(
-    readingStreamValues(metadataSchema ?? Schema.Unknown) as Schema.Codec<unknown>,
-  )
-  const decodeSnapshotState = Schema.decodeUnknownEffect(
-    readingStreamValues(snapshot?.schema ?? Schema.Unknown) as Schema.Codec<unknown>,
-  )
+  // anywhere else, and read back as those values. A decode that dies on one fails as
+  // 1.39.0's did, which decoded through the declared schema (`decodingAsBefore`).
+  const decodingStream = (declared: Schema.Top) =>
+    decodingAsBefore(readingStreamValues(declared), declared)
+  const decodeEventData = decodingStream(eventUnion)
+  const decodeMetadata = decodingStream(metadataSchema ?? Schema.Unknown)
+  const decodeSnapshotState = decodingStream(snapshot?.schema ?? Schema.Unknown)
 
   /**
    * An event's stored `data` → its wire form (plain JSON), by the stored
