@@ -5,22 +5,30 @@
  * paths").
  *
  * The paths: the expression path (an entity with none of the below, sent as one `UpdateItem`), and
- * the paths that read the row first: an entity with `unique` (the unique value restated or
- * changed), one with `versioned: { retain: true }`, and an input leaving out a defaulted index
+ * the paths that read the row first: an entity with `unique` naming a field outside the primary
+ * key (the unique value restated or changed), one with `unique` naming only a primary-key
+ * composite, one with `versioned: { retain: true }`, and an input leaving out a defaulted index
  * composite. 1.39.0 gave one input three outcomes by configuration: the expression path stored
- * the default's entries, unique and retain removed every entry, and the defaulted-composite path
- * left them alone. The read-first paths give the expression path's. Leaving `data` out leaves the
+ * the default's entries; `unique` outside the primary key and `retain` removed every entry and
+ * wrote none; `unique` on the primary key and the defaulted-composite path left the entries alone
+ * and wrote none. The read-first paths give the expression path's. Leaving `data` out leaves the
  * stored entries alone on every path.
  *
  * A default holding a key the write refuses is refused, citing the default, with nothing sent, as
  * each path does on 1.40.0: an empty key and one holding `#` on every path (the expression path
- * always refused them), and an attribute name over 255 bytes on the unique and retain paths, which
- * write the row whole; the expression and defaulted-composite paths store that one.
+ * always refused them; 1.39.0 wrote none of the default on the others), and an attribute name over
+ * 255 bytes where the upsert writes the row whole: `unique` outside the primary key, and `retain`.
+ * The expression path, `unique` on the primary key and the defaulted-composite path store that one.
  */
 
 import { Effect, Schema } from "effect"
 
-export type UpsertPath = "expression" | "unique" | "retain" | "defaulted composite"
+export type UpsertPath =
+  | "expression"
+  | "unique"
+  | "unique on the primary key"
+  | "retain"
+  | "defaulted composite"
 export type DefaultKind =
   | "no refused key"
   | "an empty key"
@@ -46,6 +54,7 @@ export const INPUTS: Record<UpsertInput, Record<string, unknown>> = {
 const PATHS: Record<UpsertPath, Record<string, unknown>> = {
   expression: {},
   unique: { unique: { note: ["note"] } },
+  "unique on the primary key": { unique: { id: ["id"] } },
   retain: { versioned: { retain: true } },
   // `status` has a decoding default and no input gives it.
   "defaulted composite": {
