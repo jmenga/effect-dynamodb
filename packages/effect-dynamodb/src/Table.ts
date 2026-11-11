@@ -1138,12 +1138,57 @@ export interface RekeyReport {
   readonly byMember: Readonly<Record<string, RekeyMemberReport>>
   /** What the run consumed — always measured, whatever `ConsumedCapacity` reporting is set to. */
   readonly capacity: CapacityTotals
+  /** What the run remembered, and whether it ran out of room: {@link RekeyJournal}. */
+  readonly journal: RekeyJournal
   /**
    * Where the scan stopped, when it stopped before the end of the table
    * (`maxPages`): pass it as {@link RekeyOptions.resume} to go on.
    * `None` when the run covered the whole table.
    */
   readonly resume: Option.Option<string>
+}
+
+/** The counts of a {@link RekeyReport}, by name. */
+export type RekeyCountName =
+  | "scanned"
+  | "unchanged"
+  | "moved"
+  | "indexKeysRewritten"
+  | "sentinelsMoved"
+  | "indexKeys"
+  | "reservations"
+  | "guardGaps"
+  | "conflicts"
+  | "skipped"
+
+/**
+ * What a `rekey` run remembers ({@link RekeyOptions.journalCapacity}): the keys it wrote to, the
+ * units it judged, and what it counted once, each a 128-bit digest with a few flags, never key
+ * text or a row. A row it doesn't move, write or report costs nothing; an aggregate's rows, which
+ * its root's move may take after the scan meets them, cost an entry each, moved or not. Moving a
+ * row costs about five entries. A real run keeps no row's image (only the last few it put); a dry
+ * run keeps each row it plans to put, which its reads see, and that row takes an entry for every
+ * 256 bytes of it.
+ *
+ * Under the capacity every count is exact, and the same whatever order the run meets the rows in.
+ * Once it's reached (`full`), the run carries on — its writes are guarded as ever, so no row is
+ * lost or overwritten — but what it forgets it can't pass or count once: `inexact` names the counts
+ * that may be off. A real run then meets a row it put as a row stored there (`scanned`, `unchanged`,
+ * `indexKeys` count it, as 1.40.0 counted every such row), judges a unit reached again once more
+ * (`unchanged`, `reservations`), may count a row stored under two old key texts as two moves
+ * (`moved`), may report a row in another's way that a run with room moves after it (`conflicts`; a
+ * rerun moves it), and doesn't report a row with no aggregate root found (`skipped`). A dry run's
+ * reads no longer see its whole plan, so any count may be off.
+ */
+export interface RekeyJournal {
+  /** {@link RekeyOptions.journalCapacity}, as used. */
+  readonly capacity: number
+  /** The entries the run kept: at most `capacity`. */
+  readonly used: number
+  /** Whether the run had more to keep than `capacity` entries. */
+  readonly full: boolean
+  /** The counts that may be off: none while the journal isn't full. */
+  readonly inexact: ReadonlyArray<RekeyCountName>
 }
 
 /** Options for `db.tables.<Table>.rekey()`. */
@@ -1188,6 +1233,15 @@ export interface RekeyOptions {
   readonly concurrency?: number | undefined
   /** The scan's page size (`Limit`). Default: DynamoDB's (1 MB pages). */
   readonly pageSize?: number | undefined
+  /**
+   * How many entries the run's journal holds at most ({@link RekeyJournal}): one for each key it
+   * writes to, unit it judges and row it counts once; a row it doesn't move, write or report costs
+   * none. Default 1,000,000: about 120 bytes an entry, so about 115 MiB when full, and exact counts
+   * for about 200,000 moved rows. Past it the run goes on, its counts named in
+   * {@link RekeyReport.journal} may be off, and a smaller run (`maxPages`, then `resume`) keeps
+   * them exact. A positive integer up to 16,000,000.
+   */
+  readonly journalCapacity?: number | undefined
   /**
    * Stop after this many scan pages (all segments together) and return a
    * {@link RekeyReport.resume} token: bound a run to a time slot and go on

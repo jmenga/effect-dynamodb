@@ -174,6 +174,7 @@ const report = yield* db.tables.MainTable.rekey({
 | `segments` | `1` | Parallel scan segments, each scanned by its own fiber |
 | `concurrency` | `4` | Rows of one scan page handled at once, per segment |
 | `pageSize` | DynamoDB's (1 MB pages) | The scan's `Limit` |
+| `journalCapacity` | `1000000` | Entries the run remembers at most (see [Memory](#memory)) |
 | `maxPages` | none | Stop after this many scan pages, all segments together, and return a `resume` token |
 | `resume` | none | A `resume` token (the string) from an earlier run, or the last one `onProgress` received |
 | `streams` | `[]` | The event streams on the table, bound or not |
@@ -426,6 +427,17 @@ Counting `reservations` costs nothing beyond those reads, except under `preserve
 Counting `indexKeys` costs nothing beyond the scan, and so does `repairIndexKeys` on a table with nothing to repair: judging is composing strings from a row already read. A row with keys to repair costs one `UpdateItem`, and a strongly consistent read and a second `UpdateItem` if a writer got there first.
 
 `report.capacity` holds what the run consumed. It is always measured, whether or not [consumed-capacity reporting](/effect-dynamodb/guides/consumed-capacity/) is on, and with a `ConsumedCapacity` layer the run is reported as one `Table.rekey` operation. Use `segments` and `concurrency` to trade speed against the capacity left for your application, and `maxPages` to spread the run out.
+
+## Memory
+
+A run remembers what it needs to count each row once and not to meet its own writes, and nothing else: the keys it moved rows from and to, the rows, aggregates and streams it judged, and its partitions with a root. Each entry is a 128-bit digest with a few flags, never a key's text or a row, about 120 bytes. A row the run doesn't move, write or report costs nothing, so a table of rows already under their current keys, or of another application's rows, is scanned in flat memory. An aggregate's rows cost an entry each, moved or not, and moving a row costs about five. A real run keeps no image of a row it moved, except the last 64 it put; a dry run keeps each row it plans to put, since its reads must see them, at an entry per 256 bytes.
+
+`journalCapacity` bounds it: 1,000,000 entries by default, about 115 MiB when full, which counts about 200,000 moved rows exactly. `report.journal` says how many entries the run kept (`used`) and whether it ran out (`full`). Past the capacity the run carries on, each write as guarded as ever, but what it had no room for it can't pass or count once, and `report.journal.inexact` names the counts that may then be off:
+
+- A real run meets a row it put as a row stored there, so `scanned`, `unchanged` and `indexKeys` may count it, as 1.40.0 counted every such row. A unit reached again is judged again (`unchanged`, `reservations`), a row stored under two old key texts may count as two moves (`moved`), a row in another's way may be reported where a run with room moves it after the other (`conflicts`; a rerun moves it), and an aggregate row with no root may go unreported (`skipped`). A unique sentinel naming a row that doesn't exist is `undecided` rather than `orphaned`, since the run can't tell whether it moved that row, so nothing is released that a run with room would have left.
+- A dry run's reads no longer see its whole plan, so any count may be off.
+
+To keep every count exact on a large table, raise `journalCapacity`, or bound each run with `maxPages` and resume: every run starts with an empty journal.
 
 <Aside type="caution">
 `rekey` moves the rows of the members the client knows. A table shared with a service that registers other entities, aggregates or streams reports their rows as `unregistered`: run `rekey` there too, with a client that knows them.

@@ -13816,7 +13816,12 @@ const makeImpl = <
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      if (!ctx.claim(Rekey.identity(entityType, "indexKeys", at[rekeyPk]!, at[rekeySk]!))) {
+      // Only a row the run put is met twice — by its move, and by the scan when the journal had no
+      // room to pass it — so only that one is claimed: a row it didn't move costs nothing here.
+      if (
+        ctx.placed(toAttributeMap(at)) &&
+        !ctx.claim(Rekey.identity(entityType, "indexKeys", at[rekeyPk]!, at[rekeySk]!))
+      ) {
         return { tally: {}, wrote: false }
       }
       let work = judgeIndexKeys(row)
@@ -14613,11 +14618,12 @@ const makeImpl = <
     row: StoredRow,
     key: { readonly pk: string; readonly sk: string },
     otherKinds: boolean,
+    currentTextOnly = false,
   ): boolean => {
     const lifted = liftedSentinelValues(constraintDef, source)
     const fields = otherKinds ? resolveUniqueFields(constraintDef) : []
     const text = JSON.stringify([key.pk, key.sk])
-    return [schema, ...sentinelTexts()].some(
+    return (currentTextOnly ? [schema] : [schema, ...sentinelTexts()]).some(
       (under) =>
         kindReading(
           row,
@@ -15283,6 +15289,16 @@ const makeImpl = <
           message: "The row it names was moved by this run, so it's judged by the next one.",
         }
       }
+      // Past the journal's capacity the run can't tell whether it moved that row.
+      if (live === undefined && ctx.journalFull()) {
+        return {
+          _tag: "undecided",
+          owner,
+          message:
+            "The row it names doesn't exist, and this run is past its journal's capacity, so it " +
+            "can't tell whether it moved that row: it's judged by the next run.",
+        }
+      }
       if (live === undefined && !exactlyComposed(constraintName, constraintDef)) {
         return {
           _tag: "undecided",
@@ -15451,7 +15467,12 @@ const makeImpl = <
         const stored = storedKeyOf(sentinel)!
         return { pk: stored[rekeyPk]!, sk: stored[rekeySk]! }
       }
-      const named = (sentinel: StoredRow, owner: StoredRow, otherKinds: boolean) => {
+      const named = (
+        sentinel: StoredRow,
+        owner: StoredRow,
+        otherKinds: boolean,
+        currentTextOnly = false,
+      ) => {
         if (constraintDef === undefined) return false
         const values = toDomainView(fromAttributeMap(owner) as globalThis.Record<string, unknown>)
         return sentinelHeldAt(
@@ -15461,7 +15482,25 @@ const makeImpl = <
           owner,
           keyOf(sentinel),
           otherKinds,
+          currentTextOnly,
         )
+      }
+      /**
+       * A sentinel its owner's own pass moves after this visit — its owner isn't under its current
+       * key, or it isn't under the key its owner's values compose now — is kept as counted, so that
+       * move doesn't count it again ({@link Rekey.RekeyRowContext.awaitsMove}).
+       */
+      const leftToOwner = (sentinel: StoredRow, owner: StoredRow) => {
+        const targets = rowTargets(owner)
+        const ownerAt = storedKeyOf(owner)
+        if (
+          targets === undefined ||
+          ownerAt === undefined ||
+          !sameStoredKey(ownerAt, targets.current) ||
+          !named(sentinel, owner, false, true)
+        ) {
+          ctx.awaitsMove(sentinel)
+        }
       }
       // Its owner's own pass moves it, except from under the other numeric kind's text, which an
       // owner under its current key doesn't look under: this one moves it from there, from the key
@@ -15470,9 +15509,16 @@ const makeImpl = <
         owner === undefined
           ? Effect.succeed(undefined)
           : named(sentinel, owner, false)
-            ? orphanedByTombstone(owner) && constraintDef !== undefined
-              ? Effect.as(judgeReservationRow(ctx, sentinel, constraintName, constraintDef, at), {})
-              : Effect.succeed({})
+            ? Effect.sync(() => leftToOwner(sentinel, owner)).pipe(
+                Effect.andThen(
+                  orphanedByTombstone(owner) && constraintDef !== undefined
+                    ? Effect.as(
+                        judgeReservationRow(ctx, sentinel, constraintName, constraintDef, at),
+                        {},
+                      )
+                    : Effect.succeed({}),
+                ),
+              )
             : named(sentinel, owner, true)
               ? sentinelsUnderOtherKind(ctx, owner, { constraintName, key: keyOf(sentinel) })
               : Effect.succeed(undefined)

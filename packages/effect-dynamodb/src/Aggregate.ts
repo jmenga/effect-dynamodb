@@ -90,6 +90,7 @@ import type { DynamoClient, DynamoClientError, DynamoClientService } from "./Dyn
 import { type EntityGet, fromDefinition as entityFromDefinition } from "./Entity.js"
 import * as Capacity from "./internal/Capacity.js"
 import { decodeKeyCursor, encodeKeyCursor } from "./internal/Cursor.js"
+import { digest } from "./internal/Digest.js"
 import {
   type CompileResult,
   type ConditionOps,
@@ -3566,8 +3567,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
     )
 
   /**
-   * What a run has learned: the partitions holding a root or about to, so each edge row in one costs
-   * no read of its own, and the rows found in a partition with no root.
+   * What a run has learned, within its journal's capacity ({@link Rekey.RekeyRowContext.keep}): the
+   * partitions holding a root or about to, each as its {@link digest}, so each edge row in one costs
+   * no read of its own; and the keys of the rows found in a partition with no root. A partition the
+   * run has no room for costs its edge rows a read each.
    */
   const rekeyRuns = new WeakMap<
     Rekey.RekeyRowContext,
@@ -3582,20 +3585,32 @@ const makeAggregate = <TSchema extends Schema.Top>(
     return known
   }
 
+  /** `pk` holds a root, or is about to. */
+  const markRooted = (ctx: Rekey.RekeyRowContext, pk: string) => {
+    const { rooted } = rekeyRunOf(ctx)
+    const key = digest(pk)
+    if (!rooted.has(key) && ctx.keep()) rooted.add(key)
+  }
+
   const rekeyRowBelowRoot = (
     row: Record<string, AttributeValue>,
     pk: string,
     ctx: Rekey.RekeyRowContext,
   ) =>
     Effect.gen(function* () {
+      // The move of an aggregate rooted in its partition, or moving there, may take it after this
+      // visit: whichever aggregate that is, it's kept as counted.
+      ctx.awaitsMove(row)
       const { rooted, rootless } = rekeyRunOf(ctx)
-      if (rooted.has(pk)) return {}
+      if (rooted.has(digest(pk))) return {}
       const { Item } = yield* rootItemAt(ctx.tableName, pk)
       if (Item !== undefined) {
-        rooted.add(pk)
+        markRooted(ctx, pk)
         return {}
       }
-      rootless.push(row)
+      if (ctx.keep()) {
+        rootless.push({ [config.pk.field]: row[config.pk.field]!, sk: row.sk! })
+      }
       return {}
     })
 
@@ -3617,7 +3632,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const client = yield* Capacity.client
       let left = 0
       for (const row of rootless) {
-        if (rooted.has(row[config.pk.field]!.S!)) continue
+        if (rooted.has(digest(row[config.pk.field]!.S!))) continue
         const { Item } = yield* client.getItem({
           TableName: ctx.tableName,
           Key: { [config.pk.field]: row[config.pk.field]!, sk: row.sk! },
@@ -3653,9 +3668,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
     if (current === undefined || !holdsPartition(row, key, pk)) {
       return { tally: { skipped: { unrecognizedKey: 1 } } }
     }
-    const { rooted } = rekeyRunOf(ctx)
-    rooted.add(pk)
-    rooted.add(current)
+    markRooted(ctx, pk)
+    markRooted(ctx, current)
     return { unit: rekeyUnit(pk), work: rekeyRoot(key, pk, current, ctx) }
   }
 

@@ -1054,7 +1054,7 @@ be reported twice, two ways, or counted as `unchanged` after the run moved it.
   key is composed from (`otherElement`), never by key alone.
 - **The run doesn't meet its own writes** (`Journal`). Every write on the
   table is noted by key as it's answered. The scan passes a row the run put
-  (its fingerprint, `textHash` of `canonicalItem`, is one the run left there),
+  (its fingerprint, the `digest` of `canonicalItem`, is one the run left there),
   and a row the run took that a page read before the take still returned.
   Anything else at such a key, a row someone wrote there since, is a new row,
   counted and judged.
@@ -1075,12 +1075,40 @@ be reported twice, two ways, or counted as `unchanged` after the run moved it.
   precedence (`failed`, `unguarded`, `uncomposable`, `bothKeys`, `contended`,
   `taken`), in a fixed order (member, kind, key, reason, target, message).
 
-The journal costs memory: an entry per key the scan returns (a key text), and,
-for each key the run wrote to, what it left there (a fingerprint, not the row).
-It reads and writes nothing: over a table with nothing to move, a run sends
-exactly the requests 1.40.0 sent (`test/fixtures/rekey-requests-1.40.0.json`,
-from the published package; `RekeyQuietRequests.test.ts` and its connected
-twin).
+**What a run remembers is bounded** (`RekeyOptions.journalCapacity`, default
+1,000,000 entries; `RekeyReport.journal`). One `Budget` is shared by the
+journal's keys, the settled units, the claims and an aggregate's known roots and
+rootless rows, and every entry is a 128-bit digest (`internal/Digest.ts`:
+SHA-256 of the text's UTF-16 code units, synchronous and runtime-agnostic) with
+a few flags, never key text and never a row: about 120 bytes an entry, so about
+115 MiB at the default when full. A row the run doesn't move, write or report
+costs nothing: the scan counts it, and a take while its visit runs (`inFlight`)
+is of a row already counted. A visit that leaves its row for another unit to
+take after it — a sentinel its owner moves, an aggregate's row its root moves —
+says so (`RekeyRowContext.awaitsMove`), and the row is kept as counted; so an
+aggregate's rows cost an entry each, moved or not. A real run keeps no image
+(only the last `RECENT_IMAGES` rows it put, to follow its own updates of them);
+a dry run keeps each row it plans to put, which its reads see, at an entry per
+256 bytes. Moving a row costs about five entries (its old and new keys, its
+verdict, its two claims), so the default counts exactly up to about 200,000
+moved rows. Past the capacity the run carries on: what it has no room for it
+doesn't keep, its writes are as guarded as ever, and the report names the counts
+that may be off (`journal.inexact`): a real run meets a row it put as a row
+stored there (`scanned`, `unchanged`, `indexKeys`, as 1.40.0 counted every such
+row), judges again a unit reached again (`unchanged`, `reservations`), may count
+a row stored under two old key texts as two moves (`moved`), may report a row in
+another's way that a run with room moves after it (`conflicts`: `vacated` can't
+see the take), and doesn't report rootless rows it couldn't keep (`skipped`); a
+dry run's reads no longer see the whole plan, so any count may be off. Writes
+never depend on the journal: each is conditioned on what it read. Past the
+capacity a decision the journal informs (`vacated`, `placed`) can only leave a
+row for a rerun or count it differently: a reservation whose named row is
+missing is `undecided` once the journal is full (`journalFull`), since the run
+can't tell whether it moved that row, so no release is sent that a run with
+room wouldn't send. The journal reads and writes nothing: over a table with nothing to
+move, a run sends exactly the requests 1.40.0 sent
+(`test/fixtures/rekey-requests-1.40.0.json`, from the published package;
+`RekeyQuietRequests.test.ts` and its connected twin).
 
 **Idempotence.** A row moves only when it is stored under a key its values
 composed under another form and that key differs from the one they compose now. The scan is

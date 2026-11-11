@@ -41,9 +41,11 @@ import { Context, Deferred, Effect, Option } from "effect"
 import { DynamoClient, type DynamoClientError, type DynamoClientService } from "../DynamoClient.js"
 import type {
   RekeyConflict,
+  RekeyCountName,
   RekeyCounts,
   RekeyGuardGaps,
   RekeyIndexKeys,
+  RekeyJournal,
   RekeyMemberReport,
   RekeyOptions,
   RekeyReport,
@@ -62,6 +64,7 @@ import {
   toBase64Url,
   type WireValue,
 } from "./Cursor.js"
+import { digest } from "./Digest.js"
 import type { UnprovableRow } from "./ExpressionLimits.js"
 
 type Item = Record<string, AttributeValue>
@@ -86,8 +89,23 @@ export interface RekeyRowContext {
    * nothing. Only meaningful in {@link RekeyMember.finish}.
    */
   readonly sawWholeTable: () => boolean
-  /** `true` the first time the run asks for `unit`: work counted once per run, however reached. */
+  /**
+   * `true` the first time the run asks for `unit`: work counted once per run, however reached.
+   * Kept within the run's journal capacity ({@link RekeyOptions.journalCapacity}): past it, a unit
+   * not kept is `true` again.
+   */
   readonly claim: (unit: string) => boolean
+  /**
+   * Room for one more thing a handler keeps for the run (a partition it read the root of): taken
+   * from the run's journal capacity, or `false` when there is none, and then not kept.
+   */
+  readonly keep: () => boolean
+  /**
+   * `row`, which the scan returned, is left for another unit's move to take after this visit (a
+   * sentinel its owner moves, a row its aggregate's root moves): the run keeps it as counted, so
+   * that take doesn't count it again. A take while the visit runs needs no telling.
+   */
+  readonly awaitsMove: (row: Item) => void
   /**
    * Judge `unit` — a stored row, or rows that move together (an aggregate partition, an event
    * stream) — once per run, `work` being its judgment, counted under `member` when it settles. The
@@ -107,8 +125,16 @@ export interface RekeyRowContext {
    * its puts, deletes and updates are what the run reads, and the scan passes, from then on.
    */
   readonly plan: (items: ReadonlyArray<TransactWriteItem>) => boolean
-  /** Whether the row stored at `key` is gone by the run's write (a dry run: its plan). */
+  /**
+   * Whether the row stored at `key` is gone by the run's write (a dry run: its plan). Past the
+   * journal's capacity ({@link journalFull}) a take it had no room for reads as `false`.
+   */
   readonly vacated: (key: Item) => boolean
+  /**
+   * Whether the journal has had no room for something ({@link RekeyOptions.journalCapacity}): from
+   * then on {@link vacated} and {@link placed} may miss what the run did.
+   */
+  readonly journalFull: () => boolean
   /** Whether the row at `key` is one the run put there (a dry run: planned to). */
   readonly placed: (key: Item) => boolean
   /**
@@ -486,6 +512,7 @@ class Totals {
     dryRun: boolean,
     capacity: Capacity.CapacityTotals,
     resume: string | undefined,
+    budget: Budget,
   ): RekeyReport {
     // By member, kind, key, reason, target and message: the same whatever order the run met them.
     const conflicts = [...this.conflicts.values()]
@@ -528,10 +555,47 @@ class Totals {
       skipped: { ...this.skipped },
       byMember,
       capacity,
+      journal: {
+        capacity: budget.capacity,
+        used: budget.used,
+        full: budget.full,
+        inexact: budget.full ? (dryRun ? INEXACT_DRY : INEXACT_REAL) : [],
+      },
       resume: Option.fromUndefinedOr(resume),
     }
   }
 }
+
+/**
+ * What a real run past its journal's capacity may count wrong ({@link RekeyJournal}): a row it put
+ * is met by the scan as a row stored there (`scanned`, `unchanged`, `indexKeys`, as 1.40.0 counted
+ * them), a unit reached again is judged again (`unchanged`, `reservations`), a row stored under two
+ * old key texts may count as two moves (`moved`), a row in another's way may be reported where a
+ * run with room moves both (`conflicts`), and a row with no root found isn't reported (`skipped`).
+ */
+const INEXACT_REAL: ReadonlyArray<RekeyCountName> = [
+  "scanned",
+  "unchanged",
+  "moved",
+  "indexKeys",
+  "reservations",
+  "conflicts",
+  "skipped",
+]
+
+/** What a dry run past its journal's capacity may count wrong: anything, as its reads no longer see the whole plan. */
+const INEXACT_DRY: ReadonlyArray<RekeyCountName> = [
+  "scanned",
+  "unchanged",
+  "moved",
+  "indexKeysRewritten",
+  "sentinelsMoved",
+  "indexKeys",
+  "reservations",
+  "guardGaps",
+  "conflicts",
+  "skipped",
+]
 
 // ---------------------------------------------------------------------------
 // Resume tokens
@@ -600,28 +664,63 @@ const CurrentUnit = Context.Reference<Unit | undefined>("effect-dynamodb/Rekey/C
 })
 
 /**
+ * What the run remembers, and how much: at most `capacity` entries, shared by the journal's keys,
+ * the settled units and the claims ({@link RekeyOptions.journalCapacity}). Each is a 128-bit
+ * {@link digest}, never key text or a row. An entry the budget refuses isn't kept: the run goes on
+ * without it, and `full` says the counts it would have kept exact may not be
+ * ({@link RekeyJournal}).
+ */
+class Budget {
+  used = 0
+  full = false
+  constructor(readonly capacity: number) {}
+  /** Room for `n` more entries: taken, or, past the capacity, refused and `full` set. */
+  admit(n = 1): boolean {
+    if (this.used + n > this.capacity) {
+      this.full = true
+      return false
+    }
+    this.used += n
+    return true
+  }
+}
+
+/**
  * The run's units ({@link RekeyRowContext.judge}). A visit of a unit being judged waits for its
  * verdict, unless the wait would close a loop — the unit waits, through the units each waits on,
  * on the caller — which can't end: then every unit on it is marked, and each is told `loop`. The
  * waits that are taken never form a loop, so every wait ends.
+ *
+ * A unit being judged is held as itself, for its waits: as many as the run judges at once. Once
+ * settled it is its unit's digest and one bit (on a loop or not), within the {@link Budget}. One the
+ * budget has no room for is judged again when reached again: its work reads what's stored, and
+ * finds its rows moved.
  */
 class Units {
-  private readonly all = new Map<string, Unit>()
+  private readonly judging = new Map<string, Unit>()
+  /** Settled units, by digest: whether each was on a loop. */
+  private readonly settled = new Map<string, boolean>()
 
-  constructor(private readonly totals: Totals) {}
+  constructor(
+    private readonly totals: Totals,
+    private readonly budget: Budget,
+  ) {}
 
   judge<E, R>(
     member: string,
-    key: string,
+    unitText: string,
     work: Effect.Effect<RekeyTally, E, R>,
   ): Effect.Effect<Judged, E, R> {
     return Effect.withFiber((fiber) => {
+      const key = digest(unitText)
       const caller = fiber.getRef(CurrentUnit)
-      const verdict = (unit: Unit): Judged => (caller?.loop && unit.loop ? "loop" : "settled")
-      const known = this.all.get(key)
+      const verdict = (loop: boolean): Judged => (caller?.loop && loop ? "loop" : "settled")
+      const known = this.judging.get(key)
       if (known === undefined) {
+        const settled = this.settled.get(key)
+        if (settled !== undefined) return Effect.succeed(verdict(settled))
         const unit: Unit = { state: "judging", waitingOn: undefined, loop: false, done: undefined }
-        this.all.set(key, unit)
+        this.judging.set(key, unit)
         if (caller !== undefined) caller.waitingOn = unit
         return work.pipe(
           Effect.provideService(CurrentUnit, unit),
@@ -631,14 +730,16 @@ class Units {
               unit.state = "settled"
               unit.waitingOn = undefined
               if (caller !== undefined && caller.waitingOn === unit) caller.waitingOn = undefined
+              this.judging.delete(key)
+              if (this.budget.admit()) this.settled.set(key, unit.loop)
               if (unit.done !== undefined) Deferred.doneUnsafe(unit.done, Effect.void)
               unit.done = undefined
             }),
           ),
-          Effect.map(() => verdict(unit)),
+          Effect.map(() => verdict(unit.loop)),
         )
       }
-      if (known.state === "settled") return Effect.succeed(verdict(known))
+      if (known.state === "settled") return Effect.succeed(verdict(known.loop))
       if (caller !== undefined) {
         for (let at: Unit | undefined = known; at !== undefined; at = at.waitingOn) {
           if (at !== caller) continue
@@ -658,7 +759,7 @@ class Units {
             if (caller !== undefined && caller.waitingOn === known) caller.waitingOn = undefined
           }),
         ),
-        Effect.map(() => verdict(known)),
+        Effect.map(() => verdict(known.loop)),
       )
     })
   }
@@ -721,28 +822,10 @@ export const canonicalItem = (item: Item): string =>
     .join(",")}}`
 
 /**
- * `text` as its length and two 32-bit hashes of its UTF-16 code units, FNV-1a and a
- * multiply-shift one, each from its own seed. One `Math.imul` a lane a code unit: a row near
- * 400 KB costs a couple of milliseconds, where hashing its bytes in 128-bit arithmetic cost fifty.
+ * A row's image as its {@link canonicalItem} text's {@link digest}: 128 bits of SHA-256, so two
+ * different rows share one only by a SHA-256 collision. A row near 400 KB costs a few milliseconds.
  */
-export const textHash = (text: string): string => {
-  let a = 0x811c9dc5
-  let b = 0x9e3779b9
-  for (let i = 0; i < text.length; i++) {
-    const unit = text.charCodeAt(i)
-    a = Math.imul(a ^ unit, 0x01000193)
-    b = Math.imul(b ^ unit, 0x5bd1e995)
-    b ^= b >>> 15
-  }
-  const hex = (lane: number) => (lane >>> 0).toString(16).padStart(8, "0")
-  return `${text.length.toString(16)}.${hex(a)}${hex(b)}`
-}
-
-/**
- * A row's image as its {@link canonicalItem} text's {@link textHash}. Compared only between images
- * at one key, so two different ones are taken for one with negligible odds.
- */
-export const fingerprint = (item: Item): string => textHash(canonicalItem(item))
+export const fingerprint = (item: Item): string => digest(canonicalItem(item))
 
 // ---------------------------------------------------------------------------
 // The journal: the run's writes, by key
@@ -863,45 +946,85 @@ const keyConditionOf = (input: {
   return undefined
 }
 
-/** What the journal holds for a key the run wrote (a dry run: planned) to. */
+/** What the journal holds for a key the run wrote (a dry run: planned) to, by the key's digest. */
 interface KeyState {
-  /** Images the run left here — put, sent to put, or (a dry run) planned — each with its count. */
-  own: Map<string, number> | undefined
-  /** The run left an image here it can't compute: the scan passes whatever it finds. */
-  any: boolean
-  /** The latest of the run's writes here that took effect: the row it put, or `taken`. */
-  last: Item | "taken" | undefined
+  /** The row stored here at the start is counted in `scanned`. */
+  counted: boolean
   /** When the row stored here was taken by the run (its {@link Journal.seq}), if it was. */
   takenAt: number | undefined
+  /**
+   * The latest of the run's writes here that took effect: `taken`, or the row it put — a real run
+   * keeps `ours` (the image only in {@link Journal.recent}), a dry run the image, unless it had no
+   * room for it (`ours`, with `any`).
+   */
+  last: Item | "ours" | "taken" | undefined
+  /**
+   * The {@link fingerprint}s of the images the run left here — put, sent to put, or (a dry run)
+   * planned — once per time it left each, at most {@link MAX_PRINTS}.
+   */
+  prints: Array<string> | undefined
+  /** The run left an image here it can't name: the scan passes whatever it finds. */
+  any: boolean
   /** A dry run's updates to the row stored here, which it didn't put. */
   patches: Array<Update> | undefined
-  /** A dry run's planned row here: its partition key value ({@link Journal.placedIn}). */
+  /** A dry run's planned row here: its partition key value's digest ({@link Journal.placedIn}). */
   partition: string | undefined
 }
+
+/** Images one key holds, past which the scan passes whatever it finds there ({@link KeyState.any}). */
+const MAX_PRINTS = 8
+
+/** Rows a real run keeps the image of, the latest it put, to follow its own updates of them. */
+const RECENT_IMAGES = 64
+
+/** How many bytes of a row a dry run plans to put take one more entry of the capacity. */
+const IMAGE_ENTRY_BYTES = 256
+
+/** The default {@link RekeyOptions.journalCapacity}. */
+export const DEFAULT_JOURNAL_CAPACITY = 1_000_000
+
+/** The largest {@link RekeyOptions.journalCapacity}: a `Map` holds 2^24 entries at most. */
+export const MAX_JOURNAL_CAPACITY = 16_000_000
 
 /** A put's condition is on the row it replaces, as read: it writes over a row stored there. */
 const overwrites = (condition: string | undefined): boolean =>
   condition !== undefined && condition.trim() !== "" && !condition.includes("attribute_not_exists")
 
+/** A row the scan returned that the run judges, and the key its visit holds while it runs. */
+interface Visit {
+  readonly row: Item
+  readonly key: string | undefined
+}
+
 /**
- * The run's writes, by key — sent and answered, or (a dry run) planned — and the keys whose row
- * stored at the start it has counted. Memory: an entry for each key the scan returned, a key text
- * each; and for each key the run wrote to, what it left there.
+ * The run's writes, by key — sent and answered, or (a dry run) planned — within the run's
+ * {@link Budget}. Each key is a 128-bit {@link digest} of its typed values, and a real run keeps no
+ * image of a row, only its {@link fingerprint}: an entry is the same size whatever the key or the
+ * row. A dry run also keeps each row it plans to put, which its reads see.
  *
  * - `scanned` counts each row stored at the start once: when the scan returns it, or when the run
- *   takes it (moves it away, or writes over it as read) before the scan gets to it.
+ *   takes it (moves it away, or writes over it as read) before the scan gets to it. A row the scan
+ *   returns costs nothing past its visit: a take while its visit runs ({@link inFlight}) is of a
+ *   row already counted. A row left for another unit's move after its visit, the journal is told of
+ *   ({@link RekeyRowContext.awaitsMove}).
  * - The scan passes a row the run put (its image is one the run left there), and a row the run took
  *   that a page read before the take still returned. Anything else at such a key — a row written
  *   there since by someone else — is a new row, counted and judged.
  * - A dry run plans its writes ({@link Journal.plan}), and its reads ({@link Journal.view}) see the
  *   plan: a row it would take is gone, one it would put is there.
+ *
+ * Past the capacity, a key the budget has no room for isn't kept: a row the run put there is met
+ * by the scan as a new row, and one it took is counted again if the scan returns it.
  */
 class Journal {
   /** How many takes the run has made: a scan page records it when it is read. */
   seq = 0
   private readonly keys = new Map<string, KeyState>()
-  private readonly counted = new Set<string>()
-  /** A dry run's planned rows, by the partition key value ({@link canonicalValue}). */
+  /** The keys whose scanned rows are being judged now, each with how many visits hold it. */
+  private readonly inFlight = new Map<string, number>()
+  /** A real run's latest images of rows it put, by key, oldest first ({@link RECENT_IMAGES}). */
+  private readonly recent = new Map<string, Item>()
+  /** A dry run's planned rows, by the digest of the partition key value ({@link canonicalValue}). */
   private readonly placedIn = new Map<string, Set<string>>()
   /**
    * A dry run's planned rows by the value of an attribute a secondary index is partitioned on,
@@ -913,25 +1036,30 @@ class Journal {
     private readonly tableName: string,
     private readonly names: { readonly pk: string; readonly sk: string } | undefined,
     private readonly totals: Totals,
+    private readonly budget: Budget,
     private readonly dryRun: boolean,
   ) {}
 
+  /** The digest of an item's table key, its typed values ({@link canonicalValue}). */
   keyOf(item: Item | undefined): string | undefined {
     if (this.names === undefined || item === undefined) return undefined
     const pk = item[this.names.pk]
     if (pk === undefined) return undefined
     const sk = item[this.names.sk]
-    return identity(canonicalValue(pk), sk === undefined ? "" : canonicalValue(sk))
+    return digest(identity(canonicalValue(pk), sk === undefined ? "" : canonicalValue(sk)))
   }
 
-  private state(key: string): KeyState {
+  /** `key`'s state, made if the budget has room: `undefined` when it has none. */
+  private state(key: string): KeyState | undefined {
     const known = this.keys.get(key)
     if (known !== undefined) return known
+    if (!this.budget.admit()) return undefined
     const fresh: KeyState = {
-      own: undefined,
-      any: false,
-      last: undefined,
+      counted: false,
       takenAt: undefined,
+      last: undefined,
+      prints: undefined,
+      any: false,
       patches: undefined,
       partition: undefined,
     }
@@ -940,21 +1068,36 @@ class Journal {
   }
 
   /** The row stored at `key` at the start is met: counted, once. */
-  private count(key: string): void {
-    if (this.counted.has(key)) return
-    this.counted.add(key)
+  private count(state: KeyState): void {
+    if (state.counted) return
+    state.counted = true
     this.totals.scanned++
   }
 
-  private addOwn(state: KeyState, print: string): void {
-    if (state.own === undefined) state.own = new Map()
-    state.own.set(print, (state.own.get(print) ?? 0) + 1)
+  /**
+   * The row stored at `key` at the start is taken, or written over, by the run: counted unless the
+   * scan counted it — its visit is running, or it was left for this ({@link awaitsMove}). A dry run
+   * counts it when its scan meets it, since a dry run takes nothing.
+   */
+  private countTaken(key: string, state: KeyState | undefined): void {
+    if (this.dryRun) return
+    if (state?.counted === true) return
+    if (state !== undefined) state.counted = true
+    if (!this.inFlight.has(key)) this.totals.scanned++
   }
 
-  private dropOwn(state: KeyState, print: string): void {
-    const n = state.own?.get(print) ?? 0
-    if (n <= 1) state.own?.delete(print)
-    else state.own!.set(print, n - 1)
+  private addPrint(state: KeyState, print: string): void {
+    if (state.any) return
+    if (state.prints === undefined) state.prints = [print]
+    else if (state.prints.length >= MAX_PRINTS) {
+      state.any = true
+      state.prints = undefined
+    } else state.prints.push(print)
+  }
+
+  private dropPrint(state: KeyState, print: string): void {
+    const at = state.prints?.indexOf(print) ?? -1
+    if (at >= 0) state.prints!.splice(at, 1)
   }
 
   /** Whether the row at `key` is the run's own: one it put, or left by an update of one it put. */
@@ -962,61 +1105,98 @@ class Journal {
     return state.last !== undefined && state.last !== "taken"
   }
 
+  /** A real run's latest image of a row it put at `key`. */
+  private remember(key: string, image: Item): void {
+    this.recent.delete(key)
+    this.recent.set(key, image)
+    if (this.recent.size > RECENT_IMAGES) {
+      this.recent.delete(this.recent.keys().next().value!)
+    }
+  }
+
   /**
    * The scan returned `row`, on a page read when {@link seq} was `pageSeq`: the row to judge (in
-   * a dry run, with the plan's updates applied), or `undefined` when the scan passes it.
+   * a dry run, with the plan's updates applied), or `undefined` when the scan passes it. A row
+   * judged holds its key until {@link left}.
    */
-  visit(row: Item, pageSeq: number): Item | undefined {
+  visit(row: Item, pageSeq: number): Visit | undefined {
+    // A row that isn't the library's is one the run never writes, nor writes over.
+    if (row.__edd_e__ === undefined) {
+      this.totals.scanned++
+      return { row, key: undefined }
+    }
     const key = this.keyOf(row)
     if (key === undefined) {
       this.totals.scanned++
-      return row
+      return { row, key: undefined }
     }
     const state = this.keys.get(key)
-    if (state !== undefined) {
+    if (state === undefined) {
+      this.totals.scanned++
+    } else {
       // A dry run writes nothing, so what its scan returns where its plan took the row is that row,
       // whatever the plan put there since, however alike.
       if (this.dryRun && state.takenAt !== undefined) {
-        this.count(key)
+        this.count(state)
         return undefined
       }
-      if (state.any || state.own?.has(fingerprint(row)) === true) return undefined
+      if (state.any || state.prints?.includes(fingerprint(row)) === true) {
+        return undefined
+      }
       // The row the run took, returned by a page read before the take.
       if (state.takenAt !== undefined && state.takenAt > pageSeq) {
-        this.count(key)
+        this.count(state)
         return undefined
       }
+      // Counted already: a row written there since the run took the one stored at the start.
+      if (state.counted) this.totals.scanned++
+      else this.count(state)
     }
-    if (this.counted.has(key)) {
-      // A row written there since the run took the one stored at the start: a new row.
-      this.totals.scanned++
-    } else {
-      this.count(key)
-    }
-    return state?.patches === undefined ? row : this.patched(state, row)
+    this.inFlight.set(key, (this.inFlight.get(key) ?? 0) + 1)
+    return { row: state?.patches === undefined ? row : this.patched(state, row), key }
+  }
+
+  /** The visit is over: its key is no longer held. */
+  left(visit: Visit): void {
+    if (visit.key === undefined) return
+    const n = this.inFlight.get(visit.key) ?? 0
+    if (n <= 1) this.inFlight.delete(visit.key)
+    else this.inFlight.set(visit.key, n - 1)
+  }
+
+  /**
+   * `row`, scanned and judged, stays where it is for another unit's move to take it once its visit
+   * is over ({@link RekeyRowContext.awaitsMove}): kept as counted, so the take doesn't count it too.
+   */
+  awaitsMove(row: Item): void {
+    const key = this.keyOf(row)
+    if (key === undefined) return
+    const state = this.state(key)
+    if (state !== undefined) state.counted = true
   }
 
   vacated(key: Item): boolean {
-    const text = this.keyOf(key)
-    return text !== undefined && this.keys.get(text)?.last === "taken"
+    const digested = this.keys.size === 0 ? undefined : this.keyOf(key)
+    return digested !== undefined && this.keys.get(digested)?.last === "taken"
   }
 
   placed(key: Item): boolean {
-    const text = this.keyOf(key)
-    const state = text === undefined ? undefined : this.keys.get(text)
+    const digested = this.keys.size === 0 ? undefined : this.keyOf(key)
+    const state = digested === undefined ? undefined : this.keys.get(digested)
     return state !== undefined && this.ours(state)
   }
 
   /** A take of the row at `key` took effect (or was planned). */
   private take(key: string): void {
     const state = this.state(key)
-    // A row the run never put there was stored there at the start. A dry run's scan meets every
-    // such row, since it takes none: counted there, as a run resumed after it counts its own.
-    if (!this.ours(state) && !this.dryRun) this.count(key)
+    // A row the run never put there was stored there at the start.
+    if (state === undefined || !this.ours(state)) this.countTaken(key, state)
     this.seq++
+    this.recent.delete(key)
+    if (state === undefined) return
     state.takenAt = this.seq
     state.last = "taken"
-    state.own = undefined
+    state.prints = undefined
     state.any = false
     state.patches = undefined
     if (state.partition !== undefined) this.placedIn.get(state.partition)?.delete(key)
@@ -1030,7 +1210,7 @@ class Journal {
       for (const keys of byValue.values()) keys.delete(key)
       const value = image?.[attribute]
       if (value === undefined) continue
-      const text = canonicalValue(value)
+      const text = digest(canonicalValue(value))
       const keys = byValue.get(text)
       if (keys === undefined) byValue.set(text, new Set([key]))
       else keys.add(key)
@@ -1046,57 +1226,79 @@ class Journal {
       for (const keys of this.placedIn.values()) {
         for (const key of keys) {
           const image = this.keys.get(key)?.last
-          const held = image === undefined || image === "taken" ? undefined : image[attribute]
+          const held = typeof image === "object" ? image[attribute] : undefined
           if (held === undefined) continue
-          const text = canonicalValue(held)
+          const text = digest(canonicalValue(held))
           const same = byValue.get(text)
           if (same === undefined) byValue.set(text, new Set([key]))
           else same.add(key)
         }
       }
     }
-    return byValue.get(canonicalValue(value)) ?? []
+    return byValue.get(digest(canonicalValue(value))) ?? []
   }
 
   /** A put of `image` took effect (or was planned); `replaced`: over the row there, as read. */
   private put(key: string, image: Item, replaced: boolean): void {
     const state = this.state(key)
-    if (replaced && !this.ours(state)) {
-      if (!this.dryRun) this.count(key)
+    if (replaced && (state === undefined || !this.ours(state))) {
+      this.countTaken(key, state)
       this.seq++
-      state.takenAt = this.seq
+      if (state !== undefined) state.takenAt = this.seq
+    }
+    if (state === undefined) return
+    state.patches = undefined
+    if (!this.dryRun) {
+      state.last = "ours"
+      this.remember(key, image)
+      return
+    }
+    // A dry run keeps the image it plans, which its reads see: its size, in entries.
+    const text = canonicalItem(image)
+    this.addPrint(state, digest(text))
+    if (state.partition !== undefined) this.placedIn.get(state.partition)?.delete(key)
+    state.partition = undefined
+    if (!this.budget.admit(Math.ceil((text.length * 2) / IMAGE_ENTRY_BYTES))) {
+      // No room for the image: the plan has a row here, as nothing it can read.
+      state.last = "ours"
+      state.any = true
+      this.indexPlaced(key, undefined)
+      return
     }
     state.last = image
-    state.patches = undefined
-    if (this.dryRun) {
-      this.addOwn(state, fingerprint(image))
-      const partition = canonicalValue(image[this.names!.pk]!)
-      state.partition = partition
-      const set = this.placedIn.get(partition)
-      if (set === undefined) this.placedIn.set(partition, new Set([key]))
-      else set.add(key)
-      this.indexPlaced(key, image)
-    }
+    const partition = digest(canonicalValue(image[this.names!.pk]!))
+    state.partition = partition
+    const set = this.placedIn.get(partition)
+    if (set === undefined) this.placedIn.set(partition, new Set([key]))
+    else set.add(key)
+    this.indexPlaced(key, image)
   }
 
   /** An update took effect (or was planned) at `key`. */
   private update(key: string, update: Update): void {
-    const state = this.state(key)
-    const last = state.last
-    if (last !== undefined && last !== "taken") {
-      const next = updated(last, update)
+    const known = this.keys.get(key)
+    if (known !== undefined && this.ours(known)) {
+      const image = typeof known.last === "object" ? known.last : this.recent.get(key)
+      const next = image === undefined ? undefined : updated(image, update)
       if (next === undefined) {
-        state.any = true
+        known.any = true
+        known.prints = undefined
         return
       }
-      state.last = next
-      this.addOwn(state, fingerprint(next))
-      if (this.dryRun) this.indexPlaced(key, next)
+      this.addPrint(known, fingerprint(next))
+      if (!this.dryRun) {
+        this.remember(key, next)
+        return
+      }
+      known.last = next
+      this.indexPlaced(key, next)
       return
     }
     // The row stored at the start, updated in place: the scan meets it as it is. A dry run's
     // reads see the update.
     if (this.dryRun) {
+      const state = known ?? this.state(key)
+      if (state === undefined || !this.budget.admit()) return
       if (state.patches === undefined) state.patches = []
       state.patches.push(update)
     }
@@ -1172,7 +1374,9 @@ class Journal {
     const state = key === undefined ? undefined : this.keys.get(key)
     if (state === undefined) return item
     if (state.last === "taken") return undefined
-    if (state.last !== undefined) return state.last
+    if (typeof state.last === "object") return state.last
+    // A row planned with no room for its image reads as what's stored.
+    if (state.last === "ours") return item
     return item === undefined ? undefined : this.patched(state, item)
   }
 
@@ -1191,8 +1395,9 @@ class Journal {
         const key = this.keyOf(item)
         if (key === undefined || item === undefined) continue
         const state = this.state(key)
+        if (state === undefined) continue
         const print = fingerprint(item)
-        this.addOwn(state, print)
+        this.addPrint(state, print)
         sent.push({ state, print })
       }
       return send.pipe(
@@ -1203,7 +1408,7 @@ class Journal {
         ),
         Effect.tapError(() =>
           Effect.sync(() => {
-            for (const { state, print } of sent) this.dropOwn(state, print)
+            for (const { state, print } of sent) this.dropPrint(state, print)
           }),
         ),
       )
@@ -1385,7 +1590,7 @@ class Journal {
         value === undefined
           ? []
           : condition.attribute === names.pk
-            ? (this.placedIn.get(canonicalValue(value)) ?? [])
+            ? (this.placedIn.get(digest(canonicalValue(value))) ?? [])
             : this.placedWith(condition.attribute, value)
       for (const key of candidates) {
         if (answered.has(key)) continue
@@ -1440,7 +1645,11 @@ export const run = (args: {
         positiveInteger(options.segments, "segments") ??
         positiveInteger(options.concurrency, "concurrency") ??
         positiveInteger(options.pageSize, "pageSize") ??
-        positiveInteger(options.maxPages, "maxPages")
+        positiveInteger(options.maxPages, "maxPages") ??
+        positiveInteger(options.journalCapacity, "journalCapacity") ??
+        ((options.journalCapacity ?? 0) > MAX_JOURNAL_CAPACITY
+          ? `journalCapacity must be at most ${MAX_JOURNAL_CAPACITY}; received ${options.journalCapacity}.`
+          : undefined)
       if (problem !== undefined) return yield* optionError(problem)
 
       let positions: Array<Position>
@@ -1475,13 +1684,15 @@ export const run = (args: {
       )
 
       const totals = new Totals()
+      const budget = new Budget(options.journalCapacity ?? DEFAULT_JOURNAL_CAPACITY)
       const journal = new Journal(
         tableName,
         members.find((member) => member.key !== undefined)?.key,
         totals,
+        budget,
         dryRun,
       )
-      const units = new Units(totals)
+      const units = new Units(totals, budget)
       const claimed = new Set<string>()
       const ctx: RekeyRowContext = {
         tableName,
@@ -1491,13 +1702,17 @@ export const run = (args: {
         writesStopped: options.writesStopped === true,
         sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
         claim: (unit) => {
-          if (claimed.has(unit)) return false
-          claimed.add(unit)
+          const key = digest(unit)
+          if (claimed.has(key)) return false
+          if (budget.admit()) claimed.add(key)
           return true
         },
+        keep: () => budget.admit(),
+        awaitsMove: (row) => journal.awaitsMove(row),
         judge: (member, unit, work) => units.judge(member, unit, work),
         plan: (items) => journal.plan(items),
         vacated: (key) => journal.vacated(key),
+        journalFull: () => budget.full,
         placed: (key) => journal.placed(key),
         yieldTo: (row, rows) =>
           Effect.gen(function* () {
@@ -1513,9 +1728,14 @@ export const run = (args: {
       }
 
       const handle = (found: Item, pageSeq: number) =>
+        Effect.suspend(() => {
+          const visit = journal.visit(found, pageSeq)
+          if (visit === undefined) return Effect.void
+          return judgeRow(visit.row).pipe(Effect.ensuring(Effect.sync(() => journal.left(visit))))
+        })
+
+      const judgeRow = (row: Item) =>
         Effect.gen(function* () {
-          const row = journal.visit(found, pageSeq)
-          if (row === undefined) return
           const type = row.__edd_e__?.S
           if (type === undefined) {
             totals.add(undefined, { skipped: { notLibrary: 1 } })
@@ -1549,7 +1769,7 @@ export const run = (args: {
 
       const token = (): string | undefined =>
         positions.every((p) => p === 1) ? undefined : encodeToken(tableName, positions)
-      const snapshot = (): RekeyReport => totals.report(dryRun, capacity(), token())
+      const snapshot = (): RekeyReport => totals.report(dryRun, capacity(), token(), budget)
 
       let pagesLeft = options.maxPages ?? Number.POSITIVE_INFINITY
       const concurrency = options.concurrency ?? 4
