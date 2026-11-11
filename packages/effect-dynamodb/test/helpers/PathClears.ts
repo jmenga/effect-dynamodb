@@ -8,12 +8,11 @@
  * whose row couldn't be read is refused before anything is sent where the schema shows no stored
  * value survives it, and sent as 1.39.0 sent it where which value is stored decides (a tagged
  * union's member, how many positions a tuple holds), which only a read would say. A list position
- * is judged by length alone, so a removal that leaves a length the field accepts is sent as 1.39.0
- * sent it even where what's left can't be read (a value in a position that can't hold it, a list
- * only a member its tag rules out accepts). A clear whose way to the path passes a node the guard
- * doesn't model (`Schema.Unknown`, a record with two index signatures, a tuple with elements
- * after its rest) is sent as 1.39.0 sent it, whatever the row reads. Run on a recording table
- * (`Kept139.test.ts`) and on DynamoDB Local (`connected.kept-1.39.0.test.ts`).
+ * is judged by the lists that may read what's left: their lengths, their elements against the
+ * ones that moved, and a tag beside the list; a record by the signatures its key matches (#238).
+ * A clear whose way to the path passes a node the guard doesn't model (`Schema.Unknown`, a tuple
+ * with elements after its rest) is sent as 1.39.0 sent it, whatever the row reads. Run on a
+ * recording table (`Kept139.test.ts`) and on DynamoDB Local (`connected.kept-1.39.0.test.ts`).
  */
 
 import { it } from "@effect/vitest"
@@ -211,21 +210,21 @@ const clears: Record<string, ReadonlyArray<Clear>> = {
     { field: "Union([[string, string], unknown])", seed: ["first", "second"], op: pathRemoveAt(0) },
     // The same removal, on a list holding only the required position: only a read would tell.
     { field: "[string, string?]", seed: ["first"], op: pathRemoveAt(0), unreadable: true },
-    // What's left is a length the field accepts: length alone can't see that "second"'s place
-    // holds a number, or that the tag rules out the member reading a list of one.
-    { field: "[string, number?]", seed: ["first", 1], op: pathRemoveAt(0), unreadable: true },
-    // A record with two index signatures isn't modelled, so this is sent whatever the row reads.
+    // What's left is a length the field accepts, but no list reads it (#238): the number moves
+    // into the string's place, the key's signature reads only lists of two, and the tag rules out
+    // the member reading a list of one.
+    { field: "[string, number?]", seed: ["first", 1], op: pathRemoveAt(0), refused: true },
     {
       field: "{ [open-*]: [string, string?], [fixed-*]: [string, string] }",
       seed: { "fixed-k": ["first", "second"] },
       op: pathRemoveAt("fixed-k", 0),
-      unreadable: true,
+      refused: true,
     },
     {
       field: 'Union([{ kind: "a", p: [string, string] }, { kind: "b", p: [string] }])',
       seed: tagged,
       op: pathRemoveAt("p", 0),
-      unreadable: true,
+      refused: true,
     },
     // No value survives these: no list one shorter is a length the field accepts.
     { field: "[string, string]", seed: ["first", "second"], op: pathRemoveAt(0), refused: true },

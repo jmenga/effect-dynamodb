@@ -428,11 +428,48 @@ describe("pathIsRequired", () => {
       ["p", 0],
       true,
     ],
-    // Length alone can't see a value in a position that can't hold it, or a tag ruling out the
-    // member that reads what's left: sent, as 1.39.0 sent them.
+    // What's left is judged by its elements too, and by what's beside the list (#238): a value
+    // moved into a position that can't hold it, or a tag ruling out the member whose list reads
+    // what's left. Published 1.39.0 and 1.40.0 sent these, and the row didn't read back.
     [
       "a required position before an optional one of another type",
       Schema.Tuple([Schema.String, Schema.optional(Schema.Number)]),
+      [0],
+      true,
+    ],
+    [
+      "the optional last position of another type",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.Number)]),
+      [1],
+      false,
+    ],
+    [
+      "a required position before an optional one of the same type",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+      [0],
+      false,
+    ],
+    [
+      "a required position before an optional literal the string can't be",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.Literal("b"))]),
+      [0],
+      false,
+    ],
+    [
+      "a position before a rest of another type",
+      Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.Number]),
+      [0],
+      true,
+    ],
+    [
+      "a rest's position, after one of another type",
+      Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.Number]),
+      [1],
+      false,
+    ],
+    [
+      "a fixed tuple's position before one of another type, shifted into an array",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.Number]), Schema.Array(Schema.Number)]),
       [0],
       false,
     ],
@@ -446,7 +483,91 @@ describe("pathIsRequired", () => {
         Schema.Struct({ kind: Schema.Literal("b"), p: Schema.Tuple([Schema.String]) }),
       ]),
       ["p", 0],
+      true,
+    ],
+    [
+      "tuples of two lengths in tagged structs",
+      Schema.Union([
+        Schema.TaggedStruct("A", { p: Schema.Tuple([Schema.String, Schema.String]) }),
+        Schema.TaggedStruct("B", { p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 0],
+      true,
+    ],
+    [
+      "tuples of two lengths in tagged structs, a position the shorter doesn't hold",
+      Schema.Union([
+        Schema.TaggedStruct("A", { p: Schema.Tuple([Schema.String, Schema.String]) }),
+        Schema.TaggedStruct("B", { p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 1],
       false,
+    ],
+    [
+      "tuples of two lengths, the shorter member's tag optional",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({
+          kind: Schema.optionalKey(Schema.Literal("b")),
+          p: Schema.Tuple([Schema.String]),
+        }),
+      ]),
+      ["p", 0],
+      true,
+    ],
+    [
+      "tuples of two lengths, both members' tags optional",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.optionalKey(Schema.Literal("a")),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({
+          kind: Schema.optionalKey(Schema.Literal("b")),
+          p: Schema.Tuple([Schema.String]),
+        }),
+      ]),
+      ["p", 0],
+      false,
+    ],
+    [
+      "tuples of two lengths, a tag the other member's can be",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({ kind: Schema.String, p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 0],
+      false,
+    ],
+    [
+      "tuples of two lengths below the tagged members",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          q: Schema.Struct({ p: Schema.Tuple([Schema.String, Schema.String]) }),
+        }),
+        Schema.Struct({
+          kind: Schema.Literal("b"),
+          q: Schema.Struct({ p: Schema.Tuple([Schema.String]) }),
+        }),
+      ]),
+      ["q", "p", 0],
+      true,
+    ],
+    [
+      "a tag inside the list itself",
+      Schema.Union([
+        Schema.Tuple([Schema.Literal("a"), Schema.String, Schema.String]),
+        Schema.Tuple([Schema.Literal("b"), Schema.String]),
+      ]),
+      [1],
+      true,
     ],
     ["a recursive schema's required property", Tree, ["next", "value"], true],
     ["a recursive schema's optional property", Tree, ["next", "next"], false],
@@ -528,6 +649,7 @@ describe("pathIsRequired", () => {
       [0, 0],
       false,
     ],
+    // A record's signatures are judged by the key: each it matches reads the entry (#238).
     [
       "a record with two index signatures, the always-unreadable entry",
       Schema.StructWithRest(Schema.Struct({}), [
@@ -541,6 +663,60 @@ describe("pathIsRequired", () => {
         ),
       ]),
       ["fixed-k", 0],
+      true,
+    ],
+    [
+      "a record with two index signatures, a key neither reads",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(
+          Schema.TemplateLiteral(["open-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+        ),
+        Schema.Record(
+          Schema.TemplateLiteral(["fixed-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.String]),
+        ),
+      ]),
+      ["other-k", 0],
+      false,
+    ],
+    [
+      "a record whose signatures overlap, the key read by both",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(Schema.String, Schema.Struct({ x: Schema.optional(Schema.String) })),
+        Schema.Record(Schema.TemplateLiteral(["k-", Schema.String]), Address),
+      ]),
+      ["k-1", "city"],
+      false,
+    ],
+    [
+      "a record whose signatures overlap, both requiring it",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(Schema.String, Address),
+        Schema.Record(Schema.TemplateLiteral(["k-", Schema.String]), Address),
+      ]),
+      ["k-1", "city"],
+      true,
+    ],
+    [
+      "a record keyed by a template literal with a number in it",
+      Schema.Record(Schema.TemplateLiteral(["k-", Schema.Number]), Address),
+      ["k-1", "city"],
+      false,
+    ],
+    [
+      "an entry's required property, as a sparse map's read rebuilds it",
+      Schema.Record(Schema.String, Schema.Struct({ x: Schema.String, y: Schema.String })),
+      ["k", "x"],
+      true,
+    ],
+    [
+      "an entry's optional property",
+      Schema.Record(
+        Schema.String,
+        Schema.Struct({ x: Schema.optional(Schema.String), y: Schema.String }),
+      ),
+      ["k", "x"],
       false,
     ],
     [
@@ -562,7 +738,7 @@ describe("pathIsRequired", () => {
       "a record keyed by a template literal",
       Schema.Record(Schema.TemplateLiteral(["k-", Schema.String]), Address),
       ["k-1", "city"],
-      false,
+      true,
     ],
     [
       "a struct with an index signature",
