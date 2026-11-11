@@ -62,6 +62,7 @@ import {
   resolveFieldEncoding,
   resolveSystemFields,
   resolveUniqueFields,
+  storedAsOverTransform,
   validateNoTransformOverride,
 } from "./internal/EntitySchemas.js"
 import type {
@@ -966,16 +967,18 @@ export const buildEntityDefinition = (config: {
   // `Schema.optional(X)` is a union with `Undefined`, which has no date representation of its own,
   // so the value schema is what's read: an optional date is a date, as `Schema.optionalKey(X)`
   // always was. An aggregate's stamp overwrites what a caller supplied, so its optional dates stay
-  // the caller's.
+  // the caller's. A date transform carrying a `storedAs` of the other wire kind isn't read through:
+  // `Entity.make` refuses one as a stamp outside `Schema.optional`, its stamp could never be read
+  // back, and 1.39.0 left such a field the caller's.
   const systemFields = resolveSystemFields(
     config.timestamps,
     config.versioned,
     config.timeSeries,
     Object.fromEntries(
-      Object.entries(modelFields).map(([name, field]) => [
-        name,
-        optionalField(field as Schema.Top)?.inner ?? field,
-      ]),
+      Object.entries(modelFields).map(([name, field]) => {
+        const inner = optionalField(field as Schema.Top)?.inner
+        return [name, inner === undefined || storedAsOverTransform(inner) ? field : inner]
+      }),
     ) as typeof modelFields,
     configuredAttributes,
     `Entity "${config.entityType}"`,
