@@ -13317,9 +13317,14 @@ const makeImpl = <
       return undefined
     })
 
-  /** A row is left because what holds its current key has to move first, and can't. */
-  const cantMoveHolder = (kind: RowKind, from: StoredKey, to: StoredKey) =>
-    rekeyConflict(kind, "taken", from, to, "A row that can't move holds its current key.")
+  /**
+   * A row is left because what holds its current key has to move first, and can't: it stays, or
+   * it and this row hold each other's way, through others or directly (`loop`).
+   */
+  const cantMoveHolder = (kind: RowKind, from: StoredKey, to: StoredKey, judged: Rekey.Judged) =>
+    judged === "loop"
+      ? rekeyConflict(kind, "contended", from, to, Rekey.LOOP_MESSAGE)
+      : rekeyConflict(kind, "taken", from, to, "A row that can't move holds its current key.")
 
   /**
    * Make room at `to` for a row moving there: a stale row (another value's,
@@ -13337,7 +13342,6 @@ const makeImpl = <
     kind: RowKind,
     from: StoredKey,
     to: StoredKey,
-    depth: number,
     copy?: (held: StoredRow) => boolean,
     elsewhere: ReadonlyArray<StoredKey> = [],
   ): Effect.Effect<
@@ -13354,24 +13358,18 @@ const makeImpl = <
         Key: toAttributeMap(to),
         ConsistentRead: true,
       })
-      const first =
-        atTarget === undefined && depth < Rekey.DISPLACE_DEPTH
-          ? yield* movingThereToo(ctx, elsewhere, to)
-          : undefined
+      const first = atTarget === undefined ? yield* movingThereToo(ctx, elsewhere, to) : undefined
       if (first !== undefined) {
-        const tally = yield* Rekey.displace(ctx, (under) => rekeyRow(first.row, under, depth + 1))
-        if ((tally.conflicts ?? []).length > 0) {
-          return {
-            cleared: false,
-            tally: Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to)),
-          }
+        // That row is judged first, as its own unit: once it has moved to `to` (a dry run: would
+        // have), `to` is judged again with it there.
+        const judged = yield* judgeStoredRow(first.row, ctx)
+        const firstAt = storedKeyOf(first.row)
+        if (firstAt === undefined || !ctx.vacated(toAttributeMap(firstAt))) {
+          return { cleared: false, tally: cantMoveHolder(kind, from, to, judged) }
         }
-        if (!ctx.dryRun) {
-          const after = yield* clearTarget(ctx, kind, from, to, depth, copy)
-          return { ...after, tally: Rekey.mergeTallies(tally, after.tally) }
-        }
+        return yield* clearTarget(ctx, kind, from, to, copy)
       }
-      const held = atTarget ?? first?.at
+      const held = atTarget
       if (held === undefined) return { cleared: true, tally: {} }
       const occupant = occupantOf(held, to)
       if (occupant === "same" && copy?.(held) === true) return { cleared: "twin", tally: {} }
@@ -13404,22 +13402,11 @@ const makeImpl = <
           tally: rekeyConflict(kind, "taken", from, to, "Another row holds its current key."),
         }
       }
-      if (depth >= Rekey.DISPLACE_DEPTH) {
-        return {
-          cleared: false,
-          tally: rekeyConflict(
-            kind,
-            "contended",
-            from,
-            to,
-            "Too many rows under other key text hold each other's current keys.",
-          ),
-        }
-      }
-      const tally = yield* Rekey.displace(ctx, (under) => rekeyRow(held, under, depth + 1))
-      return (tally.conflicts ?? []).length === 0
-        ? { cleared: true, tally }
-        : { cleared: false, tally: Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to)) }
+      // Another value's row under other key text moves out first, judged as its own unit.
+      const judged = yield* judgeStoredRow(held, ctx)
+      return ctx.vacated(toAttributeMap(to))
+        ? { cleared: true, tally: {} }
+        : { cleared: false, tally: cantMoveHolder(kind, from, to, judged) }
     })
 
   /**
@@ -13435,7 +13422,6 @@ const makeImpl = <
     kind: RowKind,
     from: StoredKey,
     to: StoredKey,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -13470,13 +13456,11 @@ const makeImpl = <
           kind,
           from,
           to,
-          depth,
           same === undefined ? undefined : (held) => sameSnapshotHeld(held, read!),
           targets.elsewhere,
         )
         tally = Rekey.mergeTallies(tally, room.tally)
         if (room.cleared === "twin") {
-          if (ctx.dryRun) return countMove(ctx, kind, to, tally)
           const items: ReadonlyArray<TransactWriteItem> = [
             {
               ConditionCheck: {
@@ -13501,12 +13485,7 @@ const makeImpl = <
               },
             },
           ]
-          const deleted = yield* client.transactWriteItems({ TransactItems: [...items] }).pipe(
-            Effect.as(true),
-            Effect.catch((err: DynamoClientError) =>
-              isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
-            ),
-          )
+          const deleted = yield* sendRekeyTransaction(ctx, items)
           if (deleted) return countMove(ctx, kind, to, tally)
           // Either row changed between the reads and the write: read again.
           continue
@@ -13515,22 +13494,8 @@ const makeImpl = <
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
         const sentinels =
           kind === "tombstone"
-            ? yield* sentinelRekeys(
-                ctx,
-                kind,
-                values,
-                read!,
-                targets.isLive,
-                targets.live,
-                depth,
-                true,
-              )
+            ? yield* sentinelRekeys(ctx, kind, values, read!, targets.isLive, targets.live, true)
             : NO_SENTINEL_REKEYS
-        if (ctx.dryRun) {
-          return Rekey.mergeTallies(countMove(ctx, kind, to, tally), sentinels.tally, {
-            sentinelsMoved: sentinels.count,
-          })
-        }
         const items: ReadonlyArray<TransactWriteItem> = [
           {
             Put: {
@@ -13553,12 +13518,7 @@ const makeImpl = <
           },
           ...sentinels.items,
         ]
-        const done = yield* client.transactWriteItems({ TransactItems: [...items] }).pipe(
-          Effect.as(true),
-          Effect.catch((err: DynamoClientError) =>
-            isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
-          ),
-        )
+        const done = yield* sendRekeyTransaction(ctx, items)
         if (done) {
           return Rekey.mergeTallies(countMove(ctx, kind, to, tally), sentinels.tally, {
             sentinelsMoved: sentinels.count,
@@ -13896,7 +13856,6 @@ const makeImpl = <
     ctx: Rekey.RekeyRowContext,
     from: StoredKey,
     to: StoredKey,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -13927,7 +13886,7 @@ const makeImpl = <
               break
           }
         }
-        const room = yield* clearTarget(ctx, "item", from, to, depth, undefined, targets.elsewhere)
+        const room = yield* clearTarget(ctx, "item", from, to, undefined, targets.elsewhere)
         tally = Rekey.mergeTallies(tally, room.tally)
         if (!room.cleared) return tally
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
@@ -13938,7 +13897,6 @@ const makeImpl = <
           read!,
           (key) => sameStoredKey(key, from),
           to,
-          depth,
           true,
         )
         tally = Rekey.mergeTallies(tally, sentinels.tally)
@@ -13955,18 +13913,6 @@ const makeImpl = <
           ),
         )
         if (moved._tag === "Failed") return failed(moved.error)
-        if (ctx.dryRun) {
-          // The real run goes on to rewrite or report what the move leaves on the row.
-          const left = staleIndexKeys(moved.row)
-          const repair = yield* repairIndexKeys(ctx, { ...moved.row, ...left.sets }, to)
-          return Rekey.mergeTallies(
-            countMove(ctx, "item", to, tally),
-            { sentinelsMoved: sentinels.moved },
-            Object.keys(left.sets).length === 0 ? {} : { indexKeysRewritten: 1 },
-            heldBackIndexKeys(to, left.uncomposable),
-            repair.tally,
-          )
-        }
         const items: ReadonlyArray<TransactWriteItem> = [
           {
             Put: {
@@ -13989,6 +13935,20 @@ const makeImpl = <
           },
           ...sentinels.items,
         ]
+        if (ctx.dryRun) {
+          // Raced, as far as the plan knows: judge it again.
+          if (!ctx.plan(items)) continue
+          // The real run goes on to rewrite or report what the move leaves on the row.
+          const left = staleIndexKeys(moved.row)
+          const repair = yield* repairIndexKeys(ctx, { ...moved.row, ...left.sets }, to)
+          return Rekey.mergeTallies(
+            countMove(ctx, "item", to, tally),
+            { sentinelsMoved: sentinels.moved },
+            Object.keys(left.sets).length === 0 ? {} : { indexKeysRewritten: 1 },
+            heldBackIndexKeys(to, left.uncomposable),
+            repair.tally,
+          )
+        }
         const done = yield* client.transactWriteItems({ TransactItems: [...items] }).pipe(
           Effect.as({ _tag: "Done" as const }),
           Effect.catch((err: DynamoClientError) =>
@@ -14198,7 +14158,6 @@ const makeImpl = <
     ctx: Rekey.RekeyRowContext,
     scanned: StoredRow,
     at: StoredKey,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -14280,7 +14239,6 @@ const makeImpl = <
         row,
         (key) => sameStoredKey(key, at),
         at,
-        depth,
         false,
       )
       const refused = heldBackIndexKeys(at, uncomposable)
@@ -14289,6 +14247,7 @@ const makeImpl = <
           repair.wrote ||
           (refused.conflicts ?? []).length > 0 ||
           (sentinels.sentinelsMoved ?? 0) > 0 ||
+          sentinels.worked === true ||
           (sentinels.conflicts ?? []).length > 0
           ? {}
           : { unchanged: 1 },
@@ -14310,7 +14269,6 @@ const makeImpl = <
     ctx: Rekey.RekeyRowContext,
     scanned: StoredRow,
     at: StoredKey,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const predicted = yield* movedRowOf(scanned, at, "rekey").pipe(
@@ -14331,16 +14289,25 @@ const makeImpl = <
       })
       // Gone, or another row's: the scan judges that one where it finds it.
       if (moved === undefined || occupantOf(moved, at) !== "same") return {}
-      const { unchanged: _unchanged, ...tally } = yield* rekeyCurrentItem(ctx, moved, at, depth)
+      const { unchanged: _unchanged, ...tally } = yield* rekeyCurrentItem(ctx, moved, at)
       return tally
     })
 
+  /** A constraint's sentinel writes: a move from under other key text (`from`), or a re-point. */
+  type SentinelWrites = {
+    readonly constraintName: string
+    readonly from: SentinelKey | undefined
+    readonly items: ReadonlyArray<TransactWriteItem>
+  }
+
   const NO_SENTINEL_REKEYS: {
     readonly items: ReadonlyArray<TransactWriteItem>
+    readonly groups: ReadonlyArray<SentinelWrites>
     readonly count: number
     readonly moved: number
+    readonly worked: boolean
     readonly tally: Rekey.RekeyTally
-  } = { items: [], count: 0, moved: 0, tally: {} }
+  } = { items: [], groups: [], count: 0, moved: 0, worked: false, tally: {} }
 
   /**
    * A unique sentinel's key under `under`; `undefined` when the values have none there. A field in
@@ -14572,7 +14539,6 @@ const makeImpl = <
     /** Is a key a sentinel names one of its owners'? */
     owns: (key: StoredKey) => boolean,
     to: StoredKey,
-    depth: number,
     /**
      * Look under the other numeric kind's text too ({@link otherSentinelKeys}). A moving row's
      * sentinels are looked for there, since they name its old key: under the first readings, then,
@@ -14583,6 +14549,8 @@ const makeImpl = <
     otherKinds: boolean,
     /** A sentinel the scan reached, which names the row: looked at first, for its constraint. */
     scanned?: { readonly constraintName: string; readonly key: SentinelKey } | undefined,
+    /** Only this constraint's sentinel: one moved by itself, out of another's way. */
+    only?: string | undefined,
   ) =>
     Effect.gen(function* () {
       if (config.unique === undefined) return NO_SENTINEL_REKEYS
@@ -14604,8 +14572,11 @@ const makeImpl = <
         return owns(named) ? named : undefined
       }
       const items: Array<TransactWriteItem> = []
+      const groups: Array<SentinelWrites> = []
       let count = 0
       let moved = 0
+      // A sentinel this run brought to its current key for the row, by another unit's move.
+      let worked = false
       let tally: Rekey.RekeyTally = {}
       const refused = (
         reason: "bothKeys" | "taken" | "contended",
@@ -14628,6 +14599,7 @@ const makeImpl = <
       for (const [constraintName, constraintDef] of Object.entries(
         config.unique as globalThis.Record<string, UniqueConstraintDef>,
       )) {
+        if (only !== undefined && constraintName !== only) continue
         const now = (() => {
           try {
             return {
@@ -14737,36 +14709,24 @@ const makeImpl = <
               )
               continue
             }
-            if (depth >= Rekey.DISPLACE_DEPTH) {
+            // The holder's sentinel moves out first, as a unit of its own: with its row when that
+            // row moves too, and otherwise by itself, so two rows holding each other's sentinel
+            // keys under different constraints don't wait on each other.
+            const judged = yield* holderSentinelOut(ctx, holder!, constraintName, current)
+            if (!ctx.vacated(toAttributeMap(sentinelKeyRecord(current)))) {
               refused(
-                "contended",
+                judged === "loop" ? "contended" : "taken",
                 constraintName,
                 found.key,
                 current,
-                "too many sentinels under other key text hold each other's current keys.",
-              )
-              continue
-            }
-            const displaced = yield* Rekey.displace(ctx, (under) =>
-              rekeyRow(holder!, under, depth + 1),
-            )
-            tally = Rekey.mergeTallies(tally, displaced)
-            // A dry run moved nothing: what would stop the holder is what would leave it there.
-            const stillHeld = ctx.dryRun
-              ? (displaced.conflicts ?? []).length > 0
-              : (yield* readAt(current)) !== undefined
-            if (stillHeld) {
-              refused(
-                "taken",
-                constraintName,
-                found.key,
-                current,
-                "its sentinel's current key is held by another item.",
+                judged === "loop"
+                  ? "sentinels under other key text hold each other's current keys in a loop."
+                  : "its sentinel's current key is held by another item.",
               )
               continue
             }
           }
-          items.push(
+          const move: ReadonlyArray<TransactWriteItem> = [
             {
               Put: {
                 TableName: ctx.tableName,
@@ -14782,14 +14742,23 @@ const makeImpl = <
               },
             },
             sentinelRelease(ctx.tableName, found.key, ownerOf(found.owner)),
-          )
+          ]
+          items.push(...move)
+          groups.push({ constraintName, from: found.key, items: move })
           count++
           moved++
           continue
         }
         const ownerNow = ownerIn(heldNow)
+        if (
+          ownerNow !== undefined &&
+          sameStoredKey(ownerNow, to) &&
+          ctx.placed(toAttributeMap(sentinelKeyRecord(current)))
+        ) {
+          worked = true
+        }
         if (ownerNow !== undefined && !sameStoredKey(ownerNow, to)) {
-          items.push({
+          const repoint: TransactWriteItem = {
             Update: {
               TableName: ctx.tableName,
               Key: toAttributeMap(sentinelKeyRecord(current)),
@@ -14803,11 +14772,13 @@ const makeImpl = <
                 ":nsk": to[rekeySk],
               }),
             },
-          })
+          }
+          items.push(repoint)
+          groups.push({ constraintName, from: undefined, items: [repoint] })
           count++
         }
       }
-      return { items, count, moved, tally }
+      return { items, groups, count, moved, worked, tally }
     })
 
   /**
@@ -14821,13 +14792,12 @@ const makeImpl = <
     row: StoredRow,
     owns: (key: StoredKey) => boolean,
     to: StoredKey,
-    depth: number,
     otherKinds: boolean,
     scanned?: { readonly constraintName: string; readonly key: SentinelKey } | undefined,
+    only?: string | undefined,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       if (config.unique === undefined) return {}
-      const client = yield* Capacity.client
       const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
         const planned = yield* sentinelRekeys(
@@ -14837,20 +14807,47 @@ const makeImpl = <
           row,
           owns,
           to,
-          depth,
           otherKinds,
           scanned,
+          only,
         )
-        const moved = planned.count > 0 ? { sentinelsMoved: planned.count } : {}
-        if (planned.items.length === 0 || ctx.dryRun) {
-          return Rekey.mergeTallies(planned.tally, moved)
+        // A sentinel under other key text is a unit of its own, judged as the row stored where it
+        // is (`rowUnit`): this pass, and a move that needs it out of its way
+        // ({@link holderSentinelOut}), judge it once, and it's counted when it settles. The
+        // pass's other writes go in one transaction.
+        const units = only === undefined ? planned.groups.filter((group) => group.from) : []
+        for (const unit of units) {
+          const from = unit.from!
+          yield* ctx.judge(
+            entityType,
+            Rekey.rowUnit(from.pk, from.sk),
+            Effect.flatMap(sendRekeyTransaction(ctx, unit.items), (done) =>
+              done
+                ? Effect.succeed<Rekey.RekeyTally>({ sentinelsMoved: 1 })
+                : rekeySentinels(
+                    ctx,
+                    kind,
+                    row,
+                    owns,
+                    to,
+                    otherKinds,
+                    { constraintName: unit.constraintName, key: from },
+                    unit.constraintName,
+                  ),
+            ),
+          )
         }
-        const done = yield* client.transactWriteItems({ TransactItems: [...planned.items] }).pipe(
-          Effect.as(true),
-          Effect.catch((err: DynamoClientError) =>
-            isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
-          ),
-        )
+        const rest =
+          units.length === 0
+            ? planned.items
+            : planned.groups.filter((group) => !group.from).flatMap((group) => group.items)
+        const count = planned.count - units.length
+        const moved: Rekey.RekeyTally = {
+          ...(count > 0 && { sentinelsMoved: count }),
+          ...((planned.worked || units.length > 0) && { worked: true }),
+        }
+        if (rest.length === 0) return Rekey.mergeTallies(planned.tally, moved)
+        const done = yield* sendRekeyTransaction(ctx, rest)
         if (done) return Rekey.mergeTallies(planned.tally, moved)
         // A sentinel changed between the read and the write: read again.
       }
@@ -14945,7 +14942,6 @@ const makeImpl = <
             owner,
             targets.isLive,
             targets.live,
-            0,
             true,
             scanned,
           )
@@ -14955,21 +14951,19 @@ const makeImpl = <
             owner,
             (key) => sameStoredKey(key, ownerAt),
             ownerAt,
-            0,
             true,
             scanned,
           )
     })
 
-  /** The entity's `rekey` handler: one scanned row — or one displaced by a move. */
+  /** The entity's `rekey` handler: one scanned row. */
   const rekeyRow = (
     row: StoredRow,
     ctx: Rekey.RekeyRowContext,
-    depth = 0,
   ): Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const type = row.__edd_e__?.S
-      if (isValueless(row)) return yield* rekeyProjectionRow(row, ctx, undefined, depth)
+      if (isValueless(row)) return yield* rekeyProjectionRow(row, ctx)
       if (type?.startsWith(`${entityType}._unique.`)) return yield* rekeySentinelRow(row, ctx)
       if (type !== entityType) return undefined
       const stored = storedKeyOf(row)
@@ -14988,43 +14982,150 @@ const makeImpl = <
         )
       }
       if (sameStoredKey(stored, targets.current)) {
-        // A sentinel in another row's way has this row reached before the scan gets to it, and
-        // then it has nothing left to do: `unchanged` counts a row the run didn't touch.
-        const firstVisit = ctx.claim(
-          `${entityType}\u0000at\u0000${stored[rekeyPk]}\u0000${stored[rekeySk]}`,
+        // Only the scan's visit judges a row under its current key: a move needing a sentinel of
+        // it out of its way moves that sentinel alone ({@link holderSentinelOut}).
+        if (targets.kind === "item") return yield* rekeyCurrentItem(ctx, row, stored)
+        if (targets.kind !== "tombstone") return { unchanged: 1 }
+        // A tombstone under its current key: its sentinels may still hold
+        // other key text or name another of the item's keys.
+        const sentinels = yield* rekeySentinels(
+          ctx,
+          "tombstone",
+          row,
+          targets.isLive,
+          targets.live,
+          false,
         )
-        const tally: Rekey.RekeyTally = yield* Effect.gen(function* () {
-          if (targets.kind === "item") return yield* rekeyCurrentItem(ctx, row, stored, depth)
-          if (targets.kind !== "tombstone") return { unchanged: 1 }
-          // A tombstone under its current key: its sentinels may still hold
-          // other key text or name another of the item's keys.
-          const sentinels = yield* rekeySentinels(
-            ctx,
-            "tombstone",
-            row,
-            targets.isLive,
-            targets.live,
-            depth,
-            false,
-          )
-          return (sentinels.sentinelsMoved ?? 0) > 0 || (sentinels.conflicts ?? []).length > 0
-            ? sentinels
-            : { unchanged: 1 }
-        })
-        if (firstVisit) return tally
-        const { unchanged: _again, ...rest } = tally
-        return rest
+        return (sentinels.sentinelsMoved ?? 0) > 0 ||
+          sentinels.worked === true ||
+          (sentinels.conflicts ?? []).length > 0
+          ? sentinels
+          : { unchanged: 1 }
       }
       if (targets.old === undefined) return { skipped: { unrecognizedKey: 1 } }
-      if (targets.kind !== "item") {
-        return yield* moveHistoryRow(ctx, targets.kind, stored, targets.current, depth)
-      }
-      const moved = yield* moveItem(ctx, stored, targets.current, depth)
+      // Under other key text: judged as its own unit, counted when it settles.
+      yield* judgeStoredRow(row, ctx)
+      return {}
+    })
+
+  /**
+   * What moving `row` — under other key text, or a projection's valueless row whose key's values
+   * compose another key now — is, judged as its unit; `undefined` for a row that isn't one to
+   * move. `keys`: the row's table key attributes.
+   */
+  const moveWork = (
+    row: StoredRow,
+    ctx: Rekey.RekeyRowContext,
+    keys: { readonly pk: string; readonly sk: string },
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> | undefined => {
+    if (isValueless(row)) {
+      const move = valuelessMove(row, keys)
+      return typeof move === "object" ? moveValuelessRow(row, ctx, keys, move) : undefined
+    }
+    if (row.__edd_e__?.S !== entityType) return undefined
+    const stored = storedKeyOf(row)
+    const targets = rowPlaces(row)
+    if (
+      stored === undefined ||
+      targets === undefined ||
+      "uncomposable" in targets ||
+      targets.old === undefined ||
+      sameStoredKey(stored, targets.current)
+    ) {
+      return undefined
+    }
+    if (targets.kind !== "item") {
+      return moveHistoryRow(ctx, targets.kind, stored, targets.current)
+    }
+    return Effect.gen(function* () {
+      const moved = yield* moveItem(ctx, stored, targets.current)
       // A dry run wrote nothing to read back: `moveItem` judged the row it predicted.
       // A conflict left the row where it was.
       if (ctx.dryRun || (moved.conflicts ?? []).length > 0) return moved
-      return Rekey.mergeTallies(moved, yield* rekeyAfterMove(ctx, row, targets.current, depth))
+      return Rekey.mergeTallies(moved, yield* rekeyAfterMove(ctx, row, targets.current))
     })
+  }
+
+  /**
+   * Judge the row stored at `row`'s key as its unit ({@link Rekey.RekeyRowContext.judge}): by the
+   * first visit, the scan's or a move's that needs it out of the way. A row that isn't one to move
+   * is `settled` as it is.
+   */
+  const judgeStoredRow = (
+    row: StoredRow,
+    ctx: Rekey.RekeyRowContext,
+    keys: { readonly pk: string; readonly sk: string } = { pk: rekeyPk, sk: rekeySk },
+  ): Effect.Effect<Rekey.Judged, DynamoClientError, DynamoClient | TableConfig> => {
+    const work = moveWork(row, ctx, keys)
+    return work === undefined
+      ? Effect.succeed("settled")
+      : ctx.judge(entityType, Rekey.rowUnit(row[keys.pk]?.S, row[keys.sk]?.S), work)
+  }
+
+  /**
+   * Get `holder`'s sentinel of `constraintName`, stored at `at` under other key text, out of
+   * another row's way: with its row, when that row moves too ({@link judgeStoredRow}); otherwise
+   * by itself, as a unit of its own, to the key `holder`'s values compose now.
+   */
+  const holderSentinelOut = (
+    ctx: Rekey.RekeyRowContext,
+    holder: StoredRow,
+    constraintName: string,
+    at: SentinelKey,
+  ): Effect.Effect<Rekey.Judged, DynamoClientError, DynamoClient | TableConfig> => {
+    if (moveWork(holder, ctx, { pk: rekeyPk, sk: rekeySk }) !== undefined) {
+      return judgeStoredRow(holder, ctx)
+    }
+    const targets = rowTargets(holder)
+    const holderAt = storedKeyOf(holder)
+    if (targets === undefined || holderAt === undefined) return Effect.succeed("settled")
+    const scanned = { constraintName, key: at }
+    return ctx.judge(
+      entityType,
+      Rekey.rowUnit(at.pk, at.sk),
+      targets.kind === "tombstone"
+        ? rekeySentinels(
+            ctx,
+            "tombstone",
+            holder,
+            targets.isLive,
+            targets.live,
+            false,
+            scanned,
+            constraintName,
+          )
+        : rekeySentinels(
+            ctx,
+            "item",
+            holder,
+            (key) => sameStoredKey(key, holderAt),
+            holderAt,
+            false,
+            scanned,
+            constraintName,
+          ),
+    )
+  }
+
+  /**
+   * Send `items`, one transaction of `rekey`'s, or in a dry run plan them
+   * ({@link Rekey.RekeyRowContext.plan}): `false` when a condition failed — in a dry run, when the
+   * plan says one would.
+   */
+  const sendRekeyTransaction = (
+    ctx: Rekey.RekeyRowContext,
+    items: ReadonlyArray<TransactWriteItem>,
+  ): Effect.Effect<boolean, DynamoClientError, DynamoClient> =>
+    ctx.dryRun
+      ? Effect.sync(() => ctx.plan(items))
+      : Effect.flatMap(Capacity.client, (client) =>
+          client.transactWriteItems({ TransactItems: [...items] }).pipe(
+            Effect.as(true),
+            Effect.catch((err: DynamoClientError) =>
+              isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
+            ),
+          ),
+        )
 
   /**
    * A key's values read with each numeric composite as its declared kind or the other one, the
@@ -15172,66 +15273,67 @@ const makeImpl = <
   /**
    * Move a projection's row tombstone or outbox item as a row: one transaction puts `item` at
    * `to`, where nothing may be, and deletes it at `from` while it is as `read`, unclaimed by a
-   * drainer since. `false` when either condition failed.
+   * drainer since.
    */
-  const moveValueless = (
+  const valuelessItems = (
     tableName: string,
     pkField: string,
     from: StoredKey,
     guard: NonNullable<ReturnType<typeof valuelessGuard>>,
     item: StoredRow,
-  ): Effect.Effect<boolean, DynamoClientError, DynamoClient> =>
-    Effect.gen(function* () {
-      const client = yield* Capacity.client
-      return yield* client
-        .transactWriteItems({
-          TransactItems: [
-            {
-              Put: {
-                TableName: tableName,
-                Item: item,
-                ConditionExpression: "attribute_not_exists(#pk)",
-                ExpressionAttributeNames: { "#pk": pkField },
-              },
-            },
-            {
-              Delete: {
-                TableName: tableName,
-                Key: toAttributeMap(from),
-                ...guard,
-              },
-            },
-          ],
-        })
-        .pipe(
-          Effect.as(true),
-          Effect.catch((err: DynamoClientError) =>
-            isAwsTransactionCancelled(err.cause) ? Effect.succeed(false) : Effect.fail(err),
-          ),
-        )
-    })
+  ): ReadonlyArray<TransactWriteItem> => [
+    {
+      Put: {
+        TableName: tableName,
+        Item: item,
+        ConditionExpression: "attribute_not_exists(#pk)",
+        ExpressionAttributeNames: { "#pk": pkField },
+      },
+    },
+    {
+      Delete: {
+        TableName: tableName,
+        Key: toAttributeMap(from),
+        ...guard,
+      },
+    },
+  ]
 
   /**
    * A projection's row tombstone or outbox item, which holds no values: where
    * it belongs is read back from its key ({@link valuelessMove}). One whose key's values compose
-   * another key now moves there as a row ({@link moveValueless}); another value's row left at
-   * that key moves first, by its kind. One a drainer holds is left, a conflict until a rerun finds
-   * it delivered. `keys`: the item's table key attributes.
+   * another key now moves there as a row ({@link moveValuelessRow}), judged as its unit. `keys`:
+   * the item's table key attributes.
    */
   const rekeyProjectionRow = (
     row: StoredRow,
     ctx: Rekey.RekeyRowContext,
     keys: { readonly pk: string; readonly sk: string } = { pk: rekeyPk, sk: rekeySk },
-    depth = 0,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const move = valuelessMove(row, keys)
       if (move === undefined) return { skipped: { unrecognizedKey: 1 } }
       if (move === "current") return { unchanged: 1 }
+      yield* judgeStoredRow(row, ctx, keys)
+      return {}
+    })
+
+  /**
+   * Move a valueless row whose key's values compose another key now ({@link valuelessItems});
+   * another value's row left at that key moves first, by its kind, as its own unit. One a drainer
+   * holds is left, a conflict until a rerun finds it delivered.
+   */
+  const moveValuelessRow = (
+    row: StoredRow,
+    ctx: Rekey.RekeyRowContext,
+    keys: { readonly pk: string; readonly sk: string },
+    move: { readonly kind: RowKind; readonly from: StoredKey; readonly to: StoredKey },
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
       const { kind, from, to } = move
       const client = yield* Capacity.client
       const counted = keyAt(to[keys.pk]!, to[keys.sk]!)
-      let tally: Rekey.RekeyTally = {}
+      const tally: Rekey.RekeyTally = {}
       for (let attempt = 0; attempt < GUARDED_PUT_ATTEMPTS; attempt++) {
         // The scan's read is eventually consistent: act on a consistent one.
         const { Item: read } = yield* client.getItem({
@@ -15239,8 +15341,7 @@ const makeImpl = <
           Key: toAttributeMap(from),
           ConsistentRead: true,
         })
-        // Gone since the scan — delivered, or moved by a write or by this run
-        // (counted then), and its key may hold another row now.
+        // Gone since the scan — delivered, or moved by a write — and its key may hold another row.
         if (read === undefined || read.__edd_e__?.S !== row.__edd_e__?.S) return tally
         const plan = valuelessMove(read, keys)
         if (
@@ -15263,10 +15364,10 @@ const makeImpl = <
             rekeyConflict(kind, "unguarded", from, to, Rekey.UNGUARDED_MESSAGE),
           )
         }
-        if (
-          !ctx.dryRun &&
-          (yield* moveValueless(ctx.tableName, keys.pk, from, guard, plan.moved(read)))
-        ) {
+        const items = valuelessItems(ctx.tableName, keys.pk, from, guard, plan.moved(read))
+        // A real run tries the move first; a dry run sees what's at `to` first, as the real run
+        // does when its move fails.
+        if (!ctx.dryRun && (yield* sendRekeyTransaction(ctx, items))) {
           return countMove(ctx, kind, counted, tally)
         }
         const { Item: there } = yield* client.getItem({
@@ -15277,7 +15378,7 @@ const makeImpl = <
         if (there !== undefined) {
           // Another value's row left at its current key moves out first.
           if (occupantOf(there, counted) !== "stale") {
-            // Or it is this row, moved there since the read by another row's move (counted then).
+            // Or it is this row, moved there since the read by a write.
             const { Item: left } = yield* client.getItem({
               TableName: ctx.tableName,
               Key: toAttributeMap(from),
@@ -15289,29 +15390,12 @@ const makeImpl = <
               rekeyConflict(kind, "taken", from, to, "Another row holds its current key."),
             )
           }
-          if (depth >= Rekey.DISPLACE_DEPTH) {
-            return Rekey.mergeTallies(
-              tally,
-              rekeyConflict(
-                kind,
-                "contended",
-                from,
-                to,
-                "Too many rows under other key text hold each other's current keys.",
-              ),
-            )
-          }
-          const displaced = yield* Rekey.displace(ctx, (under) =>
-            isValueless(there)
-              ? rekeyProjectionRow(there, under, keys, depth + 1)
-              : rekeyRow(there, under, depth + 1),
-          )
-          tally = Rekey.mergeTallies(tally, displaced)
-          if ((displaced.conflicts ?? []).length > 0) {
-            return Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to))
+          const judged = yield* judgeStoredRow(there, ctx, keys)
+          if (!ctx.vacated(toAttributeMap(to))) {
+            return Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to, judged))
           }
         }
-        if (ctx.dryRun) return countMove(ctx, kind, counted, tally)
+        if (ctx.dryRun && ctx.plan(items)) return countMove(ctx, kind, counted, tally)
         // It changed between the read and the write, or made room: read again.
       }
       return Rekey.mergeTallies(
@@ -15330,6 +15414,7 @@ const makeImpl = <
     name: entityType,
     types: [entityType, `${entityType}#tombstone`, `${entityType}#outbox`],
     typePrefixes: [`${entityType}._unique.`],
+    key: { pk: rekeyPk, sk: rekeySk },
     row: (row, ctx) => rekeyRow(row, ctx),
   }
 

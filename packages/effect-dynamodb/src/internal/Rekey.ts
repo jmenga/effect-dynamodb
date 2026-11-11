@@ -17,12 +17,28 @@
  * (`unrecognizedKey`). That makes a run idempotent: a rerun finds every moved
  * row current. Conflicts — a row under both keys, a current key another row
  * holds — are reported, never overwritten.
+ *
+ * What a run decides over a table nothing else writes to doesn't depend on the order its segments,
+ * pages and concurrent visits meet the rows (DESIGN.md §7 "`rekey`", "One outcome whatever the
+ * order"):
+ *
+ * - **One verdict per row.** A row (by its stored key), an aggregate partition and an event stream
+ *   are each a unit judged once per run ({@link RekeyRowContext.judge}): the first visit judges it
+ *   — the scan's, or a move's that needs it out of the way — and a visit meanwhile waits for that
+ *   verdict instead of judging it again. A wait that would close a loop (a row in the way of a row
+ *   in the way of it) isn't taken: every unit on the loop is told so, and each reports `contended`.
+ * - **The run doesn't meet its own writes** ({@link Journal}). The scan passes a row the run put,
+ *   and a row the run took that a page read before the take still returned; `scanned` counts each
+ *   row stored at the start once, whether the scan returned it or a move took it first.
+ * - **A dry run plans the writes a real run sends** ({@link RekeyRowContext.plan}) and reads
+ *   through the plan, so a later decision sees what an earlier one would have done.
+ * - **Conflicts are reported one per row**, the first by precedence, in a fixed order.
  */
 
-import type { AttributeValue } from "@aws-sdk/client-dynamodb"
+import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
-import { Deferred, Effect, Option } from "effect"
-import type { DynamoClient, DynamoClientError } from "../DynamoClient.js"
+import { Context, Deferred, Effect, Option } from "effect"
+import { DynamoClient, type DynamoClientError, type DynamoClientService } from "../DynamoClient.js"
 import type {
   RekeyConflict,
   RekeyCounts,
@@ -46,6 +62,7 @@ import {
 import type { UnprovableRow } from "./ExpressionLimits.js"
 
 type Item = Record<string, AttributeValue>
+type Update = NonNullable<TransactWriteItem["Update"]>
 
 /** What a member's handler is told about the run. */
 export interface RekeyRowContext {
@@ -61,20 +78,40 @@ export interface RekeyRowContext {
    * nothing. Only meaningful in {@link RekeyMember.finish}.
    */
   readonly sawWholeTable: () => boolean
-  /**
-   * Claim a unit of rows that move together — an aggregate, an event stream —
-   * for this run: `true` for the first row that claims it, `false` after.
-   */
+  /** `true` the first time the run asks for `unit`: work counted once per run, however reached. */
   readonly claim: (unit: string) => boolean
   /**
-   * Do the work of a unit of rows that move together, once per run: the first caller runs it and
-   * gets its tally. A later caller waits for that run to finish and gets an empty one, so a move
-   * that needs another unit out of its way goes on once it is.
+   * Judge `unit` — a stored row, or rows that move together (an aggregate partition, an event
+   * stream) — once per run, `work` being its judgment, counted under `member` when it settles. The
+   * first call runs `work`; a call while it runs waits for it; a later one finds it settled. What
+   * the caller learns is `settled`, or `loop`: the caller is itself in `unit`'s way, through the
+   * units each waits on, so neither can move first. Whether the row left its key is
+   * {@link vacated}.
    */
-  readonly once: <E, R>(
+  readonly judge: <E, R>(
+    member: string,
     unit: string,
     work: Effect.Effect<RekeyTally, E, R>,
-  ) => Effect.Effect<RekeyTally, E, R>
+  ) => Effect.Effect<Judged, E, R>
+  /**
+   * A dry run's write, which it doesn't send: whether it would succeed as far as the run knows (no
+   * row the plan placed where it asks for none, none the plan took where it asks for one); if so,
+   * its puts, deletes and updates are what the run reads, and the scan passes, from then on.
+   */
+  readonly plan: (items: ReadonlyArray<TransactWriteItem>) => boolean
+  /** Whether the row stored at `key` is gone by the run's write (a dry run: its plan). */
+  readonly vacated: (key: Item) => boolean
+  /** Whether the row at `key` is one the run put there (a dry run: planned to). */
+  readonly placed: (key: Item) => boolean
+  /**
+   * `row`, read with `rows` (as stored), stands where one of the caller's belongs: judge first
+   * what it is part of, when another unit holds it ({@link RekeyMember.holder}), as the scan would
+   * judge that unit. Its verdict, as {@link judge} gives it; `undefined` when no unit holds it.
+   */
+  readonly yieldTo: (
+    row: Item,
+    rows: ReadonlyArray<Item>,
+  ) => Effect.Effect<Judged | undefined, DynamoClientError, DynamoClient | TableConfig>
 }
 
 /**
@@ -91,11 +128,16 @@ export const UNGUARDED_MESSAGE =
   "one expression, and it has no version or updatedAt the library stamps to stand in. It's left " +
   "where it is: stop writes to the table, then run rekey with writesStopped: true."
 
-/**
- * How many rows still to move a row's own move goes through first: one chain, `foo%20bar`'s row
- * where `foo bar`'s belongs and so on. Past it the row is reported, and the next run goes on.
- */
-export const DISPLACE_DEPTH = 4
+/** What {@link RekeyRowContext.judge} found: the unit settled, or it and the caller are a loop. */
+export type Judged = "settled" | "loop"
+
+/** The unit a stored row is judged as ({@link RekeyRowContext.judge}): its stored key. */
+export const rowUnit = (pk: string | undefined, sk: string | undefined): string =>
+  `row\u0000${pk ?? ""}\u0000${sk ?? ""}`
+
+/** What a row in a loop of rows holding each other's current keys is reported with. */
+export const LOOP_MESSAGE =
+  "Rows under other key text hold each other's current keys in a loop: none can move first."
 
 /** What a handler did with one scanned row (and the rows that moved with it). */
 export interface RekeyTally {
@@ -106,6 +148,11 @@ export interface RekeyTally {
   readonly indexKeys?: Partial<RekeyIndexKeys> | undefined
   readonly conflicts?: ReadonlyArray<RekeyConflict> | undefined
   readonly skipped?: Partial<Record<RekeySkipReason, number>> | undefined
+  /**
+   * The handler found work the run did on the row's behalf elsewhere (a sentinel already moved to
+   * its current key by this run): the row isn't `unchanged`, though this call wrote nothing.
+   */
+  readonly worked?: boolean | undefined
 }
 
 /** A tally saying only that the member couldn't read the row's key back. */
@@ -123,11 +170,25 @@ export interface RekeyMember {
   readonly types: ReadonlyArray<string>
   /** `__edd_e__` prefixes of rows that may be the member's (unique sentinels). */
   readonly typePrefixes?: ReadonlyArray<string> | undefined
+  /** The table's key attributes, by which the run tells the keys its writes touch apart. */
+  readonly key?: { readonly pk: string; readonly sk: string } | undefined
   /** Handle one scanned row; `undefined` when it is not the member's after all. */
   readonly row: (
     row: Item,
     ctx: RekeyRowContext,
   ) => Effect.Effect<RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig>
+  /**
+   * Whether `row`, read with `rows`, is part of a unit of this member's whose rows move together
+   * (an aggregate's): if so, that unit judged ({@link RekeyRowContext.judge}) and its verdict.
+   * Reads nothing: `rows` are what the asker read. See {@link RekeyRowContext.yieldTo}.
+   */
+  readonly holder?:
+    | ((
+        row: Item,
+        rows: ReadonlyArray<Item>,
+        ctx: RekeyRowContext,
+      ) => Effect.Effect<Judged | undefined, DynamoClientError, DynamoClient | TableConfig>)
+    | undefined
   /** After the scan: rows it could judge only with everything scanned. */
   readonly finish?:
     | ((
@@ -222,10 +283,52 @@ interface MutableMember {
   indexKeysRewritten: number
   sentinelsMoved: number
   indexKeys: MutableIndexKeys
-  conflicts: number
 }
 
-/** The run's counts, merged as handlers finish. */
+/** A value as text whose order is the same whatever order its object's properties were set in. */
+const stableText = (value: unknown): string => {
+  if (typeof value !== "object" || value === null) return JSON.stringify(value) ?? "undefined"
+  if (Array.isArray(value)) return `[${value.map(stableText).join(",")}]`
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  )
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableText(v)}`).join(",")}}`
+}
+
+/** Which of a row's conflicts is reported when it is met more than once: the first that applies. */
+const REASON_ORDER: ReadonlyArray<RekeyConflict["reason"]> = [
+  "failed",
+  "unguarded",
+  "uncomposable",
+  "bothKeys",
+  "contended",
+  "taken",
+]
+
+const reasonRank = (reason: RekeyConflict["reason"]): number => {
+  const at = REASON_ORDER.indexOf(reason)
+  return at === -1 ? REASON_ORDER.length : at
+}
+
+/** The order conflicts are reported in, and the tie-break between two of one row. */
+const conflictOrder = (conflict: RekeyConflict): ReadonlyArray<string> => [
+  conflict.member,
+  conflict.kind,
+  stableText(conflict.key),
+  String(reasonRank(conflict.reason)).padStart(2, "0"),
+  stableText(conflict.target),
+  conflict.message,
+]
+
+const compareOrders = (a: ReadonlyArray<string>, b: ReadonlyArray<string>): number => {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]! < b[i]!) return -1
+    if (a[i]! > b[i]!) return 1
+  }
+  return 0
+}
+
+/** The run's counts, merged as units settle. */
 class Totals {
   scanned = 0
   unchanged = 0
@@ -233,8 +336,8 @@ class Totals {
   indexKeysRewritten = 0
   sentinelsMoved = 0
   indexKeys = zeroIndexKeys()
-  conflicts: Array<RekeyConflict> = []
-  private readonly conflicted = new Set<string>()
+  /** One conflict per row (member, kind, key): the first by {@link REASON_ORDER}, then by text. */
+  private readonly conflicts = new Map<string, RekeyConflict>()
   skipped: { -readonly [R in RekeySkipReason]: number } = {
     notLibrary: 0,
     unregistered: 0,
@@ -243,23 +346,22 @@ class Totals {
   }
   byMember = new Map<string, MutableMember>()
 
+  private memberOf(member: string): MutableMember {
+    const known = this.byMember.get(member)
+    if (known !== undefined) return known
+    const fresh: MutableMember = {
+      unchanged: 0,
+      moved: zeroCounts(),
+      indexKeysRewritten: 0,
+      sentinelsMoved: 0,
+      indexKeys: zeroIndexKeys(),
+    }
+    this.byMember.set(member, fresh)
+    return fresh
+  }
+
   add(member: string | undefined, tally: RekeyTally): void {
-    const into =
-      member === undefined
-        ? undefined
-        : (this.byMember.get(member) ??
-          (() => {
-            const fresh: MutableMember = {
-              unchanged: 0,
-              moved: zeroCounts(),
-              indexKeysRewritten: 0,
-              sentinelsMoved: 0,
-              indexKeys: zeroIndexKeys(),
-              conflicts: 0,
-            }
-            this.byMember.set(member, fresh)
-            return fresh
-          })())
+    const into = member === undefined ? undefined : this.memberOf(member)
     const unchanged = tally.unchanged ?? 0
     this.unchanged += unchanged
     if (into !== undefined) into.unchanged += unchanged
@@ -280,12 +382,14 @@ class Totals {
       if (into !== undefined) into.indexKeys[count] += n
     }
     for (const conflict of tally.conflicts ?? []) {
-      // A row that can't move is met again by what wants its key, and by the scan.
-      const row = `${conflict.member}\u0000${conflict.kind}\u0000${JSON.stringify(conflict.key)}`
-      if (this.conflicted.has(row)) continue
-      this.conflicted.add(row)
-      this.conflicts.push(conflict)
-      if (into !== undefined) into.conflicts += 1
+      // A row that can't move is met again by what wants its key, and by the scan: whichever
+      // reaches it first, it's reported once, and the same way.
+      this.memberOf(conflict.member)
+      const row = `${conflict.member}\u0000${conflict.kind}\u0000${stableText(conflict.key)}`
+      const known = this.conflicts.get(row)
+      if (known === undefined || compareOrders(conflictOrder(conflict), conflictOrder(known)) < 0) {
+        this.conflicts.set(row, conflict)
+      }
     }
     for (const reason of SKIP_REASONS) this.skipped[reason] += tally.skipped?.[reason] ?? 0
   }
@@ -295,6 +399,11 @@ class Totals {
     capacity: Capacity.CapacityTotals,
     resume: string | undefined,
   ): RekeyReport {
+    // By member, kind, key, reason, target and message: the same whatever order the run met them.
+    const conflicts = [...this.conflicts.values()]
+      .map((conflict) => ({ conflict, order: conflictOrder(conflict) }))
+      .sort((a, b) => compareOrders(a.order, b.order))
+      .map(({ conflict }) => conflict)
     const byMember: Record<string, RekeyMemberReport> = {}
     for (const [name, m] of [...this.byMember.entries()].sort(([a], [b]) =>
       a < b ? -1 : a > b ? 1 : 0,
@@ -305,7 +414,7 @@ class Totals {
         indexKeysRewritten: m.indexKeysRewritten,
         sentinelsMoved: m.sentinelsMoved,
         indexKeys: { ...m.indexKeys },
-        conflicts: m.conflicts,
+        conflicts: conflicts.filter((conflict) => conflict.member === name).length,
       }
     }
     return {
@@ -316,7 +425,7 @@ class Totals {
       indexKeysRewritten: this.indexKeysRewritten,
       sentinelsMoved: this.sentinelsMoved,
       indexKeys: { ...this.indexKeys },
-      conflicts: [...this.conflicts],
+      conflicts,
       skipped: { ...this.skipped },
       byMember,
       capacity,
@@ -371,6 +480,851 @@ const positiveInteger = (value: number | undefined, name: string): string | unde
   value === undefined || (Number.isInteger(value) && value > 0)
     ? undefined
     : `${name} must be a positive integer; received ${String(value)}.`
+
+// ---------------------------------------------------------------------------
+// Units: one verdict each per run
+// ---------------------------------------------------------------------------
+
+interface Unit {
+  state: "judging" | "settled"
+  /** The unit this one's judgment waits on now: one judged in its way, here or by another fiber. */
+  waitingOn: Unit | undefined
+  /** On a loop of units each waiting on the next ({@link RekeyRowContext.judge}). */
+  loop: boolean
+  /** Completed when it settles; made only when something waits. */
+  done: Deferred.Deferred<void> | undefined
+}
+
+/** The unit the current fiber is judging, innermost first. */
+const CurrentUnit = Context.Reference<Unit | undefined>("effect-dynamodb/Rekey/CurrentUnit", {
+  defaultValue: () => undefined,
+})
+
+/**
+ * The run's units ({@link RekeyRowContext.judge}). A visit of a unit being judged waits for its
+ * verdict, unless the wait would close a loop — the unit waits, through the units each waits on,
+ * on the caller — which can't end: then every unit on it is marked, and each is told `loop`. The
+ * waits that are taken never form a loop, so every wait ends.
+ */
+class Units {
+  private readonly all = new Map<string, Unit>()
+
+  constructor(private readonly totals: Totals) {}
+
+  judge<E, R>(
+    member: string,
+    key: string,
+    work: Effect.Effect<RekeyTally, E, R>,
+  ): Effect.Effect<Judged, E, R> {
+    return Effect.withFiber((fiber) => {
+      const caller = fiber.getRef(CurrentUnit)
+      const verdict = (unit: Unit): Judged => (caller?.loop && unit.loop ? "loop" : "settled")
+      const known = this.all.get(key)
+      if (known === undefined) {
+        const unit: Unit = { state: "judging", waitingOn: undefined, loop: false, done: undefined }
+        this.all.set(key, unit)
+        if (caller !== undefined) caller.waitingOn = unit
+        return work.pipe(
+          Effect.provideService(CurrentUnit, unit),
+          Effect.tap((tally) => Effect.sync(() => this.totals.add(member, tally))),
+          Effect.ensuring(
+            Effect.sync(() => {
+              unit.state = "settled"
+              unit.waitingOn = undefined
+              if (caller !== undefined && caller.waitingOn === unit) caller.waitingOn = undefined
+              if (unit.done !== undefined) Deferred.doneUnsafe(unit.done, Effect.void)
+              unit.done = undefined
+            }),
+          ),
+          Effect.map(() => verdict(unit)),
+        )
+      }
+      if (known.state === "settled") return Effect.succeed(verdict(known))
+      if (caller !== undefined) {
+        for (let at: Unit | undefined = known; at !== undefined; at = at.waitingOn) {
+          if (at !== caller) continue
+          for (let on: Unit | undefined = known; on !== undefined && on !== caller; ) {
+            on.loop = true
+            on = on.waitingOn
+          }
+          caller.loop = true
+          return Effect.succeed<Judged>("loop")
+        }
+        caller.waitingOn = known
+      }
+      known.done ??= Deferred.makeUnsafe<void>()
+      return Deferred.await(known.done).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (caller !== undefined && caller.waitingOn === known) caller.waitingOn = undefined
+          }),
+        ),
+        Effect.map(() => verdict(known)),
+      )
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprints: a row's image as a hash
+// ---------------------------------------------------------------------------
+
+/**
+ * A number as DynamoDB keeps it, from its text, never through `Number`: its significant digits,
+ * without leading or trailing zeros, where the point falls, and its sign; zero is `0`.
+ */
+export const canonicalNumber = (text: string): string => {
+  const match = /^\s*([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?\s*$/.exec(text)
+  if (match === null) return `?${text}`
+  const whole = match[2] ?? ""
+  let digits = whole + (match[3] ?? "")
+  let point = whole.length + Number(match[4] ?? 0)
+  let lead = 0
+  while (lead < digits.length && digits[lead] === "0") lead++
+  digits = digits.slice(lead)
+  point -= lead
+  digits = digits.replace(/0+$/, "")
+  if (digits === "") return "0"
+  return `${match[1] === "-" ? "-" : ""}${digits}e${point}`
+}
+
+const hexOf = (bytes: Uint8Array): string =>
+  Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+
+/**
+ * An attribute value as one canonical text, type-tagged and recursive: two values DynamoDB stores
+ * alike give the same text. A set's elements sorted, a map's entries by name, a list in order.
+ */
+export const canonicalValue = (value: AttributeValue): string => {
+  if (value.S !== undefined) return `S${JSON.stringify(value.S)}`
+  if (value.N !== undefined) return `N${canonicalNumber(value.N)}`
+  if (value.B !== undefined) return `B${hexOf(value.B)}`
+  if (value.BOOL !== undefined) return value.BOOL ? "BOOL1" : "BOOL0"
+  if (value.NULL !== undefined) return "NULL"
+  if (value.SS !== undefined) {
+    return `SS[${value.SS.map((s) => JSON.stringify(s))
+      .sort()
+      .join(",")}]`
+  }
+  if (value.NS !== undefined) return `NS[${value.NS.map(canonicalNumber).sort().join(",")}]`
+  if (value.BS !== undefined) return `BS[${value.BS.map(hexOf).sort().join(",")}]`
+  if (value.L !== undefined) return `L[${value.L.map(canonicalValue).join(",")}]`
+  if (value.M !== undefined) return `M${canonicalItem(value.M)}`
+  return `?${JSON.stringify(value)}`
+}
+
+/** An item as one canonical text: its attributes sorted by name ({@link canonicalValue}). */
+export const canonicalItem = (item: Item): string =>
+  `{${Object.keys(item)
+    .filter((name) => item[name] !== undefined)
+    .sort()
+    .map((name) => `${JSON.stringify(name)}:${canonicalValue(item[name]!)}`)
+    .join(",")}}`
+
+/**
+ * `text` as its length and two 32-bit hashes of its UTF-16 code units, FNV-1a and a
+ * multiply-shift one, each from its own seed. One `Math.imul` a lane a code unit: a row near
+ * 400 KB costs a couple of milliseconds, where hashing its bytes in 128-bit arithmetic cost fifty.
+ */
+export const textHash = (text: string): string => {
+  let a = 0x811c9dc5
+  let b = 0x9e3779b9
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i)
+    a = Math.imul(a ^ unit, 0x01000193)
+    b = Math.imul(b ^ unit, 0x5bd1e995)
+    b ^= b >>> 15
+  }
+  const hex = (lane: number) => (lane >>> 0).toString(16).padStart(8, "0")
+  return `${text.length.toString(16)}.${hex(a)}${hex(b)}`
+}
+
+/**
+ * A row's image as its {@link canonicalItem} text's {@link textHash}. Compared only between images
+ * at one key, so two different ones are taken for one with negligible odds.
+ */
+export const fingerprint = (item: Item): string => textHash(canonicalItem(item))
+
+// ---------------------------------------------------------------------------
+// The journal: the run's writes, by key
+// ---------------------------------------------------------------------------
+
+/** A key attribute's value as text: what tells two keys apart. */
+const valueText = (value: AttributeValue): string =>
+  value.S !== undefined
+    ? `S${value.S}`
+    : value.N !== undefined
+      ? `N${canonicalNumber(value.N)}`
+      : canonicalValue(value)
+
+/** An update's SET and REMOVE clauses, applied to `image`: `undefined` for any other update. */
+export const updated = (image: Item, update: Update): Item | undefined => {
+  const names = update.ExpressionAttributeNames ?? {}
+  const values = update.ExpressionAttributeValues ?? {}
+  const nameOf = (token: string) => (token.startsWith("#") ? names[token] : token)
+  const next: Item = { ...image }
+  const clauses = (update.UpdateExpression ?? "").split(/\b(?=SET\b|REMOVE\b|ADD\b|DELETE\b)/)
+  for (const clause of clauses) {
+    const text = clause.trim()
+    if (text === "") continue
+    if (text.startsWith("SET ")) {
+      for (const assignment of text.slice(4).split(",")) {
+        const match = /^\s*(#?[\w.-]+)\s*=\s*(:[\w-]+)\s*$/.exec(assignment)
+        const name = match === null ? undefined : nameOf(match[1]!)
+        const value = match === null ? undefined : values[match[2]!]
+        if (name === undefined || value === undefined) return undefined
+        next[name] = value
+      }
+    } else if (text.startsWith("REMOVE ")) {
+      for (const token of text.slice(7).split(",")) {
+        const name = nameOf(token.trim())
+        if (name === undefined) return undefined
+        delete next[name]
+      }
+    } else {
+      return undefined
+    }
+  }
+  return next
+}
+
+/** A query's key condition, read: the partition it names, and a test of each item's sort key. */
+const keyConditionOf = (input: {
+  readonly KeyConditionExpression?: string | undefined
+  readonly ExpressionAttributeNames?: Record<string, string> | undefined
+  readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+}):
+  | {
+      readonly attribute: string
+      readonly sort: string | undefined
+      readonly holds: (item: Item) => boolean
+    }
+  | undefined => {
+  const names = input.ExpressionAttributeNames ?? {}
+  const values = input.ExpressionAttributeValues ?? {}
+  const nameOf = (token: string) => (token.startsWith("#") ? names[token] : token)
+  const match = /^\s*\(?\s*(#?\w+)\s*=\s*(:\w+)\s*\)?\s*(?:AND\s+(.*?))?\s*$/i.exec(
+    input.KeyConditionExpression ?? "",
+  )
+  if (match === null) return undefined
+  const attribute = nameOf(match[1]!)
+  const value = values[match[2]!]
+  if (attribute === undefined || value === undefined) return undefined
+  // The sort key condition, out of the parentheses around it, if any (not a function's own).
+  const raw = match[3]?.trim()
+  const rest = raw?.startsWith("(") && raw.endsWith(")") ? raw.slice(1, -1).trim() : raw
+  const same = (item: Item) => {
+    const at = item[attribute]
+    return at !== undefined && valueText(at) === valueText(value)
+  }
+  if (rest === undefined) return { attribute, sort: undefined, holds: same }
+  const text = (v: AttributeValue | undefined) => v?.S ?? undefined
+  const begins = /^begins_with\(\s*(#?\w+)\s*,\s*(:\w+)\s*\)$/i.exec(rest)
+  if (begins !== null) {
+    const sort = nameOf(begins[1]!)
+    const prefix = text(values[begins[2]!])
+    if (sort === undefined || prefix === undefined) return undefined
+    return {
+      attribute,
+      sort,
+      holds: (item) => same(item) && (text(item[sort]) ?? "￿").startsWith(prefix),
+    }
+  }
+  const between = /^(#?\w+)\s+BETWEEN\s+(:\w+)\s+AND\s+(:\w+)$/i.exec(rest)
+  if (between !== null) {
+    const sort = nameOf(between[1]!)
+    const lo = text(values[between[2]!])
+    const hi = text(values[between[3]!])
+    if (sort === undefined || lo === undefined || hi === undefined) return undefined
+    return {
+      attribute,
+      sort,
+      holds: (item) => {
+        const at = text(item[sort])
+        return same(item) && at !== undefined && at >= lo && at <= hi
+      },
+    }
+  }
+  const compare = /^(#?\w+)\s*(<=|>=|<|>|=)\s*(:\w+)$/.exec(rest)
+  if (compare !== null) {
+    const sort = nameOf(compare[1]!)
+    const bound = text(values[compare[3]!])
+    if (sort === undefined || bound === undefined) return undefined
+    const op = compare[2]!
+    return {
+      attribute,
+      sort,
+      holds: (item) => {
+        const at = text(item[sort])
+        if (!same(item) || at === undefined) return false
+        return op === "<"
+          ? at < bound
+          : op === "<="
+            ? at <= bound
+            : op === ">"
+              ? at > bound
+              : op === ">="
+                ? at >= bound
+                : at === bound
+      },
+    }
+  }
+  return undefined
+}
+
+/** What the journal holds for a key the run wrote (a dry run: planned) to. */
+interface KeyState {
+  /** Images the run left here — put, sent to put, or (a dry run) planned — each with its count. */
+  own: Map<string, number> | undefined
+  /** The run left an image here it can't compute: the scan passes whatever it finds. */
+  any: boolean
+  /** The latest of the run's writes here that took effect: the row it put, or `taken`. */
+  last: Item | "taken" | undefined
+  /** When the row stored here was taken by the run (its {@link Journal.seq}), if it was. */
+  takenAt: number | undefined
+  /** A dry run's updates to the row stored here, which it didn't put. */
+  patches: Array<Update> | undefined
+}
+
+/** A put's condition is on the row it replaces, as read: it writes over a row stored there. */
+const overwrites = (condition: string | undefined): boolean =>
+  condition !== undefined && condition.trim() !== "" && !condition.includes("attribute_not_exists")
+
+/**
+ * The run's writes, by key — sent and answered, or (a dry run) planned — and the keys whose row
+ * stored at the start it has counted. Memory: an entry for each key the scan returned, a key text
+ * each; and for each key the run wrote to, what it left there.
+ *
+ * - `scanned` counts each row stored at the start once: when the scan returns it, or when the run
+ *   takes it (moves it away, or writes over it as read) before the scan gets to it.
+ * - The scan passes a row the run put (its image is one the run left there), and a row the run took
+ *   that a page read before the take still returned. Anything else at such a key — a row written
+ *   there since by someone else — is a new row, counted and judged.
+ * - A dry run plans its writes ({@link Journal.plan}), and its reads ({@link Journal.view}) see the
+ *   plan: a row it would take is gone, one it would put is there.
+ */
+class Journal {
+  /** How many takes the run has made: a scan page records it when it is read. */
+  seq = 0
+  private readonly keys = new Map<string, KeyState>()
+  private readonly counted = new Set<string>()
+  /** A dry run's planned rows, by the partition key value's text. */
+  private readonly placedIn = new Map<string, Set<string>>()
+  /**
+   * A dry run's planned rows by the value of an attribute a secondary index is partitioned on,
+   * built on the first query of that index ({@link placedWith}).
+   */
+  private readonly placedBy = new Map<string, Map<string, Set<string>>>()
+
+  constructor(
+    private readonly tableName: string,
+    private readonly names: { readonly pk: string; readonly sk: string } | undefined,
+    private readonly totals: Totals,
+    private readonly dryRun: boolean,
+  ) {}
+
+  keyOf(item: Item | undefined): string | undefined {
+    if (this.names === undefined || item === undefined) return undefined
+    const pk = item[this.names.pk]
+    if (pk === undefined) return undefined
+    const sk = item[this.names.sk]
+    return `${valueText(pk)}\u0000${sk === undefined ? "" : valueText(sk)}`
+  }
+
+  private state(key: string): KeyState {
+    const known = this.keys.get(key)
+    if (known !== undefined) return known
+    const fresh: KeyState = {
+      own: undefined,
+      any: false,
+      last: undefined,
+      takenAt: undefined,
+      patches: undefined,
+    }
+    this.keys.set(key, fresh)
+    return fresh
+  }
+
+  /** The row stored at `key` at the start is met: counted, once. */
+  private count(key: string): void {
+    if (this.counted.has(key)) return
+    this.counted.add(key)
+    this.totals.scanned++
+  }
+
+  private addOwn(state: KeyState, print: string): void {
+    if (state.own === undefined) state.own = new Map()
+    state.own.set(print, (state.own.get(print) ?? 0) + 1)
+  }
+
+  private dropOwn(state: KeyState, print: string): void {
+    const n = state.own?.get(print) ?? 0
+    if (n <= 1) state.own?.delete(print)
+    else state.own!.set(print, n - 1)
+  }
+
+  /** Whether the row at `key` is the run's own: one it put, or left by an update of one it put. */
+  private ours(state: KeyState): boolean {
+    return state.last !== undefined && state.last !== "taken"
+  }
+
+  /**
+   * The scan returned `row`, on a page read when {@link seq} was `pageSeq`: the row to judge (in
+   * a dry run, with the plan's updates applied), or `undefined` when the scan passes it.
+   */
+  visit(row: Item, pageSeq: number): Item | undefined {
+    const key = this.keyOf(row)
+    if (key === undefined) {
+      this.totals.scanned++
+      return row
+    }
+    const state = this.keys.get(key)
+    if (state !== undefined) {
+      // A dry run writes nothing, so what its scan returns where its plan took the row is that row,
+      // whatever the plan put there since, however alike.
+      if (this.dryRun && state.takenAt !== undefined) {
+        this.count(key)
+        return undefined
+      }
+      if (state.any || state.own?.has(fingerprint(row)) === true) return undefined
+      // The row the run took, returned by a page read before the take.
+      if (state.takenAt !== undefined && state.takenAt > pageSeq) {
+        this.count(key)
+        return undefined
+      }
+    }
+    if (this.counted.has(key)) {
+      // A row written there since the run took the one stored at the start: a new row.
+      this.totals.scanned++
+    } else {
+      this.count(key)
+    }
+    return state?.patches === undefined ? row : this.patched(state, row)
+  }
+
+  vacated(key: Item): boolean {
+    const text = this.keyOf(key)
+    return text !== undefined && this.keys.get(text)?.last === "taken"
+  }
+
+  placed(key: Item): boolean {
+    const text = this.keyOf(key)
+    const state = text === undefined ? undefined : this.keys.get(text)
+    return state !== undefined && this.ours(state)
+  }
+
+  /** A take of the row at `key` took effect (or was planned). */
+  private take(key: string): void {
+    const state = this.state(key)
+    // A row the run never put there was stored there at the start. A dry run's scan meets every
+    // such row, since it takes none: counted there, as a run resumed after it counts its own.
+    if (!this.ours(state) && !this.dryRun) this.count(key)
+    this.seq++
+    state.takenAt = this.seq
+    state.last = "taken"
+    state.own = undefined
+    state.any = false
+    state.patches = undefined
+    this.placedIn.get(this.partitionOf(key))?.delete(key)
+    this.indexPlaced(key, undefined)
+  }
+
+  /** `key`'s planned image is now `image` (`undefined`: none): the secondary index maps follow. */
+  private indexPlaced(key: string, image: Item | undefined): void {
+    for (const [attribute, byValue] of this.placedBy) {
+      for (const keys of byValue.values()) keys.delete(key)
+      const value = image?.[attribute]
+      if (value === undefined) continue
+      const text = valueText(value)
+      const keys = byValue.get(text)
+      if (keys === undefined) byValue.set(text, new Set([key]))
+      else keys.add(key)
+    }
+  }
+
+  /** The keys of planned rows whose `attribute` holds `value`. */
+  private placedWith(attribute: string, value: AttributeValue): Iterable<string> {
+    let byValue = this.placedBy.get(attribute)
+    if (byValue === undefined) {
+      byValue = new Map()
+      this.placedBy.set(attribute, byValue)
+      for (const keys of this.placedIn.values()) {
+        for (const key of keys) {
+          const image = this.keys.get(key)?.last
+          const held = image === undefined || image === "taken" ? undefined : image[attribute]
+          if (held === undefined) continue
+          const text = valueText(held)
+          const same = byValue.get(text)
+          if (same === undefined) byValue.set(text, new Set([key]))
+          else same.add(key)
+        }
+      }
+    }
+    return byValue.get(valueText(value)) ?? []
+  }
+
+  /** A put of `image` took effect (or was planned); `replaced`: over the row there, as read. */
+  private put(key: string, image: Item, replaced: boolean): void {
+    const state = this.state(key)
+    if (replaced && !this.ours(state)) {
+      if (!this.dryRun) this.count(key)
+      this.seq++
+      state.takenAt = this.seq
+    }
+    state.last = image
+    state.patches = undefined
+    if (this.dryRun) {
+      this.addOwn(state, fingerprint(image))
+      const partition = this.partitionOf(key)
+      const set = this.placedIn.get(partition)
+      if (set === undefined) this.placedIn.set(partition, new Set([key]))
+      else set.add(key)
+      this.indexPlaced(key, image)
+    }
+  }
+
+  /** An update took effect (or was planned) at `key`. */
+  private update(key: string, update: Update): void {
+    const state = this.state(key)
+    const last = state.last
+    if (last !== undefined && last !== "taken") {
+      const next = updated(last, update)
+      if (next === undefined) {
+        state.any = true
+        return
+      }
+      state.last = next
+      this.addOwn(state, fingerprint(next))
+      if (this.dryRun) this.indexPlaced(key, next)
+      return
+    }
+    // The row stored at the start, updated in place: the scan meets it as it is. A dry run's
+    // reads see the update.
+    if (this.dryRun) {
+      if (state.patches === undefined) state.patches = []
+      state.patches.push(update)
+    }
+  }
+
+  private partitionOf(key: string): string {
+    return key.slice(0, key.indexOf("\u0000"))
+  }
+
+  private patched(state: KeyState, row: Item): Item {
+    return state.patches === undefined
+      ? row
+      : state.patches.reduce<Item>((image, update) => updated(image, update) ?? image, row)
+  }
+
+  /** A dry run's write ({@link RekeyRowContext.plan}). */
+  plan(items: ReadonlyArray<TransactWriteItem>): boolean {
+    // What a condition asks of the row at its key: that there be none, that there be one, or what
+    // only DynamoDB can judge (assumed to hold, as the run assumes of every request).
+    const asks = (condition: string | undefined): "absent" | "present" | undefined => {
+      const text = condition?.trim() ?? ""
+      if (text === "") return undefined
+      if (/^attribute_not_exists\(\s*#?\w+\s*\)$/.test(text)) return "absent"
+      if (text.includes("attribute_not_exists")) return undefined
+      return "present"
+    }
+    const mine = items.filter((item) => {
+      const table =
+        item.Put?.TableName ??
+        item.Delete?.TableName ??
+        item.Update?.TableName ??
+        item.ConditionCheck?.TableName
+      return table === this.tableName
+    })
+    for (const item of mine) {
+      const write =
+        item.Put !== undefined
+          ? { key: item.Put.Item, condition: item.Put.ConditionExpression }
+          : item.Delete !== undefined
+            ? { key: item.Delete.Key, condition: item.Delete.ConditionExpression }
+            : item.Update !== undefined
+              ? { key: item.Update.Key, condition: item.Update.ConditionExpression }
+              : {
+                  key: item.ConditionCheck?.Key,
+                  condition: item.ConditionCheck?.ConditionExpression,
+                }
+      const key = this.keyOf(write.key)
+      if (key === undefined) continue
+      const last = this.keys.get(key)?.last
+      const there = last === undefined ? undefined : last !== "taken"
+      const asked = asks(write.condition)
+      if (asked === "absent" && there === true) return false
+      if (asked === "present" && there === false) return false
+    }
+    for (const item of mine) this.applied(item)
+    return true
+  }
+
+  /** What one write item did, once it took effect (or was planned). */
+  private applied(item: TransactWriteItem): void {
+    if (item.Put?.Item !== undefined) {
+      const key = this.keyOf(item.Put.Item)
+      if (key !== undefined) {
+        this.put(key, item.Put.Item, overwrites(item.Put.ConditionExpression))
+      }
+    } else if (item.Delete !== undefined) {
+      const key = this.keyOf(item.Delete.Key)
+      if (key !== undefined) this.take(key)
+    } else if (item.Update !== undefined) {
+      const key = this.keyOf(item.Update.Key)
+      if (key !== undefined) this.update(key, item.Update)
+    }
+  }
+
+  /** A row a dry run's read returned, as the plan leaves it: `undefined` if the plan took it. */
+  private reconcile(key: string | undefined, item: Item | undefined): Item | undefined {
+    const state = key === undefined ? undefined : this.keys.get(key)
+    if (state === undefined) return item
+    if (state.last === "taken") return undefined
+    if (state.last !== undefined) return state.last
+    return item === undefined ? undefined : this.patched(state, item)
+  }
+
+  /**
+   * `send`, a real run's write: the rows it puts are the run's own from when it's sent (the scan
+   * may return one before the answer comes), and what it did is noted once it's answered.
+   */
+  private writing<A, E>(
+    puts: ReadonlyArray<Item | undefined>,
+    send: Effect.Effect<A, E>,
+    done: (output: A) => ReadonlyArray<TransactWriteItem>,
+  ): Effect.Effect<A, E> {
+    return Effect.suspend(() => {
+      const sent: Array<{ readonly state: KeyState; readonly print: string }> = []
+      for (const item of puts) {
+        const key = this.keyOf(item)
+        if (key === undefined || item === undefined) continue
+        const state = this.state(key)
+        const print = fingerprint(item)
+        this.addOwn(state, print)
+        sent.push({ state, print })
+      }
+      return send.pipe(
+        Effect.tap((output) =>
+          Effect.sync(() => {
+            for (const item of done(output)) this.applied(item)
+          }),
+        ),
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            for (const { state, print } of sent) this.dropOwn(state, print)
+          }),
+        ),
+      )
+    })
+  }
+
+  /**
+   * The client the handlers use: in a real run, `client` with each write on this table noted as
+   * it's answered; in a dry run, `client` with its reads seeing the plan, and every write refused
+   * (a dry run writes nothing). Built over the instrumented client, it is itself one, so
+   * `Capacity.client` hands it out as is and each request is reported once.
+   */
+  view(client: DynamoClientService): DynamoClientService {
+    const view = Object.create(client) as {
+      -readonly [K in keyof DynamoClientService]: DynamoClientService[K]
+    }
+    const onTable = (name: string | undefined) => name === this.tableName
+    if (this.dryRun) {
+      const refuse = (operation: string) => () =>
+        Effect.die(new Error(`rekey: a dry run sent a write (${operation})`))
+      view.putItem = refuse("PutItem")
+      view.deleteItem = refuse("DeleteItem")
+      view.updateItem = refuse("UpdateItem")
+      view.transactWriteItems = refuse("TransactWriteItems")
+      view.batchWriteItem = refuse("BatchWriteItem")
+      view.getItem = (input) =>
+        onTable(input.TableName)
+          ? Effect.map(client.getItem(input), (output) => {
+              const item = this.reconcile(this.keyOf(input.Key), output.Item)
+              return item === output.Item ? output : { ...output, Item: item }
+            })
+          : client.getItem(input)
+      view.query = (input) =>
+        onTable(input.TableName)
+          ? Effect.map(client.query(input), (output) => this.reconcileQuery(input, output))
+          : client.query(input)
+      view.batchGetItem = (input) =>
+        Effect.map(client.batchGetItem(input), (output) => {
+          const responses: Record<string, Array<Item>> = { ...output.Responses }
+          const rows = output.Responses?.[this.tableName]
+          const asked = input.RequestItems?.[this.tableName]
+          if (rows === undefined || asked === undefined) return output
+          const answered = new Set<string>()
+          const kept: Array<Item> = []
+          for (const row of rows) {
+            const key = this.keyOf(row)
+            if (key !== undefined) answered.add(key)
+            const item = this.reconcile(key, row)
+            if (item !== undefined) kept.push(item)
+          }
+          const unprocessed = new Set(
+            (output.UnprocessedKeys?.[this.tableName]?.Keys ?? []).map((key) => this.keyOf(key)),
+          )
+          for (const ask of asked.Keys ?? []) {
+            const key = this.keyOf(ask)
+            if (key === undefined || answered.has(key) || unprocessed.has(key)) continue
+            const item = this.reconcile(key, undefined)
+            if (item !== undefined) kept.push(item)
+          }
+          responses[this.tableName] = kept
+          return { ...output, Responses: responses }
+        })
+      return view
+    }
+    view.putItem = (input) =>
+      onTable(input.TableName)
+        ? this.writing([input.Item], client.putItem(input), () => [
+            {
+              Put: {
+                TableName: input.TableName,
+                Item: input.Item!,
+                ConditionExpression: input.ConditionExpression,
+              },
+            },
+          ])
+        : client.putItem(input)
+    view.deleteItem = (input) =>
+      onTable(input.TableName)
+        ? this.writing([], client.deleteItem(input), () => [
+            { Delete: { TableName: input.TableName, Key: input.Key! } },
+          ])
+        : client.deleteItem(input)
+    view.updateItem = (input) =>
+      onTable(input.TableName)
+        ? this.writing([], client.updateItem(input), () => [{ Update: input as Update }])
+        : client.updateItem(input)
+    view.transactWriteItems = (input) => {
+      const items = (input.TransactItems ?? []).filter((item) =>
+        onTable(
+          item.Put?.TableName ??
+            item.Delete?.TableName ??
+            item.Update?.TableName ??
+            item.ConditionCheck?.TableName,
+        ),
+      )
+      return this.writing(
+        items.map((item) => item.Put?.Item),
+        client.transactWriteItems(input),
+        () => items,
+      )
+    }
+    view.batchWriteItem = (input) => {
+      const writes = input.RequestItems?.[this.tableName] ?? []
+      return this.writing(
+        writes.map((write) => write.PutRequest?.Item),
+        client.batchWriteItem(input),
+        (output) => {
+          const left = new Set(
+            (output.UnprocessedItems?.[this.tableName] ?? []).map((write) =>
+              this.keyOf(write.PutRequest?.Item ?? write.DeleteRequest?.Key),
+            ),
+          )
+          return writes.flatMap((write): ReadonlyArray<TransactWriteItem> => {
+            const key = this.keyOf(write.PutRequest?.Item ?? write.DeleteRequest?.Key)
+            if (key === undefined || left.has(key)) return []
+            return write.PutRequest?.Item !== undefined
+              ? [{ Put: { TableName: this.tableName, Item: write.PutRequest.Item } }]
+              : [{ Delete: { TableName: this.tableName, Key: write.DeleteRequest!.Key! } }]
+          })
+        },
+      )
+    }
+    return view
+  }
+
+  /**
+   * A dry run's query page, reconciled with the plan: rows it took dropped, rows it put in their
+   * place, and rows it put that match the key condition, inside the page's range, added in order.
+   */
+  private reconcileQuery<
+    O extends {
+      readonly Items?: Array<Item> | undefined
+      readonly LastEvaluatedKey?: Item | undefined
+      readonly Count?: number | undefined
+    },
+  >(
+    input: {
+      readonly IndexName?: string | undefined
+      readonly KeyConditionExpression?: string | undefined
+      readonly ExpressionAttributeNames?: Record<string, string> | undefined
+      readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
+      readonly ExclusiveStartKey?: Item | undefined
+      readonly ScanIndexForward?: boolean | undefined
+      readonly Select?: string | undefined
+    },
+    output: O,
+  ): O {
+    if (output.Items === undefined || input.Select === "COUNT") return output
+    const condition = keyConditionOf(input)
+    const names = this.names
+    const rows: Array<Item> = []
+    const answered = new Set<string>()
+    let changed = false
+    for (const item of output.Items) {
+      const key = this.keyOf(item)
+      if (key !== undefined) answered.add(key)
+      const row = this.reconcile(key, item)
+      if (row !== item) changed = true
+      // An index holds a row only while its key does: one the plan's update moved off it is gone.
+      if (row !== undefined && (row === item || condition === undefined || condition.holds(row))) {
+        rows.push(row)
+      }
+    }
+    const added: Array<Item> = []
+    if (condition !== undefined && names !== undefined) {
+      // The table orders by its sort key, an index by the attribute its condition names: rows of
+      // an index queried by partition alone, whose order isn't known here, join its last page.
+      const sort = condition.sort ?? (input.IndexName === undefined ? names.sk : undefined)
+      const order = (item: Item | undefined) =>
+        item === undefined || sort === undefined ? undefined : item[sort]?.S
+      const forward = input.ScanIndexForward !== false
+      const start = order(input.ExclusiveStartKey)
+      const end = order(output.LastEvaluatedKey)
+      const value =
+        input.ExpressionAttributeValues?.[
+          /=\s*(:\w+)/.exec(input.KeyConditionExpression ?? "")?.[1] ?? ""
+        ]
+      const candidates =
+        value === undefined
+          ? []
+          : condition.attribute === names.pk
+            ? (this.placedIn.get(valueText(value)) ?? [])
+            : this.placedWith(condition.attribute, value)
+      for (const key of candidates) {
+        if (answered.has(key)) continue
+        const image = this.reconcile(key, undefined)
+        if (image === undefined || !condition.holds(image)) continue
+        if (sort === undefined) {
+          if (output.LastEvaluatedKey === undefined) added.push(image)
+          continue
+        }
+        const at = order(image)
+        if (at === undefined) continue
+        if (start !== undefined && (forward ? at <= start : at >= start)) continue
+        if (end !== undefined && (forward ? at > end : at < end)) continue
+        added.push(image)
+      }
+      if (added.length > 0) {
+        const merged =
+          sort === undefined
+            ? [...rows, ...added]
+            : [...rows, ...added].sort((a, b) => {
+                const x = order(a) ?? ""
+                const y = order(b) ?? ""
+                return (x < y ? -1 : x > y ? 1 : 0) * (forward ? 1 : -1)
+              })
+        return { ...output, Items: merged, Count: merged.length }
+      }
+    }
+    if (!changed) return output
+    return { ...output, Items: rows, Count: rows.length }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // The run
@@ -428,8 +1382,15 @@ export const run = (args: {
         (member.typePrefixes ?? []).map((prefix) => ({ prefix, member })),
       )
 
+      const totals = new Totals()
+      const journal = new Journal(
+        tableName,
+        members.find((member) => member.key !== undefined)?.key,
+        totals,
+        dryRun,
+      )
+      const units = new Units(totals)
       const claimed = new Set<string>()
-      const running = new Map<string, Deferred.Deferred<void>>()
       const ctx: RekeyRowContext = {
         tableName,
         dryRun,
@@ -441,19 +1402,27 @@ export const run = (args: {
           claimed.add(unit)
           return true
         },
-        once: (unit, work) =>
-          Effect.suspend(() => {
-            const under = running.get(unit)
-            if (under !== undefined) return Effect.as(Deferred.await(under), {})
-            const done = Deferred.makeUnsafe<void>()
-            running.set(unit, done)
-            return Effect.ensuring(work, Deferred.succeed(done, undefined))
+        judge: (member, unit, work) => units.judge(member, unit, work),
+        plan: (items) => journal.plan(items),
+        vacated: (key) => journal.vacated(key),
+        placed: (key) => journal.placed(key),
+        yieldTo: (row, rows) =>
+          Effect.gen(function* () {
+            const type = row.__edd_e__?.S
+            if (type === undefined) return undefined
+            for (const member of byType.get(type) ?? []) {
+              if (member.holder === undefined) continue
+              const judged = yield* member.holder(row, rows, ctx)
+              if (judged !== undefined) return judged
+            }
+            return undefined
           }),
       }
-      const totals = new Totals()
 
-      const handle = (row: Item) =>
+      const handle = (found: Item, pageSeq: number) =>
         Effect.gen(function* () {
+          const row = journal.visit(found, pageSeq)
+          if (row === undefined) return
           const type = row.__edd_e__?.S
           if (type === undefined) {
             totals.add(undefined, { skipped: { notLibrary: 1 } })
@@ -491,7 +1460,12 @@ export const run = (args: {
 
       let pagesLeft = options.maxPages ?? Number.POSITIVE_INFINITY
       const concurrency = options.concurrency ?? 4
+      // The scan reads through the instrumented client; handlers read and write through the
+      // journal's view of it, which `Capacity.client` hands them as is.
       const client = yield* Capacity.client
+      const view = journal.view(client)
+      const viaView = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        Effect.provideService(effect, DynamoClient, view)
 
       const scanSegment = (segment: number) =>
         Effect.gen(function* () {
@@ -499,15 +1473,19 @@ export const run = (args: {
             if (pagesLeft <= 0) return
             pagesLeft--
             const at = positions[segment]!
+            const pageSeq = journal.seq
             const page = yield* client.scan({
               TableName: tableName,
               ...(positions.length > 1 && { Segment: segment, TotalSegments: positions.length }),
               ...(options.pageSize !== undefined && { Limit: options.pageSize }),
               ...(at !== 0 && { ExclusiveStartKey: keyFromWire(at) }),
             })
-            const rows = page.Items ?? []
-            totals.scanned += rows.length
-            yield* Effect.forEach(rows, handle, { concurrency, discard: true })
+            yield* viaView(
+              Effect.forEach(page.Items ?? [], (row) => handle(row, pageSeq), {
+                concurrency,
+                discard: true,
+              }),
+            )
             const last = page.LastEvaluatedKey as Item | undefined
             positions[segment] = last === undefined ? 1 : (keyToWire(last) ?? 1)
             if (options.onProgress !== undefined) yield* options.onProgress(snapshot())
@@ -520,33 +1498,15 @@ export const run = (args: {
         { concurrency: "unbounded", discard: true },
       )
       for (const member of members) {
-        if (member.finish !== undefined) totals.add(member.name, yield* member.finish(ctx))
+        if (member.finish !== undefined) {
+          totals.add(member.name, yield* viaView(member.finish(ctx)))
+        }
       }
       return snapshot()
     }),
   )
 
 /** Tallies added up, field by field. */
-/**
- * Get a row out of the way of another row's move, `run` being its own handler under the context
- * given: for real in a real run. In a dry run nothing moves, so the row is only judged, under a
- * context that counts nothing and takes no claim, since the scan counts it when it reaches it:
- * what comes back is what would stop it, the same conflicts the real run gets, and so a dry run
- * agrees with the real run about a chain. A row that's met more than once is reported once
- * ({@link RekeyReport.conflicts}).
- */
-export const displace = <E, R>(
-  ctx: RekeyRowContext,
-  run: (ctx: RekeyRowContext) => Effect.Effect<RekeyTally | undefined, E, R>,
-): Effect.Effect<RekeyTally, E, R> =>
-  ctx.dryRun
-    ? Effect.map(
-        run({ ...ctx, claim: () => false, once: (_unit, work) => work }),
-        (tally): RekeyTally =>
-          (tally?.conflicts ?? []).length > 0 ? { conflicts: tally!.conflicts! } : {},
-      )
-    : Effect.map(run(ctx), (tally): RekeyTally => tally ?? {})
-
 export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally => {
   const moved: Partial<Record<RekeyRowKind, number>> = {}
   const skipped: Partial<Record<RekeySkipReason, number>> = {}
@@ -555,7 +1515,9 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
   let unchanged = 0
   let indexKeysRewritten = 0
   let sentinelsMoved = 0
+  let worked = false
   for (const tally of tallies) {
+    worked ||= tally.worked === true
     unchanged += tally.unchanged ?? 0
     indexKeysRewritten += tally.indexKeysRewritten ?? 0
     sentinelsMoved += tally.sentinelsMoved ?? 0
@@ -581,5 +1543,6 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     ...(Object.keys(indexKeys).length > 0 && { indexKeys }),
     ...(conflicts.length > 0 && { conflicts }),
     ...(Object.keys(skipped).length > 0 && { skipped }),
+    ...(worked && { worked }),
   }
 }

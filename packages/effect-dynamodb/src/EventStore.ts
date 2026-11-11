@@ -5411,7 +5411,6 @@ export const makeStream = <
     to: string,
     streamIdText: string,
     ttlAttribute: string,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
@@ -5479,6 +5478,26 @@ export const makeStream = <
       })
       const cancelled = (error: DynamoClientError) =>
         isAwsConditionalCheckFailed(error.cause) ? Effect.succeed(false) : Effect.fail(error)
+      /**
+       * A dry run's move of `rows`, planned: each copied to `to` (a snapshot `to` holds newer is
+       * kept) and taken from `from`, as the real run's copy, flip and drain leave them.
+       */
+      const planMove = (rows: ReadonlyArray<Record<string, AttributeValue>>): Rekey.RekeyTally => {
+        ctx.plan(
+          rows.flatMap(
+            (row): ReadonlyArray<TransactWriteItem> => [
+              { Put: { TableName: ctx.tableName, Item: copyOf(row) } },
+              {
+                Delete: {
+                  TableName: ctx.tableName,
+                  Key: toAttributeMap({ pk: from, sk: skOf(row) }),
+                },
+              },
+            ],
+          ),
+        )
+        return { moved: { stream: rows.length } }
+      }
       /**
        * Copy `row` to `to`: where nothing is (or only a row whose TTL has
        * passed) — or, a snapshot, over an older one (`older`), so a copy never
@@ -5592,7 +5611,7 @@ export const makeStream = <
         return { moved: { stream: left.length } } satisfies Rekey.RekeyTally
       })
 
-      let tally: Rekey.RekeyTally = {}
+      const tally: Rekey.RekeyTally = {}
       for (let attempt = 0; attempt < STREAM_MOVE_ATTEMPTS; attempt++) {
         const rows = yield* readOwn
         // Moved since the scan read it.
@@ -5608,33 +5627,23 @@ export const makeStream = <
             const refused = unguardedRows(rows)
             if (refused !== undefined) return Rekey.mergeTallies(tally, refused)
           }
-          // Another stream under other key text moves out first.
+          // Another stream under other key text moves out first, judged as its own unit.
           const stale = atTarget.find(elsewhere)
           if (stale !== undefined) {
-            if (depth >= Rekey.DISPLACE_DEPTH) {
+            const judged = yield* judgeStream(stale, ctx)
+            // A dry run reads what its plan leaves (`Rekey.RekeyRowContext.plan`).
+            if ((yield* readAll(to)).some(elsewhere)) {
               return Rekey.mergeTallies(
                 tally,
-                conflict(
-                  "contended",
-                  "too many streams under other key text hold each other's current keys.",
-                ),
+                judged === "loop"
+                  ? conflict("contended", Rekey.LOOP_MESSAGE)
+                  : conflict(
+                      "taken",
+                      "rows of another stream are under its current partition key.",
+                    ),
               )
             }
-            const displaced = yield* Rekey.displace(ctx, (under) =>
-              rekeyStreamRow(stale, under, depth + 1),
-            )
-            tally = Rekey.mergeTallies(tally, displaced)
-            // A dry run moved nothing: what would stop that stream is what would leave it there.
-            const stillThere = ctx.dryRun
-              ? (displaced.conflicts ?? []).length > 0
-              : (yield* readAll(to)).some(elsewhere)
-            if (stillThere) {
-              return Rekey.mergeTallies(
-                tally,
-                conflict("taken", "rows of another stream are under its current partition key."),
-              )
-            }
-            if (!ctx.dryRun) continue
+            continue
           }
           const there = new Map(
             atTarget.filter((row) => !elsewhere(row)).map((row) => [skOf(row), row]),
@@ -5668,7 +5677,7 @@ export const makeStream = <
               )
             }
           }
-          if (ctx.dryRun) return Rekey.mergeTallies(tally, { moved: { stream: rows.length } })
+          if (ctx.dryRun) return Rekey.mergeTallies(tally, planMove(rows))
           // COPY
           let copiedAll = true
           for (const row of rows) {
@@ -5761,7 +5770,7 @@ export const makeStream = <
           // A write landed in between: copy again.
           if (!won) continue
         } else if (ctx.dryRun) {
-          return Rekey.mergeTallies(tally, { moved: { stream: rows.length } })
+          return Rekey.mergeTallies(tally, planMove(rows))
         }
         // DELETE
         const drained = yield* drain
@@ -5773,11 +5782,61 @@ export const makeStream = <
       )
     })
 
-  /** One scanned row of the stream — or one at a key another stream's move needs. */
+  /**
+   * The unit a row of the stream under other key text is judged as, and its move: the stream moves
+   * whole, once per run, from whichever of its rows the scan reaches first, and rows left there
+   * after it moved move after it. `undefined` for a row under its current key, or not readable.
+   */
+  const streamMove = (
+    row: Record<string, AttributeValue>,
+    ctx: Rekey.RekeyRowContext,
+  ): Effect.Effect<
+    | {
+        readonly unit: string
+        readonly work: Effect.Effect<
+          Rekey.RekeyTally,
+          DynamoClientError,
+          DynamoClient | TableConfig
+        >
+      }
+    | undefined,
+    never,
+    TableConfig
+  > =>
+    Effect.gen(function* () {
+      const tableConfig = yield* config.table.Tag
+      const keys = streamKeys(row)
+      if (typeof keys !== "object") return undefined
+      const from = row.pk!.S!
+      if (from === keys.current) return undefined
+      const streamIdText = row.streamId?.S ?? ""
+      return {
+        unit: `${config.streamName}\u0000${from}\u0000${streamIdText}`,
+        work: moveStream(
+          ctx,
+          from,
+          keys.current,
+          streamIdText,
+          resolveTtlAttributeName(tableConfig),
+        ),
+      }
+    })
+
+  /** Judge the stream a row at a key another stream's move needs belongs to, as its unit. */
+  const judgeStream = (
+    row: Record<string, AttributeValue>,
+    ctx: Rekey.RekeyRowContext,
+  ): Effect.Effect<Rekey.Judged, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.flatMap(streamMove(row, ctx), (move) =>
+      move === undefined
+        ? Effect.succeed<Rekey.Judged>("settled")
+        : ctx.judge(config.streamName, move.unit, move.work),
+    )
+
+  /** One scanned row of the stream. */
   const rekeyStreamRow = (
     row: Record<string, AttributeValue>,
     ctx: Rekey.RekeyRowContext,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const tableConfig = yield* config.table.Tag
@@ -5801,28 +5860,16 @@ export const makeStream = <
           ],
         }
       }
-      const from = row.pk!.S!
-      if (from === keys.current) return { unchanged: 1 }
-      // A stream moves whole, once per run, from whichever of its rows the scan reaches
-      // first, and rows left there after it moved move after it.
-      const streamIdText = row.streamId?.S ?? ""
-      return yield* ctx.once(
-        `${config.streamName}\u0000${from}\u0000${streamIdText}`,
-        moveStream(
-          ctx,
-          from,
-          keys.current,
-          streamIdText,
-          resolveTtlAttributeName(tableConfig),
-          depth,
-        ),
-      )
+      if (row.pk!.S! === keys.current) return { unchanged: 1 }
+      yield* judgeStream(row, ctx)
+      return {}
     })
 
   const rekeyHandler: Rekey.RekeyMember = {
     name: config.streamName,
     types: [entityType, snapshotEntityType, commandEntityType],
-    row: (row, ctx) => rekeyStreamRow(row, ctx, 0),
+    key: { pk: "pk", sk: "sk" },
+    row: (row, ctx) => rekeyStreamRow(row, ctx),
   }
 
   return {

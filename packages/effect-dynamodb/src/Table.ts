@@ -939,7 +939,9 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" 
  * - `bothKeys` — the same row (the same item, version, event, …) is also
  *   under its current key — for an aggregate, any of its rows is, or which
  *   of them are where can't be told; both are left as they are
- * - `taken` — another row holds its current key
+ * - `taken` — another row holds its current key — for an aggregate, a row
+ *   that isn't one of its own holds one of its rows' current keys, and doesn't
+ *   move out of the way in this run
  * - `contended` — concurrent writes changed it on every attempt
  * - `failed` — it could not be moved as stored (its values no longer decode,
  *   a stream id reads as more than one id, or a write was refused);
@@ -1006,17 +1008,25 @@ export interface RekeyMemberReport {
 }
 
 /**
- * What a `rekey` run did — or, with `dryRun`, would do. Counts are of rows
- * acted on: a row the scan reads after the run moved it (at its current key)
- * is `unchanged`, so `scanned` is not the sum of the others. A row an
- * application write moved between the scan and the move is `unchanged` too:
- * `moved` counts the rows this run moved.
+ * What a `rekey` run did — or, with `dryRun`, would do. Each row is judged once a run, however
+ * many times the scan and the moves of other rows reach it, and the report and the rows left
+ * don't depend on the order the scan returns rows in, its segment count or its `concurrency`.
+ * Counts are of rows stored when the run met them, never of rows the run wrote: the scan passes
+ * a row the run moved there. A row an application write moved between the scan and the move is
+ * `unchanged`: `moved` counts the rows this run moved.
  */
 export interface RekeyReport {
   readonly dryRun: boolean
-  /** Rows the scan returned. */
+  /**
+   * Rows the table held that the run met: each once, when the scan returned it or when the run
+   * moved it out of another row's way first. Rows the run put aren't counted, nor is a row the
+   * scan returned from a page read before the run moved it.
+   */
   readonly scanned: number
-  /** Rows of a known member already under their current keys, with nothing to rewrite. */
+  /**
+   * Rows of a known member already under their current keys, with nothing to rewrite. A row the
+   * run moved isn't, whichever member meets it after.
+   */
   readonly unchanged: number
   /** Rows moved to their current keys (a dry run: rows that would move), by kind. */
   readonly moved: RekeyCounts

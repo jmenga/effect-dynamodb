@@ -3393,6 +3393,7 @@ const makeFromConfig = (config: {
               handlers.add({
                 name: readModel.entityType,
                 types: [`${readModel.entityType}#outbox`],
+                ...(keys.length === 1 && { key: keys[0] }),
                 // A table has one key schema, so its items are under the layout whose attributes
                 // they hold.
                 row: (row, ctx) =>

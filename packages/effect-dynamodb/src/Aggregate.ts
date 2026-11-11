@@ -1980,7 +1980,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
       const allItems =
         from === undefined
           ? yield* read(pkValue)
-          : [...(yield* read(from)), ...(rekeyRead?.fromOnly === true ? [] : yield* read(pkValue))]
+          : [...(yield* read(from)), ...(yield* read(pkValue))]
       return { client, tableConfig, pkValue, allItems }
     })
 
@@ -2529,6 +2529,41 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
+   * Whether `stored`, a row read from the partition, is provably not `item`'s: a `many` element's
+   * row holding other values for what its sort key is composed from (its declared `sk.composite`,
+   * else its refs' identifiers, and its node's discriminators). Values neither side holds, or one
+   * the marshaller refuses, prove nothing. Any other row's sort key is its node's alone.
+   */
+  const otherElement = (item: DecomposedItem, stored: Record<string, unknown>): boolean => {
+    const node = item.node
+    if (node.cardinality !== "many") return false
+    const text = (value: unknown): string | undefined => {
+      if (value === undefined || value === null) return undefined
+      try {
+        return Rekey.canonicalValue(toAttributeValue(value))
+      } catch {
+        return undefined
+      }
+    }
+    const differs = (ours: unknown, theirs: unknown) => {
+      const a = text(ours)
+      const b = text(theirs)
+      return a !== undefined && b !== undefined && a !== b
+    }
+    for (const [field, value] of Object.entries(node.discriminator ?? {})) {
+      if (typeof value !== "function" && differs(item.attributes[field], stored[field])) return true
+    }
+    if (node.skComposite === undefined) {
+      const ours = extractRefIdentifiers(item.attributes, node.refIdentifierField)
+      const theirs = extractRefIdentifiers(stored, node.refIdentifierField)
+      return ours.length === theirs.length && ours.some((id, i) => differs(id, theirs[i]))
+    }
+    return node.skComposite.some((path) =>
+      differs(readCompositePath(item.attributes, path), readCompositePath(stored, path)),
+    )
+  }
+
+  /**
    * `rekey`'s view of where the aggregate's rows are stored (#183, DESIGN.md §7 "`rekey`"): for
    * each decomposed item, its current key and its old one — the partition the row was found in
    * and the sort key text of the other setting — the rows stored at each, and where the item is
@@ -2595,9 +2630,27 @@ const makeAggregate = <TSchema extends Schema.Top>(
       })),
       (position) => storedAt.has(position),
     )
+    // Another aggregate sharing the partition can hold a key of the chain (#240): its row reads,
+    // by the keys alone, as this one's under both keys, or can't be told apart. There, a key holds
+    // the row only if the row stored there holds the values its sort key is composed from
+    // ({@link otherElement}); a row stored under neither by that test keeps what the keys said.
+    const refined = placements.map((placement, r) => {
+      if (placement !== "both" && placement !== "ambiguous") return placement
+      const row = rows[r]!
+      const holds = (at: Position) => {
+        const there = storedAt.get(positionOf(at.pk, at.sk))
+        return there !== undefined && !otherElement(row.item, there)
+      }
+      const atOld = holds(row.old)
+      const atCurrent = holds(row.current)
+      if (atOld && atCurrent) return "both"
+      if (atOld) return "old"
+      if (atCurrent) return "current"
+      return placement
+    })
     return rows.map((row, r) => ({
       ...row,
-      placement: placements[r]!,
+      placement: refined[r]!,
       atCurrent: storedAt.get(positionOf(row.current.pk, row.current.sk)),
       atOld: storedAt.get(positionOf(row.old.pk, row.old.sk)),
     }))
@@ -2904,31 +2957,34 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * fits, as 1.39.0 finished it). Rows whose keys chain move in order, the one whose current key is
    * free first, so no write lands on a row still to move, and the root moves last, so a move cut
    * short is found by the next run. A write that loses to a concurrent one reads the aggregate
-   * again; a row stored under both keys leaves the aggregate as it is, reported. A dry run writes
-   * nothing.
+   * again; a row stored under both keys leaves the aggregate as it is, reported, as does one whose
+   * current key holds a row that isn't its own and stays there once what holds it is judged (#240).
+   * A dry run writes nothing: it plans each write the run would send (`plan`), and reads its plan.
    */
   const rekeyCore = (
     key: Record<string, unknown>,
-    dryRun: boolean,
+    ctx: Rekey.RekeyRowContext,
     /** The old partition the aggregate's root was found in, when it isn't the current one. */
     from: string | undefined,
-    /**
-     * Leave the current partition unread: a dry run's, while another aggregate still to move
-     * holds it, whose rows this one's move would find gone by then.
-     */
-    fromOnly: boolean,
-    /** What a row too wide to guard whole, with no `updatedAt` to stand in, gets. */
-    unprovable: UnprovableRow,
   ): Effect.Effect<Rekey.RekeyTally, AggregateWriteError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
+      /** What a row too wide to guard whole, with no `updatedAt` to stand in, gets. */
+      const unprovable = Rekey.unprovableRow(ctx)
       let movedRows = 0
       let rewrittenRows = 0
+      // Whether the aggregates holding this one's current keys have been judged first.
+      let yielded = false
+      // The aggregate left as it is, reported: with what it moved before it found that.
+      const leftAsIs = (conflicts: Rekey.RekeyTally["conflicts"] & {}): Rekey.RekeyTally => ({
+        ...(movedRows > 0 && { moved: { aggregate: movedRows } }),
+        ...(rewrittenRows > 0 && { indexKeysRewritten: rewrittenRows }),
+        conflicts,
+      })
       for (let attempt = 0; attempt < REKEY_ATTEMPTS; attempt++) {
         const stored: Array<Record<string, AttributeValue>> = []
         const { client, tableConfig, pkValue, allItems } = yield* fetchPartition(key, "rekey", {
           stored,
           from,
-          fromOnly,
         })
         const done = (rows: number): Rekey.RekeyTally => {
           const unchanged = Math.max(0, rows - movedRows - rewrittenRows)
@@ -2946,7 +3002,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // again, and while a row read under the old partition has gone from it, retry.
         const atFrom = allItems.filter((item) => item[config.pk.field] === from)
         if (from !== undefined && atFrom.length > 0 && atFrom.length < allItems.length) {
-          const again = yield* fetchPartition(key, "rekey", { from, fromOnly })
+          const again = yield* fetchPartition(key, "rekey", { from })
           const held = new Set(
             again.allItems
               .filter((item) => item[config.pk.field] === from)
@@ -2996,8 +3052,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
               .pipe(Effect.map(({ Item }) => Item !== undefined)),
           )
           if (held.some((still) => !still)) continue
-          return {
-            conflicts: doubled.map((row) => ({
+          return leftAsIs(
+            doubled.map((row) => ({
               member: aggregateName,
               kind: "aggregate" as const,
               reason: "bothKeys" as const,
@@ -3009,7 +3065,56 @@ const makeAggregate = <TSchema extends Schema.Top>(
                   : "Its rows' keys overlap across key text, and which row is stored under which " +
                     "key can't be told from the keys held: the aggregate is left as it is.",
             })),
+          )
+        }
+
+        // A row whose current key holds another's row (another aggregate's, sharing the partition,
+        // #240) moves once that row has: what holds it is judged first, as the scan would judge it
+        // (`yieldTo`), and the aggregate read again. A row still there, or one held by what waits
+        // on this aggregate in turn, leaves the aggregate as it is, reported.
+        const sources = new Set(
+          rows.flatMap((row) =>
+            row.placement === "old" ? [positionOf(row.old.pk, row.old.sk)] : [],
+          ),
+        )
+        const blocked = rows.filter(
+          (row) =>
+            row.placement === "old" &&
+            row.atCurrent !== undefined &&
+            !sources.has(positionOf(row.current.pk, row.current.sk)),
+        )
+        if (blocked.length > 0) {
+          let waited = false
+          let loop = false
+          if (!yielded) {
+            yielded = true
+            const raw = new Map(
+              stored.map((item) => [
+                positionOf(item[config.pk.field]?.S ?? "", item.sk?.S ?? ""),
+                item,
+              ]),
+            )
+            for (const row of blocked) {
+              const there = raw.get(positionOf(row.current.pk, row.current.sk))
+              if (there === undefined) continue
+              const judged = yield* ctx.yieldTo(there, stored)
+              if (judged === "loop") loop = true
+              if (judged === "settled") waited = true
+            }
           }
+          if (waited && !loop) continue
+          return leftAsIs(
+            blocked.map((row) => ({
+              member: aggregateName,
+              kind: "aggregate" as const,
+              reason: loop ? ("contended" as const) : ("taken" as const),
+              key: { [config.pk.field]: row.old.pk, sk: row.old.sk },
+              target: { [config.pk.field]: row.current.pk, sk: row.current.sk },
+              message: loop
+                ? Rekey.LOOP_MESSAGE
+                : "Another row is stored where this one belongs: the aggregate is left as it is.",
+            })),
+          )
         }
 
         // With `ownsRows`, every row of its types it reads is the aggregate's (DESIGN.md §7 "Which
@@ -3032,8 +3137,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
         }
         const stranded = unplaced.filter((at) => at.pk !== pkValue)
         if (stranded.length > 0) {
-          return {
-            conflicts: stranded.map((at) => ({
+          return leftAsIs(
+            stranded.map((at) => ({
               member: aggregateName,
               kind: "aggregate" as const,
               reason: "failed" as const,
@@ -3044,12 +3149,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
                 "decomposes to, so where it goes can't be told. Moving the rest would leave it in " +
                 "the old partition: the aggregate is left as it is.",
             })),
-          }
+          )
         }
         const left: Rekey.RekeyTally =
           unplaced.length > 0 ? { skipped: { unrecognizedKey: unplaced.length } } : {}
         const tally = (rows: number): Rekey.RekeyTally => ({ ...done(rows), ...left })
-        const counted = rows.length
+        // A row at its current key that this run put there (another aggregate holding it moved it)
+        // was counted where it moved: not again here as unchanged.
+        const counted = rows.filter(
+          (row) =>
+            row.placement !== "current" ||
+            !ctx.placed(toAttributeMap({ [config.pk.field]: row.current.pk, sk: row.current.sk })),
+        ).length
 
         // Each row's write keeps the `created` and `updated` of the row it moves.
         const createdField = stampFields?.createdAt ?? null
@@ -3213,25 +3324,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
         // Nothing of it has moved (`unprovableHere`): an unguarded row leaves the aggregate as is.
         if (unguarded.length > 0) {
           return {
-            ...(movedRows > 0 && { moved: { aggregate: movedRows } }),
-            ...(rewrittenRows > 0 && { indexKeysRewritten: rewrittenRows }),
             ...left,
-            conflicts: unguarded.map((row) => ({
-              member: aggregateName,
-              kind: "aggregate" as const,
-              reason: "unguarded" as const,
-              key: { [config.pk.field]: row.from.pk, sk: row.from.sk },
-              target: { [config.pk.field]: row.to.pk, sk: row.to.sk },
-              message: `${Rekey.UNGUARDED_MESSAGE} Its aggregate's other rows are left with it.`,
-            })),
+            ...leftAsIs(
+              unguarded.map((row) => ({
+                member: aggregateName,
+                kind: "aggregate" as const,
+                reason: "unguarded" as const,
+                key: { [config.pk.field]: row.from.pk, sk: row.from.sk },
+                target: { [config.pk.field]: row.to.pk, sk: row.to.sk },
+                message: `${Rekey.UNGUARDED_MESSAGE} Its aggregate's other rows are left with it.`,
+              })),
+            ),
           }
         }
         if (moves.length === 0 && rewrites.length === 0) return tally(counted)
-        if (dryRun) {
-          movedRows += moves.length
-          rewrittenRows += rewrites.length
-          return tally(counted)
-        }
 
         // In waves: a row moves once no row still to move is stored at its
         // current key, and the root once nothing else is left: while it's under the old partition
@@ -3263,16 +3369,18 @@ const makeAggregate = <TSchema extends Schema.Top>(
             shape,
           )
           for (const chunk of chunks) {
-            const written = yield* client
-              .transactWriteItems({ TransactItems: chunk.flatMap((unit) => unit.items) })
-              .pipe(
-                Effect.as(true),
-                Effect.catch((error: DynamoClientError) =>
-                  isAwsTransactionCancelled(error.cause)
-                    ? Effect.succeed(false)
-                    : Effect.fail(error),
-                ),
-              )
+            const items = chunk.flatMap((unit) => unit.items)
+            // A dry run plans the write, as the run would send it (`plan`), and reads its plan.
+            const written = ctx.dryRun
+              ? ctx.plan(items)
+              : yield* client.transactWriteItems({ TransactItems: items }).pipe(
+                  Effect.as(true),
+                  Effect.catch((error: DynamoClientError) =>
+                    isAwsTransactionCancelled(error.cause)
+                      ? Effect.succeed(false)
+                      : Effect.fail(error),
+                  ),
+                )
             if (!written) {
               lost = true
               break
@@ -3457,10 +3565,119 @@ const makeAggregate = <TSchema extends Schema.Top>(
       return { skipped: ctx.sawWholeTable() ? { unrecognizedKey: left } : { rootNotSeen: left } }
     })
 
+  /**
+   * The unit a root row is judged as (its stored partition's: `rekeyUnit`) and its judgment, the
+   * aggregate's move; or, for a root nothing can place, its tally.
+   */
+  const rootWork = (
+    row: Record<string, AttributeValue>,
+    ctx: Rekey.RekeyRowContext,
+  ):
+    | {
+        readonly unit: string
+        readonly work: Effect.Effect<
+          Rekey.RekeyTally,
+          DynamoClientError,
+          DynamoClient | TableConfig
+        >
+      }
+    | { readonly tally: Rekey.RekeyTally } => {
+    const pk = row[config.pk.field]!.S!
+    const key = rootKeyAsRead(fromAttributeMap(row) as Record<string, unknown>)
+    const current = partitionUnder(config.schema, key)
+    // Under none of the keys its values have had: nothing here can place it.
+    if (current === undefined || !holdsPartition(row, key, pk)) {
+      return { tally: { skipped: { unrecognizedKey: 1 } } }
+    }
+    const { rooted } = rekeyRunOf(ctx)
+    rooted.add(pk)
+    rooted.add(current)
+    return { unit: rekeyUnit(pk), work: rekeyRoot(key, pk, current, ctx) }
+  }
+
+  /** Judge the root `row` as the scan does: its unit's verdict, or `undefined` for a root left. */
+  const judgeRoot = (row: Record<string, AttributeValue>, ctx: Rekey.RekeyRowContext) => {
+    const judged = rootWork(row, ctx)
+    return "unit" in judged
+      ? ctx.judge(aggregateName, judged.unit, judged.work)
+      : Effect.succeed(undefined)
+  }
+
+  const rekeyRoot = (
+    key: Record<string, unknown>,
+    pk: string,
+    current: string,
+    ctx: Rekey.RekeyRowContext,
+  ): Effect.Effect<Rekey.RekeyTally, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const from = pk === current ? undefined : pk
+      // The chain: another aggregate may still be stored where this one goes (`foo%20bar`'s old
+      // row where `foo bar`'s current one belongs). It's judged first, as its own unit; it leaves
+      // no row in this one's way, and nothing is overwritten or merged whichever the scan reached
+      // first. One still there, or one waiting on this aggregate in turn, leaves this one as it is.
+      if (from !== undefined) {
+        const stale = yield* staleRootAt(ctx.tableName, current)
+        if (stale !== undefined) {
+          const judged = yield* judgeRoot(stale, ctx)
+          if (judged === "loop" || (yield* staleRootAt(ctx.tableName, current)) !== undefined) {
+            return {
+              conflicts: [
+                {
+                  member: aggregateName,
+                  kind: "aggregate" as const,
+                  reason: judged === "loop" ? ("contended" as const) : ("taken" as const),
+                  key: { [config.pk.field]: pk, sk: rekeyRootSk },
+                  target: { [config.pk.field]: current, sk: rekeyRootSk },
+                  message:
+                    judged === "loop"
+                      ? Rekey.LOOP_MESSAGE
+                      : "Another aggregate's root is stored where this one's belongs.",
+                },
+              ],
+            }
+          }
+        }
+      }
+      return yield* rekeyCore(key, ctx, from).pipe(
+        Effect.catch(
+          (error: AggregateWriteError): Effect.Effect<Rekey.RekeyTally, DynamoClientError> => {
+            if (Rekey.isDynamoClientError(error)) return Effect.fail(error)
+            const assembly = error._tag === "AggregateAssemblyError" ? error.reason : undefined
+            // Gone since the scan read it: deleted by a write.
+            if (assembly === "Missing root item") return Effect.succeed({})
+            // A root under both partition keys (its sort key is fixed, so one
+            // partition holds one): neither copy is judged.
+            const both = assembly === "Multiple root items found"
+            // What went wrong, as the error says it: a tagged error's own message is empty.
+            const detail =
+              error._tag === "AggregateAssemblyError" ||
+              error._tag === "AggregateDecompositionError"
+                ? error.reason
+                : error._tag === "ValidationError"
+                  ? String(error.cause ?? error.message)
+                  : error.message
+            return Effect.succeed({
+              conflicts: [
+                {
+                  member: aggregateName,
+                  kind: "aggregate" as const,
+                  reason: both ? ("bothKeys" as const) : ("failed" as const),
+                  key: { [config.pk.field]: pk, sk: rekeyRootSk },
+                  target: { [config.pk.field]: current, sk: rekeyRootSk },
+                  message: both
+                    ? "The aggregate's root is also stored under its current key."
+                    : `${error._tag}: ${detail}`,
+                },
+              ],
+            })
+          },
+        ),
+      )
+    })
+
   const rekeyRow = (
     row: Record<string, AttributeValue>,
     ctx: Rekey.RekeyRowContext,
-    depth: number,
   ): Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig> =>
     Effect.gen(function* () {
       const pk = row[config.pk.field]?.S
@@ -3470,102 +3687,84 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (row.sk?.S !== rekeyRootSk || row.__edd_e__?.S !== config.root.entityType) {
         return yield* rekeyRowBelowRoot(row, pk, ctx)
       }
-      const key = rootKeyAsRead(fromAttributeMap(row) as Record<string, unknown>)
-      const current = partitionUnder(config.schema, key)
-      // Under none of the keys its values have had: nothing here can place it.
-      if (current === undefined || !holdsPartition(row, key, pk)) {
-        return { skipped: { unrecognizedKey: 1 } }
-      }
-      const { rooted } = rekeyRunOf(ctx)
-      rooted.add(pk)
-      rooted.add(current)
-      return yield* ctx.once(
-        rekeyUnit(pk),
-        Effect.gen(function* () {
-          const from = pk === current ? undefined : pk
-          // The chain: another aggregate may still be stored where this one goes (`foo%20bar`'s
-          // old row where `foo bar`'s current one belongs). It moves first; it leaves no row in
-          // this one's way, and nothing is overwritten or merged whichever the scan reached first.
-          let first: Rekey.RekeyTally = {}
-          let fromOnly = false
-          if (from !== undefined) {
-            const stale = yield* staleRootAt(ctx.tableName, current)
-            if (stale !== undefined) {
-              const tooDeep = depth >= Rekey.DISPLACE_DEPTH
-              first = tooDeep
-                ? {}
-                : yield* Rekey.displace(ctx, (under) => rekeyRow(stale, under, depth + 1))
-              // A dry run moved nothing: what would stop that aggregate is what would leave it.
-              const stillThere = ctx.dryRun
-                ? tooDeep || (first.conflicts ?? []).length > 0
-                : (yield* staleRootAt(ctx.tableName, current)) !== undefined
-              if (stillThere) {
-                return Rekey.mergeTallies(first, {
-                  conflicts: [
-                    {
-                      member: aggregateName,
-                      kind: "aggregate" as const,
-                      reason: "taken" as const,
-                      key: { [config.pk.field]: pk, sk: rekeyRootSk },
-                      target: { [config.pk.field]: current, sk: rekeyRootSk },
-                      message: "Another aggregate's root is stored where this one's belongs.",
-                    },
-                  ],
-                })
-              }
-              fromOnly = ctx.dryRun
-            }
-          }
-          const moved = yield* rekeyCore(
-            key,
-            ctx.dryRun,
-            from,
-            fromOnly,
-            Rekey.unprovableRow(ctx),
-          ).pipe(
-            Effect.catch(
-              (error: AggregateWriteError): Effect.Effect<Rekey.RekeyTally, DynamoClientError> => {
-                if (Rekey.isDynamoClientError(error)) return Effect.fail(error)
-                const assembly = error._tag === "AggregateAssemblyError" ? error.reason : undefined
-                // Gone since the scan read it: deleted by a write.
-                if (assembly === "Missing root item") return Effect.succeed({})
-                // A root under both partition keys (its sort key is fixed, so one
-                // partition holds one): neither copy is judged.
-                const both = assembly === "Multiple root items found"
-                // What went wrong, as the error says it: a tagged error's own message is empty.
-                const detail =
-                  error._tag === "AggregateAssemblyError" ||
-                  error._tag === "AggregateDecompositionError"
-                    ? error.reason
-                    : error._tag === "ValidationError"
-                      ? String(error.cause ?? error.message)
-                      : error.message
-                return Effect.succeed({
-                  conflicts: [
-                    {
-                      member: aggregateName,
-                      kind: "aggregate" as const,
-                      reason: both ? ("bothKeys" as const) : ("failed" as const),
-                      key: { [config.pk.field]: pk, sk: rekeyRootSk },
-                      target: { [config.pk.field]: current, sk: rekeyRootSk },
-                      message: both
-                        ? "The aggregate's root is also stored under its current key."
-                        : `${error._tag}: ${detail}`,
-                    },
-                  ],
-                })
-              },
-            ),
-          )
-          return Rekey.mergeTallies(first, moved)
-        }),
+      // Judged as its partition's unit, counted when it settles (`judge`).
+      const judged = rootWork(row, ctx)
+      if (!("unit" in judged)) return judged.tally
+      yield* ctx.judge(aggregateName, judged.unit, judged.work)
+      return {}
+    })
+
+  /**
+   * A row read with `rows` (as stored, the partitions its reader read), that the reader found
+   * where one of its own belongs: if it's a row of an aggregate of this kind rooted in its
+   * partition — one its value, assembled from those rows, decomposes to at that key — that
+   * aggregate is judged, as the scan would judge its root (`yieldTo`). Nothing is read: the rows
+   * are the reader's.
+   */
+  const rekeyHolder = (
+    row: Record<string, AttributeValue>,
+    rows: ReadonlyArray<Record<string, AttributeValue>>,
+    ctx: Rekey.RekeyRowContext,
+  ): Effect.Effect<Rekey.Judged | undefined, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      const pk = row[config.pk.field]?.S
+      const sk = row.sk?.S
+      if (pk === undefined || sk === undefined) return undefined
+      if (!ownedTypes.has(row.__edd_e__?.S ?? "")) return undefined
+      const root = rows.find(
+        (item) =>
+          item[config.pk.field]?.S === pk &&
+          item.sk?.S === rekeyRootSk &&
+          item.__edd_e__?.S === config.root.entityType,
       )
+      if (root === undefined) return undefined
+      const key = rootKeyAsRead(fromAttributeMap(root) as Record<string, unknown>)
+      const current = partitionUnder(config.schema, key)
+      if (current === undefined) return undefined
+      const owns = yield* Effect.gen(function* () {
+        const items = rows
+          .filter((item) => item[config.pk.field]?.S === pk)
+          .map((item) => fromAttributeMap(item) as Record<string, unknown>)
+        yield* unpackAggregateItems(items, dispatchByType, aggregateName)
+        const assembled = yield* assembleAggregate(
+          assembly,
+          rootNode,
+          items,
+          contextFields,
+          key,
+          aggregateName,
+          systemAttrs,
+        )
+        const groups = yield* decomposeAggregate(
+          { ...(assembled as object) } as Record<string, unknown>,
+          rootNode,
+          contextFields,
+          rootEncoders,
+          aggregateName,
+          config.schema,
+        )
+        const composed = yield* composeOrFail("rekey", () =>
+          buildDynamoItems(groups, config, current, undefined, keyRecord),
+        )
+        const placed = locateRows(groups, composed, items, current, pk === current ? undefined : pk)
+        const stored = fromAttributeMap(row) as Record<string, unknown>
+        return placed.some(
+          (at) =>
+            (positionOf(at.old.pk, at.old.sk) === positionOf(pk, sk) ||
+              positionOf(at.current.pk, at.current.sk) === positionOf(pk, sk)) &&
+            !otherElement(at.item, stored),
+        )
+      }).pipe(Effect.orElseSucceed(() => false))
+      if (!owns) return undefined
+      return yield* judgeRoot(root, ctx)
     })
 
   const rekeyHandler: Rekey.RekeyMember = {
     name: aggregateName,
     types: rekeyTypes,
-    row: (row, ctx) => rekeyRow(row, ctx, 0),
+    key: { pk: config.pk.field, sk: "sk" },
+    row: rekeyRow,
+    holder: rekeyHolder,
     finish: rekeyFinish,
   }
 
@@ -7045,8 +7244,6 @@ interface RekeyRead {
   readonly stored?: Array<Record<string, AttributeValue>> | undefined
   /** The partition the root was found in, when it isn't the current one. */
   readonly from?: string | undefined
-  /** Read only `from`. */
-  readonly fromOnly?: boolean | undefined
 }
 
 interface ListPartitionOptions {
