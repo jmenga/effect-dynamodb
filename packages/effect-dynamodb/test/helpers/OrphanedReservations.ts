@@ -34,9 +34,19 @@ const fixture: {
 /** The fixture's rows. */
 export const ROWS_139 = fixture.rows
 
+/**
+ * What 1.39.0 stored for a unique `Schema.Duration`: a live row (`p1`, 5 s), the map it stored for
+ * the value, and its sentinel, whose text is the instance's own (`5000 millis`); and the sentinel a
+ * delete left (`p2`, 7 s), since 1.39.0 composed `[object object]` from the stored map to release it.
+ */
+const DURATION_ROWS_139: ReadonlyArray<StoredRow> = JSON.parse(
+  readFileSync(new URL("../fixtures/duration-reservations-1.39.0.json", import.meta.url), "utf8"),
+).rows
+
 const Holding = Schema.Struct({ id: Schema.String, n: Schema.BigInt })
 const Seat = Schema.Struct({ venue: Schema.String, seat: Schema.String, n: Schema.BigInt })
 const Handle = Schema.Struct({ id: Schema.String, handle: Schema.String })
+const Plan = Schema.Struct({ id: Schema.String, length: Schema.Duration })
 const primaryKey = {
   pk: { field: "pk", composite: ["id"] },
   sk: { field: "sk", composite: [] },
@@ -100,7 +110,13 @@ export const world = (escapeKeys: boolean) => {
     unique: { handle: ["handle"] },
     softDelete: true,
   })
-  const entities = { Accounts, Members, Holders, Passes, Renamed, Seats, Handles, Tags }
+  const Plans = Entity.make({
+    model: Plan,
+    entityType: "Plan",
+    primaryKey,
+    unique: { length: ["length"] },
+  })
+  const entities = { Accounts, Members, Holders, Passes, Renamed, Seats, Handles, Tags, Plans }
   const MainTable = Table.make({ schema, entities })
   const client = DynamoClient.make({ entities, tables: { MainTable } })
   return { schema, MainTable, client }
@@ -705,6 +721,48 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
 // ---------------------------------------------------------------------------
 
 export const untouchedScenarios: ReadonlyArray<RepairScenario> = [
+  ...bothSettings(
+    "a sentinel of a value without key text of its own (a Duration 1.39.0 stored) is undecided, and left",
+    (h, on) => {
+      const w = world(on)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          yield* seedAll(table, DURATION_ROWS_139)
+          const db = yield* w.client
+          const options = { releaseOrphanedReservations: true, writesStopped: true } as const
+          const dry = yield* rekey(db, { ...options, dryRun: true })
+          const real = yield* rekey(db, options)
+          expect(rekeyOutcome(real)).toEqual(rekeyOutcome(dry))
+          expect(real.reservations).toMatchObject({ ...ZERO, undecided: 2 })
+          // p1 is live and stores a map, which composes `[object object]`: it may hold the
+          // sentinel or not, nothing says. p2 is gone, and a Duration composes no text that finds
+          // its sentinel, so p2 may live under another key: nothing proves it orphaned either.
+          expect(
+            entriesOf(real).map(({ owner, outcome, message }) => ({ owner, outcome, message })),
+          ).toEqual([
+            {
+              owner: itemKey("plan", "p1"),
+              outcome: "undecided",
+              message:
+                "The values of the row it names, or of a tombstone in its partition, compose no " +
+                "exact sentinel key under some key text, so nothing says whether they hold it.",
+            },
+            {
+              owner: itemKey("plan", "p2"),
+              outcome: "undecided",
+              message:
+                "The row it names doesn't exist, and the constraint's values can be ones without " +
+                "key text of their own, so the row may have moved without its sentinel.",
+            },
+          ])
+          expect(writesOf(table)).toEqual([])
+          expect(yield* table.rows()).toEqual(DURATION_ROWS_139)
+          const p1 = (yield* db.entities.Plans.get({ id: "p1" })) as { length: Duration.Duration }
+          expect(Duration.toMillis(p1.length)).toBe(5000)
+        }),
+      )
+    },
+  ),
   ...bothSettings("a sentinel naming no row is undecided, and left", (h, on) => {
     const w = world(on)
     return h.on(w, (table) =>

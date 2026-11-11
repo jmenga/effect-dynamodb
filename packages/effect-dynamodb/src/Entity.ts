@@ -313,6 +313,7 @@ import {
   allKeyFieldNames,
   type DerivedSchemas,
   getSchemaFields,
+  inferDefaultEncoding,
   makePathValueEncoder,
   primaryKeyComposites,
   type ResolvedSystemFields,
@@ -14832,13 +14833,8 @@ const makeImpl = <
             const currentKey = sentinelKeyRecord(current)
             if (
               ctx.releaseOrphanedReservations &&
-              (yield* judgeReservation(
-                ctx.tableName,
-                heldNow,
-                constraintName,
-                constraintDef,
-                currentKey,
-              ))._tag === "orphaned"
+              (yield* judgeReservation(ctx, heldNow, constraintName, constraintDef, currentKey))
+                ._tag === "orphaned"
             ) {
               yield* judgeReservationRow(ctx, heldNow, constraintName, constraintDef, currentKey)
             }
@@ -15040,8 +15036,11 @@ const makeImpl = <
 
   /**
    * Whether `row` — the row a sentinel names, or a tombstone of it — holds the sentinel at `at`: its
-   * values compose that key under some key text, a numeric value as either kind. `unknown` when
-   * they don't and can't be composed at all, so nothing says what they would give.
+   * values compose that key under some key text, a numeric value as either kind. `no` only when
+   * that's proven: the values compose other key text under every text, each value with key text of
+   * its own (`KeyComposer.hasExactText`). `unknown` when they can't be composed, or a value's text
+   * is only its `String` form (a map read back for a `Schema.Duration` 1.39.0 stored gives
+   * `[object object]`, where the sentinel holds `5000 millis`), so nothing says what it held.
    */
   const holdsSentinel = (
     row: StoredRow,
@@ -15052,6 +15051,7 @@ const makeImpl = <
     const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
     const key = { pk: String(at[rekeyPk]), sk: String(at[rekeySk]) }
     if (sentinelHeldAt(constraintName, constraintDef, values, row, key, true)) return "yes"
+    const inexact = new Error("inexact")
     for (const under of [schema, ...sentinelTexts()]) {
       try {
         composeUniqueSentinel(
@@ -15060,7 +15060,11 @@ const makeImpl = <
           constraintName,
           constraintDef,
           values,
-          readSentinelValue,
+          (field, value) => {
+            const stored = readSentinelValue(field, value) ?? value
+            if (!KeyComposer.hasExactText(stored)) throw inexact
+            return stored
+          },
         )
       } catch {
         return "unknown"
@@ -15068,6 +15072,31 @@ const makeImpl = <
     }
     return "no"
   }
+
+  /**
+   * Whether every value a constraint's fields can store has key text of its own, by their schemas:
+   * a string, number, bigint or boolean key form, or a date. Only then does a row gone from where a
+   * sentinel says prove the sentinel orphaned: a value without exact text (a `Schema.Duration`
+   * 1.39.0 stored, read back as a map) composes no text that finds its sentinel, so a move of its
+   * row (1.40.0's `rekey`) can leave the sentinel naming the key the row left.
+   */
+  const exactlyComposed = (() => {
+    const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
+    const known = new Map<string, boolean>()
+    return (constraintName: string, constraintDef: UniqueConstraintDef): boolean => {
+      const cached = known.get(constraintName)
+      if (cached !== undefined) return cached
+      const exact = resolveUniqueFields(constraintDef).every((name) => {
+        const field = fields?.[name]
+        return (
+          field !== undefined &&
+          (keyFormValueKind(field) !== undefined || inferDefaultEncoding(field) !== undefined)
+        )
+      })
+      known.set(constraintName, exact)
+      return exact
+    }
+  })()
 
   /**
    * The tombstones of the item at `owner` (`preserveUnique`: each kept its reservations), under
@@ -15180,11 +15209,15 @@ const makeImpl = <
    * does when its values compose `at` under some key text, and with `preserveUnique` so does a
    * tombstone of that row: the soft delete kept the reservation on purpose. Without
    * `preserveUnique` a soft delete releases its reservations, so a tombstone holds none.
-   * `undecided` when nothing says: no back-pointer, a row of another type behind it, or values
-   * that compose no sentinel key under some text.
+   * `orphaned` only when that's proven: the row it names was read, and its values (and its
+   * tombstones') compose other key text, each value with text of its own ({@link holdsSentinel}),
+   * or it's gone from a key this run didn't take, and the constraint's values always have such text
+   * ({@link exactlyComposed}). Anything short of that is `undecided`: no back-pointer, a row of
+   * another type behind it, values that compose no exact key text, a tombstone it can't attribute,
+   * or a row gone from where it may have moved without the sentinel.
    */
   const judgeReservation = (
-    tableName: string,
+    ctx: Rekey.RekeyRowContext,
     sentinel: StoredRow,
     constraintName: string,
     constraintDef: UniqueConstraintDef,
@@ -15200,6 +15233,7 @@ const makeImpl = <
           message: "It names no row: it has no `_entity_pk` and `_entity_sk` strings.",
         }
       }
+      const tableName = ctx.tableName
       const owner = keyAt(pk, sk)
       const client = yield* Capacity.client
       const { Item: live } = yield* client.getItem({
@@ -15238,10 +15272,26 @@ const makeImpl = <
           owner,
           message:
             "The values of the row it names, or of a tombstone in its partition, compose no " +
-            "sentinel key under some key text, so nothing says whether they hold it.",
+            "exact sentinel key under some key text, so nothing says whether they hold it.",
         }
       }
       const tombstoneNote = preserveUnique() ? ", nor does a tombstone of it" : ""
+      if (live === undefined && ctx.vacated(toAttributeMap(owner))) {
+        return {
+          _tag: "undecided",
+          owner,
+          message: "The row it names was moved by this run, so it's judged by the next one.",
+        }
+      }
+      if (live === undefined && !exactlyComposed(constraintName, constraintDef)) {
+        return {
+          _tag: "undecided",
+          owner,
+          message:
+            `The row it names doesn't exist${tombstoneNote}, and the constraint's values can be ` +
+            "ones without key text of their own, so the row may have moved without its sentinel.",
+        }
+      }
       if (live === undefined) {
         return {
           _tag: "orphaned",
@@ -15320,7 +15370,7 @@ const makeImpl = <
       Effect.gen(function* () {
         const client = yield* Capacity.client
         const judge = (sentinel: StoredRow) =>
-          judgeReservation(ctx.tableName, sentinel, constraintName, constraintDef, at)
+          judgeReservation(ctx, sentinel, constraintName, constraintDef, at)
         const readAgain = Effect.map(
           client.getItem({
             TableName: ctx.tableName,

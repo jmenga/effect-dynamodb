@@ -3871,3 +3871,22 @@ describe("composeKeySpace", () => {
     })
   })
 })
+
+describe("hasExactText", () => {
+  it("is true for a value with key text of its own", () => {
+    for (const value of ["a", 1, -0.5, 5n, true, new Date(0), DateTime.makeUnsafe(0)]) {
+      expect(KeyComposer.hasExactText(value), String(value)).toBe(true)
+    }
+  })
+
+  it("is false for a value whose text is only its String form", () => {
+    // A Duration 1.39.0 stored, read back: a map whose text is `[object Object]`.
+    const durationMap = { "~effect/Duration": "~effect/Duration", value: { millis: 5000 } }
+    // A DateTime read back: a map carrying the type id, not a DateTime (#133).
+    const dateTimeMap = { "~effect/DateTime": "~effect/DateTime", epochMillis: 0 }
+    expect(DateTime.isDateTime(dateTimeMap)).toBe(true)
+    for (const value of [durationMap, dateTimeMap, [1], new Set(["a"]), null, undefined]) {
+      expect(KeyComposer.hasExactText(value), JSON.stringify(value)).toBe(false)
+    }
+  })
+})
