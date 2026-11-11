@@ -1,0 +1,73 @@
+{
+  "version": "1.39.0",
+  "results": [
+    [
+      "Applied"
+    ],
+    [
+      "Applied"
+    ]
+  ],
+  "tombstone": {
+    "__edd_removed__": {
+      "S": "2026-11-11T21:06:02.334Z"
+    },
+    "owner": {
+      "S": "x"
+    },
+    "rev": {
+      "N": "2"
+    },
+    "__edd_e__": {
+      "S": "SparseFallback#tombstone"
+    },
+    "sk": {
+      "S": "$fallback#v1#sparsefallback"
+    },
+    "pk": {
+      "S": "$fallback#v1#sparsefallback#id_shared"
+    },
+    "map": {
+      "M": {
+        "order#y": {
+          "N": "1"
+        }
+      }
+    },
+    "cp": {
+      "N": "1"
+    }
+  },
+  "items": [
+    {
+      "__edd_removed__": {
+        "S": "2026-11-11T21:06:02.334Z"
+      },
+      "owner": {
+        "S": "x"
+      },
+      "rev": {
+        "N": "2"
+      },
+      "__edd_e__": {
+        "S": "SparseFallback#tombstone"
+      },
+      "sk": {
+        "S": "$fallback#v1#sparsefallback"
+      },
+      "pk": {
+        "S": "$fallback#v1#sparsefallback#id_shared"
+      },
+      "map": {
+        "M": {
+          "order#y": {
+            "N": "1"
+          }
+        }
+      },
+      "cp": {
+        "N": "1"
+      }
+    }
+  ]
+}
