@@ -10,9 +10,9 @@
  * first segment turned a condition on `t.g.entry("b")` into one on `stored`, so a guarded delete
  * fired where the entry didn't hold and an update was refused where it did.
  *
- * `fixtures/entry-beside-field-1.40.0.json` holds what the published 1.40.0 did: the head does the
- * same, except a path write on a unique entity, where 1.40.0 took the entry's attribute for the
- * unique field and wrote the field (`expected`).
+ * `fixtures/entry-beside-field-1.40.0.json` holds what the published 1.40.0 did, every request
+ * whole: the head does the same, except a path write on a unique entity, where 1.40.0 took the
+ * entry's attribute for the unique field and wrote the field (`expected`, `CHANGED`).
  */
 
 import { readFileSync } from "node:fs"
@@ -21,6 +21,8 @@ import { Cause, Effect, Exit, Schema } from "effect"
 import { expect } from "vitest"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
+import { wholeOf } from "./RenamedSparseMapWrites.js"
+import { expectDiffersOnly } from "./WholeDiff.js"
 
 const fixture = JSON.parse(
   readFileSync(new URL("../fixtures/entry-beside-field-1.40.0.json", import.meta.url), "utf8"),
@@ -188,6 +190,23 @@ export const expected = (name: string): Captured => {
   return fixture.cases[name]!
 }
 
+/**
+ * Where the head's case differs from 1.40.0's own: one write of the entry, where 1.40.0 read the
+ * row and the unique sentinel and wrote the field through a transaction.
+ */
+const CHANGED = [
+  "outcome.ok.a#b",
+  "outcome.ok.g.b",
+  "read.a#b",
+  "read.g.b",
+  "row.a#b.N",
+  "row.stored.N",
+  "sent[0].getItem",
+  "sent[0].updateItem",
+  "sent[1]",
+  "sent[2]",
+]
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
 const normal = (value: unknown): any =>
@@ -198,32 +217,6 @@ const normal = (value: unknown): any =>
         ? "<time>"
         : held,
   )
-
-const PARTS = [
-  "UpdateExpression",
-  "ConditionExpression",
-  "FilterExpression",
-  "ProjectionExpression",
-  "ExpressionAttributeNames",
-  "ExpressionAttributeValues",
-] as const
-const partsOf = (input: Record<string, unknown>) =>
-  Object.fromEntries(PARTS.filter((part) => input[part] !== undefined).map((p) => [p, input[p]]))
-
-/** The expression parts of a write, a transaction's per item. */
-const sentOf = (request: unknown): Record<string, unknown> | undefined => {
-  const [command, input] = Object.entries(request as Record<string, Record<string, any>>)[0]!
-  if (command === "getItem" || command === "query") return undefined
-  return normal(
-    input.TransactItems !== undefined
-      ? {
-          [command]: (input.TransactItems as ReadonlyArray<Record<string, any>>).map((item) =>
-            Object.fromEntries(Object.entries(item).map(([kind, body]) => [kind, partsOf(body)])),
-          ),
-        }
-      : { [command]: partsOf(input) },
-  )
-}
 
 const outcomeOf = (exit: Exit.Exit<unknown, unknown>): unknown => {
   if (Exit.isSuccess(exit)) return { ok: normal(exit.value) }
@@ -253,7 +246,7 @@ const rowOf = (rows: ReadonlyArray<Row>, entity: string): Row | null => {
   )
 }
 
-/** Each scenario on a table of its own: the outcome, the writes it sent, the row and its read. */
+/** Each scenario on a table of its own: the outcome, every request it sent, the row and its read. */
 export const entryBesideFieldSuite = (open: OpenTable) => {
   for (const [name, [entity, run]] of Object.entries(scenarios)) {
     it.effect(name, () =>
@@ -274,10 +267,7 @@ export const entryBesideFieldSuite = (open: OpenTable) => {
               if (entity === "Retained") yield* db.entities.Retained.put(SEED).asEffect()
               log.length = 0
               const exit = yield* Effect.exit(Effect.suspend(() => run(db)))
-              const sent = log.flatMap((request) => {
-                const parts = sentOf(request)
-                return parts === undefined ? [] : [parts]
-              })
+              const sent = log.map((request) => wholeOf(request, table.name))
               const row = rowOf(yield* table.rows, entity)
               const read = yield* Effect.exit(db.entities[entity].get({ id: "a" }))
               return {
@@ -295,6 +285,7 @@ export const entryBesideFieldSuite = (open: OpenTable) => {
         expect(got.row).toEqual(want.row)
         expect(got.read).toEqual(want.read)
         expect(got.outcome).toEqual(want.outcome)
+        expectDiffersOnly(fixture.cases[name], got, want === fixture.cases[name] ? [] : CHANGED)
       }),
     )
   }
