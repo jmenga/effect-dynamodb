@@ -72,7 +72,7 @@ import {
   rowOmits,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseReadAsSparseEntry } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
-import { sparseReader, validateSparseKey } from "@effect-dynamodb/schema/internal/SparseKey.js"
+import { sparseKeyRefusal, sparseReader } from "@effect-dynamodb/schema/internal/SparseKey.js"
 import type { GsiConfig, IndexDefinition, KeyPart } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { normalizeGsiConfig } from "@effect-dynamodb/schema/KeyComposer.js"
@@ -7440,14 +7440,13 @@ const makeImpl = <
           )
         : []
       // A payload whose refs are read first has its entry keys judged before that read, by what
-      // is known before it: an update that surely writes the row whole (`rewritesWholeItem`,
-      // which a path op rules out) refuses the keys a put refuses, and any other the keys every
+      // is known before it: an update that surely refuses the keys a put refuses
+      // (`refusesPutKeys`, which a path op rules out) refuses them, and any other the keys every
       // update refuses. `checkUpdatePayload` judges the rest once the refs are in.
       if (refsToHydrate.length > 0) {
         const refusedKey = refusedSparseKey(
           encodedUpdates,
-          (isRetainEnabled() || needsBothImages || uState.upsertOver !== undefined) &&
-            !hasPathOps(uState),
+          (isRetainEnabled() || needsBothImages) && !hasPathOps(uState),
           everyRowWrites,
         )
         if (refusedKey !== undefined) {
@@ -7517,22 +7516,33 @@ const makeImpl = <
     whole: boolean,
     /** Whether the operation writes the field's value whatever the row holds. */
     writes: (field: string) => boolean = () => true,
-  ): string | undefined => {
+  ): string | undefined => refusedSparseEntry(payload, whole, writes)?.refusal
+
+  /** The entry {@link refusedSparseKey} refuses: its map, its key, and why. */
+  const refusedSparseEntry = (
+    payload: unknown,
+    whole: boolean,
+    writes: (field: string) => boolean,
+  ):
+    | {
+        readonly field: string
+        readonly prefix: string
+        readonly key: string
+        readonly refusal: string
+      }
+    | undefined => {
     if (!hasSparseFields || typeof payload !== "object" || payload === null) return undefined
     for (const [field, sparse] of Object.entries(sparseFields)) {
       if (!writes(field) || !Object.hasOwn(payload, field)) continue
       const value = (payload as globalThis.Record<string, unknown>)[field]
       if (value === null || typeof value !== "object") continue
       for (const key of Object.keys(value)) {
-        if (whole) {
-          try {
-            validateSparseKey(field, sparse.prefix, key)
-          } catch (e) {
-            return e instanceof Error ? e.message : String(e)
-          }
-        } else if (key.length === 0 || key.includes("#")) {
-          return `Sparse map "${field}": invalid key ${JSON.stringify(key)}`
-        }
+        const refusal = whole
+          ? sparseKeyRefusal(field, sparse.prefix, key)
+          : key.length === 0 || key.includes("#")
+            ? `Sparse map "${field}": invalid key ${JSON.stringify(key)}`
+            : undefined
+        if (refusal !== undefined) return { field, prefix: sparse.prefix, key, refusal }
       }
     }
     return undefined
@@ -7540,6 +7550,28 @@ const makeImpl = <
 
   /** Whether an update or an upsert writes the field's value whatever the row holds. */
   const everyRowWrites = (field: string): boolean => !immutableFields.has(field)
+
+  /**
+   * Whether an update refuses the entry keys a put refuses (`refusedSparseKey`'s `whole`): one that
+   * reads the row and writes it whole for a retained entity, a change to a unique field, a computed
+   * index composite or both images, and carries no path operation, as 1.39.0 decided it. Any other
+   * refuses only an empty key and one holding `#`. An upsert over a row it read is written whole as
+   * well (`rewritesWholeItem`), but 1.39.0 sent it as the update of the upserted fields, so it
+   * refuses what that update refuses.
+   */
+  const refusesPutKeys = (
+    needsBothImages: boolean,
+    checked: {
+      readonly touchesUniqueFields: boolean
+      readonly computedComposites: ReadonlyArray<string>
+      readonly pathOpsPresent: boolean
+    },
+  ): boolean =>
+    (isRetainEnabled() ||
+      checked.touchesUniqueFields ||
+      checked.computedComposites.length > 0 ||
+      needsBothImages) &&
+    !checked.pathOpsPresent
 
   /** Whether an update reads the row and writes it whole, in a transaction, and not as an expression. */
   const rewritesWholeItem = (
@@ -7551,12 +7583,31 @@ const makeImpl = <
       readonly pathOpsPresent: boolean
     },
   ): boolean =>
-    (isRetainEnabled() ||
-      checked.touchesUniqueFields ||
-      checked.computedComposites.length > 0 ||
-      needsBothImages ||
-      uState.upsertOver !== undefined) &&
-    !checked.pathOpsPresent
+    refusesPutKeys(needsBothImages, checked) ||
+    (uState.upsertOver !== undefined && !checked.pathOpsPresent)
+
+  /**
+   * Whether an update writes or changes a field one of the entity's unique constraints holds: a
+   * field its payload sets (to anything but `undefined`) or one of its operations names.
+   */
+  const touchesUniqueFieldsOf = (
+    uState: UpdateState,
+    updates: globalThis.Record<string, unknown>,
+  ): boolean => {
+    if (config.unique == null || Object.keys(config.unique).length === 0) return false
+    const uniqueFieldSet = new Set(
+      Object.values(config.unique).flatMap((def) => [...resolveUniqueFields(def)]),
+    )
+    const allUpdatedFields = new Set([
+      ...Object.keys(updates).filter((k) => updates[k] !== undefined),
+      ...(uState.remove ?? []),
+      ...Object.keys(uState.add ?? {}),
+      ...Object.keys(uState.subtract ?? {}),
+      ...Object.keys(uState.append ?? {}),
+      ...Object.keys(uState.deleteFromSet ?? {}),
+    ])
+    return [...uniqueFieldSet].some((f) => allUpdatedFields.has(f))
+  }
 
   /**
    * The refusals an update's keys decide, before reading anything: a key its payload composes with
@@ -7598,24 +7649,7 @@ const makeImpl = <
       const marshalledKey = toAttributeMap(primaryKey)
 
       // Detect whether the update touches any unique constraint fields
-      const hasUniqueConstraints = config.unique != null && Object.keys(config.unique).length > 0
-      let touchesUniqueFields = false
-      if (hasUniqueConstraints) {
-        const uniqueFieldSet = new Set(
-          Object.values(config.unique!).flatMap((def) => [...resolveUniqueFields(def)]),
-        )
-        const allUpdatedFields = new Set([
-          ...Object.keys(hydratedUpdates as globalThis.Record<string, unknown>).filter(
-            (k) => (hydratedUpdates as globalThis.Record<string, unknown>)[k] !== undefined,
-          ),
-          ...(uState.remove ?? []),
-          ...Object.keys(uState.add ?? {}),
-          ...Object.keys(uState.subtract ?? {}),
-          ...Object.keys(uState.append ?? {}),
-          ...Object.keys(uState.deleteFromSet ?? {}),
-        ])
-        touchesUniqueFields = [...uniqueFieldSet].some((f) => allUpdatedFields.has(f))
-      }
+      const touchesUniqueFields = touchesUniqueFieldsOf(uState, hydratedUpdates)
 
       // `.add()` / `.subtract()` / `.append()` / `.deleteFromSet()` on an
       // index composite: DynamoDB would compute the new value, but the
@@ -7670,7 +7704,7 @@ const makeImpl = <
       }
       const refused = refusedSparseKey(
         hydratedUpdates,
-        rewritesWholeItem(uState, needsBothImages, checked),
+        refusesPutKeys(needsBothImages, checked),
         everyRowWrites,
       )
       if (refused !== undefined) {
@@ -10422,9 +10456,27 @@ const makeImpl = <
         client
           .getItem({ TableName: tableName, Key: marshalledKey, ConsistentRead: true })
           .pipe(Effect.map((result) => result.Item))
-      // Either way this writes the whole item: the entry keys a put refuses are refused before
-      // the read.
-      const refusedKey = refusedSparseKey(encodedInput, true, everyRowWrites)
+      // A row that isn't there is written whole, as a put, and one that is takes the update of the
+      // upserted fields (`updates`), which refuses the entry keys `refusesPutKeys` says. A put
+      // refuses every key that update refuses, so such a key is refused before the read, in the
+      // put's words. Any other is judged by the write the read leads to.
+      const refusedEntry = refusedSparseEntry(
+        Object.fromEntries(
+          Object.keys(updates)
+            .filter((field) => Object.hasOwn(encodedInput, field))
+            .map((field) => [field, encodedInput[field]]),
+        ),
+        refusesPutKeys(false, {
+          touchesUniqueFields: touchesUniqueFieldsOf(emptyUpdateState, updates),
+          computedComposites: [],
+          pathOpsPresent: false,
+        }),
+        everyRowWrites,
+      )
+      const refusedKey =
+        refusedEntry === undefined
+          ? undefined
+          : sparseKeyRefusal(refusedEntry.field, refusedEntry.prefix, refusedEntry.key)
       if (refusedKey !== undefined) {
         return yield* new ValidationError({
           entityType,
