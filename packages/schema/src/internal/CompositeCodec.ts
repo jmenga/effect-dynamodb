@@ -43,6 +43,7 @@ import {
   holdsPlainBigint,
   numericTypeWithStringEncoding,
 } from "./SchemaAccessors.js"
+import { namesZone, zonesAsStored } from "./StoredForm.js"
 
 /** The same encoded composite value: a scalar, or a `Date` of the same instant. */
 const sameValue = (a: unknown, b: unknown): boolean =>
@@ -233,8 +234,13 @@ export const makeCompositeKeyForm = (
       const reencoded = encode(decoded.value)
       return Option.isSome(reencoded) && sameValue(reencoded.value, value)
     }
+    // A zone's key text is its name as `storedZoneName` gives it, whichever Effect is installed:
+    // Effect's own string codecs encode the name a zone was made from on 4.1.3 (`Etc/UTC` where
+    // 4.1.2 encoded `UTC`), and the key encodes the zone 4.1.2 held (`zonesAsStored`). The stored
+    // attribute is the codec's, untouched.
+    const encodeNamed = (value: unknown) => encode(zonesAsStored(value))
     const toEncoded = (value: unknown): Option.Option<unknown> => {
-      const direct = encode(value)
+      const direct = encodeNamed(value)
       if (Option.isSome(direct)) {
         // `encode` takes the value and changes it: a domain value, or, for a codec whose
         // `encode` takes its own output, its stored text, which is its key text.
@@ -243,7 +249,7 @@ export const makeCompositeKeyForm = (
         }
         return direct
       }
-      return Option.flatMap(decode(value), (decoded) => encode(decoded))
+      return Option.flatMap(decode(value), (decoded) => encodeNamed(decoded))
     }
     // The stored form, as case 3a takes it (`OptionFromNullOr(BigInt)`, a
     // `BigInt` under a decoding default): asked only when the value as given
@@ -269,7 +275,7 @@ export const makeCompositeKeyForm = (
         const fromStored = toEncoded(lifted)
         if (Option.isSome(fromStored)) return fromStored.value
       }
-      const fromRead = Option.flatMap(asRead(value), (decoded) => encode(decoded))
+      const fromRead = Option.flatMap(asRead(value), (decoded) => encodeNamed(decoded))
       if (Option.isSome(fromRead)) return fromRead.value
       return refuse(attr, value)
     }
@@ -373,6 +379,56 @@ export const storedFormOfDeclaration = (
  */
 export const storedNumericForm = (field: Schema.Top): ((value: unknown) => unknown) | undefined =>
   liftToKind(storedNumericKinds(field))
+
+/** The parse function of each declaration whose value can name a zone: a zone, a zoned date. */
+const ZONE_RUNS = new Set<unknown>(
+  [Schema.TimeZone, Schema.TimeZoneNamed, Schema.DateTimeZoned].map(
+    (schema) => (schema.ast as SchemaAST.Declaration).run,
+  ),
+)
+
+/** Whether a schema's Type side can hold a value naming a zone, wherever it sits. */
+const holdsZone = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (SchemaAST.isDeclaration(ast)) {
+    return ZONE_RUNS.has(ast.run) || ast.typeParameters.some((type) => holdsZone(type, seen))
+  }
+  if (SchemaAST.isSuspend(ast)) return holdsZone(ast.thunk(), seen)
+  if (SchemaAST.isUnion(ast)) return ast.types.some((member) => holdsZone(member, seen))
+  if (SchemaAST.isObjects(ast)) {
+    return (
+      ast.propertySignatures.some((property) => holdsZone(property.type, seen)) ||
+      ast.indexSignatures.some((index) => holdsZone(index.type, seen))
+    )
+  }
+  if (SchemaAST.isArrays(ast)) {
+    return [...ast.elements, ...ast.rest].some((element) => holdsZone(element, seen))
+  }
+  return false
+}
+
+/**
+ * For a field encoding a zone, or a date zoned in one, to text (Effect's `TimeZoneNamedFromString`,
+ * `TimeZoneFromString`, `DateTimeZonedFromString`, or an application's own): the text it stores, or
+ * one read back, with the zone named as the key form names it (case 3b, `zonesAsStored`). A unique
+ * sentinel and a time-series event's sort key are composed from the text stored, and Effect's codecs
+ * write the name a zone was made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`), so these take
+ * this text instead, which is the same on both. `undefined` for any other field, and from the function
+ * returned for text already so named, text naming no zone, and text the field doesn't decode.
+ */
+export const storedZoneText = (field: Schema.Top): ((value: unknown) => unknown) | undefined => {
+  if (!hasEncodingTransformation(field) || !holdsZone(SchemaAST.toType(field.ast))) return undefined
+  const codec = field as unknown as Schema.Codec<unknown, unknown>
+  const decode = Schema.decodeUnknownOption(codec)
+  const encode = Schema.encodeUnknownOption(codec)
+  return (value) => {
+    const decoded = decode(value)
+    if (Option.isNone(decoded) || !namesZone(decoded.value)) return undefined
+    const stored = encode(zonesAsStored(decoded.value))
+    return Option.isSome(stored) && !sameValue(stored.value, value) ? stored.value : undefined
+  }
+}
 
 /** {@link storedNumericForm}, from the kinds a field stores. */
 const liftToKind = (kinds: ReadonlySet<NumericKind>): ((value: unknown) => unknown) | undefined => {

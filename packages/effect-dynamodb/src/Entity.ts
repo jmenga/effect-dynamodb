@@ -60,6 +60,7 @@ import {
   refuseInexact,
   storedFormOfRead,
   storedNumericForm,
+  storedZoneText,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
@@ -4364,7 +4365,9 @@ const makeImpl = <
   /**
    * A unique field's value as `put` stored it, from a row read back: sentinels are composed from
    * the Encoded value, which for a field stored as `N` the unmarshaller may hand back as the other
-   * numeric kind (`storedNumericForm`). `undefined` when the value is already as stored.
+   * numeric kind (`storedNumericForm`). A zone's text names it as the key form does
+   * (`storedZoneText`), so `Equal` zones compose one sentinel on either Effect. `undefined` when the
+   * value is already as stored.
    */
   const storedSentinelValue = (() => {
     const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
@@ -4372,7 +4375,12 @@ const makeImpl = <
     return (field: string, value: unknown): unknown => {
       if (!forms.has(field)) {
         const fieldSchema = fields?.[field]
-        forms.set(field, fieldSchema === undefined ? undefined : storedNumericForm(fieldSchema))
+        forms.set(
+          field,
+          fieldSchema === undefined
+            ? undefined
+            : (storedNumericForm(fieldSchema) ?? storedZoneText(fieldSchema)),
+        )
       }
       return forms.get(field)?.(value)
     }
@@ -4384,6 +4392,7 @@ const makeImpl = <
    * schema, the value decoded through the field, as a read decodes it, and encoded again
    * (`storedFormOfRead`). `Schema.Unknown` decoded to a `Schema.BigInt` stored `5n`, which reads back
    * as `5`. Only a value read from a row is taken this way: a write's own value is the one it stores.
+   * A zone's text is named as the key form names it (`storedZoneText`), as a write's is.
    */
   const readSentinelValue = (() => {
     const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top)
@@ -4391,7 +4400,12 @@ const makeImpl = <
     return (field: string, value: unknown): unknown => {
       if (!forms.has(field)) {
         const fieldSchema = fields?.[field]
-        forms.set(field, fieldSchema === undefined ? undefined : storedFormOfRead(fieldSchema))
+        forms.set(
+          field,
+          fieldSchema === undefined
+            ? undefined
+            : (storedFormOfRead(fieldSchema) ?? storedZoneText(fieldSchema)),
+        )
       }
       return forms.get(field)?.(value)
     }
@@ -11937,7 +11951,8 @@ const makeImpl = <
             currentSk,
             KeyComposer.eventOrderByValue(
               schema,
-              encoded[orderByField],
+              // A zone's text named as the key form names it (`storedZoneText`).
+              storedSentinelValue(orderByField, encoded[orderByField]) ?? encoded[orderByField],
               appendKeyForm[orderByField],
             ),
           ),
@@ -18029,11 +18044,14 @@ export const bind = <
           const codec = field as unknown as Schema.Codec<unknown, unknown>
           const encode = Schema.encodeUnknownOption(codec)
           const decode = Schema.decodeUnknownOption(codec)
+          // A zone's text named as `append` names it in the event's key (`storedZoneText`).
+          const zoneText = storedZoneText(field)
+          const named = (e: unknown) => (zoneText === undefined ? e : (zoneText(e) ?? e))
           return (v: unknown): unknown => {
             const direct = encode(v)
-            if (Option.isSome(direct)) return direct.value
+            if (Option.isSome(direct)) return named(direct.value)
             const again = Option.flatMap(decode(v), (decoded) => encode(decoded))
-            return Option.isSome(again) ? again.value : v
+            return Option.isSome(again) ? named(again.value) : v
           }
         })()
 

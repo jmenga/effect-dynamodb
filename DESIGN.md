@@ -5090,9 +5090,13 @@ names a zone and one rule writes it, whichever Effect is installed.
   for a zone made fresh or read back from a map of either form, and it's what 4.1.3's
   `Equal` compares (`resolvedId` against `resolvedId ?? id`; 4.1.2's compares `id`), so
   two zones Effect holds equal have one name. Key text (`zonesAsStored`, also for a zone
-  in an `Option`, a `Result` or a zoned date), a unique sentinel (composed from the key
-  form), the ISO text of `DynamoModel.DateTimeZoned` and of a date stored as text
-  (`zonedIsoText`), an aggregate's comparison and every write take it from there. The
+  in an `Option`, a `Result` or a zoned date, and in the key form's case 3b, so a field
+  of a codec that encodes a zone to text keys the name too), a unique sentinel and a
+  time-series event's sort key (composed from the text stored, which `storedZoneText`
+  names again: `storedSentinelValue`, `readSentinelValue`, `append`, and a
+  `history().where()` bound), the ISO text of `DynamoModel.DateTimeZoned` and of a date
+  stored as text (`zonedIsoText`), an aggregate's comparison and every write take it
+  from there. The
   property test in `ZoneNames.test.ts` builds zones every way (fresh, as each Effect
   makes one, read back from either map) and holds equal ones to one key text, sentinel
   and ISO text.
@@ -5125,11 +5129,17 @@ other. This is the runtime's, not the library's, and the library doesn't change 
 Effect's own codecs are left as they are:
 `Schema.TimeZoneNamedFromString`, `Schema.TimeZoneFromString` and
 `Schema.DateTimeZonedFromString` write a zone made from an alias by the name it was
-made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`). `ZoneNames.test.ts` (both
+made from on 4.1.3 (`Etc/UTC` where 4.1.2 wrote `UTC`), and the attribute stores what
+they write, so it differs between the two (reads take both, and an equality condition
+or filter on it compares the stored string). Every key composed from it names the zone
+as above, so it's the same on both. `ZoneNames.test.ts` (both
 packages) makes 4.1.3's zone on the installed Effect's prototype and asserts the stored
 values literally, so it holds on either version, and `EffectValueTypes.test.ts` holds
 each of Effect's value types in each position (typed and untyped native attributes,
-packed, key text, aggregate comparison) to one literal table.
+packed, key text, aggregate comparison) to one literal table, and each of these codecs,
+given an alias zone made on the installed Effect, to one key text per position (sort
+key, index key, unique sentinel, event key, `history().where()`), with the attribute's
+text per version.
 
 **Custom declarations at write (`EDD-9126`).** A `Schema.instanceOf` and a duck-typed
 `Schema.declare` have the same AST, so `EDD-9125` can't judge them, and only values

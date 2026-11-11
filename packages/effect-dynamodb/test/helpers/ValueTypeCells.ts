@@ -202,3 +202,88 @@ export const cellsOf = (name: string): Effect.Effect<Record<string, Cell>> => {
     return cells
   }).pipe(Effect.provide(Main.layer({ name: "vt" })), Effect.provide(table.layer)) as never
 }
+
+/** Effect's string codecs for a zone and a zoned date, each given a zone made fresh from a name. */
+export const CODECS: Readonly<Record<string, Kind>> = Object.fromEntries(
+  (
+    [
+      ["TimeZoneNamedFromString", Schema.TimeZoneNamedFromString, false],
+      ["TimeZoneFromString", Schema.TimeZoneFromString, false],
+      ["DateTimeZonedFromString", Schema.DateTimeZonedFromString, true],
+    ] as const
+  ).flatMap(([codec, schema, dated]) =>
+    ["Etc/UTC", "Asia/Kolkata"].map(
+      (zone) =>
+        [
+          `${codec}, ${zone}`,
+          {
+            schema,
+            make: () =>
+              dated
+                ? DateTime.makeZonedUnsafe(0, { timeZone: zone })
+                : DateTime.zoneMakeNamedUnsafe(zone),
+          },
+        ] as const,
+    ),
+  ),
+)
+
+/**
+ * For one of {@link CODECS}: the attribute a typed field stores, and the key text each key composed
+ * from it holds: the primary sort key, an index's sort key, a unique sentinel's partition key and a
+ * time-series event's sort key (the codec as `orderBy`), and the events a `history().where()` bound
+ * equal to the value finds.
+ */
+export const codecCellsOf = (name: string): Effect.Effect<Record<string, Cell>> => {
+  const kind = CODECS[name]!
+  const model = Schema.Struct({
+    id: Schema.String,
+    k: kind.schema,
+    n: Schema.optional(Schema.String),
+  })
+  const Keyed = Entity.make({
+    model,
+    entityType: "C",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: ["k"] } },
+    indexes: {
+      byK: {
+        name: "gsi1",
+        pk: { field: "gsi1pk", composite: ["id"] },
+        sk: { field: "gsi1sk", composite: ["k"] },
+      },
+    },
+    unique: { u: ["k"] },
+  } as never)
+  const Series = Entity.make({
+    model,
+    entityType: "S",
+    primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+    timeSeries: { orderBy: "k", appendInput: model },
+  } as never)
+  const Main = Table.make({ schema, entities: { Keyed, Series } } as never) as any
+  const table = makeRecordingTable()
+  return Effect.gen(function* () {
+    const db: any = yield* DynamoClient.make({
+      entities: { Keyed, Series },
+      tables: { Main },
+    } as never)
+    yield* db.entities.Keyed.put({ id: "a", k: kind.make() }).asEffect()
+    const rows = [...table.items.values()] as Array<Record<string, any>>
+    const row = rows.find((one) => one.__edd_e__?.S === "C")!
+    const sentinel = rows.find((one) => one.__edd_e__?.S !== "C")!
+    table.items.clear()
+    yield* db.entities.Series.append({ id: "b", k: kind.make() }).asEffect()
+    const event = [...table.items.values()].find((one: any) => one.sk.S.includes("#e#")) as any
+    const bounded = yield* db.entities.Series.history({ id: "b" })
+      .where((t: any, { eq }: any) => eq(t.k, kind.make()))
+      .collect()
+    return {
+      typed: JSON.stringify(row.k),
+      sk: row.sk.S,
+      keyText: row.gsi1sk.S,
+      sentinel: sentinel.pk.S,
+      event: event.sk.S,
+      historyEq: `${bounded.length} event`,
+    }
+  }).pipe(Effect.provide(Main.layer({ name: "vt" })), Effect.provide(table.layer)) as never
+}

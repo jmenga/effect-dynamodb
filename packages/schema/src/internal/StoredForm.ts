@@ -257,6 +257,23 @@ export const zonesAsStored = (value: unknown): unknown => {
   return value
 }
 
+/**
+ * Whether a value names a zone ({@link zonesAsStored} takes it): a named zone, a date zoned in one, or
+ * an `Option` or a `Result` holding one.
+ */
+export const namesZone = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || isPlainObject(value)) return false
+  if (isZoneInstance(value)) return DateTime.isTimeZoneNamed(value)
+  if (isRealDate(value)) return DateTime.isZoned(value) && DateTime.isTimeZoneNamed(value.zone)
+  if (inherits(value, OPTION_MARKER) && Option.isOption(value)) {
+    return Option.isSome(value) && namesZone(value.value)
+  }
+  if (inherits(value, RESULT_MARKER) && Result.isResult(value)) {
+    return namesZone(Result.isSuccess(value) ? value.success : value.failure)
+  }
+  return false
+}
+
 /** A zoned date as ISO text with its zone's name, the name 4.1.2 gave it ({@link zonesAsStored}). */
 export const zonedIsoText = (date: DateTime.Zoned): string =>
   DateTime.formatIsoZoned(zonesAsStored(date) as DateTime.Zoned)

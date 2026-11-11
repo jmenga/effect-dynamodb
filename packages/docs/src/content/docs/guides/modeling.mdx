@@ -111,6 +111,8 @@ A union is read back by trying its members, so a stored value must not be claima
 
 A zoned field, either `DynamoModel.DateTimeZoned` or a self `Schema.DateTimeZoned`, is stored as an ISO string with its zone, and read back with the same zone: a named zone as `2025-01-01T19:00:00.000+09:00[Asia/Tokyo]`, an offset zone as `2025-01-01T15:00:00.000+05:00`. That holds wherever the field sits, on entities and aggregates. Versions up to 1.22.0 read an offset zone back as UTC. The stored form is unchanged. A named zone is written under the name `Intl` resolves it to, as Effect 4.1.2 named it, on any Effect 4.1: a zone made from `Etc/UTC` is stored as `[UTC]`.
 
+Effect's own string codecs, `Schema.DateTimeZonedFromString`, `Schema.TimeZoneNamedFromString` and `Schema.TimeZoneFromString`, are Effect's, and the library stores what they write. On Effect 4.1.3 they write a zone made from an alias by the name it was made from, where 4.1.2 wrote the name it resolves to, so the stored string for an alias zone differs after you upgrade Effect: `Etc/UTC` where 4.1.2 stored `UTC`, `…[Asia/Kolkata]` where it stored `…[Asia/Calcutta]`. Reads take both forms. Every key composed from such a field, a sort key, an index key, a unique sentinel or a time-series event's key, names the zone as 4.1.2 did, so it's the same on either Effect. An equality condition or filter on that attribute compares the stored string, so it matches only the form the row holds.
+
 Offsets that aren't whole minutes, such as historical local-mean-time offsets or a sub-minute `DateTime.zoneMakeOffset`, are rounded to the minute by Effect's ISO format, and the instant read back moves by the same amount. Earlier versions behaved the same way.
 
 #### Maps

@@ -8,8 +8,8 @@
  * it" is built on the installed Effect's own prototype, so it is one on either version.
  */
 import { describe, expect, it } from "@effect/vitest"
-import { Effect } from "effect"
-import { type Cell, cellsOf, KINDS } from "./helpers/ValueTypeCells.js"
+import { DateTime, Effect } from "effect"
+import { type Cell, CODECS, cellsOf, codecCellsOf, KINDS } from "./helpers/ValueTypeCells.js"
 
 const TABLE: Readonly<Record<string, Readonly<Record<string, Cell>>>> = {
   DateTimeUtc: {
@@ -195,6 +195,93 @@ describe("each value type, in each position, on every Effect version", () => {
     it.effect(name, () =>
       Effect.gen(function* () {
         expect(yield* cellsOf(name)).toEqual(TABLE[name])
+      }),
+    )
+  }
+})
+
+/** Whether the installed Effect is 4.1.3 or later: it gives a named zone a `resolvedId`. */
+const EFFECT_413 = Object.hasOwn(DateTime.zoneMakeNamedUnsafe("Etc/UTC"), "resolvedId")
+
+/**
+ * Effect's own string codecs for a zone and a zoned date, given a zone made fresh on the installed
+ * Effect from an alias or a renamed zone. The attribute is the codec's text, which Effect 4.1.3 writes
+ * with the name the zone was made from and 4.1.2 with the one `Intl` resolves it to: Effect's, and
+ * left as Effect writes it (reads take both). Every key composed from it, the primary sort key, an
+ * index's sort key, a unique sentinel and a time-series event's sort key, is the same on both, and a
+ * `history().where()` bound on it names the event's key.
+ */
+const CODEC_TABLE: Readonly<
+  Record<string, Readonly<{ typed: { "4.1.2": Cell; "4.1.3": Cell } } & Record<string, unknown>>>
+> = {
+  "TimeZoneNamedFromString, Etc/UTC": {
+    typed: { "4.1.2": '{"S":"UTC"}', "4.1.3": '{"S":"Etc/UTC"}' },
+    sk: "$vt#v1#c#k_utc",
+    keyText: "$vt#v1#c#k_utc",
+    sentinel: "$vt#v1#c.u#utc",
+    event: "$vt#v1#s#e#utc",
+    historyEq: "1 event",
+  },
+  "TimeZoneNamedFromString, Asia/Kolkata": {
+    typed: { "4.1.2": '{"S":"Asia/Calcutta"}', "4.1.3": '{"S":"Asia/Kolkata"}' },
+    sk: "$vt#v1#c#k_asia/calcutta",
+    keyText: "$vt#v1#c#k_asia/calcutta",
+    sentinel: "$vt#v1#c.u#asia/calcutta",
+    event: "$vt#v1#s#e#asia/calcutta",
+    historyEq: "1 event",
+  },
+  "TimeZoneFromString, Etc/UTC": {
+    typed: { "4.1.2": '{"S":"UTC"}', "4.1.3": '{"S":"Etc/UTC"}' },
+    sk: "$vt#v1#c#k_utc",
+    keyText: "$vt#v1#c#k_utc",
+    sentinel: "$vt#v1#c.u#utc",
+    event: "$vt#v1#s#e#utc",
+    historyEq: "1 event",
+  },
+  "TimeZoneFromString, Asia/Kolkata": {
+    typed: { "4.1.2": '{"S":"Asia/Calcutta"}', "4.1.3": '{"S":"Asia/Kolkata"}' },
+    sk: "$vt#v1#c#k_asia/calcutta",
+    keyText: "$vt#v1#c#k_asia/calcutta",
+    sentinel: "$vt#v1#c.u#asia/calcutta",
+    event: "$vt#v1#s#e#asia/calcutta",
+    historyEq: "1 event",
+  },
+  "DateTimeZonedFromString, Etc/UTC": {
+    typed: {
+      "4.1.2": '{"S":"1970-01-01T00:00:00.000+00:00[UTC]"}',
+      "4.1.3": '{"S":"1970-01-01T00:00:00.000+00:00[Etc/UTC]"}',
+    },
+    sk: "$vt#v1#c#k_1970-01-01t00:00:00.000+00:00[utc]",
+    keyText: "$vt#v1#c#k_1970-01-01t00:00:00.000+00:00[utc]",
+    sentinel: "$vt#v1#c.u#1970-01-01t00:00:00.000+00:00[utc]",
+    event: "$vt#v1#s#e#1970-01-01t00:00:00.000+00:00[utc]",
+    historyEq: "1 event",
+  },
+  "DateTimeZonedFromString, Asia/Kolkata": {
+    typed: {
+      "4.1.2": '{"S":"1970-01-01T05:30:00.000+05:30[Asia/Calcutta]"}',
+      "4.1.3": '{"S":"1970-01-01T05:30:00.000+05:30[Asia/Kolkata]"}',
+    },
+    sk: "$vt#v1#c#k_1970-01-01t05:30:00.000+05:30[asia/calcutta]",
+    keyText: "$vt#v1#c#k_1970-01-01t05:30:00.000+05:30[asia/calcutta]",
+    sentinel: "$vt#v1#c.u#1970-01-01t05:30:00.000+05:30[asia/calcutta]",
+    event: "$vt#v1#s#e#1970-01-01t05:30:00.000+05:30[asia/calcutta]",
+    historyEq: "1 event",
+  },
+}
+
+describe("Effect's zone string codecs, given an alias zone, on every Effect version", () => {
+  it("covers every codec and zone", () => {
+    expect(Object.keys(CODEC_TABLE)).toEqual(Object.keys(CODECS))
+  })
+  for (const name of Object.keys(CODECS)) {
+    it.effect(name, () =>
+      Effect.gen(function* () {
+        const { typed, ...keys } = CODEC_TABLE[name]!
+        expect(yield* codecCellsOf(name)).toEqual({
+          typed: typed[EFFECT_413 ? "4.1.3" : "4.1.2"],
+          ...keys,
+        })
       }),
     )
   }
