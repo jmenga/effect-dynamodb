@@ -1,0 +1,14 @@
+---
+"effect-dynamodb": minor
+"@effect-dynamodb/schema": minor
+"@effect-dynamodb/geo": minor
+"@effect-dynamodb/language-service": minor
+---
+
+`rekey`'s report, and the rows one run leaves, no longer depend on the order its visits meet the rows in. Each row, aggregate partition, event stream and unique reservation is judged once a run, by whichever visit reaches it first (the scan, or the move of a row it's in the way of), and counted once whoever judged it. A run no longer meets its own writes: the scan passes a row the run put, and `scanned` counts each row stored when the run met it once, so a row moved before its segment was scanned is still counted and a row written ahead of the scan isn't counted again, or as `unchanged`. Aggregates sharing a partition are placed by which row is stored at a key, not by which keys are held, so three whose escaped sort keys chain all move in one run, whatever the order. A dry run sees what its earlier decisions would have written, so it reports what the run does. Up to 1.40.0 a chain could report `moved: 1` plus `unchanged: 1` where the dry run said `moved: 2`, a sentinel cycle across constraints `sentinelsMoved: 0` after moving all four, and three segments `scanned: 3` against a dry run's 4. Over a table with nothing to move, a run sends exactly the requests 1.40.0 sent.
+
+A dry run with `repairIndexKeys` counts no key `repaired`: it writes none. 1.40.0 counted the keys it would have written.
+
+`rekey` judges unique-constraint sentinels no row holds, and counts them in the new `report.reservations` (`orphaned`, `undecided`, an entry for each), on every run. 1.40.0 counted them in `skipped.unrecognizedKey`, or, one naming a tombstone, not at all. `rekey({ releaseOrphanedReservations: true })` deletes the orphaned ones, so their values can be taken again: the reservations a delete, update or soft delete on 1.39 or earlier left for a unique value that read back otherwise than `put` keyed it, such as a `Schema.BigInt`. Each release is one transaction, conditioned on the sentinel and on the row it names as read, so a write that claims the value first wins. A move whose unique value's current key holds such a reservation is `taken`, as in 1.40.0, unless the option releases it first.
+
+Two writes a move used to lose now cancel it, so the row moves with them: a `reembed` landing on a versioned item with a vector index (the move also holds its vector attributes as read), and a write adding a field of an aggregate node declared as an annotated class or a union (the move holds each property the node's schema can store still absent). What no condition on the move can see is counted in the new `report.guardGaps`, with writes going on: `stamp` (a wide row guarded on its `updatedAt`), `sparse` (an item with a sparse map, guarded whole) and `strongest` (a row of a part-moved aggregate or stream). With `writesStopped: true` nothing is counted. Counting reads and writes nothing.

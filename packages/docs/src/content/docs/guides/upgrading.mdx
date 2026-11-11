@@ -441,6 +441,14 @@ An inverted index over strings is broken in 1.37.0 and 1.38.0: a value with a sp
 
 Index keys belong in [dedicated attributes](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute): an inverted index is supported, not encouraged.
 
+## Changes to `rekey` in 1.41
+
+- **One outcome whatever the order.** Each row, aggregate and stream is judged once a run, by whichever visit reaches it first: the scan, or the move of a row it's in the way of. Up to 1.40.0 both judged it, so what the report said, and in a chain of keys spelling each other's what moved, could depend on the order the scan returned rows in, on `segments` and on `concurrency`: a row could be reported twice or two ways, or counted `unchanged` after the run moved it. A dry run now sees what its earlier decisions would have written, so it reports what the run does. Over a table with nothing to move, a run sends exactly the requests 1.40.0 sent.
+- **`scanned`** counts each row stored when the run met it, once, and never a row the run put.
+- **A dry run with `repairIndexKeys` counts no key `repaired`.** 1.40.0 counted the keys it would have written.
+- **`reservations`** counts the unique-constraint sentinels no row holds, on every run, and [`releaseOrphanedReservations`](#releasing-orphaned-reservations) deletes them. 1.40.0 counted such a sentinel in `skipped.unrecognizedKey`, or, one naming a tombstone, not at all.
+- **Two writes a move used to lose now cancel it**: a `reembed` landing on a versioned item with a vector index, and a write adding a field of an aggregate node declared as an annotated class or a union. The rest are counted in [`guardGaps`](#writes-during-a-run).
+
 ## Changes to `rekey` in 1.40
 
 - **A write that adds a declared attribute to an aggregate row cancels its move.** The move is guarded on the row as read, as in 1.39.0, and now also on each attribute the row's entity type declares that the row didn't hold still being absent, so a write that sets one between `rekey`'s read and its move is moved with the row, as an entity's item already was. With no such attribute the request is 1.39.0's.
