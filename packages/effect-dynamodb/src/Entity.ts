@@ -14667,6 +14667,154 @@ const makeImpl = <
     !preserveUnique() && rowTargets(owner)?.kind === "tombstone"
 
   /**
+   * Does the live row at `owner`, a key a sentinel names, hold the sentinel at `at`: its values
+   * compose that key under some key text ({@link holdsSentinel}), or may, when nothing says. A
+   * tombstone without `preserveUnique` holds no reservation, so a sentinel naming its item that
+   * the item holds is the item's, even under the tombstone's other key text (`a b` escapes to
+   * where `a%20b` is stored raw), and only the item's pass moves it. Read only when such a
+   * tombstone finds a sentinel under its values' other key text, which a release that's run its
+   * soft deletes as it should never leaves.
+   */
+  const liveRowHolds = (
+    tableName: string,
+    owner: StoredKey,
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    at: SentinelKey,
+  ) =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      const { Item: live } = yield* client.getItem({
+        TableName: tableName,
+        Key: toAttributeMap(owner),
+        ConsistentRead: true,
+      })
+      return (
+        live !== undefined &&
+        live.__edd_e__?.S === entityType &&
+        rowTargets(live)?.kind === "item" &&
+        holdsSentinel(live, constraintName, constraintDef, sentinelKeyRecord(at)) !== "no"
+      )
+    })
+
+  /**
+   * Under `preserveUnique` an item's live row and each of its tombstones hold a sentinel, all
+   * naming the item's key, so a sentinel naming it can be any of theirs. `row`'s values compose
+   * `old` under other key text and `current` under the current text, and both hold a sentinel
+   * naming the item: one is `row`'s and the other another of the item's rows'. Each row's
+   * sentinel is under its current key or under another, and the keys the item's rows compose chain
+   * (one row's current key another's under other text), so along the chain the first key holding
+   * none says which way each row went: a gap on the `old` side means the rows there moved,
+   * `row` too, so `row`'s is at `current` (`settled`); otherwise `row`'s is at `old`, and the one
+   * at `current` is the next row's, under its other key text, which moves out first (that row).
+   * `undefined` when nothing in the chain says: both are `row`'s (`bothKeys`). Read only then: an
+   * item's rows reading each other's keys is what makes the chain.
+   */
+  const sameItemHolder = (
+    ctx: Rekey.RekeyRowContext,
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    row: StoredRow,
+    owns: (key: StoredKey) => boolean,
+    keys: {
+      readonly old: SentinelKey
+      readonly current: SentinelKey
+      /** The item keys the sentinels name, and the item's current key. */
+      readonly named: ReadonlyArray<StoredKey>
+    },
+  ): Effect.Effect<"settled" | StoredRow | undefined, DynamoClientError, DynamoClient> =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      const self = storedKeyOf(row)
+      const rows: Array<StoredRow> = []
+      const add = (other: StoredRow) => {
+        const at = storedKeyOf(other)
+        if (at === undefined || (self !== undefined && sameStoredKey(at, self))) return
+        if (rows.some((seen) => sameStoredKey(storedKeyOf(seen)!, at))) return
+        rows.push(other)
+      }
+      const named: Array<StoredKey> = []
+      for (const key of keys.named) {
+        if (!named.some((seen) => sameStoredKey(seen, key))) named.push(key)
+      }
+      for (const key of named) {
+        const { Item: live } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(key),
+          ConsistentRead: true,
+        })
+        if (live?.__edd_e__?.S === entityType && rowTargets(live)?.kind === "item") add(live)
+      }
+      const partitions = new Set<string>()
+      for (const key of named) {
+        if (partitions.has(String(key[rekeyPk]))) continue
+        partitions.add(String(key[rekeyPk]))
+        for (const tombstone of (yield* tombstonesOf(ctx.tableName, key)).rows) add(tombstone)
+      }
+      const valuesOf = (other: StoredRow) =>
+        toDomainView(fromAttributeMap(other) as globalThis.Record<string, unknown>)
+      const currentOf = (other: StoredRow): SentinelKey | undefined => {
+        try {
+          return composeUniqueSentinel(
+            schema,
+            entityType,
+            constraintName,
+            constraintDef,
+            valuesOf(other),
+            readSentinelValue,
+          )?.key
+        } catch {
+          return undefined
+        }
+      }
+      const namesItem = (held: StoredRow | undefined): boolean => {
+        const pk = held?._entity_pk?.S
+        const sk = held?._entity_sk?.S
+        if (pk === undefined || sk === undefined) return false
+        const key = keyAt(pk, sk)
+        return owns(key) || named.some((one) => sameStoredKey(one, key))
+      }
+      // Toward `old`: the row whose current key it is, then that row's other keys, and so on.
+      let at = keys.old
+      for (let step = 0; step <= rows.length; step++) {
+        const before = rows.find((other) => {
+          const now = currentOf(other)
+          return now !== undefined && sameSentinelKey(now, at)
+        })
+        if (before === undefined) break
+        const elsewhere = otherSentinelKeys(
+          constraintName,
+          constraintDef,
+          valuesOf(before),
+          before,
+          currentOf(before),
+          true,
+        ).first
+        let held: SentinelKey | undefined
+        for (const key of elsewhere) {
+          const { Item } = yield* client.getItem({
+            TableName: ctx.tableName,
+            Key: toAttributeMap(sentinelKeyRecord(key)),
+            ConsistentRead: true,
+          })
+          if (namesItem(Item)) {
+            held = key
+            break
+          }
+        }
+        // That row holds none under other text: it moved to `at`, and so did `row`.
+        if (held === undefined) return "settled"
+        at = held
+      }
+      // Toward `current`: the row whose other key text it is moves out first.
+      return rows.find(
+        (other) =>
+          !sameSentinelKey(currentOf(other) ?? keys.current, keys.current) &&
+          sentinelHeldAt(constraintName, constraintDef, valuesOf(other), other, keys.current, true),
+      )
+    })
+
+  /**
    * The writes that bring the unique sentinels of `values` to their current keys, naming `to`,
    * from consistent reads: a sentinel naming a key `owns` holds under other key text is put under
    * its current key and released under the old one; one under its current key naming another key
@@ -14822,58 +14970,51 @@ const makeImpl = <
             keys.mixes().filter((key) => !at.some((one) => sameSentinelKey(one, key))),
           )
         }
+        // A tombstone without `preserveUnique` holds no reservation: one its item's live row holds,
+        // which can be under this tombstone's other key text, is that row's, and moves with it.
+        if (
+          found !== undefined &&
+          kind === "tombstone" &&
+          !preserveUnique() &&
+          (yield* liveRowHolds(
+            ctx.tableName,
+            found.owner,
+            constraintName,
+            constraintDef,
+            found.key,
+          ))
+        ) {
+          continue
+        }
         if (found !== undefined) {
           if (heldNow !== undefined) {
             if (ownerIn(heldNow) !== undefined) {
-              refused(
-                "bothKeys",
-                constraintName,
-                found.key,
-                current,
-                "its sentinel's current key is also held by the item.",
-              )
-              continue
-            }
-            // With `releaseOrphanedReservations`, a sentinel no row holds is judged first, as the
-            // scan judges it, and released: its key is then free.
-            const currentKey = sentinelKeyRecord(current)
-            if (
-              ctx.releaseOrphanedReservations &&
-              (yield* judgeReservation(ctx, heldNow, constraintName, constraintDef, currentKey))
-                ._tag === "orphaned"
-            ) {
-              yield* judgeReservationRow(ctx, heldNow, constraintName, constraintDef, currentKey)
-            }
-            if (!ctx.vacated(toAttributeMap(currentKey))) {
-              // Another value's sentinel under other key text moves out first, with its row.
-              const holder = yield* sentinelOwnerRow(ctx.tableName, heldNow)
-              const holderNow =
-                holder === undefined
-                  ? undefined
-                  : sentinelKeyUnder(
-                      schema,
-                      constraintName,
-                      constraintDef,
-                      toDomainView(fromAttributeMap(holder) as globalThis.Record<string, unknown>),
-                    )
-              const stale =
-                holderNow !== undefined &&
-                (holderNow.pk !== current.pk || holderNow.sk !== current.sk)
-              if (!stale) {
+              // Both name the item: under `preserveUnique`, either can be another of its rows'.
+              const other = preserveUnique()
+                ? yield* sameItemHolder(ctx, constraintName, constraintDef, row, owns, {
+                    old: found.key,
+                    current,
+                    named: [found.owner, ownerIn(heldNow)!, to],
+                  })
+                : undefined
+              if (other === "settled") {
+                // Under its current key, by this run's move of it or an earlier one.
+                if (ctx.placed(toAttributeMap(sentinelKeyRecord(current)))) worked = true
+                continue
+              }
+              if (other === undefined) {
                 refused(
-                  "taken",
+                  "bothKeys",
                   constraintName,
                   found.key,
                   current,
-                  "its sentinel's current key is held by another item.",
+                  "its sentinel's current key is also held by the item.",
                 )
                 continue
               }
-              // The holder's sentinel moves out first, as a unit of its own: with its row when
-              // that row moves too, and otherwise by itself, so two rows holding each other's
-              // sentinel keys under different constraints don't wait on each other.
-              const judged = yield* holderSentinelOut(ctx, holder!, constraintName, current)
-              if (!ctx.vacated(toAttributeMap(currentKey))) {
+              // Another of the item's rows' sentinel under other key text: it moves out first.
+              const judged = yield* holderSentinelOut(ctx, other, constraintName, current)
+              if (!ctx.vacated(toAttributeMap(sentinelKeyRecord(current)))) {
                 refused(
                   judged === "loop" ? "contended" : "taken",
                   constraintName,
@@ -14881,9 +15022,64 @@ const makeImpl = <
                   current,
                   judged === "loop"
                     ? "sentinels under other key text hold each other's current keys in a loop."
-                    : "its sentinel's current key is held by another item.",
+                    : "its sentinel's current key is held by another of the item's rows.",
                 )
                 continue
+              }
+            } else {
+              // With `releaseOrphanedReservations`, a sentinel no row holds is judged first, as the
+              // scan judges it, and released: its key is then free.
+              const currentKey = sentinelKeyRecord(current)
+              if (
+                ctx.releaseOrphanedReservations &&
+                (yield* judgeReservation(ctx, heldNow, constraintName, constraintDef, currentKey))
+                  ._tag === "orphaned"
+              ) {
+                yield* judgeReservationRow(ctx, heldNow, constraintName, constraintDef, currentKey)
+              }
+              if (!ctx.vacated(toAttributeMap(currentKey))) {
+                // Another value's sentinel under other key text moves out first, with its row.
+                const holder = yield* sentinelOwnerRow(ctx.tableName, heldNow)
+                const holderNow =
+                  holder === undefined
+                    ? undefined
+                    : sentinelKeyUnder(
+                        schema,
+                        constraintName,
+                        constraintDef,
+                        toDomainView(
+                          fromAttributeMap(holder) as globalThis.Record<string, unknown>,
+                        ),
+                      )
+                const stale =
+                  holderNow !== undefined &&
+                  (holderNow.pk !== current.pk || holderNow.sk !== current.sk)
+                if (!stale) {
+                  refused(
+                    "taken",
+                    constraintName,
+                    found.key,
+                    current,
+                    "its sentinel's current key is held by another item.",
+                  )
+                  continue
+                }
+                // The holder's sentinel moves out first, as a unit of its own: with its row when
+                // that row moves too, and otherwise by itself, so two rows holding each other's
+                // sentinel keys under different constraints don't wait on each other.
+                const judged = yield* holderSentinelOut(ctx, holder!, constraintName, current)
+                if (!ctx.vacated(toAttributeMap(currentKey))) {
+                  refused(
+                    judged === "loop" ? "contended" : "taken",
+                    constraintName,
+                    found.key,
+                    current,
+                    judged === "loop"
+                      ? "sentinels under other key text hold each other's current keys in a loop."
+                      : "its sentinel's current key is held by another item.",
+                  )
+                  continue
+                }
               }
             }
           }
@@ -15488,7 +15684,10 @@ const makeImpl = <
       /**
        * A sentinel its owner's own pass moves after this visit — its owner isn't under its current
        * key, or it isn't under the key its owner's values compose now — is kept as counted, so that
-       * move doesn't count it again ({@link Rekey.RekeyRowContext.awaitsMove}).
+       * move doesn't count it again ({@link Rekey.RekeyRowContext.awaitsMove}). So is one under
+       * `preserveUnique` whose owner's values compose other key text too: it names the item, so it
+       * can be a tombstone's of the item, under that tombstone's other key text, which the
+       * tombstone's pass moves ({@link sameItemHolder}).
        */
       const leftToOwner = (sentinel: StoredRow, owner: StoredRow) => {
         const targets = rowTargets(owner)
@@ -15497,7 +15696,16 @@ const makeImpl = <
           targets === undefined ||
           ownerAt === undefined ||
           !sameStoredKey(ownerAt, targets.current) ||
-          !named(sentinel, owner, false, true)
+          !named(sentinel, owner, false, true) ||
+          (preserveUnique() &&
+            otherSentinelKeys(
+              constraintName,
+              constraintDef!,
+              toDomainView(fromAttributeMap(owner) as globalThis.Record<string, unknown>),
+              owner,
+              keyOf(sentinel),
+              false,
+            ).first.length > 0)
         ) {
           ctx.awaitsMove(sentinel)
         }
@@ -15540,8 +15748,11 @@ const makeImpl = <
       ) {
         return { skipped: { unrecognizedKey: 1 } }
       }
-      // No row holds it, as far as the scan's reads say. Without `reservations`, counted as 1.40.0
-      // counted it, with nothing more read; with it, judged as its unit, counted when it settles.
+      // No row its back-pointer names holds it, as far as the scan's reads say. A tombstone of the
+      // item can still move it, as its own or as one no row holds: kept as counted.
+      ctx.awaitsMove(fresh)
+      // Without `reservations`, counted as 1.40.0 counted it, with nothing more read; with it,
+      // judged as its unit, counted when it settles.
       if (!ctx.reservations) return { skipped: { unrecognizedKey: 1 } }
       yield* judgeReservationRow(ctx, fresh, constraintName, constraintDef, at)
       return {}

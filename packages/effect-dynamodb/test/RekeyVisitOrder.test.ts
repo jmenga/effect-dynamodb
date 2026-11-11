@@ -16,6 +16,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Layer, Schema } from "effect"
+import { TestClock } from "effect/testing"
 import * as Aggregate from "../src/Aggregate.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -23,6 +24,15 @@ import * as Table from "../src/Table.js"
 import { gatedLayer } from "./helpers/GatedClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
+import {
+  RESERVED,
+  REUSED_ROWS,
+  reservedOf,
+  reusedWorld,
+  SENTINELS_ON,
+  sentinelsOf,
+  writeReusedKeys,
+} from "./helpers/ReusedKeys.js"
 import { storedRows } from "./helpers/StoredRows.js"
 
 type Row = Record<string, AttributeValue>
@@ -232,5 +242,118 @@ describe.each([
         )
       }
     }
+  }
+})
+
+/** The rows of {@link writeReusedKeys}, as written with escaping off. */
+const reusedSeeded = Effect.gen(function* () {
+  const table = makeRecordingTable()
+  const off = reusedWorld(false)
+  yield* writeReusedKeys(off, TestClock.adjust("1 second")).pipe(
+    Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))),
+  )
+  return [...table.items.values()]
+})
+
+describe.each([
+  ["reporting", { reservations: true }],
+  ["leaving", {}],
+] as const)("rekey over keys used again after a delete reaches one outcome in one run, %s", (_, mode) => {
+  const first = new Map<string, unknown>()
+  for (const segments of [1, 2, 3]) {
+    for (const seed of [0, 1, 2, 3, 4, 5]) {
+      for (const concurrency of [1, 4]) {
+        it.effect(`${segments} segment(s), order ${seed}, ${concurrency} at once`, () =>
+          Effect.gen(function* () {
+            const rows = yield* reusedSeeded
+            const table = makeRecordingTable()
+            for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+            const on = reusedWorld(true)
+            const layer = Layer.merge(
+              gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+              on.MainTable.layer({ name: "t" }),
+            )
+            const options = { segments, concurrency, pageSize: 3, ...mode }
+            const runs = yield* Effect.gen(function* () {
+              const db = yield* on.client
+              const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
+              const untouched = storedOf(table.items.values())
+              const real = yield* db.tables.MainTable.rekey(options)
+              const after = storedOf(table.items.values())
+              const sentinels = sentinelsOf(table.items.values())
+              const again = yield* db.tables.MainTable.rekey(options)
+              // Every live value and every value a tombstone under `preserveUnique` holds is
+              // still reserved.
+              const taken = yield* reservedOf(db)
+              return { dry, untouched, real, after, sentinels, again, taken }
+            }).pipe(Effect.provide(layer))
+
+            expect(runs.untouched).toEqual(storedOf(rows))
+            expect(decided(runs.dry)).toEqual(decided(runs.real))
+            expect(runs.real.conflicts).toEqual([])
+            expect(rows).toHaveLength(REUSED_ROWS)
+            expect(runs.real.scanned).toBe(REUSED_ROWS)
+            // Each value's sentinel is under its current key, naming the item.
+            expect(runs.sentinels).toEqual(SENTINELS_ON)
+            expect(runs.taken).toEqual(RESERVED.map(() => "reserved"))
+            // A second run finds nothing to move.
+            expect(runs.again.sentinelsMoved).toBe(0)
+            expect(Object.values(runs.again.moved).every((n) => n === 0)).toBe(true)
+            expect(runs.again.conflicts).toEqual([])
+            // The same report and the same rows whatever the order.
+            const outcome = { report: decided(runs.real), rows: runs.after }
+            const seen = first.get("outcome")
+            if (seen === undefined) first.set("outcome", outcome)
+            else expect(outcome).toEqual(seen)
+          }),
+        )
+      }
+    }
+  }
+})
+
+describe("rekey under one setting throughout leaves a live item's sentinel to it", () => {
+  // `a%20b`'s tombstone holds `a b`, whose key text under the other setting is where the live
+  // item `a%2520b` holds `a%20b`, under the key its item's text has under that setting too.
+  for (const seed of [0, 1, 2, 3]) {
+    it.effect(`order ${seed}`, () =>
+      Effect.gen(function* () {
+        const table = makeRecordingTable()
+        const off = reusedWorld(false)
+        const layer = Layer.merge(
+          gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+          off.MainTable.layer({ name: "t" }),
+        )
+        const runs = yield* Effect.gen(function* () {
+          const db = yield* off.client
+          for (const entity of [db.entities.Softs, db.entities.Keeps]) {
+            yield* entity.put({ id: "a%20b", code: "a b" }).asEffect()
+            yield* entity.delete({ id: "a%20b" }).asEffect()
+            yield* entity.put({ id: "a%2520b", code: "a%20b" }).asEffect()
+          }
+          const before = storedOf(table.items.values())
+          const dry = yield* db.tables.MainTable.rekey({ pageSize: 2, dryRun: true })
+          const real = yield* db.tables.MainTable.rekey({ pageSize: 2 })
+          const after = storedOf(table.items.values())
+          const taken = yield* Effect.forEach([db.entities.Softs, db.entities.Keeps], (entity) =>
+            Effect.map(
+              Effect.exit(entity.put({ id: "second", code: "a%20b" }).asEffect()),
+              (exit) => exit._tag,
+            ),
+          )
+          const restored = yield* Effect.exit(
+            db.entities.Keeps.put({ id: "third", code: "a b" }).asEffect(),
+          )
+          return { before, dry, real, after, taken, restored: restored._tag }
+        }).pipe(Effect.provide(layer))
+        expect(decided(runs.dry)).toEqual(decided(runs.real))
+        expect(runs.real.sentinelsMoved).toBe(0)
+        expect(runs.real.conflicts).toEqual([])
+        expect(runs.after).toEqual(runs.before)
+        // Both live values stay reserved, and so does the one the `preserveUnique` tombstone holds.
+        expect(runs.taken).toEqual(["Failure", "Failure"])
+        expect(runs.restored).toBe("Failure")
+      }),
+    )
   }
 })

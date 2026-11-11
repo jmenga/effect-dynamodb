@@ -73,55 +73,59 @@ const keysOf = (items: Iterable<Item>) =>
   [...items].map((item) => `${item.pk!.S}|${item.sk!.S}`).sort()
 
 describe("rekey's journal", () => {
-  it.effect("keeps nothing for rows it doesn't move: untouched rows cost no entry", () =>
-    Effect.gen(function* () {
-      const on = world()
-      const PAGE = 25_000
-      const PAGES = 16
-      // Every other page is items under their current keys; the rest, another application's rows.
-      let page = 0
-      const client = mockDynamoClient({
-        scan: () =>
-          Effect.sync(() => {
-            const at = page++
-            const Items = Array.from({ length: PAGE }, (_, i) =>
-              at % 2 === 0 ? foreignRow(at * PAGE + i) : itemRow(at * PAGE + i, true),
-            )
-            return {
-              Items,
-              ...(page < PAGES && {
-                LastEvaluatedKey: { pk: Items[PAGE - 1]!.pk!, sk: Items[PAGE - 1]!.sk! },
-              }),
-            } as never
-          }),
-      })
-      let first = 0
-      let peak = 0
-      const report = yield* Effect.gen(function* () {
-        const db = yield* on.client
-        return yield* db.tables.MainTable.rekey({
-          journalCapacity: 1,
-          onProgress: () =>
+  it.effect(
+    "keeps nothing for rows it doesn't move: untouched rows cost no entry",
+    () =>
+      Effect.gen(function* () {
+        const on = world()
+        const PAGE = 25_000
+        const PAGES = 16
+        // Every other page is items under their current keys; the rest, another application's rows.
+        let page = 0
+        const client = mockDynamoClient({
+          scan: () =>
             Effect.sync(() => {
-              gc()
-              const used = process.memoryUsage().heapUsed
-              if (page === 1) first = used
-              else peak = Math.max(peak, used)
+              const at = page++
+              const Items = Array.from({ length: PAGE }, (_, i) =>
+                at % 2 === 0 ? foreignRow(at * PAGE + i) : itemRow(at * PAGE + i, true),
+              )
+              return {
+                Items,
+                ...(page < PAGES && {
+                  LastEvaluatedKey: { pk: Items[PAGE - 1]!.pk!, sk: Items[PAGE - 1]!.sk! },
+                }),
+              } as never
             }),
         })
-      }).pipe(
-        Effect.provide(
-          Layer.merge(Layer.succeed(DynamoClient, client), on.MainTable.layer({ name: "t" })),
-        ),
-      )
-      expect(report.scanned).toBe(PAGE * PAGES)
-      expect(report.unchanged).toBe((PAGE * PAGES) / 2)
-      expect(report.skipped.notLibrary).toBe((PAGE * PAGES) / 2)
-      // One entry at most, and none taken: nothing the run met is remembered.
-      expect(report.journal).toEqual({ capacity: 1, used: 0, full: false, inexact: [] })
-      // The heap holds nothing per row: 400,000 rows at 208 bytes each would be 79 MiB.
-      expect((peak - first) / 1048576).toBeLessThan(16)
-    }),
+        let first = 0
+        let peak = 0
+        const report = yield* Effect.gen(function* () {
+          const db = yield* on.client
+          return yield* db.tables.MainTable.rekey({
+            journalCapacity: 1,
+            onProgress: () =>
+              Effect.sync(() => {
+                gc()
+                const used = process.memoryUsage().heapUsed
+                if (page === 1) first = used
+                else peak = Math.max(peak, used)
+              }),
+          })
+        }).pipe(
+          Effect.provide(
+            Layer.merge(Layer.succeed(DynamoClient, client), on.MainTable.layer({ name: "t" })),
+          ),
+        )
+        expect(report.scanned).toBe(PAGE * PAGES)
+        expect(report.unchanged).toBe((PAGE * PAGES) / 2)
+        expect(report.skipped.notLibrary).toBe((PAGE * PAGES) / 2)
+        // One entry at most, and none taken: nothing the run met is remembered.
+        expect(report.journal).toEqual({ capacity: 1, used: 0, full: false, inexact: [] })
+        // The heap holds nothing per row: 400,000 rows at 208 bytes each would be 79 MiB.
+        expect((peak - first) / 1048576).toBeLessThan(16)
+      }),
+    // 400,000 rows and a collection per page: seconds on an idle machine, more under load.
+    120_000,
   )
 
   it.effect("under its capacity, counts exactly what it moved and met", () =>
@@ -208,64 +212,67 @@ describe("rekey's journal", () => {
       }),
   )
 
-  it.effect("moving large rows keeps none of them once each page is done", () =>
-    Effect.gen(function* () {
-      const on = world()
-      const count = 1_200
-      const width = 64 * 1024
-      const moved = new Set<number>()
-      const big = (n: number, current: boolean) =>
-        itemRow(n, current, String.fromCharCode(65 + (n % 26)).repeat(width))
-      const numberOf = (text: string) => Number(/#id_(\d+)/.exec(text)?.[1])
-      let page = 0
-      const client: DynamoClientService = mockDynamoClient({
-        scan: () =>
-          Effect.sync(() => {
-            const n = page++
-            return {
-              Items: [big(n, false)],
-              ...(page < count && { LastEvaluatedKey: { pk: { S: String(n) }, sk: { S: "x" } } }),
-            } as never
-          }),
-        getItem: (input) =>
-          Effect.sync(() => {
-            const text = input.Key!.pk!.S!
-            const n = numberOf(text)
-            const current = text.includes("%20")
-            return (moved.has(n) === current ? { Item: big(n, current) } : {}) as never
-          }),
-        transactWriteItems: (input) =>
-          Effect.sync(() => {
-            for (const item of input.TransactItems ?? []) {
-              if (item.Delete !== undefined) moved.add(numberOf(item.Delete.Key!.pk!.S!))
-            }
-            return {} as never
-          }),
-      })
-      let first = 0
-      let last = 0
-      const report = yield* Effect.gen(function* () {
-        const db = yield* on.client
-        return yield* db.tables.MainTable.rekey({
-          pageSize: 1,
-          concurrency: 1,
-          onProgress: () =>
+  it.effect(
+    "moving large rows keeps none of them once each page is done",
+    () =>
+      Effect.gen(function* () {
+        const on = world()
+        const count = 1_200
+        const width = 64 * 1024
+        const moved = new Set<number>()
+        const big = (n: number, current: boolean) =>
+          itemRow(n, current, String.fromCharCode(65 + (n % 26)).repeat(width))
+        const numberOf = (text: string) => Number(/#id_(\d+)/.exec(text)?.[1])
+        let page = 0
+        const client: DynamoClientService = mockDynamoClient({
+          scan: () =>
             Effect.sync(() => {
-              if (page !== 1 && page !== count) return
-              gc()
-              if (page === 1) first = process.memoryUsage().heapUsed
-              else last = process.memoryUsage().heapUsed
+              const n = page++
+              return {
+                Items: [big(n, false)],
+                ...(page < count && { LastEvaluatedKey: { pk: { S: String(n) }, sk: { S: "x" } } }),
+              } as never
+            }),
+          getItem: (input) =>
+            Effect.sync(() => {
+              const text = input.Key!.pk!.S!
+              const n = numberOf(text)
+              const current = text.includes("%20")
+              return (moved.has(n) === current ? { Item: big(n, current) } : {}) as never
+            }),
+          transactWriteItems: (input) =>
+            Effect.sync(() => {
+              for (const item of input.TransactItems ?? []) {
+                if (item.Delete !== undefined) moved.add(numberOf(item.Delete.Key!.pk!.S!))
+              }
+              return {} as never
             }),
         })
-      }).pipe(
-        Effect.provide(
-          Layer.merge(Layer.succeed(DynamoClient, client), on.MainTable.layer({ name: "t" })),
-        ),
-      )
-      expect(report.moved.item).toBe(count)
-      // 1,200 rows of 64 KiB are 75 MiB: the run keeps no row it moved.
-      expect(last - first).toBeLessThan(20 * 1048576)
-    }),
+        let first = 0
+        let last = 0
+        const report = yield* Effect.gen(function* () {
+          const db = yield* on.client
+          return yield* db.tables.MainTable.rekey({
+            pageSize: 1,
+            concurrency: 1,
+            onProgress: () =>
+              Effect.sync(() => {
+                if (page !== 1 && page !== count) return
+                gc()
+                if (page === 1) first = process.memoryUsage().heapUsed
+                else last = process.memoryUsage().heapUsed
+              }),
+          })
+        }).pipe(
+          Effect.provide(
+            Layer.merge(Layer.succeed(DynamoClient, client), on.MainTable.layer({ name: "t" })),
+          ),
+        )
+        expect(report.moved.item).toBe(count)
+        // 1,200 rows of 64 KiB are 75 MiB: the run keeps no row it moved.
+        expect(last - first).toBeLessThan(20 * 1048576)
+      }),
+    120_000,
   )
 
   it.effect("refuses a journalCapacity that isn't a positive integer up to 16,000,000", () =>
