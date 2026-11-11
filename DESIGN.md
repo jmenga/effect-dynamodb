@@ -1431,7 +1431,12 @@ changes in what is sent or stored. A Z-order dimension's `FilterExpression`
 compares the stored attribute, so its operands stay in the stored form. Rows
 holding no values were already keyed by the stored text: a unique sentinel holds
 it, and a projection's row tombstone and outbox items were keyed by it, so they
-keep their keys. An aggregate composes its own keys from domain values (one encode
+keep their keys. Turning `escapeKeys` on in the same pass, a row 1.39.0 keyed and
+one keyed by the stored text under the old text (the read model's removal
+tombstone, or a write's row beside 1.39.0's) move to one key: the doubled-text
+row's move first moves the other one there (`RowTargets.elsewhere`, `clearTarget`;
+a dry run judges it as if moved), so the second holds the key and 1.39.0's row is
+`taken` or `bothKeys`, whichever `rekey` reaches first. An aggregate composes its own keys from domain values (one encode
 for a root's composite, none for an edge's sort key), and only its own paths compose
 them, so it keeps 1.39.0's key form (`text139`) and every byte.
 

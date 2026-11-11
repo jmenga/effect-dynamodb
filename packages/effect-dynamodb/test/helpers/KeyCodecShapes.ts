@@ -16,8 +16,9 @@
 import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Schema, SchemaGetter } from "effect"
+import { Effect, Layer, Schema, SchemaGetter } from "effect"
 import * as Collection from "../../src/Collection.js"
+import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Query from "../../src/Query.js"
 import * as Table from "../../src/Table.js"
@@ -480,3 +481,29 @@ export const reads: ReadonlyArray<{
     expected: 1,
   },
 ]
+
+/**
+ * The client of `layer`, its scans handing back first the rows `first` picks: with `rekey`'s
+ * `concurrency: 1`, the order its handlers take them in.
+ */
+export const scanningFirst = <E, R>(
+  layer: Layer.Layer<DynamoClient, E, R>,
+  first: (row: Row) => boolean,
+): Layer.Layer<DynamoClient, E, R> =>
+  Layer.effect(
+    DynamoClient,
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      return {
+        ...client,
+        scan: (input: Parameters<typeof client.scan>[0]) =>
+          Effect.map(client.scan(input), (page) => ({
+            ...page,
+            Items: [
+              ...(page.Items ?? []).filter((row) => first(row as Row)),
+              ...(page.Items ?? []).filter((row) => !first(row as Row)),
+            ],
+          })),
+      }
+    }),
+  ).pipe(Layer.provide(layer))

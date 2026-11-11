@@ -14,6 +14,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import type * as Table from "../src/Table.js"
 import * as P from "./helpers/KeyCodecProjection.js"
+import * as Shapes from "./helpers/KeyCodecShapes.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 type Recording = ReturnType<typeof makeRecordingTable>
@@ -225,6 +226,80 @@ describe.each([
       expect(read.byMember.Effected?.moved.item).toBe(1)
       expect(at(table, w.rowKey.Removable)).toMatchObject({ __edd_e__: "Removable#tombstone" })
       expect(at(table, then.doubledKey.Removable)).toMatchObject({ __edd_e__: "Removable" })
+    }),
+  )
+
+  /** `rekey` of the read model's table, one row at a time, its scan handing `first`'s rows first. */
+  const rekeyInOrder = (table: Recording, first: (row: P.Row) => boolean, dryRun = false) =>
+    Effect.gen(function* () {
+      const db = yield* DynamoClient.make({
+        entities: { Removable: w.Removable, Effected: w.Effected },
+        tables: { EventsTable: w.EventsTable, ReadTable: w.ReadTable },
+      })
+      const report: Table.RekeyReport = yield* db.tables.ReadTable.rekey({
+        concurrency: 1,
+        dryRun,
+      })
+      return { ...report, capacity: undefined }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Shapes.scanningFirst(table.layer, first),
+          w.EventsTable.layer({ name: "events" }),
+          w.ReadTable.layer({ name: "read" }),
+        ),
+      ),
+    ) as Effect.Effect<Omit<Table.RekeyReport, "capacity">, unknown, never>
+
+  for (const [order, first] of P.removalOrders) {
+    it.effect(
+      `rekey puts the removal tombstone at the row's key, ${order}, and a rerun agrees`,
+      () =>
+        Effect.gen(function* () {
+          const table = holding([...f.final.events, ...f.final.read])
+          const report = yield* rekeyInOrder(table, first)
+          const leftover = {
+            member: "Removable",
+            kind: "item",
+            reason: "taken",
+            key: then.doubledKey.Removable,
+            target: w.rowKey.Removable,
+            message: "Another row holds its current key.",
+          }
+          expect(report.conflicts).toEqual([leftover])
+          expect(report.byMember.Removable?.moved).toEqual({
+            ...ZERO,
+            tombstone: written === now ? 0 : 1,
+          })
+          expect(report.byMember.Effected?.moved.item).toBe(1)
+          expect(at(table, w.rowKey.Removable)).toMatchObject({ __edd_e__: "Removable#tombstone" })
+          expect(at(table, then.doubledKey.Removable)).toMatchObject({ __edd_e__: "Removable" })
+          if (written !== now) expect(at(table, then.rowKey.Removable)).toBeUndefined()
+
+          const again = yield* rekeyInOrder(table, first)
+          expect(again.conflicts).toEqual([leftover])
+          expect(again.moved).toEqual(ZERO)
+        }),
+    )
+  }
+
+  it.effect("rekey reports and leaves the same in either order, and a dry run agrees", () =>
+    Effect.gen(function* () {
+      const [a, b] = P.removalOrders.map(() => holding([...f.final.events, ...f.final.read]))
+      const dry = [
+        yield* rekeyInOrder(a!, P.removalOrders[0][1], true),
+        yield* rekeyInOrder(b!, P.removalOrders[1][1], true),
+      ]
+      const reports = [
+        yield* rekeyInOrder(a!, P.removalOrders[0][1]),
+        yield* rekeyInOrder(b!, P.removalOrders[1][1]),
+      ]
+      expect(reports[0]).toEqual(reports[1])
+      expect(comparable(a!.items.values())).toEqual(comparable(b!.items.values()))
+      for (const run of dry) {
+        expect(run.conflicts).toEqual(reports[0]!.conflicts)
+        expect(run.moved).toEqual(reports[0]!.moved)
+      }
     }),
   )
 })

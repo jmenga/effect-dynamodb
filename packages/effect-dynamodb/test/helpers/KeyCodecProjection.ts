@@ -149,3 +149,9 @@ export const world = (setting: Setting) => {
     outboxPk: `$kp#v1#effected#orderid_x:${text}`,
   }
 }
+
+/** The two orders `rekey` can meet a read model's row and its removal tombstone in. */
+export const removalOrders = [
+  ["the read model's row first", (row: Row) => row.__edd_e__?.S === "Removable"],
+  ["its removal tombstone first", (row: Row) => row.__edd_e__?.S === "Removable#tombstone"],
+] as const

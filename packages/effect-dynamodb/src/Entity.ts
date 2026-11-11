@@ -12955,6 +12955,12 @@ const makeImpl = <
      * or what its values compose under another text, a numeric composite as either kind.
      */
     readonly isLive: (key: StoredKey) => boolean
+    /**
+     * For a row 1.39.0 keyed by a codec's doubled text (`keyForm139`): where its values' stored
+     * text puts the same row under each other text, from which another row (a read model's removal
+     * tombstone, or a write since) may move to `current` too ({@link clearTarget}).
+     */
+    readonly elsewhere: ReadonlyArray<StoredKey>
   }
 
   /** What a row's sort key says it is, for a row whose values compose no key to say it by. */
@@ -13010,8 +13016,9 @@ const makeImpl = <
         key: StoredKey,
         atOf: (reading: globalThis.Record<string, unknown>) => At,
         fields: ReadonlyArray<string>,
+        among: ReadonlyArray<globalThis.Record<string, unknown>> = readings,
       ) =>
-        readings.some((reading) => {
+        among.some((reading) => {
           const at = atOf(reading)
           return keyFormsOf().some(
             (form) =>
@@ -13046,12 +13053,27 @@ const makeImpl = <
         fields: ReadonlyArray<string> = primaryTextFields,
       ): RowTargets => {
         const current = atOf(rowKeyForm)(now, live, rowKeyForm)
+        const under139 = readings.length > 1 && !placed(stored, atOf, fields, [rowKeyForm])
         return {
           kind,
           current,
           old: sameStoredKey(stored, current) || placed(stored, atOf, fields) ? stored : undefined,
           live,
           isLive,
+          elsewhere: !under139
+            ? []
+            : keyFormsOf().flatMap((form) => {
+                try {
+                  const at = atOf(rowKeyForm)(
+                    form,
+                    KeyText136.composeAt(form, entityType, entityVersion, primary, rowKeyForm),
+                    rowKeyForm,
+                  )
+                  return sameStoredKey(at, current) || sameStoredKey(at, stored) ? [] : [at]
+                } catch {
+                  return []
+                }
+              }),
         }
       }
       const layoutOf = (reading: globalThis.Record<string, unknown>) =>
@@ -13249,6 +13271,35 @@ const makeImpl = <
         : {}
     })
 
+  /**
+   * The first row at one of `elsewhere` that moves to `to`, and that row as it would be there.
+   */
+  const movingThereToo = (
+    ctx: Rekey.RekeyRowContext,
+    elsewhere: ReadonlyArray<StoredKey>,
+    to: StoredKey,
+  ) =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      for (const key of elsewhere) {
+        const { Item: row } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(key),
+          ConsistentRead: true,
+        })
+        if (row === undefined) continue
+        const plan = isValueless(row) ? valuelessMove(row, { pk: rekeyPk, sk: rekeySk }) : undefined
+        if (typeof plan === "object" && sameStoredKey(plan.to, to)) {
+          return { row, at: plan.moved(row) }
+        }
+        const targets = plan === undefined ? rowTargets(row) : undefined
+        if (targets !== undefined && sameStoredKey(targets.current, to)) {
+          return { row, at: { ...row, ...toAttributeMap(to) } }
+        }
+      }
+      return undefined
+    })
+
   /** A row is left because what holds its current key has to move first, and can't. */
   const cantMoveHolder = (kind: RowKind, from: StoredKey, to: StoredKey) =>
     rekeyConflict(kind, "taken", from, to, "A row that can't move holds its current key.")
@@ -13258,6 +13309,11 @@ const makeImpl = <
    * under other key text) moves out first. A tally of what moved, or the
    * conflict that leaves the row where it is. `copy`: whether the row at `to`
    * is a copy of the moving one, which the move then only deletes (`twin`).
+   *
+   * `elsewhere` ({@link RowTargets.elsewhere}): a row 1.39.0 keyed by a codec's doubled text moves
+   * to `to` after a row there that moves there too, whichever the scan reaches first, so a read
+   * model's removal tombstone, not the row it removed, ends up at `to`, and the report is the
+   * same in every order. In a dry run nothing moves: that row is judged as if at `to`.
    */
   const clearTarget = (
     ctx: Rekey.RekeyRowContext,
@@ -13266,6 +13322,7 @@ const makeImpl = <
     to: StoredKey,
     depth: number,
     copy?: (held: StoredRow) => boolean,
+    elsewhere: ReadonlyArray<StoredKey> = [],
   ): Effect.Effect<
     | { readonly cleared: true; readonly tally: Rekey.RekeyTally }
     | { readonly cleared: false; readonly tally: Rekey.RekeyTally }
@@ -13275,11 +13332,29 @@ const makeImpl = <
   > =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
-      const { Item: held } = yield* client.getItem({
+      const { Item: atTarget } = yield* client.getItem({
         TableName: ctx.tableName,
         Key: toAttributeMap(to),
         ConsistentRead: true,
       })
+      const first =
+        atTarget === undefined && depth < Rekey.DISPLACE_DEPTH
+          ? yield* movingThereToo(ctx, elsewhere, to)
+          : undefined
+      if (first !== undefined) {
+        const tally = yield* Rekey.displace(ctx, (under) => rekeyRow(first.row, under, depth + 1))
+        if ((tally.conflicts ?? []).length > 0) {
+          return {
+            cleared: false,
+            tally: Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to)),
+          }
+        }
+        if (!ctx.dryRun) {
+          const after = yield* clearTarget(ctx, kind, from, to, depth, copy)
+          return { ...after, tally: Rekey.mergeTallies(tally, after.tally) }
+        }
+      }
+      const held = atTarget ?? first?.at
       if (held === undefined) return { cleared: true, tally: {} }
       const occupant = occupantOf(held, to)
       if (occupant === "same" && copy?.(held) === true) return { cleared: "twin", tally: {} }
@@ -13367,6 +13442,7 @@ const makeImpl = <
           to,
           depth,
           same === undefined ? undefined : (held) => sameSnapshotHeld(held, read!),
+          targets.elsewhere,
         )
         tally = Rekey.mergeTallies(tally, room.tally)
         if (room.cleared === "twin") {
@@ -13810,7 +13886,7 @@ const makeImpl = <
         if (targets?.kind !== "item" || !sameStoredKey(targets.current, to)) {
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
-        const room = yield* clearTarget(ctx, "item", from, to, depth)
+        const room = yield* clearTarget(ctx, "item", from, to, depth, undefined, targets.elsewhere)
         tally = Rekey.mergeTallies(tally, room.tally)
         if (!room.cleared) return tally
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
@@ -15137,6 +15213,13 @@ const makeImpl = <
         if (there !== undefined) {
           // Another value's row left at its current key moves out first.
           if (occupantOf(there, counted) !== "stale") {
+            // Or it is this row, moved there since the read by another row's move (counted then).
+            const { Item: left } = yield* client.getItem({
+              TableName: ctx.tableName,
+              Key: toAttributeMap(from),
+              ConsistentRead: true,
+            })
+            if (left === undefined) return tally
             return Rekey.mergeTallies(
               tally,
               rekeyConflict(kind, "taken", from, to, "Another row holds its current key."),

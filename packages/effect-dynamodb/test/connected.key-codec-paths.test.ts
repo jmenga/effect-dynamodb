@@ -428,11 +428,13 @@ describeConnected.each([
     )
   /**
    * Fresh event and read-model tables holding `rows`, each table `rekey`ed; then `body`, and the
-   * read model's rows.
+   * read model's rows. With `first`, the read model's `rekey` takes its rows one at a time, the
+   * rows `first` picks first.
    */
   const withTables = <A>(
     rows: { readonly events: ReadonlyArray<Row>; readonly read: ReadonlyArray<Row> },
     body: (readTable: string) => Effect.Effect<A, unknown, any>,
+    first?: (row: Row) => boolean,
   ) => {
     const suffix = `${Date.now()}-${tables++}`
     const names = { events: `key-codec-ev-${suffix}`, read: `key-codec-rm-${suffix}` }
@@ -466,7 +468,9 @@ describeConnected.each([
             entities: { Removable: w.Removable, Effected: w.Effected },
             tables: { EventsTable: w.EventsTable, ReadTable: w.ReadTable },
           })
-          const report: Table.RekeyReport = yield* db.tables.ReadTable.rekey()
+          const report: Table.RekeyReport = yield* db.tables.ReadTable.rekey(
+            first === undefined ? undefined : { concurrency: 1 },
+          )
           yield* db.tables.EventsTable.rekey({ streams: [w.Orders] })
           const result = yield* body(names.read)
           return { report, result, rows: yield* scan(names.read) }
@@ -480,7 +484,7 @@ describeConnected.each([
     ).pipe(
       Effect.provide(
         Layer.mergeAll(
-          ClientLayer,
+          first === undefined ? ClientLayer : Shapes.scanningFirst(ClientLayer, first),
           w.EventsTable.layer({ name: names.events }),
           w.ReadTable.layer({ name: names.read }),
         ),
@@ -535,22 +539,45 @@ describeConnected.each([
       }),
   )
 
-  it.effect("rekey leaves a row whose key 1.39.0's removal tombstoned, and reports it", () =>
-    Effect.gen(function* () {
-      const { report, rows } = yield* withTables(f.final, () => Effect.void)
-      expect(report.conflicts).toEqual([
-        {
-          member: "Removable",
-          kind: "item",
-          reason: "taken",
-          key: then.doubledKey.Removable,
-          target: w.rowKey.Removable,
-          message: expect.any(String),
-        },
-      ])
-      expect(report.byMember.Effected?.moved.item).toBe(1)
-      expect(at(rows, w.rowKey.Removable)?.__edd_e__).toEqual({ S: "Removable#tombstone" })
-      expect(at(rows, then.doubledKey.Removable)?.__edd_e__).toEqual({ S: "Removable" })
-    }),
-  )
+  for (const [order, first] of P.removalOrders) {
+    it.effect(
+      `rekey puts the removal tombstone at the row's key, ${order}, and a rerun agrees`,
+      () =>
+        Effect.gen(function* () {
+          const {
+            report,
+            result: again,
+            rows,
+          } = yield* withTables(
+            f.final,
+            () =>
+              Effect.gen(function* () {
+                const db = yield* DynamoClient.make({
+                  entities: { Removable: w.Removable, Effected: w.Effected },
+                  tables: { EventsTable: w.EventsTable, ReadTable: w.ReadTable },
+                })
+                return yield* db.tables.ReadTable.rekey({ concurrency: 1 })
+              }),
+            first,
+          )
+          const leftover = {
+            member: "Removable",
+            kind: "item",
+            reason: "taken",
+            key: then.doubledKey.Removable,
+            target: w.rowKey.Removable,
+            message: "Another row holds its current key.",
+          }
+          expect(report.conflicts).toEqual([leftover])
+          expect(report.byMember.Removable?.moved.tombstone).toBe(written === now ? 0 : 1)
+          expect(report.byMember.Removable?.moved.item).toBe(0)
+          expect(report.byMember.Effected?.moved.item).toBe(1)
+          expect(at(rows, w.rowKey.Removable)?.__edd_e__).toEqual({ S: "Removable#tombstone" })
+          expect(at(rows, then.doubledKey.Removable)?.__edd_e__).toEqual({ S: "Removable" })
+          if (written !== now) expect(at(rows, then.rowKey.Removable)).toBeUndefined()
+          expect(again.conflicts).toEqual([leftover])
+          expect(Object.values(again.moved).every((n) => n === 0)).toBe(true)
+        }),
+    )
+  }
 })

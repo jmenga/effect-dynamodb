@@ -513,6 +513,123 @@ describe.each([
 })
 
 /**
+ * An item, its version snapshot and a time series' event 1.39.0 wrote under `escapeKeys` off, keyed
+ * by the codec's doubled text, and the same three a write gave the stored text's key since (the
+ * second row a put writes beside one not yet moved): turning `escapeKeys` on, one pass moves both
+ * to one key. The write's row, the newer, is the one there after it, whichever the scan meets
+ * first; 1.39.0's is left and reported `bothKeys`, the same in either order, and again by a rerun.
+ */
+describe("1.39.0's rows and a write's since, moved by one pass to escapeKeys on", () => {
+  const off = Shapes.world("off")
+  const on = Shapes.world("on")
+  const withDb = <A>(
+    world: ReturnType<typeof Shapes.world>,
+    table: ReturnType<typeof makeRecordingTable>,
+    body: (db: any) => Effect.Effect<A, unknown, any>,
+    first?: (row: Shapes.Row) => boolean,
+  ) =>
+    Effect.flatMap(
+      DynamoClient.make({ entities: world.entities, tables: { Base: world.Base } }),
+      (db) => body(db),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          VectorSearchEmulation.layer(
+            first === undefined ? table.layer : Shapes.scanningFirst(table.layer, first),
+            { tables: { Base: world.Base } },
+          ),
+          world.Base.layer({ name: "kc" }),
+          Embedder.layerTest({ dimensions: 8 }),
+        ),
+      ),
+    ) as Effect.Effect<A, unknown, never>
+  const seeded = Effect.gen(function* () {
+    const table = makeRecordingTable({ indexes: Shapes.indexes })
+    for (const row of Shapes.fixture.off.rows) table.items.set(`${row.pk!.S}|${row.sk!.S}`, row)
+    yield* withDb(off, table, (db) =>
+      Effect.gen(function* () {
+        yield* db.entities.Docs.put({ docId: "Mi X", part: "P 1", code: "C 1", n: 9 }).asEffect()
+        yield* db.entities.Revs.put({ cardId: "Mi X", part: "P 1", n: 9 }).asEffect()
+        yield* db.entities.Readings.append({ sensorId: "Mi X", at: "T 2", n: 9 }).asEffect()
+      }),
+    )
+    return table
+  })
+  const doubled = (row: Shapes.Row) => row.pk?.S?.includes("x:x:") === true
+  const orders = [
+    ["1.39.0's rows first", doubled],
+    ["the write's rows first", (row: Shapes.Row) => !doubled(row)],
+  ] as const
+  /** `rekey`, one row at a time, `first`'s rows first; the report, its conflicts in key order. */
+  const rekeyInOrder = (
+    table: ReturnType<typeof makeRecordingTable>,
+    first: (row: Shapes.Row) => boolean,
+  ) =>
+    withDb(
+      on,
+      table,
+      (db) =>
+        Effect.map(
+          db.tables.Base.rekey({ concurrency: 1 }) as Effect.Effect<Table.RekeyReport>,
+          (report) => ({
+            ...report,
+            capacity: undefined,
+            conflicts: [...report.conflicts].sort((a, b) =>
+              JSON.stringify(a.key) < JSON.stringify(b.key) ? -1 : 1,
+            ),
+          }),
+        ),
+      first,
+    )
+  const read = (table: ReturnType<typeof makeRecordingTable>) =>
+    withDb(on, table, (db) =>
+      Effect.all({
+        doc: db.entities.Docs.get({ docId: "Mi X", part: "P 1" }),
+        rev: db.entities.Revs.get({ cardId: "Mi X", part: "P 1" }),
+        v1: db.entities.Revs.getVersion({ cardId: "Mi X", part: "P 1" }, 1),
+        reading: db.entities.Readings.get({ sensorId: "Mi X" }),
+        events: db.entities.Readings.history({ sensorId: "Mi X" }).collect(),
+      }),
+    ) as Effect.Effect<any>
+
+  for (const [order, first] of orders)
+    it.effect(`the write's rows are at their keys after it, ${order}, and a rerun agrees`, () =>
+      Effect.gen(function* () {
+        const table = yield* seeded
+        const report = yield* rekeyInOrder(table, first)
+        expect(report.conflicts.map((c) => [c.member, c.kind, c.reason])).toEqual([
+          ["Doc", "item", "bothKeys"],
+          ["Reading", "item", "bothKeys"],
+          ["Reading", "event", "bothKeys"],
+          ["Rev", "item", "bothKeys"],
+          ["Rev", "snapshot", "bothKeys"],
+        ])
+        expect(report.conflicts.every((c) => JSON.stringify(c.key).includes("x:x:"))).toBe(true)
+        const got = yield* read(table)
+        expect(got.doc.n).toBe(9)
+        expect(got.rev.n).toBe(9)
+        expect(got.v1.n).toBe(9)
+        expect(got.reading.n).toBe(9)
+        expect(got.events.find((e: { at: string }) => e.at === "T 2")?.n).toBe(9)
+
+        const again = yield* rekeyInOrder(table, first)
+        expect(again.conflicts).toEqual(report.conflicts)
+        expect(Object.values(again.moved).every((n) => n === 0)).toBe(true)
+      }),
+    )
+
+  it.effect("rekey reports and leaves the same in either order", () =>
+    Effect.gen(function* () {
+      const a = yield* seeded
+      const b = yield* seeded
+      const reports = [yield* rekeyInOrder(a, orders[0][1]), yield* rekeyInOrder(b, orders[1][1])]
+      expect(reports[0]).toEqual(reports[1])
+      expect(Shapes.comparable(a.items.values())).toEqual(Shapes.comparable(b.items.values()))
+    }),
+  )
+})
+
+/**
  * A geo index's partition key holds a codec `pkFilter` composite (`depot`): 1.39.0 keyed it encoded
  * once more (`fixtures/key-codec-geo-1.39.0.json`, in the geo package, whose `GeoSearch.test.ts`
  * searches it). `rekey` rewrites it in place to what a write gives it now.
