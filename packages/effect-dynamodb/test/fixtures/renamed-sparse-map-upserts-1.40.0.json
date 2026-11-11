@@ -1,0 +1,3018 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Entities over { id, note?: string, counts: Record<string, number> }: Plain and Stamped (timestamps: true) configure counts { storedAs: SparseMap(), field: 'sr' }, Unrenamed { storedAs: SparseMap() } with no rename. Each case starts from a row put or upsert created with { id: 'a', counts: { a: 1 } } (put stores the map whole as sr, a plain upsert stores the entry counts#a), or from no row, and sends one upsert. Recorded: its outcome (a result, or a failure's tag and the first line of its message), every request it sent (command and expression parts), every row of the table after it, and what get read back; UUIDs and timestamps are replaced by <token> and <time>. Never regenerate it: it is the record of what 1.40.0 did.",
+ "cases": {
+  "Plain, a row put created: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row put created: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row upsert created: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row upsert created: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   }
+  },
+  "Plain, a row upsert created: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row upsert created: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, a row upsert created: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Plain, no row: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     }
+    }
+   }
+  },
+  "Plain, no row: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   }
+  },
+  "Plain, no row: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {}
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {}
+    }
+   }
+  },
+  "Plain, no row: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Plain"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#plain#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#plain"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2
+     }
+    }
+   }
+  },
+  "Plain, no row: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Plain"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [],
+   "read": {
+    "fail": "ItemNotFound",
+    "says": ""
+   }
+  },
+  "Stamped, a row put created: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row put created: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row put created: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = if_not_exists(#u2, :u2), #u3 = :u3",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__",
+       "#u2": "createdAt",
+       "#u3": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Stamped"
+       },
+       ":u2": {
+        "S": "<time>"
+       },
+       ":u3": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row put created: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = if_not_exists(#u4, :u4), #u5 = :u5",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#u4": "createdAt",
+       "#u5": "updatedAt",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Stamped"
+       },
+       ":u4": {
+        "S": "<time>"
+       },
+       ":u5": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row put created: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "sr": {
+      "M": {
+       "a": {
+        "N": "1"
+       }
+      }
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row upsert created: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row upsert created: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row upsert created: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = if_not_exists(#u2, :u2), #u3 = :u3",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__",
+       "#u2": "createdAt",
+       "#u3": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Stamped"
+       },
+       ":u2": {
+        "S": "<time>"
+       },
+       ":u3": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row upsert created: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = if_not_exists(#u4, :u4), #u5 = :u5",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#u4": "createdAt",
+       "#u5": "updatedAt",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Stamped"
+       },
+       ":u4": {
+        "S": "<time>"
+       },
+       ":u5": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, a row upsert created: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, no row: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, no row: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, no row: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {},
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = if_not_exists(#u2, :u2), #u3 = :u3",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__",
+       "#u2": "createdAt",
+       "#u3": "updatedAt"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Stamped"
+       },
+       ":u2": {
+        "S": "<time>"
+       },
+       ":u3": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {},
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, no row: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3, #u4 = if_not_exists(#u4, :u4), #u5 = :u5",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#u4": "createdAt",
+       "#u5": "updatedAt",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Stamped"
+       },
+       ":u4": {
+        "S": "<time>"
+       },
+       ":u5": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Stamped"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "createdAt": {
+      "S": "<time>"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#stamped#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#stamped"
+     },
+     "updatedAt": {
+      "S": "<time>"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2
+     },
+     "createdAt": "<time>",
+     "updatedAt": "<time>"
+    }
+   }
+  },
+  "Stamped, no row: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = if_not_exists(#u3, :u3), #u4 = :u4",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#u3": "createdAt",
+       "#u4": "updatedAt",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Stamped"
+       },
+       ":u3": {
+        "S": "<time>"
+       },
+       ":u4": {
+        "S": "<time>"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [],
+   "read": {
+    "fail": "ItemNotFound",
+    "says": ""
+   }
+  },
+  "Unrenamed, a row put created: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, a row put created: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   }
+  },
+  "Unrenamed, a row put created: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, a row put created: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, a row put created: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, a row upsert created: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, a row upsert created: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   }
+  },
+  "Unrenamed, a row upsert created: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, a row upsert created: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2,
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, a row upsert created: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "1"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 1
+     }
+    }
+   }
+  },
+  "Unrenamed, no row: upsert({ counts: { b: 2 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "b": 2
+     }
+    }
+   }
+  },
+  "Unrenamed, no row: upsert({ counts: { a: 5 } })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#a",
+       "#u2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "5"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#a": {
+      "N": "5"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {
+      "a": 5
+     }
+    }
+   }
+  },
+  "Unrenamed, no row: upsert({ counts: {} })": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "counts": {}
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "id": {
+      "S": "a"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "counts": {}
+    }
+   }
+  },
+  "Unrenamed, no row: upsert({ note: 'n', counts: { b: 2 } }) condition notExists(t.note), which holds": {
+   "outcome": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2
+     }
+    }
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2, #u3 = :u3",
+      "ConditionExpression": "(attribute_not_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "note",
+       "#u2": "counts#b",
+       "#u3": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "S": "n"
+       },
+       ":u2": {
+        "N": "2"
+       },
+       ":u3": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Unrenamed"
+     },
+     "counts#b": {
+      "N": "2"
+     },
+     "id": {
+      "S": "a"
+     },
+     "note": {
+      "S": "n"
+     },
+     "pk": {
+      "S": "$sr#v1#unrenamed#id_a"
+     },
+     "sk": {
+      "S": "$sr#v1#unrenamed"
+     }
+    }
+   ],
+   "read": {
+    "ok": {
+     "id": "a",
+     "note": "n",
+     "counts": {
+      "b": 2
+     }
+    }
+   }
+  },
+  "Unrenamed, no row: upsert({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold": {
+   "outcome": {
+    "fail": "ConditionalCheckFailed",
+    "says": ""
+   },
+   "sent": [
+    {
+     "updateItem": {
+      "UpdateExpression": "SET #u0 = :u0, #u1 = :u1, #u2 = :u2",
+      "ConditionExpression": "(attribute_exists(#e0))",
+      "ExpressionAttributeNames": {
+       "#u0": "id",
+       "#u1": "counts#b",
+       "#u2": "__edd_e__",
+       "#e0": "note"
+      },
+      "ExpressionAttributeValues": {
+       ":u0": {
+        "S": "a"
+       },
+       ":u1": {
+        "N": "2"
+       },
+       ":u2": {
+        "S": "Unrenamed"
+       }
+      }
+     }
+    }
+   ],
+   "rows": [],
+   "read": {
+    "fail": "ItemNotFound",
+    "says": ""
+   }
+  }
+ }
+}

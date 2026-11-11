@@ -17,8 +17,9 @@
  *   answers its refusal on a row holding `sr` with a `ValidationError` (`EDD-9150`);
  * - asks a condition or a filter on an entry both ways, each beside the test of which the row holds.
  *
- * `put`, `upsert`, `Batch.write` and a transaction's put are sent as 1.40.0 sent them, and so is
- * every write naming no entry. `fixtures/renamed-sparse-map-1.40.0.json` holds what the published
+ * `put`, `Batch.write`, a transaction's put and a retained or unique `upsert` are sent as 1.40.0 sent
+ * them, and so is every write naming no entry. A plain `upsert` carries the same guard as an unread
+ * update (`RenamedSparseMapWrites.ts`). `fixtures/renamed-sparse-map-1.40.0.json` holds what the published
  * 1.40.0 did in each case (identical under `escapeKeys`); every case where 1.40.0 left the map as
  * the operation meant to leave it leaves the same rows here.
  */
@@ -187,7 +188,7 @@ const writes: ReadonlyArray<
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
-const normal = (value: unknown): any =>
+export const normal = (value: unknown): any =>
   JSON.parse(JSON.stringify(value ?? null), (_key, held) =>
     typeof held === "string" && (UUID.test(held) || held === "<uuid>")
       ? "<token>"
@@ -210,7 +211,7 @@ const partsOf = (input: Record<string, any>) =>
   Object.fromEntries(PARTS.filter((part) => input[part] !== undefined).map((p) => [p, input[p]]))
 
 /** A request as the capture recorded it: its command and expression parts, a transaction's per item. */
-const sentOf = (request: unknown): unknown => {
+export const sentOf = (request: unknown): unknown => {
   const [command, input] = Object.entries(request as Record<string, Record<string, any>>)[0]!
   return normal(
     input.TransactItems !== undefined
@@ -232,7 +233,7 @@ const sentOf = (request: unknown): unknown => {
 }
 
 /** An outcome as the capture recorded it: a result, or a failure's tag and its message's first line. */
-const outcomeOf = (exit: Exit.Exit<unknown, unknown>, length = 200): any => {
+export const outcomeOf = (exit: Exit.Exit<unknown, unknown>, length = 200): any => {
   if (Exit.isSuccess(exit)) return { ok: normal(exit.value) }
   const squashed = Cause.squash(exit.cause) as any
   const message = String(
@@ -247,7 +248,7 @@ const outcomeOf = (exit: Exit.Exit<unknown, unknown>, length = 200): any => {
 }
 
 const keyOf = (row: Row) => `${row.pk?.S}|${row.sk?.S}`
-const rowsOf = (rows: ReadonlyArray<Row>) =>
+export const rowsOf = (rows: ReadonlyArray<Row>) =>
   normal(
     [...rows]
       .sort((a, b) => (keyOf(a) < keyOf(b) ? -1 : 1))
@@ -303,8 +304,45 @@ const runCase = (
   })
 
 /** The commands a case sent, in order. */
-const commands = (sent: ReadonlyArray<unknown>) =>
+export const commands = (sent: ReadonlyArray<unknown>) =>
   sent.map((request) => Object.keys(request as object)[0])
+
+/**
+ * What a plain upsert writing an entry of the map does where 1.40.0 did `was`: the same request with
+ * `attribute_not_exists(sr)` beside its own condition, refused (`EDD-9150`, nothing written) on a
+ * row holding the map whole, and otherwise what 1.40.0 did.
+ */
+export const guardedUpsert = (
+  was: Captured,
+  before: ReadonlyArray<Row>,
+  says: string | undefined,
+  holdsWhole: boolean,
+): Captured => {
+  const [request] = was.sent as ReadonlyArray<any>
+  const update = request.updateItem
+  const sent = [
+    {
+      updateItem: {
+        ...update,
+        ConditionExpression:
+          update.ConditionExpression === undefined
+            ? "attribute_not_exists(#fm0)"
+            : `${update.ConditionExpression} AND attribute_not_exists(#fm0)`,
+        ExpressionAttributeNames: { ...update.ExpressionAttributeNames, "#fm0": "sr" },
+      },
+    },
+  ]
+  if (!holdsWhole) return { ...was, sent }
+  expect(says).toContain("[EDD-9150]")
+  expect(says).toContain("this upsert writes its entries")
+  return {
+    outcome: { fail: "ValidationError", says: says!.split("\n")[0]!.slice(0, 200) },
+    sent,
+    rows: before,
+    // What the row read before: 1.40.0's write changed nothing a read sees either.
+    read: was.read,
+  }
+}
 
 export const renamedSparseMapSuite = (open: OpenTable) => {
   for (const entity of ["Plain", "Retained", "Unique"]) {
@@ -417,10 +455,16 @@ export const renamedSparseMapSuite = (open: OpenTable) => {
       ]
       for (const [label, body] of puts) {
         const name = `${on}: ${label}`
-        it.effect(`${name}: sent as 1.40.0 sent it`, () =>
+        // A plain upsert is guarded on the row not holding the map whole (`RenamedSparseMapWrites.ts`).
+        const guarded = entity === "Plain" && label.startsWith("upsert")
+        it.effect(`${name}: ${guarded ? "guarded" : "sent as 1.40.0 sent it"}`, () =>
           Effect.gen(function* () {
-            const { captured } = yield* runCase(open, entity, form, body)
-            expect(captured).toEqual(fixture.cases[name])
+            const { captured, before, says } = yield* runCase(open, entity, form, body)
+            if (!guarded) {
+              expect(captured).toEqual(fixture.cases[name])
+              return
+            }
+            expect(captured).toEqual(guardedUpsert(fixture.cases[name]!, before, says, holdsWhole))
           }),
         )
       }

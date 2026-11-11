@@ -7,7 +7,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/NestedKeyEncodings.ts` (the last five against 1.40.0), `helpers/EntryInQueries.ts`.
+ * `helpers/RenamedSparseMapWrites.ts`, `helpers/NestedKeyEncodings.ts` (the last six against 1.40.0), `helpers/EntryInQueries.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -36,6 +36,7 @@ import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { optionalTransformDatesSuite } from "./helpers/OptionalTransformDates.js"
 import { pathClearSuite } from "./helpers/PathClears.js"
 import { renamedSparseMapSuite } from "./helpers/RenamedSparseMap.js"
+import { renamedSparseMapUpsertsSuite } from "./helpers/RenamedSparseMapWrites.js"
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
@@ -151,6 +152,10 @@ describeConnected("a pathRemove beside another clause in the same field", () => 
 
 describeConnected("a sparse map a field: rename stores whole", () => {
   renamedSparseMapSuite(openTable)
+})
+
+describeConnected("an upsert of a sparse map a field: rename stores whole", () => {
+  renamedSparseMapUpsertsSuite(openTable)
 })
 
 describeConnected("a path below a struct that renames its keys as they're stored", () => {

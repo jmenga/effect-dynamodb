@@ -2742,18 +2742,21 @@ const makeImpl = <
           }
         })
   /**
-   * Why an update that wrote the entries of renamed sparse map `field` as their own attributes,
-   * without reading the row, was refused: the row holds the map whole, where `put` stores it, and
-   * a read takes that in their place (#238).
+   * Why an update or an upsert that wrote the entries of renamed sparse map `field` as their own
+   * attributes, without reading the row, was refused: the row holds the map whole, where `put`
+   * stores it, and a read takes that in their place (#238).
    */
-  const renamedMapRefusal = (field: string): string => {
+  const renamedMapRefusal = (field: string, write: "update" | "upsert"): string => {
     const attribute = renamedMapAttribute(field)!
     return (
       `Sparse map "${field}" is stored whole under "${attribute}" on this row, as put stores ` +
-      `it, and this update writes its entries as attributes of their own without reading the ` +
-      `row: a read would take "${attribute}" in their place. Nothing was written. Send the ` +
-      `update in a transaction (Transaction.transactWrite), which reads the row and writes the ` +
-      `entries inside "${attribute}", or put the item whole. [EDD-9150]`
+      `it, and this ${write} writes its entries as attributes of their own without reading the ` +
+      `row: a read would take "${attribute}" in their place. Nothing was written. ` +
+      (write === "update"
+        ? `Send the update in a transaction (Transaction.transactWrite), which reads the row and ` +
+          `writes the entries inside "${attribute}", or put the item whole. [EDD-9150]`
+        : `Write the entries with an update in a transaction (Transaction.transactWrite), which ` +
+          `reads the row and writes them inside "${attribute}", or put the item whole. [EDD-9150]`)
     )
   }
   /**
@@ -11064,7 +11067,7 @@ const makeImpl = <
                 return new ValidationError({
                   entityType,
                   operation: "update",
-                  cause: renamedMapRefusal(wholeMap),
+                  cause: renamedMapRefusal(wholeMap, "update"),
                 })
               }
               return conditionRejection(
@@ -12362,6 +12365,9 @@ const makeImpl = <
           let counter = 0
           // Each written value's placeholders, for the key guards below.
           const placeholders = new Map<string, readonly [string, string]>()
+          // The sparse maps a `field:` rename stores whole whose entries this upsert writes as
+          // attributes of their own: guarded on the row not holding the map whole (#238).
+          const entriesWritten = new Set<string>()
 
           // The physical key attributes (`pk` / `sk`) live in `Key` and cannot
           // appear in an UpdateExpression. The COMPOSITE SOURCE fields are
@@ -12420,6 +12426,7 @@ const makeImpl = <
                 }
                 const nameKey = `#u${counter}`
                 names[nameKey] = `${sparse.prefix}#${k}`
+                if (renamedMapAttribute(attr) !== undefined) entriesWritten.add(attr)
                 if (hasNoStoredForm(v)) {
                   upsertRemoveClauses.push(nameKey)
                   counter++
@@ -12593,6 +12600,14 @@ const makeImpl = <
             keyGuards.push(`(attribute_not_exists(#kpk) OR (${stays.join(" AND ")}))`)
           }
           condParts.push(...keyGuards)
+          // An entry written as its own attribute is lost on a row holding its map whole, where a
+          // read takes the map in its place: such a row refuses the upsert (#238). The guard costs
+          // no request, and an entity without such a map sends what it always sent.
+          const formGuards = [...entriesWritten].map((field, i) => {
+            names[`#fm${i}`] = renamedMapAttribute(field)!
+            return `attribute_not_exists(#fm${i})`
+          })
+          condParts.push(...formGuards)
 
           const upsertInput: UpdateItemCommandInput = {
             TableName: tableName,
@@ -12601,8 +12616,9 @@ const makeImpl = <
             ExpressionAttributeNames: names,
             ExpressionAttributeValues: values,
             ConditionExpression: condParts.length > 0 ? condParts.join(" AND ") : undefined,
-            // The corruption guard needs the stored item, and so does a rejected key guard.
-            ...((systemFields.version || keyGuards.length > 0) && {
+            // The corruption guard needs the stored item, and so do a rejected key guard and a
+            // rejected form guard.
+            ...((systemFields.version || keyGuards.length > 0 || formGuards.length > 0) && {
               ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
             }),
             ReturnValues: "ALL_NEW",
@@ -12615,6 +12631,20 @@ const makeImpl = <
             if (isAwsConditionalCheckFailed(err.cause)) {
               const corrupt = versionCorruption(err.cause.Item, "upsert")
               if (corrupt !== undefined) return corrupt
+              const stored = err.cause.Item as globalThis.Record<string, unknown> | undefined
+              const wholeMap =
+                stored === undefined
+                  ? undefined
+                  : [...entriesWritten].find((field) =>
+                      Object.hasOwn(stored, renamedMapAttribute(field)!),
+                    )
+              if (wholeMap !== undefined) {
+                return new ValidationError({
+                  entityType,
+                  operation: "upsert",
+                  cause: renamedMapRefusal(wholeMap, "upsert"),
+                })
+              }
               if (keyGuards.length > 0 && err.cause.Item !== undefined) {
                 rejected.row = err.cause.Item as globalThis.Record<string, AttributeValue>
               }
