@@ -13,7 +13,10 @@
  * (a retained update after its read), even with a version the row isn't at; at a sparse map's
  * entry's property it didn't check it, so it kept the stored value where the row held the path,
  * stored `-1` where it didn't (a row that no longer reads), and refused a version the row isn't at
- * with `OptimisticLockError`.
+ * with `OptimisticLockError`. On a row that isn't there it refused the operand at a top-level
+ * attribute and a struct's property, and answered the update at a sparse map's entry's property as
+ * it answers it with any operand (`ItemNotFound`; `ConcurrentModification` for a transaction's
+ * update clearing a sparse map).
  */
 
 import { Schema } from "effect"
@@ -71,18 +74,26 @@ const REFUSED = "ValidationError (update.pathIfNotExists)"
 export const positions: ReadonlyArray<{
   readonly name: string
   readonly segments: ReadonlyArray<string | number>
-  /** What 1.40.0 did where the row held the path, where it lacked it, and at another version. */
-  readonly on140: { readonly here: string; readonly absent: string; readonly stale: string }
+  /**
+   * What 1.40.0 did where the row held the path, where it lacked it, at another version, and where
+   * the row isn't there.
+   */
+  readonly on140: {
+    readonly here: string
+    readonly absent: string
+    readonly stale: string
+    readonly missing: string
+  }
 }> = [
   {
     name: "a top-level attribute",
     segments: ["n"],
-    on140: { here: REFUSED, absent: REFUSED, stale: REFUSED },
+    on140: { here: REFUSED, absent: REFUSED, stale: REFUSED, missing: REFUSED },
   },
   {
     name: "a struct's property",
     segments: ["meta", "n"],
-    on140: { here: REFUSED, absent: REFUSED, stale: REFUSED },
+    on140: { here: REFUSED, absent: REFUSED, stale: REFUSED, missing: REFUSED },
   },
   {
     name: "a sparse map's entry's property",
@@ -91,6 +102,7 @@ export const positions: ReadonlyArray<{
       here: "written, value kept",
       absent: "stored -1, the row no longer reads",
       stale: "OptimisticLockError",
+      missing: "as with any operand",
     },
   },
 ]

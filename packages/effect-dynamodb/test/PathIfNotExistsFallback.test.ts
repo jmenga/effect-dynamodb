@@ -15,7 +15,8 @@
  *   operand's write differs from it by its operand and that condition alone.
  *
  * A version the update expects and the row isn't at is that refusal, on every path, whether or not
- * the row holds the path. Each name ends with what 1.40.0 did there (`helpers/PathIfNotExistsFallback.ts`).
+ * the row holds the path; a row that isn't there is answered as the update is with any operand
+ * (nothing is stored). Each name ends with what 1.40.0 did there (`helpers/PathIfNotExistsFallback.ts`).
  */
 
 import { it } from "@effect/vitest"
@@ -37,7 +38,7 @@ import { makeRecordingTable } from "./helpers/RecordingTable.js"
 const run = (
   path: (typeof paths)[number],
   segments: ReadonlyArray<string | number>,
-  id: "here" | "absent" | "orphan",
+  id: "here" | "absent" | "orphan" | "missing",
   value: unknown,
   transaction: boolean,
   expectedVersion?: number,
@@ -203,6 +204,26 @@ describe("pathIfNotExists with an operand a check refuses: refused only where it
           expect(got.unchanged).toBe(true)
         }),
     )
+  }
+
+  // A row that isn't there stores nothing: the update is answered as it is with any operand.
+  for (const path of paths) {
+    for (const position of positions) {
+      for (const transaction of [false, true]) {
+        it.effect(
+          `${path.name} | ${position.name} | ${transaction ? "in a transaction" : "alone"} | the row isn't there: answered as with an operand the checks take | 1.40.0: ${position.on140.missing}`,
+          () =>
+            Effect.gen(function* () {
+              const refused = yield* run(path, position.segments, "missing", -1, transaction)
+              const taken = yield* run(path, position.segments, "missing", 5, transaction)
+              expect(taken.ok).toBe(false)
+              expect(refused.failure?.tag).toBe(taken.failure?.tag)
+              expect(refused.unchanged).toBe(true)
+              expect(refused.read).toBeUndefined()
+            }),
+        )
+      }
+    }
   }
 
   // The version first: the operand's decision is the row's, at the version the caller expects.

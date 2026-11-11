@@ -3414,11 +3414,13 @@ write requiring the path, `attribute_exists(<path>)` beside its own
 (`ALL_OLD`); a missing parent fails that condition too, and is refused the same
 way. Where the row has the path the update is written and the stored value
 kept. A version the update expects and the row isn't at is refused first
-(`OptimisticLockError`), on every path, whether the row has the path or not. An
-operand the checks accept is sent as 1.40.0 sent it, with no condition added.
-1.40.0 refused these operands before sending (after a retained entity's read)
-at a position the write schema's walk knows, even where DynamoDB would have kept
-the stored value, and with `ValidationError` before `OptimisticLockError`; at a
+(`OptimisticLockError`), on every path, whether the row has the path or not; a
+row that isn't there stores nothing, and the update is answered as it is with
+any operand (`ItemNotFound`). An operand the checks accept is sent as 1.40.0
+sent it, with no condition added. 1.40.0 refused these operands before sending
+(after a retained entity's read) at a position the write schema's walk knows,
+even where DynamoDB would have kept the stored value, and with `ValidationError`
+before `OptimisticLockError` and `ItemNotFound`; at a
 sparse map's entry, which it didn't check, it stored them where the row lacked
 the path, leaving a row that no longer read. `PathIfNotExistsFallback.test.ts`
 and `connected.path-if-not-exists.test.ts` pin both outcomes on every path,

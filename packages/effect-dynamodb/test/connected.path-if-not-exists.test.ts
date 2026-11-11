@@ -4,8 +4,9 @@
  * takes (`helpers/PathIfNotExistsFallback.ts`), alone and in a transaction, at a top-level
  * attribute, a struct's property and a sparse map's entry's property. Where the row holds the
  * path, DynamoDB keeps the stored value and the update is written; where it lacks it, the update
- * is refused and the table is as it was. Each name ends with what 1.40.0 did there, measured on
- * DynamoDB Local.
+ * is refused and the table is as it was; where the row isn't there, nothing is stored, and the
+ * update is answered as it is with any operand. Each name ends with what 1.40.0 did there,
+ * measured on DynamoDB Local.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -58,9 +59,10 @@ let tables = 0
 const outcome = (
   path: (typeof paths)[number],
   segments: ReadonlyArray<string | number>,
-  id: "here" | "absent" | "orphan",
+  id: "here" | "absent" | "orphan" | "missing",
   transaction: boolean,
   expectedVersion?: number,
+  value: unknown = -1,
 ): Effect.Effect<Outcome, unknown> => {
   const { E, Main } = definitions(path)
   const tableName = `path-if-not-exists-${Date.now()}-${tables++}`
@@ -99,7 +101,7 @@ const outcome = (
         }
         const before = yield* scan
         const exit = yield* Effect.exit(
-          send(db, sent, segments, id, -1, transaction) as Effect.Effect<unknown, unknown>,
+          send(db, sent, segments, id, value, transaction) as Effect.Effect<unknown, unknown>,
         )
         const unchanged = JSON.stringify(yield* scan) === JSON.stringify(before)
         const read = yield* Effect.exit(db.entities.E.get({ id }))
@@ -163,6 +165,32 @@ describeConnected(
             expect(got.unchanged).toBe(true)
           }),
       )
+    }
+
+    for (const path of paths) {
+      for (const position of positions) {
+        for (const transaction of [false, true]) {
+          it.effect(
+            `${path.name} | ${position.name} | ${transaction ? "in a transaction" : "alone"} | the row isn't there: answered as with an operand the checks take | 1.40.0: ${position.on140.missing}`,
+            () =>
+              Effect.gen(function* () {
+                const refused = yield* outcome(path, position.segments, "missing", transaction)
+                const taken = yield* outcome(
+                  path,
+                  position.segments,
+                  "missing",
+                  transaction,
+                  undefined,
+                  5,
+                )
+                expect(taken.failure).toBeDefined()
+                expect(refused.failure?.tag).toBe(taken.failure?.tag)
+                expect(refused.unchanged).toBe(true)
+                expect(refused.read).toBeUndefined()
+              }),
+          )
+        }
+      }
     }
 
     const versioned = paths.find((path) => path.name.startsWith("versioned"))!
