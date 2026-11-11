@@ -691,6 +691,19 @@ export interface Entity<
 
   /** @internal Normalized vector index definitions keyed by logical name. */
   readonly _vectorIndexes: globalThis.Record<string, VectorIndexDefinition>
+  /** @internal `reembed`'s condition that its inputs are as it read them. */
+  readonly _reembedGuard: (
+    read: globalThis.Record<string, AttributeValue>,
+    definitions: ReadonlyArray<VectorIndexDefinition>,
+    update: {
+      readonly names: globalThis.Record<string, string>
+      readonly values: globalThis.Record<string, AttributeValue>
+    },
+  ) => {
+    readonly expression: string
+    readonly names: globalThis.Record<string, string>
+    readonly values: globalThis.Record<string, AttributeValue>
+  }
 
   /**
    * @internal `[EDD-9140]` for the attributes a table's configuration names (its TTL attribute):
@@ -4915,6 +4928,60 @@ const makeImpl = <
       fields.push(definition.vectorField, definition.partitionField)
     }
     return fields
+  }
+
+  /**
+   * `reembed`'s condition that what it embedded and composed is still as it read it (#240):
+   * `attribute_exists(#pk)` and, for each of `definitions`, every attribute holding a source field
+   * or a partition composite equal to the value read, or still absent. A write that changed any of
+   * them between `reembed`'s read and its write wrote its own vector, so it cancels `reembed`'s. A
+   * sparse map's entries are held as read; one added in between isn't seen. Held while they fit
+   * DynamoDB's limits on one expression beside `update`'s names and values: the rest are left out,
+   * never refused.
+   */
+  const reembedGuard = (
+    read: globalThis.Record<string, AttributeValue>,
+    definitions: ReadonlyArray<VectorIndexDefinition>,
+    update: {
+      readonly names: globalThis.Record<string, string>
+      readonly values: globalThis.Record<string, AttributeValue>
+    },
+  ): {
+    readonly expression: string
+    readonly names: globalThis.Record<string, string>
+    readonly values: globalThis.Record<string, AttributeValue>
+  } => {
+    const names: globalThis.Record<string, string> = {
+      "#pk": config.indexes.primary.pk.field,
+      ...update.names,
+    }
+    const values: globalThis.Record<string, AttributeValue> = { ...update.values }
+    let expression = "attribute_exists(#pk)"
+    const fields = [...new Set(definitions.flatMap((d) => [...d.sourceFields, ...d.partition]))]
+    const attrs = [
+      ...new Set(
+        fields.flatMap((field) => {
+          const sparse = Object.hasOwn(sparseFields, field) ? sparseFields[field] : undefined
+          if (sparse === undefined) return [resolveDbName(field)]
+          const entry = `${sparse.prefix}#`
+          return Object.keys(read)
+            .filter((attr) => attr.startsWith(entry))
+            .sort()
+        }),
+      ),
+    ]
+    for (const [i, attr] of attrs.entries()) {
+      const value = read[attr]
+      const clause = value === undefined ? `attribute_not_exists(#s${i})` : `#s${i} = :s${i}`
+      const nextNames = { ...names, [`#s${i}`]: attr }
+      const nextValues = value === undefined ? values : { ...values, [`:s${i}`]: value }
+      if (!expressionFits(`${expression} AND ${clause}`)) continue
+      if (!substitutionsFit(nextNames, nextValues)) continue
+      Object.assign(names, nextNames)
+      Object.assign(values, nextValues)
+      expression = `${expression} AND ${clause}`
+    }
+    return { expression, names, values }
   }
 
   /**
@@ -15967,6 +16034,7 @@ const makeImpl = <
     generatedId: config.generatedId as TGeneratedId,
     vectorIndexes: config.vectorIndexes as TVectorIndexes,
     _vectorIndexes: vectorIndexes,
+    _reembedGuard: reembedGuard,
     _refuseTableAttributes: refuseTableAttributes,
     _packedFields: Object.keys(packedFields),
     _packFields: packFields,
@@ -16313,6 +16381,7 @@ export const bind = <
                 if (storedSk !== liveSk) return false
 
                 const attributes: globalThis.Record<string, unknown> = {}
+                const embedded: Array<VectorIndexDefinition> = []
                 for (const [logicalName, definition] of vectorDefs) {
                   const partition = KeyComposer.tryComposeVectorPartition(
                     boundSchema,
@@ -16345,24 +16414,32 @@ export const bind = <
                   }
                   attributes[definition.partitionField] = partition
                   attributes[definition.vectorField] = vector
+                  embedded.push(definition)
                 }
                 if (Object.keys(attributes).length === 0) return false
 
-                const names: globalThis.Record<string, string> = { "#pk": primary.pk.field }
-                const values: globalThis.Record<string, AttributeValue> = {}
+                const setNames: globalThis.Record<string, string> = {}
+                const setValues: globalThis.Record<string, AttributeValue> = {}
                 const sets: Array<string> = []
                 let i = 0
                 for (const [field, value] of Object.entries(attributes)) {
-                  names[`#v${i}`] = field
-                  values[`:v${i}`] = toAttributeValue(value)
+                  setNames[`#v${i}`] = field
+                  setValues[`:v${i}`] = toAttributeValue(value)
                   sets.push(`#v${i} = :v${i}`)
                   i++
                 }
-                // Scan → embed → update is not atomic: an item can be hard-deleted
+                // Scan → embed → update is not atomic. An item can be hard-deleted
                 // between the scan page and this write, and an unconditional
                 // UpdateItem would resurrect it as a key-plus-vector fragment that
-                // decodes to nothing but still answers searches. Guard on the item
-                // still existing and treat the rejection as "skipped".
+                // decodes to nothing but still answers searches; and a write can
+                // change the text or partition this embedded, writing its own
+                // vector, which this one would overwrite with the old text's
+                // (#240). Guard on the item still existing with its inputs as read,
+                // and treat the rejection as "skipped": not retried, not counted.
+                const guard = entity._reembedGuard(marshalled, embedded, {
+                  names: setNames,
+                  values: setValues,
+                })
                 const update = {
                   TableName: tableName,
                   Key: {
@@ -16370,9 +16447,9 @@ export const bind = <
                     [primary.sk.field]: marshalled[primary.sk.field]!,
                   },
                   UpdateExpression: `SET ${sets.join(", ")}`,
-                  ConditionExpression: "attribute_exists(#pk)",
-                  ExpressionAttributeNames: names,
-                  ExpressionAttributeValues: values,
+                  ConditionExpression: guard.expression,
+                  ExpressionAttributeNames: guard.names,
+                  ExpressionAttributeValues: guard.values,
                 }
                 return yield* client.updateItem(update).pipe(
                   Effect.as(true),

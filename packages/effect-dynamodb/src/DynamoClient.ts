@@ -2262,7 +2262,9 @@ type EntityVectorAccessors<M extends Schema.Top, VI> =
          *
          * DynamoDB never recomputes a vector — this is the migration path when the
          * embedding model or the declared `source.fields` change. Returns the
-         * number of items whose vector was rewritten.
+         * number of items whose vector was rewritten. An item a write changed
+         * between the scan and the rewrite (a source field or a partition
+         * composite) is skipped: that write wrote its own vector.
          */
         readonly reembed: (options?: {
           readonly concurrency?: number | undefined

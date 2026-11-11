@@ -314,7 +314,7 @@ DynamoDB will never recompute a stored vector. When you change embedding model â
 const rewritten = yield* db.entities.Products.reembed({ concurrency: 4 })
 ```
 
-`reembed` scans the entity's items, re-derives the source text, embeds, and writes the vector back, returning the number of items rewritten. Version snapshots and soft-delete tombstones are skipped automatically.
+`reembed` scans the entity's items, re-derives the source text, embeds, and writes the vector back, returning the number of items rewritten. Version snapshots and soft-delete tombstones are skipped automatically. Each write holds the item's source fields and partition composites as `reembed` read them: a write that changed any of them in between wrote its own vector, so `reembed` leaves that item alone and doesn't count it. Up to 1.40.0 it overwrote that write's vector with the old text's.
 
 ## Lifecycle
 

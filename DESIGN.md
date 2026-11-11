@@ -6438,7 +6438,14 @@ like a GSI half whose composites are all primary-key members.
 **Out-of-band refresh.** `db.entities.Products.reembed({ concurrency })` streams
 the entity's items (Scan scoped by `__edd_e__`), re-derives source text, embeds,
 and writes the vector back. This is the migration path when the embedding model
-changes — DynamoDB will never recompute a vector for you.
+changes — DynamoDB will never recompute a vector for you. Each write is
+conditioned on the item existing with every attribute holding a source field or a
+partition composite as read (or still absent), as many as fit DynamoDB's limits on
+one expression (#240): a write that changed one in between wrote its own vector
+and partition, so `reembed`'s is cancelled, and the item is skipped, neither
+retried nor counted. A sparse map's entries are held as read; one added in between
+isn't seen. Up to 1.40.0 the condition was `attribute_exists(#pk)` alone, and such
+a write's vector was overwritten with the old text's.
 
 ### Lifecycle integration
 
