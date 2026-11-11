@@ -1373,7 +1373,7 @@ describe("[EDD-9134] a read model whose outbox is on another table, sharing its 
           OutboxTable.layer({ name: "o" }),
         ),
       ),
-    )
+    ) as Effect.Effect<void, unknown>
   })
 
   it.effect("EventStore.processBatch compares tables by the names its context gives them", () => {
@@ -2231,44 +2231,48 @@ describe("[EDD-9134] a date composite beside a label its key text can't spell", 
     ["DynamoModel.DateTimeZoned", DynamoModel.DateTimeZoned],
     ["DynamoModel.DateEpochSeconds", DynamoModel.DateEpochSeconds],
     ["an optional DynamoModel.DateString", Schema.optional(DynamoModel.DateString)],
-  ] as const)("a date as %s binds beside `at_x`, under either setting", ([, at]) =>
-    Effect.gen(function* () {
-      for (const w of [On, Off]) {
-        const bound = yield* datePair(w, [
-          [datedWith(at), "at"],
-          [Dated, "at_x"],
-        ]).bind
-        expect(bound).toEqual({ make: "binds", processBatch: "binds" })
-      }
-    }),
+  ] as const)(
+    "a date as %s binds beside `at_x`, under either setting",
+    ([, at]) =>
+      Effect.gen(function* () {
+        for (const w of [On, Off]) {
+          const bound = yield* datePair(w, [
+            [datedWith(at), "at"],
+            [Dated, "at_x"],
+          ]).bind
+          expect(bound).toEqual({ make: "binds", processBatch: "binds" })
+        }
+      }) as Effect.Effect<void, unknown>,
   )
 
-  it.effect("a date beside a string or a date of its name is still refused", () =>
-    Effect.gen(function* () {
-      for (const other of [Schema.String, Schema.DateTimeUtc, DynamoModel.DateTimeZoned]) {
-        for (const at of [Schema.DateTimeUtc, DynamoModel.DateTimeZoned]) {
-          const bound = yield* datePair(On, [
-            [datedWith(at), "at"],
-            [datedWith(other), "at"],
-          ]).bind
-          expect(bound.make).toContain(
-            `[EDD-9134] DynamoClient.make: "A" writes its projection's outbox items into another ` +
-              `table ("o"), where "B" writes its own under the same key space (partition keys ` +
-              `starting "$dates#v1#ledger#at_"`,
-          )
-          expect(bound.processBatch).toContain("[EDD-9134] EventStore.processBatch:")
+  it.effect(
+    "a date beside a string or a date of its name is still refused",
+    () =>
+      Effect.gen(function* () {
+        for (const other of [Schema.String, Schema.DateTimeUtc, DynamoModel.DateTimeZoned]) {
+          for (const at of [Schema.DateTimeUtc, DynamoModel.DateTimeZoned]) {
+            const bound = yield* datePair(On, [
+              [datedWith(at), "at"],
+              [datedWith(other), "at"],
+            ]).bind
+            expect(bound.make).toContain(
+              `[EDD-9134] DynamoClient.make: "A" writes its projection's outbox items into another ` +
+                `table ("o"), where "B" writes its own under the same key space (partition keys ` +
+                `starting "$dates#v1#ledger#at_"`,
+            )
+            expect(bound.processBatch).toContain("[EDD-9134] EventStore.processBatch:")
+          }
         }
-      }
-      // Two epochs, or an epoch beside a number: a number's text.
-      const epoch = DynamoModel.configure(Dated, { at: { storedAs: DynamoModel.DateEpochMs } })
-      for (const other of [epoch, datedWith(Schema.Number)]) {
-        const bound = yield* datePair(On, [
-          [epoch, "at"],
-          [other, "at"],
-        ]).bind
-        expect(bound.make).toContain("[EDD-9134] DynamoClient.make:")
-      }
-    }),
+        // Two epochs, or an epoch beside a number: a number's text.
+        const epoch = DynamoModel.configure(Dated, { at: { storedAs: DynamoModel.DateEpochMs } })
+        for (const other of [epoch, datedWith(Schema.Number)]) {
+          const bound = yield* datePair(On, [
+            [epoch, "at"],
+            [other, "at"],
+          ]).bind
+          expect(bound.make).toContain("[EDD-9134] DynamoClient.make:")
+        }
+      }) as Effect.Effect<void, unknown>,
   )
 })
 

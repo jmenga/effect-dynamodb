@@ -23,24 +23,41 @@ describe("a sparse checkpoint map's entries beside another role's attribute", ()
     owner: Schema.optional(Schema.String),
   })
 
+  const sparse = { storedAs: DynamoModel.SparseMap({ prefix: "p" }) }
+  const primaryKey = {
+    pk: { field: "pk", composite: ["id"] },
+    sk: { field: "sk", composite: [] },
+  } as const
+  const loads = {
+    rev: () =>
+      Entity.make({
+        model: DynamoModel.configure(Model, { checkpoints: sparse, rev: { field: "p#rev" } }),
+        entityType: "Row",
+        primaryKey,
+      }),
+    version: () =>
+      Entity.make({
+        model: DynamoModel.configure(Model, {
+          checkpoints: sparse,
+          version: { field: "p#version" },
+        }),
+        entityType: "Row",
+        primaryKey,
+      }),
+    owner: () =>
+      Entity.make({
+        model: DynamoModel.configure(Model, { checkpoints: sparse, owner: { field: "p#owner" } }),
+        entityType: "Row",
+        primaryKey,
+      }),
+  }
+
   it.each([
     ["revision", "rev"],
     ["checkpoint", "version"],
     ["checkpoint owner", "owner"],
   ] as const)("a %s stored as an entry's attribute is refused at load", (_role, field) => {
-    expect(() =>
-      Entity.make({
-        model: DynamoModel.configure(Model, {
-          checkpoints: { storedAs: DynamoModel.SparseMap({ prefix: "p" }) },
-          [field]: { field: `p#${field}` },
-        }),
-        entityType: "Row",
-        primaryKey: {
-          pk: { field: "pk", composite: ["id"] },
-          sk: { field: "sk", composite: [] },
-        },
-      }),
-    ).toThrow(
+    expect(loads[field]).toThrow(
       `[EDD-9140] Entity "Row": sparse map "checkpoints" stores each entry as "p#<key>", and a ` +
         `row's reader takes "p#${field}", the attribute the field "${field}" is stored in, as its ` +
         `entry "${field}".`,
