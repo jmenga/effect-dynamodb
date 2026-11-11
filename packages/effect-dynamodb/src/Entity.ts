@@ -1124,7 +1124,7 @@ export interface Entity<
   readonly _overTombstone: (
     item: globalThis.Record<string, unknown>,
   ) => Effect.Effect<
-    Option.Option<{ readonly guard: ConditionInput; readonly token: RawCondition | undefined }>,
+    Option.Option<{ readonly guard: ConditionInput; readonly term: RawCondition | undefined }>,
     DynamoClientError,
     DynamoClient | TableConfig
   >
@@ -8134,15 +8134,9 @@ const makeImpl = <
           // renames and sparse flattening, before marshalling, so every size
           // measured from here on is the stored size.
           yield* packFields(item, operation)
-          // A projection's write (#237): its library attributes and carried bookkeeping, as
-          // stored.
+          // A projection's write (#237): its library attributes (the row token), as stored.
           const projected = opts.projectionWrite
-          if (projected !== undefined) {
-            for (const [name, value] of Object.entries(projected.fill ?? {})) {
-              if (!Object.hasOwn(item, name)) item[name] = value
-            }
-            Object.assign(item, projected.attributes)
-          }
+          if (projected !== undefined) Object.assign(item, projected.attributes)
 
           // The caller's condition, ANDed onto `create`'s not-exists guard —
           // a guard no `.condition()` can replace (#133). `upsert`'s create
@@ -8174,7 +8168,7 @@ const makeImpl = <
                   resolveDbName,
                   storedFormAt,
                 ),
-                over.value.token,
+                over.value.term,
               )
             }
           }
@@ -8210,6 +8204,7 @@ const makeImpl = <
               ConditionExpression?: string
               ExpressionAttributeNames?: globalThis.Record<string, string>
               ExpressionAttributeValues?: globalThis.Record<string, AttributeValue>
+              ReturnValuesOnConditionCheckFailure?: "ALL_OLD"
             } = {
               TableName: tableName,
               Item: marshalledItem,
@@ -8220,6 +8215,9 @@ const makeImpl = <
               if (Object.keys(userCondition.values).length > 0) {
                 putInput.ExpressionAttributeValues = userCondition.values
               }
+              if (projected?.returnOld === true) {
+                putInput.ReturnValuesOnConditionCheckFailure = "ALL_OLD"
+              }
             }
             yield* client.putItem(putInput).pipe(
               Effect.mapError((err): DynamoClientError | ConditionalCheckFailed => {
@@ -8227,6 +8225,11 @@ const makeImpl = <
                   return new ConditionalCheckFailed({
                     entityType,
                     key: encoded as globalThis.Record<string, unknown>,
+                    ...(projected?.returnOld === true && {
+                      current: Option.fromNullishOr(
+                        (err.cause as { readonly Item?: unknown }).Item,
+                      ),
+                    }),
                   })
                 }
                 return err

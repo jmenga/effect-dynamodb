@@ -1569,17 +1569,20 @@ describe("a source's second instance falling back to a sparse checkpoint map", (
 })
 
 describe("a read model with one projection", () => {
-  it.effect("sends and stores what 1.39.0 did, around its tombstones", () => {
-    const { run } = scenario(
-      { DynamoSchema, Table, Entity, EventStore, Transaction, DynamoClient },
-      { events: "events", read: "read" },
-    )
-    return Effect.gen(function* () {
-      const sent = yield* run(InMemoryClient)
-      expectAsFixture(
-        sent,
-        [...store.entries()].filter(([key]) => key.startsWith("read|")).map(([, item]) => item),
+  it.effect(
+    "sends and stores what 1.39.0 did, around its tombstones, the create guard exact",
+    () => {
+      const { run } = scenario(
+        { DynamoSchema, Table, Entity, EventStore, Transaction, DynamoClient },
+        { events: "events", read: "read" },
       )
-    })
-  })
+      return Effect.gen(function* () {
+        const sent = yield* run(InMemoryClient)
+        expectAsFixture(
+          sent,
+          [...store.entries()].filter(([key]) => key.startsWith("read|")).map(([, item]) => item),
+        )
+      })
+    },
+  )
 })

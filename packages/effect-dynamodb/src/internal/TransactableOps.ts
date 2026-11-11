@@ -301,11 +301,18 @@ export const projectionTtlConflict = (
  * naming it is refused when it writes (`projectionTtlConflict`), and one defined after a tombstone
  * was written would otherwise carry its expiry onto the row.
  *
- * On a read model whose rows carry the row token (`rowTokened`), a tombstone also holds the
- * bookkeeping of the other projections that had written the row (#237): those of projections
- * without `removal` are carried after, each attribute the others haven't named, in the same way.
- * The row gets a fresh token, keeping the tombstone's record of its writers, and `token` is the
- * term naming the tombstone's own (`rowTokenTerm`), so a tombstone written since fails it.
+ * Each value is stored as the row stores any value of the field: a sparse map as its entries (a
+ * tombstone holds it whole, as 1.39.0's did), an entry whose key sparse storage can't hold left
+ * off, never the whole map (#237).
+ *
+ * On a read model whose rows carry the row token (`rowTokened`), or when the tombstone holds one,
+ * it also holds the bookkeeping of the other projections that had written the row (#237): those of
+ * projections without `removal` are carried after, each attribute the others haven't named, in
+ * the same way. The row gets a fresh token recording the projections whose bookkeeping it holds,
+ * and `term` names the tombstone's own (`rowTokenTerm`), so a tombstone written since fails it.
+ * Without a token, `term` names every value carried as the tombstone holds it (or its absence):
+ * the removal stamp alone has a millisecond's resolution, so a row written over the tombstone and
+ * removed again within one would pass it, and its newer checkpoints be lost to the older ones.
  */
 export const overTombstone = (
   entity: {
@@ -317,12 +324,13 @@ export const overTombstone = (
       }
     }
     readonly _renameToDynamo: (item: Record<string, unknown>) => void
+    readonly _serializeSparseFields: (item: Record<string, unknown>) => void
   },
   client: Pick<DynamoClientService, "getItem">,
   table: TableConfig,
   item: Record<string, unknown>,
 ): Effect.Effect<
-  Option.Option<{ readonly guard: ConditionInput; readonly token: RawCondition | undefined }>,
+  Option.Option<{ readonly guard: ConditionInput; readonly term: RawCondition | undefined }>,
   DynamoClientError
 > =>
   Effect.gen(function* () {
@@ -342,9 +350,31 @@ export const overTombstone = (
     const ttl = layouts.some((layout) => layout.ttl) ? resolveTtlAttributeName(table) : undefined
     // An attribute is the tombstone's own, never a member it inherits.
     const held = (name: string): unknown => (Object.hasOwn(tomb, name) ? tomb[name] : undefined)
+    // A value as the row stores it: a sparse map as its entries, each one sparse storage can hold.
+    const carry = (name: string, value: unknown) => {
+      const holds = (part: Record<string, unknown>) => {
+        try {
+          entity._serializeSparseFields(part)
+          return true
+        } catch {
+          return false
+        }
+      }
+      const whole: Record<string, unknown> = { [name]: value }
+      if (holds(whole)) {
+        Object.assign(item, whole)
+        return
+      }
+      if (typeof value !== "object" || value === null) return
+      for (const [entry, v] of Object.entries(value)) {
+        const part: Record<string, unknown> = { [name]: { [entry]: v } }
+        if (holds(part)) Object.assign(item, part)
+      }
+    }
     // The projections with `removal`, the one defined last first. Each attribute once, in the role
     // of the first that names it: its checkpoints, then its revision, as with one layout.
     const taken = new Set<string>()
+    const carried = new Set<string>()
     const ordered = [...layouts].reverse()
     for (const layout of [
       ...ordered.filter((layout) => layout.removal),
@@ -355,21 +385,62 @@ export const overTombstone = (
         .filter(([name]) => name !== ttl && !taken.has(name))
       for (const [name, role] of mine) {
         taken.add(name)
-        if (role !== "revision" && held(name) !== undefined) item[name] = held(name)
+        if (role !== "revision" && held(name) !== undefined) {
+          carry(name, held(name))
+          carried.add(name)
+        }
       }
       for (const [name, role] of mine) {
-        if (role === "revision" && held(name) !== undefined) item[name] = Number(held(name)) + 1
+        if (role === "revision" && held(name) !== undefined) {
+          item[name] = Number(held(name)) + 1
+          carried.add(name)
+        }
       }
     }
-    const tokened = rowTokened(entity)
-    if (tokened) item[ROW_TOKEN] = yield* freshRowToken(rowWriters(Item[ROW_TOKEN]))
+    const read = Item[ROW_TOKEN]
+    if (rowTokened(entity) || read !== undefined) {
+      // The projections whose bookkeeping the row holds: those this program doesn't define kept.
+      const known = new Map(layouts.map((layout) => [layoutTag(layout), layout]))
+      const writers = rowWriters(read).filter((tag) => {
+        const layout = known.get(tag)
+        return (
+          layout === undefined ||
+          layout.roles.some(([field]) => {
+            const name = storedName(entity, field)
+            return carried.has(name) || Object.hasOwn(item, name)
+          })
+        )
+      })
+      item[ROW_TOKEN] = yield* freshRowToken(writers)
+      return Option.some({
+        guard: tombstoneGuard(entity.entityType, tomb),
+        term: rowTokenTerm(read),
+      })
+    }
+    // Without a token, the tombstone's every value this write carries, as read.
+    const terms: Array<string> = []
+    const names: Record<string, string> = {}
+    const values: Record<string, AttributeValue> = {}
+    for (const [i, name] of [...taken].entries()) {
+      names[`#eddTb${i}`] = name
+      const value = Object.hasOwn(Item, name) ? Item[name] : undefined
+      if (value === undefined) terms.push(`attribute_not_exists(#eddTb${i})`)
+      else {
+        terms.push(`#eddTb${i} = :eddTb${i}`)
+        values[`:eddTb${i}`] = value
+      }
+    }
     return Option.some({
-      guard: {
-        eq: { __edd_e__: `${entity.entityType}#tombstone`, __edd_removed__: tomb.__edd_removed__ },
-      } as ConditionInput,
-      token: tokened ? rowTokenTerm(Item[ROW_TOKEN]) : undefined,
+      guard: tombstoneGuard(entity.entityType, tomb),
+      term: terms.length === 0 ? undefined : { expression: terms.join(" AND "), names, values },
     })
   })
+
+/** The guard naming a tombstone by its marker and removal stamp. */
+const tombstoneGuard = (entityType: string, tomb: Record<string, unknown>): ConditionInput =>
+  ({
+    eq: { __edd_e__: `${entityType}#tombstone`, __edd_removed__: tomb.__edd_removed__ },
+  }) as ConditionInput
 
 /**
  * @internal Flatten `entity`'s sparse-map fields on `item` (stored names) into per-entry

@@ -773,7 +773,7 @@ export const buildTransactWriteItems = (
             ? yield* op.entity._overTombstone(built.item)
             : Option.none<{
                 readonly guard: ConditionInput
-                readonly token: RawCondition | undefined
+                readonly term: RawCondition | undefined
               }>()
         push(
           {
@@ -787,7 +787,7 @@ export const buildTransactWriteItems = (
                         op.entity,
                         withGuard(over.value.guard, op.callerCondition),
                       ),
-                      over.value.token,
+                      over.value.term,
                     )
                   : op.condition,
               ),
