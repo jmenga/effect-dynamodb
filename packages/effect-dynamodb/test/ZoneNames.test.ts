@@ -620,4 +620,84 @@ describe("an aggregate compares a zone as it's stored", () => {
       }),
     )
   })
+
+  describe("a zone carrying more than its own fields", () => {
+    class Desk extends Schema.Class<Desk>("Desk")({
+      deskId: Schema.String,
+      zone: Schema.TimeZoneOffset,
+    }) {}
+    const Desks = Aggregate.make(Desk, {
+      table: Main,
+      schema: AppSchema,
+      pk: { field: "pk", composite: ["deskId"] },
+      collection: { name: "desk" },
+      root: { entityType: "DeskItem" },
+      edges: {},
+    })
+    const carrying = (metadata: unknown) =>
+      Object.assign(DateTime.zoneMakeOffset(3_600_000), { metadata })
+    const updated = (before: unknown, after: unknown) => {
+      const table = makeRecordingTable()
+      return running(
+        table,
+        Main,
+        Effect.gen(function* () {
+          const db: any = yield* DynamoClient.make({
+            entities: {},
+            aggregates: { Desks },
+            tables: { Main },
+          } as never)
+          yield* db.aggregates.Desks.create({ deskId: "d", zone: carrying(before) })
+          table.take()
+          yield* db.aggregates.Desks.update({ deskId: "d" }, ({ state }: any) => ({
+            ...state,
+            zone: carrying(after),
+          }))
+          const root = [...table.items.values()].find(
+            (row: any) => row.__edd_e__?.S === "DeskItem",
+          ) as any
+          return {
+            sent: table.take().map(({ command }) => command),
+            metadata: root.zone.M.metadata,
+          }
+        }),
+      )
+    }
+
+    it.effect("a set it holds that changes is written", () =>
+      Effect.gen(function* () {
+        expect(yield* updated(new Set(["a"]), new Set(["b"]))).toEqual({
+          sent: ["Query", "TransactWriteItems"],
+          metadata: { SS: ["b"] },
+        })
+      }),
+    )
+
+    it.effect("a bigint past 2^53 that changes is written", () =>
+      Effect.gen(function* () {
+        expect(yield* updated(9007199254740993n, 9007199254740994n)).toEqual({
+          sent: ["Query", "TransactWriteItems"],
+          metadata: { N: "9007199254740994" },
+        })
+      }),
+    )
+
+    it.effect("a map it holds, in another key order, writes nothing", () =>
+      Effect.gen(function* () {
+        expect(yield* updated({ a: 1, e: 2 }, { e: 2, a: 1 })).toEqual({
+          sent: ["Query"],
+          metadata: { M: { a: { N: "1" }, e: { N: "2" } } },
+        })
+      }),
+    )
+
+    it.effect("bytes that change are written", () =>
+      Effect.gen(function* () {
+        expect(yield* updated(new Uint8Array([1]), new Uint8Array([2]))).toEqual({
+          sent: ["Query", "TransactWriteItems"],
+          metadata: { B: new Uint8Array([2]) },
+        })
+      }),
+    )
+  })
 })

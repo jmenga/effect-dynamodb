@@ -73,7 +73,7 @@ import {
   refuseUnreadable,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
-import { isZoneInstance, storedFormOf } from "@effect-dynamodb/schema/internal/StoredForm.js"
+import { isZoneInstance, zoneEntriesWritten } from "@effect-dynamodb/schema/internal/StoredForm.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
   type Context,
@@ -4372,14 +4372,20 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
     )
   }
 
-  // A zone compares as it's stored. Effect 4.1.3 keeps the name a zone was made from, so `Etc/UTC`
-  // and `UTC` are two zones stored as one map, where 4.1.2 made them one zone: compared by their
-  // properties, an update that sets the zone already stored wrote it again.
+  // A zone compares as it's stored: each property a write stores of it, by this same equality, with
+  // a named zone's name as `zoneEntriesWritten` writes it. Effect 4.1.3 keeps the name a zone was made
+  // from, so `Etc/UTC` and `UTC` are two zones stored as one map, where 4.1.2 made them one zone:
+  // compared by their properties, an update that sets the zone already stored wrote it again.
   if (isZoneInstance(a) || isZoneInstance(b)) {
+    if (!isZoneInstance(a) || !isZoneInstance(b)) return false
+    const aStored = zoneStored(a)
+    const bStored = zoneStored(b)
     return (
-      isZoneInstance(a) &&
-      isZoneInstance(b) &&
-      JSON.stringify(storedFormOf(a)) === JSON.stringify(storedFormOf(b))
+      aStored.length === bStored.length &&
+      aStored.every(([key, value]) => {
+        const other = bStored.find(([at]) => at === key)
+        return other !== undefined && deepEqual(value, other[1])
+      })
     )
   }
 
@@ -4390,6 +4396,21 @@ const deepEqual = (a: unknown, b: unknown): boolean => {
   const bKeys = Object.keys(bObj).filter((k) => !isCachedNormal(bObj, k))
   if (aKeys.length !== bKeys.length) return false
   return aKeys.every((k) => deepEqual(aObj[k], bObj[k]))
+}
+
+/** What a write stores of a zone: its enumerable properties, its name as `zoneEntriesWritten` gives it. */
+const zoneStored = (zone: object): ReadonlyArray<readonly [string, unknown]> => {
+  const entries: Array<readonly [string, unknown]> = []
+  for (const key in zone) {
+    const value = (zone as Record<string, unknown>)[key]
+    if (value !== undefined && typeof value !== "function") entries.push([key, value])
+  }
+  return zoneEntriesWritten(
+    entries,
+    true,
+    (value) => value,
+    (name) => name,
+  )
 }
 
 const deepEqualGroups = (a: TransactionGroup, b: TransactionGroup): boolean =>
