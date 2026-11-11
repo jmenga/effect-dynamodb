@@ -207,6 +207,8 @@ const worldOf = (schema: DynamoSchema.DynamoSchema) => {
       entities: { Tallies, Ledgers, Rems, Pages },
       tables: { ReadTable, OutboxTable },
     }),
+    /** A client that sees the read models only as members of the tables it binds. */
+    tablesOnly: DynamoClient.make({ entities: {}, tables: { ReadTable, OutboxTable } }),
   }
 }
 type World = ReturnType<typeof worldOf>
@@ -293,9 +295,13 @@ const versionsOf = (w: World, title: string) =>
       .map(({ entry }) => entry)
   })
 
-const rekeyAll = (w: World, options?: { readonly dryRun?: boolean }) =>
+const rekeyAll = (
+  w: World,
+  options?: { readonly dryRun?: boolean },
+  client: World["db"] | World["tablesOnly"] = w.db,
+) =>
   Effect.gen(function* () {
-    const db = yield* w.db
+    const db = yield* client
     const read: Table.RekeyReport = yield* db.tables.ReadTable.rekey(options)
     const outbox: Table.RekeyReport = yield* db.tables.OutboxTable.rekey(options)
     return { read, outbox }
@@ -650,6 +656,27 @@ describeConnected("#183 rekey over the rows 1.36.0 wrote", () => {
           }),
         tables,
       ),
+    )
+
+    it.live(
+      "a client binding only the tables moves them too, the other table's outbox included",
+      () =>
+        onFixture(
+          (names) =>
+            Effect.gen(function* () {
+              const { read, outbox } = yield* rekeyAll(Off, undefined, Off.tablesOnly)
+              expect(read.conflicts).toEqual([])
+              expect(outbox.conflicts).toEqual([])
+              expect(read.moved).toEqual({ ...ZERO, item: 6, snapshot: 5, tombstone: 2, outbox: 3 })
+              expect(outbox.moved).toEqual({ ...ZERO, outbox: 2 })
+              expect(outbox.skipped.unregistered).toBe(0)
+              const after = yield* rowsOf(names)
+              for (const role of Object.keys(names) as ReadonlyArray<keyof Names>) {
+                expect(keysIn(after[role]!)).toEqual(keysIn(fixture.tables[role]))
+              }
+            }),
+          tables,
+        ),
     )
 
     it.live(`with the flag on, ${release}'s sort keys are what it composes: nothing moves`, () =>

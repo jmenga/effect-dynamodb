@@ -3710,3 +3710,164 @@ describe("composeKnownHalves", () => {
     )
   })
 })
+
+describe("composeKeySpace", () => {
+  const schema = DynamoSchema.make({ name: "a", version: 1, escapeKeys: true })
+  const index = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>, collection?: string) => ({
+    pk: { field: "pk", composite: [...pk] },
+    sk: { field: "sk", composite: [...sk] },
+    ...(collection === undefined ? {} : { collection, type: "clustered" as const }),
+  })
+
+  it("is the text before the first composite's value, its label included", () => {
+    expect(
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop", "x"], ["name"])),
+    ).toEqual({
+      pk: { text: "$a#v1#ledger#shop_", after: [], values: [], open: true },
+      sk: { text: "$a#v1#ledger#name_", after: [], values: [], open: true },
+    })
+    expect(
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop"], ["name"], "ca")),
+    ).toEqual({
+      pk: { text: "$a#v1#ca#shop_", after: [], values: [], open: true },
+      sk: { text: "$a#v1#ca#ledger_1#name_", after: [], values: [], open: true },
+    })
+  })
+
+  it("is the whole key for a half with no composite", () => {
+    expect(KeyComposer.composeKeySpace(schema, "Ledger", 1, index(["shop"], [])).sk).toEqual({
+      text: "$a#v1#ledger",
+      after: [],
+      values: [],
+      open: false,
+    })
+  })
+
+  it("goes on past a composite that can't hold the delimiter, to the next label", () => {
+    const valuesOf = (name: string): KeyComposer.CompositeValues =>
+      name === "n" || name === "m" ? "number" : "open"
+    const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string> = []) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk), valuesOf)
+    const number = { kind: "number" }
+    // Up to the first composite that can hold it, its label included.
+    expect(space(["n", "shop", "x"]).pk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#shop_"],
+      values: [number],
+      open: true,
+    })
+    // Every composite walked: the key ends after the last value.
+    expect(space(["n", "m"]).pk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#m_", ""],
+      values: [number, number],
+      open: false,
+    })
+    expect(space(["shop"], ["n", "name"]).sk).toEqual({
+      text: "$a#v1#ledger#n_",
+      after: ["#name_"],
+      values: [number],
+      open: true,
+    })
+    const meet = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) =>
+      KeyComposer.keySpacesMeet(space(a).pk, space(b).pk)
+    // The labels after the value differ: no key of one is a key of the other.
+    expect(meet(["n", "idA"], ["n", "idB"])).toBe(false)
+    expect(meet(["n", "m"], ["n", "idB"])).toBe(false)
+    // One ends where the other goes on.
+    expect(meet(["n"], ["n", "idA"])).toBe(false)
+    expect(meet(["n", "m"], ["n", "m", "idA"])).toBe(false)
+    // The same labels: one space, whatever follows the first open value.
+    expect(meet(["n", "idA"], ["n", "idA", "idB"])).toBe(true)
+    expect(meet(["n", "m"], ["n", "m"])).toBe(true)
+    // A label that starts another's: the longer one's rest can be the shorter one's value.
+    expect(meet(["n", "id"], ["n", "id_b"])).toBe(true)
+    // A value that can hold the delimiter can hold the other's next label too.
+    expect(meet(["shop", "idA"], ["shop", "idB"])).toBe(true)
+    expect(meet(["shop"], ["shop", "idB"])).toBe(true)
+  })
+
+  it("meets another when either could start the other", () => {
+    const space = (pk: ReadonlyArray<string>, sk: ReadonlyArray<string>) =>
+      KeyComposer.composeKeySpace(schema, "Ledger", 1, index(pk, sk))
+    const meet = (a: ReturnType<typeof space>, b: ReturnType<typeof space>) =>
+      KeyComposer.keySpacesMeet(a.pk, b.pk) && KeyComposer.keySpacesMeet(a.sk, b.sk)
+    // Different first composites: apart.
+    expect(meet(space(["idA"], ["name"]), space(["idB"], ["name"]))).toBe(false)
+    // The same first composite: one space, whatever follows.
+    expect(meet(space(["idA"], ["name"]), space(["idA", "idB"], ["name"]))).toBe(true)
+    // A whole key starting with an open space's text, and two whole keys.
+    const whole = { text: "$a#v1#ledger#shop_x", after: [], open: false }
+    const other = (text: string) => ({ text, after: [], open: false })
+    expect(KeyComposer.keySpacesMeet(space(["shop"], []).pk, whole)).toBe(true)
+    expect(KeyComposer.keySpacesMeet(whole, other("$a#v1#ledger#shop_x"))).toBe(true)
+    expect(KeyComposer.keySpacesMeet(whole, other("$a#v1#ledger#shop_y"))).toBe(false)
+  })
+
+  describe("a value is what its type can compose", () => {
+    /** Every composite walked, as where read models are bound: `values` says what each can be. */
+    const plain =
+      (values: Record<string, KeyComposer.CompositeValues>, options = {}) =>
+      (pk: ReadonlyArray<string>) =>
+        KeyComposer.composeKeySpace(
+          schema,
+          "Ledger",
+          1,
+          index(pk, []),
+          (name) => values[name] ?? "text",
+          options,
+        ).pk
+    const meet = (a: KeyComposer.KeySpace, b: KeyComposer.KeySpace) =>
+      KeyComposer.keySpacesMeet(a, b)
+
+    it("a number's text holds no letter a label starts with", () => {
+      const space = plain({ n: "number" })
+      // `n_7` and `n_x_q`: a number's text can't be `x_q`.
+      expect(meet(space(["n"]), space(["n_x"]))).toBe(false)
+      // As text, `n` can be `x_q`.
+      const text = plain({})
+      expect(meet(text(["n"]), text(["n_x"]))).toBe(true)
+      // A number and a number: the same keys for the same values.
+      expect(meet(space(["n"]), space(["n"]))).toBe(true)
+      // A number beside text: the text can be the number's.
+      expect(meet(space(["n"]), text(["n"]))).toBe(true)
+      // A label holding `_`, which no number's text holds.
+      expect(meet(space(["n"]), space(["n_1"]))).toBe(false)
+      // Its first character is never a letter, even one its later ones can be.
+      expect(meet(space(["n"]), space(["n_e"]))).toBe(false)
+    })
+
+    it("a number's text is never empty", () => {
+      const space = plain({ n: "number" })
+      const whole = { text: "$a#v1#ledger#n_", after: [], open: false }
+      expect(meet(space(["n"]), whole)).toBe(false)
+      expect(meet(plain({})(["n"]), whole)).toBe(true)
+    })
+
+    it("literals and booleans are their own text", () => {
+      const space = plain({ kind: { values: ["a", "b"] }, on: { values: [true, false] } })
+      expect(space(["kind"])).toEqual({
+        text: "$a#v1#ledger#kind_",
+        after: [""],
+        values: [{ kind: "oneOf", texts: ["a", "b"] }],
+        open: false,
+      })
+      // `kind_a` can't be `kind_x_q`, nor `kind_b_q`'s text `kind_b` followed by more.
+      expect(meet(space(["kind"]), space(["kind_x"]))).toBe(false)
+      expect(meet(space(["kind", "idA"]), space(["kind", "idB"]))).toBe(false)
+      expect(meet(space(["kind", "idA"]), space(["kind", "idA"]))).toBe(true)
+      // A literal holding what the other's label starts with.
+      const ab = plain({ kind: { values: ["x_q"] } })
+      expect(meet(ab(["kind"]), plain({})(["kind_x"]))).toBe(true)
+      expect(space(["on"]).values).toEqual([{ kind: "oneOf", texts: ["true", "false"] }])
+    })
+
+    it("a literal's text under every setting, with everyForm", () => {
+      const values = { kind: { values: ["a b"] } }
+      expect(plain(values)(["kind"]).values).toEqual([{ kind: "oneOf", texts: ["a%20b"] }])
+      expect(plain(values, { everyForm: true })(["kind"]).values).toEqual([
+        { kind: "oneOf", texts: ["a%20b", "a b"] },
+      ])
+    })
+  })
+})

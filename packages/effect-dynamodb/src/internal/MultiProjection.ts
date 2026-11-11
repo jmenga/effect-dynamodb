@@ -31,6 +31,7 @@ import {
   type ProjectionOutboxConfig,
   type ProjectionReadModel,
   type ProjectionReadModelError,
+  ProjectionReadModelKey,
   type ProjectionRevision,
   ProjectionRoutes,
   type ProjectionState,
@@ -302,6 +303,8 @@ const MultiProjectionTypeId: unique symbol = Symbol.for("effect-dynamodb/MultiPr
 export interface MultiProjection<S, K, Sources extends Record<string, AnySource>, Err, R, O = never>
   extends Pipeable.Pipeable {
   readonly [MultiProjectionTypeId]: typeof MultiProjectionTypeId
+  /** @internal See {@link ProjectionReadModelKey}. */
+  readonly [ProjectionReadModelKey]: unknown
   /** @internal */
   readonly [ProjectionRoutes]: (name: string) => ReadonlyArray<Route>
   readonly entityType: string
@@ -826,6 +829,7 @@ export const multiProjection = <
       return Pipeable.pipeArguments(this, arguments)
     },
     [ProjectionRoutes]: routes,
+    [ProjectionReadModelKey]: readModel,
     entityType: readModel.entityType,
     sources,
     // Each method a named operation for consumed-capacity reports (#174).

@@ -200,6 +200,12 @@ import {
 } from "./internal/Packed.js"
 import { createPathBuilder, type PathModel } from "./internal/PathBuilder.js"
 import {
+  physicalTableName,
+  refuseSharedOutboxKeySpace,
+  remoteOutboxesOf,
+  sharedOutboxKeySpace,
+} from "./internal/ProjectionEngine.js"
+import {
   canonicalJson,
   compareUtf8,
   compositePlanner,
@@ -3300,66 +3306,102 @@ const makeFromConfig = (config: {
     const client = yield* DynamoClient
     const tables: Record<string, TableOperations> = {}
 
+    // The entities the client sees (`visible`) are where `rekey` finds the outboxes of their
+    // projections. `entities` comes first, so the read models it found before keep their order.
+    const visibleEntities: ReadonlyArray<unknown> = visible.map(([, entity]) => entity)
+    const named = visible.map(([name, entity]) => [`"${name}"`, entity] as const)
+    yield* refuseSharedOutboxKeySpace("DynamoClient.make", named)
+
     // `rekey` (#171) hands each row to the member owning it: the table's
     // entities and aggregates, those the client binds on the same table, and
     // the streams the caller passes (`DynamoClient.make` binds no streams).
     const rekeyFor =
       (tableName: string, tagKey: string, registered: ReadonlyArray<unknown>) =>
-      (options?: RekeyOptions): Effect.Effect<RekeyReport, DynamoClientError | ValidationError> => {
-        const onTable = (member: unknown) =>
-          (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key === tagKey
-        const handlers = new Set<Rekey.RekeyMember>()
-        for (const member of [
-          ...registered,
-          ...Object.values(config.entities).filter(onTable),
-          ...Object.values(config.aggregates ?? {}).filter(onTable),
-          ...(options?.streams ?? []),
-        ]) {
-          const handler = Rekey.handlerOf(member)
-          if (handler !== undefined) handlers.add(handler)
-        }
-        // The outboxes on this table of a read model on another (#171): every projection's, so a
-        // second projection of one read model doesn't hide the first's items.
-        const outboxOf = new Set<unknown>()
-        for (const entity of [...registered, ...Object.values(config.entities)]) {
-          if (outboxOf.has(entity)) continue
-          outboxOf.add(entity)
-          const outboxes = (
-            entity as {
-              readonly _projectionOutboxes?: ReadonlyArray<{
-                readonly table: { readonly Tag: { readonly key: string } } | undefined
-                readonly pk: string
-                readonly sk: string
-              }>
+      (options?: RekeyOptions): Effect.Effect<RekeyReport, DynamoClientError | ValidationError> =>
+        provide(
+          Effect.gen(function* () {
+            const onTable = (member: unknown) =>
+              (member as { readonly _tableTag?: { readonly key: string } })._tableTag?.key ===
+              tagKey
+            const handlers = new Set<Rekey.RekeyMember>()
+            const tableMembers = [
+              ...registered,
+              ...Object.values(config.entities).filter(onTable),
+              ...Object.values(config.aggregates ?? {}).filter(onTable),
+            ]
+            for (const member of [...tableMembers, ...(options?.streams ?? [])]) {
+              const handler = Rekey.handlerOf(member)
+              if (handler !== undefined) handlers.add(handler)
             }
-          )._projectionOutboxes
-          // Their key attributes, once each.
-          const layouts = new Map<string, { readonly pk: string; readonly sk: string }>()
-          for (const outbox of outboxes ?? []) {
-            if (outbox.table?.Tag.key !== tagKey) continue
-            layouts.set(`${outbox.pk}\u0000${outbox.sk}`, { pk: outbox.pk, sk: outbox.sk })
-          }
-          if (layouts.size === 0) continue
-          const keys = [...layouts.values()]
-          const readModel = entity as unknown as Pick<
-            EntityType,
-            "entityType" | "_rekeyProjectionRow"
-          >
-          handlers.add({
-            name: readModel.entityType,
-            types: [`${readModel.entityType}#outbox`],
-            // A table has one key schema, so its items are under the layout whose attributes they hold.
-            row: (row, ctx) =>
-              readModel._rekeyProjectionRow(
-                row,
-                ctx,
-                keys.find((key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined) ??
-                  keys[0]!,
+            // The read models whose outboxes are on this table are checked before anything is
+            // sent: `rekey` reads an item's key back by its key space, so two whose keys could be
+            // read as each other's are refused here, where `DynamoClient.make` refuses only those
+            // whose items would overwrite each other in normal operation, and so is a member of
+            // this table that would read a read model's items as its own. Projections are defined
+            // when the program runs them, so one defined after the client was made has its outbox
+            // recorded only now. A run's refusal is the run's `ValidationError`.
+            const shared = yield* sharedOutboxKeySpace("rekey", named, {
+              key: tagKey,
+              name: tableName,
+              members: [...new Set(tableMembers)].map(
+                (member) =>
+                  [
+                    named.find(([, entity]) => entity === member)?.[0] ??
+                      `"${(member as { readonly entityType?: string }).entityType}"`,
+                    member,
+                  ] as const,
               ),
-          })
-        }
-        return provide(Rekey.run({ tableName, members: [...handlers], options }))
-      }
+            })
+            if (shared !== undefined) {
+              return yield* new ValidationError({
+                entityType: "Table",
+                operation: "rekey",
+                cause: shared,
+              })
+            }
+            // The outboxes on this table of a read model on another (#171): every projection's, so
+            // a second projection of one read model doesn't hide the first's items, named by this
+            // table's service or by another handle on the same physical table. A read model's
+            // projections may have one each, on tables of their own.
+            const outboxOf = new Set<unknown>()
+            for (const entity of [...registered, ...visibleEntities]) {
+              if (outboxOf.has(entity)) continue
+              outboxOf.add(entity)
+              // Their key attributes, once each.
+              const layouts = new Map<string, { readonly pk: string; readonly sk: string }>()
+              for (const outbox of remoteOutboxesOf(entity)) {
+                if (
+                  outbox.table.Tag.key !== tagKey &&
+                  (yield* physicalTableName(outbox.table.Tag)) !== tableName
+                ) {
+                  continue
+                }
+                layouts.set(`${outbox.pk}\u0000${outbox.sk}`, { pk: outbox.pk, sk: outbox.sk })
+              }
+              if (layouts.size === 0) continue
+              const keys = [...layouts.values()]
+              const readModel = entity as unknown as Pick<
+                EntityType,
+                "entityType" | "_rekeyProjectionRow"
+              >
+              handlers.add({
+                name: readModel.entityType,
+                types: [`${readModel.entityType}#outbox`],
+                // A table has one key schema, so its items are under the layout whose attributes
+                // they hold.
+                row: (row, ctx) =>
+                  readModel._rekeyProjectionRow(
+                    row,
+                    ctx,
+                    keys.find(
+                      (key) => row[key.pk]?.S !== undefined && row[key.sk]?.S !== undefined,
+                    ) ?? keys[0]!,
+                  ),
+              })
+            }
+            return yield* Rekey.run({ tableName, members: [...handlers], options })
+          }),
+        )
 
     if (config.tables) {
       for (const [tableKey, table] of Object.entries(config.tables)) {

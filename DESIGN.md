@@ -961,8 +961,65 @@ also claims its projection row tombstones (`<type>#tombstone`) and outbox
 items (`<type>#outbox`); an outbox on another table is claimed on that table,
 for a read model whose projection registered it (`_projectionOutboxes`, one
 entry per projection defined on the read model, so a second projection doesn't
-hide the first's; under the key attributes of the entry the row holds). A row of a member stored under no text its values
-composed is `unrecognizedKey`. A unit that moves together (an aggregate, a
+hide the first's; under the key attributes of the entry the row holds) and that
+the client sees: one it binds, or a member of any table it binds. A read model's
+projections may each have an outbox on a table of its own, and each is claimed
+on its table. The outbox is on the table being rekeyed when its handle
+is, or when the context gives its handle the table's physical name (another
+`Table.make` on the same table). A row of a member stored under no text its
+values composed is `unrecognizedKey`. Several members may claim one `__edd_e__`
+(read models of one entity type in different schemas or primary collections,
+whose outboxes share a table): each is tried in turn, and one that can't read
+the row's key back as its own key space (`unrecognizedKey`) passes it to the
+next, so the row goes to the member whose primary key prefix its key names,
+whatever order they're listed in. It is `unrecognizedKey` only when none can,
+and counted once either way, so a report's totals add up to `scanned`. A key
+space is, for each key half, the text the entity's primary key composes around
+its composites' values (`KeyComposer.composeKeySpace`): the schema name and
+version, the primary collection (or the entity type), under a collection the
+entity type and its version, and each composite's label (`shop_`), with what
+each value can be. A half with no composite is its whole text. Two key spaces
+meet when a key of one can be a key of the other (an outbox item's sort key adds
+`#outbox#` to its row's); `KeyComposer.keySpacesMeet` reads the two together,
+character against character. A value is what its type can compose: a number's
+or a bigint's key text (digits and `-+.:;)*`, and of letters only `e` and those
+of `Infinity`, starting with a digit, `-`, `:` or `;`), the key text of a
+literal union's members or of `true` and `false`, or, for anything else (a
+string, a date, a field the model doesn't declare), any text. Two read models whose
+projections' outboxes are on one table are refused (`EDD-9134`) at two places,
+by two questions. Where they're bound, when the client is made and by
+`EventStore.processBatch`: can a key of one be a key of the other with values
+that hold no `#`, each composite walked to the end of the key with the values
+its type can compose? Then their items overwrite each other whenever their
+values match, and both are defects. Read models whose keys meet only through a
+value holding `#` (`ida_x` and `ida_x#idb_y`) bind and run, as on 1.39.0, as do
+two whose keys part where one's value can't spell the other's text (`n_7`, a
+number, beside `n_x_q`). By the outbox table's `rekey`, before it sends
+anything: can `rekey` read an item of one as the other's at all? Its reader
+(`KeyText136.readIndexKeys`) takes a number, a bigint or a boolean only as text
+its value composes again, but a literal composite as any text, as it takes a
+string, so the keys an item is written under (a literal one of its members'
+text) are compared with the keys the other's reader takes (a literal any text),
+each way round, under every setting a row can have been written under. The walk
+stops at the first value that may hold `#`, a string's or (on the reader's side)
+a literal's, and anything follows it: read models whose leading composites
+differ are apart, those whose leading composites are the same are one space
+whatever follows, and past a number, a bigint or a boolean the next labels must
+still differ (`n_7#ida_` and `n_7#idb_` are apart; `kind_a#ida_` and
+`kind_a#idb_`, `kind` a literal, are not). The table's own members are compared
+too: an entity claims the outbox items of its entity type on its table (its own
+projections' outbox there), so one that can read a read model's items as its own
+would move them by its own key, to a key that isn't theirs. A member is refused
+unless it composes its keys exactly as the read model does (the same schema,
+entity type and version, primary key composites, casing, collection and
+composite types), when it moves an item where the read model would. `rekey`
+couldn't tell whose an item is, and the run fails with a `ValidationError`; this
+also covers projections defined after the client was made. `rekey` of the
+client's other tables runs. Tables are compared by the physical name the
+context gives them (two handles on one table are one table), or by handle when
+it gives none. Read models that never meet at one of those sites, bound
+separately or in different programs, can't be checked: key spaces must be
+distinct per outbox table, and that is the application's to keep. A unit that moves together (an aggregate, a
 stream, a moved row's target) is claimed once per run (`claim`, `once`), so it is
 moved and counted once whichever of its rows the scan reaches first, and a row
 reached after it moved — by this run, or by an application write between the
@@ -6565,9 +6622,10 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9130` | `DynamoClient.ts` (`make`), through `Aggregate.ts` (`ownershipConflict`) | An aggregate declaring `ownsRows` beside another member the client sees that can write a row of one of its entity types into its partition: the message names the aggregate, the member, the type and the channel. A defect from `DynamoClient.make`, as `EDD-9037` is (§7 "Which rows in its partition are an aggregate's"). |
 | `EDD-9131` | `Aggregate.ts` (`hydrateAggregateRefs`, `refIdValue`) | An aggregate `create` is given an id that is no value of the edge's entity's key composite, neither of its type nor its stored or JSON form (`"5"` for a number key), so it names no item; or an id of its type `put` refuses, as DynamoDB can't store it (`Infinity`, anywhere in a struct, an `Option` or a `Result`) or as it doesn't encode as the composite is stored (an infinity through a digits-only string codec), judged by `put`'s own rule (`Entity._unstorableKey`). A `ValidationError` naming where the id was given, what it was given, the composite and the entity, judged before anything is fetched or written. Up to 1.39.0 a string was fetched under a key no `put` writes (`RefNotFound`), and anything else was dropped. |
 | `EDD-9133` | `internal/TransactableOps.ts` (`addProjectionLayout`, `projectionTtlConflict`), through `internal/ProjectionEngine.ts` (`EventStore.projection` / `multiProjection`, `preflight`) | On a projection read model one of whose projections has `removal`, one stored attribute one projection keeps in two roles: a checkpoint, checkpoint map, checkpoint owner or revision it also uses in another role, compared by stored name. Thrown by the definition that completes the conflict (the projection's own, or the first `removal`), with nothing recorded. Without `removal` nothing is refused, nor are two projections keeping one attribute in different roles. The table's TTL attribute, known only at run time, is checked by every entry point that writes a row (not the drains) before it sends anything: an attribute a projection keeps that is stored as it, while a projection's tombstones set it (`removal.ttl`), fails every projection on the read model with a `ValidationError`. |
+| `EDD-9134` | `internal/ProjectionEngine.ts` (`sharedOutboxKeySpace`, `refuseSharedOutboxKeySpace`), through `DynamoClient.make`, a table's `rekey` and `EventStore.processBatch` | Two read models whose projections' outboxes are on one table, in the same key space (the partition and sort key text their primary keys compose: schema name and version, primary collection, entity type, the composites' labels, and what each composite's type can compose: a number's or bigint's key text, a literal union's members, `true` and `false`, or any text). `DynamoClient.make` (among the entities it binds and its tables' members) and `processBatch` (among the read models of the projections it's handed) refuse two whose keys can be the same with values that hold no `#`: their items would overwrite each other. A defect, before anything runs. Two whose keys meet only through a value holding `#`, or part where one's value can't spell the other's text (a number beside a label), bind and run. `rekey` of the outbox's table refuses two whose items it could read as each other's, a value holding `#` included and a literal composite read as any text, as its reader reads one, with the outboxes of projections defined since the client was made; and a member of that table claiming the outbox items of a read model's entity type that could read them as its own, unless it composes its keys exactly as the read model does. A `ValidationError`, before it sends anything; `rekey` of other tables runs. Tables are compared by the physical name the context gives them, so two handles on one table are one table. Read models that never meet at one of these can't be checked: key spaces must be distinct per outbox table. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
 
-Next free code: none below `9141` (`9132` and `9134`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
+Next free code: none below `9141` (`9132` and `9135`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.
 
 ## 16. Consumed Capacity
 

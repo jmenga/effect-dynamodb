@@ -91,6 +91,13 @@ export interface RekeyTally {
   readonly skipped?: Partial<Record<RekeySkipReason, number>> | undefined
 }
 
+/** A tally saying only that the member couldn't read the row's key back. */
+const onlyUnrecognized = (tally: RekeyTally): boolean =>
+  Object.keys(tally).length === 1 &&
+  tally.skipped !== undefined &&
+  Object.keys(tally.skipped).length === 1 &&
+  (tally.skipped.unrecognizedKey ?? 0) > 0
+
 /** A member's part in a run: the rows it may own, and its handler. */
 export interface RekeyMember {
   /** The name it is reported under: an entity type, aggregate or stream name. */
@@ -438,10 +445,23 @@ export const run = (args: {
             ...(byType.get(type) ?? []),
             ...prefixed.filter((p) => type.startsWith(p.prefix)).map((p) => p.member),
           ]
+          // A member that can't read the row's key back (`unrecognizedKey`) isn't its owner: the
+          // key names another member's key space. The search goes on, so the order members are
+          // listed in doesn't choose one, and the row is counted unrecognized only when no member
+          // recognises it.
+          let unrecognized: { readonly member: RekeyMember; readonly tally: RekeyTally } | undefined
           for (const member of candidates) {
             const tally = yield* member.row(row, ctx)
             if (tally === undefined) continue
+            if (onlyUnrecognized(tally)) {
+              unrecognized ??= { member, tally }
+              continue
+            }
             totals.add(member.name, tally)
+            return
+          }
+          if (unrecognized !== undefined) {
+            totals.add(unrecognized.member.name, unrecognized.tally)
             return
           }
           totals.add(undefined, { skipped: { unregistered: 1 } })
