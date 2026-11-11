@@ -46,6 +46,8 @@ import type {
   RekeyMemberReport,
   RekeyOptions,
   RekeyReport,
+  RekeyReservation,
+  RekeyReservationCounts,
   RekeyRowKind,
   RekeySkipReason,
   TableConfig,
@@ -70,6 +72,11 @@ export interface RekeyRowContext {
   readonly dryRun: boolean
   /** Write the index keys that differ ({@link RekeyOptions.repairIndexKeys}), or only count them. */
   readonly repairIndexKeys: boolean
+  /**
+   * Delete the unique sentinels no row holds ({@link RekeyOptions.releaseOrphanedReservations}), or
+   * only count them.
+   */
+  readonly releaseOrphanedReservations: boolean
   /** Writes to the table are stopped ({@link RekeyOptions.writesStopped}): see {@link unprovableRow}. */
   readonly writesStopped: boolean
   /**
@@ -135,6 +142,14 @@ export type Judged = "settled" | "loop"
 export const rowUnit = (pk: string | undefined, sk: string | undefined): string =>
   `row\u0000${pk ?? ""}\u0000${sk ?? ""}`
 
+/**
+ * The unit a unique sentinel is judged as for its reservation ({@link RekeyRowContext.judge}): is
+ * it held, and if not, is it reported or released. Apart from {@link rowUnit}, the unit that moves
+ * it, since a sentinel no row holds may still move with the tombstone it names.
+ */
+export const reservationUnit = (pk: string | undefined, sk: string | undefined): string =>
+  `reservation\u0000${pk ?? ""}\u0000${sk ?? ""}`
+
 /** What a row in a loop of rows holding each other's current keys is reported with. */
 export const LOOP_MESSAGE =
   "Rows under other key text hold each other's current keys in a loop: none can move first."
@@ -146,6 +161,8 @@ export interface RekeyTally {
   readonly indexKeysRewritten?: number | undefined
   readonly sentinelsMoved?: number | undefined
   readonly indexKeys?: Partial<RekeyIndexKeys> | undefined
+  /** Unique sentinels no row holds, or that couldn't be judged, each by its outcome. */
+  readonly reservations?: ReadonlyArray<RekeyReservation> | undefined
   readonly conflicts?: ReadonlyArray<RekeyConflict> | undefined
   readonly skipped?: Partial<Record<RekeySkipReason, number>> | undefined
   /**
@@ -277,12 +294,33 @@ const zeroIndexKeys = (): MutableIndexKeys => ({
   skipped: 0,
 })
 
+type MutableReservations = { -readonly [K in keyof RekeyReservationCounts]: number }
+
+const zeroReservations = (): MutableReservations => ({
+  orphaned: 0,
+  released: 0,
+  skipped: 0,
+  undecided: 0,
+})
+
+/** Count a reservation by its outcome: `orphaned` counts every one found ({@link RekeyReservationCounts}). */
+const countReservation = (into: MutableReservations, entry: RekeyReservation): void => {
+  if (entry.outcome === "undecided") {
+    into.undecided += 1
+    return
+  }
+  into.orphaned += 1
+  if (entry.outcome === "released") into.released += 1
+  if (entry.outcome === "skipped") into.skipped += 1
+}
+
 interface MutableMember {
   unchanged: number
   moved: MutableCounts
   indexKeysRewritten: number
   sentinelsMoved: number
   indexKeys: MutableIndexKeys
+  reservations: MutableReservations
 }
 
 /** A value as text whose order is the same whatever order its object's properties were set in. */
@@ -336,6 +374,9 @@ class Totals {
   indexKeysRewritten = 0
   sentinelsMoved = 0
   indexKeys = zeroIndexKeys()
+  reservations = zeroReservations()
+  /** One entry per sentinel: a sentinel is its own unit, judged once a run. */
+  private readonly reservationEntries: Array<RekeyReservation> = []
   /** One conflict per row (member, kind, key): the first by {@link REASON_ORDER}, then by text. */
   private readonly conflicts = new Map<string, RekeyConflict>()
   skipped: { -readonly [R in RekeySkipReason]: number } = {
@@ -355,6 +396,7 @@ class Totals {
       indexKeysRewritten: 0,
       sentinelsMoved: 0,
       indexKeys: zeroIndexKeys(),
+      reservations: zeroReservations(),
     }
     this.byMember.set(member, fresh)
     return fresh
@@ -380,6 +422,11 @@ class Totals {
       const n = tally.indexKeys?.[count] ?? 0
       this.indexKeys[count] += n
       if (into !== undefined) into.indexKeys[count] += n
+    }
+    for (const entry of tally.reservations ?? []) {
+      this.reservationEntries.push(entry)
+      countReservation(this.reservations, entry)
+      countReservation(this.memberOf(entry.member).reservations, entry)
     }
     for (const conflict of tally.conflicts ?? []) {
       // A row that can't move is met again by what wants its key, and by the scan: whichever
@@ -414,6 +461,7 @@ class Totals {
         indexKeysRewritten: m.indexKeysRewritten,
         sentinelsMoved: m.sentinelsMoved,
         indexKeys: { ...m.indexKeys },
+        reservations: { ...m.reservations },
         conflicts: conflicts.filter((conflict) => conflict.member === name).length,
       }
     }
@@ -425,6 +473,14 @@ class Totals {
       indexKeysRewritten: this.indexKeysRewritten,
       sentinelsMoved: this.sentinelsMoved,
       indexKeys: { ...this.indexKeys },
+      // By member, then key: the same whatever order the run met them.
+      reservations: {
+        ...this.reservations,
+        entries: this.reservationEntries
+          .map((entry) => ({ entry, order: [entry.member, stableText(entry.key)] }))
+          .sort((a, b) => compareOrders(a.order, b.order))
+          .map(({ entry }) => entry),
+      },
       conflicts,
       skipped: { ...this.skipped },
       byMember,
@@ -1395,6 +1451,7 @@ export const run = (args: {
         tableName,
         dryRun,
         repairIndexKeys: options.repairIndexKeys === true,
+        releaseOrphanedReservations: options.releaseOrphanedReservations === true,
         writesStopped: options.writesStopped === true,
         sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
         claim: (unit) => {
@@ -1511,6 +1568,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
   const moved: Partial<Record<RekeyRowKind, number>> = {}
   const skipped: Partial<Record<RekeySkipReason, number>> = {}
   const conflicts: Array<RekeyConflict> = []
+  const reservations: Array<RekeyReservation> = []
   const indexKeys: Partial<MutableIndexKeys> = {}
   let unchanged = 0
   let indexKeysRewritten = 0
@@ -1534,6 +1592,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
       if (n !== undefined) skipped[reason] = (skipped[reason] ?? 0) + n
     }
     for (const conflict of tally.conflicts ?? []) conflicts.push(conflict)
+    for (const entry of tally.reservations ?? []) reservations.push(entry)
   }
   return {
     ...(unchanged > 0 && { unchanged }),
@@ -1541,6 +1600,7 @@ export const mergeTallies = (...tallies: ReadonlyArray<RekeyTally>): RekeyTally 
     ...(indexKeysRewritten > 0 && { indexKeysRewritten }),
     ...(sentinelsMoved > 0 && { sentinelsMoved }),
     ...(Object.keys(indexKeys).length > 0 && { indexKeys }),
+    ...(reservations.length > 0 && { reservations }),
     ...(conflicts.length > 0 && { conflicts }),
     ...(Object.keys(skipped).length > 0 && { skipped }),
     ...(worked && { worked }),

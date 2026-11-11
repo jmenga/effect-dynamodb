@@ -920,7 +920,10 @@ export type RekeyCounts = { readonly [K in RekeyRowKind]: number }
  *   or it is an outbox item on another table than its read model's, of a
  *   projection not defined where `rekey` runs
  * - `unrecognizedKey` — its member's, but stored neither under the key its
- *   values compose now nor under the one 1.36 composed for them. When several
+ *   values compose now nor under the one 1.36 composed for them. A unique
+ *   sentinel of a constraint the entity doesn't declare, or one not under the
+ *   schema's own key prefix, is counted here too (a sentinel of a declared
+ *   constraint that no row holds is in {@link RekeyReport.reservations}). When several
  *   members claim its `__edd_e__` (read models of one entity type in different
  *   schemas or primary collections, whose outboxes share a table), none of them
  *   reads its key back
@@ -998,6 +1001,60 @@ export interface RekeyIndexKeys {
   readonly skipped: number
 }
 
+/**
+ * What `rekey` did with a unique sentinel no row holds, or one it couldn't judge
+ * ({@link RekeyReservation}):
+ *
+ * - `orphaned` — no row holds it, and it was left: the run didn't ask for
+ *   {@link RekeyOptions.releaseOrphanedReservations}, or a write claimed it or its row before the
+ *   release
+ * - `released` — deleted, or with `dryRun`, would be
+ * - `skipped` — left to a write that changed it or its row between the read and the release, twice
+ * - `undecided` — left, since nothing says whether a row holds it: it names no row, it names a row
+ *   of another type, or that row's values compose no sentinel key
+ */
+export type RekeyReservationOutcome = "orphaned" | "released" | "skipped" | "undecided"
+
+/**
+ * A unique sentinel of a known entity and constraint that no row holds, or that `rekey` couldn't
+ * judge. A sentinel is held by the row its back-pointer (`_entity_pk` / `_entity_sk`) names, when
+ * that row's values compose the sentinel's key under any key text. With `softDelete: {
+ * preserveUnique: true }` a tombstone of that row holds it the same way: the soft delete kept the
+ * reservation on purpose.
+ */
+export interface RekeyReservation {
+  /** The entity type. */
+  readonly member: string
+  /** The unique constraint's name. */
+  readonly constraint: string
+  /** The sentinel's primary key, as stored. */
+  readonly key: Readonly<Record<string, unknown>>
+  /** The key its back-pointer names, as stored: `undefined` when it names none. */
+  readonly owner: Readonly<Record<string, unknown>> | undefined
+  readonly outcome: RekeyReservationOutcome
+  readonly message: string
+}
+
+/**
+ * Unique sentinels no row holds, and ones `rekey` couldn't judge. `orphaned` and `undecided` are
+ * counted on every run; `released` and `skipped` only with
+ * {@link RekeyOptions.releaseOrphanedReservations}. `orphaned` counts every one found, so it
+ * includes those `released` and `skipped`. Each sentinel is judged once a run, however the run
+ * reaches it.
+ */
+export interface RekeyReservationCounts {
+  readonly orphaned: number
+  readonly released: number
+  readonly skipped: number
+  readonly undecided: number
+}
+
+/** {@link RekeyReservationCounts}, and each sentinel counted. */
+export interface RekeyReservations extends RekeyReservationCounts {
+  /** One per sentinel counted, by member and then key. */
+  readonly entries: ReadonlyArray<RekeyReservation>
+}
+
 /** One member's share of a {@link RekeyReport}. */
 export interface RekeyMemberReport {
   readonly unchanged: number
@@ -1006,6 +1063,7 @@ export interface RekeyMemberReport {
   readonly sentinelsMoved: number
   readonly conflicts: number
   readonly indexKeys: RekeyIndexKeys
+  readonly reservations: RekeyReservationCounts
 }
 
 /**
@@ -1040,6 +1098,8 @@ export interface RekeyReport {
   readonly sentinelsMoved: number
   /** Index keys that aren't what a `put` of their row's values writes: {@link RekeyIndexKeys}. */
   readonly indexKeys: RekeyIndexKeys
+  /** Unique sentinels no row holds, and ones that couldn't be judged: {@link RekeyReservations}. */
+  readonly reservations: RekeyReservations
   /** Rows left where they are — see {@link RekeyConflict}. */
   readonly conflicts: ReadonlyArray<RekeyConflict>
   /** Rows no member owns, by reason. */
@@ -1071,6 +1131,18 @@ export interface RekeyOptions {
    * again, then counted in `skipped`. A table with nothing to repair costs the scan alone.
    */
   readonly repairIndexKeys?: boolean | undefined
+  /**
+   * Also delete the unique sentinels {@link RekeyReport.reservations} finds no row holding
+   * (`orphaned`), so their values can be taken again. Default `false`: the run counts them and
+   * deletes nothing. Each is one transaction: the sentinel's `Delete`, conditioned on its
+   * back-pointer (and TTL, when it has one) as read, so a reservation claimed in between is never
+   * deleted, and a `ConditionCheck` that the row it names is still absent, or still holds the values
+   * read. On a failed condition the sentinel is read once and judged again, then counted in
+   * `skipped`. Only a sentinel of a known entity and constraint, under the schema's own key prefix,
+   * is ever judged. An orphaned sentinel holding the current key of another item's sentinel is
+   * judged, and released, before that sentinel moves there.
+   */
+  readonly releaseOrphanedReservations?: boolean | undefined
   /**
    * Writes to the table are stopped for this run. A row `rekey` can't prove unchanged when it
    * moves (`unguarded`: too wide to guard whole, with no version or stamped `updatedAt` to stand in) then

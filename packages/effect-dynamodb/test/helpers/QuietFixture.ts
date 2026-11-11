@@ -50,3 +50,32 @@ export const QUIET_RUNS: Readonly<Record<string, Table.RekeyOptions>> = {
   "dry run": { segments: 1, concurrency: 1, dryRun: true },
   "repairIndexKeys run": { segments: 1, concurrency: 1, repairIndexKeys: true },
 }
+
+/**
+ * Runs with options the fixture's runs don't use, each with the fixture run whose requests it must
+ * send: over a table with nothing to move, releasing orphaned reservations (new in 1.41) and
+ * `writesStopped` send nothing more.
+ */
+export const QUIET_RUNS_ALIKE: Readonly<
+  Record<string, { readonly options: Table.RekeyOptions; readonly sends: string }>
+> = {
+  "releaseOrphanedReservations run": {
+    options: { ...QUIET_RUNS.run, releaseOrphanedReservations: true },
+    sends: "run",
+  },
+  "releaseOrphanedReservations dry run": {
+    options: { ...QUIET_RUNS["dry run"], releaseOrphanedReservations: true },
+    sends: "dry run",
+  },
+  "writesStopped run": { options: { ...QUIET_RUNS.run, writesStopped: true }, sends: "run" },
+}
+
+/** Every run to replay over a setting's rows: its name, its options and the requests it sends. */
+export const quietRuns = (
+  runs: Readonly<Record<string, ReadonlyArray<string>>>,
+): ReadonlyArray<readonly [string, Table.RekeyOptions, ReadonlyArray<string>]> => [
+  ...Object.entries(runs).map(([run, sent]) => [run, QUIET_RUNS[run]!, sent] as const),
+  ...Object.entries(QUIET_RUNS_ALIKE).map(
+    ([run, { options, sends }]) => [run, options, runs[sends]!] as const,
+  ),
+]

@@ -4,8 +4,11 @@
  * table holds each shape whose outcome once depended on that order — rows whose keys chain (each
  * one's current key where the next is stored), two items holding each other's current sentinel
  * keys under different constraints, aggregates sharing a partition whose rows chain across owners,
- * and aggregates whose partitions chain — and every run must report the same, leave the same rows,
- * agree with its dry run, and leave a second run nothing to do.
+ * aggregates whose partitions chain, and a unique sentinel no row holds where a moving sentinel goes —
+ * and every run must report the same, leave the same rows, agree with its dry run, and leave a
+ * second run nothing to do. With `releaseOrphanedReservations` the sentinel no row holds is released
+ * and the moving one takes its key; without, it's reported and the move is refused, whichever of the
+ * two the scan meets first.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -86,6 +89,9 @@ const seeded = Effect.gen(function* () {
     // m1's email goes where m2's is stored, and m2's nick where m1's is.
     yield* db.entities.Members.put({ id: "m1", email: "foo bar", nick: "x%20y" }).asEffect()
     yield* db.entities.Members.put({ id: "m2", email: "foo%20bar", nick: "x y" }).asEffect()
+    // m3's email goes where m4's is stored, and m4 is gone: its sentinels are held by no row.
+    yield* db.entities.Members.put({ id: "m3", email: "baz qux", nick: "m3" }).asEffect()
+    yield* db.entities.Members.put({ id: "m4", email: "baz%20qux", nick: "m4" }).asEffect()
     // One partition: a's line goes where b's is stored, b's where c's is.
     const lids = { a: "x y", b: "x%20y", c: "x%2520y" } as const
     for (const name of ["a", "b", "c"] as const) {
@@ -98,6 +104,9 @@ const seeded = Effect.gen(function* () {
     yield* db.aggregates.Routes.create({ id: "q r", area: "one" })
     yield* db.aggregates.Routes.create({ id: "q%20r", area: "two" })
   }).pipe(Effect.provide(Layer.merge(table.layer, off.MainTable.layer({ name: "t" }))))
+  for (const [key, row] of table.items) {
+    if (row.__edd_e__?.S === "Member" && row.id?.S === "m4") table.items.delete(key)
+  }
   return [...table.items.values()]
 })
 
@@ -143,7 +152,10 @@ const decided = (report: Table.RekeyReport) => {
 const storedOf = (rows: Iterable<Row>) =>
   [...rows].map((row) => JSON.stringify(row, Object.keys(row).sort())).sort()
 
-describe("rekey's outcome doesn't depend on the order it meets the rows in", () => {
+describe.each([
+  ["releasing", true],
+  ["reporting", false],
+] as const)("rekey's outcome doesn't depend on the order it meets the rows in, %s orphans", (_, release) => {
   const first = new Map<string, unknown>()
   for (const segments of [1, 2, 3, 5]) {
     for (const seed of [0, 1, 2, 3]) {
@@ -158,7 +170,12 @@ describe("rekey's outcome doesn't depend on the order it meets the rows in", () 
               gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
               on.MainTable.layer({ name: "t" }),
             )
-            const options = { segments, concurrency, pageSize: 3 }
+            const options = {
+              segments,
+              concurrency,
+              pageSize: 3,
+              releaseOrphanedReservations: release,
+            }
             const runs = yield* Effect.gen(function* () {
               const db = yield* on.client
               const dry = yield* db.tables.MainTable.rekey({ ...options, dryRun: true })
@@ -172,8 +189,16 @@ describe("rekey's outcome doesn't depend on the order it meets the rows in", () 
             // A dry run writes nothing and says what the run does.
             expect(runs.untouched).toEqual(storedOf(rows))
             expect(decided(runs.dry)).toEqual(decided(runs.real))
-            // Every chain moves in one run, every row counted once.
-            expect(runs.real.conflicts).toEqual([])
+            // Every chain moves in one run, every row counted once. m4's sentinels are released,
+            // and m3's email takes its key; or they're reported, and m3's stays where it is.
+            expect(runs.real.reservations).toMatchObject(
+              release
+                ? { orphaned: 2, released: 2, skipped: 0, undecided: 0 }
+                : { orphaned: 2, released: 0, skipped: 0, undecided: 0 },
+            )
+            expect(runs.real.conflicts.map((conflict) => conflict.reason)).toEqual(
+              release ? [] : ["taken"],
+            )
             expect(runs.real.scanned).toBe(rows.length)
             // A second run finds nothing to move.
             expect(runs.again.moved).toEqual({
@@ -186,7 +211,8 @@ describe("rekey's outcome doesn't depend on the order it meets the rows in", () 
               stream: 0,
             })
             expect(runs.again.sentinelsMoved).toBe(0)
-            expect(runs.again.conflicts).toEqual([])
+            expect(runs.again.conflicts).toEqual(runs.real.conflicts)
+            expect(runs.again.reservations.released).toBe(0)
             expect(storedOf(table.items.values())).toEqual(runs.after)
             // The same report and the same rows whatever the order.
             const outcome = { report: decided(runs.real), rows: runs.after }

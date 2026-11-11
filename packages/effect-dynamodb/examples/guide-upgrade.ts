@@ -9,6 +9,7 @@
  *   - A bounded run (`maxPages`) resumed until the table is done
  *   - A rerun moves nothing
  *   - `rekey({ repairIndexKeys: true })`: write an index key its row's values compose and it lacks
+ *   - `rekey({ releaseOrphanedReservations: true })`: delete a unique sentinel no row holds
  *   - `rekey` under the default moves them back, the same way
  *   - An entity keyed by a codec whose `encode` takes its own output: 1.39.0's rows need `rekey`
  *
@@ -72,6 +73,11 @@ class Badge extends Schema.Class<Badge>("Badge")({
   holder: Schema.String,
 }) {}
 
+class Ticket extends Schema.Class<Ticket>("Ticket")({
+  ticketId: Schema.String,
+  number: Schema.BigInt,
+}) {}
+
 class Calibrated extends Schema.TaggedClass<Calibrated>()("Calibrated", {
   offset: Schema.Number,
 }) {}
@@ -106,18 +112,27 @@ const membersUnder = (schema: DynamoSchema.DynamoSchema) => {
       sk: { field: "sk", composite: [] },
     },
   })
-  const MainTable = Table.make({ schema, entities: { Sensors, Badges } })
+  const Tickets = Entity.make({
+    model: Ticket,
+    entityType: "Ticket",
+    primaryKey: {
+      pk: { field: "pk", composite: ["ticketId"] },
+      sk: { field: "sk", composite: [] },
+    },
+    unique: { number: ["number"] },
+  })
+  const MainTable = Table.make({ schema, entities: { Sensors, Badges, Tickets } })
   const Calibrations = EventStore.makeStream({
     table: MainTable,
     streamName: "Calibrations",
     events: [Calibrated],
     streamId: { composite: ["siteId"] },
   })
-  return { Sensors, Badges, MainTable, Calibrations }
+  return { Sensors, Badges, Tickets, MainTable, Calibrations }
 }
 
 const Default = membersUnder(DefaultSchema)
-const { Sensors, MainTable, Calibrations } = membersUnder(AppSchema)
+const { Sensors, Badges, Tickets, MainTable, Calibrations } = membersUnder(AppSchema)
 
 // =============================================================================
 // 2. The upgrade
@@ -148,7 +163,10 @@ const program = Effect.gen(function* () {
   yield* Default.Calibrations.append({ siteId: "north" }, [new Calibrated({ offset: 0.5 })], 0)
   yield* Console.log("Three sensors (one soft-deleted) and a stream.")
 
-  const db = yield* DynamoClient.make({ entities: { Sensors }, tables: { MainTable } })
+  const db = yield* DynamoClient.make({
+    entities: { Sensors, Badges, Tickets },
+    tables: { MainTable },
+  })
 
   // #region not-found
   // With the flag on and before `rekey`, a row whose key text changed isn't found.
@@ -290,6 +308,52 @@ const program = Effect.gen(function* () {
   assertEq(repaired.indexKeys, { ...repairs.indexKeys, repaired: 1 }, "the run repairs what it found")
   assertEq((yield* byPump.collect()).length, 1, "a query finds it")
   yield* Console.log(`Repaired: ${JSON.stringify(repaired.indexKeys)}`)
+
+  // --- Releasing orphaned reservations ---
+  yield* Console.log("\n=== Releasing orphaned reservations ===\n")
+
+  // What a delete under an earlier release could leave: the ticket is gone, and its number's
+  // reservation isn't, so no other ticket can take the number.
+  yield* db.entities.Tickets.put({ ticketId: "t-1", number: 5n })
+  yield* raw.deleteItem({
+    TableName: tableName,
+    Key: { pk: { S: "$upgrade#v1#ticket#ticketid_t-1" }, sk: { S: "$upgrade#v1#ticket" } },
+  })
+  const taken = yield* db.entities.Tickets.put({ ticketId: "t-2", number: 5n })
+    .asEffect()
+    .pipe(Effect.flip)
+  assertEq(taken._tag, "UniqueConstraintViolation", "the number is still reserved")
+
+  // #region reservations
+  // `rekey` counts unique sentinels no row holds. `releaseOrphanedReservations`
+  // deletes them, so their values can be taken again: dry run first.
+  const orphans = yield* db.tables.MainTable.rekey({
+    dryRun: true,
+    releaseOrphanedReservations: true,
+    streams: [Calibrations],
+  })
+  // orphans.reservations → { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: [...] }
+  // orphans.reservations.entries[0].message → "The row it names doesn't exist."
+
+  const released = yield* db.tables.MainTable.rekey({
+    releaseOrphanedReservations: true,
+    streams: [Calibrations],
+  })
+  // released.reservations → the same, and the number can be taken again
+  // #endregion
+  assertEq(
+    { ...orphans.reservations, entries: orphans.reservations.entries.length },
+    { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: 1 },
+    "what the dry run says",
+  )
+  assertEq(
+    orphans.reservations.entries[0]?.message,
+    "The row it names doesn't exist.",
+    "and why",
+  )
+  assertEq(released.reservations, orphans.reservations, "the run agrees")
+  yield* db.entities.Tickets.put({ ticketId: "t-2", number: 5n })
+  yield* Console.log(`Released: ${JSON.stringify(released.reservations.entries[0]?.key)}`)
 
   // --- Back to the default ---
   yield* Console.log("\n=== Back to the default ===\n")

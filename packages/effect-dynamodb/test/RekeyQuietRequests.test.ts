@@ -12,13 +12,13 @@ import { Effect, Layer } from "effect"
 import type { DynamoClientService } from "../src/DynamoClient.js"
 import type * as Table from "../src/Table.js"
 import { gatedLayer } from "./helpers/GatedClient.js"
-import { QUIET_MODULES, QUIET_RUNS, quietFixture } from "./helpers/QuietFixture.js"
+import { QUIET_MODULES, quietFixture, quietRuns } from "./helpers/QuietFixture.js"
 import { quietWorld, requestText } from "./helpers/QuietTable.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 describe("rekey over a table with nothing to move sends 1.40.0's requests", () => {
   for (const [setting, stored] of Object.entries(quietFixture.settings)) {
-    for (const [run, expected] of Object.entries(stored.runs)) {
+    for (const [run, options, expected] of quietRuns(stored.runs)) {
       it.effect(
         `${setting}, ${run}`,
         () =>
@@ -37,7 +37,7 @@ describe("rekey over a table with nothing to move sends 1.40.0's requests", () =
             const report: Table.RekeyReport = yield* Effect.gen(function* () {
               const db: any = yield* world.client
               return yield* db.tables.MainTable.rekey({
-                ...QUIET_RUNS[run],
+                ...options,
                 streams: [world.Counters],
               })
             }).pipe(Effect.provide(layer))

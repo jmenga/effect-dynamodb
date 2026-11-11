@@ -190,25 +190,35 @@ const SETTINGS = [
 describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction, escapeKeys) => {
   const w = world(escapeKeys)
 
-  it.effect("a unique sentinel with no row behind it, on every run", () => {
-    const table = tableOf()
-    return Effect.gen(function* () {
-      const db = yield* w.client
-      yield* db.entities.Accounts.put({ id: "a", email: "x y" }).asEffect()
-      table.items.delete(
-        `${KeyComposer.composePk(w.schema, "Account", w.Accounts.indexes.primary, { id: "a" })}|${KeyComposer.composeSk(w.schema, "Account", 1, w.Accounts.indexes.primary, { id: "a" })}`,
-      )
-      const before = keysOf(table)
-      expect(before).toHaveLength(1)
-      const { dry, real } = yield* dryThenReal(db)
-      expect(real.skipped.unrecognizedKey).toBe(1)
-      expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-      expect((yield* db.tables.MainTable.rekey()).skipped.unrecognizedKey).toBe(1)
-      expect(keysOf(table)).toEqual(before)
-    }).pipe(on(w, table))
-  })
+  it.effect(
+    "a unique sentinel with no row behind it is an orphaned reservation, on every run",
+    () => {
+      const table = tableOf()
+      return Effect.gen(function* () {
+        const db = yield* w.client
+        yield* db.entities.Accounts.put({ id: "a", email: "x y" }).asEffect()
+        table.items.delete(
+          `${KeyComposer.composePk(w.schema, "Account", w.Accounts.indexes.primary, { id: "a" })}|${KeyComposer.composeSk(w.schema, "Account", 1, w.Accounts.indexes.primary, { id: "a" })}`,
+        )
+        const before = keysOf(table)
+        expect(before).toHaveLength(1)
+        const { dry, real } = yield* dryThenReal(db)
+        expect(real.skipped.unrecognizedKey).toBe(0)
+        expect(real.reservations).toMatchObject({
+          orphaned: 1,
+          released: 0,
+          skipped: 0,
+          undecided: 0,
+        })
+        expect(real.reservations.entries.map((entry) => entry.outcome)).toEqual(["orphaned"])
+        expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
+        expect((yield* db.tables.MainTable.rekey()).reservations.orphaned).toBe(1)
+        expect(keysOf(table)).toEqual(before)
+      }).pipe(on(w, table))
+    },
+  )
 
-  it.effect("a unique sentinel its row's values don't compose", () => {
+  it.effect("a unique sentinel its row's values don't compose is an orphaned reservation", () => {
     const table = tableOf()
     return Effect.gen(function* () {
       const db = yield* w.client
@@ -225,7 +235,13 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
       const before = keysOf(table)
       const { dry, real } = yield* dryThenReal(db)
       expect(real.conflicts).toEqual([])
-      expect(real.skipped.unrecognizedKey).toBe(1)
+      expect(real.skipped.unrecognizedKey).toBe(0)
+      expect(real.reservations).toMatchObject({
+        orphaned: 1,
+        released: 0,
+        skipped: 0,
+        undecided: 0,
+      })
       expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
       expect(keysOf(table)).toEqual(before)
     }).pipe(on(w, table))

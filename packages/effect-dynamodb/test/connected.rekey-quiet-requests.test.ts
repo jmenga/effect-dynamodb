@@ -13,7 +13,7 @@ import { Config, Effect, Layer } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import type * as Table from "../src/Table.js"
-import { QUIET_MODULES, QUIET_RUNS, quietFixture } from "./helpers/QuietFixture.js"
+import { QUIET_MODULES, quietFixture, quietRuns } from "./helpers/QuietFixture.js"
 import { quietWorld, requestText } from "./helpers/QuietTable.js"
 
 const ENDPOINT = Effect.runSync(
@@ -43,7 +43,7 @@ describeConnected(
   "rekey over a table with nothing to move sends 1.40.0's requests, in order",
   () => {
     for (const [setting, stored] of Object.entries(quietFixture.settings)) {
-      for (const [run, expected] of Object.entries(stored.runs)) {
+      for (const [run, options, expected] of quietRuns(stored.runs)) {
         it.live(
           `${setting}, ${run}`,
           () =>
@@ -78,7 +78,7 @@ describeConnected(
                     yield* raw.putItem({ TableName: tableName, Item: row })
                   recording = true
                   const report = yield* db.tables.MainTable.rekey({
-                    ...QUIET_RUNS[run],
+                    ...options,
                     streams: [world.Counters],
                   })
                   recording = false

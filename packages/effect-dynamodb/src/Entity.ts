@@ -195,7 +195,12 @@ import {
 } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import { filterExpr, selectPaths } from "./Query.js"
-import { type RekeyConflict, resolveTtlAttributeName, type TableConfig } from "./Table.js"
+import {
+  type RekeyConflict,
+  type RekeyReservationOutcome,
+  resolveTtlAttributeName,
+  type TableConfig,
+} from "./Table.js"
 
 // Internal modules (decomposed from Entity.ts)
 export type {
@@ -14502,7 +14507,12 @@ const makeImpl = <
     )
   }
 
-  /** The row a sentinel's back-pointer names: the item, or a tombstone keeping its reservation. */
+  /**
+   * The row a sentinel's back-pointer names: the item, or its latest tombstone, which moves the
+   * sentinel with it. Only under `preserveUnique` does a tombstone keep the reservation
+   * ({@link judgeReservation}); without, the sentinel is one an earlier release's soft delete left
+   * behind, which moves as it is and is reported ({@link orphanedByTombstone}).
+   */
   const sentinelOwnerRow = (tableName: string, sentinel: StoredRow) =>
     Effect.gen(function* () {
       const pk = sentinel._entity_pk?.S
@@ -14516,6 +14526,14 @@ const makeImpl = <
       })
       return item ?? (yield* latestTombstone(tableName, pk, sk))
     })
+
+  /**
+   * A tombstone without `preserveUnique` holds no reservation: its soft delete released them. A
+   * sentinel naming its item, which 1.39 and earlier left behind, still moves with it, as it did
+   * (the value stays reserved until it's released), and is judged as one no row holds.
+   */
+  const orphanedByTombstone = (owner: StoredRow): boolean =>
+    !preserveUnique() && rowTargets(owner)?.kind === "tombstone"
 
   /**
    * The writes that bring the unique sentinels of `values` to their current keys, naming `to`,
@@ -14685,46 +14703,71 @@ const makeImpl = <
               )
               continue
             }
-            // Another value's sentinel under other key text moves out first, with its row.
-            const holder = yield* sentinelOwnerRow(ctx.tableName, heldNow)
-            const holderNow =
-              holder === undefined
-                ? undefined
-                : sentinelKeyUnder(
-                    schema,
-                    constraintName,
-                    constraintDef,
-                    toDomainView(fromAttributeMap(holder) as globalThis.Record<string, unknown>),
-                  )
-            const stale =
-              holderNow !== undefined &&
-              (holderNow.pk !== current.pk || holderNow.sk !== current.sk)
-            if (!stale) {
-              refused(
-                "taken",
+            // With `releaseOrphanedReservations`, a sentinel no row holds is judged first, as the
+            // scan judges it, and released: its key is then free.
+            const currentKey = sentinelKeyRecord(current)
+            if (
+              ctx.releaseOrphanedReservations &&
+              (yield* judgeReservation(
+                ctx.tableName,
+                heldNow,
                 constraintName,
-                found.key,
-                current,
-                "its sentinel's current key is held by another item.",
-              )
-              continue
+                constraintDef,
+                currentKey,
+              ))._tag === "orphaned"
+            ) {
+              yield* judgeReservationRow(ctx, heldNow, constraintName, constraintDef, currentKey)
             }
-            // The holder's sentinel moves out first, as a unit of its own: with its row when that
-            // row moves too, and otherwise by itself, so two rows holding each other's sentinel
-            // keys under different constraints don't wait on each other.
-            const judged = yield* holderSentinelOut(ctx, holder!, constraintName, current)
-            if (!ctx.vacated(toAttributeMap(sentinelKeyRecord(current)))) {
-              refused(
-                judged === "loop" ? "contended" : "taken",
-                constraintName,
-                found.key,
-                current,
-                judged === "loop"
-                  ? "sentinels under other key text hold each other's current keys in a loop."
-                  : "its sentinel's current key is held by another item.",
-              )
-              continue
+            if (!ctx.vacated(toAttributeMap(currentKey))) {
+              // Another value's sentinel under other key text moves out first, with its row.
+              const holder = yield* sentinelOwnerRow(ctx.tableName, heldNow)
+              const holderNow =
+                holder === undefined
+                  ? undefined
+                  : sentinelKeyUnder(
+                      schema,
+                      constraintName,
+                      constraintDef,
+                      toDomainView(fromAttributeMap(holder) as globalThis.Record<string, unknown>),
+                    )
+              const stale =
+                holderNow !== undefined &&
+                (holderNow.pk !== current.pk || holderNow.sk !== current.sk)
+              if (!stale) {
+                refused(
+                  "taken",
+                  constraintName,
+                  found.key,
+                  current,
+                  "its sentinel's current key is held by another item.",
+                )
+                continue
+              }
+              // The holder's sentinel moves out first, as a unit of its own: with its row when
+              // that row moves too, and otherwise by itself, so two rows holding each other's
+              // sentinel keys under different constraints don't wait on each other.
+              const judged = yield* holderSentinelOut(ctx, holder!, constraintName, current)
+              if (!ctx.vacated(toAttributeMap(currentKey))) {
+                refused(
+                  judged === "loop" ? "contended" : "taken",
+                  constraintName,
+                  found.key,
+                  current,
+                  judged === "loop"
+                    ? "sentinels under other key text hold each other's current keys in a loop."
+                    : "its sentinel's current key is held by another item.",
+                )
+                continue
+              }
             }
+          }
+          if (kind === "tombstone" && !preserveUnique()) {
+            // A sentinel a tombstone without `preserveUnique` names is one no row holds
+            // ({@link orphanedByTombstone}): judged first, as the scan judges it. Released, it
+            // doesn't move; otherwise it moves as it is.
+            const from = sentinelKeyRecord(found.key)
+            yield* judgeReservationRow(ctx, found.held, constraintName, constraintDef, from)
+            if (ctx.vacated(toAttributeMap(from))) continue
           }
           const move: ReadonlyArray<TransactWriteItem> = [
             {
@@ -14861,10 +14904,363 @@ const makeImpl = <
     })
 
   /**
-   * A scanned unique sentinel. It holds no values and moves with the row it names, so it is
-   * counted only when no row will: its row is gone (and no tombstone keeps the reservation), or
-   * that row's values compose no such sentinel under any key text. Read again first, since a move
-   * of its row takes it along.
+   * Is `at` a key a sentinel of `constraintName` is stored under, under some key text? Its sort key
+   * is the constraint's, and its partition key starts with it. A sentinel of another schema, or
+   * another application's on the same table, isn't.
+   */
+  const isSentinelKeyOf = (constraintName: string, at: StoredKey): boolean =>
+    [schema, ...sentinelTexts()].some((under) => {
+      const { sk } = DynamoSchema.composeUniqueKey(under, entityType, constraintName, [])
+      return at[rekeySk] === sk && String(at[rekeyPk] ?? "").startsWith(`${sk}#`)
+    })
+
+  /**
+   * Whether `row` — the row a sentinel names, or a tombstone of it — holds the sentinel at `at`: its
+   * values compose that key under some key text, a numeric value as either kind. `unknown` when
+   * they don't and can't be composed at all, so nothing says what they would give.
+   */
+  const holdsSentinel = (
+    row: StoredRow,
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    at: StoredKey,
+  ): "yes" | "no" | "unknown" => {
+    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
+    const key = { pk: String(at[rekeyPk]), sk: String(at[rekeySk]) }
+    if (sentinelHeldAt(constraintName, constraintDef, values, row, key, true)) return "yes"
+    for (const under of [schema, ...sentinelTexts()]) {
+      try {
+        composeUniqueSentinel(
+          under,
+          entityType,
+          constraintName,
+          constraintDef,
+          values,
+          readSentinelValue,
+        )
+      } catch {
+        return "unknown"
+      }
+    }
+    return "no"
+  }
+
+  /**
+   * The tombstones of the item at `owner` (`preserveUnique`: each kept its reservations), under
+   * every key text, and whether a tombstone in its partition couldn't be told to be its or another
+   * item's.
+   */
+  const tombstonesOf = (tableName: string, owner: StoredKey) =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      const prefixes = [
+        ...new Set(
+          [schema, ...sentinelTexts()].map((under) =>
+            DynamoSchema.composeDeletedKeyPrefix(under, entityType),
+          ),
+        ),
+      ]
+      const rows: Array<StoredRow> = []
+      let unattributed = false
+      for (const prefix of prefixes) {
+        let start: StoredRow | undefined
+        do {
+          const page = yield* client.query({
+            TableName: tableName,
+            KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :prefix)",
+            ExpressionAttributeNames: { "#pk": rekeyPk, "#sk": rekeySk },
+            ExpressionAttributeValues: toAttributeMap({ ":pk": owner[rekeyPk], ":prefix": prefix }),
+            ConsistentRead: true,
+            ...(start !== undefined && { ExclusiveStartKey: start }),
+          })
+          for (const row of page.Items ?? []) {
+            if (row.__edd_e__?.S !== entityType) continue
+            const targets = rowTargets(row)
+            if (targets === undefined) unattributed = true
+            else if (targets.kind === "tombstone" && targets.isLive(owner)) rows.push(row)
+          }
+          start = page.LastEvaluatedKey as StoredRow | undefined
+        } while (start !== undefined)
+      }
+      return { rows, unattributed }
+    })
+
+  type ReservationJudgement =
+    | { readonly _tag: "held" }
+    | {
+        readonly _tag: "orphaned"
+        readonly owner: StoredKey
+        readonly message: string
+        /** The release's `ConditionCheck`: the row it names is still as it was read. */
+        readonly check: TransactWriteItem
+      }
+    | {
+        readonly _tag: "undecided"
+        readonly owner: StoredKey | undefined
+        readonly message: string
+      }
+
+  /**
+   * The `ConditionCheck` a release carries: the row a sentinel names is still absent, or still holds
+   * what the judgement read of it — its type, the constraint's fields and the defaults list
+   * (`__edd_d__`), each as read or absent — so a write that makes it hold the sentinel wins.
+   */
+  const ownerCheck = (
+    tableName: string,
+    owner: StoredKey,
+    live: StoredRow | undefined,
+    constraintDef: UniqueConstraintDef,
+  ): TransactWriteItem => {
+    if (live === undefined) {
+      return {
+        ConditionCheck: {
+          TableName: tableName,
+          Key: toAttributeMap(owner),
+          ConditionExpression: "attribute_not_exists(#pk)",
+          ExpressionAttributeNames: { "#pk": rekeyPk },
+        },
+      }
+    }
+    const names: globalThis.Record<string, string> = { "#e": "__edd_e__" }
+    const values: globalThis.Record<string, AttributeValue> = { ":e": live.__edd_e__! }
+    const guards = ["#e = :e"]
+    const attributes = [
+      ...new Set([
+        ...resolveUniqueFields(constraintDef).map((field) => resolveDbName(field)),
+        UNSENTINELED_DEFAULTS,
+      ]),
+    ]
+    for (const [i, attribute] of attributes.entries()) {
+      names[`#a${i}`] = attribute
+      const read = live[attribute]
+      if (read === undefined) {
+        guards.push(`attribute_not_exists(#a${i})`)
+      } else {
+        values[`:a${i}`] = read
+        guards.push(`#a${i} = :a${i}`)
+      }
+    }
+    return {
+      ConditionCheck: {
+        TableName: tableName,
+        Key: toAttributeMap(owner),
+        ConditionExpression: guards.join(" AND "),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      },
+    }
+  }
+
+  /**
+   * Does any row hold the unique sentinel `sentinel`, stored at `at`? The row its back-pointer names
+   * does when its values compose `at` under some key text, and with `preserveUnique` so does a
+   * tombstone of that row: the soft delete kept the reservation on purpose. Without
+   * `preserveUnique` a soft delete releases its reservations, so a tombstone holds none.
+   * `undecided` when nothing says: no back-pointer, a row of another type behind it, or values
+   * that compose no sentinel key under some text.
+   */
+  const judgeReservation = (
+    tableName: string,
+    sentinel: StoredRow,
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    at: StoredKey,
+  ): Effect.Effect<ReservationJudgement, DynamoClientError, DynamoClient> =>
+    Effect.gen(function* () {
+      const pk = sentinel._entity_pk?.S
+      const sk = sentinel._entity_sk?.S
+      if (pk === undefined || sk === undefined) {
+        return {
+          _tag: "undecided",
+          owner: undefined,
+          message: "It names no row: it has no `_entity_pk` and `_entity_sk` strings.",
+        }
+      }
+      const owner = keyAt(pk, sk)
+      const client = yield* Capacity.client
+      const { Item: live } = yield* client.getItem({
+        TableName: tableName,
+        Key: toAttributeMap(owner),
+        ConsistentRead: true,
+      })
+      if (live !== undefined && live.__edd_e__?.S !== entityType) {
+        const type = live.__edd_e__?.S
+        return {
+          _tag: "undecided",
+          owner,
+          message:
+            type === undefined
+              ? "The row it names isn't the library's: it has no `__edd_e__`."
+              : `The row it names is a ${JSON.stringify(type)} row, not a ${JSON.stringify(entityType)}.`,
+        }
+      }
+      let unknown = false
+      if (live !== undefined) {
+        const holds = holdsSentinel(live, constraintName, constraintDef, at)
+        if (holds === "yes") return { _tag: "held" }
+        if (holds === "unknown") unknown = true
+      }
+      if (preserveUnique()) {
+        const tombstones = yield* tombstonesOf(tableName, owner)
+        const holds = tombstones.rows.map((row) =>
+          holdsSentinel(row, constraintName, constraintDef, at),
+        )
+        if (holds.includes("yes")) return { _tag: "held" }
+        if (holds.includes("unknown") || tombstones.unattributed) unknown = true
+      }
+      if (unknown) {
+        return {
+          _tag: "undecided",
+          owner,
+          message:
+            "The values of the row it names, or of a tombstone in its partition, compose no " +
+            "sentinel key under some key text, so nothing says whether they hold it.",
+        }
+      }
+      const tombstoneNote = preserveUnique() ? ", nor does a tombstone of it" : ""
+      if (live === undefined) {
+        return {
+          _tag: "orphaned",
+          owner,
+          message: `The row it names doesn't exist${tombstoneNote}.`,
+          check: ownerCheck(tableName, owner, undefined, constraintDef),
+        }
+      }
+      const now = sentinelKeyUnder(
+        schema,
+        constraintName,
+        constraintDef,
+        toDomainView(fromAttributeMap(live) as globalThis.Record<string, unknown>),
+      )
+      return {
+        _tag: "orphaned",
+        owner,
+        message:
+          now === undefined
+            ? `The row it names holds no value for the constraint${tombstoneNote}.`
+            : `The row it names holds another value, whose sentinel is ${JSON.stringify(sentinelKeyRecord(now))}${tombstoneNote}.`,
+        check: ownerCheck(tableName, owner, live, constraintDef),
+      }
+    })
+
+  /**
+   * The `Delete` releasing an orphaned sentinel, conditioned on the sentinel as read: the same
+   * back-pointer and the same TTL (or none), so a reservation claimed in between — a TTL'd one
+   * expired and taken again included — is never deleted.
+   */
+  const reservationRelease = (
+    tableName: string,
+    sentinel: StoredRow,
+    at: StoredKey,
+    ttlAttribute: string,
+  ): TransactWriteItem => {
+    const ttl = sentinel[ttlAttribute]
+    return {
+      Delete: {
+        TableName: tableName,
+        Key: toAttributeMap(at),
+        ConditionExpression: `#epk = :epk AND #esk = :esk AND ${
+          ttl === undefined ? "attribute_not_exists(#ttl)" : "#ttl = :ttl"
+        }`,
+        ExpressionAttributeNames: {
+          "#epk": "_entity_pk",
+          "#esk": "_entity_sk",
+          "#ttl": ttlAttribute,
+        },
+        ExpressionAttributeValues: {
+          ":epk": sentinel._entity_pk!,
+          ":esk": sentinel._entity_sk!,
+          ...(ttl !== undefined && { ":ttl": ttl }),
+        },
+      },
+    }
+  }
+
+  /**
+   * Judge the unique sentinel `read` (a consistent read of it, at `at`) as its unit, once a run
+   * ({@link Rekey.RekeyRowContext.judge}): a sentinel no row holds is reported in
+   * {@link RekeyReport.reservations}, and with `releaseOrphanedReservations` deleted, by one
+   * transaction guarded on it and the row it names as read. One nothing can judge is `undecided`.
+   * The scan's visit and a move needing its key ({@link sentinelRekeys}) reach it alike.
+   */
+  const judgeReservationRow = (
+    ctx: Rekey.RekeyRowContext,
+    read: StoredRow,
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    at: StoredKey,
+  ): Effect.Effect<Rekey.Judged, DynamoClientError, DynamoClient | TableConfig> =>
+    ctx.judge(
+      entityType,
+      Rekey.reservationUnit(String(at[rekeyPk]), String(at[rekeySk])),
+      Effect.gen(function* () {
+        const client = yield* Capacity.client
+        const judge = (sentinel: StoredRow) =>
+          judgeReservation(ctx.tableName, sentinel, constraintName, constraintDef, at)
+        const readAgain = Effect.map(
+          client.getItem({
+            TableName: ctx.tableName,
+            Key: toAttributeMap(at),
+            ConsistentRead: true,
+          }),
+          (result) => result.Item,
+        )
+        let sentinel = read
+        let judged = yield* judge(sentinel)
+        if (judged._tag === "held") return {}
+        const report = (
+          outcome: RekeyReservationOutcome,
+          owner: StoredKey | undefined,
+          message: string,
+        ): Rekey.RekeyTally => ({
+          reservations: [
+            { member: entityType, constraint: constraintName, key: at, owner, outcome, message },
+          ],
+        })
+        if (judged._tag === "undecided") return report("undecided", judged.owner, judged.message)
+        if (!ctx.releaseOrphanedReservations) {
+          return report("orphaned", judged.owner, judged.message)
+        }
+        const ttlAttribute = resolveTtlAttributeName(yield* tableTag)
+        for (let attempt = 0; ; attempt++) {
+          const released = yield* sendRekeyTransaction(ctx, [
+            reservationRelease(ctx.tableName, sentinel, at, ttlAttribute),
+            judged.check,
+          ])
+          if (released) return report("released", judged.owner, judged.message)
+          // A write changed the sentinel or its row first: judge it as it is now, and try once more.
+          if (attempt > 0) {
+            return report(
+              "skipped",
+              judged.owner,
+              `${judged.message} A write changed it or its row before each release, so it was left.`,
+            )
+          }
+          const again = yield* readAgain
+          const rejudged = again === undefined ? undefined : yield* judge(again)
+          if (rejudged?._tag === "undecided") {
+            return report("undecided", rejudged.owner, rejudged.message)
+          }
+          if (rejudged?._tag !== "orphaned") {
+            return report(
+              "orphaned",
+              judged.owner,
+              `${judged.message} A write claimed it, or released it, before the release, so it was left.`,
+            )
+          }
+          sentinel = again!
+          judged = rejudged
+        }
+      }),
+    )
+
+  /**
+   * A scanned unique sentinel. It holds no values and moves with the row it names, so nothing more
+   * is done when that row holds it. One no row holds is judged as its unit
+   * ({@link judgeReservationRow}): reported in {@link RekeyReport.reservations}, and released with
+   * `releaseOrphanedReservations`. Read again first, since a move of its row takes it along. A
+   * sentinel of a constraint the entity doesn't declare, or under another key prefix, isn't judged
+   * at all (`unrecognizedKey`).
    */
   const rekeySentinelRow = (
     row: StoredRow,
@@ -14900,7 +15296,9 @@ const makeImpl = <
         owner === undefined
           ? Effect.succeed(undefined)
           : named(sentinel, owner, false)
-            ? Effect.succeed({})
+            ? orphanedByTombstone(owner) && constraintDef !== undefined
+              ? Effect.as(judgeReservationRow(ctx, sentinel, constraintName, constraintDef, at), {})
+              : Effect.succeed({})
             : named(sentinel, owner, true)
               ? sentinelsUnderOtherKind(ctx, owner, { constraintName, key: keyOf(sentinel) })
               : Effect.succeed(undefined)
@@ -14913,11 +15311,18 @@ const makeImpl = <
         ConsistentRead: true,
       })
       if (fresh === undefined) return {}
-      return (
-        (yield* judge(fresh, yield* sentinelOwnerRow(ctx.tableName, fresh))) ?? {
-          skipped: { unrecognizedKey: 1 },
-        }
-      )
+      const again = yield* judge(fresh, yield* sentinelOwnerRow(ctx.tableName, fresh))
+      if (again !== undefined) return again
+      if (
+        constraintDef === undefined ||
+        !Object.hasOwn(config.unique as object, constraintName) ||
+        !isSentinelKeyOf(constraintName, at)
+      ) {
+        return { skipped: { unrecognizedKey: 1 } }
+      }
+      // No row holds it, as far as the scan's reads say: judged as its unit, counted when it settles.
+      yield* judgeReservationRow(ctx, fresh, constraintName, constraintDef, at)
+      return {}
     })
 
   /**
