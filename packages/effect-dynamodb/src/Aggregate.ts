@@ -970,8 +970,7 @@ const dateAttrEncoder = (
   options?: { readonly mixedUnions?: boolean },
 ): ((value: unknown) => unknown) | undefined => {
   if (options?.mixedUnions !== true && isMixedDateUnion(fieldSchema.ast)) return undefined
-  const explicit = DynamoModel.getEncoding(fieldSchema)
-  const encodings = explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)
+  const encodings = storedDateEncodings(fieldSchema)
   const last = encodings.at(-1)
   if (!last) return undefined
   // A union of dates of different kinds: a value is stored in the form of the kind it is.
@@ -990,10 +989,21 @@ const dateAttrEncoder = (
   }
 }
 
+/**
+ * The encodings a date field's values are stored in, the last for a value of no earlier one's kind:
+ * the field's own annotation, else those its schema's dates imply. Read off the field as declared, so
+ * an annotation inside `Schema.optional`'s union isn't seen, and such a field's values are stored as
+ * its date's default, ISO text, as 1.39.0 stored them. A stamp in a field a row declares is stored
+ * the same way (`rowStampsOf`).
+ */
+const storedDateEncodings = (fieldSchema: Schema.Top): ReadonlyArray<DynamoEncoding> => {
+  const explicit = DynamoModel.getEncoding(fieldSchema)
+  return explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)
+}
+
 /** Whether a value is a date field's stored form: one its date encodings decode. */
 const storedDateForm = (fieldSchema: Schema.Top): ((value: unknown) => boolean) => {
-  const explicit = DynamoModel.getEncoding(fieldSchema)
-  const decoders = (explicit ? [explicit] : inferDateEncodings(fieldSchema.ast)).map((encoding) =>
+  const decoders = storedDateEncodings(fieldSchema).map((encoding) =>
     Schema.decodeUnknownOption(buildDateTransform(encoding) as Schema.Codec<any>),
   )
   return (value) => decoders.some((decode) => Option.isSome(decode(value)))
@@ -1530,13 +1540,35 @@ const makeAggregate = <TSchema extends Schema.Top>(
     schemaFields,
     config.pk.composite,
   )
+  // The form a stamp is stored in: on a row declaring its field, the form the row stores any value of
+  // that field in ({@link storedDateEncodings}, as `buildAttrEncoders` reads it), else the stamp's
+  // own encoding. A row that doesn't declare it holds what the root's would.
+  const storedIn = (
+    fields: Record<string, Schema.Top> | undefined,
+    name: string | null,
+    declared: boolean,
+    encoding: DynamoEncoding | null,
+  ): DynamoEncoding | null => {
+    const field = declared && name !== null ? fields?.[name] : undefined
+    return (field === undefined ? undefined : storedDateEncodings(field).at(-1)) ?? encoding
+  }
   const stampFields: StampFields | undefined =
     timestampFields.createdAt !== null || timestampFields.updatedAt !== null
       ? {
           createdAt: timestampFields.createdAt,
-          createdEncoding: timestampFields.createdAtEncoding,
+          createdEncoding: storedIn(
+            schemaFields,
+            timestampFields.createdAt,
+            timestampFields.createdAtCollision,
+            timestampFields.createdAtEncoding,
+          ),
           updatedAt: timestampFields.updatedAt,
-          updatedEncoding: timestampFields.updatedAtEncoding,
+          updatedEncoding: storedIn(
+            schemaFields,
+            timestampFields.updatedAt,
+            timestampFields.updatedAtCollision,
+            timestampFields.updatedAtEncoding,
+          ),
         }
       : undefined
   // What the read path may drop before decoding: each node drops those its rows
@@ -1569,11 +1601,17 @@ const makeAggregate = <TSchema extends Schema.Top>(
     return {
       createdAt: stampFields.createdAt === null ? null : own.createdAt,
       createdEncoding: own.createdAtCollision ? own.createdAtEncoding : stampFields.createdEncoding,
+      createdStored: own.createdAtCollision
+        ? storedIn(fields, own.createdAt, true, own.createdAtEncoding)
+        : stampFields.createdEncoding,
       createdDeclared: own.createdAtCollision,
       createdRequired: own.createdAtCollision && requiredIn(fields, own.createdAt),
       createdReplaces,
       updatedAt: stampFields.updatedAt === null ? null : own.updatedAt,
       updatedEncoding: own.updatedAtCollision ? own.updatedAtEncoding : stampFields.updatedEncoding,
+      updatedStored: own.updatedAtCollision
+        ? storedIn(fields, own.updatedAt, true, own.updatedAtEncoding)
+        : stampFields.updatedEncoding,
       updatedDeclared: own.updatedAtCollision,
       updatedRequired: own.updatedAtCollision && requiredIn(fields, own.updatedAt),
       updatedReplaces,
@@ -6105,7 +6143,7 @@ const hashToShard = (value: string, cardinality: number): number => {
 // Internal: Compose DynamoDB items from decomposed data
 // ---------------------------------------------------------------------------
 
-/** Resolved timestamp attribute names + storage for one aggregate. */
+/** Resolved timestamp attribute names, and the form the root's rows store each stamp in. */
 interface StampFields {
   readonly createdAt: string | null
   readonly createdEncoding: DynamoEncoding | null
@@ -6113,15 +6151,21 @@ interface StampFields {
   readonly updatedEncoding: DynamoEncoding | null
 }
 
-/** What a node's rows do with each timestamp: see `rowStampsOf`. A null name isn't stamped. */
+/**
+ * What a node's rows do with each timestamp: see `rowStampsOf`. A null name isn't stamped. The
+ * encoding is the form `create`'s input takes the stamp in, which the field's schema decodes; the
+ * stored form is what's written.
+ */
 interface RowStamps {
   readonly createdAt: string | null
   readonly createdEncoding: DynamoEncoding | null
+  readonly createdStored: DynamoEncoding | null
   readonly createdDeclared: boolean
   readonly createdRequired: boolean
   readonly createdReplaces: boolean
   readonly updatedAt: string | null
   readonly updatedEncoding: DynamoEncoding | null
+  readonly updatedStored: DynamoEncoding | null
   readonly updatedDeclared: boolean
   readonly updatedRequired: boolean
   readonly updatedReplaces: boolean
@@ -6309,7 +6353,7 @@ const buildDynamoItems = (
         if (row.createdAt !== null) {
           const held = row.createdDeclared ? item.attributes[row.createdAt] : undefined
           stamped[row.createdAt] =
-            existingCreated.get(sk) ?? held ?? generateTimestampPrimitive(now, row.createdEncoding)
+            existingCreated.get(sk) ?? held ?? generateTimestampPrimitive(now, row.createdStored)
         }
         if (row.updatedAt !== null) {
           const held = row.updatedDeclared ? item.attributes[row.updatedAt] : undefined
@@ -6318,7 +6362,7 @@ const buildDynamoItems = (
             held !== undefined && !(before?.has(sk) && deepEqual(before.get(sk), held))
           stamped[row.updatedAt] =
             stamp.existingUpdated?.get(sk) ??
-            (supplied ? held : generateTimestampPrimitive(now, row.updatedEncoding))
+            (supplied ? held : generateTimestampPrimitive(now, row.updatedStored))
         }
       }
 

@@ -3,7 +3,7 @@
  * `Kept139.test.ts`. Each scenario replays its steps and compares them with what 1.39.0 did
  * (`fixtures/*-1.39.0.json`, captured once, never regenerated).
  * Scenarios: `helpers/OptionalShardAppend.ts`, `helpers/StoredNaNKeys.ts`,
- * `helpers/AggregateCreateStamps.ts`.
+ * `helpers/AggregateCreateStamps.ts`, `helpers/AggregateStampForms.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -21,6 +21,7 @@ import { describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
+import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
@@ -81,4 +82,8 @@ describeConnected("a key over a number stored as a string, holding NaN", () => {
 
 describeConnected("an aggregate create over a field the rows declare a stamp in", () => {
   aggregateCreateStampsSuite(openTable)
+})
+
+describeConnected("the form an aggregate stores its stamps in", () => {
+  aggregateStampFormsSuite(openTable)
 })

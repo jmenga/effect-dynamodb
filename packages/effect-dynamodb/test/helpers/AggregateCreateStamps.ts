@@ -295,17 +295,6 @@ const stampedRows = (
 
 const isRoot = (row: Row) => row.__edd_e__?.S === "Match"
 
-/**
- * `rows` with `name` as the instant it holds, whatever its form: the update writes a stamp under a
- * date the root declares optional in the field's own form, which `create` didn't.
- */
-const instants = (rows: ReadonlyArray<Row>, name: string) =>
-  rows.map((row) => {
-    const held = row[name]
-    if (held === undefined) return row
-    return { ...row, [name]: "N" in held ? Number(held.N) : Date.parse(held.S!) }
-  })
-
 /** The scenarios, each a test against a table `open` makes. */
 export const aggregateCreateStampsSuite = (open: OpenTable) => {
   it("1.39.0 stored the stamp over a value passed, but under a date the root declares optional", () => {
@@ -360,11 +349,9 @@ export const aggregateCreateStampsSuite = (open: OpenTable) => {
           // couldn't read an edge declaring a stamped date back (`Missing key`).
           const later = stamp + 5_000
           const rewritten = stampedRows(create.rows, [definition.updated], later, () => true)
-          expect(instants(update.rows, definition.updated)).toEqual(
-            instants(
-              rewritten.map((row) => (isRoot(row) ? { ...row, name: { S: "o" } } : row)),
-              definition.updated,
-            ),
+          // The update's stamp takes the form `create` stored the field in (`AggregateStampForms.ts`).
+          expect(update.rows).toEqual(
+            rewritten.map((row) => (isRoot(row) ? { ...row, name: { S: "o" } } : row)),
           )
           if ("ok" in updated.outcome && keeps.length === 0) {
             expect(update.rows).toEqual(updated.rows)
