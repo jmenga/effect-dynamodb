@@ -22,6 +22,7 @@ import * as Table from "../src/Table.js"
 import { gatedLayer } from "./helpers/GatedClient.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
+import { storedRows } from "./helpers/StoredRows.js"
 
 type Row = Record<string, AttributeValue>
 
@@ -149,8 +150,8 @@ const decided = (report: Table.RekeyReport) => {
   }
 }
 
-const storedOf = (rows: Iterable<Row>) =>
-  [...rows].map((row) => JSON.stringify(row, Object.keys(row).sort())).sort()
+/** The stored rows, every attribute's typed value included ({@link storedRows}). */
+const storedOf = (rows: Iterable<Row>) => storedRows(rows)
 
 describe.each([
   ["releasing", true],
