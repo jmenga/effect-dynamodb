@@ -376,3 +376,160 @@ describeConnected.each(["1.39.0", "1.40.0"])(
     )
   },
 )
+
+/**
+ * Rows moving while `rekey` of the outbox table decides whose an item is. `a1` is A's item, read
+ * by A's row (where it is, then where A would move it): here A's rows move (A's table's own
+ * `rekey`) right after `rekey` first reads A's table for `a1`, or B writes a row of its own at
+ * `a1` then. Whichever reads land before and after, `a1` is never taken for B's (left where it
+ * is, uncounted): it moves by A, or is left and reported, and a later run, with the rows settled,
+ * decides it as one run without movement does. A dry run, a run resumed from its token, then a
+ * rerun.
+ */
+describeConnected.each(["1.39.0", "1.40.0"])(
+  "rekey of a shared outbox table while rows move, items %s wrote",
+  (version) => {
+    const written = captured(version).runs["escapeKeys off"]
+
+    it.effect.each([
+      ["A's rows move", "move"],
+      ["B writes a row at a1", "write"],
+    ] as const)("%s mid-run: a1 is A's or left, never B's; a rerun settles it", ([, movement]) => {
+      const now = world(true)
+      const stamp = `${Date.now()}-${made++}`
+      const names = {
+        events: `mv-e-${stamp}`,
+        ra: `mv-ra-${stamp}`,
+        rb: `mv-rb-${stamp}`,
+        o: `mv-o-${stamp}`,
+      }
+      const a1 = "$amb#v1#ledger#ida_a1"
+      const item = (idA: string, shop: string) =>
+        `$amb#v1#ledger#ida_${idA}|$amb#v1#ledger#shop_${shop}#outbox#000000000001#0000`
+      // Run `hook` once, right after the next `GetItem` of A's table for `a1` returns.
+      const pending: { hook?: Effect.Effect<unknown, unknown> | undefined } = {}
+      const hooked = Layer.effect(
+        DynamoClient,
+        Effect.map(Effect.service(DynamoClient), (inner) => ({
+          ...inner,
+          getItem: (input: Parameters<typeof inner.getItem>[0]) =>
+            inner.getItem(input).pipe(
+              Effect.tap(() => {
+                const hook = pending.hook
+                if (hook === undefined || input.TableName !== names.ra) return Effect.void
+                if (input.Key?.pk?.S !== a1) return Effect.void
+                pending.hook = undefined
+                return Effect.orDie(hook)
+              }),
+            ),
+        })),
+      ).pipe(Layer.provide(ClientLayer))
+      const tablesLayer = Layer.mergeAll(
+        now.EventsTable.layer({ name: names.events }),
+        now.A.ReadTable.layer({ name: names.ra }),
+        now.B.ReadTable.layer({ name: names.rb }),
+        now.OutboxTable.layer({ name: names.o }),
+      )
+      return Effect.gen(function* () {
+        const ddb = yield* DynamoClient
+        for (const name of Object.values(names)) {
+          yield* ddb.createTable({
+            TableName: name,
+            BillingMode: "PAY_PER_REQUEST",
+            AttributeDefinitions: [
+              { AttributeName: "pk", AttributeType: "S" },
+              { AttributeName: "sk", AttributeType: "S" },
+            ],
+            KeySchema: [
+              { AttributeName: "pk", KeyType: "HASH" },
+              { AttributeName: "sk", KeyType: "RANGE" },
+            ],
+          })
+        }
+        const scan = (name: string) =>
+          Effect.map(ddb.scan({ TableName: name, ConsistentRead: true }), (page) =>
+            (page.Items ?? []).map(keyOf).sort(),
+          )
+        for (const [table, items] of [
+          [names.ra, written.ra],
+          [names.rb, written.rb],
+          [names.o, written.o],
+        ] as const) {
+          for (const stored of items) yield* ddb.putItem({ TableName: table, Item: stored })
+        }
+        const db = (yield* DynamoClient.make({
+          entities: { A: now.A.Ledgers, B: now.B.Ledgers },
+          tables: { RA: now.A.ReadTable, RB: now.B.ReadTable, O: now.OutboxTable },
+        })) as any
+        const rekeyOf = (table: "RA" | "RB" | "O") => (options: Record<string, unknown>) =>
+          db.tables[table].rekey({ streams: [now.Accounts], ...options }) as Effect.Effect<
+            Table.RekeyReport,
+            unknown
+          >
+        // The movement: A's table's `rekey`, or a row of B's at `a1` (B's row at `b1`, re-keyed).
+        const b1 = written.rb.find((stored) => stored.pk?.S === "$amb#v1#ledger#ida_b1")!
+        const movement_ =
+          movement === "move"
+            ? Effect.asVoid(rekeyOf("RA")({}))
+            : ddb.putItem({
+                TableName: names.rb,
+                Item: { ...b1, pk: { S: a1 }, idA: { S: "a1" } },
+              })
+        const settled = (run: {
+          readonly ambiguous: ReadonlyArray<Table.RekeyAmbiguity>
+        }): ReadonlyArray<string> =>
+          run.ambiguous.map((a) => String(a.key.pk).slice("$amb#v1#ledger#ida_".length)).sort()
+        const before = yield* scan(names.o)
+
+        // The dry run, the movement mid-run.
+        pending.hook = movement_
+        const dry = yield* fullRun(rekeyOf("O"), { dryRun: true }, true)
+        expect(pending.hook).toBeUndefined()
+        expect(yield* scan(names.o)).toEqual(before)
+        // `a1` moves by A, or is left and reported: never counted unchanged (B's). A's row is
+        // read where it is first, before it moves; B's after A's, so B's new row is seen.
+        expect(dry.moved).toEqual({ ...ZERO, outbox: movement === "move" ? 1 : 0 })
+        expect(settled(dry)).toEqual(
+          movement === "move" ? ["both", "gone", "tomb"] : ["a1", "both", "gone", "tomb"],
+        )
+        expect(dry.unchanged).toBe(1)
+        expect(dry.conflicts).toEqual([])
+
+        // A run resumed from its token, then a rerun: the rows have settled by then.
+        const real = yield* fullRun(rekeyOf("O"), {}, true)
+        expect(real.slices).toBeGreaterThan(1)
+        expect(real.unchanged).toBe(1)
+        expect(real.conflicts).toEqual([])
+        const again = yield* fullRun(rekeyOf("O"), {}, false)
+        expect(again.moved).toEqual(ZERO)
+        expect(settled(again)).toEqual(settled(real))
+        if (movement === "move") {
+          // A's row is where A reads it now: `a1` is A's, as without movement.
+          expect(real.moved).toEqual({ ...ZERO, outbox: 1 })
+          expect(settled(real)).toEqual(["both", "gone", "tomb"])
+          expect(yield* scan(names.o)).toEqual(
+            [
+              item("a1", "north%23branch_b1"),
+              ...["b1", "both", "gone", "tomb"].map((id) => item(id, "north#branch_b1")),
+            ].sort(),
+          )
+        } else {
+          // `a1` holds a row of each read model now: unsettled, left where it is.
+          expect(real.moved).toEqual(ZERO)
+          expect(settled(real)).toEqual(["a1", "both", "gone", "tomb"])
+          expect(yield* scan(names.o)).toEqual(before)
+        }
+      }).pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            const ddb = yield* DynamoClient
+            for (const name of Object.values(names)) {
+              yield* ddb.deleteTable({ TableName: name }).pipe(Effect.ignore)
+            }
+          }),
+        ),
+        Effect.provide(Layer.mergeAll(hooked, tablesLayer)),
+      ) as Effect.Effect<void, unknown>
+    })
+  },
+)
