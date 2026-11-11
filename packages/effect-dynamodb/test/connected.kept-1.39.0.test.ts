@@ -7,7 +7,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/NestedKeyEncodings.ts` (the last five against 1.40.0).
+ * `helpers/NestedKeyEncodings.ts` (the last five against 1.40.0), `helpers/EntryInQueries.ts`.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -28,6 +28,7 @@ import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
+import { entrySelectsSuite } from "./helpers/EntryInQueries.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { nestedKeyCollectionSuite, nestedKeyEncodingsSuite } from "./helpers/NestedKeyEncodings.js"
@@ -158,4 +159,8 @@ describeConnected("a path below a struct that renames its keys as they're stored
 
 describeConnected("a path below a struct that renames its keys, in a collection", () => {
   nestedKeyCollectionSuite(openTable)
+})
+
+describeConnected("a select of one sparse map entry, in a query and a collection", () => {
+  entrySelectsSuite(openTable)
 })

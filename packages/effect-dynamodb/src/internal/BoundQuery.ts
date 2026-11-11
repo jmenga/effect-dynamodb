@@ -641,6 +641,13 @@ const plainSelect = (
       )
     : Query.selectPaths(query, paths)
 
+/** `paths` without repeats, in order. */
+const uniquePaths = (
+  paths: ReadonlyArray<ReadonlyArray<string | number>>,
+): ReadonlyArray<ReadonlyArray<string | number>> => [
+  ...new Map(paths.map((path) => [JSON.stringify(path), path])).values(),
+]
+
 /** The top-level field names an expression's paths name. */
 const pathHeads = (node: unknown, into: Set<string> = new Set()): Set<string> => {
   if (Array.isArray(node)) {
@@ -674,6 +681,12 @@ export interface WholeRows {
    * whole ask the row where it holds the map, as a condition does (`Entity._entryForms`).
    */
   readonly entryForms: (expr: Expr) => Expr
+  /**
+   * The stored paths a row may hold entry `key` of map `field` under: the entry's attribute
+   * (`<prefix>#<key>`), and below the attribute a `field:` rename stores the map under whole
+   * (`Entity._sparseEntryPaths`).
+   */
+  readonly entryPaths: (field: string, key: string) => ReadonlyArray<ReadonlyArray<string>>
 }
 
 /** @internal An entity's {@link WholeRows}, or `undefined` when it has no sparse map field. */
@@ -682,22 +695,49 @@ export const wholeRowsOf = (entity: {
   readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
   readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
   readonly _entryForms?: ((expr: Expr) => Expr) | undefined
+  readonly _sparseEntryPaths?:
+    | ((field: string, key: string) => ReadonlyArray<ReadonlyArray<string>>)
+    | undefined
 }): WholeRows | undefined =>
   entity._sparseFieldNames === undefined ||
   entity._sparseFieldNames.length === 0 ||
   entity._sparseMapOf === undefined ||
-  entity._toDomainView === undefined
+  entity._toDomainView === undefined ||
+  entity._sparseEntryPaths === undefined
     ? undefined
     : {
         sparseFields: entity._sparseFieldNames,
         mapOf: entity._sparseMapOf,
         view: entity._toDomainView,
         entryForms: entity._entryForms ?? ((expr) => expr),
+        entryPaths: entity._sparseEntryPaths,
       }
 
 /** @internal Whether a selected path names one of `sparseFields` (its first segment, as a field). */
 const namesMap = (path: ReadonlyArray<string | number>, sparseFields: ReadonlyArray<string>) =>
   typeof path[0] === "string" && sparseFields.includes(path[0])
+
+/** @internal The entry a selected path names through its map field (`[field, key, ...]`), if any. */
+const mapEntryOf = (path: ReadonlyArray<string | number>, sparseFields: ReadonlyArray<string>) =>
+  namesMap(path, sparseFields) && typeof path[1] === "string"
+    ? { field: path[0] as string, key: path[1] }
+    : undefined
+
+/**
+ * @internal The stored paths a projection of `path` names, for an entity whose sparse maps
+ * `wholeRows` describes (#238): an entry, each place a row may hold it, with the segments below it
+ * as stored; any other path as {@link storedPath} names it.
+ */
+const projectedPaths = (
+  wholeRows: WholeRows | undefined,
+  path: ReadonlyArray<string | number>,
+  storedOf: (path: ReadonlyArray<string | number>) => ReadonlyArray<string | number>,
+): ReadonlyArray<ReadonlyArray<string | number>> => {
+  const entry = wholeRows === undefined ? undefined : mapEntryOf(path, wholeRows.sparseFields)
+  if (entry === undefined) return [storedOf(path)]
+  const rest = storedOf(path).slice(2)
+  return wholeRows!.entryPaths(entry.field, entry.key).map((held) => [...held, ...rest])
+}
 
 /**
  * @internal What a whole row gives a select (#238), for one entity: each path naming a sparse map,
@@ -752,15 +792,17 @@ const fromWholeRow = (
 
 /**
  * @internal Whether a select of `paths` reads whole rows (#238): one of them names a sparse map
- * field, stored one attribute per entry, which a `ProjectionExpression` can't name. A path naming
- * the item itself is left to the projection, which DynamoDB refuses.
+ * field whole, stored one attribute per entry, which a `ProjectionExpression` can't name by
+ * prefix. A select of an entry (the map's field with a key below it) projects the attributes the
+ * entry is stored under instead. A path naming the item itself is left to the
+ * projection, which DynamoDB refuses.
  */
 const readsWholeRows = (
   paths: ReadonlyArray<ReadonlyArray<string | number>>,
   sparseFields: ReadonlyArray<string>,
 ): boolean =>
   paths.every((path) => path.length > 0) &&
-  paths.some((path) => typeof path[0] === "string" && sparseFields.includes(path[0]))
+  paths.some((path) => namesMap(path, sparseFields) && mapEntryOf(path, sparseFields) === undefined)
 
 /**
  * @internal An entity's naming (#133): filters and selects name the stored
@@ -805,6 +847,18 @@ export const entityNaming = (
               .filter((path) => !namesMap(path, wholeRows.sparseFields))
               .map((path) => storedPath(path, stored, below)),
             (projected, raw) => fromWholeRow(wholeRows, paths, stored, projected, raw, below),
+          )
+        }
+        // An entry selected: its attributes projected, and the map rebuilt from what they hold.
+        if (
+          wholeRows !== undefined &&
+          paths.some((path) => mapEntryOf(path, wholeRows.sparseFields) !== undefined)
+        ) {
+          const storedOf = (path: ReadonlyArray<string | number>) => storedPath(path, stored, below)
+          return Query.selectProjected(
+            query,
+            uniquePaths(paths.flatMap((path) => projectedPaths(wholeRows, path, storedOf))),
+            (raw) => fromWholeRow(wholeRows, paths, stored, raw, raw, below),
           )
         }
         return paths.some(
@@ -919,12 +973,22 @@ export const collectionNaming = (
       // Only a member's own domain fields are read for it.
       const has = (m: (typeof members)[number], head: string) =>
         m.fields === undefined || m.fields.has(head)
+      /** A member's paths that name an entry of one of its sparse maps (#238). */
+      const namesEntry = (m: (typeof members)[number]) =>
+        m.wholeRows !== undefined &&
+        paths.some(
+          (path) =>
+            has(m, String(path[0])) && mapEntryOf(path, m.wholeRows!.sparseFields) !== undefined,
+        )
       const stored = new Map<string, ReadonlyArray<string | number>>()
       for (const m of members) {
+        const storedOf = (path: ReadonlyArray<string | number>) =>
+          storedPath(path, (head) => m.resolve(head), m.below)
         for (const path of paths) {
           if (!has(m, String(path[0]))) continue
-          const renamed = storedPath(path, (head) => m.resolve(head), m.below)
-          stored.set(JSON.stringify(renamed), renamed)
+          for (const renamed of projectedPaths(m.wholeRows, path, storedOf)) {
+            stored.set(JSON.stringify(renamed), renamed)
+          }
         }
       }
       const plans = new Map(
@@ -992,6 +1056,14 @@ export const collectionNaming = (
       return Query.selectProjected(query, [...stored.values()], (raw) => {
         const m = byType.get(raw.__edd_e__ as string)
         if (m === undefined) return { _memberKey: "__unknown__", _decoded: raw }
+        // An entry of one of its maps selected: the map rebuilt from the attributes projected.
+        if (namesEntry(m)) {
+          const own = paths.filter((path) => has(m, String(path[0])))
+          return {
+            _memberKey: m.entityKey,
+            _decoded: fromWholeRow(m.wholeRows!, own, (head) => m.resolve(head), raw, raw, m.below),
+          }
+        }
         const item: Record<string, unknown> = {}
         for (const head of heads) {
           if (!has(m, head)) continue

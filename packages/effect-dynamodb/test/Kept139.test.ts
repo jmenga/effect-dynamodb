@@ -6,7 +6,7 @@
  * `helpers/OptionalTransformDates.ts`, `helpers/WideShardAppend.ts`, `helpers/PathClears.ts`,
  * `helpers/HashFieldNames.ts`, `helpers/SelectSparseMaps.ts`, `helpers/EntryBesideField.ts`,
  * `helpers/SelectBesideSparseMaps.ts`, `helpers/AccompaniedClears.ts`, `helpers/RenamedSparseMap.ts`,
- * `helpers/NestedKeyEncodings.ts` (the last five against 1.40.0). Connected twin:
+ * `helpers/NestedKeyEncodings.ts` (the last five against 1.40.0), `helpers/EntryInQueries.ts`. Connected twin:
  * `connected.kept-1.39.0.test.ts`.
  */
 
@@ -15,6 +15,7 @@ import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
+import { entrySelectsSuite } from "./helpers/EntryInQueries.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import { openRecordingTable } from "./helpers/Kept139.js"
 import { nestedKeyCollectionSuite, nestedKeyEncodingsSuite } from "./helpers/NestedKeyEncodings.js"
@@ -93,4 +94,8 @@ describe("a path below a struct that renames its keys as they're stored", () => 
 
 describe("a path below a struct that renames its keys, in a collection", () => {
   nestedKeyCollectionSuite(openRecordingTable)
+})
+
+describe("a select of one sparse map entry, in a query and a collection", () => {
+  entrySelectsSuite(openRecordingTable)
 })

@@ -2,9 +2,11 @@
  * A `.select()` naming a sparse map field (#238 section 1). A sparse map is stored one attribute
  * per entry (`m#<key>`), and a `ProjectionExpression` can't name attributes by prefix: through
  * 1.40.0 the select projected `f`, which no row holds, so the map came back absent, on an entity's
- * scan and index query and on a collection alike. Such a select now reads whole rows (the request
- * is the one it sent, without the projection), rebuilds each as a read does and trims it to what
- * was selected. A select naming no sparse map sends what it always sent.
+ * scan and index query and on a collection alike. A select of a whole map now reads whole rows
+ * (the request is the one it sent, without the projection), rebuilds each as a read does and trims
+ * it to what was selected. A select of an entry through its map (`t.f.k`) projects the entry's
+ * attribute (`m#k`) in place of `f.k`, and rebuilds the map from it (`entryProjections`). A select
+ * naming no sparse map sends what it always sent.
  *
  * `fixtures/select-sparse-maps-1.39.0.json` holds what the published 1.39.0 did (1.40.0 did the
  * same): the head sends the same requests, less the projection where a sparse map is named, and
@@ -126,7 +128,33 @@ const results: Record<string, unknown> = {
   },
 }
 
-/** 1.39.0's request, without its projection: what a select naming a sparse map sends now. */
+/**
+ * What a select of an entry through its map sends now: 1.39.0's request, projecting the entry's
+ * attribute (`m#k`, `gm#a`) where 1.39.0 projected the map's field and key (`f.k`), which no row
+ * holds.
+ */
+const entryProjections: Record<string, Captured["sent"]> = {
+  "scan, select((t) => [t.f.k, t.note])": [
+    {
+      scan: {
+        FilterExpression: "#eddE IN (:et0)",
+        ProjectionExpression: "#proj0, #proj1",
+        ExpressionAttributeNames: { "#eddE": "__edd_e__", "#proj0": "m#k", "#proj1": "nt" },
+      },
+    },
+  ],
+  "scan, select((t) => [t.g.a.x])": [
+    {
+      scan: {
+        FilterExpression: "#eddE IN (:et0)",
+        ProjectionExpression: "#proj0.#proj1",
+        ExpressionAttributeNames: { "#eddE": "__edd_e__", "#proj0": "gm#a", "#proj1": "x" },
+      },
+    },
+  ],
+}
+
+/** 1.39.0's request, without its projection: what a select of a whole sparse map sends now. */
 const withoutProjection = (sent: Captured["sent"]): Captured["sent"] =>
   sent.map((request) =>
     Object.fromEntries(
@@ -199,10 +227,13 @@ export const selectSparseMapsSuite = (open: OpenTable, options: { readonly dynam
   for (const name of Object.keys(scenarios)) {
     const was = fixture.cases[name]!
     const changed = Object.hasOwn(results, name)
+    const entry = entryProjections[name]
     it.effect(
-      changed
-        ? `${name}: the map as a read rebuilds it, with no projection sent`
-        : `${name}: does what 1.39.0 did`,
+      entry !== undefined
+        ? `${name}: the map as a read rebuilds it, from the entry's attribute projected`
+        : changed
+          ? `${name}: the map as a read rebuilds it, with no projection sent`
+          : `${name}: does what 1.39.0 did`,
       () =>
         Effect.gen(function* () {
           const log: Array<unknown> = []
@@ -233,7 +264,7 @@ export const selectSparseMapsSuite = (open: OpenTable, options: { readonly dynam
                 return { outcome: outcomeOf(exit) as Captured["outcome"], sent: log.map(partsOf) }
               }),
           )
-          expect(got.sent).toEqual(changed ? withoutProjection(was.sent) : was.sent)
+          expect(got.sent).toEqual(entry ?? (changed ? withoutProjection(was.sent) : was.sent))
           const want = changed ? { ok: results[name] } : was.outcome
           if (options.dynamodb) {
             expect(got.outcome).toEqual(want)

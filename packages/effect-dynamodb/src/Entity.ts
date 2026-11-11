@@ -887,6 +887,13 @@ export interface Entity<
   readonly _sparseMapOf: (attribute: string) => string | undefined
 
   /**
+   * @internal The stored paths a row may hold entry `key` of sparse map `field` under (#238): the
+   * entry's own attribute (`<prefix>#<key>`), and below the attribute a `field:` rename stores the
+   * map under whole. A projection of them gives a read what it rebuilds the entry from.
+   */
+  readonly _sparseEntryPaths: (field: string, key: string) => ReadonlyArray<ReadonlyArray<string>>
+
+  /**
    * @internal A condition or filter (domain-named) whose conditions on an entry of a sparse map a
    * `field:` rename stores whole ask the row where it holds the map (#238); any other as given.
    */
@@ -2703,6 +2710,14 @@ const makeImpl = <
     return entry === undefined || renamedMapAttribute(entry.field) === undefined
       ? undefined
       : { field: entry.field, key: entry.key, rest: segments.slice(1) }
+  }
+  /** The stored paths a row may hold entry `key` of sparse map `field` under (`_sparseEntryPaths`). */
+  const sparseEntryPaths = (field: string, key: string): ReadonlyArray<ReadonlyArray<string>> => {
+    const whole = renamedMapAttribute(field)
+    return [
+      [`${sparseFields[field]!.prefix}#${key}`],
+      ...(whole === undefined ? [] : [[whole, key]]),
+    ]
   }
   /**
    * A condition or filter whose conditions on an entry of a sparse map a `field:` rename stores
@@ -18898,6 +18913,7 @@ const makeImpl = <
     _sparseFieldNames: Object.keys(sparseFields),
     _toDomainView: toDomainView,
     _sparseMapOf: sparseMapOf,
+    _sparseEntryPaths: sparseEntryPaths,
     _entryForms: entryForms,
     _storedBelow: storedBelow,
     /** @internal Entity schema version baked into composed keys. */
