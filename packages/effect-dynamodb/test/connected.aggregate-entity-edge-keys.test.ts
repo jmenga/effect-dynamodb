@@ -1,6 +1,7 @@
 /**
  * An aggregate's `entity:` many edge whose declared sort key names a field the entity's model
- * encodes, against DynamoDB Local. The suite is `helpers/AggregateEntityEdgeKeys.ts`;
+ * encodes, against DynamoDB Local. The suites are `helpers/AggregateEntityEdgeKeys.ts`,
+ * `helpers/AggregateDottedEdgeKeys.ts` and `helpers/AggregateEntityEdgeKeyTable.ts`;
  * recording-table twin: `AggregateEntityEdgeKeys.test.ts`.
  *
  * Prerequisites:
@@ -12,7 +13,9 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { Config, Effect, Layer } from "effect"
 import { describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
+import { dottedSuite } from "./helpers/AggregateDottedEdgeKeys.js"
 import { suite } from "./helpers/AggregateEntityEdgeKeys.js"
+import { keyTableSuite } from "./helpers/AggregateEntityEdgeKeyTable.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -113,3 +116,5 @@ const harness = {
 }
 
 suite(harness, dynamoAvailable ? describe : describe.skip)
+dottedSuite(harness, dynamoAvailable ? describe : describe.skip)
+keyTableSuite(harness, dynamoAvailable ? describe : describe.skip)

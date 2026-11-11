@@ -317,8 +317,10 @@ const aggregateTransactionOverflowMessage = (
     fields.previousKeyText === undefined
       ? ""
       : ` The group holds ${fields.previousKeyText} row${fields.previousKeyText === 1 ? "" : "s"} ` +
-        "under the previous key text, which the write deletes in the same transaction; without " +
-        "them it fits. Run `db.tables.<Table>.rekey()` to move them, then write again."
+        "under the previous key text. The write moves each in the same transaction, a delete " +
+        `beside its write under the new text, so ${fields.previousKeyText} of these ` +
+        `${fields.itemCount} items are those deletes, and without them it fits. Run ` +
+        "`db.tables.<Table>.rekey()` to move them, then write again."
   if (committed.length === 0) return `${head} Nothing was written.${previous}`
   const already =
     ` Each sub-aggregate is its own transaction, and earlier ones of this write were ` +

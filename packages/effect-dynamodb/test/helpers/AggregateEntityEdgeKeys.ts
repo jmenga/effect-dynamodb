@@ -117,6 +117,14 @@ const Bulk = Schema.Struct({
   title: Schema.String,
   tallies: Schema.Array(Tally),
 })
+const Note = Schema.Struct({ noteId: Schema.String, text: Schema.String })
+/** A root group holding rows that don't move (`notes`, a plain edge) beside rows that do. */
+const Mix = Schema.Struct({
+  id: Schema.String,
+  title: Schema.String,
+  notes: Schema.Array(Note),
+  tallies: Schema.Array(Tally),
+})
 const Part = Schema.Struct({ partName: Schema.String, cased: Schema.Array(Line) })
 const Split = Schema.Struct({ id: Schema.String, title: Schema.String, part: Part })
 
@@ -212,7 +220,25 @@ const define = (escapeKeys: boolean) => {
       },
     } as never,
   ) as any
-  return { Lines, Tallies, Main, Sheets, Pairs, Bulks, Splits }
+  const Mixes = Aggregate.make(
+    Mix as never,
+    {
+      table: Main,
+      schema,
+      pk: { field: "pk", composite: ["id"] },
+      collection: { name: "mix" },
+      root: { entityType: "Mix" },
+      edges: {
+        notes: Aggregate.many({ entityType: "Note", sk: { composite: ["noteId"] } } as never),
+        tallies: Aggregate.many({
+          entityType: "MixTally",
+          entity: Tallies,
+          sk: { composite: ["n"] },
+        } as never),
+      },
+    } as never,
+  ) as any
+  return { Lines, Tallies, Main, Sheets, Pairs, Bulks, Splits, Mixes }
 }
 
 /** One definition per setting, each its own `Table.make`. */
@@ -272,6 +298,13 @@ const bulk = (id: string, count: number) => ({
   id,
   title: "t",
   tallies: Array.from({ length: count }, (_, i) => ({ tallyId: `t${i}`, n: i + 1 })),
+})
+
+const mix = (id: string, notes: number, tallies: number) => ({
+  id,
+  title: "t",
+  notes: Array.from({ length: notes }, (_, i) => ({ noteId: `n${i}`, text: "x" })),
+  tallies: Array.from({ length: tallies }, (_, i) => ({ tallyId: `t${i}`, n: i + 1 })),
 })
 
 const PK = {
@@ -372,6 +405,7 @@ const session = <A>(
           Pairs: defs.Pairs,
           Bulks: defs.Bulks,
           Splits: defs.Splits,
+          Mixes: defs.Mixes,
         },
         tables: { Main: defs.Main },
       })
@@ -919,7 +953,7 @@ export const suite = (
     )
 
     it.effect(
-      "under escapeKeys: true, a group of 50 rows 1.40.0 stored is moved by its first changed write, with no rekey",
+      "under escapeKeys: true, a root group of the root and 49 rows under 1.40.0's text (50 puts and 49 deletes, 99 items) is moved by its first changed write, with no rekey",
       () =>
         Effect.gen(function* () {
           const [title, rekey] = yield* session(harness, ON, then.bulk50[0].rows, ({ db, step }) =>
@@ -949,7 +983,7 @@ export const suite = (
     )
 
     it.effect.skipIf(!harness.enforcesLimits)(
-      "under escapeKeys: true, a group of more than 50 rows 1.40.0 stored can't be written until rekey moves them",
+      "under escapeKeys: true, a root group of the root and 50 rows under 1.40.0's text (51 puts and 50 deletes, 101 items) can't be written until rekey moves them",
       () =>
         Effect.gen(function* () {
           const seeded = then.bulk51[0].rows
@@ -994,8 +1028,9 @@ export const suite = (
           expect(title.outcome.error.message).toBe(
             `Aggregate "Bulk": the transaction of sub-aggregate "root" holds 101 items, over ` +
               `DynamoDB's limit of 100 for one transaction, and DynamoDB rejected it. Nothing was ` +
-              `written. The group holds 50 rows under the previous key text, which the write ` +
-              `deletes in the same transaction; without them it fits. Run ` +
+              `written. The group holds 50 rows under the previous key text. The write moves each ` +
+              `in the same transaction, a delete beside its write under the new text, so 50 of ` +
+              `these 101 items are those deletes, and without them it fits. Run ` +
               "`db.tables.<Table>.rekey()` to move them, then write again.",
           )
           expect(title.rows).toEqual(sorted(seeded))
@@ -1021,6 +1056,55 @@ export const suite = (
             ),
           ])
           expect(rekeyed(again.outcome, "Bulk")).toEqual({ moved: 0, conflicts: [] })
+        }),
+    )
+
+    it.effect(
+      "under escapeKeys: true, a group holding rows that don't move counts them too: its rows plus its rows under 1.40.0's text, 100 items written, 101 refused naming rekey",
+      () =>
+        Effect.gen(function* () {
+          // `escapeKeys: false` stores 1.40.0's text byte for byte (pinned above), so it writes the
+          // rows 1.40.0 would have: here a number's text, which escaping leaves as it is.
+          for (const [notes, items] of [
+            [9, 100],
+            [10, 101],
+          ] as const) {
+            if (items > 100 && !harness.enforcesLimits) continue
+            const id = `m${notes}`
+            const pk = `$edges#v1#mix#${id}`
+            const created = yield* session(harness, OFF, [], ({ db, step }) =>
+              step("create", () => db.aggregates.Mixes.create(mix(id, notes, 45)), pk),
+            )
+            expect(created.outcome).toHaveProperty("ok")
+            const title = yield* session(harness, ON, created.rows, ({ db, step }) =>
+              step("update title", () => db.aggregates.Mixes.update({ id }, retitled), pk),
+            )
+            if (items <= 100) {
+              expect(title.outcome.ok.title).toBe("t2")
+              const sent = transaction(title.requests)
+              // The root, 9 notes and 45 tallies, and the 45 tallies' rows under 1.40.0's text.
+              expect([sent.puts.length, sent.deletes.length]).toEqual([1 + notes + 45, 45])
+              expect(sent.puts.length + sent.deletes.length).toBe(items)
+              expect(sks(title.rows)).toEqual(
+                [
+                  "$edges#v1#mix",
+                  ...Array.from(
+                    { length: 45 },
+                    (_, i) => `$edges#v1#mixtally#${String(i + 1).padStart(16, "0")}`,
+                  ),
+                  ...Array.from({ length: notes }, (_, i) => `$edges#v1#note#n${i}`),
+                ].sort(),
+              )
+            } else {
+              expect(title.outcome.fail).toBe("AggregateTransactionOverflow")
+              expect(title.outcome.error.itemCount).toBe(items)
+              expect(title.outcome.error.previousKeyText).toBe(45)
+              expect(title.outcome.error.message).toContain(
+                "so 45 of these 101 items are those deletes",
+              )
+              expect(title.rows).toEqual(sorted(created.rows))
+            }
+          }
         }),
     )
 

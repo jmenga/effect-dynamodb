@@ -5240,9 +5240,16 @@ of the same name whatever that field is: `byn#5` for a `Schema.NumberFromString`
 edge composes `byn#0000000000000005` from the value. Under `escapeKeys: false` that is kept, byte for
 byte. Under `escapeKeys: true` such an edge composes its sort key from the element's own values, as a
 plain edge does (`ResolvedNode.keyAttrEncoders` is empty, `otherCompositionEncoders` the entity's).
-Only an edge whose declared composite's top-level field the entity's model encodes changes; one with
-no declared sort key (keyed by the entity's identifier) is unchanged under both settings, since a
-plain edge takes no id that isn't a string.
+Which composites change is decided in one place, `entityEdgeEncodedComposites`: a composite, a
+field or a path into one (`entry.n`), whose top-level field the entity's model encodes for keys
+(`buildKeyAttrEncoders`: a transformation, optional or not, such as a codec, a date stored as a
+number or a `Schema.Class`). Its text changes where the encoded value's text differs from the
+value's; a composite it doesn't name never changes. The composer, `update`'s move and `rekey` read
+the encoders resolved from it. An edge with no declared sort key (keyed by the entity's identifier)
+is unchanged under both settings, since a plain edge takes no id that isn't a string. Every row
+below, and every unchanged type named after it, is measured against published 1.40.0
+(`test/helpers/AggregateEntityEdgeKeyTable.ts`, `AggregateDottedEdgeKeys.ts` for a dotted
+composite's reads, moves and `rekey`).
 
 | Field the entity's model declares | 1.40.0, `escapeKeys: true` | Now |
 |---|---|---|
@@ -5252,9 +5259,13 @@ plain edge takes no id that isn't a string.
 | `DynamoModel.DateEpochSeconds` | `0000001714979289` | `2024-05-06t07:08:09.000z` |
 | `Schema.DateTimeZonedFromString` | `2024-05-06t09:08:09.000+02:00[europe/paris]` | `2024-05-06t07:08:09.000z` |
 | A codec storing other text (`x` as `x `, `A` as `41`) | `x%20`, `41` | `x`, `a` |
+| `Schema.optionalKey(Schema.NumberFromString)` `5` | `5` | `0000000000000005` |
+| A path into a field encoded whole (`entry.n` of a `Schema.Class` with a `NumberFromString` `n`, or of a codec of the whole object) | `5` | `0000000000000005` |
 
-A `Schema.DateTimeUtcFromString` (ISO text either way), a nested path (`entry.line`), a union (never
-encoded for a key) and every other key are unchanged.
+`Schema.DateTimeUtc` and `Schema.DateTimeUtcFromString` (ISO text either way), a path into a
+`Schema.Struct` (never encoded for a key as a whole, so `entry.n` reads the value), a path into a
+`Schema.Class` whose leaf isn't transformed, a union or `Schema.NullOr` (never encoded for a key) and
+every other key are unchanged.
 
 Rows stored under 1.40.0's text, with `escapeKeys: true`:
 
@@ -5264,7 +5275,8 @@ Rows stored under 1.40.0's text, with `escapeKeys: true`:
   (`skCompositesOtherComposition`, which no element's current key is) is deleted in the group's own
   transaction, unless the write puts a row there, and the element's row keeps that row's `created`
   through the carry every update uses (`existingCreated`). A no-op writes nothing. The deletes count
-  against the transaction's 100 items: a group whose rows and such rows exceed 100 is rejected,
+  against the transaction's 100 items, one per moved row beside the group's own (the root and 49
+  such rows are 99 items, with 50 they are 101): a group whose rows and such rows exceed 100 is rejected,
   diagnosed as `AggregateTransactionOverflow` with `previousKeyText` (their count) when the group
   fits without them, naming `rekey`; an overflow the group has anyway names none.
 - **`delete`** deletes every row of the aggregate's types it reads, under either text.

@@ -1347,6 +1347,29 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
   return encoders
 }
 
+/**
+ * @internal The one decision of which declared sort key composites of an `entity:` `many` edge
+ * escapeKeys moves (#241, DESIGN.md §11 "An `entity:` edge's sort key"). Through 1.40.0 such an
+ * edge composed a composite from the entity's encoding of the field the composite starts at (`n`
+ * of `n`, `f` of `f.n`) wherever the entity's model encodes that field for keys
+ * ({@link buildKeyAttrEncoders}: a field whose schema, optional or not, is a transformation, such
+ * as a codec, a date stored as a number or a `Schema.Class`), and from the value elsewhere, as a
+ * plain edge composes every composite. These are the composites named here. Under `escapeKeys:
+ * true` they are composed from the value; their text changes where the encoded value's text
+ * differs from the value's (`5` stored `"5"` composes `5`, the value `0000000000000005`), and a
+ * composite not named here never changes. The composer reads it, and `update` and `rekey`, which
+ * compose a row's text under the other composition to find and move the rows stored under 1.40.0's
+ * text, read the encoders resolved from it.
+ */
+export const entityEdgeEncodedComposites = (
+  entityModel: unknown,
+  composites: ReadonlyArray<string> | undefined,
+): ReadonlyArray<string> => {
+  if (entityModel === undefined || composites === undefined) return []
+  const encoders = buildKeyAttrEncoders(fieldsOf(entityModel))
+  return composites.filter((path) => Object.hasOwn(encoders, path.split(".")[0]!))
+}
+
 /** A value as a refusal names it: as JSON, or as text where it has none (a `bigint`). */
 const shown = (value: unknown): string => {
   try {
@@ -5200,12 +5223,11 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
         // transforms) through 1.40.0, so no stored key is re-spelled. Under `escapeKeys: true` a
         // declared sort key is composed from the element's own values, as a plain edge's is (#241):
         // the entity's encoders ran over the element's field of the same name, whatever that
-        // field is. `rekey` moves the rows; `update` moves a group's when it writes it.
+        // field is. Which composites that moves is decided by `entityEdgeEncodedComposites`.
+        // `rekey` moves the rows; `update` moves a group's when it writes it.
         const entityKeyEncoders = buildKeyAttrEncoders(entityFields)
         const recomposed =
-          edge.entity !== undefined &&
-          edge.sk?.composite !== undefined &&
-          edge.sk.composite.some((path) => Object.hasOwn(entityKeyEncoders, path.split(".")[0]!))
+          entityEdgeEncodedComposites(edge.entity?.model, edge.sk?.composite).length > 0
         const escaped = args.escapeKeys === true
         children.push(
           resolveNode({
