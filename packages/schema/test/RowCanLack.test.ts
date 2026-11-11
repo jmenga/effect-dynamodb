@@ -416,8 +416,10 @@ describe("the derived update schema", () => {
     }
   })
 
-  it("refuses `undefined` for a set that must not be empty", () => {
-    expect(Exit.isFailure(decode({ filled: undefined }))).toBe(true)
+  it("takes `undefined` for a set that must not be empty: its check is the write's to run", () => {
+    // Whether the check takes an empty set is only known by running it, and defining an entity
+    // runs none of a model's code. The update clearing the field runs it, and is refused.
+    expect(Exit.isSuccess(decode({ filled: undefined }))).toBe(true)
   })
 
   it("takes an empty set for a set, and refuses one for a set that must not be empty", () => {

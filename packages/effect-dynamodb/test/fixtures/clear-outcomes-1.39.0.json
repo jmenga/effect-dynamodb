@@ -1,0 +1,294 @@
+{
+  "comment": "Captured from published effect-dynamodb@1.39.0 against DynamoDB Local (clear-outcomes.mjs for `outcomes`, clear-sites.mjs for `sites`). A record of what 1.39.0 did: never regenerate it.",
+  "version": "1.39.0",
+  "generatedBy": "clear-outcomes.mjs against DynamoDB Local",
+  "outcomes": [
+    {
+      "case": "a default its own check refuses",
+      "clear": "ValidationError",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ValidationError"
+    },
+    {
+      "case": "a default that fails",
+      "clear": "ValidationError",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ValidationError"
+    },
+    {
+      "case": "a step refusing an absent key",
+      "clear": "ValidationError",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ValidationError"
+    },
+    {
+      "case": "a step leaving an absent key absent",
+      "clear": "ValidationError",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ValidationError"
+    },
+    {
+      "case": "a middleware filling a missing key",
+      "clear": "ok",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ok",
+      "fieldReadAfter": "fallback"
+    },
+    {
+      "case": "a middleware failing a missing key",
+      "clear": "ValidationError",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ValidationError"
+    },
+    {
+      "case": "a default inside a suspension",
+      "clear": "ok",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ok",
+      "fieldReadAfter": "d"
+    },
+    {
+      "case": "a step filling a required key",
+      "clear": "ok",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ok",
+      "fieldReadAfter": "filled"
+    },
+    {
+      "case": "a set that mustn't be empty, removed",
+      "clear": "ValidationError",
+      "rowHoldsFieldAfter": false,
+      "readAfter": "ValidationError"
+    },
+    {
+      "case": "a set that mustn't be empty, set to the empty set",
+      "clear": "ValidationError",
+      "rowHoldsFieldAfter": true,
+      "readAfter": "ok"
+    }
+  ],
+  "sites": {
+    "a middleware filling a missing key": {
+      "remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "set undefined": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "pathRemove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "patch remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "retained remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "transactWrite remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      }
+    },
+    "a middleware failing a missing key": {
+      "remove": {
+        "clear": "ValidationError",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ValidationError"
+      },
+      "set undefined": {
+        "clear": "ValidationError",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ValidationError"
+      },
+      "pathRemove": {
+        "clear": "ValidationError",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ValidationError"
+      },
+      "patch remove": {
+        "clear": "ValidationError",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ValidationError"
+      },
+      "retained remove": {
+        "clear": "ValidationError",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ValidationError"
+      },
+      "transactWrite remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ValidationError"
+      }
+    },
+    "a default inside a suspension": {
+      "remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "d"
+      },
+      "set undefined": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "d"
+      },
+      "pathRemove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "d"
+      },
+      "patch remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "d"
+      },
+      "retained remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "d"
+      },
+      "transactWrite remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "d"
+      }
+    },
+    "a step filling a required key": {
+      "remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "filled"
+      },
+      "set undefined": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "filled"
+      },
+      "pathRemove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "filled"
+      },
+      "patch remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "filled"
+      },
+      "retained remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "filled"
+      },
+      "transactWrite remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "filled"
+      }
+    },
+    "a middleware filling a required key": {
+      "remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "set undefined": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "pathRemove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "patch remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "retained remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      },
+      "transactWrite remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": "fallback"
+      }
+    },
+    "a stored key read as optional": {
+      "remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": null
+      },
+      "set undefined": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": null
+      },
+      "pathRemove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": null
+      },
+      "patch remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": null
+      },
+      "retained remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": null
+      },
+      "transactWrite remove": {
+        "clear": "ok",
+        "rowHoldsFieldAfter": false,
+        "readAfter": "ok",
+        "fieldReadAfter": null
+      }
+    }
+  }
+}
