@@ -307,6 +307,12 @@ interface ResolvedNode {
    */
   readonly attrEncoders?: AttrEncoders | undefined
   /**
+   * `many` edges only: the encoder of an element whose schema shows no fields of its own (a union,
+   * or a transformation of the whole element such as `Schema.encodeKeys`), which puts the element
+   * into its stored form as a whole (#241). See {@link wholeElementEncoder}.
+   */
+  readonly elementEncoder?: AttrEncoder | undefined
+  /**
    * `many` edges only: the encoders whose output the edge's sort-key composites
    * are read from. These are the pre-#133 encoders, kept separate from
    * {@link attrEncoders} so that putting a nested value into its wire form can
@@ -1330,6 +1336,53 @@ const buildKeyAttrEncoders = (fields: Record<string, Schema.Top> | undefined): A
     }
   }
   return encoders
+}
+
+/**
+ * The encoder of a `many` edge's element as a whole (#241): one whose schema shows no fields of
+ * its own, a union (a member renaming a field among them) or a transformation of the whole element
+ * (`Schema.encodeKeys`, a struct decoded to another), so no encoder of {@link buildAttrEncoders}
+ * reaches what it transforms. Up to 1.40.0 such an element was stored as the domain value it held
+ * (`text` where its schema stores `line`), with only the encoders of the edge entity's fields, by
+ * name. This is the encoder {@link buildAttrEncoders} gives a field holding the element, so the
+ * element is encoded exactly once, through the schema a read decodes it with, as every other
+ * attribute is. A row stored as the domain value still reads, through the same tolerant decode.
+ *
+ * None for an element that shows its fields (each has its own encoder), an opaque ref (encoded as the
+ * entity's model), one with nothing to encode, and an edge with a custom `decompose`, whose rows are
+ * what it returns, not elements of the schema.
+ */
+const wholeElementEncoder = (
+  edgeName: string,
+  element: Schema.Top | undefined,
+  decompose: unknown,
+  resolveRef: RefResolver | undefined,
+): AttrEncoder | undefined => {
+  if (element === undefined || decompose !== undefined) return undefined
+  if (getSchemaFields(element) !== undefined || isOpaqueRefField(element)) return undefined
+  return buildAttrEncoders({ [edgeName]: element }, resolveRef)[edgeName]
+}
+
+/**
+ * A `many` element's attributes in their stored form, and the fields stored as given. Exactly one
+ * encoding: the element's as a whole where {@link wholeElementEncoder} gave the node one and it
+ * takes the element, else the per-field encoders, as every element was stored up to 1.40.0.
+ */
+const storedElement = (
+  elem: unknown,
+  node: ResolvedNode,
+): { readonly attrs: Record<string, unknown>; readonly storedAsGiven: ReadonlyArray<string> } => {
+  if (node.elementEncoder !== undefined) {
+    let refused = false
+    const encoded = node.elementEncoder(elem, () => {
+      refused = true
+    })
+    if (!refused && encoded !== null && typeof encoded === "object" && !Array.isArray(encoded)) {
+      return { attrs: { ...(encoded as Record<string, unknown>) }, storedAsGiven: [] }
+    }
+  }
+  const attrs = { ...(elem as Record<string, unknown>) }
+  return { attrs, storedAsGiven: applyNodeAttrEncoders(attrs, node.attrEncoders) }
 }
 
 /**
@@ -4793,6 +4846,7 @@ interface ResolveNodeArgs {
   readonly decomposeInput?: ((written: Written) => Option.Option<unknown>) | undefined
   readonly ownDiscriminator?: Record<string, unknown> | undefined
   readonly attrEncoders?: AttrEncoders | undefined
+  readonly elementEncoder?: AttrEncoder | undefined
   readonly keyAttrEncoders?: AttrEncoders | undefined
   readonly otherCompositionEncoders?: AttrEncoders | undefined
   readonly skComposite?: ReadonlyArray<string> | undefined
@@ -4989,6 +5043,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
               resolveRef,
               keyedValue !== undefined && edge.entity === undefined,
             ),
+            elementEncoder: wholeElementEncoder(field, arrayElement, edge.decompose, resolveRef),
             keyAttrEncoders: recomposed && escaped ? {} : entityKeyEncoders,
             ...(recomposed && {
               otherCompositionEncoders: escaped ? entityKeyEncoders : {},
@@ -5070,6 +5125,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(args.packed !== undefined && { packed: args.packed }),
     ...(args.dispatch !== undefined && { dispatch: args.dispatch }),
     attrEncoders,
+    ...(args.elementEncoder !== undefined && { elementEncoder: args.elementEncoder }),
     ...(keyAttrEncoders !== undefined && { keyAttrEncoders }),
     ...(args.otherCompositionEncoders !== undefined && {
       otherCompositionEncoders: args.otherCompositionEncoders,
@@ -6988,9 +7044,9 @@ const decomposeNode = (
 
       for (const elem of arrayItems) {
         // The element's attributes in their STORED form — every nested date,
-        // transformed scalar and hydrated ref encoded (#72, #133).
-        const attrs = { ...(elem as Record<string, unknown>) }
-        const storedAsGiven = applyNodeAttrEncoders(attrs, node.attrEncoders)
+        // transformed scalar and hydrated ref encoded (#72, #133), and an element
+        // whose schema shows no fields encoded as a whole (#241).
+        const { attrs, storedAsGiven } = storedElement(elem, node)
         withContext(attrs, contextValues.stored)
 
         // The sort key is read from the element as the pre-#133 encoders left

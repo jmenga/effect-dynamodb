@@ -9,9 +9,10 @@
  * into (a declaration, a transformation, a union with such a member) reads exactly as 1.40.0 read
  * it, and a custom `assemble` is still handed them.
  *
- * Nothing written changes: `create` and a no-op `update` send and store what 1.40.0 did, and the
- * no-op `update` still sends only its read. A union member that renames a field and is given its
- * domain value is still stored under the domain name (`text`, not `line`), as 1.40.0 stores it.
+ * Nothing written changes for this: `create` and a no-op `update` send and store what 1.40.0 did,
+ * and the no-op `update` still sends only its read. A union member that renames a field and is given
+ * its domain value is now stored in its stored form, `line` where 1.40.0 stored `text`, and read
+ * through its transformation, which takes only its own fields: `helpers/AggregateWholeElements.ts`.
  *
  * `fixtures/aggregate-discriminator-read-1.39.0.json` holds what published 1.39.0 and 1.40.0 did
  * for each of `shapes` on DynamoDB Local, and `fixtures/aggregate-discriminator-read-opaque-1.40.0.json`
@@ -28,6 +29,7 @@ import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
+import { renamedAttribute, storedAsNow } from "./AggregateWholeElements.js"
 
 type Row = Record<string, AttributeValue>
 type Request = { readonly command: string; readonly input: unknown }
@@ -87,6 +89,11 @@ type Shape = {
   readonly read: unknown
   /** What published 1.40.0's read returned. */
   readonly published: unknown
+  /**
+   * An element whose schema shows no fields, which 1.40.0 stored as its domain value: its row as
+   * this release stores it (`helpers/AggregateWholeElements.ts`).
+   */
+  readonly nowStored?: (row: Row) => Row
 }
 
 const sheets = () => Aggregate.many({ entityType: "Sheet", sk: { composite: ["qty"] } } as never)
@@ -126,11 +133,16 @@ const note = { qty: 1, note: "n" }
 const own = { kind: "own", qty: 3, text: "KEEP" }
 
 export const shapes: Record<string, () => Shape> = {
-  "a union member renaming a field, given its domain value": () =>
-    manyShape(renaming(), own, false, own, own),
-  // A union with a transformation member can't be seen into: read as 1.40.0 read it.
-  "sub-aggregate, a union member renaming a field, given its domain value": () =>
-    manyShape(renaming(), own, true, { ...own, side: 1 }, { ...own, side: 1 }),
+  "a union member renaming a field, given its domain value": () => ({
+    ...manyShape(renaming(), own, false, own, own),
+    nowStored: renamedAttribute("text", "line"),
+  }),
+  // A union with a transformation member can't be seen into. 1.40.0 read the domain value it stored
+  // as it was, the discriminator with it; the stored form is read through the transformation.
+  "sub-aggregate, a union member renaming a field, given its domain value": () => ({
+    ...manyShape(renaming(), own, true, own, { ...own, side: 1 }),
+    nowStored: renamedAttribute("text", "line"),
+  }),
   "sub-aggregate, an Unknown element": () =>
     manyShape(Schema.Unknown, note, true, note, { ...note, side: 1 }),
   // A declaration can't be seen into: read as 1.40.0 read it.
@@ -477,13 +489,17 @@ export const suite = (
               const shape = define()
               const then = thenSet[label]!
               const actual = yield* run(harness, shape)
+              const now =
+                shape.nowStored === undefined
+                  ? { row: (row: Row) => row, requests: (sent: unknown) => sent }
+                  : storedAsNow("Sheet", shape.nowStored)
               expect(judged(actual.create)).toEqual(judged(then.create))
-              expect(actual.requests).toEqual(then.requests)
-              expect(actual.rows).toEqual(sorted(then.rows))
+              expect(actual.requests).toEqual(now.requests(then.requests))
+              expect(actual.rows).toEqual(sorted(then.rows.map(now.row)))
               // A no-op update sends its read and nothing else.
               expect(actual.updateRequests.map((request) => request.command)).toEqual(["Query"])
               expect(actual.updateRequests).toEqual(then.updateRequests)
-              expect(actual.updateRows).toEqual(sorted(then.updateRows))
+              expect(actual.updateRows).toEqual(sorted(then.updateRows.map(now.row)))
               for (const step of ["get", "update", "getAfterUpdate"] as const) {
                 expect({ step, ...judged(then[step]) }).toEqual({ step, ok: shape.published })
                 expect({ step, ...judged(actual[step]) }).toEqual({ step, ok: shape.read })
