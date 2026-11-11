@@ -5487,11 +5487,15 @@ const makeImpl = <
       return { expression: full, names, values, inputs: attrs, proves: true, by: "row" }
     }
     // Too wide to guard attribute by attribute (a sparse map with hundreds of
-    // entries): the strongest guard that fits. Every library write sets
-    // `updatedAt`, so with timestamps it alone detects any library update;
-    // then as many attributes as fit, those the sentinels derive from first,
-    // then the model's own fields, then the rest. `updatedAt` is named by the
-    // attribute it's stored in: a guard on its model name holds on no row.
+    // entries): the strongest guard that fits. `updatedAt` first: a library
+    // write of the item's values stamps it, so it detects them, but for one
+    // within the stamp's resolution and `reembed`, which sets the vector
+    // attributes alone and stamps nothing (DESIGN.md §7 "What 'as read'
+    // proves"; a move under it is counted in `guardGaps.stamp`). Then as many
+    // attributes as fit: those the sentinels derive from first, then the
+    // model's own fields, then the rest, the vector attributes among them.
+    // `updatedAt` is named by the attribute it's stored in: a guard on its
+    // model name holds on no row.
     const updatedAttr = systemFields.updatedAt ? resolveDbName(systemFields.updatedAt) : null
     const strongest = () => {
       for (const key of Object.keys(names)) if (key.startsWith("#dg")) delete names[key]
