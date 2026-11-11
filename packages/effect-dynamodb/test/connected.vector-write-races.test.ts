@@ -73,3 +73,12 @@ describeConnected(
     }
   },
 )
+
+describeConnected(
+  "a reembed landing between a read-first write's read and its write, on DynamoDB",
+  () => {
+    for (const scenario of VectorWriteRaces.copyScenarios) {
+      it.live(scenario.name, () => scenario.run(harness))
+    }
+  },
+)

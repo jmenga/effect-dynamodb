@@ -19,3 +19,9 @@ describe("a write landing between a vector entity's read and its write", () => {
     it.live(scenario.name, () => scenario.run(harness))
   }
 })
+
+describe("a reembed landing between a read-first write's read and its write", () => {
+  for (const scenario of VectorWriteRaces.copyScenarios) {
+    it.live(scenario.name, () => scenario.run(harness))
+  }
+})

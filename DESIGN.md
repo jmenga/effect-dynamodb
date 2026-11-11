@@ -1317,8 +1317,8 @@ class, a union's members) names every property its schema can store, on its type
 and encoded sides (`storedFieldNames`); a stream row's and a projection row's,
 none more. A versioned entity's item is guarded on its version and incarnation,
 as 1.39.0 guarded it, and with vector indexes on its vector attributes as read
-too, where they fit (`itemMoveGuard`): `reembed` sets them alone, bumping no
-version.
+too, where they fit (`vectorsAsRead`, through `deleteGuard`'s whole-row guard):
+`reembed` sets them alone, bumping no version.
 
 A row too wide for its whole guard (DynamoDB's limits on one expression) is
 guarded, when its member stamps an `updatedAt`, on that stamp, held or still
@@ -6500,6 +6500,29 @@ that sees every write, a sparse map's new entry and the attributes past the limi
 included, and `rekey`'s guard would see a `reembed` too. Every item would then
 carry an attribute no release writes today, so it is a stored-format change, and it
 waits for the next major, behind one flag off by default until then.
+
+The other way round, a `reembed` landing between the read and the write of a
+write that reads a versioned item first isn't seen by its version guard either.
+Two such writes copy the vector they read (#240), and hold each vector index's
+vector and partition attributes as read, where they fit (`vectorsAsRead`, the
+function `rekey`'s move uses): a soft delete, whose tombstone stashes the
+embedding (`deleteGuard`'s whole-row guard), and an update too wide for one
+expression, which puts the item back whole (only the indexes it doesn't embed
+itself). A lost race is a `ConcurrentModification` naming the vector attributes
+(`vectorRace`): the soft delete reads again and deletes again within
+`GUARDED_PUT_ATTEMPTS`, as for any race, and fails with a `.condition()` (in
+`transactWrite`, planned again, as any race there is, never taken for the
+caller's condition); the update fails, as a read-first update fails on any race. Up to 1.40.0 the
+tombstone stashed the old vector, so `restore` brought it back, and the update
+wrote it over the new one. The rest copy no vector: a retain delete's snapshot
+strips it and the item goes, and an update writing only what changed leaves the
+vector attributes alone unless it embeds them itself, so they hold nothing more,
+and nothing changes for an entity without a vector index
+(`connected.versioned-copies.test.ts`, against the requests the published
+1.40.0 sent). The terms carry the vector in the request: for 1,536 dimensions,
+about 12.7 KB of DynamoDB's size accounting (17.5 KB for float32-derived
+values) added to a soft delete's transaction, far within its 4 MB, and the same
+to an update's substitutions, within their 2 MB.
 
 ### Lifecycle integration
 

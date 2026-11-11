@@ -4932,6 +4932,41 @@ const makeImpl = <
   }
 
   /**
+   * Terms holding each vector index's vector and partition attributes as `read` stores them (an
+   * absent one still absent), for a write of a versioned item that copies them from the read
+   * (#240): `reembed` sets them alone, stamping neither the version nor `updatedAt`, so the version
+   * doesn't prove them unchanged. `recomputed` names the indexes the write embeds itself: its own
+   * vector wins, so nothing is held for them. The placeholders go into `names` and `values`;
+   * returns the terms and the attributes they hold. Used by every such write: a whole-row
+   * {@link deleteGuard} (a soft delete's, `rekey`'s move) and an update put back whole.
+   */
+  const vectorsAsRead = (
+    read: globalThis.Record<string, AttributeValue>,
+    names: globalThis.Record<string, string>,
+    values: globalThis.Record<string, AttributeValue>,
+    recomputed: ReadonlySet<string> = new Set(),
+  ): { readonly terms: ReadonlyArray<string>; readonly held: ReadonlyArray<string> } => {
+    const terms: Array<string> = []
+    const held: Array<string> = []
+    for (const [logicalName, definition] of vectorIndexEntries) {
+      if (recomputed.has(logicalName)) continue
+      for (const field of [definition.vectorField, definition.partitionField]) {
+        const i = held.length
+        held.push(field)
+        names[`#dv${i}`] = field
+        const value = read[field]
+        if (value === undefined) {
+          terms.push(`attribute_not_exists(#dv${i})`)
+        } else {
+          values[`:dv${i}`] = value
+          terms.push(`#dv${i} = :dv${i}`)
+        }
+      }
+    }
+    return { terms, held }
+  }
+
+  /**
    * `reembed`'s condition that what it embedded and composed is still as it read it (#240):
    * `attribute_exists(#pk)` and, for each of `definitions`, every attribute holding a source field
    * or a partition composite equal to the value read, or still absent. A write that changed any of
@@ -5519,14 +5554,23 @@ const makeImpl = <
       }
       const incarnation = incarnationGuard(read, names, values)
       if (incarnation !== undefined) parts.push(incarnation)
-      return {
+      const byVersion = {
         expression: parts.join(" AND "),
         names,
         values,
-        inputs: [],
+        inputs: [] as ReadonlyArray<string>,
         proves: true,
-        by: "version",
+        by: "version" as const,
       }
+      // A whole row copied (a tombstone, a move) copies its vector attributes too, which the
+      // version doesn't cover: held as read where they fit, and named in `inputs`.
+      if (dependsOn !== "item" || vectorIndexEntries.length === 0) return byVersion
+      const heldNames = { ...names }
+      const heldValues = { ...values }
+      const { terms, held } = vectorsAsRead(read, heldNames, heldValues)
+      const expression = [byVersion.expression, ...terms].join(" AND ")
+      if (!fits(expression) || !substitutionsFit(heldNames, heldValues)) return byVersion
+      return { ...byVersion, expression, names: heldNames, values: heldValues, inputs: held }
     }
     names["#dpk"] = pkField
     parts.push("attribute_exists(#dpk)")
@@ -5602,6 +5646,38 @@ const makeImpl = <
   }
 
   /** Which predicate rejected a guarded delete — from the stored item (ALL_OLD). */
+  /**
+   * A versioned item's write rejected because a vector attribute it held as read
+   * ({@link vectorsAsRead}) changed under the same version and incarnation: a `reembed` landed
+   * in between. A lost race, whatever the caller's condition says; `undefined` otherwise.
+   */
+  const vectorRace = (
+    key: globalThis.Record<string, unknown>,
+    read: globalThis.Record<string, AttributeValue>,
+    held: ReadonlyArray<string>,
+    stored: Readonly<globalThis.Record<string, unknown>>,
+  ): ConcurrentModification | undefined => {
+    const changed = held.filter(
+      (attr) => !attributeValueEquals(stored[attr] as AttributeValue | undefined, read[attr]),
+    )
+    if (changed.length === 0 || storedVersionOf(stored) !== storedVersionOf(read)) return undefined
+    if (
+      incarnationAttr !== undefined &&
+      !attributeValueEquals(
+        stored[incarnationAttr] as AttributeValue | undefined,
+        read[incarnationAttr],
+      )
+    ) {
+      return undefined
+    }
+    return new ConcurrentModification({
+      entityType,
+      key,
+      attributes: changed.map(domainNameOf),
+      current: Option.none(),
+    })
+  }
+
   const deleteRejection = (
     key: globalThis.Record<string, unknown>,
     read: globalThis.Record<string, AttributeValue>,
@@ -5611,11 +5687,9 @@ const makeImpl = <
   ): ItemNotFound | OptimisticLockError | ConcurrentModification | ConditionalCheckFailed => {
     if (stored === undefined) return new ItemNotFound({ entityType, key })
     if (systemFields.version) {
-      return conditionRejection(
-        key,
-        stored,
-        { version: storedVersionOf(read), read },
-        userCondition,
+      return (
+        vectorRace(key, read, inputs, stored) ??
+        conditionRejection(key, stored, { version: storedVersionOf(read), read }, userCondition)
       )
     }
     const changed = inputs.filter(
@@ -8228,8 +8302,10 @@ const makeImpl = <
         // Re-embedding is still gated on the payload touching a source
         // field (`DESIGN.md §14`); untouched indexes keep their stored
         // vector, which the merge above already carried onto `newItem`.
+        // The vector indexes this write embeds itself: the rest keep the vector read.
+        let embedFor: ReadonlySet<string> = new Set()
         if (hasVectorIndexes) {
-          const embedFor = new Set(
+          embedFor = new Set(
             vectorIndexesNeedingUpdate(
               collectTouchedFields(hydratedUpdates as globalThis.Record<string, unknown>, uState),
               uState.withVectors,
@@ -8440,20 +8516,35 @@ const makeImpl = <
           wide && !systemFields.version
             ? deleteGuard(currentItem, "item", condParts.slice(1).join(" AND "))
             : undefined
-        const putCondition =
+        const guardedCondition =
           wideGuard === undefined
             ? condParts.join(" AND ")
             : [wideGuard.expression, ...condParts.slice(1)].join(" AND ")
+        // A versioned item put back whole copies the vectors it didn't embed from the read: they
+        // are held as read too, where they fit (#240; `reembed` changes them under the version).
+        const vectorNames: globalThis.Record<string, string> = {}
+        const vectorValues: globalThis.Record<string, AttributeValue> = {}
+        const vectorHold =
+          wide && systemFields.version
+            ? vectorsAsRead(currentItem, vectorNames, vectorValues, embedFor)
+            : { terms: [], held: [] }
+        const withVectors = [guardedCondition, ...vectorHold.terms].join(" AND ")
+        const vectorsHeld =
+          vectorHold.terms.length > 0 &&
+          expressionFits(withVectors) &&
+          substitutionsFit(vectorNames, vectorValues)
+        const putCondition = vectorsHeld ? withVectors : guardedCondition
+        const heldVectors = vectorsHeld ? vectorHold.held : []
         // Only the placeholders the condition uses (the Put has no update expression).
         const putTokens = new Set(putCondition.match(/[#:][A-Za-z0-9_]+/g) ?? [])
         const used = <V>(entries: globalThis.Record<string, V>) =>
           Object.fromEntries(Object.entries(entries).filter(([token]) => putTokens.has(token)))
-        const putValues = used({ ...writeValues, ...wideGuard?.values })
+        const putValues = used({ ...writeValues, ...wideGuard?.values, ...vectorValues })
         const mainPut = {
           TableName: tableName,
           Item: marshalledNewItem,
           ConditionExpression: putCondition,
-          ExpressionAttributeNames: used({ ...writeNames, ...wideGuard?.names }),
+          ExpressionAttributeNames: used({ ...writeNames, ...wideGuard?.names, ...vectorNames }),
           ...(Object.keys(putValues).length > 0 && { ExpressionAttributeValues: putValues }),
           ReturnValuesOnConditionCheckFailure: "ALL_OLD" as const,
         }
@@ -8462,7 +8553,7 @@ const makeImpl = <
         // The stored attributes the rejection compares: the guarded inputs,
         // and on the wide fallback whatever else its guard covered.
         const guardedAttrs = [
-          ...new Set([...inputs.map(resolveDbName), ...(wideGuard?.inputs ?? [])]),
+          ...new Set([...inputs.map(resolveDbName), ...(wideGuard?.inputs ?? []), ...heldVectors]),
         ]
 
         // A rejected main write: which predicate, from the stored item.
@@ -8470,6 +8561,16 @@ const makeImpl = <
           stored: Readonly<globalThis.Record<string, unknown>> | undefined,
         ): OptimisticLockError | ConditionalCheckFailed | ConcurrentModification | ItemNotFound => {
           if (systemFields.version) {
+            const raced =
+              stored === undefined
+                ? undefined
+                : vectorRace(
+                    encodedKey as globalThis.Record<string, unknown>,
+                    currentItem,
+                    heldVectors,
+                    stored,
+                  )
+            if (raced !== undefined) return raced
             return conditionRejection(
               encodedKey as globalThis.Record<string, unknown>,
               stored,
@@ -9829,11 +9930,18 @@ const makeImpl = <
       const readVersion = storedVersionOf(ownRow)
       const changedFrom = (stored: globalThis.Record<string, AttributeValue>) =>
         conditionAttrs.filter((attr) => !attributeValueEquals(stored[attr], ownRow?.[attr]))
+      // Versioned, the vector attributes the condition holds as read too (`vectorsAsRead`): a
+      // `reembed` changes them under the version.
+      const vectorAttrs = new Set(vectorKeyFields())
+      const heldVectors = conditionAttrs.filter((attr) => vectorAttrs.has(attr))
+      const vectorRaced = (stored: globalThis.Record<string, AttributeValue>) =>
+        ownRow === undefined ? undefined : vectorRace(encodedKey, ownRow, heldVectors, stored)
       const raced = (stored: globalThis.Record<string, AttributeValue>) =>
         systemFields.version
           ? storedVersionOf(stored) !== readVersion ||
             (incarnationAttr !== undefined &&
-              !attributeValueEquals(stored[incarnationAttr], ownRow?.[incarnationAttr]))
+              !attributeValueEquals(stored[incarnationAttr], ownRow?.[incarnationAttr])) ||
+            vectorRaced(stored) !== undefined
           : changedFrom(stored).length > 0
       /** A lost race: the error once retries run out, as a guarded put reports it. */
       const lostRace = (stored: globalThis.Record<string, AttributeValue> | undefined) =>
@@ -9841,12 +9949,13 @@ const makeImpl = <
           _tag: "Retry",
           stored,
           error: systemFields.version
-            ? new OptimisticLockError({
+            ? ((stored === undefined ? undefined : vectorRaced(stored)) ??
+              new OptimisticLockError({
                 entityType,
                 key: encodedKey,
                 expectedVersion: readVersion ?? 0,
                 actualVersion: storedVersionOf(stored) ?? -1,
-              })
+              }))
             : new ConcurrentModification({
                 entityType,
                 key: encodedKey as globalThis.Record<string, unknown>,
@@ -13951,30 +14060,6 @@ const makeImpl = <
    * A sentinel that can't come leaves the item where it is, in a dry run too.
    */
   /**
-   * The guard on a moving item's Delete: {@link deleteGuard}'s, and on a versioned entity with
-   * vector indexes its vector attributes as read too. `reembed` writes them alone, stamping neither
-   * the version nor `updatedAt`, so the version doesn't prove them unchanged, and a move copying the
-   * old ones lost its write (#240). Added only where they fit; otherwise the guard is as before.
-   */
-  const itemMoveGuard = (read: StoredRow): ReturnType<typeof deleteGuard> => {
-    const guard = deleteGuard(read, "item", undefined)
-    const fields = vectorKeyFields()
-    if (guard.by !== "version" || fields.length === 0) return guard
-    const names: globalThis.Record<string, string> = { ...guard.names }
-    const values: globalThis.Record<string, AttributeValue> = { ...guard.values }
-    const terms = fields.map((field, i) => {
-      names[`#dv${i}`] = field
-      const value = read[field]
-      if (value === undefined) return `attribute_not_exists(#dv${i})`
-      values[`:dv${i}`] = value
-      return `#dv${i} = :dv${i}`
-    })
-    const expression = [guard.expression, ...terms].join(" AND ")
-    if (!expressionFits(expression) || !substitutionsFit(names, values)) return guard
-    return { ...guard, expression, names, values }
-  }
-
-  /**
    * Whether a move under `guard` can miss a write landing in between ({@link RekeyGuardGaps}): one
    * guarded on its `updatedAt` misses a write within the stamp's resolution; one guarded whole
    * misses a write that only adds an entry to a sparse map, which no declaration names.
@@ -14004,7 +14089,9 @@ const makeImpl = <
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
         // Its Delete is guarded on the item as read: one nothing proves unchanged is the context's.
-        const guard = itemMoveGuard(read!)
+        // On a versioned entity with vector indexes, its vector attributes as read too
+        // (`vectorsAsRead`): a move copying old ones lost a `reembed`'s write (#240).
+        const guard = deleteGuard(read!, "item", undefined)
         if (!guard.proves) {
           switch (Rekey.unprovableRow(ctx)) {
             case "report":
