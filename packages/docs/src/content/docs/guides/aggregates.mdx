@@ -367,10 +367,12 @@ back off the partition the update already fetched and re-emitted unchanged.
 Timestamp attributes are stripped on the read path, so they never appear on the assembled
 domain object. If you want them *in* the domain model, declare the field under the same name,
 on the root or on any row below it: a sub-aggregate root, a `one` edge or a `many` element.
-That row then works like an entity:
+That row then works much like an entity:
 
-- The input doesn't need the date, required or optional. The library stamps it, using the
-  model's own encoding, and a value you supply wins.
+- The input doesn't need the date, required or optional. `create` stamps it, using the
+  model's own encoding, whether or not you supply a value: a value there is replaced, as it
+  always was. The exception is a date the root declares with `Schema.optional`, which keeps a
+  value you supply to `create`, as it always did. (An entity's `put` keeps a value you supply.)
 - `create` and `update` return what they stored, and the value is decoded normally on read.
 - On `update`, `createdAt` stays what's stored whatever the mutation did. A mutation that
   changes `updatedAt` gives it; otherwise a rewritten row gets a new stamp.

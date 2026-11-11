@@ -45,6 +45,7 @@ import {
   readBackUnsure,
   readsBackOtherwise,
   refuseInexact,
+  storedNaNKeyForm,
   toCompositeKeyRecord,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import type { TimestampsConfig } from "@effect-dynamodb/schema/internal/EntityConfig.js"
@@ -1546,25 +1547,36 @@ const makeAggregate = <TSchema extends Schema.Top>(
     ),
   )
 
+  const requiredIn = (fields: Record<string, Schema.Top> | undefined, name: string | null) =>
+    name !== null && fields?.[name] !== undefined && !isFieldOptional(fields[name])
+  // On `create`, a stamp replaces a value the input holds, as on 1.39.0, except under a date the root
+  // declares `Schema.optional`: 1.39.0 left that field the caller's and stored a value passed for it.
+  const createdReplaces =
+    !timestampFields.createdAtCollision || requiredIn(schemaFields, timestampFields.createdAt)
+  const updatedReplaces =
+    !timestampFields.updatedAtCollision || requiredIn(schemaFields, timestampFields.updatedAt)
+
   /**
    * What the rows of a value with these fields do with each timestamp, as an entity's do: a date the
-   * value declares is the library's, a supplied value winning, under the field's encoding; any other
-   * field of that name is the caller's and the row isn't stamped. Undeclared, the row is stamped.
+   * value declares is the library's, under the field's encoding, and `create` stamps it over what the
+   * input holds unless the root declares it optional ({@link fillStamps}), where an `update` takes a
+   * value the mutation changed; any other field of that name is the caller's and the row isn't
+   * stamped. Undeclared, the row is stamped.
    */
   const rowStampsOf = (fields: Record<string, Schema.Top> | undefined): RowStamps | undefined => {
     if (stampFields === undefined) return undefined
     const own = resolveStampsOver(fields)
-    const required = (name: string | null) =>
-      name !== null && fields?.[name] !== undefined && !isFieldOptional(fields[name])
     return {
       createdAt: stampFields.createdAt === null ? null : own.createdAt,
       createdEncoding: own.createdAtCollision ? own.createdAtEncoding : stampFields.createdEncoding,
       createdDeclared: own.createdAtCollision,
-      createdRequired: own.createdAtCollision && required(own.createdAt),
+      createdRequired: own.createdAtCollision && requiredIn(fields, own.createdAt),
+      createdReplaces,
       updatedAt: stampFields.updatedAt === null ? null : own.updatedAt,
       updatedEncoding: own.updatedAtCollision ? own.updatedAtEncoding : stampFields.updatedEncoding,
       updatedDeclared: own.updatedAtCollision,
-      updatedRequired: own.updatedAtCollision && required(own.updatedAt),
+      updatedRequired: own.updatedAtCollision && requiredIn(fields, own.updatedAt),
+      updatedReplaces,
     }
   }
   refuseManySortKeysOverMovingValue(aggregateName, config.timestamps, schemaFields, config.edges)
@@ -3427,8 +3439,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
           // 2. Validate via schema decode (decodeSchema substitutes nested edge
           //    self-date/Redacted leaves — Option A — and is identical to `schema`
-          //    when no edge needs it). A date the library stamps is stamped now
-          //    unless supplied, so what's composed and returned is what's stored.
+          //    when no edge needs it). A date the library stamps is stamped now,
+          //    over what the input holds for it unless the root declares it
+          //    optional, so what's composed and returned is what's stored.
           const now = yield* DateTime.now
           const written = fillStamps(rootNode, hydrated, now, "declared")
           const decoded = yield* Schema.decodeUnknownEffect(writeSchema)(written).pipe(
@@ -6028,7 +6041,10 @@ const manyEdgeSkComposites = (
       })
     }
 
-    return values
+    // A number its field stores as a string holds its `NaN` in key form, as the root's key does.
+    return values.map((value, i) =>
+      storedNaNKeyForm(fieldAtPath(node.ownFields, declared[i]!), value),
+    )
   })
 
 /**
@@ -6103,10 +6119,12 @@ interface RowStamps {
   readonly createdEncoding: DynamoEncoding | null
   readonly createdDeclared: boolean
   readonly createdRequired: boolean
+  readonly createdReplaces: boolean
   readonly updatedAt: string | null
   readonly updatedEncoding: DynamoEncoding | null
   readonly updatedDeclared: boolean
   readonly updatedRequired: boolean
+  readonly updatedReplaces: boolean
 }
 
 /**
@@ -6136,10 +6154,13 @@ const fillRows = (
 }
 
 /**
- * `value` with the dates its rows declare and it doesn't supply, walking the graph: a stamped date is
- * never the input's to supply, as on an entity. `"required"` leaves one a schema doesn't require,
- * which a rewrite stamps anyway: a mutation that changes nothing still has nothing to write. A value
- * with nothing to add comes back as it is.
+ * `value` with the dates its rows declare, walking the graph. `"declared"` (`create`) stamps every one
+ * the input lacks, and one it holds unless the root declares that date optional (`replaces`): up to
+ * 1.39.0 the input had to hold a date the root required, which the stamp then replaced, so a value
+ * there is a placeholder, and one the root declares optional was the caller's to store. `"required"`
+ * (`update`) fills only one the mutated state lacks and a schema requires; one it doesn't require a
+ * rewrite stamps anyway: a mutation that changes nothing still has nothing to write. A value with
+ * nothing to add comes back as it is.
  */
 const fillStamps = (
   node: ResolvedNode,
@@ -6153,18 +6174,31 @@ const fillStamps = (
   const row = node.rowStamps
   const fill = (
     name: string | null,
-    declared: boolean | undefined,
-    required: boolean | undefined,
-    encoding: DynamoEncoding | null | undefined,
+    declared: boolean,
+    required: boolean,
+    replaces: boolean,
+    encoding: DynamoEncoding | null,
   ) => {
-    if (name === null || given[name] !== undefined) return
-    if (which === "declared" ? declared === true : required === true) {
-      added[name] = generateTimestampPrimitive(now, encoding ?? null)
+    if (name === null || (given[name] !== undefined && (which === "required" || !replaces))) return
+    if (which === "declared" ? declared : required) {
+      added[name] = generateTimestampPrimitive(now, encoding)
     }
   }
   if (row !== undefined) {
-    fill(row.createdAt, row.createdDeclared, row.createdRequired, row.createdEncoding)
-    fill(row.updatedAt, row.updatedDeclared, row.updatedRequired, row.updatedEncoding)
+    fill(
+      row.createdAt,
+      row.createdDeclared,
+      row.createdRequired,
+      row.createdReplaces,
+      row.createdEncoding,
+    )
+    fill(
+      row.updatedAt,
+      row.updatedDeclared,
+      row.updatedRequired,
+      row.updatedReplaces,
+      row.updatedEncoding,
+    )
   }
   for (const child of node.children) {
     const current = given[child.fieldName!]
@@ -6264,8 +6298,9 @@ const buildDynamoItems = (
 
       // System timestamps. Written last, so a generated value wins over the same-named field
       // propagated onto edge items via `context`; known first, so a key over one holds what the row
-      // holds. A date the row declares is as an entity's: a supplied value wins, and `created` stays
-      // what's stored whatever the mutation did to it.
+      // holds. A date the row declares holds what the row does: on `create` the stamp `fillStamps`
+      // put there, on `update` a value the mutation changed, and `created` stays what's stored
+      // whatever the mutation did to it.
       const stamped: Record<string, unknown> = {}
       const row = item.rowStamps
       if (stamp && row !== undefined) {

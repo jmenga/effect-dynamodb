@@ -25,4 +25,4 @@ A relative update that breaks a `.check()` still lands, since it can't be judged
 
 `Entity` and `BoundEntity` each gain a type parameter, last and defaulting to `never`. A type written with the old argument count still compiles.
 
-`Entity.make` refuses a `timeSeries.appendInput` carrying a sharded index's `by` attribute without the composites its key needs beside it (`EDD-9113`), which used to fail on every append with `EDD-9100`.
+`Entity.make` refuses a `timeSeries.appendInput` that always carries a sharded index's `by` attribute and never the composites its key needs beside it (`EDD-9113`), which used to fail on every append with `EDD-9100`. An input that may leave a composite out, so that some append composes the key, still loads: that append is written, and one that can't compose the key fails with `EDD-9100`, as before.

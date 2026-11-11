@@ -24,6 +24,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { DateTime } from "effect"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as KeyText136 from "../src/internal/KeyText136.js"
+import { STORED_NAN } from "../src/internal/NumericKey.js"
 import * as KeyComposer from "../src/KeyComposer.js"
 
 type Tagged = { readonly t: string; readonly v: string }
@@ -148,9 +149,11 @@ describe("the default composes the golden vectors from the published 1.36.0", ()
     for (const { value, text } of vectors.serializeValue) {
       const revived = revive(value)
       expect(KeyComposer.compositeText(of136, revived), JSON.stringify(value)).toBe(text)
-      // The one vector the default refuses: nothing can be stored under it from here on.
+      // The one vector the default refuses for a `number`, which no row holds. A number its field
+      // stores as a string holds one, and it keeps the text 1.36 gave it.
       if (typeof revived === "number" && Number.isNaN(revived)) {
         expect(() => KeyComposer.compositeText(schema, revived)).toThrow("[EDD-9096]")
+        expect(KeyComposer.compositeText(schema, STORED_NAN)).toBe(text)
       } else {
         expect(KeyComposer.compositeText(schema, revived), JSON.stringify(value)).toBe(text)
       }

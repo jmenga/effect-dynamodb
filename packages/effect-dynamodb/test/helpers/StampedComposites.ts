@@ -1084,12 +1084,12 @@ export const adjacentScenarios: ReadonlyArray<RepairScenario> = [
     return h.on({ MainTable }, (table) =>
       Effect.gen(function* () {
         const db = yield* client
-        // A supplied value is the row's and the key's.
+        // `create` stamps over a value the input holds, as up to 1.39.0, in the row and the key.
         yield* db.aggregates.Created.create({ id: "b", createdAt: supplied })
         const given = typeOf(yield* table.rows(), "Created", "b")
-        expect(given.createdAt.S).toBe(SUPPLIED)
+        expect(given.createdAt.S).not.toBe(SUPPLIED)
         expect(given.gsi1sk.S).toContain(stamp(given, "createdAt"))
-        // Otherwise the key follows the stamp.
+        // Without one the key follows the stamp too.
         yield* db.aggregates.Created.create({ id: "a" })
         yield* db.aggregates.Updated.create({ id: "a" })
         const created = typeOf(yield* table.rows(), "Created")
@@ -2201,22 +2201,23 @@ const declaredDates = (
         expect(row.createdAt.S).toEqual(row.updatedAt.S)
         expectReturnedAsStored(fields.read(made), row)
         expectReturnedAsStored(fields.read(yield* subject.get({ id: "a" })), row)
-        // Supplied: stored, returned and read back.
+        // Supplied to `create`: the stamp is stored all the same, as up to 1.39.0, where the input
+        // had to hold a value. What's returned and read back is what's stored.
         const given = yield* subject.create({
           id: "b",
           ...fields.input({ createdAt: supplied, updatedAt: supplied }),
         })
         const givenRow = onlyRow(yield* table.rows(), type, "b")
-        expect(givenRow.createdAt.S).toBe(SUPPLIED)
-        expect(givenRow.updatedAt.S).toBe(SUPPLIED)
+        expect(givenRow.createdAt.S).not.toBe(SUPPLIED)
+        expect(givenRow.updatedAt.S).toBe(givenRow.createdAt.S)
         expectReturnedAsStored(fields.read(given), givenRow)
         expectReturnedAsStored(fields.read(yield* subject.get({ id: "b" })), givenRow)
         // An update of the row keeps `createdAt`, moves `updatedAt`, and returns what it stored.
         yield* tick
         const edited = yield* subject.update({ id: "b" }, ({ state }: any) => fields.edit(state))
         const editedRow = onlyRow(yield* table.rows(), type, "b")
-        expect(editedRow.createdAt.S).toBe(SUPPLIED)
-        expect(editedRow.updatedAt.S).not.toBe(SUPPLIED)
+        expect(editedRow.createdAt.S).toBe(givenRow.createdAt.S)
+        expect(editedRow.updatedAt.S).not.toBe(givenRow.updatedAt.S)
         expectReturnedAsStored(fields.read(edited), editedRow)
         expectReturnedAsStored(fields.read(yield* subject.get({ id: "b" })), editedRow)
         // An update naming `updatedAt` gives it; `createdAt` isn't the update's to change.
@@ -2224,7 +2225,7 @@ const declaredDates = (
           fields.named(state, { createdAt: second, updatedAt: second }),
         )
         const namedRow = onlyRow(yield* table.rows(), type, "b")
-        expect(namedRow.createdAt.S).toBe(SUPPLIED)
+        expect(namedRow.createdAt.S).toBe(givenRow.createdAt.S)
         expect(namedRow.updatedAt.S).toBe(SECOND)
         expectReturnedAsStored(fields.read(named), namedRow)
         // Nothing changed, nothing written, and what's returned is what's stored.
@@ -2374,6 +2375,7 @@ export const aggregateScenarios: ReadonlyArray<RepairScenario> = [
           id: "a",
           lines: [{ sku: "s", createdAt: supplied, updatedAt: supplied }],
         })
+        yield* tick
         const updated = yield* db.aggregates.WithMany.update({ id: "a" }, ({ state }: any) => ({
           ...state,
           lines: [...state.lines, { sku: "t" }],
@@ -2384,8 +2386,11 @@ export const aggregateScenarios: ReadonlyArray<RepairScenario> = [
           const returned = updated.lines.find((line: any) => line.sku === row.sku.S)
           expectReturnedAsStored(returned, row)
         }
-        expect(rows.find((row) => row.sku.S === "s")!.createdAt.S).toBe(SUPPLIED)
+        // `create` stamped the first over what the input held; the update stamped the second.
+        const first = rows.find((row) => row.sku.S === "s")!.createdAt.S
+        expect(first).not.toBe(SUPPLIED)
         expect(rows.find((row) => row.sku.S === "t")!.createdAt.S).not.toBe(SUPPLIED)
+        expect(rows.find((row) => row.sku.S === "t")!.createdAt.S).not.toBe(first)
       }),
     )
   }),
@@ -3497,24 +3502,27 @@ export const decomposeScenarios: ReadonlyArray<RepairScenario> = [
       )
     }),
   ),
-  ...bothSettings("a supplied date wins, and a date field is stored as its own form", (h, on) => {
-    const w = decomposeWorld(on, OrderOfRecord, byValues)
-    return h.on(w, (table) =>
-      Effect.gen(function* () {
-        const db = yield* w.client
-        const created = yield* db.aggregates.Orders.create({
-          id: "o",
-          lines: { a: { sku: "a", qty: 1, at: SUPPLIED, updatedAt: SUPPLIED } },
-        })
-        expect(DateTime.formatIso(created.lines.a.updatedAt)).toBe(SUPPLIED)
-        const line = (yield* table.rows()).find((row) => row.sku?.S === "a")!
-        expect(line.at.S).toBe(SUPPLIED)
-        expect(line.updatedAt.S).toBe(SUPPLIED)
-        const read = yield* db.aggregates.Orders.get({ id: "o" })
-        expect(DateTime.formatIso(read.lines.a.at)).toBe(SUPPLIED)
-      }),
-    )
-  }),
+  ...bothSettings(
+    "create stamps over a supplied date, and a date field is stored as its own form",
+    (h, on) => {
+      const w = decomposeWorld(on, OrderOfRecord, byValues)
+      return h.on(w, (table) =>
+        Effect.gen(function* () {
+          const db = yield* w.client
+          const created = yield* db.aggregates.Orders.create({
+            id: "o",
+            lines: { a: { sku: "a", qty: 1, at: SUPPLIED, updatedAt: SUPPLIED } },
+          })
+          expect(DateTime.formatIso(created.lines.a.updatedAt)).not.toBe(SUPPLIED)
+          const line = (yield* table.rows()).find((row) => row.sku?.S === "a")!
+          expect(line.at.S).toBe(SUPPLIED)
+          expect(line.updatedAt.S).toBe(DateTime.formatIso(created.lines.a.updatedAt))
+          const read = yield* db.aggregates.Orders.get({ id: "o" })
+          expect(DateTime.formatIso(read.lines.a.at)).toBe(SUPPLIED)
+        }),
+      )
+    },
+  ),
   ...bothSettings("an array with its own decompose and assemble", (h, on) => {
     const Order = Schema.Struct({ id: Schema.String, lines: Schema.Array(Line) })
     const assembled: Array<number> = []

@@ -746,8 +746,9 @@ orders the forms (`-` < digits < `:` < `;`; under `-`, `)` < `*` < digits), and 
 negative's `:` terminator sorts its shorter text last, so `-3.14 < -3.1 < -3`. Every
 byte is above the `#` delimiter and none is a letter, so casing never changes it and
 a composite that continues with `#<next>` keeps the order. `NaN` has no order, so it throws
-`[EDD-9096]` (`KeyValueError`) under either setting. A bigint of more than 1,000 digits overflows
-the exponent, and throws it with `escapeKeys: true`. Where that surfaces:
+`[EDD-9096]` (`KeyValueError`) with `escapeKeys: true`, and so does a `Schema.Number`'s with it off
+(a `Schema.NumberFromString`'s keeps 1.36's text there, below). A bigint of more than 1,000 digits
+overflows the exponent, and throws it with `escapeKeys: true`. Where that surfaces:
 
 | Path | Result |
 |---|---|
@@ -767,12 +768,20 @@ every other number (negative, fractional, `≥ 1e16`, `±Infinity`), every negat
 
 **Off composes what 1.36 composed**, so a row 1.36 stored stays where a read looks: a very long
 bigint is its digits and `Infinity` is `00000000infinity` (then cased), and neither is refused.
-`NaN` alone isn't composed, since no order or lookup can use it. `KeyText136.schema136` still
-composes `0000000000000NaN` for the fixture and for `rekey`, `text136` being what lets it: no write
-or query has that text. Only a `NumberFromString` ever stored it (the marshaller refused a number),
-and 1.37 and 1.38 refused it too. Such a row still decodes on a scan. `rekey` leaves it and names
-it: a row whose own key needs the `NaN` is the conflict `uncomposable` (since 1.40.0; earlier it was
-counted in `skipped.unrecognizedKey`), and an index key holding it has no difference to judge.
+A `NaN` is composed only where a row can hold it. A `Schema.NumberFromString` stores it as
+`"NaN"`, so its row is keyed `0000000000000NaN` (then cased), written, read, queried, updated and
+deleted by that key on every path, as up to 1.39.0 (`test/fixtures/stored-nan-keys-1.39.0.json`).
+The composite key form tells it apart: it hands that field's `NaN` on as `NumericKey.STORED_NAN`
+(`CompositeCodec.storedNaNKeyForm`, also what an aggregate's `many` edge sort key is read through),
+which the composers compose by the setting, and which is a number to the type checks
+(`keyFormValueKindOf`) and to arithmetic. A `Schema.Number`'s own `NaN` has no stored form (the
+marshaller refuses it), so no row holds it, and it is refused (`[EDD-9096]`); 1.39.0 composed its
+text, and every write of it died in the marshaller. `KeyText136.schema136` composes
+`0000000000000NaN` for a number's `NaN` too, for the fixture and for `rekey`, `text136` being what
+lets it. 1.37 and 1.38 refused both. With `escapeKeys` on, `rekey` names a row whose own key needs
+the `NaN` as the conflict `uncomposable` (since 1.40.0; earlier it was counted in
+`skipped.unrecognizedKey`), and an index key holding it has no difference to judge; with it off,
+the row is where the entity composes it, and is left as it is.
 
 **History.** 1.37.0 composed numeric text unconditionally, and 1.38.0 kept it. Since 1.39.0
 it belongs to `escapeKeys: true`.
@@ -1166,7 +1175,7 @@ different snapshot of the version), `taken` (another row
 holds the target), `contended` (concurrent writes on every attempt, or the attempts exhausted),
 `failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, or an
 aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
-compose a current one; a row whose own key holds a value with no key text, `NaN`, or one of whose key
+compose a current one; a row whose own key holds a value with no key text, `NaN` under `escapeKeys: true`, or one of whose key
 composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or
 rows are gone since the scan read them (moved or deleted by a write) is
@@ -1179,7 +1188,7 @@ or 1.38.0 run cut short left (root at the current key, edges at the old partitio
 under no text; a projection tombstone or outbox item whose key reads as more than one set of values.
 `conflicts`, `failed`: a row whose Z-order value no
 longer places a key; a stream id whose rows read as two different ids. `conflicts`, `uncomposable`: a
-row whose own key holds `NaN`, or one of whose key composites holds a value no form of its schema takes. `skipped.rootNotSeen`: an aggregate's
+row whose own key holds `NaN` under `escapeKeys: true`, or one of whose key composites holds a value no form of its schema takes. `skipped.rootNotSeen`: an aggregate's
 rows below no root, met by a run that didn't read the whole table (`maxPages`, `resume`). Such a run can't
 say the root isn't there, since a root at its old key on a page it didn't read could claim them, so a run
 over the whole table judges them; only that run counts them `unrecognizedKey`.
@@ -4691,11 +4700,19 @@ configuration that could add one (#98).
 5. **What a row declares is decided per row, as on an entity.** Each node (root,
    sub-aggregate root, `one` edge, `many` element) resolves the stamps against its
    own value's fields (`rowStampsOf`). A date that value declares, under
-   `Schema.optional` as well, is managed: the input doesn't need it, and a supplied
-   value wins, in the row and in any key holding it. A field of that name of another
-   type is the caller's, on that row. Undeclared, the row is stamped and it's stripped
-   from what's read. A root field of that name that isn't a date turns the stamp off
-   for every row, as it always did (`resolveAggregateStamps`).
+   `Schema.optional` as well, is managed: the input doesn't need it, and `create`
+   stamps it whether or not the input holds a value, in the row and in any key holding
+   it. Up to 1.39.0 `create` failed with `Missing key` without one and then stored the
+   stamp in its place, so a value there is a placeholder, never stored
+   (`test/fixtures/aggregate-create-stamps-1.39.0.json`). The exception is also
+   1.39.0's: a date the root declares `Schema.optional` was the caller's then, so
+   `create` stores a value supplied for it, on every row (`createdReplaces` /
+   `updatedReplaces`, read by `fillStamps`); without one it's stamped. An entity's
+   `put` differs: a value supplied for a colliding timestamp field wins there, as it
+   did. A field of that name of another type is the caller's, on that row.
+   Undeclared, the row is stamped and it's stripped from what's read. A root field of
+   that name that isn't a date turns the stamp off for every row, as it always did
+   (`resolveAggregateStamps`).
 6. **What `create` and `update` return is what they stored.** `create` fills the
    declared dates before it validates (`fillStamps`), so the value it returns holds
    them. `update` keeps `createdAt` whatever the mutation did, as an entity's update
@@ -6392,7 +6409,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9093` | `DynamoClient.ts` (accessor, accessor `.within()`), `internal/BoundQuery.ts`, `Entity.ts` (legacy `query` namespace) | Misuse reachable from untyped code. On a Z-order accessor: a dimension or prefix composite passed as an accessor composite, or `.where()` (a binary address has no text order to compare). In `.within()`: an unknown or partition key field, a composite the accessor already pinned, a composite the item doesn't store (its bound can't be checked on the row; a ref-derived `${ref}Id` is read from the stored ref), a bound that is not one of `{ eq }`, `{ between: [low, high] }`, `{ gt \| gte }` and / or `{ lt \| lte }`, a range bound on a Z-order prefix composite, `in` on a dimension that is not `literals`, a bound of the wrong key-form type, `.within()` together with `.where()` or a second `.within()`, or `.within()` on a query with no sort key composites to bound |
 | `EDD-9094` | `Query.ts` (`ValidationError` at the terminal, operation `query.startFrom`), `Aggregate.ts` (`ValidationError`, operation `list`) | On `Aggregate.list`: a cursor it can't decode, or a v2 cursor holding anything but a key (#197). On a query: a cursor that doesn't belong to the query: a malformed cursor of either format, a fingerprint mismatch (other bounds, partition or direction), a v2 `.within()` cursor on a query without one, a legacy cursor for any plan other than a key or naive plan (skip-scan, filter, jump, precise, empty), or a position outside the recomputed plan (`docs/designs/zorder-indexes.md` §10.2, §10.3). On a sharded index (#183): also a wrong position count or shape, an unexpected attribute in a position, a checksum mismatch, a plain or planned cursor on a sharded query and a sharded cursor on any other query (`docs/designs/gsi-write-sharding.md` §6.6). `startFrom` itself never throws: the cursor is decoded when a terminal runs |
 | `EDD-9095` | `Query.ts`, `internal/BoundQuery.ts` | Invalid library option: unknown `strategy`; `maxRanges` or `concurrency` not a positive integer; `maxSkips` not a non-negative integer; a `.pageSize()` string other than `"natural"`; `.zorder()` on a query without a Z-order accessor. Numeric `pageSize` values are not checked (DynamoDB enforces `Limit`) |
-| `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`), and `KeyComposer.compositeText` for `NaN` with `escapeKeys` off: a `ValidationError` before anything is sent, on every path that composes a key ("Numeric key text"). Off refuses `NaN` and composes the 1.36 text of everything else; only `KeyText136.schema136` (`text136`) has text for it | A key composite or bound with no numeric key text: `NaN` (no order) under either setting, or, with `escapeKeys: true`, a bigint of more than 1,000 digits (past the 3-digit exponent) |
+| `EDD-9096` | `internal/NumericKey.ts` (schema, via `KeyComposer.serializeValue`), and `KeyComposer.compositeText` for a `number`'s `NaN` with `escapeKeys` off: a `ValidationError` before anything is sent, on every path that composes a key ("Numeric key text"). Off refuses a `Schema.Number`'s `NaN` and composes the 1.36 text of everything else, a `Schema.NumberFromString`'s `NaN` included (`NumericKey.STORED_NAN`); `KeyText136.schema136` (`text136`) has text for a number's too | A key composite or bound with no numeric key text: `NaN` (no order), with `escapeKeys: true`, or with it off a `NaN` no row can hold (a `Schema.Number`'s); with `escapeKeys: true`, a bigint of more than 1,000 digits (past the 3-digit exponent) |
 | `EDD-9097` | — | **Retired** in #183 (`ItemNotMoved`, a transaction over an item still under its 1.36 key): nothing reads or moves a row under other text but `rekey`. Do not reuse |
 | `EDD-9098` | `internal/Rekey.ts` (`ValidationError`, `entityType: "Table"`, `operation: "rekey"`) | A `rekey` option that is not a positive integer (`segments`, `concurrency`, `pageSize`, `maxPages`), a malformed resume token, a token of another table, or a `segments` other than the token's. Nothing is read |
 
@@ -6407,7 +6424,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9108` | `internal/SharedKeyAttribute.ts` (schema), through `Entity.make` | One entity uses one physical index twice, even over the same fields |
 | `EDD-9109` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredInKeyAttribute`), through `Entity.make` | A model attribute, a system timestamp or a version field is stored in a key attribute the entity writes (`writtenKeyAttributes`: the table's, and since 1.40 each secondary index's), by rename or by name; or, since 1.40, a model attribute is named as one under a rename, which moved the composed key into the field's attribute |
 | `EDD-9112` | `internal/SharedKeyAttribute.ts` (schema), through `Aggregate.make` | An aggregate's list key or collection sort key is stored in a table key attribute |
-| `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, without what its key needs beside it: the partition key's composites, the other `by` attributes, or (under `preserve`) a sort key composite before it. Every append carrying it would fail with `EDD-9100` |
+| `EDD-9113` | `Entity.ts` (schema, `refuseAppendThatCannotShard`), through `Entity.make`, and the type-level guard where literals show it | A `timeSeries.appendInput` carrying a `shards.by` attribute of an index, no append of which can compose the index's key: none can hold what the key needs beside it (the partition key's composites, the other `by` attributes, or under `preserve` a sort key composite before it), and none can leave the index alone. Every append would fail with `EDD-9100`. Judged by composing each append the input allows, with and without the composites it may leave out (an optional key, or a value that may be `undefined` or `null`): an input one append of which composes loads, as up to 1.39.0, and an append that can't compose fails with `EDD-9100` when it's made |
 | `EDD-9121` | `Entity.ts` (schema, `Entity.make`), and the type-level guard for a secondary index's composites; `Aggregate.make`, pure and operational (`AggregateSchemas.refuseAggregateKeyOverMovingValue`, `refuseManySortKeysOverMovingValue`) | A key over a value the library changes on every write: the `versioned` attribute in a secondary index without `retain`, or in a primary key; `timestamps.updated` in a primary key; either in `shards.by`; a stamped `updatedAt` in an aggregate's partition key or a `many` edge's sort key (§7 "Composites the library stamps") |
 | `EDD-9122` | `Entity.ts` (schema, `Entity.make`) | A `configure` `field:` rename of the attribute `versioned` keeps the version in. Every read and write of the item reads the version from the attribute by that name, so the first write stored it elsewhere and every later one failed; `versioned: { field }` names the attribute. |
 | `EDD-9123` | `Aggregate.ts` (`keyCompositesOrThrow`), through `composeKeysOrFail` | An aggregate's partition key or collection sort key has no value for a composite, on a write or a read, or a `list` filter leaves out a composite of the list's partition key. A `ValidationError`, before anything is written (`delete`: `AggregateAssemblyError`, its channel has no `ValidationError`). A list key with no value isn't this: the row is left out of the list. |

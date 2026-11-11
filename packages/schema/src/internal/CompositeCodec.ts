@@ -35,7 +35,7 @@
 
 import { Equal, Option, Schema, SchemaAST } from "effect"
 import { substituteSchemaDeep } from "./EntitySchemas.js"
-import { KeyValueError } from "./NumericKey.js"
+import { isStoredNaN, KeyValueError, STORED_NAN } from "./NumericKey.js"
 import {
   getSchemaFields,
   hasEncodingTransformation,
@@ -76,7 +76,9 @@ export const refuseInexact = (composite: string, value: unknown, reason: string)
  *    already a wire-shaped string.
  * 2. **Numeric Type with string Encoded** — the rule's exception. Target is the
  *    numeric Type value: keep a `number` / `bigint` as-is, otherwise `decode`
- *    to reach it.
+ *    to reach it. A `NaN` is handed on as `NumericKey.STORED_NAN`: the field
+ *    stores it (`"NaN"`), which no other numeric field can, so with
+ *    `escapeKeys` off it keeps the key text 1.36 gave it.
  * 3. **Anything else** — target is the Encoded value. A field with no encoding
  *    transformation is identity by construction (a numeric one still coerced
  *    to its declared kind, as in case 2) (`SchemaAST` documents
@@ -140,12 +142,14 @@ export const makeCompositeKeyForm = (
     if (numericTypeWithStringEncoding(field)) {
       const wantsBigInt = SchemaAST.isBigInt(SchemaAST.toType(field.ast))
       const decode = Schema.decodeUnknownOption(codec)
+      const stored = (value: unknown): unknown => storedNaNKeyForm(field, value)
       const fn = (value: unknown): unknown => {
+        if (isStoredNaN(value)) return value
         if (typeof value === "bigint" || typeof value === "number") {
-          return exactly(attr, wantsBigInt ? "bigint" : "number", value)
+          return stored(exactly(attr, wantsBigInt ? "bigint" : "number", value))
         }
         const decoded = decode(value)
-        if (Option.isSome(decoded)) return decoded.value
+        if (Option.isSome(decoded)) return stored(decoded.value)
         return refuse(attr, value)
       }
       cache.set(attr, fn)
@@ -1044,6 +1048,30 @@ export const keyFormValueKind = (field: Schema.Top): KeyFormValueKind | undefine
   }
   return astKeyFormValueKind(SchemaAST.toEncoded(field.ast))
 }
+
+/**
+ * `value` in key form where it's the `NaN` of a number `field` stores as a string
+ * (`Schema.NumberFromString`): `NumericKey.STORED_NAN`. The field stores it as `"NaN"`, so a row
+ * can hold it, and with `escapeKeys` off it composes the text 1.36 gave it, as up to 1.39.0. A
+ * `number`'s own `NaN`, which no row holds, has no key text. Any other value as it is. The one
+ * place the two are told apart: the composite key form, and an aggregate's `many` edge sort key,
+ * which is composed from the element's values.
+ */
+export const storedNaNKeyForm = (field: Schema.Top | undefined, value: unknown): unknown =>
+  typeof value === "number" &&
+  Number.isNaN(value) &&
+  field !== undefined &&
+  numericTypeWithStringEncoding(field) &&
+  !SchemaAST.isBigInt(SchemaAST.toType(field.ast))
+    ? STORED_NAN
+    : value
+
+/**
+ * The JavaScript type of a key-form value, to compare with {@link keyFormValueKind}: `"number"` for
+ * `NumericKey.STORED_NAN`, the `NaN` a number stored as a string hands on, as for any other number.
+ */
+export const keyFormValueKindOf = (value: unknown): string =>
+  isStoredNaN(value) ? "number" : typeof value
 
 /**
  * The literal members a field's key form is limited to (a literal, a union of

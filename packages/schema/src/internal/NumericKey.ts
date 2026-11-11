@@ -66,6 +66,26 @@ export class KeyValueError extends Data.TaggedError("KeyValueError")<{
 export const isKeyValueError = (u: unknown): u is KeyValueError =>
   Predicate.isTagged(u, "KeyValueError")
 
+const StoredNaNTypeId: unique symbol = Symbol.for("@effect-dynamodb/schema/StoredNaN")
+
+/**
+ * The `NaN` of a number its field stores as a string, in key form. `Schema.NumberFromString`
+ * stores `"NaN"`, so a row can hold it: with `escapeKeys` off it composes the text 1.36 gave it
+ * (`0000000000000NaN`), as up to 1.39.0, where such a row was written, read, updated and deleted.
+ * A `number`'s own `NaN` has no stored form, so no row holds it and it has no key text under
+ * either setting. Only the field can tell the two apart, so the composite key form
+ * (`CompositeCodec`) hands the first on as this value and the composers compose it by the
+ * schema's setting. It is `NaN` to arithmetic and comparison.
+ */
+export const STORED_NAN: { readonly [StoredNaNTypeId]: true } = Object.freeze({
+  [StoredNaNTypeId]: true as const,
+  valueOf: () => Number.NaN,
+  toString: () => "NaN",
+})
+
+/** Is `u` {@link STORED_NAN}? By its id, so two copies of this package still agree. */
+export const isStoredNaN = (u: unknown): boolean => Predicate.hasProperty(u, StoredNaNTypeId)
+
 const refuse = (value: unknown, shown: string, reason: string): never => {
   throw new KeyValueError({
     value,

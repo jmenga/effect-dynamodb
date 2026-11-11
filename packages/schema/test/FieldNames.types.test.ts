@@ -951,4 +951,82 @@ describe("timeSeries.appendInput against a sharded index (EDD-9113)", () => {
       }),
     ).toThrow("[EDD-9113]")
   })
+
+  it("an optional `by` compiles and loads: an append may leave it out", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          group: Schema.optional(Schema.String),
+        }),
+      },
+    })
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          group: Schema.UndefinedOr(Schema.String),
+        }),
+      },
+    })
+  })
+
+  it("an optional composite after a gap compiles and loads: an append may leave it out", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes: {
+        byTenant: {
+          name: "gsi",
+          indexPolicy: { pk: "preserve", sk: "preserve" },
+          pk: { field: "gpk", composite: ["tenant"] },
+          sk: { field: "gsk", composite: ["group", "region"] },
+          shards: { count: 4, by: ["group"] },
+        },
+      },
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          tenant: Schema.String,
+          group: Schema.String,
+        }),
+      },
+    })
+  })
+
+  it("a required `by` after a composite no append holds, beside optional ones, still doesn't", () => {
+    expect(() =>
+      Entity.make({
+        model: Series,
+        entityType: "Series",
+        primaryKey,
+        indexes,
+        timeSeries: {
+          orderBy: "at",
+          // @ts-expect-error every append carries `group`, and none can carry `region`
+          appendInput: Schema.Struct({
+            id: Schema.String,
+            at: Schema.optional(Schema.Number),
+            tenant: Schema.String,
+            group: Schema.String,
+          }),
+        },
+      }),
+    ).toThrow()
+  })
 })

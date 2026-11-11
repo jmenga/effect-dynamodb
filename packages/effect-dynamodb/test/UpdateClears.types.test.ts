@@ -474,6 +474,44 @@ describe("an appendInput that can't compose a sharded index's key (EDD-9113)", (
       },
     })
   })
+
+  it("an optional `by` compiles and loads, as up to 1.39.0: an append may leave it out", () => {
+    Entity.make({
+      model: Series,
+      entityType: "Series",
+      primaryKey,
+      indexes,
+      timeSeries: {
+        orderBy: "at",
+        appendInput: Schema.Struct({
+          id: Schema.String,
+          at: Schema.Number,
+          group: Schema.optional(Schema.String),
+        }),
+      },
+    })
+  })
+
+  it("an optional `by` beside the partition composite compiles, and make refuses it", () => {
+    // The literals don't show that an append naming the partition needs the shard's source too.
+    expect(() =>
+      Entity.make({
+        model: Series,
+        entityType: "Series",
+        primaryKey,
+        indexes,
+        timeSeries: {
+          orderBy: "at",
+          appendInput: Schema.Struct({
+            id: Schema.String,
+            at: Schema.Number,
+            tenant: Schema.String,
+            group: Schema.optional(Schema.String),
+          }),
+        },
+      }),
+    ).toThrow("[EDD-9113]")
+  })
 })
 
 describe("a value with no stored form", () => {

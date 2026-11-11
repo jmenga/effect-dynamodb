@@ -65,6 +65,7 @@ import {
   validateNoTransformOverride,
 } from "./internal/EntitySchemas.js"
 import type {
+  AlwaysHeldFieldName,
   DimensionFieldNames,
   EntityRefCreateType,
   EntityRefInputType,
@@ -74,7 +75,7 @@ import type {
   PrefixFieldNames,
   VersionFieldName,
 } from "./internal/EntityTypes.js"
-import { refuseUnreadable } from "./internal/SchemaAccessors.js"
+import { alwaysHeld, refuseUnreadable } from "./internal/SchemaAccessors.js"
 import { isShardSourceError } from "./internal/Shards.js"
 import {
   refuseReadAsSparseEntry,
@@ -517,30 +518,34 @@ type SortKeyHole<C, TCarried, TGap extends string = never> = C extends readonly 
   : never
 
 /**
- * What an index's key lacks when an input carrying `TCarried` touches its `shards.by`.
- * A sort key hole fails only under `preserve`; `sparse` takes the row out of the index.
+ * What an index's key lacks on every append, when every append touches its `shards.by`: the input
+ * always holds one of `by` (`TAlways`) and can never hold (`TCarried`) a composite the key needs.
+ * A sort key hole is one no append can close, before a composite every append holds; it fails
+ * only under `preserve`, where `sparse` takes the row out of the index.
  */
-type AppendShardGap<TEntry, TCarried> = TEntry extends {
+type AppendShardGap<TEntry, TCarried, TAlways> = TEntry extends {
   readonly pk: { readonly composite: infer PC extends ReadonlyArray<string> }
   readonly sk: { readonly composite: infer SC extends ReadonlyArray<string> }
   readonly shards: { readonly by: infer By extends ReadonlyArray<string> }
 }
-  ? [By[number] & TCarried] extends [never]
+  ? [By[number] & TAlways] extends [never]
     ? never
     :
         | Exclude<PC[number] | By[number], TCarried>
         | (TEntry extends { readonly indexPolicy: infer P }
             ? [P] extends [{ readonly pk?: unknown; readonly sk?: "preserve" }]
-              ? SortKeyHole<SC, TCarried>
+              ? Exclude<SortKeyHole<SC, TAlways>, TCarried>
               : never
-            : SortKeyHole<SC, TCarried>)
+            : Exclude<SortKeyHole<SC, TAlways>, TCarried>)
   : never
 
 /**
- * @internal A `timeSeries.appendInput` carrying a `shards.by` attribute of an index,
- * without what its key needs beside it: every append carrying it would fail with
- * `EDD-9100`, so it's an error on `appendInput`. `Entity.make` checks again at run time
- * (`EDD-9113`), which covers whatever the literals here don't show.
+ * @internal A `timeSeries.appendInput` that always holds a `shards.by` attribute of an index,
+ * and never what its key needs beside it: every append would fail with `EDD-9100`, so it's an
+ * error on `appendInput`. An input that may leave the attribute out compiles: an append
+ * without it leaves the index alone, as up to 1.39.0, and one carrying it fails then.
+ * `Entity.make` checks again at run time (`EDD-9113`), which covers whatever the literals
+ * here don't show.
  */
 export type AppendShardGuard<TIndexes, TTimeSeries> = TTimeSeries extends {
   readonly appendInput: infer A extends Schema.Top
@@ -549,13 +554,21 @@ export type AppendShardGuard<TIndexes, TTimeSeries> = TTimeSeries extends {
     ? unknown
     : [
           {
-            readonly [K in keyof TIndexes]: AppendShardGap<TIndexes[K], ModelFieldName<A>>
+            readonly [K in keyof TIndexes]: AppendShardGap<
+              TIndexes[K],
+              ModelFieldName<A>,
+              AlwaysHeldFieldName<A>
+            >
           }[keyof TIndexes],
         ] extends [never]
       ? unknown
       : {
           readonly appendInput: `EDD-9113: appendInput carries a sharded index's \`by\` attribute but not ${{
-            readonly [K in keyof TIndexes]: AppendShardGap<TIndexes[K], ModelFieldName<A>>
+            readonly [K in keyof TIndexes]: AppendShardGap<
+              TIndexes[K],
+              ModelFieldName<A>,
+              AlwaysHeldFieldName<A>
+            >
           }[keyof TIndexes] &
             string}`
         }
@@ -840,11 +853,16 @@ const bindShards = (
 }
 
 /**
- * An `appendInput` carrying a `shards.by` attribute of an index whose key can't be
- * composed from what that input carries (`[EDD-9113]`): every append carrying it would
- * fail with `[EDD-9100]`. Judged by composing one such append, through the composer every
- * append goes through, so the policy decides as it would on the call: a sort key gap
- * under `sparse` takes the row out of the index rather than failing.
+ * An `appendInput` no append of which can compose a sharded index's key (`[EDD-9113]`): it
+ * always holds a `shards.by` attribute of the index, and never what the key needs beside it,
+ * so every append would fail with `[EDD-9100]`. Judged by composing each append the input
+ * allows (its fields, with or without those it may leave out), through the composer every
+ * append goes through, so the policy decides as it would on the call: a sort key gap under
+ * `sparse` takes the row out of the index rather than failing.
+ *
+ * One append that composes is enough to load. An input whose `by` attribute is optional loads:
+ * an append without it leaves the index alone, and one carrying it fails with `[EDD-9100]`
+ * when it's made, as up to 1.39.0.
  */
 const refuseAppendThatCannotShard = (
   entityType: string,
@@ -852,32 +870,56 @@ const refuseAppendThatCannotShard = (
   timeSeries: { readonly appendInput?: unknown } | undefined,
 ): void => {
   if (timeSeries?.appendInput === undefined || timeSeries.appendInput === null) return
-  const carried = Object.keys(getSchemaFields(timeSeries.appendInput as Schema.Top) ?? {})
+  const fields = getSchemaFields(timeSeries.appendInput as Schema.Top) ?? {}
+  const carried = Object.keys(fields)
   const primary = indexes.primary
   if (primary === undefined) return
   const primaryComposites = [...primary.pk.composite, ...primary.sk.composite]
-  const appended = (fields: ReadonlyArray<string>) =>
-    Object.fromEntries(fields.map((field) => [field, "x"]))
+  const appended = (held: ReadonlyArray<string>) =>
+    Object.fromEntries(held.map((field) => [field, "x"]))
   for (const [indexName, index] of Object.entries(indexes)) {
     const by = index.shards?.by
     if (by === undefined || !by.some((attr) => carried.includes(attr))) continue
-    try {
-      composeGsiKeysForUpdatePolicyAware(
-        DynamoSchema.make({ name: "definition", version: 1 }),
-        entityType,
-        1,
-        { primary, [indexName]: index },
-        appended(carried.filter((field) => !primaryComposites.includes(field))),
-        appended(carried),
+    /** Whether an append holding `held` fails for want of the shard's source. */
+    const fails = (held: ReadonlyArray<string>): boolean => {
+      try {
+        composeGsiKeysForUpdatePolicyAware(
+          DynamoSchema.make({ name: "definition", version: 1 }),
+          entityType,
+          1,
+          { primary, [indexName]: index },
+          appended(held.filter((field) => !primaryComposites.includes(field))),
+          appended(held),
+        )
+        return false
+      } catch (error) {
+        if (!isShardSourceError(error)) throw error
+        return true
+      }
+    }
+    // The composites of this index an append may leave out. No other field changes its key.
+    const open = carried.filter(
+      (field) =>
+        (index.pk.composite.includes(field) || index.sk.composite.includes(field)) &&
+        !primaryComposites.includes(field) &&
+        !alwaysHeld(fields[field] as Schema.Top),
+    )
+    // Each subset of `open` left out is one append: `left`'s bits say which.
+    let everyAppendFails = true
+    for (let left = 0; everyAppendFails && left < 2 ** open.length; left++) {
+      everyAppendFails = fails(
+        carried.filter((field) => !open.some((name, i) => name === field && (left >> i) % 2 === 1)),
       )
-    } catch (error) {
-      if (!isShardSourceError(error)) throw error
-      const lastCarried = index.sk.composite.reduce(
-        (last, attr, position) => (carried.includes(attr) ? position : last),
+    }
+    if (everyAppendFails) {
+      // What no append holds, up to the last sort key composite every append does.
+      const lastHeld = index.sk.composite.reduce(
+        (last, attr, position) =>
+          carried.includes(attr) && !open.includes(attr) ? position : last,
         -1,
       )
       const missing = [
-        ...new Set([...index.pk.composite, ...by, ...index.sk.composite.slice(0, lastCarried)]),
+        ...new Set([...index.pk.composite, ...by, ...index.sk.composite.slice(0, lastHeld)]),
       ].filter((attr) => !carried.includes(attr))
       const names = (attrs: ReadonlyArray<string>) => attrs.map((attr) => `"${attr}"`).join(", ")
       throw new Error(

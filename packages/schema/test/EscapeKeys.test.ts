@@ -11,6 +11,7 @@ import { describe, expect, it } from "@effect/vitest"
 import { DateTime } from "effect"
 import * as DynamoSchema from "../src/DynamoSchema.js"
 import * as KeyText136 from "../src/internal/KeyText136.js"
+import { isStoredNaN, STORED_NAN } from "../src/internal/NumericKey.js"
 import * as KeyComposer from "../src/KeyComposer.js"
 
 type Tagged = { readonly t: string; readonly v: string }
@@ -244,6 +245,26 @@ describe("what the flag changes", () => {
     expect(() => KeyComposer.composePk(on, "E", index, record)).toThrow("[EDD-9096]")
     expect(KeyComposer.composePk(KeyText136.schema136(flagOff), "E", index, record)).toBe(
       "$app#v1#e#tenant_0000000000000nan",
+    )
+  })
+
+  it("the NaN of a number stored as a string keeps 1.36's text off, and has none on", () => {
+    // `Schema.NumberFromString` stores `"NaN"`, so a row holds it: the composite key form hands
+    // it on as `STORED_NAN`, and 1.39.0 composed this text for it.
+    const record = { tenant: STORED_NAN, label: "x" }
+    expect(KeyComposer.composePk(flagOff, "E", index, record)).toBe(
+      "$app#v1#e#tenant_0000000000000nan",
+    )
+    expect(KeyComposer.compositeText(flagOff, STORED_NAN)).toBe("0000000000000NaN")
+    expect(KeyComposer.serializeValue136(STORED_NAN)).toBe("0000000000000NaN")
+    expect(() => KeyComposer.composePk(on, "E", index, record)).toThrow("[EDD-9096]")
+    expect(() => KeyComposer.serializeValue(STORED_NAN)).toThrow("[EDD-9096]")
+    // It is NaN to arithmetic and comparison, and nothing else is it.
+    expect(Number(STORED_NAN)).toBeNaN()
+    expect((STORED_NAN as unknown as number) < 1).toBe(false)
+    expect(isStoredNaN(STORED_NAN)).toBe(true)
+    expect([Number.NaN, "NaN", null, undefined, {}, 0].some((value) => isStoredNaN(value))).toBe(
+      false,
     )
   })
 

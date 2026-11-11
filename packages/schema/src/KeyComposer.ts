@@ -17,7 +17,7 @@ import {
   KEY_DELIMITER,
 } from "./DynamoSchema.js"
 import type { CompositeKeyHoleError } from "./Errors.js"
-import { encodeBigInt, encodeNumber } from "./internal/NumericKey.js"
+import { encodeBigInt, encodeNumber, isStoredNaN } from "./internal/NumericKey.js"
 import { MAX_SHARD_COUNT, ShardSourceError, shardMarker, shardOf } from "./internal/Shards.js"
 import {
   concatBytes,
@@ -527,6 +527,7 @@ const serializeWith = (
   if (typeof value === "string") return value
   if (typeof value === "number") return number(value)
   if (typeof value === "bigint") return bigint(value)
+  if (isStoredNaN(value)) return number(Number.NaN)
   if (typeof value === "boolean") return value ? "true" : "false"
   // DateTime types → ISO string (Zoned normalized to UTC for sort order)
   if (typeof value === "object" && value !== null && DateTime.isDateTime(value)) {
@@ -572,10 +573,14 @@ export const serializeValue136 = (value: unknown): string =>
   )
 
 /**
- * A composite value's serialized text under the schema's setting, before casing and escaping. `NaN`
- * has no place in key order under any setting: `[EDD-9096]`. With `escapeKeys` off every other value
- * keeps the text 1.36 gave it, and only {@link DynamoSchema.DynamoSchema.text136} composes 1.36's for
- * `NaN` too, for `rekey` to find a row stored under it.
+ * A composite value's serialized text under the schema's setting, before casing and escaping. A
+ * `number`'s `NaN` has no place in key order under any setting, and no stored form: `[EDD-9096]`.
+ * With `escapeKeys` off every other value keeps the text 1.36 gave it. That includes the `NaN` of a
+ * number its field stores as a string (`NumericKey.STORED_NAN`, which the composite key form hands
+ * on for a `Schema.NumberFromString`): a row holds it under `0000000000000NaN`, as 1.39.0 wrote
+ * it, and is read, updated and deleted by that key. With `escapeKeys` on it's refused like any
+ * `NaN`. {@link DynamoSchema.DynamoSchema.text136} composes 1.36's text for a `number`'s `NaN` too,
+ * for `rekey` to find a row stored under it.
  */
 export const compositeText = (schema: DynamoSchema.DynamoSchema, value: unknown): string => {
   if (schema.escapeKeys === true || schema.numericKeyText === true) return serializeValue(value)

@@ -130,6 +130,7 @@ import {
   compositeKeyFormKind,
   type KeyFormValueKind,
   keyFormValueKind,
+  keyFormValueKindOf,
   makeCompositeKeyForm,
   refuseInexact,
   toCompositeKeyRecord,
@@ -646,7 +647,7 @@ const planCompositeWithin = <A>(args: {
     const expected = kindOf(field)
     const keyForm = (value: unknown): unknown => {
       const converted = compositeKeyForm(field, value)
-      if (expected !== undefined && typeof converted !== expected) {
+      if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
         return refuse(
           `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
             `the composite's key form is a ${expected}.`,
@@ -1030,7 +1031,7 @@ const planZOrderWithin = <A>(args: {
     const converted = compositeKeyForm(field, value)
     const schema = fields?.[field]
     const expected = schema === undefined ? undefined : keyFormValueKind(schema)
-    if (expected !== undefined && typeof converted !== expected) {
+    if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
       return refuse(
         `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
           `the field's key form is a ${expected}.`,

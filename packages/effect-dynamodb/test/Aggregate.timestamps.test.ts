@@ -361,16 +361,18 @@ describe("Aggregate timestamps", () => {
         yield* TestClock.adjust(Duration.millis(FROZEN_MS))
         mockTransactWrite.mockResolvedValue({})
 
-        yield* TrackedAggregate.create({
+        const created = yield* TrackedAggregate.create({
           matchId: "m-9",
           name: "Tracked",
           updated: new Date(0),
         })
 
         const stored = writtenItems()
-        // Model encoding (epoch millis) wins over the ISO-string default, and a
-        // supplied value is what's stored, as on an entity.
-        expect(stored[0]!.updated.N).toBe("0")
+        // Model encoding (epoch millis) wins over the ISO-string default, and the
+        // caller-supplied value is replaced by the generated one, as up to 1.39.0,
+        // where the input had to hold one. What's returned is what's stored.
+        expect(stored[0]!.updated.N).toBe(String(FROZEN_MS))
+        expect(DateTime.toEpochMillis(created.updated as never)).toBe(FROZEN_MS)
 
         mockQuery.mockResolvedValueOnce({ Items: stored, LastEvaluatedKey: undefined })
         const read = yield* TrackedAggregate.get({ matchId: "m-9" })
