@@ -165,6 +165,7 @@ export {
   unwrapModel,
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 export type {
+  AggregateCreateInputType,
   AggregateInputType,
   BoundSubAggregate,
   Input,
@@ -202,6 +203,7 @@ import {
   unwrapModel,
 } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import type {
+  AggregateCreateInputType,
   AggregateEdgesConfig,
   AggregateEdgesGuard,
   AggregateInputType,
@@ -406,6 +408,20 @@ export type AggregateWriteError =
 export type AggregateCreateError = AggregateWriteError | ConditionalCheckFailed
 
 /**
+ * What `create` takes for an input of type `I`. An input typed with a string index signature
+ * (`Record<string, unknown>`, parsed JSON, a value built at run time) is taken as it is and judged
+ * at run time, as 1.39.0's `create` took every input. Any other input (an object literal, a value
+ * of a precise type) is checked against `TCreate`, `create`'s input type, which refuses only what
+ * 1.39.0's `create` failed on at run time. An input `TCreate` takes is taken with keys it doesn't
+ * declare, at any depth, which `create` ignores, as 1.39.0's did: in an object literal too.
+ */
+export type CreateArgument<I, TCreate> = string extends keyof I
+  ? I
+  : [I] extends [TCreate]
+    ? I
+    : TCreate
+
+/**
  * An operational aggregate — returned by `Aggregate.make` with full config.
  * Provides `get`, `create`, `update`, and `delete` for full CRUD lifecycle.
  */
@@ -413,6 +429,9 @@ export interface Aggregate<
   TSchema extends Schema.Top,
   TKey extends Record<string, unknown>,
   TInput = unknown,
+  // `any` by default, so a type written with three arguments names every aggregate, whatever
+  // its `create` takes, and code calling `create` through it compiles as before.
+  TCreate = any,
 > {
   readonly [TypeId]: TypeId
   readonly _tag: "Aggregate"
@@ -478,13 +497,16 @@ export interface Aggregate<
   >
 
   /**
-   * Create a new aggregate from input data.
-   * Ref fields accept IDs (e.g., `venueId` instead of `venue: Venue`).
-   * Refs are hydrated automatically via the `refs` config.
-   * Items are written via sub-aggregate transaction groups.
+   * Create a new aggregate from input data, typed as `create` takes it
+   * ({@link AggregateCreateInputType}): the aggregate's key composites and its fields, an edge
+   * whose entity one id names given its id (`venueId` instead of `venue: Venue`) or the entity
+   * whole. Each id is fetched and hydrated. Items are written via sub-aggregate transaction groups.
+   *
+   * An input typed with a string index signature (`Record<string, unknown>`, parsed JSON) is taken
+   * as it is and judged at run time ({@link CreateArgument}).
    */
-  readonly create: (
-    input: Record<string, unknown>,
+  readonly create: <const I = TCreate>(
+    input: CreateArgument<I, TCreate>,
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, DynamoClient | TableConfig>
 
   /**
@@ -581,6 +603,9 @@ export interface BoundAggregate<
   TSchema extends Schema.Top,
   TKey extends Record<string, unknown>,
   TInput = unknown,
+  // `any` by default, so a type written with three arguments names every aggregate, whatever
+  // its `create` takes, and code calling `create` through it compiles as before.
+  TCreate = any,
 > {
   readonly schema: TSchema
 
@@ -592,8 +617,9 @@ export interface BoundAggregate<
     never
   >
 
-  readonly create: (
-    input: Record<string, unknown>,
+  /** {@link Aggregate.create}, with its services resolved. */
+  readonly create: <const I = TCreate>(
+    input: CreateArgument<I, TCreate>,
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateCreateError, never>
 
   readonly update: (
@@ -798,6 +824,13 @@ export function make<
     TPK,
     AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
     SchemaFieldsOf<TSchema>
+  >,
+  AggregateCreateInputType<
+    Schema.Schema.Type<TSchema>,
+    TEdges,
+    TPK,
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
   >
 >
 export function make<
@@ -818,7 +851,7 @@ export function make<
 export function make<TSchema extends Schema.Top>(
   schema: TSchema,
   config: SubAggregateConfig | AggregateConfig<TSchema>,
-): SubAggregate<TSchema> | Aggregate<TSchema, Record<string, unknown>> {
+): SubAggregate<TSchema> | Aggregate<TSchema, Record<string, unknown>, unknown, any> {
   refuseUnreadable(`Aggregate "${config.root.entityType}"`, "aggregate", unwrapModel(schema), {
     manyEdges: manyEdgePaths(config.edges),
   })
@@ -3379,7 +3412,8 @@ const makeAggregate = <TSchema extends Schema.Top>(
 
           // 1. Hydrate refs from edges
           const hydrated = yield* hydrateAggregateRefs(
-            input,
+            // What `create`'s type takes (`CreateArgument`) is judged here, at run time.
+            input as Record<string, unknown>,
             config.edges,
             schemaFields,
             aggregateName,
@@ -3710,7 +3744,10 @@ const makeAggregate = <TSchema extends Schema.Top>(
  * Each aggregate operation as a named operation for consumed-capacity
  * reports (#174); the entity ops and batches it composes nest under it.
  */
-const withOperations = <A extends Aggregate<any, any, any>>(aggregateName: string, ops: A): A => {
+const withOperations = <A extends Aggregate<any, any, any, any>>(
+  aggregateName: string,
+  ops: A,
+): A => {
   const target = { target: aggregateName }
   return {
     ...ops,
@@ -3734,9 +3771,18 @@ const withOperations = <A extends Aggregate<any, any, any>>(aggregateName: strin
  *
  * @internal Used by `DynamoClient.make()` to bind aggregates.
  */
-export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unknown>, TInput>(
-  aggregate: Aggregate<TSchema, TKey, TInput>,
-): Effect.Effect<BoundAggregate<TSchema, TKey, TInput>, never, DynamoClient | TableConfig> =>
+export const bind = <
+  TSchema extends Schema.Top,
+  TKey extends Record<string, unknown>,
+  TInput,
+  TCreate,
+>(
+  aggregate: Aggregate<TSchema, TKey, TInput, TCreate>,
+): Effect.Effect<
+  BoundAggregate<TSchema, TKey, TInput, TCreate>,
+  never,
+  DynamoClient | TableConfig
+> =>
   Effect.gen(function* () {
     // Detached: no current operation or parent span is pinned for later calls (#174).
     const ctx = Capacity.detachContext(yield* Effect.context<DynamoClient | TableConfig>())
@@ -3747,7 +3793,7 @@ export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unk
     return {
       schema: aggregate.schema,
       get: (key: TKey) => provide(aggregate.get(key)),
-      create: (input: Record<string, unknown>) => provide(aggregate.create(input)),
+      create: (input: TCreate) => provide(aggregate.create(input)),
       update: (
         key: TKey,
         mutationFn: (
@@ -3763,7 +3809,7 @@ export const bind = <TSchema extends Schema.Top, TKey extends Record<string, unk
       createSchema: aggregate.createSchema,
       updateSchema: aggregate.updateSchema,
       provide,
-    } as BoundAggregate<TSchema, TKey, TInput>
+    } as BoundAggregate<TSchema, TKey, TInput, TCreate>
   })
 
 // ---------------------------------------------------------------------------

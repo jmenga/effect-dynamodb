@@ -2576,6 +2576,7 @@ describe("Aggregate write path", () => {
           edges: {},
         })
 
+        // @ts-expect-error — the required fields are left out on purpose: create refuses them
         const error = yield* ArticleAggregate.create({
           articleId: "a-1",
           // missing required fields: title, author, tags

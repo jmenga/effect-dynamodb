@@ -71,6 +71,7 @@ export {
   unwrapModel,
 } from "./internal/AggregateSchemas.js"
 export type {
+  AggregateCreateInputType,
   AggregateInputType,
   BoundSubAggregate,
   Input,

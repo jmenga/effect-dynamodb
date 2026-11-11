@@ -398,6 +398,7 @@ describeConnected("an aggregate takes a caller's value as a domain value", () =>
     onTable(Main, (tableName) =>
       Effect.gen(function* () {
         const db = yield* withMaker
+        // @ts-expect-error — nonsense on purpose: create refuses it
         const refused = yield* db.aggregates.Roots.create({ ...input("b"), f: "nonsense" }).pipe(
           Effect.flip,
         )
