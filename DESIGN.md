@@ -7395,6 +7395,14 @@ instance).
     attributes, so on its own rows they keep their roles, as on 1.39.0.
     Projections that share rows and swap an attribute's roles are broken, as
     on 1.39.0, and can't be detected.
+    A checkpoint map stored as a sparse map is compared by its container's
+    name, not by the attributes its entries are stored in, and needs nothing
+    more: every role is a model field (`EDD-9081`), and `Entity.make` refuses a
+    model field stored where a row's reader takes an entry of a sparse map
+    (`EDD-9140`), so no revision, checkpoint or owner can be stored as
+    `<prefix>#<key>` beside it. 1.39.0 loaded a revision renamed `p#rev`
+    beside a checkpoint map with prefix `p`, and stored the map's entry there
+    (`test/EventStore.projection-shared-rows.test.ts`).
     The table's TTL attribute is known only when a projection runs: one a
     projection keeps (by its stored name) while a projection's tombstones set
     it (`removal.ttl`) refuses every projection on the read model with a
