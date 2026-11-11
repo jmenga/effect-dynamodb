@@ -3436,7 +3436,10 @@ resolves it, a record op's as the expression does) and `readersAt`
 (`SchemaAccessors.ts`) walks that field's READ schema through the nodes
 `modelled` models exactly, collecting what decodes the value at the end: the
 node there, one per way through the unions, or each array's element for an
-append. Anything it can't resolve exactly (an `Option`, a transformed or
+append. A `Schema.UndefinedOr` field resolves as a `Schema.optional` one does:
+the read takes its absent attribute as `undefined` through a default of its own,
+which runs only where nothing is stored, so the walk takes the field beneath it
+(`ReadsAbsentAs`). Anything it can't resolve exactly (an `Option`, a transformed or
 checked node above the position, a decoding default, a hidden, packed or
 non-model attribute, an entry keyed `__proto__`, an entry of a sparse map stored
 under a `field:` rename, which a read takes whole from that attribute, a tuple

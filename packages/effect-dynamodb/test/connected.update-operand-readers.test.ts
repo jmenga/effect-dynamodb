@@ -3,7 +3,8 @@
  * shapes #236 reproduced, each alone, in a transaction and on a retained entity: an operand no
  * reader at its position reads is refused and the stored row is the row that was there, where
  * 1.39.0 and 1.40.0 wrote a row that no longer read; an operand only its encoded form is valid for
- * is stored in that form, and the row reads back.
+ * is stored in that form, and the row reads back. A `Schema.UndefinedOr` field is read as a
+ * `Schema.optional` one is: where 1.40.0 sent elements neither of its lists reads, they're refused.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -51,6 +52,14 @@ const definitions = (retained: boolean) => {
       sparse: Schema.Record(Schema.String, Entry),
       lists: Schema.Union([Schema.Array(Schema.Number), Schema.Array(Schema.String)]),
       suspended: Suspended,
+      undefOr: Schema.UndefinedOr(
+        Schema.Union([Schema.Array(Schema.Number), Schema.Array(Schema.String)]),
+      ),
+      inner: Schema.Struct({
+        u: Schema.UndefinedOr(
+          Schema.Union([Schema.Array(Schema.Number), Schema.Array(Schema.String)]),
+        ),
+      }),
     }),
     { sparse: { storedAs: Lib.DynamoModel.SparseMap() } },
   )
@@ -102,6 +111,8 @@ const run = (sending: Sending, apply: (update: any) => any) => {
           sparse: { a: new Entry({ n: 1 }) },
           lists: [1],
           suspended: { n: 1 },
+          undefOr: [1],
+          inner: { u: [1] },
         })
         yield* db.entities.E.put(seed("a")).asEffect()
         yield* db.entities.E.put(seed("b")).asEffect()
@@ -161,6 +172,16 @@ const refused: ReadonlyArray<readonly [what: string, operation: string, apply: (
     "a value a suspended schema refuses",
     "update.pathSet",
     (update) => update.pathSet({ segments: ["suspended", "n"], value: true, isPath: false }),
+  ],
+  [
+    "elements neither list of a Schema.UndefinedOr union reads (append; 1.40.0 sent them)",
+    "update.append",
+    (update) => update.append({ undefOr: [true] }),
+  ],
+  [
+    "elements neither list of a nested Schema.UndefinedOr union reads (pathAppend; 1.40.0 sent them)",
+    "update.pathAppend",
+    (update) => update.pathAppend({ segments: ["inner", "u"], value: [true] }),
   ],
 ]
 

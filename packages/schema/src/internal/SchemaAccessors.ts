@@ -1364,6 +1364,20 @@ const classStruct = (ast: SchemaAST.Declaration): Modelled | undefined => {
 }
 
 /**
+ * The annotation on a field a read takes an absent attribute of as the value that absence stands
+ * for (a `Schema.UndefinedOr`'s `undefined`, `EntitySchemas`' `readingAbsent`): the field as it reads
+ * a stored value. The default the read adds runs only where the attribute is absent, so a value
+ * written there is read as this field alone.
+ */
+export const ReadsAbsentAs: unique symbol = Symbol.for("effect-dynamodb/ReadsAbsentAs")
+
+/** A node as it reads a stored value: under the read's default for an absent attribute, the field. */
+const asStored = (ast: SchemaAST.AST): SchemaAST.AST => {
+  const field = (SchemaAST.resolve(ast) as Record<symbol, unknown> | undefined)?.[ReadsAbsentAs]
+  return typeof field === "object" && field !== null ? (field as SchemaAST.AST) : ast
+}
+
+/**
  * Where a value can be at the end of a path, one entry per way through the schema to it:
  *
  * - `At`: a modelled node, a value of which is there;
@@ -1536,15 +1550,19 @@ export type OperandKind = "value" | "elements"
  *   optional and a rest;
  * - a union's members and a suspension's schema, each as itself.
  *
+ * A field whose absent attribute the read takes as the value it stands for (`Schema.UndefinedOr`)
+ * is the field: that default runs only where nothing is stored ({@link ReadsAbsentAs}).
+ *
  * A way the path can't take (a property of a list or a scalar, a position of a map) adds nothing:
  * DynamoDB refuses the write on such a value.
  */
 const readersBelow = (
-  ast: SchemaAST.AST,
+  declared: SchemaAST.AST,
   segments: ReadonlyArray<string | number>,
   readers: Array<SchemaAST.AST>,
   seen: ReadonlySet<SchemaAST.AST> = new Set(),
 ): boolean => {
+  const ast = asStored(declared)
   const [head, ...rest] = segments
   if (head === undefined) {
     readers.push(ast)
@@ -1590,10 +1608,11 @@ const readersBelow = (
  * record and a scalar add nothing: DynamoDB refuses to add elements to one.
  */
 const elementReaders = (
-  ast: SchemaAST.AST,
+  declared: SchemaAST.AST,
   readers: Array<SchemaAST.AST>,
   seen: ReadonlySet<SchemaAST.AST> = new Set(),
 ): boolean => {
+  const ast = asStored(declared)
   const node = seen.has(ast) ? undefined : modelled(ast)
   if (node === undefined) return false
   if (node._tag === "Union" || node._tag === "Suspend") {

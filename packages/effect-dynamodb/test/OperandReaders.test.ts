@@ -4,8 +4,8 @@
  * one other stored form those readers read back, and refused when there is none, or several.
  *
  * `judgeOperand` first, then the shapes #236 reproduced, each standalone and in a transaction:
- * a sparse map's entry named by its stored name, an append to a union of lists, and a suspended
- * schema. Every other position (an `Option`, a transformed struct, a decoding default, ...) is
+ * a sparse map's entry named by its stored name, an append to a union of lists (under
+ * `Schema.UndefinedOr` too, read as under `Schema.optional`), and a suspended schema. Every other position (an `Option`, a transformed struct, a decoding default, ...) is
  * sent as 1.39.0 sent it: `OperandPositions.test.ts` pins each against the published release.
  */
 
@@ -75,6 +75,7 @@ describe("judgeOperand", () => {
 
 class Entry extends Schema.Class<Entry>("OperandReadersEntry")({ n: Schema.NumberFromString }) {}
 const Suspended: Schema.Top = Schema.suspend(() => Schema.Struct({ n: Schema.NumberFromString }))
+const Lists = Schema.Union([Schema.Array(Schema.Number), Schema.Array(Schema.String)])
 
 const definitions = () => {
   const schema = DynamoSchema.make({ name: "readers", version: 1 })
@@ -84,6 +85,8 @@ const definitions = () => {
       sparse: Schema.Record(Schema.String, Entry),
       lists: Schema.Union([Schema.Array(Schema.Number), Schema.Array(Schema.String)]),
       suspended: Suspended,
+      undefOr: Schema.UndefinedOr(Lists),
+      inner: Schema.Struct({ u: Schema.UndefinedOr(Lists) }),
     }),
     { sparse: { storedAs: DynamoModel.SparseMap() } },
   )
@@ -118,6 +121,8 @@ const run = (
       sparse: { a: new Entry({ n: 1 }) },
       lists: [1],
       suspended: { n: 1 },
+      undefOr: [1],
+      inner: { u: [1] },
     })
     yield* db.entities.E.put(seed("a")).asEffect()
     yield* db.entities.E.put(seed("b")).asEffect()
@@ -222,6 +227,55 @@ describe("an operand at a position the read schema resolves exactly (#236)", () 
             expect(Exit.isSuccess(exit)).toBe(true)
             expect(sentValue(requests)).toContainEqual({ L: [{ N: "2" }] })
             expect(Exit.isSuccess(read)).toBe(true)
+          },
+        ),
+      )
+    })
+
+    // 1.40.0 sent these, and the row no longer read: a `Schema.UndefinedOr` field's read takes an
+    // absent attribute as `undefined`, a default that runs only where nothing is stored, and the
+    // walk to the position stopped at it. It reads a stored value as `Schema.optional`'s does.
+    describe(`a Schema.UndefinedOr field, read as Schema.optional's, ${where}`, () => {
+      for (const [operation, apply, on140] of [
+        [
+          "update.append",
+          (update: any) => update.append({ undefOr: [true] }),
+          "sent, the row unreadable",
+        ],
+        [
+          "update.pathAppend",
+          (update: any) => update.pathAppend({ segments: ["undefOr"], value: [true] }),
+          "sent, the row unreadable",
+        ],
+        [
+          "update.pathPrepend",
+          (update: any) => update.pathPrepend({ segments: ["inner", "u"], value: [true] }),
+          "sent, the row unreadable",
+        ],
+        [
+          "update.pathSet",
+          (update: any) =>
+            update.pathSet({ segments: ["inner", "u", 0], value: true, isPath: false }),
+          "refused by the write schema's walk, as now",
+        ],
+      ] as const) {
+        it.effect(`${operation} refuses what neither list reads (1.40.0: ${on140})`, () =>
+          run(transaction, apply, refusedAs(operation, "Expected")),
+        )
+      }
+      it.effect("sends elements a list reads", () =>
+        run(
+          transaction,
+          (update) =>
+            update.append({ undefOr: [2] }).pathAppend({ segments: ["inner", "u"], value: [3] }),
+          ({ exit, requests, read }) => {
+            expect(Exit.isSuccess(exit)).toBe(true)
+            expect(sentValue(requests)).toContainEqual({ L: [{ N: "2" }] })
+            expect(sentValue(requests)).toContainEqual({ L: [{ N: "3" }] })
+            if (Exit.isSuccess(read)) {
+              expect((read.value as any).undefOr).toEqual([1, 2])
+              expect((read.value as any).inner).toEqual({ u: [1, 3] })
+            } else expect.unreachable()
           },
         ),
       )

@@ -45,6 +45,7 @@ import {
   isSchemaLike,
   lackDecision,
   numericTypeWithStringEncoding,
+  ReadsAbsentAs,
   storedList,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
@@ -1775,11 +1776,14 @@ const absentAsDeclared = (schema: Schema.Top, withUndefined: boolean) => {
 const readingAbsent = (field: Schema.Top, declared: Schema.Top = field): Schema.Top => {
   const reading = absentStored(declared)
   if (reading === undefined) return field
-  return field.pipe(
-    Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
-      self: Schema.Top,
-    ) => Schema.Top,
-  )
+  // A stored value is read as `field` alone (`ReadsAbsentAs`): the default runs where none is.
+  return field
+    .pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed(reading.stored)) as (
+        self: Schema.Top,
+      ) => Schema.Top,
+    )
+    .annotate({ [ReadsAbsentAs]: field.ast })
 }
 
 /** Whether a struct field anywhere in the schema reads an absent attribute as a value. */
