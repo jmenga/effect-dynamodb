@@ -887,12 +887,13 @@ export interface Entity<
    */
   readonly _sparseMapOf: (attribute: string) => string | undefined
 
+  /** @internal The attribute entry `key` of sparse map `field` is stored under (`<prefix>#<key>`, #238). */
+  readonly _sparseEntryAttribute: (field: string, key: string) => string
   /**
-   * @internal The stored paths a row may hold entry `key` of sparse map `field` under (#238): the
-   * entry's own attribute (`<prefix>#<key>`), and below the attribute a `field:` rename stores the
-   * map under whole. A projection of them gives a read what it rebuilds the entry from.
+   * @internal The attribute a `field:` rename stores sparse map `field` under whole, as `put`
+   * stores it, if it's renamed (#238): a read takes it in place of the entries when a row holds it.
    */
-  readonly _sparseEntryPaths: (field: string, key: string) => ReadonlyArray<ReadonlyArray<string>>
+  readonly _sparseWholeAttribute: (field: string) => string | undefined
 
   /**
    * @internal A condition or filter (domain-named) whose conditions on an entry of a sparse map a
@@ -2712,14 +2713,9 @@ const makeImpl = <
       ? undefined
       : { field: entry.field, key: entry.key, rest: segments.slice(1) }
   }
-  /** The stored paths a row may hold entry `key` of sparse map `field` under (`_sparseEntryPaths`). */
-  const sparseEntryPaths = (field: string, key: string): ReadonlyArray<ReadonlyArray<string>> => {
-    const whole = renamedMapAttribute(field)
-    return [
-      [`${sparseFields[field]!.prefix}#${key}`],
-      ...(whole === undefined ? [] : [[whole, key]]),
-    ]
-  }
+  /** The attribute entry `key` of sparse map `field` is stored under (`_sparseEntryAttribute`). */
+  const sparseEntryAttribute = (field: string, key: string): string =>
+    `${sparseFields[field]!.prefix}#${key}`
   /**
    * A condition or filter whose conditions on an entry of a sparse map a `field:` rename stores
    * whole ask the row where it holds the map (#238): inside the map's attribute when the row holds
@@ -18993,7 +18989,8 @@ const makeImpl = <
     _sparseFieldNames: Object.keys(sparseFields),
     _toDomainView: toDomainView,
     _sparseMapOf: sparseMapOf,
-    _sparseEntryPaths: sparseEntryPaths,
+    _sparseEntryAttribute: sparseEntryAttribute,
+    _sparseWholeAttribute: renamedMapAttribute,
     _entryForms: entryForms,
     _storedBelow: storedBelow,
     /** @internal Entity schema version baked into composed keys. */

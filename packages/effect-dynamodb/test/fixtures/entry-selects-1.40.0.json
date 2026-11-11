@@ -1,0 +1,7335 @@
+{
+ "generatedFrom": "effect-dynamodb@1.40.0",
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Entity Doc over { id, group, lists, rl: Record<string, number[]>, whole: Record<string, number> }, lists configured { storedAs: SparseMap({ prefix: 'l' }) }, rl { storedAs: SparseMap({ prefix: 'r' }), field: 'rw' }, whole { storedAs: SparseMap({ prefix: 'w' }), field: 'wh' }; entity Peer over { id, group, lists }, lists { storedAs: SparseMap({ prefix: 'p' }) }; both with a byGroup index in collection 'group', on DynamoSchema.make({ name: 'es', version: 1 }). Rows: w, put with every list { a: [10, 20, 30] } and whole { k: 1 }; e, the renamed maps as entries (put, then a raw SET r#a, w#k REMOVE rw, wh); x, the renamed maps whole and empty beside entries r#a = [1, 2, 3], w#k = 5; y, rl { a: [7, 8, 9] } and whole { k: 1 } beside r#a = [1, 2, 3], w#k = 5, w#j = 2; Peer p with lists { a: [10, 20, 30] }. Each case sends one select through Docs.byGroup or the collection. Recorded: its outcome (a result, or a failure's tag and the first line of its message), every request it sent, whole and in order, every row of the table after it, and what an unselected byGroup read gave. The table's name is replaced by <table>, UUIDs by <token> and timestamps by <time>. Never regenerate it: it is the record of what 1.40.0 did.",
+ "cases": {
+  "a query: select lists.a.at(2)": {
+   "outcome": {
+    "ok": [
+     {},
+     {},
+     {},
+     {}
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1[2]",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "lists",
+       "#proj1": "a"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select lists.a.at(2)": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {},
+      {},
+      {}
+     ],
+     "Peers": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0.#proj1[2], #proj2",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "lists",
+       "#proj1": "a",
+       "#proj2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Peer"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select lists.a.at(0), lists.a.at(2)": {
+   "outcome": {
+    "ok": [
+     {},
+     {},
+     {},
+     {}
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1[0], #proj2.#proj3[2]",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "lists",
+       "#proj1": "a",
+       "#proj2": "lists",
+       "#proj3": "a"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select lists.a.at(0), lists.a.at(2)": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {},
+      {},
+      {}
+     ],
+     "Peers": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0.#proj1[0], #proj2.#proj3[2], #proj4",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "lists",
+       "#proj1": "a",
+       "#proj2": "lists",
+       "#proj3": "a",
+       "#proj4": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Peer"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select rl.a.at(2)": {
+   "outcome": {
+    "ok": [
+     {},
+     {
+      "rl": {
+       "a": [
+        30
+       ]
+      }
+     },
+     {},
+     {
+      "rl": {
+       "a": [
+        9
+       ]
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1[2]",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "rw",
+       "#proj1": "a"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select rl.a.at(2)": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {
+       "rl": {
+        "a": [
+         30
+        ]
+       }
+      },
+      {},
+      {
+       "rl": {
+        "a": [
+         9
+        ]
+       }
+      }
+     ],
+     "Peers": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0.#proj1[2], #proj2",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "rw",
+       "#proj1": "a",
+       "#proj2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Peer"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select rl.a.at(0), rl.a.at(2)": {
+   "outcome": {
+    "ok": [
+     {},
+     {
+      "rl": {
+       "a": [
+        10,
+        30
+       ]
+      }
+     },
+     {},
+     {
+      "rl": {
+       "a": [
+        7,
+        9
+       ]
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1[0], #proj2.#proj3[2]",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "rw",
+       "#proj1": "a",
+       "#proj2": "rw",
+       "#proj3": "a"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select rl.a.at(0), rl.a.at(2)": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {
+       "rl": {
+        "a": [
+         10,
+         30
+        ]
+       }
+      },
+      {},
+      {
+       "rl": {
+        "a": [
+         7,
+         9
+        ]
+       }
+      }
+     ],
+     "Peers": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0.#proj1[0], #proj2.#proj3[2], #proj4",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "rw",
+       "#proj1": "a",
+       "#proj2": "rw",
+       "#proj3": "a",
+       "#proj4": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Peer"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select rl.a": {
+   "outcome": {
+    "ok": [
+     {},
+     {
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      }
+     },
+     {},
+     {
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "rw",
+       "#proj1": "a"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select rl.a": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {
+       "rl": {
+        "a": [
+         10,
+         20,
+         30
+        ]
+       }
+      },
+      {},
+      {
+       "rl": {
+        "a": [
+         7,
+         8,
+         9
+        ]
+       }
+      }
+     ],
+     "Peers": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0.#proj1, #proj2",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "rw",
+       "#proj1": "a",
+       "#proj2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Peer"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select whole.k": {
+   "outcome": {
+    "ok": [
+     {},
+     {
+      "whole": {
+       "k": 1
+      }
+     },
+     {},
+     {
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "wh",
+       "#proj1": "k"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select whole.k": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {
+       "whole": {
+        "k": 1
+       }
+      },
+      {},
+      {
+       "whole": {
+        "k": 1
+       }
+      }
+     ],
+     "Peers": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0.#proj1, #proj2",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "wh",
+       "#proj1": "k",
+       "#proj2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Peer"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select whole.k, whole.j": {
+   "outcome": {
+    "ok": [
+     {},
+     {
+      "whole": {
+       "k": 1
+      }
+     },
+     {},
+     {
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0)",
+      "ProjectionExpression": "#proj0.#proj1, #proj2.#proj3",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "wh",
+       "#proj1": "k",
+       "#proj2": "wh",
+       "#proj3": "j"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select whole.k, whole.j": {
+   "outcome": {
+    "ok": {
+     "Docs": [
+      {},
+      {
+       "whole": {
+        "k": 1
+       }
+      },
+      {},
+      {
+       "whole": {
+        "k": 1
+       }
+      }
+     ],
+     "Peers": [
+      {}
+     ]
+    }
+   },
+   "sent": [
+    {
+     "query": {
+      "TableName": "<table>",
+      "IndexName": "gsi1",
+      "KeyConditionExpression": "#pk = :pk",
+      "FilterExpression": "#eddE IN (:et0, :et1)",
+      "ProjectionExpression": "#proj0.#proj1, #proj2.#proj3, #proj4",
+      "ExpressionAttributeNames": {
+       "#eddE": "__edd_e__",
+       "#pk": "gsi1pk",
+       "#proj0": "wh",
+       "#proj1": "k",
+       "#proj2": "wh",
+       "#proj3": "j",
+       "#proj4": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Peer"
+       },
+       ":pk": {
+        "S": "$es#v1#group#group_g"
+       }
+      },
+      "ScanIndexForward": true
+     }
+    }
+   ],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select whole.entry('k')": {
+   "outcome": {
+    "die": "Error",
+    "says": "PathBuilder.entry: field \"whole\" is not configured as a sparse map"
+   },
+   "sent": [],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select whole.entry('k')": {
+   "outcome": {
+    "die": "Error",
+    "says": "PathBuilder.entry: field \"whole\" is not configured as a sparse map"
+   },
+   "sent": [],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a query: select rl.entry('a')": {
+   "outcome": {
+    "die": "Error",
+    "says": "PathBuilder.entry: field \"rl\" is not configured as a sparse map"
+   },
+   "sent": [],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  },
+  "a collection: select rl.entry('a')": {
+   "outcome": {
+    "die": "Error",
+    "says": "PathBuilder.entry: field \"rl\" is not configured as a sparse map"
+   },
+   "sent": [],
+   "rows": [
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_e"
+     },
+     "id": {
+      "S": "e"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_e"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "1"
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_w"
+     },
+     "id": {
+      "S": "w"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_w"
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "10"
+         },
+         {
+          "N": "20"
+         },
+         {
+          "N": "30"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_x"
+     },
+     "id": {
+      "S": "x"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_x"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {}
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {}
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Doc"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#doc_1#id_y"
+     },
+     "id": {
+      "S": "y"
+     },
+     "l#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#doc#id_y"
+     },
+     "r#a": {
+      "L": [
+       {
+        "N": "1"
+       },
+       {
+        "N": "2"
+       },
+       {
+        "N": "3"
+       }
+      ]
+     },
+     "rw": {
+      "M": {
+       "a": {
+        "L": [
+         {
+          "N": "7"
+         },
+         {
+          "N": "8"
+         },
+         {
+          "N": "9"
+         }
+        ]
+       }
+      }
+     },
+     "sk": {
+      "S": "$es#v1#doc"
+     },
+     "w#j": {
+      "N": "2"
+     },
+     "w#k": {
+      "N": "5"
+     },
+     "wh": {
+      "M": {
+       "k": {
+        "N": "1"
+       }
+      }
+     }
+    },
+    {
+     "__edd_e__": {
+      "S": "Peer"
+     },
+     "group": {
+      "S": "g"
+     },
+     "gsi1pk": {
+      "S": "$es#v1#group#group_g"
+     },
+     "gsi1sk": {
+      "S": "$es#v1#peer_1#id_p"
+     },
+     "id": {
+      "S": "p"
+     },
+     "p#a": {
+      "L": [
+       {
+        "N": "10"
+       },
+       {
+        "N": "20"
+       },
+       {
+        "N": "30"
+       }
+      ]
+     },
+     "pk": {
+      "S": "$es#v1#peer#id_p"
+     },
+     "sk": {
+      "S": "$es#v1#peer"
+     }
+    }
+   ],
+   "read": {
+    "ok": [
+     {
+      "id": "e",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "w",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     },
+     {
+      "id": "x",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {},
+      "whole": {}
+     },
+     {
+      "id": "y",
+      "group": "g",
+      "lists": {
+       "a": [
+        10,
+        20,
+        30
+       ]
+      },
+      "rl": {
+       "a": [
+        7,
+        8,
+        9
+       ]
+      },
+      "whole": {
+       "k": 1
+      }
+     }
+    ]
+   }
+  }
+ }
+}

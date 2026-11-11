@@ -16,6 +16,7 @@ import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { entryInQueriesSuite } from "./helpers/EntryInQueries.js"
+import { entrySelectsSuite } from "./helpers/EntrySelects.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import { openRecordingTable } from "./helpers/Kept139.js"
 import { nestedKeyCollectionSuite, nestedKeyEncodingsSuite } from "./helpers/NestedKeyEncodings.js"
@@ -103,6 +104,10 @@ describe("a copy from an entry of a sparse map a field: rename stores whole", ()
 
 describe("an update of a sparse map a field: rename stores whole: whose verdict a refusal gives", () => {
   renamedSparseMapVerdictsSuite(openRecordingTable)
+})
+
+describe("a select of a sparse map's entry", () => {
+  entrySelectsSuite(openRecordingTable)
 })
 
 describe("a path below a struct that renames its keys as they're stored", () => {
