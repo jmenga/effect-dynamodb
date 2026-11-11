@@ -34,6 +34,7 @@ import {
   ConditionalCheckFailed,
   DeleteAppliedButUnreadable,
   DynamoError,
+  DynamoValidationError,
   EmbeddingError,
   ItemNotDeleted,
   ItemNotFound,
@@ -2441,6 +2442,40 @@ const makeImpl = <
     const encoded = pathValues.elements(segments, value)
     return { encoded, issue: pathValues.validateElements(segments, encoded) }
   }
+  /**
+   * DynamoDB's refusal of an update expression reading an attribute (`#f - :v`,
+   * `list_append(#f, :v)`, `ADD`, `DELETE`) on a row without it, or holding a value of a kind the
+   * expression doesn't take (`fits`): what a retained entity's update, which applies the record operation
+   * to the row it read, answers where the same operation sent as an expression would be
+   * refused. In DynamoDB's own words, as the `TransactWriteItems` the update sends would be.
+   * `undefined` when the expression applies. A `bigint` is left to the operation as it was.
+   */
+  const expressionRefusal = (before: unknown, fits: boolean): DynamoValidationError | undefined =>
+    fits || typeof before === "bigint"
+      ? undefined
+      : new DynamoValidationError({
+          operation: "TransactWriteItems",
+          cause: Object.assign(
+            new Error(
+              before === undefined
+                ? "The provided expression refers to an attribute that does not exist in the item"
+                : "An operand in the update expression has an incorrect data type",
+            ),
+            { name: "ValidationException" },
+          ),
+        })
+
+  /** Whether `before` is a set of the same kind (string, number, binary) as the set `operand`. */
+  const sameSetKind = (before: unknown, operand: unknown): boolean => {
+    if (!(before instanceof Set) || !(operand instanceof Set)) return false
+    const kind = (set: ReadonlySet<unknown>): string | undefined => {
+      const [first] = set
+      return first === undefined ? undefined : first instanceof Uint8Array ? "binary" : typeof first
+    }
+    const [was, now] = [kind(before), kind(operand)]
+    return was === undefined || now === undefined || was === now
+  }
+
   /**
    * A `pathSet` or `pathSubtract` that names another attribute in place of a value: it has no
    * operand of its own. The other path operations always write their `value`, whatever else the
@@ -8030,9 +8065,16 @@ const makeImpl = <
         if (uState.add) {
           for (const [attr, val] of Object.entries(uState.add)) {
             // DynamoDB's ADD: a number adds, a set unions, and a row without the attribute
-            // starts from nothing.
+            // starts from nothing. A value of another kind is refused, as `ADD` is (#236).
             const [holder, key] = slot(attr)
             const before = held(holder, key)
+            const refused = expressionRefusal(
+              before,
+              before === undefined ||
+                typeof val === "bigint" ||
+                (typeof val === "number" ? typeof before === "number" : sameSetKind(before, val)),
+            )
+            if (refused !== undefined) return yield* refused
             hold(
               holder,
               key,
@@ -8042,23 +8084,45 @@ const makeImpl = <
             )
           }
         }
+        // `.subtract()` and `.append()` are `SET #f = #f - :v` and `SET #f = list_append(#f, :v)`
+        // when sent: DynamoDB refuses either on a value of another kind, and writes nothing.
+        // Applied here, they're refused the same way, so a retained entity's update ends as any
+        // other entity's (#236). It used to append to a string its characters.
         if (uState.subtract) {
           for (const [attr, val] of Object.entries(uState.subtract)) {
             const [holder, key] = slot(attr)
-            hold(holder, key, ((held(holder, key) as number) ?? 0) - val)
+            const before = held(holder, key)
+            const refused = expressionRefusal(
+              before,
+              before === undefined || typeof before === "number",
+            )
+            if (refused !== undefined) return yield* refused
+            hold(holder, key, ((before as number | undefined) ?? 0) - val)
           }
         }
         if (uState.append) {
           for (const attr of Object.keys(uState.append)) {
             const [holder, key] = slot(attr)
-            const existing = (held(holder, key) as Array<unknown>) ?? []
-            hold(holder, key, [...existing, ...(operands.append[attr] as ReadonlyArray<unknown>)])
+            const before = held(holder, key)
+            const refused = expressionRefusal(before, before === undefined || Array.isArray(before))
+            if (refused !== undefined) return yield* refused
+            hold(holder, key, [
+              ...((before as Array<unknown> | undefined) ?? []),
+              ...(operands.append[attr] as ReadonlyArray<unknown>),
+            ])
           }
         }
         if (uState.deleteFromSet) {
           for (const [attr, val] of Object.entries(uState.deleteFromSet)) {
             const [holder, key] = slot(attr)
             const before = held(holder, key)
+            // DynamoDB's DELETE: nothing on a row without the attribute, and refused on a value
+            // that isn't a set of the operand's kind (#236).
+            const refused = expressionRefusal(
+              before,
+              before === undefined || sameSetKind(before, val),
+            )
+            if (refused !== undefined) return yield* refused
             if (before instanceof Set && val instanceof Set) {
               const current = new Set(before as Set<unknown>)
               for (const elem of val as Set<unknown>) {

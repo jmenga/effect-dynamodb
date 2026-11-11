@@ -3424,6 +3424,13 @@ bump, timestamps, GSI recomposition, `expectedVersion`, user condition) as the
 `Update` in one `TransactWriteItems` with the snapshot `Put`, conditioned on
 the version read. DynamoDB therefore applies the path semantics itself — parity
 by construction, never emulated — and a rejected expression writes no snapshot.
+The record operations (`.subtract()`, `.append()`, `.add()`, `.deleteFromSet()`)
+are applied to the row read, as DynamoDB applies their expressions: where it
+refuses one (any of them on a value of another kind: a string, a set of the
+other kind, `NULL`), the update fails with `DynamoValidationError` (`operation`
+`TransactWriteItems`, DynamoDB's own words) and writes nothing
+(`expressionRefusal`, #236). It used to append a string's characters (a row that
+no longer read), add a number to a string, and die on `NaN`.
 Path operations combined with a unique-constraint change, or with a computed
 change to an index composite, are rejected with a `ValidationError`: both are
 read-then-write updates that cannot carry path expressions. Record retain
