@@ -81,10 +81,10 @@ export type UpdateFn<T> = T extends { readonly schema: infer S extends Schema.To
 /**
  * Resolve the `${field}Id` value type for a OneEdge / RefEdge / ManyEdge.
  *
- * Extracts the referenced entity from the edge and resolves its branded
- * primary-key identifier via `RefEntityIdentifierValue`. Edges without an
- * associated entity (e.g. a `OneEdge` whose member is a pure sub-shape) fall
- * back to `string`.
+ * Extracts the referenced entity from the edge and resolves the type of its
+ * primary key's one composite ({@link _EdgeIdValue}), branded or not. Edges
+ * without an associated entity (e.g. a `OneEdge` whose member is a pure
+ * sub-shape) fall back to `string`.
  *
  * `entity` is required on RefEdge but optional on OneEdge / ManyEdge
  * (`entity?: E | undefined`), so we read it via indexed access and strip
@@ -97,43 +97,137 @@ type _HasEntity<Edge> =
     ? false
     : true
 
+/** The entity an edge names. */
+type _EdgeEntity<Edge> = NonNullable<
+  Edge extends { readonly entity?: unknown } ? Edge["entity"] : undefined
+>
+
+/** The attributes an entity's primary key is composed from, its partition key's and its sort key's. */
+type _KeyComposites<I> =
+  | (I extends {
+      readonly primary: {
+        readonly pk: { readonly composite: infer P extends ReadonlyArray<string> }
+      }
+    }
+      ? P[number]
+      : never)
+  | (I extends {
+      readonly primary: {
+        readonly sk: { readonly composite: infer S extends ReadonlyArray<string> }
+      }
+    }
+      ? S[number]
+      : never)
+
+type _IsUnion<T, U = T> = T extends unknown ? ([U] extends [T] ? false : true) : never
+
+/**
+ * The one attribute an id of entity `E` is a value of, as the runtime finds it (`refKeyComposite`):
+ * its primary key's only distinct composite. `never` for a key composed from more than one attribute,
+ * or none, where no one id names one item; `string` when its composites aren't known.
+ */
+type _KeyComposite<E> = E extends { readonly indexes: infer I }
+  ? [_KeyComposites<I>] extends [never]
+    ? never
+    : string extends _KeyComposites<I>
+      ? string
+      : true extends _IsUnion<_KeyComposites<I>>
+        ? never
+        : _KeyComposites<I>
+  : string
+
+/** Whether an edge's entity is fetched by one id: it has an entity, keyed by one attribute. */
+type _Fetchable<Edge> =
+  _HasEntity<Edge> extends true
+    ? [_KeyComposite<_EdgeEntity<Edge>>] extends [never]
+      ? false
+      : true
+    : false
+
 /** An edge whose input is an id `create` fetches: a `ref`, or a `one` with an entity. */
-type _IsIdEdge<Edge> =
-  Edge extends RefEdge<any> ? true : Edge extends OneEdge<any> ? _HasEntity<Edge> : false
+type _IsIdEdge<Edge> = Edge extends RefEdge<any> | OneEdge<any> ? _Fetchable<Edge> : false
 
-/** A `one` edge with no entity: there's nothing to fetch, so its input is the value itself. */
-type _IsValueEdge<Edge> =
-  Edge extends OneEdge<any> ? (_HasEntity<Edge> extends true ? false : true) : false
+/**
+ * A `one` edge with no entity, or a `ref` or `one` edge whose entity no one id names: there's
+ * nothing to fetch, so its input is the value itself.
+ */
+type _IsValueEdge<Edge> = Edge extends RefEdge<any> | OneEdge<any>
+  ? _Fetchable<Edge> extends true
+    ? false
+    : true
+  : false
 
+/**
+ * The value an id of an edge's entity is: its key composite's type (`refIdInput`), whatever its
+ * `DynamoModel.identifier` names, `number` and `bigint` included.
+ */
 type _EdgeIdValue<Edge> =
-  NonNullable<
-    Edge extends { readonly entity?: unknown } ? Edge["entity"] : undefined
-  > extends infer E
+  _EdgeEntity<Edge> extends infer E
+    ? E extends { readonly model: infer M extends Schema.Top }
+      ? _KeyComposite<E> extends infer C extends string
+        ? string extends C
+          ? string
+          : Schema.Schema.Type<M>[C & keyof Schema.Schema.Type<M>]
+        : string
+      : string
+    : string
+
+/**
+ * A many edge's input: for an entity one id names, its elements as `create` takes them
+ * ({@link _TransformManyEdge}), decided from the edge's field schema (`FS`); otherwise (no entity,
+ * or one no one id names) the elements as given, as `create` takes them.
+ */
+type _ManyEdgeInput<T, Edge, TStamps, FS> =
+  _Fetchable<Edge> extends true
+    ? _TransformManyEdge<
+        T,
+        TStamps,
+        _ElementSchema<FS>,
+        _EdgeModelSchema<Edge>,
+        _EdgeIdValue<Edge>,
+        _EdgeIdValue139<Edge>,
+        _EntityFieldName<_EdgeEntity<Edge>>
+      >
+    : _TransformManyEdge<T, TStamps, never, never, never, never, never>
+
+/**
+ * An id as 1.39.0 typed it: the entity's partition key composite's type. Taken where an element is
+ * typed as on 1.39.0: wherever `create` takes an id of the entity's key composite only as 1.39.0
+ * did, a string ({@link _TransformManyEdge}).
+ */
+type _EdgeIdValue139<Edge> =
+  _EdgeEntity<Edge> extends infer E
     ? E extends RefEntity
       ? RefEntityIdentifierValue<E>
       : string
     : string
 
+/** The schema of an edge's entity's model, as the entity declares it. */
+type _EdgeModelSchema<Edge> = _EdgeEntity<Edge> extends { readonly model: infer M } ? M : never
+
 /**
  * Compute the aggregate input type from the domain model, edges, and PK composites.
  *
- * - RefEdge, and OneEdge with an entity, fields → `${field}Id: <entity branded id>`
- * - OneEdge without one → the value, under its field name (`create` has nothing to fetch)
+ * - RefEdge, and OneEdge with an entity, fields → `${field}Id: <entity key composite>`
+ * - OneEdge without one, or with an entity no one id names → the value, under its field name
+ *   (`create` has nothing to fetch)
  * - BoundSubAggregate fields → recursed
  * - ManyEdge fields → array elements recursed for ref replacement
  * - PK composites → omitted
  * - A date `timestamps` stamps (`TStamps`, at any level) → optional, as on an entity
  * - Everything else → kept as-is
  *
- * Edge id fields resolve to the referenced entity's branded primary-key
- * identifier type (e.g. `venueId: VenueId`) when the edge carries an `entity`,
- * mirroring the standalone Entity ref path (`EntityRefInputType`).
+ * Edge id fields resolve to the type of the referenced entity's primary key's
+ * one composite (e.g. `venueId: VenueId`, `lineId: number`) when the edge
+ * carries an `entity` that one id names; an `entity` keyed by more than one
+ * attribute, or none, is given whole, as `create` takes it.
  */
 export type AggregateInputType<
   TModel,
   TEdges extends Record<string, AggregateEdge | BoundSubAggregate<any, any>>,
   TPK extends ReadonlyArray<string>,
   TStamps = never,
+  TFields = never,
 > = _Simplify<
   // Regular fields: not an edge, not a PK composite
   {
@@ -190,7 +284,7 @@ export type AggregateInputType<
         ? never
         : K
       : never]: TEdges[K] extends BoundSubAggregate<infer S, infer E>
-      ? AggregateInputType<Schema.Schema.Type<S>, E, [], TStamps>
+      ? AggregateInputType<Schema.Schema.Type<S>, E, [], TStamps, SchemaFieldsOf<S>>
       : never
   } & {
     // Optional BoundSubAggregate fields → recurse
@@ -199,7 +293,7 @@ export type AggregateInputType<
         ? K
         : never
       : never]?: TEdges[K] extends BoundSubAggregate<infer S, infer E>
-      ? AggregateInputType<Schema.Schema.Type<S>, E, [], TStamps>
+      ? AggregateInputType<Schema.Schema.Type<S>, E, [], TStamps, SchemaFieldsOf<S>>
       : never
   } & {
     // Required ManyEdge fields → transform array elements
@@ -211,7 +305,7 @@ export type AggregateInputType<
           ? IF
           : K
       : never]: K extends keyof TModel
-      ? _TransformManyEdge<TModel[K], _EdgeIdValue<TEdges[K]>, TStamps>
+      ? _ManyEdgeInput<TModel[K], TEdges[K], TStamps, _FieldOf<TFields, K>>
       : never
   } & {
     // Optional ManyEdge fields → transform array elements
@@ -222,7 +316,7 @@ export type AggregateInputType<
           : K
         : never
       : never]?: K extends keyof TModel
-      ? _TransformManyEdge<TModel[K], _EdgeIdValue<TEdges[K]>, TStamps>
+      ? _ManyEdgeInput<TModel[K], TEdges[K], TStamps, _FieldOf<TFields, K>>
       : never
   }
 >
@@ -242,6 +336,175 @@ type _NotCallersOwn<TModel, TNames> = TNames extends keyof TModel
     : never
   : TNames
 
+/**
+ * The field of a `many` element `create` takes an edge's entity in (`deriveEntityFieldName`): the
+ * entity model's identifier, or its `entityType`, first letter lowercased. The type sees it only for
+ * a `Schema.Struct` model, alone or in a `DynamoModel.configure` wrapper, and an `entityType` that
+ * is one string literal: `create` takes the `entityType` for both. Otherwise it's `never`, and the
+ * element is typed as on 1.39.0 ({@link _TransformManyEdge}):
+ * - a model with an identifier (a `Schema.Class`, a brand), which the type sees only as `string`:
+ *   `create` takes it, or the `entityType` when the model is in a `DynamoModel.configure` wrapper,
+ *   and the type can't tell the two apart;
+ * - an `entityType` that isn't one string literal (`string`, a union, a pattern);
+ * - any other model.
+ */
+type _EntityFieldName<E> = E extends {
+  readonly entityType: infer T extends string
+  readonly model: infer M
+}
+  ? M extends { readonly identifier: string }
+    ? never
+    : M extends Schema.Struct<Schema.Struct.Fields>
+      ? _IsOneLiteral<T> extends true
+        ? Uncapitalize<T>
+        : never
+      : never
+  : never
+
+/** Whether `S` is one string literal: not `string`, a union of literals, or a pattern. */
+type _IsOneLiteral<S extends string> = string extends S
+  ? false
+  : true extends _IsUnion<S>
+    ? false
+    : {} extends Record<S, 1>
+      ? false
+      : true
+
+/**
+ * @internal The field schemas of a schema that declares them (a `Schema.Struct`, a `Schema.Class`):
+ * `never` otherwise.
+ */
+export type SchemaFieldsOf<S> = S extends { readonly fields: infer F } ? F : never
+
+/** Field `K`'s schema of `TFields`, `never` when it has none. */
+type _FieldOf<TFields, K> = [TFields] extends [never]
+  ? never
+  : K extends keyof TFields
+    ? TFields[K]
+    : never
+
+type _IsAny<T> = 0 extends 1 & T ? true : false
+
+/**
+ * A field's own schema, its `Schema.optional` / `Schema.optionalKey` taken off, as `optionalField`
+ * takes them off at run time.
+ */
+type _UnwrapOptional<S> =
+  _IsAny<S> extends true
+    ? never
+    : S extends Schema.optionalKey<infer I>
+      ? I extends Schema.Union<readonly [infer X extends Schema.Top, Schema.Undefined]>
+        ? X
+        : I
+      : S
+
+/** The element schema of a `many` edge's field schema (`extractArrayElement`): `never` without one. */
+type _ElementSchema<FS> =
+  _UnwrapOptional<FS> extends infer A
+    ? A extends Schema.$Array<infer ES>
+      ? ES
+      : A extends Schema.NonEmptyArray<infer ES>
+        ? ES
+        : never
+    : never
+
+/** Whether `A` and `B` are one schema type. */
+type _SameSchema<A, B> = [A] extends [never]
+  ? false
+  : [B] extends [never]
+    ? false
+    : _IsAny<A> extends true
+      ? false
+      : [A] extends [B]
+        ? [B] extends [A]
+          ? true
+          : false
+        : false
+
+/**
+ * Whether a `many` element's schema (`ES`) is the entity itself (`isEntityElement`): a schema with
+ * fields of its own, of the entity's model's schema type (`MS`).
+ */
+type _IsEntityElement<ES, MS> = [ES] extends [never]
+  ? false
+  : [ES] extends [{ readonly fields: unknown }]
+    ? _SameSchema<ES, MS>
+    : false
+
+/**
+ * Whether a `many` element's schema (`ES`) names the field holding the entity, as `create` judges
+ * it (`entityFieldOf`): a schema with fields of its own (a `Schema.Struct`, a `Schema.Class`; not a
+ * union, a transformation or a declaration), whose field of the entity's name (`N`,
+ * {@link _EntityFieldName}) is of the entity's model's schema type (`MS`), under
+ * `Schema.optional` / `Schema.optionalKey` at most, and which doesn't declare `${N}Id` itself. The
+ * schema type is read, not the domain type, so a union whose members have one domain type is still
+ * a union.
+ */
+type _NamesEntityField<ES, MS, N extends string> = [N] extends [never]
+  ? false
+  : [ES] extends [never]
+    ? false
+    : [ES] extends [{ readonly fields: infer F }]
+      ? N extends keyof F
+        ? `${N}Id` extends keyof F
+          ? false
+          : _SameSchema<_UnwrapOptional<F[N]>, MS>
+        : false
+      : false
+
+/**
+ * An element whose definition names the field holding the entity, given by id: `${N}Id: Id` in
+ * place of field `N`, optional when it is.
+ */
+type _ElementById<E, Id, N extends string> = _Simplify<{
+  readonly [K in keyof E as K extends N ? `${N}Id` : K]: K extends N
+    ? Id | (undefined extends E[K] ? undefined : never)
+    : E[K]
+}>
+
+/** An element given whole, `${N}Id` beside it optional: neither refuses the other. */
+type _ElementWhole<E, Id, N extends string> = _Simplify<
+  E & { readonly [P in `${N}Id`]?: Id | undefined }
+>
+
+/**
+ * A many element as its input takes it beside 1.39.0's form ({@link _Element139}), for an edge
+ * whose entity (model schema `MS`) one id of type `Id` names, decided from the element's schema
+ * (`ES`):
+ * - an element that is the entity (`Array<Umpire>`, {@link _IsEntityElement}): its id, or the
+ *   entity whole;
+ * - an element naming the field holding the entity ({@link _NamesEntityField}): the element whole,
+ *   `${field}Id` beside it or not, or with `${field}Id: Id` in place of that field. Neither refuses
+ *   the other's key: given both, `create` keeps the entity given whole, and fetches a string id as
+ *   1.39.0 did.
+ * - any other element: 1.39.0's form alone.
+ */
+type _ElementInput<E, TStamps, ES, MS, Id, N extends string> =
+  _IsEntityElement<ES, MS> extends true
+    ? Id | _OptionalStamps<E, TStamps>
+    : _NamesEntityField<ES, MS, N> extends true
+      ?
+          | _OptionalStamps<_ElementWhole<E, Id, N>, TStamps>
+          | _OptionalStamps<_ElementById<E, Id, N>, TStamps>
+      : never
+
+/**
+ * A many edge's elements as its input takes them: every element 1.39.0's input took
+ * ({@link _Element139}, with `Id139`), and, for an edge whose entity one id names, the forms
+ * `create` takes an id of its key composite in ({@link _ElementInput}). Only added to 1.39.0's.
+ * With no entity to fetch (`MS = never`), the elements are taken as given.
+ */
+type _TransformManyEdge<T, TStamps, ES, MS, Id, Id139, N extends string> =
+  T extends ReadonlyArray<infer E>
+    ? [MS] extends [never]
+      ? ReadonlyArray<_OptionalStamps<E, TStamps>>
+      : ReadonlyArray<_ElementInput<E, TStamps, ES, MS, Id, N> | _Element139<E, Id139, TStamps>>
+    : T extends Readonly<Record<string, infer V>>
+      ? string extends keyof T
+        ? { readonly [key: string]: _OptionalStamps<V, TStamps> }
+        : T
+      : T
+
 /** Detect ref-like types: objects with an `id: string` property (Schema.Class entities) */
 type _IsRefLike<T> = T extends { readonly id: string }
   ? string extends keyof T
@@ -250,15 +513,10 @@ type _IsRefLike<T> = T extends { readonly id: string }
   : false
 
 /**
- * Transform an object's ref-like fields to `${field}Id: <Id>`.
- *
- * `Id` is the edge entity's branded identifier type — the ManyEdge associates a
- * single entity, and the runtime decomposition (`deriveEntityFieldName`) maps
- * the element's entity-derived ref field to exactly that entity, so the brand
- * is shared by the element's nested ref field. Falls back to `string` when the
- * edge carries no entity (`Id = string`).
+ * An element's ref-like fields ({@link _IsRefLike}) taken as `${field}Id: Id`, as 1.39.0 took them
+ * (`_RefFieldsToIds` there): whatever their name, and not when the field is optional.
  */
-type _RefFieldsToIds<T, Id> = _Simplify<{
+type _RefFieldsToIds139<T, Id> = _Simplify<{
   readonly [K in keyof T as _IsRefLike<T[K]> extends true ? `${K & string}Id` : K]: _IsRefLike<
     T[K]
   > extends true
@@ -267,23 +525,11 @@ type _RefFieldsToIds<T, Id> = _Simplify<{
 }>
 
 /**
- * Distribute over unions (e.g., ReadonlyArray<T> | undefined) to transform array elements.
- *
- * `Id` is the ManyEdge entity's branded identifier type:
- * - When the element IS the ref (`Array<Umpire>`), the array becomes `Array<Id>`.
- * - When the element wraps the ref (`Array<{ player: Player, ... }>`), the nested
- *   ref field is rewritten to `${field}Id: Id`.
+ * A many element as 1.39.0 typed it (`_TransformManyEdge` there): an element that is ref-like is
+ * `Id`; otherwise its ref-like fields are taken as `${field}Id: Id`.
  */
-type _TransformManyEdge<T, Id, TStamps = never> =
-  T extends ReadonlyArray<infer E>
-    ? _IsRefLike<E> extends true
-      ? ReadonlyArray<Id>
-      : ReadonlyArray<_OptionalStamps<_RefFieldsToIds<E, Id>, TStamps>>
-    : T extends Readonly<Record<string, infer V>>
-      ? string extends keyof T
-        ? { readonly [key: string]: _OptionalStamps<V, TStamps> }
-        : T
-      : T
+type _Element139<E, Id, TStamps> =
+  _IsRefLike<E> extends true ? Id : _OptionalStamps<_RefFieldsToIds139<E, Id>, TStamps>
 
 /** `T` with the dates the library stamps optional. */
 type _OptionalStamps<T, TStamps> = [ManagedDateField<T, TStamps>] extends [never]

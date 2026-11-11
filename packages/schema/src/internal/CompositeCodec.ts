@@ -899,6 +899,77 @@ export const kindReadingOf = (
 }
 
 /**
+ * Build the function that puts a composite's DOMAIN value into the form
+ * `Entity.put` stores it in, before `makeCompositeKeyForm`'s normaliser composes
+ * a key from it — so a key composed from a caller's value is the key `put`
+ * wrote for it.
+ *
+ * `put` encodes its input (`encode`, else `decode -> encode`), then composes
+ * keys through the key-form normaliser. For a codec that `encode` takes on its
+ * own output (`x:` prepended by `encode`, stripped by `decode`; a number scaled
+ * by `encode`), the normaliser encodes once more, so `put` stores the key of the
+ * value encoded twice. A path handing the caller's value straight to the
+ * normaliser encoded it once and composed a key no `put` writes: `Batch.get` of
+ * an item `put` wrote returned null.
+ *
+ * A codec inside a wrapper (`Schema.optional(Schema.NumberFromString)`, a union
+ * of a codec and a literal) is encoded here too, as `put` encodes it. The
+ * normaliser takes such a field as it comes, so `put` keys its stored text
+ * (`id_5`), and a caller's `5` composed `id_0000000000000005`, a key `put` never
+ * writes.
+ *
+ * Every other composite is untouched here — an untransformed one, a numeric one
+ * stored as a string (the normaliser takes either side), and a codec whose
+ * `encode` refuses its own output compose the same key whichever form they come
+ * in.
+ *
+ * A value no step takes is passed through, for the normaliser to refuse.
+ */
+export const makeCompositeStoredForm = (
+  source: Schema.Top,
+): ((record: Record<string, unknown>) => Record<string, unknown>) => {
+  const fields = getSchemaFields(source)
+  const cache = new Map<string, ((value: unknown) => unknown) | null>()
+
+  const resolve = (attr: string): ((value: unknown) => unknown) | null => {
+    const cached = cache.get(attr)
+    if (cached !== undefined) return cached
+    const field = declared(fields, attr)
+    if (
+      field === undefined ||
+      numericTypeWithStringEncoding(field) ||
+      // No transformation anywhere in it, a wrapper's included: stored as given.
+      SchemaAST.toEncoded(field.ast) === field.ast
+    ) {
+      cache.set(attr, null)
+      return null
+    }
+    const codec = field as unknown as Schema.Codec<any>
+    const encode = Schema.encodeUnknownOption(codec)
+    const decode = Schema.decodeUnknownOption(codec)
+    const fn = (value: unknown): unknown => {
+      const direct = encode(value)
+      if (Option.isSome(direct)) return direct.value
+      const decoded = decode(value)
+      if (Option.isSome(decoded)) {
+        const reencoded = encode(decoded.value)
+        if (Option.isSome(reencoded)) return reencoded.value
+      }
+      return value
+    }
+    cache.set(attr, fn)
+    return fn
+  }
+
+  const storedForm: CompositeKeyForm = (attr, value) => {
+    if (value === undefined || value === null) return value
+    const fn = resolve(attr)
+    return fn === null ? value : fn(value)
+  }
+  return (record) => toCompositeKeyRecord(storedForm, record)
+}
+
+/**
  * Apply a `CompositeKeyForm` across every entry of a record, so a whole key or
  * composite record can be normalised in one call.
  */

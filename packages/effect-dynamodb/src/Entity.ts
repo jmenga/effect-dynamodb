@@ -52,6 +52,7 @@ import {
   keyFormValueKind,
   kindReadingOf,
   makeCompositeKeyForm,
+  makeCompositeStoredForm,
   otherNumericKind,
   type ReadBackText,
   readsBackOtherwise,
@@ -778,6 +779,31 @@ export interface Entity<
   readonly _keyForm: (
     record: globalThis.Record<string, unknown>,
   ) => globalThis.Record<string, unknown>
+
+  /**
+   * @internal {@link _keyForm} of a caller's key record, a DOMAIN record: each
+   * composite first put into the form `Entity.put` stores it in
+   * (`makeCompositeStoredForm`), so the key is the one `put` wrote for that value,
+   * the key this entity's own `get` composes. For the key-taking multi-item ops
+   * (`Batch.get`, `Batch.write` deletes, `transactGet`, `transactWrite` deletes and
+   * condition checks), which hold the caller's key.
+   */
+  readonly _domainKeyForm: (
+    record: globalThis.Record<string, unknown>,
+  ) => globalThis.Record<string, unknown>
+
+  /**
+   * @internal What in a caller's DOMAIN key record DynamoDB can't store, as `put` decides it for
+   * an item holding those values: each encoded through `inputSchema`'s own field as `put` encodes
+   * its input (`encodeOrDecodeEncode`), then judged by the check `put` runs on what it encoded
+   * (`unstorableOf`), a `NaN` left to key composition (`EDD-9096`). `undefined` when it all stores;
+   * a value that doesn't encode fails with the `ValidationError` `put` fails with. For a path
+   * holding an id it fetches by (aggregate ref hydration): no item can be keyed by a value `put`
+   * refuses, and its key text may name an item of another value.
+   */
+  readonly _unstorableKey: (
+    record: globalThis.Record<string, unknown>,
+  ) => Effect.Effect<UnstorableValue | undefined, ValidationError>
 
   /**
    * @internal Rename domain field names to their stored DynamoDB attribute
@@ -2728,12 +2754,45 @@ const makeImpl = <
     )
   }
 
+  /** What in an encoded payload DynamoDB can't store, as `put` finds it when it marshals. */
+  const unstorableOf = (encoded: globalThis.Record<string, unknown>): UnstorableValue | undefined =>
+    unstorableIn(fieldsToStore(encoded))
+
+  /** `inputSchema`'s fields of a key record, once per set of names (`unstorableKey`). */
+  const keyRecordSchemas = new Map<string, Schema.Codec<any>>()
+
+  /**
+   * What DynamoDB can't store in a caller's DOMAIN key record, as `put` decides it: the record
+   * encoded through `inputSchema`'s own fields as `put` encodes its input, then `unstorableOf`,
+   * the check `put` runs on what it encoded. `undefined` when it stores; a value that doesn't
+   * encode fails as `put` fails on it, with a `ValidationError`.
+   */
+  const unstorableKey = (
+    record: globalThis.Record<string, unknown>,
+  ): Effect.Effect<UnstorableValue | undefined, ValidationError> => {
+    const names = Object.keys(record)
+    const id = names.join("\u0000")
+    let schema = keyRecordSchemas.get(id)
+    if (schema === undefined) {
+      const fields = getSchemaFields(schemas.inputSchema as unknown as Schema.Top) ?? {}
+      schema = Schema.Struct(
+        Object.fromEntries(
+          names.map((name) => [name, Object.hasOwn(fields, name) ? fields[name]! : Schema.Unknown]),
+        ) as never,
+      ) as unknown as Schema.Codec<any>
+      keyRecordSchemas.set(id, schema)
+    }
+    return encodeOrDecodeEncode(schema, record, entityType, "aggregate.create").pipe(
+      Effect.map((encoded) => unstorableOf(encoded as globalThis.Record<string, unknown>)),
+    )
+  }
+
   /** Refuses a value DynamoDB can't store, for a path about to read or send something. */
   const refuseUnstorable = (
     encoded: unknown,
     operation: string,
   ): Effect.Effect<void, ValidationError> => {
-    const unstorable = unstorableIn(fieldsToStore(encoded as globalThis.Record<string, unknown>))
+    const unstorable = unstorableOf(encoded as globalThis.Record<string, unknown>)
     return unstorable === undefined
       ? Effect.void
       : Effect.fail(
@@ -3865,6 +3924,7 @@ const makeImpl = <
     // is left as it is.
     { reads: readsKey },
   )
+  const compositeStoredForm = makeCompositeStoredForm(schemas.inputSchema as unknown as Schema.Top)
 
   /**
    * PUBLIC key boundary. Converts a caller-supplied key record from the model's
@@ -3975,6 +4035,15 @@ const makeImpl = <
       return forms.get(field)?.(value)
     }
   })()
+
+  /**
+   * `keyForm` of a caller's DOMAIN key record: each composite first put into
+   * the form `put` stores it in, as `put`'s encode and `get`'s `encodeKey` do,
+   * so a codec `encode` takes on its own output composes the key `put` wrote.
+   * Every other composite composes exactly what `keyForm` alone does.
+   */
+  const domainKeyForm = (record: globalThis.Record<string, unknown>) =>
+    keyForm(compositeStoredForm(record))
 
   // -------------------------------------------------------------------------
   // Write-limit diagnosis (#144)
@@ -15018,6 +15087,8 @@ const makeImpl = <
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
     _keyForm: keyForm,
+    _domainKeyForm: domainKeyForm,
+    _unstorableKey: unstorableKey,
     _renameToDynamo: renameToDynamo,
     _fieldOfAttribute: fieldOfAttribute,
     _incarnationToken: stampsIncarnation,

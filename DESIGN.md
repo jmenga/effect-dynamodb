@@ -1359,6 +1359,21 @@ left its sentinel behind. A field once declared both and now one kind keeps rows
 under the other kind's text, and `rekey` moves them ("Rows under the other
 numeric kind's text", under `rekey`).
 
+**A codec whose `encode` takes its own output is encoded twice.** `Entity.put`
+encodes its input (`inputSchema`), then applies the key form, whose fallback
+assumes encoding is idempotent. For a codec prepending `x:` it isn't: `"MiX"`
+is stored with the key text `x:x:mix`. The entity's own `get` and `delete` do
+the same (`encodeKey`, then the key form), so they find it. A multi-item op
+takes the caller's DOMAIN key the same way: `composePrimaryKeyOrFail` (`Batch.get`,
+`Batch.write` deletes, `transactGet`, `transactWrite` deletes and condition
+checks) composes through `_domainKeyForm` =
+`_keyForm ∘ makeCompositeStoredForm`, the stored form `put` encodes first
+(applied to transformed, non-numeric composites only; every other composite
+passes through as given, so its key is what 1.39.0 composed). Up to 1.39.0 these
+paths applied the key form alone and composed `x:mix`, so they found, deleted and
+checked nothing for such an item. The double encode itself is stored key text and
+is left as it is: correcting it is a key-format change.
+
 ### Isolated vs Clustered Key Prefixes
 
 **Isolated:**
@@ -3055,7 +3070,7 @@ none.
 
 **`BoundGet` is the exception, and must remain one.** `db.entities.X.get(key)` has returned a real `Effect` since the client gateway existed, and call sites depend on that: `db.entities.X.get(k).pipe(Effect.catchTag("ItemNotFound", …))`, `Effect.map`, `Effect.all`. So `BoundGet` is built on `Effectable.Prototype` and **is** an `Effect<A, E, never>` — the same mechanism `effect`'s own `Statement` uses for a builder that is also an Effect. It additionally carries the bound-op marker, which is what lets it be handed to `Batch.get`, `Transaction.transactGet` and `Transaction.check` (#108). Downgrading it to merely-yieldable would be a silent, wide breaking change.
 
-**One unwrap protocol, both directions.** A bound op joins the multi-item paths by carrying `BoundOpTypeId` plus `_op`; `Entity.extractTransactable` unwraps it to the underlying `EntityOp` / `EntityDelete`. That is the whole mechanism, for reads and writes alike — there is no second one to add. Because `BoundGet` wraps the entity's own `EntityGet`, the key it composes is by construction identical to the one `db.entities.X.get(key)` composes (both go through `entity._keyForm`; see §7). A value that is not a get descriptor is rejected with a `ValidationError` carrying **EDD-9052** on the error channel.
+**One unwrap protocol, both directions.** A bound op joins the multi-item paths by carrying `BoundOpTypeId` plus `_op`; `Entity.extractTransactable` unwraps it to the underlying `EntityOp` / `EntityDelete`. That is the whole mechanism, for reads and writes alike — there is no second one to add. Because `BoundGet` wraps the entity's own `EntityGet`, the key it composes is by construction identical to the one `db.entities.X.get(key)` composes (the multi-item paths through `entity._domainKeyForm`, which `get`'s `encodeKey` and key form agree with; see §7 "Composite key form"). A value that is not a get descriptor is rejected with a `ValidationError` carrying **EDD-9052** on the error channel.
 
 **Immutable accumulator.** Every chainable call returns a new builder — same semantics as `BoundQuery`.
 
@@ -4029,6 +4044,142 @@ it is documented instead (`delete` the key first). `delete` retries the
 `UnprocessedItems` of its `BatchWriteItem`s with `Batch.write`'s backoff and
 bound (5 retries), then fails with a `DynamoError`.
 
+**What `create` hydrates, and by what key.** An edge with an `entity` is given
+ids where its input takes them: a `one` or `ref` edge's `${field}Id`, the
+elements of a `many` edge given as ids, and the `${field}Id` of a `many`
+element wrapping the entity in a field of its own (`PlayerSheet.player`, the
+field `deriveEntityFieldName` names, as `deriveElementInputSchema` derives the
+input). Whether a `many` element takes an id of the key composite's type is
+decided from the element's definition alone, never from the value given or a
+guess at what a field's schema can hold:
+
+- **The element is the entity** (`isEntityElement`): its schema is the
+  entity's own model (`isEntityModel`): the schema the entity was made with,
+  its `DynamoModel.configure` wrapper taken off, or a copy of it that changes
+  only its annotations, its checks or its brand, compared by reference. An
+  identifier is never identity: a class of the entity's identifier (wrapping
+  the entity, or declaring its fields again) is another schema, judged as any
+  other element. Every question of whether a schema is the entity is asked of
+  `isEntityModel`. Its values are an id of the key composite's type, or the
+  entity whole. Given whole, it holds no ref in its own key: where the entity
+  is keyed by `${field}Id` (`lineId` of a `Line`), that is the entity's own
+  value (`elementHoldsRef`). Up to 1.39.0 it was taken for a ref because its
+  name was `${field}Id`, and `create` died composing the key, or refused the
+  element without its key. It is left unfetched exactly where 1.39.0 failed.
+  Where 1.39.0 fetched it and completed, it is fetched: the key is the
+  model's identifier, the entity's one key composite, and optional in the
+  model, so 1.39.0 took it out of the element (`fetchedByOwnKey139`). A string
+  in any other field of that name is fetched, as on 1.39.0.
+- **The element names the field holding the entity** (`entityFieldOf`): a plain
+  `Schema.Struct` or `Schema.Class` (no union, transformation, `suspend` or
+  declaration at the element) whose field of the entity's name is the entity's
+  own model schema, by AST identity, under `Schema.optional` /
+  `Schema.optionalKey` at most, and which doesn't declare `${field}Id` itself (a
+  declared one is the element's own data). A copy of the model's node that
+  changes only its annotations (`DynamoModel.ref`), its checks or its key's
+  optionality is the model; an `Option`, a `NullOr` or a `Result` of it, and a
+  struct declared again with the same fields, are not. Its `${field}Id` is an
+  id of the key composite's type (`elementHoldsRef`), unless the element is
+  given the entity whole. Its input is the element whole, `${field}Id` beside
+  it or not, or with `${field}Id` of the key composite's own schema
+  (`refIdInput`) in that field's place: neither refuses the other's key, and
+  given both, both are kept.
+- **Every other element is judged as 1.39.0 judged it.** A string given as the
+  element, or a string `${field}Id` in an object element, is an id `create`
+  fetches, whatever the element declares, and nothing else is; the hydrated
+  value is then decoded as declared. Its input is 1.39.0's: the field of the
+  entity's name, if it has one, as `${field}Id: Schema.String`, and an element
+  with no fields of its own as declared. That covers every union element
+  (through a transformation or `suspend` too), an element through a
+  transformation, one whose field of the entity's name is a scalar, an
+  `Option`, a `Result`, another struct or the entity under `NullOr`, and one
+  declaring `${field}Id`. The one change is the id's type: a string of no type
+  of the key composite fails with `EDD-9131`, below.
+
+One rule decides whether a `${field}Id` is an id `create` fetches, for a `one`
+or `ref` edge (`field` the edge's name, read off the model's fields) and a
+`many` element (`field` the entity's name, read off the element's fields)
+alike (`holdsRefId`):
+
+1. `null` and `undefined` give no id.
+2. A string is fetched, exactly as on 1.39.0, whatever the definition
+   declares: it replaces an entity given whole in `field` with the one
+   fetched, and a `${field}Id` the definition declares is taken out of the
+   value, as 1.39.0 took it.
+3. Any other id is fetched only where `field` holds the entity's own model
+   (under `optional` at most), the definition doesn't declare `${field}Id`
+   (then it is the definition's own data, stored as given), and `field` isn't
+   given whole (then it is stored as given, never replaced or read again).
+   1.39.0 fetched none of these.
+
+The id, and the entity given whole, are read off the caller's payload as
+1.39.0 read them (`given`, `payload[name]`): the payload's own property, one
+its class gives it (a getter, a property of a prototype), or one a proxy
+answers for. A function is not given: 1.39.0 took a string for an id, a list
+for a `many` edge and an object for a sub-aggregate, so a method of the
+payload's class named like an id is no id, and neither is a member every
+object inherits (`constructor`, `toString`). A definition's fields, which the
+library reads off a schema, are looked up among what the schema declares
+itself (`Object.hasOwn`).
+
+A managed timestamp is optional in every element's input.
+
+The input type (`AggregateTypes`) follows the same rule, read from the
+element's *schema* type, never its domain type, so a union whose members have
+one domain type is still a union. For an entity one id names, it only adds to
+1.39.0's: every element is
+typed as 1.39.0 typed it (a field whose type has an `id: string` by id,
+whatever its name, an element with one as an id), and the id forms are added
+beside that. An element of the entity's model schema type (with fields of its
+own) takes an id or the entity whole. A `Schema.Struct` or `Schema.Class`
+element whose field of the entity's name is of the entity's model schema type,
+under `optional` at most, and which declares no `${field}Id`, takes the element
+whole (its id beside it or not) or by id: the id form is added, the declared
+form never removed, and neither refuses the other's key. The type sees
+that field's name only for a `Schema.Struct` model (in a
+`DynamoModel.configure` wrapper or not) whose `entityType` is one string
+literal: `create` takes a `Schema.Class` model's own identifier, which the
+type sees only as `string`, and the `entityType` for a class in a `configure`
+wrapper, which the type can't tell apart from a bare class. Every other element
+is typed exactly as on 1.39.0. Two schemas of one type
+are one to the type, so a struct declared again with the entity's fields is
+typed as the entity, where `create` takes only a string id for it.
+
+Each id is a value of the entity's primary key's only distinct composite
+(`refKeyComposite`; an attribute in both halves of the key is one attribute),
+of that attribute's type (`refIdValue`): the value itself (`5` of a number,
+`5n` of a bigint, a `Date`), or what its stored form or JSON form decodes to
+(`"5"` of a `NumberFromString` or of a bigint, an ISO string of a date), for a
+codec inside a wrapper (`Schema.optional(Schema.NumberFromString)`) too. Up to
+1.39.0 only a string was taken: a number or bigint id was dropped, so a
+required edge failed decoding and an optional one was created without it. Each
+id is fetched by `Batch.get` of the entity's own `get`, so the key is the key
+`Entity.put` wrote (`composePrimaryKeyOrFail`, through `_domainKeyForm`),
+once per distinct key. An entity with no `DynamoModel.identifier` is fetched
+too, and one whose identifier names another field is fetched by its key. Up to
+1.39.0 the fetch named the identifier, or `id` without one, and died composing
+the key (`Missing composite attribute`).
+
+Every id is judged before anything is fetched. An entity keyed by more than
+one distinct composite, or none, has nothing one id names: `create` fails with
+a `ValidationError` (`EDD-9129`) naming the edge. An id of no type of the key
+composite (`"5"` for a number key, whose key text `put` never writes), or one
+`put` refuses, fails with a `ValidationError` (`EDD-9131`) naming where it was
+given and what it was given (an object by its JSON). An id given more than once
+is judged once: one composing the key text of an id already judged and equal to
+it as a value of the key composite (`Schema.toEquivalence`), so three ISO
+strings of one instant are judged once; the key text alone is not enough, as
+below. The second is `put`'s own
+judgement (`Entity._unstorableKey`: the composite encoded through
+`inputSchema`'s own field as `put` encodes its input, an encode that fails
+being `put`'s refusal too, an infinity through a digits-only string codec, then
+the check `put` runs on what it encoded, `unstorableOf`), so a
+`NumberFromString` id given `"Infinity"`, which `put` stores as that string, is
+fetched, and an infinite number is refused anywhere in the id, in a struct, an
+`Option` or a `Result`: its key text can name an item of another value
+(`{ a: Infinity }` and `{ a: 5 }` compose one), which was fetched in its place. Nothing is fetched or written. Rows already stored are untouched: nothing here changes a
+key.
+
 **Update with diff:**
 
 ```
@@ -4516,7 +4667,7 @@ configuration that could add one (#98).
    declares a stamp, the result is assembled from the rows written, with no I/O. When
    none does, it's the decoded value, and nothing extra runs.
 7. **A `many` edge with a custom `decompose`.** `fillStamps` works on the value as the model has it, before it's decoded (`fillRows`). With `decompose` and `assemble` it takes the value apart, fills each row and puts it back, so a `Schema.Record` of rows is stamped like an array, and its rows' fields are read from the record's value schema (`manyElementFields`, `extractKeyedValue`), so a date in one is stored in its own form. A value they can't take apart or put back is left for the schema to report. Two can't be filled: a value with `decompose` and no `assemble` that isn't an array (there's no way to put its rows back, nor does it read back), and an opaque field (`Schema.Unknown`) with no `entity`, where nothing says what its rows hold, so they're stamped and it's stripped on read, as a row that doesn't declare the date. A `Schema.ReadonlyMap`, `Schema.HashMap` or `Schema.Chunk` field works here, as it doesn't anywhere else (`EDD-9125`), because its collection is rows and is never stored itself.
-8. **The input matches what `create` takes, at every row.** A `one` edge with an `entity` takes an id (`venueId`), which `create` fetches and denormalises. One with no `entity` has nothing to fetch by, so it takes the value under its field name, with its stamps optional: the derived `inputSchema` (`deriveWithStamps`, `rowInput`) and the type (`AggregateInputType`, `_IsValueEdge`) agree. A `Schema.Record` `many` edge's values have optional stamps too (`keyedInput`, `_TransformManyEdge`), and its `sk.composite` names are checked against them (`ManyEdgeSkPaths`). Any other object field takes any name there: its rows are whatever its `decompose` makes, and a scalar field has no rows and takes none.
+8. **The input matches what `create` takes, at every row.** A `one` or `ref` edge whose `entity` one id names takes an id (`venueId`), of the type of the entity's key composite (`refIdInput`, `_EdgeIdValue`: a number, a bigint, a `Date`, a brand), which `create` fetches and denormalises. One with no `entity`, or whose `entity` is keyed by more than one attribute (or none), has nothing to fetch by, so it takes the value under its field name, with its stamps optional: the derived `inputSchema` (`deriveWithStamps`, `rowInput`) and the type (`AggregateInputType`, `_IsValueEdge`) agree. A `many` edge's elements follow the same rule: ids of that type for an element that is the entity, `${field}Id` for the field of an element that holds it (`deriveElementInputSchema`, `_TransformManyEdge`), an element declared a union as 1.39.0 took it (the union as declared; its type 1.39.0's, `_UnionElementInput`), and the elements as given for an edge with nothing to fetch. A `Schema.Record` `many` edge's values have optional stamps too (`keyedInput`, `_TransformManyEdge`), and its `sk.composite` names are checked against them (`ManyEdgeSkPaths`). Any other object field takes any name there: its rows are whatever its `decompose` makes, and a scalar field has no rows and takes none.
 
 **A key with no value.** A composite of an aggregate key can be optional. What happens without a value depends on what the key does:
 
@@ -6228,7 +6379,9 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9126` | `internal/RoundTrip.ts` (`notReadBack`), through `Entity.ts` (`encodeForWrite`, `notReadBackOperand`, `_refuseNotReadBack`), `Aggregate.ts` (`refuseNotReadBack`), `EventStore.ts` (`encodeToWire`) and `internal/ProjectionEngine.ts` (outbox) | A write's value of a custom declaration (a `Schema.instanceOf`, a `Schema.declare`) wouldn't read back: what the marshaller makes of it, unmarshalled, doesn't decode through the schema a read uses. A `ValidationError`, with nothing written. Only a schema holding one pays for the check (`holdsCustomDeclaration`), and a duck-typed `declare` that takes what's stored keeps writing. Rows already stored stay as they are, and still fail on read. |
 | `EDD-9127` | `internal/RoundTrip.ts` (`notStoredForm`), through `Aggregate.ts` (`refuseNotReadBack`) | An aggregate write's value its field's schema can't put in its stored form, neither encoding it nor decoding then encoding it, that wouldn't read back stored as given: such a value is stored as given only when the rows read back through the read a `get` takes. A `ValidationError` naming the member and the field, on `create` and `update`, with nothing written. Only a write that stored something as given pays for the check. |
 | `EDD-9128` | `internal/CompositeCodec.ts` (schema, `bothKindsKeyRefusal`, `readsBackOtherwise`, `fieldAtPath`, `storedFieldAtPath`), through `Entity.make` and `Aggregate.make`, pure and operational, and at write through `Entity.ts` (`refuseOtherKindRead`, in `encodeForWrite` and `_refuseNotReadBack`) and `Aggregate.ts` (`refuseOtherKindKeys`) | A value composed into key text from a field storing both numeric kinds: DynamoDB stores `5` and `5n` alike and a safe integer reads back as a `number`, while the two compose different key text, so a key composed again from a stored row wouldn't be the one written. Refused at load where the field declares both (`Schema.Union([Schema.Number, Schema.BigInt])`, a numeric literal or enum beside `Schema.BigInt`): on an entity, in the primary key, a secondary index half (a Z-order prefix included), a unique constraint, a vector partition and a time-series `orderBy`; on an aggregate, in its partition key, its collection and list keys and a `many` edge's sort key. A dotted composite is followed through what holds each segment, and a time-series `appendInput`'s own fields are refused as the model's are, as is one declaring the other kind than the model. In the same places, the value of a field whose kinds can't be read at load (`Schema.Unknown`, `Schema.Any`, an opaque declaration, a transform whose stored side is one) that reads back as something else is refused at write with a `ValidationError` naming the field, with nothing written; an aggregate's dotted `many` edge composite is judged at write through the field holding it (`throughFieldJudge`), never by the value at its path alone. A field no key reads may store both (§7 "Both numeric kinds"). |
+| `EDD-9129` | `Aggregate.ts` (`hydrateAggregateRefs`, `refKeyComposite`) | An aggregate `create` is given an id for an edge whose `entity` is keyed by more than one distinct primary-key composite, or none, so no one id names one item to fetch (an attribute in both halves of the key is one composite). A `ValidationError` naming the edge and the key's composites, judged for every edge before anything is fetched or written. Up to 1.39.0 the fetch died composing the key (`Missing composite attribute`). |
 | `EDD-9130` | `DynamoClient.ts` (`make`), through `Aggregate.ts` (`ownershipConflict`) | An aggregate declaring `ownsRows` beside another member the client sees that can write a row of one of its entity types into its partition: the message names the aggregate, the member, the type and the channel. A defect from `DynamoClient.make`, as `EDD-9037` is (§7 "Which rows in its partition are an aggregate's"). |
+| `EDD-9131` | `Aggregate.ts` (`hydrateAggregateRefs`, `refIdValue`) | An aggregate `create` is given an id that is no value of the edge's entity's key composite, neither of its type nor its stored or JSON form (`"5"` for a number key), so it names no item; or an id of its type `put` refuses, as DynamoDB can't store it (`Infinity`, anywhere in a struct, an `Option` or a `Result`) or as it doesn't encode as the composite is stored (an infinity through a digits-only string codec), judged by `put`'s own rule (`Entity._unstorableKey`). A `ValidationError` naming where the id was given, what it was given, the composite and the entity, judged before anything is fetched or written. Up to 1.39.0 a string was fetched under a key no `put` writes (`RefNotFound`), and anything else was dropped. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
 
 Next free code: none below `9141` (`9129` and `9131`–`9139` are taken on branches in flight, `9110` and `9111` are reserved for #189, `9114`–`9120` are taken on branches in flight, and `9107` is retired, don't reuse it); take the first code after those once they land, or `9009`, `9017`–`9019`, `9028`–`9029` within their bands.

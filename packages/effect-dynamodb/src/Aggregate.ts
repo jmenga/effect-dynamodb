@@ -75,6 +75,7 @@ import {
   DateTime,
   Effect,
   Equal,
+  Exit,
   type Optic,
   Option,
   Schema,
@@ -103,6 +104,7 @@ import { createPathBuilder, type PathBuilder } from "./internal/PathBuilder.js"
 import * as Rekey from "./internal/Rekey.js"
 import { asRead, notReadBack, notStoredForm, readBackRefusal } from "./internal/RoundTrip.js"
 import {
+  composePrimaryKeyOrFail,
   generateTimestampPrimitive,
   INCARNATION_TOKEN,
   KEY_TEXT,
@@ -122,7 +124,12 @@ import {
   transactItemTarget,
   withCause,
 } from "./internal/WriteDiagnosis.js"
-import { fromAttributeMap, toAttributeMap, toAttributeValue } from "./Marshaller.js"
+import {
+  fromAttributeMap,
+  toAttributeMap,
+  toAttributeValue,
+  type UnstorableValue,
+} from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
 export type {
@@ -176,9 +183,18 @@ import type { AggregateEdge, RefEntity } from "@effect-dynamodb/schema/internal/
 import {
   deriveAggregateSchemas,
   deriveEntityFieldName,
+  elementHoldsRef,
+  given,
+  holdsRefId,
+  isEntityElement,
   isFieldOptional,
   manyEdgePaths,
   manyElementFields,
+  manyElementSchema,
+  refIdField,
+  refIdValue,
+  refKeyComposite,
+  refKeyComposites,
   refuseAggregateKeyOverMovingValue,
   refuseAggregateKeysOverBothKinds,
   refuseManySortKeysOverMovingValue,
@@ -191,6 +207,7 @@ import type {
   AggregateInputType,
   AggregateStampNames,
   BoundSubAggregate,
+  SchemaFieldsOf,
   SubAggregate,
 } from "@effect-dynamodb/schema/internal/AggregateTypes.js"
 import type { ModelFieldName } from "@effect-dynamodb/schema/internal/EntityTypes.js"
@@ -779,7 +796,8 @@ export function make<
     Schema.Schema.Type<TSchema>,
     TEdges,
     TPK,
-    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>
+    AggregateStampNames<Schema.Schema.Type<TSchema>, TTimestamps>,
+    SchemaFieldsOf<TSchema>
   >
 >
 export function make<
@@ -3360,7 +3378,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
           const tableConfig: TableConfig = yield* config.table.Tag
 
           // 1. Hydrate refs from edges
-          const hydrated = yield* hydrateAggregateRefs(input, config.edges, aggregateName)
+          const hydrated = yield* hydrateAggregateRefs(
+            input,
+            config.edges,
+            schemaFields,
+            aggregateName,
+          )
 
           // 2. Validate via schema decode (decodeSchema substitutes nested edge
           //    self-date/Redacted leaves — Option A — and is identical to `schema`
@@ -4463,22 +4486,70 @@ const stripMetadata = (
 // Internal: Ref hydration (aggregate-level, edge-driven)
 // ---------------------------------------------------------------------------
 
+/** An edge's entity as hydration fetches it: an operational entity, a pure definition promoted. */
+type RuntimeRefEntity = RefEntity & {
+  readonly get: (key: any) => any
+  readonly _unstorableKey: (
+    record: Record<string, unknown>,
+  ) => Effect.Effect<UnstorableValue | undefined, ValidationError>
+}
+
 /** A ref request collected from walking edges */
 interface RefRequest {
   readonly entity: RefEntity
-  readonly id: string
+  /** The id as given. */
+  readonly given: unknown
+  /** The id as a value of the entity's key composite (`refIdValue`); `None` when it names no item. */
+  readonly id: Option.Option<unknown>
   readonly path: ReadonlyArray<string>
   readonly fieldName: string
   readonly idFieldName: string
+  /** Where the id was given, to name it in an error: `lineId`, `lines[0].lineId`. */
+  readonly at: string
 }
+
+/** An object as given, to name it in an error, whatever its `toString` (a JSON body's may be text). */
+const describeObject = (value: object): string => {
+  try {
+    const json = JSON.stringify(value)
+    if (json !== undefined) return json
+  } catch {
+    // A cycle, or a `toJSON` that throws: named by its kind below.
+  }
+  return Object.prototype.toString.call(value)
+}
+
+/** An id as given, to name it in an error. */
+const describeId = (id: unknown): string =>
+  typeof id === "string"
+    ? JSON.stringify(id)
+    : typeof id === "bigint"
+      ? `${id}n`
+      : id instanceof Date
+        ? `a Date (${Number.isNaN(id.getTime()) ? "invalid" : id.toISOString()})`
+        : typeof id === "object" && id !== null
+          ? `an object (${describeObject(id)})`
+          : typeof id === "function"
+            ? "a function"
+            : String(id)
+
+/** An id as `RefNotFound` names it. */
+const refIdText = (id: unknown): string =>
+  typeof id === "string" ? id : id instanceof Date ? id.toISOString() : String(id)
 
 /**
  * Walk the input recursively following graph edges, collect ref IDs,
  * fetch referenced entities, and replace IDs with hydrated domain data.
+ *
+ * Every id is judged before anything is fetched: an id of an entity no one id names
+ * (`EDD-9129`), then an id that is no value of the entity's key composite, or one `put` refuses as
+ * DynamoDB can't store it (`EDD-9131`), then one with no key text (`EDD-9096`). Each is then fetched by the key `Entity.put` wrote for it,
+ * composed as `Batch.get` composes an entity's own `get` (`composePrimaryKeyOrFail`), once per key.
  */
 const hydrateAggregateRefs = (
   input: Record<string, unknown>,
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+  fields: Record<string, Schema.Top> | undefined,
   aggregateName: string,
 ): Effect.Effect<
   Record<string, unknown>,
@@ -4488,7 +4559,7 @@ const hydrateAggregateRefs = (
   Effect.gen(function* () {
     // Collect all ref IDs from the entire input hierarchy
     const refRequests: RefRequest[] = []
-    collectRefIdsFromEdges(refRequests, input, edges, [])
+    collectRefIdsFromEdges(refRequests, input, edges, fields, [], "")
 
     if (refRequests.length === 0) return input
 
@@ -4504,60 +4575,196 @@ const hydrateAggregateRefs = (
       }
     }
 
+    // An entity no one id names (its key has two composites, or none): nothing to fetch it by.
+    // 1.39.0 fetched under its identifier (or `id`), which no key composes from alone, and died.
+    for (const [entityType, { entity, reqs }] of byEntityType) {
+      if (refKeyComposite(entity) !== undefined) continue
+      const composites = refKeyComposites(entity)
+      const named = [...new Set(reqs.map((req) => req.fieldName))]
+      return yield* new ValidationError({
+        entityType: aggregateName,
+        operation: "aggregate.create",
+        cause: new Error(
+          `[EDD-9129] Aggregate "${aggregateName}": ${named.map((name) => `"${name}"`).join(", ")} ` +
+            `${named.length === 1 ? "is" : "are"} given an id of entity "${entityType}", whose ` +
+            `primary key is composed from ${
+              composites.length === 0
+                ? "no attribute"
+                : composites.map((name) => `"${name}"`).join(", ")
+            }, so no one id names one item to fetch. Give "${named[0]}" whole, or key that entity ` +
+            `by one attribute to fetch it by id. Nothing was fetched or written.`,
+        ),
+      })
+    }
+
+    // `RefEntity` is the pure structural bound (no `get` — issue #66): aggregate
+    // edges can be authored from AWS-free `@effect-dynamodb/schema` definitions,
+    // which carry no runtime `.get`/operations. Ref hydration is a runtime
+    // operation, so promote a pure edge target to a full operational Entity (a
+    // thin op-attach over its retained `_data`); runtime-authored targets already
+    // carry `.get` and pass through untouched. Mirrors `DynamoClient.make()`'s
+    // entity binding. Promoted once per distinct edge entity type per hydrate (issue #71).
+    const runtimeEntities = new Map<string, RuntimeRefEntity>()
+    for (const [entityType, { entity }] of byEntityType) {
+      runtimeEntities.set(
+        entityType,
+        (typeof (entity as { readonly get?: unknown }).get === "function"
+          ? entity
+          : entityFromDefinition(entity as unknown as EntityDefinition)) as RuntimeRefEntity,
+      )
+    }
+
+    // An id that is no value of the key composite names no item: up to 1.39.0 a string was
+    // fetched under a key no `put` writes (`lineid_5` for a number), and anything else was dropped.
+    // Nor does one `put` refuses: one that doesn't encode as the attribute is stored (an infinite
+    // number through a digits-only string codec), or one DynamoDB can't store (an infinite number,
+    // at any depth of a struct, an `Option` or a `Result`), whose key text can name an item of
+    // another value (`{ a: Infinity }` and `{ a: 5 }` compose one key), fetched in its place.
+    // An id given more than once is judged once: one composing the key text of an id already
+    // judged, and equal to it as a value of the key composite (`Schema.toEquivalence`), so three
+    // ISO strings of one instant, each decoded to a `Date` of its own, are judged once. The key
+    // text alone isn't enough: `{ a: Infinity }` composes the key of `{ a: 5 }`, and is refused.
+    // An id whose key isn't composed here is judged, and fails composing below.
+    const judged = new Map<string, Array<unknown>>()
+    const composed = new Map<RefRequest, string>()
+    for (const req of refRequests) {
+      const composite = refKeyComposite(req.entity)!
+      if (Option.isNone(req.id)) {
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.create",
+          cause: new Error(
+            `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
+              `which is no value of "${composite}", the attribute entity ` +
+              `"${req.entity.entityType}" is keyed by, so it names no item to fetch. Give an id of ` +
+              `that attribute's type. Nothing was fetched or written.`,
+          ),
+        })
+      }
+      const runtimeEntity = runtimeEntities.get(req.entity.entityType)!
+      const key = yield* Effect.exit(
+        composePrimaryKeyOrFail(
+          runtimeEntity as unknown as Parameters<typeof composePrimaryKeyOrFail>[0],
+          { [composite]: req.id.value },
+          "aggregate.create",
+        ),
+      )
+      if (Exit.isSuccess(key)) {
+        const keyText = `${req.entity.entityType}:${JSON.stringify(Object.values(key.value))}`
+        composed.set(req, keyText)
+        const same = judged.get(keyText) ?? []
+        judged.set(keyText, same)
+        const equivalent = idEquivalence(req.entity)
+        const value = req.id.value
+        if (same.some((other) => equivalent(other, value))) continue
+        same.push(value)
+      }
+      const unstorable = yield* runtimeEntity._unstorableKey({ [composite]: req.id.value }).pipe(
+        Effect.mapError(
+          (refused) =>
+            new ValidationError({
+              entityType: aggregateName,
+              operation: "aggregate.create",
+              cause: new Error(
+                `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ` +
+                  `${describeId(req.given)}, which no item of entity "${req.entity.entityType}" ` +
+                  `can be keyed by: \`put\` refuses it, as it doesn't encode as "${composite}" ` +
+                  `is stored. Give an id that does. Nothing was fetched or written.`,
+                { cause: refused },
+              ),
+            }),
+        ),
+      )
+      if (unstorable !== undefined) {
+        return yield* new ValidationError({
+          entityType: aggregateName,
+          operation: "aggregate.create",
+          cause: new Error(
+            `[EDD-9131] Aggregate "${aggregateName}": "${req.at}" is given ${describeId(req.given)}, ` +
+              `which no item of entity "${req.entity.entityType}" can be keyed by: \`put\` ` +
+              `refuses it, as DynamoDB can't store it (${unstorable.describe()}). Give an id ` +
+              `DynamoDB can store. Nothing was fetched or written.`,
+          ),
+        })
+      }
+    }
+
+    // Each id's key, composed before anything is fetched: one with no key text (`NaN`,
+    // `EDD-9096`) fails here. An id fetched twice, or two ids composing one key (`"L"` and `"l"`
+    // under lowercase casing), is fetched once: `BatchGetItem` refuses a repeated key.
+    const fetches: Array<{
+      readonly entityType: string
+      readonly runtimeEntity: RuntimeRefEntity
+      readonly ops: Array<{ readonly lookupKey: string; readonly req: RefRequest }>
+    }> = []
+    const lookupKeys = new Map<RefRequest, string>()
+    for (const [entityType, { entity, reqs }] of byEntityType) {
+      const runtimeEntity = runtimeEntities.get(entityType)!
+      const composite = refKeyComposite(entity)!
+      const ops: Array<{ readonly lookupKey: string; readonly req: RefRequest }> = []
+      const seen = new Set<string>()
+      for (const req of reqs) {
+        // Composed while judging the id, unless that failed: then composing fails here.
+        let lookupKey = composed.get(req)
+        if (lookupKey === undefined) {
+          const key = yield* composePrimaryKeyOrFail(
+            runtimeEntity as unknown as Parameters<typeof composePrimaryKeyOrFail>[0],
+            { [composite]: Option.getOrThrow(req.id) },
+            "aggregate.create",
+          )
+          lookupKey = `${entityType}:${JSON.stringify(Object.values(key))}`
+        }
+        lookupKeys.set(req, lookupKey)
+        if (!seen.has(lookupKey)) {
+          seen.add(lookupKey)
+          ops.push({ lookupKey, req })
+        }
+      }
+      fetches.push({ entityType, runtimeEntity, ops })
+    }
+
     // Batch-fetch all refs — one Batch.get call per entity type
     const hydratedLookup = new Map<string, Record<string, unknown>>()
-
-    for (const [entityType, { entity, reqs }] of byEntityType) {
-      const idField = DynamoModel.getIdentifierField(entity.model)
-      const identifierName = idField?.name ?? "id"
-
-      // Deduplicate IDs for this entity type
-      const uniqueIds = [...new Set(reqs.map((r) => r.id))]
-
-      // `RefEntity` is the pure structural bound (no `get` — issue #66): aggregate
-      // edges can be authored from AWS-free `@effect-dynamodb/schema` definitions,
-      // which carry no runtime `.get`/operations. Ref hydration is a runtime
-      // operation, so promote a pure edge target to a full operational Entity (a
-      // thin op-attach over its retained `_data`); runtime-authored targets already
-      // carry `.get` and pass through untouched. Mirrors `DynamoClient.make()`'s
-      // entity binding. The loop is already grouped by entity type, so this promotes
-      // once per distinct edge entity type per hydrate (issue #71).
-      const runtimeEntity = (
-        typeof (entity as { readonly get?: unknown }).get === "function"
-          ? entity
-          : entityFromDefinition(entity as unknown as EntityDefinition)
-      ) as RefEntity & {
-        readonly get: (key: any) => any
-      }
-
-      // Build EntityGet intermediates for batch fetching
-      const getOps = uniqueIds.map(
-        (id) => runtimeEntity.get({ [identifierName]: id }) as EntityGet<any, any, any, any>,
+    for (const { entityType, runtimeEntity, ops } of fetches) {
+      const composite = refKeyComposite(runtimeEntity)!
+      // Build EntityGet intermediates for batch fetching: `Batch.get` composes each key as the
+      // entity's own `get` does, the key `Entity.put` wrote.
+      const getOps = ops.map(
+        ({ req }) =>
+          runtimeEntity.get({ [composite]: Option.getOrThrow(req.id) }) as EntityGet<
+            any,
+            any,
+            any,
+            any
+          >,
       )
 
       const results = yield* Batch.get(getOps)
 
       // Map results back to lookup, failing on missing refs.
-      for (let i = 0; i < uniqueIds.length; i++) {
-        const id = uniqueIds[i]!
+      for (let i = 0; i < ops.length; i++) {
+        const { lookupKey, req } = ops[i]!
         const result = results[i]
         if (result == null) {
           return yield* new RefNotFound({
             entity: aggregateName,
-            field: reqs.find((r) => r.id === id)?.fieldName ?? "",
+            field: req.fieldName,
             refEntity: entityType,
-            refId: id,
+            refId: refIdText(req.given),
           })
         }
         // `Batch.get` returns the decoded record: domain values, as a caller holds, and
         // `writeSchema` takes them as that. Encoded here, a field with one type on both
         // sides of a transformation would be taken for a domain value and encoded twice.
-        hydratedLookup.set(`${entityType}:${id}`, result as Record<string, unknown>)
+        hydratedLookup.set(lookupKey, result as Record<string, unknown>)
       }
     }
 
     // Walk the input again and replace IDs with hydrated data
-    const result = replaceRefIds(input, refRequests, hydratedLookup)
+    const result = replaceRefIds(input, refRequests, (req) => {
+      const lookupKey = lookupKeys.get(req)
+      return lookupKey === undefined ? undefined : hydratedLookup.get(lookupKey)
+    })
     renameInputFields(result, edges)
     return result
   })
@@ -4590,83 +4797,130 @@ const renameInputFields = (
   }
 }
 
+/** An id given for an edge's entity: the id as given, and as a value of its key composite. */
+const refId = (entity: RefEntity, given: unknown) => ({ given, id: refIdValue(entity, given) })
+
+const idEquivalences = new WeakMap<object, (a: unknown, b: unknown) => boolean>()
+
+/**
+ * Whether two ids of `entity` are one value of its key composite (`refIdField`), by the field's
+ * own equivalence (`Schema.toEquivalence`: two `Date`s of one instant are one); `Equal.equals`
+ * where the field can't be read or derives none.
+ */
+const idEquivalence = (entity: RefEntity): ((a: unknown, b: unknown) => boolean) => {
+  const field = refIdField(entity)
+  if (field === undefined) return Equal.equals
+  const cached = idEquivalences.get(field)
+  if (cached !== undefined) return cached
+  let equivalent: (a: unknown, b: unknown) => boolean
+  try {
+    equivalent = Schema.toEquivalence(field as Schema.Schema<unknown>)
+  } catch {
+    equivalent = Equal.equals
+  }
+  idEquivalences.set(field, equivalent)
+  return equivalent
+}
+
 /**
  * Recursively walk input following graph edges to collect ref ID references.
  * Edge-driven: entity lookup comes from the edge directly, not from a refs bag.
+ *
+ * An id is anything given where the input takes one (`null` and `undefined` give none), judged
+ * by `hydrateAggregateRefs` before anything is fetched. Up to 1.39.0 only a string was taken,
+ * so a number or bigint id was dropped, and an optional edge was created without it.
  */
 const collectRefIdsFromEdges = (
   result: RefRequest[],
   input: Record<string, unknown>,
   edges: Record<string, AggregateEdge | BoundSubAggregate<any>>,
+  /** The fields of the schema `input` is a value of: a `many` element's schema is read off it. */
+  fields: Record<string, Schema.Top> | undefined,
   path: ReadonlyArray<string>,
+  /** Where `input` is, to name an id in an error: `""` at the root, `"sub."` under `sub`. */
+  at: string,
 ): void => {
   for (const [edgeName, edge] of Object.entries(edges)) {
     if (!("_tag" in edge)) continue
 
-    if (edge._tag === "RefEdge") {
-      // RefEdge → ${field}Id in input
+    if (edge._tag === "RefEdge" || (edge._tag === "OneEdge" && edge.entity)) {
+      // RefEdge, and OneEdge with an entity → ${field}Id in input, where it holds an id `create`
+      // fetches (`holdsRefId`): a string as on 1.39.0, an id of another type only where the model's
+      // field is the entity's own model, its id isn't declared, and the entity isn't given whole.
+      const entity = edge.entity!
       const idFieldName = `${edgeName}Id`
-      const idValue = input[idFieldName]
-      if (typeof idValue === "string") {
+      const idValue = given(input, idFieldName)
+      if (holdsRefId(fields, edgeName, entity, input)) {
         result.push({
-          entity: edge.entity,
-          id: idValue,
+          entity,
+          ...refId(entity, idValue),
           path: [...path],
           fieldName: edgeName,
           idFieldName,
-        })
-      }
-    } else if (edge._tag === "OneEdge" && edge.entity) {
-      // OneEdge with entity → ${field}Id in input
-      const idFieldName = `${edgeName}Id`
-      const idValue = input[idFieldName]
-      if (typeof idValue === "string") {
-        result.push({
-          entity: edge.entity,
-          id: idValue,
-          path: [...path],
-          fieldName: edgeName,
-          idFieldName,
+          at: `${at}${idFieldName}`,
         })
       }
     } else if (edge._tag === "BoundSubAggregate") {
       const bound = edge as BoundSubAggregate<any>
-      const subInput = input[edgeName]
+      const subInput = given(input, edgeName)
       if (subInput != null && typeof subInput === "object") {
-        collectRefIdsFromEdges(result, subInput as Record<string, unknown>, bound.aggregate.edges, [
-          ...path,
-          edgeName,
-        ])
+        collectRefIdsFromEdges(
+          result,
+          subInput as Record<string, unknown>,
+          bound.aggregate.edges,
+          fieldsOf(bound.aggregate.schema),
+          [...path, edgeName],
+          `${at}${edgeName}.`,
+        )
       }
     } else if (edge._tag === "ManyEdge" && edge.entity) {
       // ManyEdge with entity → walk array elements for ref IDs
+      const entity = edge.entity
       const inputKey = edge.inputField ?? edgeName
-      const arr = input[inputKey]
+      const arr = given(input, inputKey)
       if (Array.isArray(arr)) {
-        const entityFieldName = deriveEntityFieldName(edge.entity)
+        const entityFieldName = deriveEntityFieldName(entity)
+        const element = manyElementSchema(fields, edgeName)
+        const entityElement = isEntityElement(element, entity)
         for (let i = 0; i < arr.length; i++) {
           const elem = arr[i]
-          if (typeof elem === "string") {
-            // Element IS the ref ID (e.g., Array<string> for Array<Umpire>)
+          if (elem == null) continue
+          const asId = refId(entity, elem)
+          if (
+            entityElement
+              ? Option.isSome(asId.id) || typeof elem !== "object"
+              : typeof elem === "string"
+          ) {
+            // Element IS the ref ID. Where the element is the entity (`Array<Umpire>`), an id of
+            // the entity's key composite, or a scalar given for one, which names no item. Any
+            // other element, a string, as on 1.39.0.
             result.push({
-              entity: edge.entity,
-              id: elem,
+              entity,
+              ...asId,
               path: [...path, inputKey, String(i)],
               fieldName: edgeName,
               idFieldName: String(i),
+              at: `${at}${inputKey}[${i}]`,
             })
-          } else if (elem != null && typeof elem === "object") {
-            // Element wraps entity + attributes — find the entityFieldName + "Id"
+          } else if (
+            typeof elem === "object" &&
+            elementHoldsRef(element, entity, elem as Record<string, unknown>)
+          ) {
+            // Element wraps the entity, given as `${field}Id`, where it holds an id `create`
+            // fetches (`elementHoldsRef`, the rule a `one` edge's id follows): a string as on
+            // 1.39.0, an id of another type only where the element's field of the entity's name is
+            // the entity's own model, its id isn't declared, and the entity isn't given whole.
             const elemObj = elem as Record<string, unknown>
             const idFieldName = `${entityFieldName}Id`
-            const idValue = elemObj[idFieldName]
-            if (typeof idValue === "string") {
+            const idValue = given(elemObj, idFieldName)
+            if (idValue != null) {
               result.push({
-                entity: edge.entity,
-                id: idValue,
+                entity,
+                ...refId(entity, idValue),
                 path: [...path, inputKey, String(i)],
                 fieldName: entityFieldName,
                 idFieldName,
+                at: `${at}${inputKey}[${i}].${idFieldName}`,
               })
             }
           }
@@ -4730,27 +4984,30 @@ const cloneInput = (value: unknown, seen: WeakMap<object, unknown> = new WeakMap
 const replaceRefIds = (
   input: Record<string, unknown>,
   refRequests: ReadonlyArray<RefRequest>,
-  lookup: Map<string, Record<string, unknown>>,
+  lookup: (req: RefRequest) => Record<string, unknown> | undefined,
 ): Record<string, unknown> => {
   // Deep clone the input for mutation
   const result = cloneInput(input) as Record<string, unknown>
 
   for (const req of refRequests) {
-    const lookupKey = `${req.entity.entityType}:${req.id}`
-    const data = lookup.get(lookupKey)
+    const data = lookup(req)
     if (!data) continue
+
+    // For ManyEdge elements that are direct IDs (element IS the ref), the target is the array
+    // itself: the path ends at the element, which may be an object (a `Date` id).
+    const isElementId = /^\d+$/.test(req.idFieldName)
+    const segments = isElementId ? req.path.slice(0, -1) : req.path
 
     // Navigate to the target location in the result
     let target: Record<string, unknown> = result
-    for (const segment of req.path) {
+    for (const segment of segments) {
       const next = target[segment]
       if (next == null || typeof next !== "object") break
       target = next as Record<string, unknown>
     }
 
-    // For ManyEdge elements that are direct IDs (element IS the ref),
-    // the target is the array itself — replace the element at the index
-    if (Array.isArray(target) && /^\d+$/.test(req.idFieldName)) {
+    // Replace the element at the index
+    if (Array.isArray(target) && isElementId) {
       target[Number(req.idFieldName)] = data
     } else {
       // Replace: remove ${field}Id, add ${field}: data
