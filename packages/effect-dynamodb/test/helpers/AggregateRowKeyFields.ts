@@ -27,6 +27,7 @@ import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import * as PureAggregate from "@effect-dynamodb/schema/Aggregate.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { readTakesOff } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import { Cause, Effect, Exit, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
@@ -57,6 +58,14 @@ const published: Published = JSON.parse(
     new URL("../fixtures/aggregate-row-key-fields-1.40.0.json", import.meta.url),
     "utf8",
   ),
+)
+/** How published 1.39.0 and 1.40.0 read a value's fields off its row, by the kind of row. */
+const publishedStrip: {
+  readonly generatedFrom: ReadonlyArray<string>
+  readonly "1.39.0": Record<string, { readonly create: Outcome; readonly get: Outcome }>
+  readonly "1.40.0": Record<string, { readonly create: Outcome; readonly get: Outcome }>
+} = JSON.parse(
+  readFileSync(new URL("../fixtures/aggregate-read-strip-1.40.0.json", import.meta.url), "utf8"),
 )
 
 const schema = DynamoSchema.make({ name: "keyf", version: 1 })
@@ -417,6 +426,111 @@ export const suite = (
         }
         expect({ label, ...was }).toEqual({ label, ...published["1.40.0"][label] })
       }
+    })
+
+    describe("a sub-aggregate's row is read as a sub-aggregate's root with an edge of its own, as a one edge's without", () => {
+      const strip = DynamoSchema.make({ name: "strip", version: 1 })
+      const StripTable = Table.make({ schema: strip, entities: {} })
+      const then = publishedStrip["1.40.0"]
+      const pure = PureAggregate as unknown as Module
+      const sub = (A: Module, withEdge: boolean) => {
+        const Part = Schema.Struct({
+          name: S,
+          pkey: opt(S),
+          ...(withEdge ? { note: Schema.Struct({ text: S }) } : {}),
+        })
+        const Sub = (A.make as any)(Part, {
+          root: { entityType: "Part" },
+          edges: withEdge ? { note: (A.one as any)({ entityType: "Note" }) } : {},
+        })
+        return (A.make as any)(Schema.Struct({ id: S, part: Part }), {
+          table: StripTable,
+          schema: strip,
+          pk: { field: "pkey", composite: ["id"] },
+          collection: A === pure ? { ...PURE_COLLECTION, name: "strip" } : { name: "strip" },
+          root: { entityType: "Root" },
+          edges: { part: Sub.with({ discriminator: { side: 1 } }) },
+        })
+      }
+
+      it("the fixture is published 1.39.0's and 1.40.0's, and they agree", () => {
+        expect(publishedStrip.generatedFrom).toEqual([
+          "effect-dynamodb@1.40.0",
+          "effect-dynamodb@1.39.0",
+        ])
+        expect(publishedStrip["1.39.0"]).toEqual(publishedStrip["1.40.0"])
+      })
+
+      it("readTakesOff states 1.40.0's reads: prefixes off an edge's and a sub-aggregate root's row", () => {
+        expect(judged(then["one edge declaring gsiNote"]!.get)).toEqual({
+          failed: "ValidationError",
+          operation: "aggregate.assemble",
+        })
+        expect(judged(then["sub-aggregate with an edge, declaring skills"]!.get)).toEqual({
+          failed: "ValidationError",
+          operation: "aggregate.assemble",
+        })
+        expect(judged(then["sub-aggregate declaring skills"]!.get)).toEqual({
+          ok: { id: "a", part: { name: "p", skills: "ts" } },
+        })
+        expect(judged(then["sub-aggregate declaring pkg (optional)"]!.get)).toEqual({
+          ok: { id: "a", part: { name: "p", pkg: "x" } },
+        })
+        expect(judged(then["root declaring gsi2pk (optional), no list"]!.get)).toEqual({
+          ok: { id: "a" },
+        })
+        expect(readTakesOff("edge", "gsiNote")).toBe(true)
+        expect(readTakesOff("subAggregate", "skills")).toBe(true)
+        expect(readTakesOff("edge", "skills")).toBe(false)
+        expect(readTakesOff("edge", "pkg")).toBe(false)
+        expect(readTakesOff("root", "gsi2pk")).toBe(true)
+        expect(readTakesOff("root", "gsiNote")).toBe(false)
+      })
+
+      it("without an edge, its pkey read back the key text, so Aggregate.make refuses it", () => {
+        const label =
+          "childless sub-aggregate declaring pkey (optional), keyed under pkey, given none"
+        expect(judged(then[label]!.get)).toEqual({
+          ok: { id: "a", part: { name: "p", pkey: "$strip#v1#strip#a" } },
+        })
+        const message = atMake('the sub-aggregate at "part"', "pkey", PK)
+        expect(() => sub(Aggregate, false)).toThrow(message)
+        expect(() => sub(pure, false)).toThrow(message)
+      })
+
+      it("with an edge, its pkey was taken off, so only a write giving it a value is refused", () =>
+        Effect.runPromise(
+          harness.onTable((tableName) =>
+            Effect.gen(function* () {
+              const label =
+                "sub-aggregate with an edge declaring pkey (optional), keyed under pkey, given mine"
+              expect(judged(then[label]!.get)).toEqual({
+                ok: { id: "a", part: { name: "p", note: { text: "n" } } },
+              })
+              expect(() => sub(pure, true)).not.toThrow()
+              const A = sub(Aggregate, true)
+              const db: any = yield* DynamoClient.make({
+                entities: {},
+                aggregates: { A },
+                tables: { StripTable },
+              } as never).pipe(Effect.provide(StripTable.layer({ name: tableName })))
+              yield* harness.commands(tableName)
+              const exit = yield* Effect.exit(
+                db.aggregates.A.create({
+                  id: "a",
+                  part: { name: "p", pkey: "mine", note: { text: "n" } },
+                }),
+              )
+              const error = Cause.squash((exit as Exit.Failure<unknown, unknown>).cause) as {
+                _tag?: string
+                reason?: string
+              }
+              expect(error._tag).toBe("AggregateDecompositionError")
+              expect(error.reason).toContain(lost("part", "pkey", PK))
+              expect(yield* harness.commands(tableName)).toEqual([])
+            }),
+          ),
+        ))
     })
 
     // An `update` judges what it writes as `create` does: one introducing a collision is refused

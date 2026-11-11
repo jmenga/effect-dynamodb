@@ -201,6 +201,22 @@ export const readTakesOff = (kind: RowKind, name: string): boolean => {
   }
 }
 
+/**
+ * How a sub-aggregate's root row is read (#241): with an edge of its own, as a sub-aggregate's root
+ * (`"subAggregate"`); without one, as a `one` edge's row (`"edge"`), since assembly reads a
+ * sub-aggregate with no edges as it reads a `one` edge.
+ */
+export const subAggregateRowKind = (edges: Record<string, unknown>): RowKind =>
+  Object.values(edges).some(
+    (edge) =>
+      typeof edge === "object" &&
+      edge !== null &&
+      "_tag" in edge &&
+      (edge._tag === "OneEdge" || edge._tag === "ManyEdge" || edge._tag === "BoundSubAggregate"),
+  )
+    ? "subAggregate"
+    : "edge"
+
 /** A key attribute the library writes on a row, with what it holds, to name it in an error. */
 export type RowKeyAttribute = readonly [attribute: string, what: string]
 
@@ -324,7 +340,7 @@ export const refuseValueFieldsOnRowAttributes = (
         const subFields = getSchemaFields(unwrapModel(bound.aggregate.schema))
         refuse(
           `the sub-aggregate at "${here}"`,
-          "subAggregate",
+          subAggregateRowKind(bound.aggregate.edges),
           declaredValueNames.own(subFields, bound.aggregate.edges),
         )
         walk(subFields, bound.aggregate.edges, [...path, name])
