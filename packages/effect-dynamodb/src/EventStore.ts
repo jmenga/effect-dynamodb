@@ -5822,7 +5822,7 @@ export const makeStream = <
       if (from === keys.current) return undefined
       const streamIdText = row.streamId?.S ?? ""
       return {
-        unit: `${config.streamName}\u0000${from}\u0000${streamIdText}`,
+        unit: Rekey.identity("stream", config.streamName, from, streamIdText),
         work: moveStream(
           ctx,
           from,

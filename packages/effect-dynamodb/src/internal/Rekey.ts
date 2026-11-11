@@ -139,17 +139,32 @@ export const UNGUARDED_MESSAGE =
 /** What {@link RekeyRowContext.judge} found: the unit settled, or it and the caller are a loop. */
 export type Judged = "settled" | "loop"
 
+/**
+ * One text for a tuple of texts, the same only for tuples equal part by part: each part is quoted
+ * as JSON, so nothing a part holds (a NUL, a quote, a comma) can pass for the end of one part and
+ * the start of the next. Every unit, claim and key the run tells apart is one of these.
+ */
+export const identity = (...parts: ReadonlyArray<string>): string => JSON.stringify(parts)
+
+/** A key attribute's value as an {@link identity} part: its type and value. A string is an S value. */
+const keyPart = (value: AttributeValue | string | undefined): string =>
+  value === undefined ? "" : canonicalValue(typeof value === "string" ? { S: value } : value)
+
 /** The unit a stored row is judged as ({@link RekeyRowContext.judge}): its stored key. */
-export const rowUnit = (pk: string | undefined, sk: string | undefined): string =>
-  `row\u0000${pk ?? ""}\u0000${sk ?? ""}`
+export const rowUnit = (
+  pk: AttributeValue | string | undefined,
+  sk: AttributeValue | string | undefined,
+): string => identity("row", keyPart(pk), keyPart(sk))
 
 /**
  * The unit a unique sentinel is judged as for its reservation ({@link RekeyRowContext.judge}): is
  * it held, and if not, is it reported or released. Apart from {@link rowUnit}, the unit that moves
  * it, since a sentinel no row holds may still move with the tombstone it names.
  */
-export const reservationUnit = (pk: string | undefined, sk: string | undefined): string =>
-  `reservation\u0000${pk ?? ""}\u0000${sk ?? ""}`
+export const reservationUnit = (
+  pk: AttributeValue | string | undefined,
+  sk: AttributeValue | string | undefined,
+): string => identity("reservation", keyPart(pk), keyPart(sk))
 
 /** What a row in a loop of rows holding each other's current keys is reported with. */
 export const LOOP_MESSAGE =
@@ -458,7 +473,7 @@ class Totals {
       // A row that can't move is met again by what wants its key, and by the scan: whichever
       // reaches it first, it's reported once, and the same way.
       this.memberOf(conflict.member)
-      const row = `${conflict.member}\u0000${conflict.kind}\u0000${stableText(conflict.key)}`
+      const row = identity(conflict.member, conflict.kind, stableText(conflict.key))
       const known = this.conflicts.get(row)
       if (known === undefined || compareOrders(conflictOrder(conflict), conflictOrder(known)) < 0) {
         this.conflicts.set(row, conflict)
@@ -733,14 +748,6 @@ export const fingerprint = (item: Item): string => textHash(canonicalItem(item))
 // The journal: the run's writes, by key
 // ---------------------------------------------------------------------------
 
-/** A key attribute's value as text: what tells two keys apart. */
-const valueText = (value: AttributeValue): string =>
-  value.S !== undefined
-    ? `S${value.S}`
-    : value.N !== undefined
-      ? `N${canonicalNumber(value.N)}`
-      : canonicalValue(value)
-
 /** An update's SET and REMOVE clauses, applied to `image`: `undefined` for any other update. */
 export const updated = (image: Item, update: Update): Item | undefined => {
   const names = update.ExpressionAttributeNames ?? {}
@@ -799,7 +806,7 @@ const keyConditionOf = (input: {
   const rest = raw?.startsWith("(") && raw.endsWith(")") ? raw.slice(1, -1).trim() : raw
   const same = (item: Item) => {
     const at = item[attribute]
-    return at !== undefined && valueText(at) === valueText(value)
+    return at !== undefined && canonicalValue(at) === canonicalValue(value)
   }
   if (rest === undefined) return { attribute, sort: undefined, holds: same }
   const text = (v: AttributeValue | undefined) => v?.S ?? undefined
@@ -868,6 +875,8 @@ interface KeyState {
   takenAt: number | undefined
   /** A dry run's updates to the row stored here, which it didn't put. */
   patches: Array<Update> | undefined
+  /** A dry run's planned row here: its partition key value ({@link Journal.placedIn}). */
+  partition: string | undefined
 }
 
 /** A put's condition is on the row it replaces, as read: it writes over a row stored there. */
@@ -892,7 +901,7 @@ class Journal {
   seq = 0
   private readonly keys = new Map<string, KeyState>()
   private readonly counted = new Set<string>()
-  /** A dry run's planned rows, by the partition key value's text. */
+  /** A dry run's planned rows, by the partition key value ({@link canonicalValue}). */
   private readonly placedIn = new Map<string, Set<string>>()
   /**
    * A dry run's planned rows by the value of an attribute a secondary index is partitioned on,
@@ -912,7 +921,7 @@ class Journal {
     const pk = item[this.names.pk]
     if (pk === undefined) return undefined
     const sk = item[this.names.sk]
-    return `${valueText(pk)}\u0000${sk === undefined ? "" : valueText(sk)}`
+    return identity(canonicalValue(pk), sk === undefined ? "" : canonicalValue(sk))
   }
 
   private state(key: string): KeyState {
@@ -924,6 +933,7 @@ class Journal {
       last: undefined,
       takenAt: undefined,
       patches: undefined,
+      partition: undefined,
     }
     this.keys.set(key, fresh)
     return fresh
@@ -1009,7 +1019,8 @@ class Journal {
     state.own = undefined
     state.any = false
     state.patches = undefined
-    this.placedIn.get(this.partitionOf(key))?.delete(key)
+    if (state.partition !== undefined) this.placedIn.get(state.partition)?.delete(key)
+    state.partition = undefined
     this.indexPlaced(key, undefined)
   }
 
@@ -1019,7 +1030,7 @@ class Journal {
       for (const keys of byValue.values()) keys.delete(key)
       const value = image?.[attribute]
       if (value === undefined) continue
-      const text = valueText(value)
+      const text = canonicalValue(value)
       const keys = byValue.get(text)
       if (keys === undefined) byValue.set(text, new Set([key]))
       else keys.add(key)
@@ -1037,14 +1048,14 @@ class Journal {
           const image = this.keys.get(key)?.last
           const held = image === undefined || image === "taken" ? undefined : image[attribute]
           if (held === undefined) continue
-          const text = valueText(held)
+          const text = canonicalValue(held)
           const same = byValue.get(text)
           if (same === undefined) byValue.set(text, new Set([key]))
           else same.add(key)
         }
       }
     }
-    return byValue.get(valueText(value)) ?? []
+    return byValue.get(canonicalValue(value)) ?? []
   }
 
   /** A put of `image` took effect (or was planned); `replaced`: over the row there, as read. */
@@ -1059,7 +1070,8 @@ class Journal {
     state.patches = undefined
     if (this.dryRun) {
       this.addOwn(state, fingerprint(image))
-      const partition = this.partitionOf(key)
+      const partition = canonicalValue(image[this.names!.pk]!)
+      state.partition = partition
       const set = this.placedIn.get(partition)
       if (set === undefined) this.placedIn.set(partition, new Set([key]))
       else set.add(key)
@@ -1088,10 +1100,6 @@ class Journal {
       if (state.patches === undefined) state.patches = []
       state.patches.push(update)
     }
-  }
-
-  private partitionOf(key: string): string {
-    return key.slice(0, key.indexOf("\u0000"))
   }
 
   private patched(state: KeyState, row: Item): Item {
@@ -1377,7 +1385,7 @@ class Journal {
         value === undefined
           ? []
           : condition.attribute === names.pk
-            ? (this.placedIn.get(valueText(value)) ?? [])
+            ? (this.placedIn.get(canonicalValue(value)) ?? [])
             : this.placedWith(condition.attribute, value)
       for (const key of candidates) {
         if (answered.has(key)) continue

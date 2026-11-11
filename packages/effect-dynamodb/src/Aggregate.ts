@@ -2300,7 +2300,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   )
 
   /** A stored row's position: its partition and sort key. */
-  const positionOf = (pk: string, sk: string): string => `${pk}\u0000${sk}`
+  const positionOf = (pk: string, sk: string): string => Rekey.identity(pk, sk)
   type Position = { readonly pk: string; readonly sk: string }
 
   /**
@@ -3501,7 +3501,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
   })()
   const rekeyPrefix = composeCollectionKey(config.schema, config.collection.name, [])
   const rekeyRootSk = composeKey(config.schema, config.root.entityType, [])
-  const rekeyUnit = (pk: string) => `${aggregateName}\u0000${pk}`
+  const rekeyUnit = (pk: string) => Rekey.identity("aggregate", aggregateName, pk)
 
   const rootItemAt = (tableName: string, pk: string) =>
     Effect.flatMap(Capacity.client, (client) =>

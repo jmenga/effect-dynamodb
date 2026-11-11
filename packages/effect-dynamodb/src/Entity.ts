@@ -13353,7 +13353,7 @@ const makeImpl = <
     extra?: Rekey.RekeyTally,
   ): Rekey.RekeyTally =>
     Rekey.mergeTallies(
-      ctx.claim(`${entityType}\u0000moved\u0000${to[rekeyPk]}\u0000${to[rekeySk]}`)
+      ctx.claim(Rekey.identity(entityType, "moved", to[rekeyPk]!, to[rekeySk]!))
         ? { moved: { [kind]: 1 } }
         : {},
       extra ?? {},
@@ -13375,7 +13375,7 @@ const makeImpl = <
       })
       return there !== undefined &&
         occupantOf(there, to) === "same" &&
-        ctx.claim(`${entityType}\u0000moved\u0000${to[rekeyPk]}\u0000${to[rekeySk]}`)
+        ctx.claim(Rekey.identity(entityType, "moved", to[rekeyPk]!, to[rekeySk]!))
         ? { unchanged: 1 }
         : {}
     })
@@ -13815,7 +13815,7 @@ const makeImpl = <
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      if (!ctx.claim(`${entityType}\u0000indexKeys\u0000${at[rekeyPk]}\u0000${at[rekeySk]}`)) {
+      if (!ctx.claim(Rekey.identity(entityType, "indexKeys", at[rekeyPk]!, at[rekeySk]!))) {
         return { tally: {}, wrote: false }
       }
       let work = judgeIndexKeys(row)
@@ -14569,7 +14569,9 @@ const makeImpl = <
       for (const field of fields) readings.push(new Set([field]))
       readings.push(new Set(fields))
     }
-    const seen = new Set<string>(current === undefined ? [] : [`${current.pk}\u0000${current.sk}`])
+    const seen = new Set<string>(
+      current === undefined ? [] : [Rekey.identity(current.pk, current.sk)],
+    )
     const keysOf = (mixes: ReadonlyArray<ReadonlySet<string>>) => {
       const keys: Array<SentinelKey> = []
       for (const under of sentinelTexts()) {
@@ -14578,8 +14580,8 @@ const makeImpl = <
           for (const field of asOther)
             record[field] = otherNumericKind(lifted[field], digits(field))
           const key = sentinelKeyUnder(under, constraintName, constraintDef, record, asOther)
-          if (key === undefined || seen.has(`${key.pk}\u0000${key.sk}`)) continue
-          seen.add(`${key.pk}\u0000${key.sk}`)
+          if (key === undefined || seen.has(Rekey.identity(key.pk, key.sk))) continue
+          seen.add(Rekey.identity(key.pk, key.sk))
           keys.push(key)
         }
       }
@@ -15586,7 +15588,7 @@ const makeImpl = <
     const work = moveWork(row, ctx, keys)
     return work === undefined
       ? Effect.succeed("settled")
-      : ctx.judge(entityType, Rekey.rowUnit(row[keys.pk]?.S, row[keys.sk]?.S), work)
+      : ctx.judge(entityType, Rekey.rowUnit(row[keys.pk], row[keys.sk]), work)
   }
 
   /**
