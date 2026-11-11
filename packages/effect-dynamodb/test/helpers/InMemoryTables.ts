@@ -1,11 +1,16 @@
 /**
  * An in-memory DynamoDB for projection and time-series unit tests — GetItem,
- * PutItem, UpdateItem, DeleteItem, Query and TransactWriteItems (`Put` and
- * `Update` items), with condition expressions evaluated: `AND` / `OR` /
- * `NOT`, parentheses, `attribute_exists` / `attribute_not_exists`, and
- * `=` / `<>` / `<` / `<=` / `>` / `>=` on scalar attributes (`#a.#b` paths
- * included). A query's sort key condition — `BETWEEN`, `begins_with` or a
- * comparison — orders `S` keys as text and `B` keys by their bytes (#171).
+ * PutItem, UpdateItem, DeleteItem, Query and TransactWriteItems (`Put`,
+ * `Update`, `Delete` and `ConditionCheck` items), with condition expressions
+ * evaluated: `AND` / `OR` / `NOT`, parentheses, `attribute_exists` /
+ * `attribute_not_exists`, `=` / `<>` on any values, compared by content as
+ * DynamoDB compares them (`sameValue`), and `<` / `<=` / `>` / `>=` on numbers,
+ * strings and bytes (`#a.#b` paths included). A query's sort key condition —
+ * `BETWEEN`, `begins_with` or a comparison — orders `S` keys as text and `B`
+ * keys by their bytes (#171). Updates go through `MockDynamoClient.applyUpdate`;
+ * one whose expression the item can't take, or a transaction naming one item
+ * twice, is rejected with DynamoDB Local's `ValidationException`, as the
+ * library's client reports it (`DynamoValidationError`).
  */
 
 import type {
@@ -15,7 +20,13 @@ import type {
 } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
-import { mockDynamoClientLayer } from "./MockDynamoClient.js"
+import { classifyError } from "../../src/DynamoClient.js"
+import {
+  awsValidationException,
+  DDB_REPEATED_ITEM,
+  mockDynamoClientLayer,
+  updateOutcome,
+} from "./MockDynamoClient.js"
 
 export type Item = Record<string, AttributeValue>
 
@@ -84,6 +95,10 @@ const conditionalCheckFailed = (operation: string) =>
 // Condition expressions
 // ---------------------------------------------------------------------------
 
+/** `obj[key]` when `obj` holds `key` itself: never a name `Object.prototype` supplies. */
+const own = <V>(obj: Readonly<Record<string, V>>, key: string): V | undefined =>
+  Object.hasOwn(obj, key) ? obj[key] : undefined
+
 type Token = { readonly kind: "word" | "op" | "lp" | "rp" | "comma"; readonly text: string }
 
 const tokenize = (expression: string): Array<Token> => {
@@ -103,27 +118,120 @@ const tokenize = (expression: string): Array<Token> => {
   return tokens
 }
 
+/**
+ * A DynamoDB number as sign, significant digits and the power of ten of the
+ * first of them, so two spellings of one number (`1.50`, `1.5`, `15E-1`) read
+ * alike and none loses digits (a number holds up to 38).
+ */
+const decimal = (text: string) => {
+  const m = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text.trim())
+  if (m === null) throw new Error(`InMemoryTables: not a number ${text}`)
+  const all = `${m[2]}${m[3] ?? ""}`
+  const lead = all.length - all.replace(/^0+/, "").length
+  const digits = all.slice(lead).replace(/0+$/, "")
+  const negative = m[1] === "-" && digits !== ""
+  return { negative, digits, exponent: m[2]!.length - lead + Number(m[4] ?? 0) }
+}
+
+/** Order two DynamoDB numbers by value. */
+const compareNumbers = (a: string, b: string): number => {
+  const [x, y] = [decimal(a), decimal(b)]
+  if (x.negative !== y.negative) return x.negative ? -1 : 1
+  const sign = x.negative ? -1 : 1
+  if (x.digits === "" || y.digits === "") {
+    return x.digits === y.digits ? 0 : sign * (x.digits === "" ? -1 : 1)
+  }
+  if (x.exponent !== y.exponent) return sign * (x.exponent < y.exponent ? -1 : 1)
+  return sign * (x.digits < y.digits ? -1 : x.digits > y.digits ? 1 : 0)
+}
+
+const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
+  a.length === b.length && a.every((byte, i) => byte === b[i])
+
+/** Whether two sets hold the same members, by `same`. */
+const sameSet = <A>(a: ReadonlyArray<A>, b: ReadonlyArray<A>, same: (x: A, y: A) => boolean) =>
+  a.every((x) => b.some((y) => same(x, y))) && b.every((y) => a.some((x) => same(x, y)))
+
+/**
+ * Whether two attribute values are equal as DynamoDB compares them: by
+ * content. A map by its keys and their values (in any order), a list by its
+ * elements in order, a set by its members (in any order), a number by its
+ * value, bytes by bytes; values of different types are never equal.
+ */
+export const sameValue = (a: AttributeValue, b: AttributeValue): boolean => {
+  if (a.S !== undefined || b.S !== undefined) return a.S === b.S
+  if (a.N !== undefined || b.N !== undefined) {
+    return a.N !== undefined && b.N !== undefined && compareNumbers(a.N, b.N) === 0
+  }
+  if (a.B !== undefined || b.B !== undefined) {
+    return a.B !== undefined && b.B !== undefined && sameBytes(a.B, b.B)
+  }
+  if (a.BOOL !== undefined || b.BOOL !== undefined) return a.BOOL === b.BOOL
+  if (a.NULL !== undefined || b.NULL !== undefined) return a.NULL === true && b.NULL === true
+  if (a.SS !== undefined || b.SS !== undefined) {
+    return a.SS !== undefined && b.SS !== undefined && sameSet(a.SS, b.SS, (x, y) => x === y)
+  }
+  if (a.NS !== undefined || b.NS !== undefined) {
+    return (
+      a.NS !== undefined &&
+      b.NS !== undefined &&
+      sameSet(a.NS, b.NS, (x, y) => compareNumbers(x, y) === 0)
+    )
+  }
+  if (a.BS !== undefined || b.BS !== undefined) {
+    return a.BS !== undefined && b.BS !== undefined && sameSet(a.BS, b.BS, sameBytes)
+  }
+  if (a.L !== undefined || b.L !== undefined) {
+    return (
+      a.L !== undefined &&
+      b.L !== undefined &&
+      a.L.length === b.L.length &&
+      a.L.every((x, i) => sameValue(x, b.L![i]!))
+    )
+  }
+  if (a.M !== undefined && b.M !== undefined) {
+    const [x, y] = [a.M, b.M]
+    const keys = Object.keys(x)
+    return (
+      keys.length === Object.keys(y).length &&
+      keys.every((k) => Object.hasOwn(y, k) && sameValue(x[k]!, y[k]!))
+    )
+  }
+  return false
+}
+
+/**
+ * Order two values for `<`, `<=`, `>`, `>=`: numbers by value, strings by
+ * their UTF-8 bytes, bytes by bytes. `undefined` for any other pair: such a
+ * comparison never holds.
+ */
+const order = (a: AttributeValue, b: AttributeValue): number | undefined => {
+  if (a.N !== undefined && b.N !== undefined) return compareNumbers(a.N, b.N)
+  if (a.S !== undefined && b.S !== undefined)
+    return Buffer.compare(Buffer.from(a.S), Buffer.from(b.S))
+  if (a.B !== undefined && b.B !== undefined) return compareKey(a, b)
+  return undefined
+}
+
 const compare = (
   a: AttributeValue | undefined,
   b: AttributeValue | undefined,
   op: string,
 ): boolean => {
   if (a === undefined || b === undefined) return op === "<>" ? a !== b : false
-  const av = a.N !== undefined ? Number(a.N) : a.S !== undefined ? a.S : JSON.stringify(a)
-  const bv = b.N !== undefined ? Number(b.N) : b.S !== undefined ? b.S : JSON.stringify(b)
+  if (op === "=") return sameValue(a, b)
+  if (op === "<>") return !sameValue(a, b)
+  const ordered = order(a, b)
+  if (ordered === undefined) return false
   switch (op) {
-    case "=":
-      return av === bv
-    case "<>":
-      return av !== bv
     case "<":
-      return av < bv
+      return ordered < 0
     case "<=":
-      return av <= bv
+      return ordered <= 0
     case ">":
-      return av > bv
+      return ordered > 0
     default:
-      return av >= bv
+      return ordered >= 0
   }
 }
 
@@ -139,14 +247,15 @@ export const holds = (
   let i = 0
   const peek = () => tokens[i]
   const next = () => tokens[i++]!
+  // Names are looked up as the item's (or the map's) own attributes only.
   const path = (word: string): AttributeValue | undefined => {
-    const parts = word.split(".").map((p) => (p.startsWith("#") ? names[p]! : p))
-    let v: AttributeValue | undefined = current?.[parts[0]!]
-    for (const p of parts.slice(1)) v = v?.M?.[p]
+    const parts = word.split(".").map((p) => (p.startsWith("#") ? own(names, p)! : p))
+    let v: AttributeValue | undefined = current === undefined ? undefined : own(current, parts[0]!)
+    for (const p of parts.slice(1)) v = v?.M === undefined ? undefined : own(v.M, p)
     return v
   }
   const operand = (word: string): AttributeValue | undefined =>
-    word.startsWith(":") ? values[word] : path(word)
+    word.startsWith(":") ? own(values, word) : path(word)
   const primary = (): boolean => {
     const t = next()
     if (t.kind === "lp") {
@@ -323,27 +432,6 @@ const conditionFails = (
   return !holds(condition, store.get(key), names ?? {}, values ?? {})
 }
 
-const applyUpdate = (
-  current: Item,
-  expression: string,
-  names: Record<string, string>,
-  values: Record<string, AttributeValue>,
-): Item => {
-  const next: Item = { ...current }
-  const set = /SET (.*?)(?: REMOVE |$)/.exec(expression)
-  const remove = /REMOVE (.*)$/.exec(expression)
-  if (set) {
-    for (const assignment of set[1]!.split(",")) {
-      const [l, r] = assignment.split("=").map((x) => x.trim())
-      next[names[l!]!] = values[r!]!
-    }
-  }
-  if (remove) {
-    for (const n of remove[1]!.split(",")) delete next[names[n.trim()]!]
-  }
-  return next
-}
-
 export const InMemoryClient = mockDynamoClientLayer({
   query: (input) =>
     Effect.sync(() => {
@@ -396,16 +484,9 @@ export const InMemoryClient = mockDynamoClientLayer({
       ) {
         return Effect.fail(conditionalCheckFailed("UpdateItem"))
       }
-      const current = store.get(key) ?? { ...input.Key! }
-      store.set(
-        key,
-        applyUpdate(
-          current,
-          input.UpdateExpression!,
-          input.ExpressionAttributeNames ?? {},
-          input.ExpressionAttributeValues ?? {},
-        ),
-      )
+      const outcome = updateOutcome(store.get(key) ?? { ...input.Key! }, input)
+      if (outcome._tag === "Refused") return Effect.fail(classifyError("UpdateItem")(outcome.error))
+      store.set(key, outcome.item)
       return Effect.succeed({} as never)
     }),
   deleteItem: (input) =>
@@ -446,15 +527,22 @@ export const InMemoryClient = mockDynamoClientLayer({
           }),
         )
       }
+      const keys = ops.map((op) => {
+        const write = (op.Put ?? op.Update ?? op.Delete ?? op.ConditionCheck)!
+        return keyOf(write.TableName!, op.Put?.Item ?? (write as { Key: Item }).Key)
+      })
+      if (new Set(keys).size !== keys.length) {
+        return Effect.fail(
+          classifyError("TransactWriteItems")(awsValidationException(DDB_REPEATED_ITEM)),
+        )
+      }
       // All conditions first; then every write.
-      const reasons = ops.map((op) => {
-        const write = op.Put ?? op.Update
-        if (write === undefined) return { Code: "None" }
-        const key = keyOf(write.TableName!, op.Put?.Item ?? op.Update!.Key!)
+      const reasons = ops.map((op, i) => {
+        const write = (op.Put ?? op.Update ?? op.Delete ?? op.ConditionCheck)!
         return conditionFails(
           write.TableName!,
           op.Put?.Item,
-          key,
+          keys[i]!,
           write.ConditionExpression,
           write.ExpressionAttributeNames,
           write.ExpressionAttributeValues,
@@ -462,6 +550,17 @@ export const InMemoryClient = mockDynamoClientLayer({
           ? { Code: "ConditionalCheckFailed" }
           : { Code: "None" }
       })
+      // An update whose condition passed but whose expression the item can't take rejects
+      // the whole request, ahead of any other item's failed condition.
+      const updated = ops.map((op, i) =>
+        op.Update === undefined || reasons[i]!.Code !== "None"
+          ? undefined
+          : updateOutcome(store.get(keys[i]!) ?? { ...op.Update.Key! }, op.Update),
+      )
+      const refusal = updated.find((outcome) => outcome?._tag === "Refused")
+      if (refusal?._tag === "Refused") {
+        return Effect.fail(classifyError("TransactWriteItems")(refusal.error))
+      }
       if (reasons.some((r) => r.Code !== "None")) {
         return Effect.fail(
           new DynamoError({
@@ -473,22 +572,11 @@ export const InMemoryClient = mockDynamoClientLayer({
           }),
         )
       }
-      for (const op of ops) {
-        if (op.Put?.Item !== undefined)
-          store.set(keyOf(op.Put.TableName!, op.Put.Item), op.Put.Item)
-        const update = op.Update
-        if (update?.Key !== undefined) {
-          const key = keyOf(update.TableName!, update.Key)
-          store.set(
-            key,
-            applyUpdate(
-              store.get(key) ?? { ...update.Key },
-              update.UpdateExpression!,
-              update.ExpressionAttributeNames ?? {},
-              update.ExpressionAttributeValues ?? {},
-            ),
-          )
-        }
+      for (const [i, op] of ops.entries()) {
+        const outcome = updated[i]
+        if (op.Put?.Item !== undefined) store.set(keys[i]!, op.Put.Item)
+        if (outcome?._tag === "Updated") store.set(keys[i]!, outcome.item)
+        if (op.Delete !== undefined) store.delete(keys[i]!)
       }
       return Effect.succeed({} as never)
     }),

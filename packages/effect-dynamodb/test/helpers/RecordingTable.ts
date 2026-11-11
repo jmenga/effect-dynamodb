@@ -12,14 +12,27 @@
  * asked for it, as DynamoDB does. With `refuseBodiesOver`, a request whose
  * body ({@link sdkBodyBytes}) is over that many bytes is refused as DynamoDB
  * Local refuses one over 16 MiB: HTTP 413, before it is read.
+ *
+ * Requests DynamoDB rejects are rejected here with DynamoDB Local's
+ * `ValidationException`, as the library's client reports it
+ * (`DynamoValidationError`): an update whose expression the item can't take
+ * (`MockDynamoClient.updateOutcome`), checked once its condition has passed and
+ * request-wide in a transaction; a batch, or a transaction, naming one item
+ * twice.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer } from "effect"
-import { DynamoClient } from "../../src/DynamoClient.js"
+import { classifyError, DynamoClient } from "../../src/DynamoClient.js"
 import { holds } from "./InMemoryTables.js"
-import { applyUpdate, mockDynamoClient } from "./MockDynamoClient.js"
+import {
+  awsValidationException,
+  DDB_REPEATED_BATCH_ITEM,
+  DDB_REPEATED_ITEM,
+  mockDynamoClient,
+  updateOutcome,
+} from "./MockDynamoClient.js"
 
 export type Item = Record<string, AttributeValue>
 
@@ -64,6 +77,14 @@ const conditionFailed = (operation: string, item: Item | undefined, input: Recor
         item !== undefined && { Item: item }),
     }),
   })
+
+/** DynamoDB's `ValidationException` for `message`, as the library's client reports it. */
+const validationFailure = (operation: string, message: string) =>
+  classifyError(operation)(awsValidationException(message))
+
+/** Whether two of `keys` name one item. */
+const repeats = (keys: ReadonlyArray<Item>) =>
+  new Set(keys.map((key) => keyOf(key))).size !== keys.length
 
 const passes = (input: Record<string, any>, item: Item | undefined) =>
   holds(
@@ -143,8 +164,9 @@ export const makeRecordingTable = (options?: {
     options?.refuseBodiesOver !== undefined &&
     sdkBodyBytes(command, input) > options.refuseBodiesOver
 
-  const update = (input: Record<string, any>, current: Item | undefined): Item =>
-    applyUpdate(current ?? { ...input.Key }, input)!
+  /** The item an update writes, or DynamoDB's rejection of it. */
+  const update = (input: Record<string, any>, current: Item | undefined) =>
+    updateOutcome(current ?? { ...input.Key }, input)
 
   const client = mockDynamoClient({
     getItem: (input) =>
@@ -173,7 +195,11 @@ export const makeRecordingTable = (options?: {
         if (!passes(input, current)) {
           return Effect.fail(conditionFailed("UpdateItem", current, input))
         }
-        const next = update(input, current)
+        const outcome = update(input, current)
+        if (outcome._tag === "Refused") {
+          return Effect.fail(classifyError("UpdateItem")(outcome.error))
+        }
+        const next = outcome.item
         items.set(key, next)
         const returned =
           input.ReturnValues === "ALL_OLD" || input.ReturnValues === "UPDATED_OLD"
@@ -299,8 +325,12 @@ export const makeRecordingTable = (options?: {
         } as never
       }),
     batchGetItem: (input) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         record("BatchGetItem", input)
+        const requested = Object.values(input.RequestItems ?? {})
+        if (requested.some((request) => repeats(request.Keys ?? []))) {
+          return Effect.fail(validationFailure("BatchGetItem", DDB_REPEATED_BATCH_ITEM))
+        }
         const Responses: Record<string, Array<Item>> = {}
         for (const [table, request] of Object.entries(input.RequestItems ?? {})) {
           Responses[table] = (request.Keys ?? []).flatMap((key) => {
@@ -308,12 +338,24 @@ export const makeRecordingTable = (options?: {
             return item === undefined ? [] : [item]
           })
         }
-        return { Responses, UnprocessedKeys: {} } as never
+        return Effect.succeed({ Responses, UnprocessedKeys: {} } as never)
       }),
     batchWriteItem: (input) =>
       Effect.suspend(() => {
         record("BatchWriteItem", input)
         if (refused("BatchWriteItem", input)) return Effect.fail(tooLargeFailure("BatchWriteItem"))
+        const written = Object.values(input.RequestItems ?? {})
+        if (
+          written.some((requests) =>
+            repeats(
+              requests.map(
+                (request) => request.PutRequest?.Item ?? request.DeleteRequest?.Key ?? {},
+              ),
+            ),
+          )
+        ) {
+          return Effect.fail(validationFailure("BatchWriteItem", DDB_REPEATED_BATCH_ITEM))
+        }
         for (const requests of Object.values(input.RequestItems ?? {})) {
           for (const request of requests) {
             if (request.PutRequest?.Item !== undefined) {
@@ -327,14 +369,18 @@ export const makeRecordingTable = (options?: {
         return Effect.succeed({ UnprocessedItems: {} } as never)
       }),
     transactGetItems: (input) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
         record("TransactGetItems", input)
-        return {
-          Responses: (input.TransactItems ?? []).map((get) => {
+        const gets = input.TransactItems ?? []
+        if (repeats(gets.map((get) => get.Get?.Key ?? {}))) {
+          return Effect.fail(validationFailure("TransactGetItems", DDB_REPEATED_ITEM))
+        }
+        return Effect.succeed({
+          Responses: gets.map((get) => {
             const item = items.get(keyOf(get.Get!.Key!))
             return item === undefined ? {} : { Item: item }
           }),
-        } as never
+        } as never)
       }),
     transactWriteItems: (input) =>
       Effect.suspend(() => {
@@ -347,15 +393,7 @@ export const makeRecordingTable = (options?: {
           keyOf(op.Put?.Item ?? op.Update?.Key ?? op.Delete?.Key ?? op.ConditionCheck?.Key ?? {}),
         )
         if (new Set(keys).size !== keys.length) {
-          return Effect.fail(
-            new DynamoError({
-              operation: "TransactWriteItems",
-              cause: Object.assign(
-                new Error("Transaction request cannot include multiple operations on one item"),
-                { name: "ValidationException" },
-              ),
-            }),
-          )
+          return Effect.fail(validationFailure("TransactWriteItems", DDB_REPEATED_ITEM))
         }
         const reasons = ops.map((op, i) => {
           const write = (op.Put ?? op.Update ?? op.Delete ?? op.ConditionCheck)!
@@ -368,6 +406,17 @@ export const makeRecordingTable = (options?: {
                   current !== undefined && { Item: current }),
               }
         })
+        // An update whose condition passed but whose expression the item can't take rejects
+        // the whole request, ahead of any other item's failed condition.
+        const updated = ops.map((op, i) =>
+          op.Update === undefined || reasons[i]!.Code !== "None"
+            ? undefined
+            : update(op.Update, items.get(keys[i]!)),
+        )
+        const refusal = updated.find((outcome) => outcome?._tag === "Refused")
+        if (refusal?._tag === "Refused") {
+          return Effect.fail(classifyError("TransactWriteItems")(refusal.error))
+        }
         if (reasons.some((reason) => reason.Code !== "None")) {
           return Effect.fail(
             new DynamoError({
@@ -381,7 +430,8 @@ export const makeRecordingTable = (options?: {
         }
         for (const [i, op] of ops.entries()) {
           if (op.Put !== undefined) items.set(keys[i]!, op.Put.Item!)
-          if (op.Update !== undefined) items.set(keys[i]!, update(op.Update, items.get(keys[i]!)))
+          const outcome = updated[i]
+          if (outcome?._tag === "Updated") items.set(keys[i]!, outcome.item)
           if (op.Delete !== undefined) items.delete(keys[i]!)
         }
         return Effect.succeed({} as never)

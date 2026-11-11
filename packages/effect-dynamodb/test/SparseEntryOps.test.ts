@@ -57,8 +57,18 @@ describe("an entry operation reaches the entry, whatever its key is called", () 
       Effect.gen(function* () {
         const was = fixture.cases[each.key]!
         const got = yield* capture(Lib as never, each)
-        if (each.expected === undefined) {
-          // DynamoDB refuses the operation on an attribute that isn't there: as on 1.39.0.
+        // Sent as an expression, an operation reading an entry the row doesn't hold is refused by
+        // DynamoDB ("The provided expression refers to an attribute that does not exist in the
+        // item"), and now by the recording table as DynamoDB Local refuses it (#243). The fixture
+        // recorded a table that took the update: 1.39.0 sent the same requests up to that one.
+        const refused = each.expected === undefined && !each.whole
+        if (refused) {
+          const last = got.commands[got.commands.length - 1]
+          expect(got).toMatchObject({ ok: false, error: `DynamoValidationError ${last}` })
+          expect(got.commands).toEqual(was.commands.slice(0, got.commands.length))
+          expect(got.stored).toBeUndefined()
+        } else if (each.expected === undefined) {
+          // Written whole, the row takes it, as on 1.39.0.
           expect(got.ok).toBe(was.ok)
           if (got.ok) expect(got.stored).toEqual(was.stored)
         } else {
@@ -73,7 +83,9 @@ describe("an entry operation reaches the entry, whatever its key is called", () 
           got.stored !== undefined,
         )
         // Sent as an expression, the operation sends what 1.39.0 sent.
-        if (!each.whole) expect({ ...got, read: undefined }).toEqual({ ...was, read: undefined })
+        if (!each.whole && !refused) {
+          expect({ ...got, read: undefined }).toEqual({ ...was, read: undefined })
+        }
       }),
     )
   }

@@ -89,12 +89,45 @@ export const mockOutput = <T extends { readonly $metadata: unknown }>(
 ): T => fields as T
 
 /**
+ * `obj[key]` when `obj` holds `key` itself: never a name `Object.prototype`
+ * supplies (`constructor`, `toString`, `__proto__`, …).
+ */
+const own = <V>(obj: Readonly<Record<string, V>>, key: string): V | undefined =>
+  Object.hasOwn(obj, key) ? obj[key] : undefined
+
+/** Set `obj[key]` as an own property, `__proto__` included. */
+const setOwn = <V>(obj: Record<string, V>, key: string, value: V): void => {
+  Object.defineProperty(obj, key, { value, writable: true, enumerable: true, configurable: true })
+}
+
+// DynamoDB's rejections of an update expression the item can't take, as
+// DynamoDB Local words them. Each is a request-wide `ValidationException`, in a
+// transaction too, checked once the update's condition has passed, and the
+// update writes nothing.
+
+/** An operand naming an attribute, map key or list element the item doesn't hold. */
+export const DDB_UPDATE_MISSING_ATTRIBUTE =
+  "The provided expression refers to an attribute that does not exist in the item"
+/** A path below an attribute or map key the item doesn't hold, or below one that isn't a map or list. */
+export const DDB_UPDATE_INVALID_PATH =
+  "The document path provided in the update expression is invalid for update"
+/** `+` / `-` on an operand that isn't a number, `list_append` on one that isn't a list, … */
+export const DDB_UPDATE_OPERAND_TYPE =
+  "An operand in the update expression has an incorrect data type"
+
+/**
  * Apply an UpdateItem request to an in-memory item, for mocks that keep a
- * store. Understands the shapes the library emits for whole attributes —
- * `SET #a = :v`, `SET #v = #v + :n`, `REMOVE #a` — which is every write of the
- * read-then-write update branch. Anything else (path expressions, ADD,
- * list_append, …) only bumps the `version` attribute, so a retain update can
- * still recognise its own write by version.
+ * store. Understands `SET`, `REMOVE`, `ADD` and `DELETE` clauses on document
+ * paths (`#a`, `#a.#b`, `#a[0]`), with `+` / `-`, `if_not_exists` and
+ * `list_append` operands. An expression it can't read only bumps the `version`
+ * attribute, so a retain update can still recognise its own write by version.
+ *
+ * An update DynamoDB rejects throws DynamoDB's `ValidationException`, as the
+ * AWS SDK throws it, and the item is left as it was: an operand naming an
+ * attribute the item doesn't hold ({@link DDB_UPDATE_MISSING_ATTRIBUTE}), a
+ * path below one it doesn't hold ({@link DDB_UPDATE_INVALID_PATH}), an operand
+ * of the wrong type ({@link DDB_UPDATE_OPERAND_TYPE}). A table answers it with
+ * {@link updateOutcome}. Names are looked up as the item's own attributes only.
  */
 export const applyUpdate = (
   item: Record<string, AttributeValue> | undefined,
@@ -113,10 +146,34 @@ export const applyUpdate = (
   if (applied) return next
   // An expression this doesn't read: the write landed, and its fields are unknown.
   const fallback: Record<string, AttributeValue> = { ...item }
-  if (fallback.version?.N !== undefined) {
-    fallback.version = { N: String(Number(fallback.version.N) + 1) }
-  }
+  const version = own(fallback, "version")?.N
+  if (version !== undefined) setOwn(fallback, "version", { N: String(Number(version) + 1) })
   return fallback
+}
+
+/**
+ * An UpdateItem as a table answers it, once its condition has passed: the
+ * item to store, or the `ValidationException` DynamoDB rejects the update
+ * with (see {@link applyUpdate}), which writes nothing.
+ */
+export const updateOutcome = (
+  item: Record<string, AttributeValue>,
+  input: Parameters<typeof applyUpdate>[1],
+):
+  | { readonly _tag: "Updated"; readonly item: Record<string, AttributeValue> }
+  | { readonly _tag: "Refused"; readonly error: Error } => {
+  try {
+    return { _tag: "Updated", item: applyUpdate(item, input)! }
+  } catch (error) {
+    if (error instanceof Error && error.name === "ValidationException") {
+      return { _tag: "Refused", error }
+    }
+    throw error
+  }
+}
+
+const refuse = (message: string): never => {
+  throw awsValidationException(message)
 }
 
 type UpdateClause = { readonly action: "SET" | "REMOVE" | "ADD" | "DELETE"; readonly text: string }
@@ -159,7 +216,7 @@ const pathSegments = (
   const segments: Array<string | number> = []
   for (const part of text.split(".")) {
     const parsed = /^(#\w+)((?:\[\d+\])*)$/.exec(part)
-    const name = parsed === null ? undefined : names[parsed[1]!]
+    const name = parsed === null ? undefined : own(names, parsed[1]!)
     if (parsed === null || name === undefined) return undefined
     segments.push(name)
     for (const index of parsed[2]!.matchAll(/\[(\d+)\]/g)) segments.push(Number(index[1]))
@@ -169,45 +226,74 @@ const pathSegments = (
 
 type Container = { [key: string]: AttributeValue } | Array<AttributeValue>
 
-/** The map or list holding a path's last segment. */
+/** The value a map holds under a name, or a list at an index: the container's own entries only. */
+const childOf = (container: Container, segment: string | number): AttributeValue | undefined =>
+  Array.isArray(container)
+    ? typeof segment === "number"
+      ? container[segment]
+      : undefined
+    : typeof segment === "string"
+      ? own(container, segment)
+      : undefined
+
+/**
+ * The map or list holding a path's last segment: `undefined` when a segment
+ * above it is missing, or isn't a map (for a name) or a list (for an index).
+ */
 const parentOf = (
   root: Record<string, AttributeValue>,
   segments: ReadonlyArray<string | number>,
 ): Container | undefined => {
-  let container: Container | undefined = root
-  for (const segment of segments.slice(0, -1)) {
-    const value: AttributeValue | undefined = (container as any)?.[segment]
-    container = value?.M ?? value?.L
-    if (container === undefined) return undefined
+  let container: Container = root
+  for (let at = 0; at < segments.length - 1; at++) {
+    const value = childOf(container, segments[at]!)
+    const inner: Container | undefined = typeof segments[at + 1] === "number" ? value?.L : value?.M
+    if (inner === undefined) return undefined
+    container = inner
   }
   return container
 }
 
+/** The container a path writes into: DynamoDB rejects a path below one the item doesn't hold. */
+const parentToWrite = (
+  root: Record<string, AttributeValue>,
+  segments: ReadonlyArray<string | number>,
+): Container => parentOf(root, segments) ?? refuse(DDB_UPDATE_INVALID_PATH)
+
 const readPath = (
   root: Record<string, AttributeValue>,
   segments: ReadonlyArray<string | number>,
-): AttributeValue | undefined => (parentOf(root, segments) as any)?.[segments[segments.length - 1]!]
+): AttributeValue | undefined => {
+  const parent = parentOf(root, segments)
+  return parent === undefined ? undefined : childOf(parent, segments[segments.length - 1]!)
+}
 
 const writePath = (
   root: Record<string, AttributeValue>,
   segments: ReadonlyArray<string | number>,
   value: AttributeValue,
 ): void => {
-  const parent = parentOf(root, segments)
-  if (parent !== undefined) (parent as any)[segments[segments.length - 1]!] = value
+  const parent = parentToWrite(root, segments)
+  const last = segments[segments.length - 1]!
+  if (Array.isArray(parent)) parent[last as number] = value
+  else setOwn(parent, last as string, value)
 }
 
 const removePath = (
   root: Record<string, AttributeValue>,
   segments: ReadonlyArray<string | number>,
 ): void => {
-  const parent = parentOf(root, segments)
+  const parent = parentToWrite(root, segments)
   const last = segments[segments.length - 1]!
   if (Array.isArray(parent)) parent.splice(last as number, 1)
-  else if (parent !== undefined) delete parent[last]
+  else if (Object.hasOwn(parent, last)) delete parent[last]
 }
 
-/** A SET clause's right-hand side, or `undefined` if this doesn't read it. */
+/**
+ * A SET clause's right-hand side, or `undefined` if this doesn't read it. Its
+ * `value` is `undefined` for a path the item doesn't hold, which only
+ * `if_not_exists` takes.
+ */
 const operand = (
   text: string,
   root: Record<string, AttributeValue>,
@@ -219,27 +305,37 @@ const operand = (
   if (sum !== undefined) {
     const left = operand(sum.left, root, names, values)
     const right = operand(sum.right, root, names, values)
-    if (left?.value?.N === undefined || right?.value?.N === undefined) return undefined
-    const [a, b] = [Number(left.value.N), Number(right.value.N)]
-    return { value: { N: String(sum.operator === "+" ? a + b : a - b) } }
+    if (left === undefined || right === undefined) return undefined
+    const [a, b] = [held(left.value).N, held(right.value).N]
+    if (a === undefined || b === undefined) return refuse(DDB_UPDATE_OPERAND_TYPE)
+    return {
+      value: { N: String(sum.operator === "+" ? Number(a) + Number(b) : Number(a) - Number(b)) },
+    }
   }
   if (trimmed.startsWith(":")) {
-    const value = values[trimmed]
+    const value = own(values, trimmed)
     return value === undefined ? undefined : { value }
   }
   const call = /^(if_not_exists|list_append)\((.*)\)$/.exec(trimmed)
   if (call !== null) {
     const [first, second] = splitTopLevel(call[2]!)
     const a = operand(first!, root, names, values)
+    if (a === undefined) return undefined
+    if (call[1] === "if_not_exists" && a.value !== undefined) return a
     const b = operand(second!, root, names, values)
-    if (a === undefined || b === undefined) return undefined
-    if (call[1] === "if_not_exists") return { value: a.value ?? b.value }
-    if (a.value?.L === undefined || b.value?.L === undefined) return undefined
-    return { value: { L: [...a.value.L, ...b.value.L] } }
+    if (b === undefined) return undefined
+    if (call[1] === "if_not_exists") return { value: held(b.value) }
+    const [x, y] = [held(a.value).L, held(b.value).L]
+    if (x === undefined || y === undefined) return refuse(DDB_UPDATE_OPERAND_TYPE)
+    return { value: { L: [...x, ...y] } }
   }
   const path = pathSegments(trimmed, names)
   return path === undefined ? undefined : { value: readPath(root, path) }
 }
+
+/** An operand's value: DynamoDB rejects one naming something the item doesn't hold. */
+const held = (value: AttributeValue | undefined): AttributeValue =>
+  value ?? refuse(DDB_UPDATE_MISSING_ATTRIBUTE)
 
 /** `text` split on its last top-level match of `separator`. */
 const splitOutside = (text: string, separator: RegExp) => {
@@ -274,25 +370,27 @@ const applyClauses = (
       const at = text.indexOf(" = ")
       const path = at < 0 ? undefined : pathSegments(text.slice(0, at), names)
       const value = at < 0 ? undefined : operand(text.slice(at + 3), before, names, values)
-      if (path === undefined || value?.value === undefined) return false
-      writePath(root, path, value.value)
+      if (path === undefined || value === undefined) return false
+      writePath(root, path, held(value.value))
     } else {
       const [target, source] = text.split(/\s+/)
       const path = target === undefined ? undefined : pathSegments(target, names)
-      const value = source === undefined ? undefined : values[source]
+      const value = source === undefined ? undefined : own(values, source)
       if (path === undefined || value === undefined) return false
       const current = readPath(root, path)
       if (value.N !== undefined && action === "ADD") {
+        if (current !== undefined && current.N === undefined) refuse(DDB_UPDATE_OPERAND_TYPE)
         writePath(root, path, { N: String(Number(current?.N ?? 0) + Number(value.N)) })
       } else {
         const kind = value.SS !== undefined ? "SS" : value.NS !== undefined ? "NS" : undefined
         if (kind === undefined) return false
-        const held: ReadonlyArray<string> = (current as any)?.[kind] ?? []
-        const given: ReadonlyArray<string> = (value as any)[kind]
+        if (current !== undefined && current[kind] === undefined) refuse(DDB_UPDATE_OPERAND_TYPE)
+        const stored: ReadonlyArray<string> = current?.[kind] ?? []
+        const given: ReadonlyArray<string> = value[kind]!
         const merged =
           action === "ADD"
-            ? [...new Set([...held, ...given])]
-            : held.filter((entry) => !given.includes(entry))
+            ? [...new Set([...stored, ...given])]
+            : stored.filter((entry) => !given.includes(entry))
         if (merged.length === 0) removePath(root, path)
         else writePath(root, path, { [kind]: merged } as unknown as AttributeValue)
       }
