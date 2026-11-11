@@ -2881,14 +2881,14 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * written, and every write is conditional: the Put only where nothing is, the Delete and the
    * rewrite only while the row is as read, whole, with each attribute its entity type can hold and
    * it didn't still absent (`wholeRowGuard`; a row too wide for that, on its `updatedAt` when the
-   * aggregate stamps one, or else as `unprovable` decides: under `"report"` an aggregate nothing of
-   * which has moved is left as it is, every row, and each such row is reported `unguarded`, dry run
-   * or not; one already part-moved is finished under the strongest guard that fits, as 1.39.0
-   * finished it). Rows whose keys chain move in order, the one whose current key is free first, so
-   * no write lands on a row still to move, and the root moves last, so a move cut short is found by
-   * the next run. A write that loses to a concurrent
-   * one reads the aggregate again; a row stored under both keys leaves the aggregate as it is,
-   * reported. A dry run writes nothing.
+   * aggregate stamps one, `preferredGuard`, or else as `unprovable` decides: under `"report"` an
+   * aggregate nothing of which has moved is left as it is, every row, and each such row is reported
+   * `unguarded`, dry run or not; one already part-moved is finished under the strongest guard that
+   * fits, as 1.39.0 finished it). Rows whose keys chain move in order, the one whose current key is
+   * free first, so no write lands on a row still to move, and the root moves last, so a move cut
+   * short is found by the next run. A write that loses to a concurrent one reads the aggregate
+   * again; a row stored under both keys leaves the aggregate as it is, reported. A dry run writes
+   * nothing.
    */
   const rekeyCore = (
     key: Record<string, unknown>,
@@ -3084,28 +3084,21 @@ const makeAggregate = <TSchema extends Schema.Top>(
           )
         const unprovableHere: UnprovableRow = partMoved ? "strongest" : unprovable
         // The row as read, whole, with every attribute its entity type can hold and it didn't
-        // still absent. A row too wide for that is guarded on its `updatedAt` when the aggregate
-        // stamps one, which every write changes, held or absent; otherwise `unprovableHere`
-        // decides, and `undefined` is a row reported.
+        // still absent: 1.39.0's guard with those appended. A row too wide for that is guarded on
+        // its `updatedAt` when the aggregate stamps one, held or absent (`preferredGuard`), with
+        // what else fits; otherwise `unprovableHere` decides, and `undefined` is a row reported.
         const guardOf = (at: { readonly pk: string; readonly sk: string }, r: number) => {
           const read = storedAt.get(positionOf(at.pk, at.sk)) ?? {}
           const absent = writableAttributes.get(built[r]!.__edd_e__?.S ?? "") ?? []
-          const whole = wholeRowGuard(
-            read,
-            config.pk.field,
-            updatedField === null ? [] : [updatedField],
-            [],
-            absent,
-          )
+          const prefer = updatedField === null ? [] : [updatedField]
+          const whole = wholeRowGuard(read, config.pk.field, prefer, [], absent)
           if (whole !== undefined) return whole
-          if (updatedField !== null) {
-            return preferredGuard(read, config.pk.field, [updatedField], absent)
-          }
+          if (updatedField !== null) return preferredGuard(read, config.pk.field, prefer, absent)
           switch (unprovableHere) {
             case "report":
               return undefined
             case "strongest":
-              return asReadGuard(read, config.pk.field, [])
+              return asReadGuard(read, config.pk.field, prefer)
           }
         }
         const keyOf = (at: { readonly pk: string; readonly sk: string }) =>
@@ -3196,7 +3189,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             },
           ])
         }
-        // Its rows move together or not at all: one unguarded row leaves the aggregate as it is.
+        // Nothing of it has moved (`unprovableHere`): an unguarded row leaves the aggregate as is.
         if (unguarded.length > 0) {
           return {
             ...(movedRows > 0 && { moved: { aggregate: movedRows } }),

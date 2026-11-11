@@ -3,8 +3,8 @@
  * 360,000-byte payload. `rekey` reads it, and an ordinary `Aggregate.update` under the old key text
  * then changes the payload. On 1.39.0 the move's guard named 149 of its attributes and not the
  * payload, so the move put the stale payload at the new key and deleted the updated row, with no
- * conflict. With writes going on the aggregate is now left whole, reported `unguarded`, and the
- * update kept; with writes stopped it moves.
+ * conflict. With writes going on the aggregate, nothing of which has moved, is now left as it is,
+ * reported `unguarded`, and the update kept; with writes stopped it moves.
  *
  * Run on a recording table (`RekeyWideAggregate.test.ts`) and on DynamoDB Local
  * (`connected.rekey-wide-aggregate.test.ts`).
@@ -159,7 +159,7 @@ export const CASES: ReadonlyArray<
   [false, true].map(
     (writesStopped) =>
       [
-        `${toEscaped ? "to on" : "to off"}, ${writesStopped ? "writes stopped: it moves" : "writes going on: left whole, unguarded, the update kept"}`,
+        `${toEscaped ? "to on" : "to off"}, ${writesStopped ? "writes stopped: it moves" : "writes going on: left as it is, unguarded, the update kept"}`,
         toEscaped,
         writesStopped,
       ] as const,

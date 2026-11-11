@@ -5416,10 +5416,10 @@ const makeImpl = <
     readonly values: globalThis.Record<string, AttributeValue>
     readonly inputs: ReadonlyArray<string>
     /**
-     * Whether the guard proves the row unchanged: it holds the version, the whole row, or the
-     * `updatedAt` every library write of this entity sets (absent when the read had none). When it
-     * doesn't, `rekey` decides by `Rekey.unprovableRow`; a soft, retain or unique delete sends it
-     * anyway, as 1.39.0 did (`UnprovableRow` `"strongest"`).
+     * Whether the guard proves the row unchanged, as far as its terms see (DESIGN.md §7 "What 'as
+     * read' proves"): it holds the version, the whole row, or the entity's `updatedAt` (held, or
+     * absent when the read had none). When it doesn't, `rekey` decides by `Rekey.unprovableRow`; a
+     * soft, retain or unique delete sends it anyway, as 1.39.0 did (`UnprovableRow` `"strongest"`).
      */
     readonly proves: boolean
   } => {
@@ -5503,8 +5503,8 @@ const makeImpl = <
         expression = `${expression} AND ${clause}`
         inputs.push(attr)
       }
-      // `updatedAt` goes first, and every library write of the entity sets it: guarded, held or
-      // absent, it proves the row. Without it, nothing guarded is what every write changes.
+      // `updatedAt` goes first: guarded, held or absent, it proves the row as far as a stamp does.
+      // Without it, no stamp a write changes is guarded.
       const proves = updatedAttr !== null && inputs.includes(updatedAttr)
       return { expression, names, values, inputs, proves }
     }
@@ -15157,8 +15157,8 @@ const makeImpl = <
 
   /**
    * A projection's row tombstone or outbox item as read, whole, and unclaimed by a drainer since. A
-   * row too wide for that holds nothing every write changes, so `unprovable` decides: `undefined`
-   * when it's reported.
+   * row too wide for that has no stamp to stand in, so `unprovable` decides: `undefined` when it's
+   * reported.
    */
   const valuelessGuard = (read: StoredRow, pkField: string, unprovable: UnprovableRow) => {
     const claims = [OUTBOX_CLAIM, OUTBOX_CLAIMED_UNTIL]

@@ -1206,43 +1206,82 @@ row: over one whose TTL has passed), a Delete or in-place rewrite only while
 the row is as read. A write that lands in between wins, and the move reads
 again or reports the row (`contended`).
 
-**What "as read" proves.** A Delete or rewrite is guarded on the whole row
-(`wholeRowGuard`, `internal/ExpressionLimits.ts`): it exists, every attribute
-it was read with holds the value read, and every attribute its member can write
-that it was read without is still absent. For an unversioned entity that is its
-model's fields, its index keys, vector attributes and timestamps
-(`deleteGuard`); for an aggregate row, its node's fields, the context fields and
-discriminators a row beneath the root carries, the index keys, the timestamps
-and `__edd_e__` (`writableAttributes`). A versioned entity's item is guarded on
-its version and incarnation, which every library write changes. A write that
-only adds an attribute none of the member's declarations name is not seen, and
-the move, which puts the row as it read it, drops that attribute.
+**What "as read" proves.** A Delete or rewrite is guarded on the whole row: it
+exists, every attribute it was read with holds the value read, and each
+attribute its member can write that it was read without is still absent. What a
+member can write is what the library enumerates from its declarations. For an
+unversioned entity the guard is `deleteGuard`'s, as 1.39.0 sent it: its model's
+fields, its index keys, vector attributes and timestamps. For an aggregate row,
+a stream row, and a projection's row tombstone or outbox item it is
+`wholeRowGuard` (`internal/ExpressionLimits.ts`): the guard 1.39.0 sent, byte
+for byte (`updatedAt` first; a drainer's claim still absent), followed by each
+absent attribute; with none it is the request 1.39.0 sent. An aggregate row's
+are its node's fields, the context fields and discriminators a row beneath the
+root carries, the index keys, the timestamps and `__edd_e__`
+(`writableAttributes`); a stream row's and a projection row's, none more. A
+versioned entity's item is guarded on its version and incarnation, as 1.39.0
+guarded it.
 
 A row too wide for its whole guard (DynamoDB's limits on one expression) is
-guarded on its `updatedAt` first, which every library write changes, then on as
-many of its other attributes as fit (`deleteGuard`'s fallback,
-`preferredGuard`). A library write is always seen; a write from outside the
-library that changes an attribute left out, and not `updatedAt`, is not.
-Whether `updatedAt` proves the row is the member's configuration, not the row's:
-a timestamped member's row written before it stamped one is guarded on
-`updatedAt` still absent, and a library write sets it. A wide row of a member
-with no `updatedAt` (and no version), and a stream row or a projection's row
-tombstone or outbox item too wide to guard whole, is one nothing proves
-unchanged. `Rekey.unprovableRow` decides it, by `RekeyOptions.writesStopped`:
+guarded, when its member stamps an `updatedAt`, on that stamp, held or still
+absent, then on as many of its other attributes as fit: an entity's in
+`deleteGuard`'s fallback order, an aggregate row's as 1.39.0 sent them, followed
+by as many of the absent ones as fit (`preferredGuard`). Whether the stamp
+proves the row is the member's configuration, not the row's: a timestamped
+member's row written before it stamped one is guarded on `updatedAt` still
+absent. A stamp or version stored under another name (`field:`) is guarded by
+that name.
+
+A guard sees a write only through its terms. The move puts the row back as it
+read it, so a write it doesn't see is lost, as on 1.39.0:
+
+- a write that only adds an attribute the library can't enumerate: one no
+  declaration names (written outside the library), a sparse map's entry, or a
+  field of an aggregate node the walk doesn't read (an annotated class, a
+  union's members);
+- on a row guarded by its stamp (a versioned item, or a wide row guarded on its
+  `updatedAt`), a write that leaves the stamp as it was: `reembed`, which sets
+  the vector alone; one landing within the stamp's resolution (the same
+  millisecond, or the same second for an `updatedAt` stored as epoch seconds);
+  one from outside the library; and, on an aggregate row whose node declares its
+  own `updatedAt` field, any write (the field is the caller's, not a stamp).
+
+A wide row of a member with no `updatedAt` (and no version), and a stream row or
+a projection's row tombstone or outbox item too wide to guard whole, is one
+nothing proves unchanged. `Rekey.unprovableRow` decides it, by
+`RekeyOptions.writesStopped`:
 
 - **Writes going on** (the default): the row is left where it is and reported
   `unguarded`, before anything of it is written, and in a dry run too. An
-  aggregate's rows move together or not at all, so one such row leaves the
-  aggregate as it is, each such row reported. A stream is checked before
-  anything of it is copied (and its leftover rows again before they're
-  deleted), and a row of it leaves the stream as it is. A projection's row
-  tombstone or outbox item is judged alone.
+  aggregate or a stream is left as it is only while nothing of it has moved,
+  each such row reported: an aggregate with no row moved in this run and none
+  read at a current key other than its old one; a stream not flipped, with no
+  row under its current partition key that belongs there. One already
+  part-moved, in this run or a run cut short, is finished under the strongest
+  guard that fits, as 1.39.0 finished it: left across two keys, a read under
+  either misses rows. A projection's row tombstone or outbox item is judged
+  alone.
 - **Writes stopped** (`writesStopped: true`): nothing can change the row, so it
   moves under the strongest guard that fits, as 1.39.0 sent.
+
+The strongest guard that fits is 1.39.0's (`asReadGuard`): as many of the row's
+attributes as fit, so a concurrent write to one it leaves out is lost.
 
 A soft, retain or unique delete with no `updatedAt` on a wide row is not a move:
 it keeps sending the strongest guard that fits (Guarded read-then-write), as
 1.39.0 did, and a concurrent write to an attribute left out of it is lost.
+
+**Within DynamoDB's limit on substitutions.** One expression's
+`ExpressionAttributeNames` and `ExpressionAttributeValues` may hold 2 MB
+together. 1.39.0's guard names the row's own attributes and values: at most the
+400 KB the row holds, with a placeholder each. The whole-row guard adds names
+only, one absence term each, and an attribute name can be up to 64 KB, so a
+member declaring long names could take it past 2 MB where 1.39.0's guard
+wasn't. `wholeRowGuard` measures its substitutions (`substitutionsFit`,
+`EXPRESSION_MAX_SUBSTITUTION_BYTES`), and over the limit it is no guard: the row
+is one too wide to guard whole. `preferredGuard` appends an absence term only
+while its substitutions fit. Neither sends a request DynamoDB refuses for its
+substitutions.
 
 | Row | Move |
 |---|---|
@@ -1278,7 +1317,8 @@ moved or gone — a run that stopped after the flip, a write beside it) reads
 both partitions again: a row the current key lacks is copied (a command
 sentinel), a snapshot newer than the current one copied over it, and a row the
 current key holds differently is `bothKeys` and nothing is deleted. Then each
-old row is deleted while it is as read, whole (`wholeRowGuard`): events from the head
+old row is deleted while it is as read, whole (`wholeRowGuard`), or, a row too wide for
+that, under the strongest guard that fits, since the stream is part-moved: events from the head
 down, the other rows, event 1 last. A delete that loses to a write reads again.
 
 **Conflicts** (`RekeyConflict`: member, kind, stored key, target, message):
@@ -1289,8 +1329,8 @@ holds the target), `contended` (concurrent writes on every attempt, or the attem
 aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
 compose a current one; a row whose own key holds a value with no key text, `NaN` under `escapeKeys: true`, or one of whose key
 composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal),
-`unguarded` (a row nothing proves unchanged, with writes going on: What "as read" proves; `message` says to
-stop writes and run with `writesStopped: true`). An aggregate whose root is under both
+`unguarded` (a row nothing proves unchanged, with writes going on, of a member nothing of which has moved:
+What "as read" proves; `message` says to stop writes and run with `writesStopped: true`). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or
 rows are gone since the scan read them (moved or deleted by a write) is
 nothing. A `DynamoClientError` fails the run.
@@ -3423,7 +3463,8 @@ strongest guard that fits. That is `attribute_exists(pk)`, then `updatedAt`
 unchanged (with timestamps), then as many attributes as fit, unique-constraint
 fields first, then the model's fields, then the rest. Without timestamps that
 guard proves nothing about the attributes it leaves out, and the delete sends it
-anyway, as 1.39.0 did; `rekey`'s moves don't (§7 "`rekey`", What "as read"
+anyway, as 1.39.0 did; `rekey`'s moves send it only with writes stopped or to
+finish an aggregate or stream already part-moved (§7 "`rekey`", What "as read"
 proves). With timestamps, every
 library write changes `updatedAt`, so any concurrent library update is detected
 except one in the same millisecond with an identical `updatedAt`. A writer

@@ -5,12 +5,15 @@
  * against the published 1.39.0; `test/RekeyGuards.test.ts` runs the same cases against this source.
  * Rows are written with `escapeKeys` off and moved with it on, under a fixed clock.
  *
- * - **An aggregate with nothing absent to guard**, timestamped and not: the requests `rekey` sends.
+ * - **An aggregate with nothing absent to guard**, timestamped and not, and a timestamped one
+ *   with a row too wide to guard whole: the requests `rekey` sends.
  * - **A wide entity row whose `updatedAt` or version is stored under another name**, and an update
  *   that lands between `rekey`'s read and its move: whether the move kept the update.
  * - **An aggregate whose first wave moved**, and an update that lands before its root's move and
  *   adds a row too wide to guard whole, or one whose run stopped before its root's move and was
  *   updated so before the next: where the aggregate ends up.
+ * - **An event stream whose run stopped after its flip**, and an event too wide to guard whole that
+ *   lands under its old key before the next run: where the stream ends up.
  *
  * The library is taken as a parameter, so one definition serves both.
  */
@@ -26,6 +29,7 @@ export interface Api {
   readonly DynamoModel: any
   readonly DynamoSchema: any
   readonly Entity: any
+  readonly EventStore: any
   readonly Table: any
 }
 
@@ -42,17 +46,19 @@ export interface Outcome {
   readonly kept?: boolean
   /** The partitions holding the aggregate's rows afterwards. */
   readonly partitions?: number
-  /** The aggregate as read under the new key text afterwards. */
+  /** The aggregate, or the stream's events, as read under the new key text afterwards. */
   readonly read?: unknown
 }
 
 export const CASES = [
   "aggregate, no timestamps: the move's requests",
   "aggregate, timestamps: the move's requests",
+  "aggregate, timestamps, a row too wide to guard whole: the move's requests",
   "wide entity, updatedAt stored as zzTime: an update lands before the move",
   "wide entity, version stored as zzVer: an update lands before the move",
   "aggregate part-moved: an update adds a wide row before the root's move",
   "aggregate part-moved by a run cut short: an update adds a wide row, and rekey runs again",
+  "stream flipped by a run cut short: a wide event lands under its old key, and rekey runs again",
 ] as const
 export type Case = (typeof CASES)[number]
 
@@ -103,7 +109,7 @@ const on = (
 /** `client`, with `write` landing just before the first transaction that `when` picks. */
 const racing = (
   client: any,
-  write: () => Effect.Effect<unknown, unknown>,
+  write: () => Effect.Effect<unknown, unknown, any>,
   when: (input: any) => boolean = () => true,
 ) => {
   let landed = false
@@ -123,16 +129,21 @@ const racing = (
   })
 }
 
-const aggregateRequests = (api: Api, timestamps: boolean) =>
+const aggregateRequests = (api: Api, timestamps: boolean, wide = false) =>
   Effect.gen(function* () {
     const world = (escapeKeys: boolean) => {
       const schema = api.DynamoSchema.make({ name: "guards", version: 1, escapeKeys })
       const Main = api.Table.make({ schema, entities: {} })
+      const line = wide
+        ? Schema.Struct({
+            name: Schema.String,
+            v: Schema.String,
+            note: Schema.optionalKey(Schema.String),
+            ...wideFields,
+          })
+        : Schema.Struct({ name: Schema.String, v: Schema.String })
       const Order = api.Aggregate.make(
-        Schema.Struct({
-          id: Schema.String,
-          lines: Schema.Array(Schema.Struct({ name: Schema.String, v: Schema.String })),
-        }),
+        Schema.Struct({ id: Schema.String, lines: Schema.Array(line) }),
         {
           schema,
           table: Main,
@@ -150,7 +161,10 @@ const aggregateRequests = (api: Api, timestamps: boolean) =>
     }
     const table = makeRecordingTable()
     yield* on(api, world(false), table.client, (db) =>
-      db.aggregates.Order.create({ id: "a b", lines: [{ name: "one", v: "v" }] }),
+      db.aggregates.Order.create({
+        id: "a b",
+        lines: [{ name: "one", v: "v", ...(wide ? wideFill : {}) }],
+      }),
     )
     table.take()
     const report = yield* on(api, world(true), table.client, (db) => db.tables.Main.rekey())
@@ -192,7 +206,7 @@ const wideEntityRace = (api: Api, renamed: "updatedAt" | "version") =>
     const report = yield* on(api, world(true), racing(table.client, update), (db) =>
       db.tables.Main.rekey(),
     )
-    const rows = [...table.items.values()]
+    const rows: Array<any> = [...table.items.values()]
     return {
       ...reportOf(report),
       kept: rows.length === 1 && rows[0]!.f159?.S === "changed",
@@ -265,14 +279,76 @@ const partMovedAggregate = (api: Api, cutShort: boolean) =>
     }
   })
 
+class Changed extends Schema.TaggedClass<Changed>()("Changed", { n: Schema.Number }) {}
+
+const flippedStream = (api: Api) =>
+  Effect.gen(function* () {
+    const world = (escapeKeys: boolean) => {
+      const schema = api.DynamoSchema.make({ name: "guards", version: 1, escapeKeys })
+      const Main = api.Table.make({ schema, entities: {} })
+      const stream = api.EventStore.makeStream({
+        table: Main,
+        streamName: "Events",
+        streamId: { composite: ["id"] },
+        events: [Changed],
+      })
+      return {
+        Main,
+        stream,
+        client: api.DynamoClient.make({ entities: {}, tables: { Main } }),
+      }
+    }
+    const old = world(false)
+    const now = world(true)
+    const table = makeRecordingTable()
+    yield* on(api, old, table.client, () =>
+      old.stream.append({ id: "a b" }, [new Changed({ n: 1 }), new Changed({ n: 2 })], 0),
+    )
+    // The run stops at its first delete, after the flip: the stream's rows are under both keys.
+    const stopped = new Proxy(table.client, {
+      get(target, prop) {
+        if (prop === "deleteItem") return () => Effect.fail("stopped")
+        return Reflect.get(target, prop)
+      },
+    })
+    yield* on(api, now, stopped, (db) => db.tables.Main.rekey({ streams: [now.stream] })).pipe(
+      Effect.ignore,
+    )
+    // Event 3 lands under the old key, written with 200 more attributes than an event holds.
+    const rows: Array<any> = [...table.items.values()]
+    const flipped = rows.find((row: any) => row.__edd_moved__ !== undefined)!
+    const second = rows.find((row: any) => row.pk.S === flipped.pk.S && row.version?.N === "2")!
+    const third: Record<string, any> = {
+      ...structuredClone(second),
+      sk: { S: second.sk.S.replace(/2$/, "3") },
+      version: { N: "3" },
+    }
+    for (let i = 0; i < 200; i++) third[`x${i}`] = { S: "v" }
+    table.items.set(`${third.pk.S}|${third.sk.S}`, third)
+    const report = yield* on(api, now, table.client, (db) =>
+      db.tables.Main.rekey({ streams: [now.stream] }),
+    )
+    const read = yield* on(api, now, table.client, () => now.stream.read({ id: "a b" })).pipe(
+      Effect.map((events: any) => events.map((event: any) => [event.version, event.data.n])),
+      Effect.orElseSucceed(() => "unreadable"),
+    )
+    return {
+      ...reportOf(report),
+      partitions: new Set([...table.items.values()].map((row: any) => row.pk.S)).size,
+      read,
+    }
+  })
+
 /** Run one case and return what it did. */
 export const capture = (api: Api, name: Case): Effect.Effect<Outcome> => {
-  const run = (() => {
+  const run: Effect.Effect<object, unknown, unknown> = (() => {
     switch (name) {
       case "aggregate, no timestamps: the move's requests":
         return aggregateRequests(api, false)
       case "aggregate, timestamps: the move's requests":
         return aggregateRequests(api, true)
+      case "aggregate, timestamps, a row too wide to guard whole: the move's requests":
+        return aggregateRequests(api, true, true)
       case "wide entity, updatedAt stored as zzTime: an update lands before the move":
         return wideEntityRace(api, "updatedAt")
       case "wide entity, version stored as zzVer: an update lands before the move":
@@ -281,6 +357,8 @@ export const capture = (api: Api, name: Case): Effect.Effect<Outcome> => {
         return partMovedAggregate(api, false)
       case "aggregate part-moved by a run cut short: an update adds a wide row, and rekey runs again":
         return partMovedAggregate(api, true)
+      case "stream flipped by a run cut short: a wide event lands under its old key, and rekey runs again":
+        return flippedStream(api)
     }
   })()
   return Effect.map(run, (outcome) => plain(outcome) as Outcome) as Effect.Effect<Outcome>

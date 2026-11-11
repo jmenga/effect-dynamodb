@@ -100,32 +100,55 @@ describe("substitutionBytes", () => {
 })
 
 describe("preferredGuard", () => {
-  it("guards the preferred attribute first, then what fits", () => {
-    const read = row(160, { updatedAt: { S: "t" } })
-    const guard = preferredGuard(read, "pk", ["updatedAt"], ["note"])
+  it("is the guard 1.39.0 sent, with the absent attributes that fit after it", () => {
+    // Too wide for the guard 1.39.0 sent to hold every attribute: nothing more fits.
+    const wide = row(160, { updatedAt: { S: "t" } })
+    const full = preferredGuard(wide, "pk", ["updatedAt"], ["note"])
+    expect(full).toEqual(asReadGuard(wide, "pk", ["updatedAt"]))
+    expect(full.ExpressionAttributeNames["#g0"]).toBe("updatedAt")
+    // Room left after it: each absent attribute that fits is appended.
+    const read = row(140, { updatedAt: { S: "t" } })
+    const absent = Array.from({ length: 30 }, (_, i) => `a${i}`)
+    const guard = preferredGuard(read, "pk", ["updatedAt"], absent)
+    const was = asReadGuard(read, "pk", ["updatedAt"])
     expect(
       guard.ConditionExpression.startsWith(
-        "attribute_exists(#gpk) AND #gp0 = :gp0 AND attribute_not_exists(#ga0) AND ",
+        `${was.ConditionExpression} AND attribute_not_exists(#gx0)`,
       ),
     ).toBe(true)
-    expect(guard.ExpressionAttributeNames["#gp0"]).toBe("updatedAt")
-    expect(guard.ExpressionAttributeNames["#ga0"]).toBe("note")
+    expect(guard.ExpressionAttributeNames["#gx0"]).toBe("a0")
+    expect(guard.ExpressionAttributeValues).toEqual(was.ExpressionAttributeValues)
     expect(expressionFits(guard.ConditionExpression)).toBe(true)
     expect(countOperators(guard.ConditionExpression, "condition")).toBeLessThanOrEqual(
       EXPRESSION_MAX_OPERATORS,
     )
+    expect(Object.values(guard.ExpressionAttributeNames)).not.toContain(absent.at(-1))
     // Every name it sends is used.
     for (const name of Object.keys(guard.ExpressionAttributeNames)) {
       expect(guard.ConditionExpression).toContain(name)
     }
   })
 
-  it("guards a preferred attribute the read didn't have as still absent", () => {
-    const guard = preferredGuard(row(160), "pk", ["updatedAt"], [])
+  it("guards a preferred attribute the read didn't have as still absent, first", () => {
+    const guard = preferredGuard(row(160), "pk", ["updatedAt"], ["updatedAt"])
+    expect(guard).toEqual(asReadGuard(row(160), "pk", ["updatedAt"], ["updatedAt"]))
     expect(
       guard.ConditionExpression.startsWith(
-        "attribute_exists(#gpk) AND attribute_not_exists(#gp0) AND ",
+        "attribute_exists(#gpk) AND attribute_not_exists(#ga0) AND #g0 = :g0",
       ),
+    ).toBe(true)
+    expect(guard.ExpressionAttributeNames["#ga0"]).toBe("updatedAt")
+  })
+
+  it("keeps its names and values within DynamoDB's 2 MB for one expression", () => {
+    const long = (i: number) => `${String(i).padStart(3, "0")}${"n".repeat(32_000)}`
+    const absent = Array.from({ length: 70 }, (_, i) => long(i))
+    const guard = preferredGuard(row(1), "pk", [], absent)
+    const appended = Object.keys(guard.ExpressionAttributeNames).filter((p) => p.startsWith("#gx"))
+    expect(appended.length).toBeGreaterThan(0)
+    expect(appended.length).toBeLessThan(70)
+    expect(
+      substitutionsFit(guard.ExpressionAttributeNames, guard.ExpressionAttributeValues ?? {}),
     ).toBe(true)
   })
 })

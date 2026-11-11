@@ -4,10 +4,11 @@
  *
  * - **A row with nothing absent to guard is guarded as 1.39.0 guarded it**, byte for byte: the
  *   whole-row guard is 1.39.0's, `updatedAt` first, with each attribute a write could add appended.
+ *   So is a timestamped aggregate's row too wide to guard whole, with no room left for one.
  * - **A stamp or a version stored under another name is guarded by that name**, so an update that
  *   lands between `rekey`'s read and its move cancels the move, as on 1.39.0.
- * - **An aggregate already part-moved is finished**, under the strongest guard that fits, as on
- *   1.39.0: left across two partitions, a read under either key text misses rows.
+ * - **An aggregate or event stream already part-moved is finished**, under the strongest guard that
+ *   fits, as on 1.39.0: left across two partitions, a read under either key text misses rows.
  */
 
 import { readFileSync } from "node:fs"

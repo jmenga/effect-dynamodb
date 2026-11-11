@@ -1033,7 +1033,7 @@ describe.each([
     )
 
     it.effect(
-      "a row too wide to guard whole, left under a moved stream's old key, stays reported until writes stop",
+      "a row too wide to guard whole, left under a moved stream's old key, moves under the strongest guard that fits",
       () =>
         Effect.gen(function* () {
           const table = makeRecordingTable()
@@ -1063,19 +1063,23 @@ describe.each([
             }),
             ...wideAttributes,
           })
+          // The stream is part-moved: it's finished, as 1.39.0 finished it, with writes going on.
           const before = streamRows(table, pk)
-          for (const dryRun of [true, false]) {
-            const report = yield* rekey(w, table, { dryRun })
-            expect(report.conflicts.map((c) => [c.kind, c.reason, c.key])).toEqual([
-              ["stream", "unguarded", { pk: pk.old, sk: commandSk }],
-            ])
-            expect(streamRows(table, pk)).toEqual(before)
-          }
-          const report = yield* rekey(w, table, { writesStopped: true })
+          const dry = yield* rekey(w, table, { dryRun: true })
+          expect(dry.conflicts).toEqual([])
+          expect(dry.byMember.Ledger?.moved.stream).toBe(2)
+          expect(streamRows(table, pk)).toEqual(before)
+          table.take()
+          const report = yield* rekey(w, table)
           expect(report.conflicts).toEqual([])
           expect(report.byMember.Ledger?.moved.stream).toBe(2)
           expect([...table.items.keys()].filter((key) => key.startsWith(`${pk.old}|`))).toEqual([])
           expect(table.items.get(`${pk.now}|${commandSk}`)?.raw299).toEqual({ S: "v299" })
+          // The wide row's delete is conditioned on the strongest guard that fits.
+          const deleted = table.requests.find(
+            (r) => r.command === "DeleteItem" && (r.input as any).Key.sk.S === commandSk,
+          )?.input as any
+          expect(deleted.ConditionExpression).toMatch(/^attribute_exists\(#gpk\) AND /)
         }),
     )
 

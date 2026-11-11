@@ -950,12 +950,14 @@ export type RekeySkipReason = "notLibrary" | "unregistered" | "unrecognizedKey" 
  *   another layout, and its values can't compose a current one (a `by`
  *   attribute was cleared) (#183)
  * - `unguarded` — it can't be proven unchanged when it moves: guarded whole, it's
- *   over DynamoDB's limits on one expression, and nothing every write sets can
- *   stand in (its member is neither `versioned` nor `timestamps`, or it's a
- *   stream's row or a projection's row tombstone or outbox item). A write
- *   landing between the read and the move would be lost, so it's left, in a dry
- *   run too (for an aggregate or a stream, every row of it). Stop writes to the
- *   table and run with {@link RekeyOptions.writesStopped}
+ *   over DynamoDB's limits on one expression, and it has no version or
+ *   `updatedAt` to stand in (its member is neither `versioned` nor `timestamps`,
+ *   or it's a stream's row or a projection's row tombstone or outbox item). A
+ *   write landing between the read and the move would be lost, so it's left, in
+ *   a dry run too (for an aggregate or a stream nothing of which has moved, every
+ *   row of it; one already part-moved is finished under the strongest guard that
+ *   fits, as on 1.39.0). Stop writes to the table and run with
+ *   {@link RekeyOptions.writesStopped}
  */
 export interface RekeyConflict {
   /** The entity type, aggregate or stream name. */
@@ -1060,10 +1062,11 @@ export interface RekeyOptions {
   readonly repairIndexKeys?: boolean | undefined
   /**
    * Writes to the table are stopped for this run. A row `rekey` can't prove unchanged when it
-   * moves (`unguarded`: too wide to guard whole, with nothing every write sets to stand in) then
+   * moves (`unguarded`: too wide to guard whole, with no version or `updatedAt` to stand in) then
    * moves under the strongest guard that fits, as on 1.39.0. Default `false`: such a row is
    * left where it is and reported `unguarded`, since a write landing between the read and the move
-   * would be lost. Run with this only while nothing else writes to the table.
+   * would be lost, unless its aggregate or stream is already part-moved. Run with this only while
+   * nothing else writes to the table.
    */
   readonly writesStopped?: boolean | undefined
   /** Parallel scan segments (`TotalSegments`), each scanned by its own fiber. Default 1. */

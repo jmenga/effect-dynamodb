@@ -5503,25 +5503,20 @@ export const makeStream = <
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
       /**
-       * `row` as read, whole. A row too wide for that holds nothing every write changes, so
-       * `unprovable` decides: `undefined` when it's reported (`unguardedRows`).
+       * `row` as read, whole, or, a row too wide for that, the strongest guard that fits, as
+       * 1.39.0 sent: only a stream already part-moved deletes one (`unguardedRows`).
        */
-      const guardOfRow = (row: Record<string, AttributeValue>) => {
-        const whole = wholeRowGuard(row, "pk", [], [], [])
-        if (whole !== undefined) return whole
-        switch (unprovable) {
-          case "report":
-            return undefined
-          case "strongest":
-            return asReadGuard(row, "pk", [])
-        }
-      }
+      const guardOfRow = (row: Record<string, AttributeValue>) =>
+        wholeRowGuard(row, "pk", [], [], []) ?? asReadGuard(row, "pk", [])
       /**
-       * The stream's rows that have no guard, each reported `unguarded`, before anything is
-       * copied: its rows move together, so one leaves the stream as it is.
+       * With writes going on (`unprovable`), the rows of a stream nothing of which has moved that
+       * are too wide to guard whole, each reported `unguarded`, before anything is copied: its rows
+       * move together, so one leaves the stream as it is. One already part-moved (a row of it under
+       * `to`, or flipped) is finished under the strongest guard that fits (`guardOfRow`).
        */
       const unguardedRows = (rows: ReadonlyArray<Record<string, AttributeValue>>) => {
-        const unguarded = rows.filter((row) => guardOfRow(row) === undefined)
+        if (unprovable === "strongest") return undefined
+        const unguarded = rows.filter((row) => wholeRowGuard(row, "pk", [], [], []) === undefined)
         if (unguarded.length === 0) return undefined
         return Rekey.mergeTallies(
           ...unguarded.map((row) =>
@@ -5534,18 +5529,14 @@ export const makeStream = <
         )
       }
       /** Delete `row` at `from` while it is as read (`guardOfRow`). `false` when a write changed it. */
-      const remove = (row: Record<string, AttributeValue>) => {
-        const guard = guardOfRow(row)
-        // Never without one: `unguardedRows` reported every such row before anything moved.
-        if (guard === undefined) return Effect.succeed(false)
-        return client
+      const remove = (row: Record<string, AttributeValue>) =>
+        client
           .deleteItem({
             TableName: ctx.tableName,
             Key: toAttributeMap({ pk: from, sk: skOf(row) }),
-            ...guard,
+            ...guardOfRow(row),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
-      }
 
       /**
        * Bring every row still under `from` over, once the stream lives at
@@ -5560,8 +5551,6 @@ export const makeStream = <
        */
       const drain = Effect.gen(function* () {
         const left = yield* readOwn
-        const refused = unguardedRows(left)
-        if (refused !== undefined) return refused
         const there = new Map((yield* readAll(to)).map((row) => [skOf(row), row]))
         const differing: Array<Record<string, AttributeValue>> = []
         for (const row of left) {
@@ -5608,14 +5597,17 @@ export const makeStream = <
         const rows = yield* readOwn
         // Moved since the scan read it.
         if (rows.length === 0) return tally
-        const refused = unguardedRows(rows)
-        if (refused !== undefined) return Rekey.mergeTallies(tally, refused)
         const first = rows.find((row) => skOf(row) === firstSk)
         // Flipped by an earlier attempt or run — or never started here: the
         // stream lives at `to`, and the rows left move to it.
         const flipped = first === undefined || first[MOVED_ATTRIBUTE] !== undefined
         if (!flipped) {
           const atTarget = yield* readAll(to)
+          // Nothing of it has moved while no row of it is under `to` (`unguardedRows`).
+          if (!atTarget.some((row) => !elsewhere(row))) {
+            const refused = unguardedRows(rows)
+            if (refused !== undefined) return Rekey.mergeTallies(tally, refused)
+          }
           // Another stream under other key text moves out first.
           const stale = atTarget.find(elsewhere)
           if (stale !== undefined) {

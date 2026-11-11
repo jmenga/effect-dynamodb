@@ -223,12 +223,12 @@ export const wholeRowGuard = (
 }
 
 /**
- * The guard on a row too wide to guard whole ({@link wholeRowGuard}) that holds a value every
- * library write changes (`prefer`: an `updatedAt`): it exists, each of `prefer` holds the value read
- * (or is still absent, when the read didn't have it), and then, as many as fit DynamoDB's limits on
- * one expression, each of `absent` the read didn't have is still absent and every other attribute
- * but the table key holds the value read. A library write is always seen; a write that changes only
- * what's left out, and not `prefer`, isn't.
+ * The guard on a row too wide to guard whole ({@link wholeRowGuard}) of a member that stamps
+ * `prefer` (an `updatedAt`): {@link asReadGuard}'s condition with `prefer` first, held or, when
+ * the read didn't have it, still absent (for a row holding it, the request 1.39.0 sent, byte for
+ * byte: then as many other attributes as fit), followed by as many of `absent` the read didn't
+ * have still absent as fit DynamoDB's limits on one expression. A write that changes `prefer`
+ * cancels the move; one that changes only what's left out, and not `prefer`, isn't seen.
  */
 export const preferredGuard = (
   stored: Record<string, AttributeValue>,
@@ -240,37 +240,19 @@ export const preferredGuard = (
   readonly ExpressionAttributeNames: Record<string, string>
   readonly ExpressionAttributeValues?: Record<string, AttributeValue>
 } => {
-  const names: Record<string, string> = { "#gpk": pkField }
-  const values: Record<string, AttributeValue> = {}
-  let expression = "attribute_exists(#gpk)"
-  const keyed = (attr: string) => attr !== pkField && attr !== "sk"
-  const preferred = [...new Set(prefer)].filter(keyed)
-  for (const [i, attr] of preferred.entries()) {
-    names[`#gp${i}`] = attr
-    if (stored[attr] === undefined) {
-      expression = `${expression} AND attribute_not_exists(#gp${i})`
-    } else {
-      values[`:gp${i}`] = stored[attr]!
-      expression = `${expression} AND #gp${i} = :gp${i}`
-    }
-  }
+  const guard = asReadGuard(stored, pkField, prefer, prefer)
+  const names: Record<string, string> = { ...guard.ExpressionAttributeNames }
+  const values: Record<string, AttributeValue> = { ...guard.ExpressionAttributeValues }
+  let expression = guard.ConditionExpression
   const missing = [...new Set(absent)].filter(
-    (attr) => keyed(attr) && !preferred.includes(attr) && stored[attr] === undefined,
+    (attr) =>
+      attr !== pkField && attr !== "sk" && stored[attr] === undefined && !prefer.includes(attr),
   )
   for (const [i, attr] of missing.entries()) {
-    const clause = `attribute_not_exists(#ga${i})`
+    const clause = `attribute_not_exists(#gx${i})`
     if (!expressionFits(`${expression} AND ${clause}`)) continue
-    names[`#ga${i}`] = attr
-    expression = `${expression} AND ${clause}`
-  }
-  const attrs = Object.keys(stored)
-    .sort()
-    .filter((attr) => keyed(attr) && !preferred.includes(attr) && stored[attr] !== undefined)
-  for (const [i, attr] of attrs.entries()) {
-    const clause = `#g${i} = :g${i}`
-    if (!expressionFits(`${expression} AND ${clause}`)) continue
-    names[`#g${i}`] = attr
-    values[`:g${i}`] = stored[attr]!
+    if (!substitutionsFit({ ...names, [`#gx${i}`]: attr }, values)) continue
+    names[`#gx${i}`] = attr
     expression = `${expression} AND ${clause}`
   }
   return {
@@ -282,12 +264,13 @@ export const preferredGuard = (
 
 /**
  * What `rekey`'s move does with a row it can't prove unchanged: one whose whole guard ({@link
- * wholeRowGuard}) doesn't fit DynamoDB's limits on one expression, with nothing every library write
- * changes to stand in (its member is neither `versioned` nor `timestamps`, or it's a stream's row or
- * a projection's row tombstone or outbox item). Every move that meets such a row switches on it, so
+ * wholeRowGuard}) doesn't fit DynamoDB's limits on one expression, with no version or `updatedAt`
+ * to stand in (its member is neither `versioned` nor `timestamps`, or it's a stream's row or a
+ * projection's row tombstone or outbox item). Every move that meets such a row switches on it, so
  * a new answer is a type error at each:
  *
- * - `"report"` — the default: the row isn't moved, and is reported `unguarded`.
+ * - `"report"` — the default: the row isn't moved, and is reported `unguarded`. An aggregate or a
+ *   stream already part-moved is finished as under `"strongest"`.
  * - `"strongest"` — with `writesStopped`, as 1.39.0: the strongest guard that fits is sent, so a
  *   concurrent write changing only what it leaves out would land unseen. A soft, retain or unique
  *   delete always sends it.

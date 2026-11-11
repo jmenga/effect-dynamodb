@@ -134,6 +134,9 @@ const lost: Readonly<Record<string, Unseen>> = {
   "aggregate wide plain: raw write changes f159": "too wide, no updatedAt",
   "entity wide timestamps: raw write changes f159": "too wide, updatedAt kept",
   "aggregate wide timestamps: raw write changes f159": "too wide, updatedAt kept",
+  // 1.39.0's guard fills the expression: the absent field's term is appended only where it fits.
+  "aggregate wide timestamps: raw write adds the absent model field note":
+    "too wide, updatedAt kept",
 }
 
 /** The attribute each concurrent write sets, and its value. */
@@ -240,9 +243,9 @@ export const scenarios = (setting: Setting): ReadonlyArray<RaceScenario> =>
 
 /**
  * A timestamped member's row written before it stamped one: too wide to guard whole, with no
- * `updatedAt`. Its member stamps one on every write, so the guard holds it absent, proves the row,
- * and the row moves with writes going on; a write that lands in between stamps one, cancels the
- * move, and moves with the row.
+ * `updatedAt`. A library write of its member stamps one, so the guard holds it absent, proves the
+ * row, and the row moves with writes going on; a write that lands in between stamps one, cancels
+ * the move, and moves with the row.
  */
 export const unstampedScenarios: ReadonlyArray<RaceScenario> = (["entity", "aggregate"] as const)
   .flatMap((kind) => SETTINGS.map(([label, setting]) => ({ kind, label, setting })))
