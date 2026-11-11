@@ -412,7 +412,9 @@ describe("create over a tombstone holding another projection's packed map (#237)
           // Packed, never native `M`: JSON text (compressed only when that's smaller, which a map
           // this small never is).
           expect(store.get(ROW)!.map).toEqual({ S: JSON.stringify({ "invoice#x": 1 }) })
-          expect((yield* w.Rows.get({ id: "x" }).asEffect()).map).toEqual({ "invoice#x": 1 })
+          expect(((yield* w.Rows.get({ id: "x" }).asEffect()) as any).map).toEqual({
+            "invoice#x": 1,
+          })
           yield* w.applyB(invoices[0]!)
           expect(state()).toBe(100)
         }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
@@ -836,7 +838,9 @@ describe("a write over a live row that stores nothing for the other's data (#237
       kind === "sparse map"
         ? (value.amount ?? 0)
         : kind === "packed"
-          ? Option.getOrElse(value, () => ({ amount: 0 })).amount
+          ? Option.getOrElse(value as Option.Option<{ readonly amount: number }>, () => ({
+              amount: 0,
+            })).amount
           : Option.getOrElse(value, () => 0)
     const define = (from: typeof Orders, checkpoint: string, revision: string, evolve: any) =>
       EventStore.projection({
