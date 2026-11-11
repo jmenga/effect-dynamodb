@@ -3155,7 +3155,10 @@ const makeImpl = <
     if (refId !== undefined) {
       return (
         `"${name}" is the id of the ref "${refId.fieldName}", which a row stores whole as ` +
-        `"${refId.fieldName}". Reassign it with .set({ ${name} })`
+        `"${refId.fieldName}". Reassign it with .set({ ${name} })` +
+        (writeLacks().canLack(refId.fieldName)
+          ? `, or remove the ref with .remove(["${refId.fieldName}"])`
+          : "")
       )
     }
     for (const [index, def] of Object.entries(allIndexes)) {
@@ -3237,6 +3240,18 @@ const makeImpl = <
     }
     const ref = resolvedRefs.find((r) => r.fieldName === field || r.idFieldName === field)
     if (ref !== undefined) {
+      // A ref the model declares optional is removed by its field (#241), by `.remove()` or
+      // `.set({ team: undefined })`, one form (`normalizeClears`): the row reads without it, and
+      // leaves the index keyed by its id (`removedSetOf`). A path removal isn't composed into that
+      // index, and the row stores the ref, not its id, so those are pointed at the field. Up to
+      // 1.40.0 every ref was refused here.
+      if (lacks.canLack(ref.fieldName)) {
+        if (field === ref.fieldName && (op === ".remove()" || op === ".set()")) return undefined
+        return (
+          `${op} of "${field}": "${ref.fieldName}" is a ref the model declares optional: remove ` +
+          `it with .remove(["${ref.fieldName}"]). Nothing was sent.`
+        )
+      }
       return (
         `${op} of "${field}": "${ref.fieldName}" is a ref, so a row without it could not be ` +
         `read. Reassign it with .set({ ${ref.idFieldName} }). Nothing was sent.`
@@ -7516,6 +7531,18 @@ const makeImpl = <
   }
 
   /**
+   * What an update's `.remove()` removes, as the index key composer is told (`removedSet`): the
+   * fields named, and the id of each ref removed, which is the composite a cascade index is keyed
+   * by (#241), so the row leaves that index as it leaves the ref.
+   */
+  const removedSetOf = (removed: ReadonlyArray<string> | undefined): Set<string> | undefined => {
+    if (removed === undefined) return undefined
+    const set = new Set(removed)
+    for (const ref of resolvedRefs) if (set.has(ref.fieldName)) set.add(ref.idFieldName)
+    return set
+  }
+
+  /**
    * Hydrate ref fields by fetching referenced entities by ID and embedding
    * their core domain data. Returns a new object with ref fields populated.
    *
@@ -7531,11 +7558,18 @@ const makeImpl = <
     DynamoClient | TableConfig
   > =>
     Effect.gen(function* () {
-      const refsToProcess = refs ?? resolvedRefs
-      if (refsToProcess.length === 0) return decoded
+      // A ref whose id isn't given (an optional ref left out, #241) names nothing: nothing is
+      // fetched for it and nothing stored. Up to 1.40.0 its id was required.
+      const refsToProcess = (refs ?? resolvedRefs).filter(
+        (ref) => decoded[ref.idFieldName] !== undefined,
+      )
+      const hydrated = { ...decoded }
+      for (const ref of refs ?? resolvedRefs) {
+        if (hydrated[ref.idFieldName] === undefined) delete hydrated[ref.idFieldName]
+      }
+      if (refsToProcess.length === 0) return hydrated
 
       // Fetch all refs in parallel
-      const hydrated = { ...decoded }
       const fetchEffects = refsToProcess.map((ref) => {
         const id = decoded[ref.idFieldName] as string
         return Effect.gen(function* () {
@@ -8641,7 +8675,7 @@ const makeImpl = <
           // first, so a shard it can compute is not refused here (#183).
           {
             onMissingShardSource: "keep",
-            ...(uState.remove === undefined ? {} : { removedSet: new Set(uState.remove) }),
+            ...(uState.remove === undefined ? {} : { removedSet: removedSetOf(uState.remove)! }),
           },
         ),
       )
@@ -9054,7 +9088,7 @@ const makeImpl = <
         // EDD-9024 was deprecated in v1.7.1 — hole patterns don't throw. A
         // Z-order value the composer can't place (EDD-9092, #171) fails the
         // update with a `ValidationError`.
-        const retainRemovedSet = uState.remove ? new Set(uState.remove) : undefined
+        const retainRemovedSet = removedSetOf(uState.remove)
         // The payload's values are the write's own; the rest of `newItem` is the row as stored.
         const ownUpdate = ownPayload(hydratedUpdates as globalThis.Record<string, unknown>)
         const gsiUpdate = yield* composeKeysOrFail(entityType, "update", () =>
@@ -9953,7 +9987,7 @@ const makeImpl = <
       //     under v3 two-way classification, the structural composer just
       //     treats the attribute as absent. (EDD-9025 guarantees these
       //     are never composites.)
-      const removedSet = uState.remove ? new Set(uState.remove) : undefined
+      const removedSet = removedSetOf(uState.remove)
       if (uState.remove) {
         for (const attr of uState.remove) {
           const nameKey = `#r${removeClauses.length}`

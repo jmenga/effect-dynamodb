@@ -2855,11 +2855,18 @@ export const buildDerivedSchemas = (
     const resolved = isConfiguredModel(targetModel)
       ? ((targetModel as ConfiguredModel<Schema.Top, any>).model as Schema.Top)
       : targetModel
-    fields[ref.fieldName] = substituteSchemaDeep(resolved, { enforceChecks: true })
-    readFields[ref.fieldName] = substituteSchemaDeep(resolved, {
-      legacyReads: true,
-      absentReads: true,
-    })
+    // As optional as the model declares it (#241): a row an optional ref was left out of, or
+    // removed from, reads without it. Up to 1.40.0 the target replaced the declaration whole.
+    const optional = optionalField(modelFields[ref.fieldName] as Schema.Top)
+    const asDeclared = (target: Schema.Top) =>
+      optional === undefined ? target : optional.rewrap(target)
+    fields[ref.fieldName] = asDeclared(substituteSchemaDeep(resolved, { enforceChecks: true }))
+    readFields[ref.fieldName] = asDeclared(
+      substituteSchemaDeep(resolved, {
+        legacyReads: true,
+        absentReads: true,
+      }),
+    )
   }
 
   // Each of Effect's look-alike declarations (a `BigDecimal`, a `Duration`, an address, a date in
@@ -2937,6 +2944,14 @@ export const buildDerivedSchemas = (
 
   // --- Input Schema: ref-aware (swap ref fields for ID fields when refs present) ---
   const refFieldSet = new Set(resolvedRefs.map((r) => r.fieldName))
+  // A ref's id is taken as the model takes the ref (#241): required where it's required, and left
+  // out (`Schema.optionalKey`) or `undefined` too (`Schema.optional`) where the model declares the
+  // ref optional, which then stores no ref. Up to 1.40.0 the id was always required.
+  const refIdInput = (ref: (typeof resolvedRefs)[number]): Schema.Top => {
+    const declared = modelFields[ref.fieldName]
+    const optional = declared === undefined ? undefined : optionalField(declared as Schema.Top)
+    return optional === undefined ? ref.keySchema : optional.rewrap(ref.keySchema)
+  }
   const buildInputFieldsAcc = (): globalThis.Record<string, Schema.Top> => {
     const acc: globalThis.Record<string, Schema.Top> = {}
     for (const [key, field] of Object.entries(fields)) {
@@ -2945,7 +2960,7 @@ export const buildDerivedSchemas = (
       if (adjusted !== null) acc[key] = adjusted
     }
     for (const ref of resolvedRefs) {
-      acc[ref.idFieldName] = ref.keySchema
+      acc[ref.idFieldName] = refIdInput(ref)
     }
     return acc
   }
@@ -2964,7 +2979,7 @@ export const buildDerivedSchemas = (
   // Add ID fields for each ref (skip if the ref field is an omitted field)
   for (const ref of resolvedRefs) {
     if (createOmitFields.has(ref.fieldName)) continue
-    createFieldsAcc[ref.idFieldName] = ref.keySchema
+    createFieldsAcc[ref.idFieldName] = refIdInput(ref)
   }
   const createSchema = Schema.Struct(createFieldsAcc as Schema.Struct.Fields)
 
