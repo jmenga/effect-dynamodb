@@ -478,32 +478,39 @@ describeConnected("#171 sort key escaping and E7 — connected", () => {
     }).pipe(provide),
   )
 
-  it.effect(
-    "every operator on every shape, .where() and .within(), forward and reverse, both casings",
-    () =>
-      Effect.gen(function* () {
-        for (const [casing, db] of [
-          ["lowercase", yield* makeDb],
-          ["uppercase", yield* makeUpperDb],
-        ] as const) {
-          const accessors = db.entities.Places as unknown as Record<string, (pins: object) => any>
-          for (const shape of SHAPES) {
-            const inPins = (place: Place) =>
-              Object.entries(shape.pins).every(([k, v]) => place[k as keyof Place] === v)
-            for (const bound of boundsOf(casing, OPERANDS)) {
-              const want = PLACES.filter(
-                (place) => inPins(place) && oracle(casing, bound, place.city),
-              )
-                .map((place) => place.id)
-                .sort()
-              const accessor = () => accessors[shape.index]!({ store: "s-1", ...shape.pins })
-              const queries: Array<[string, any]> = [
-                [".where()", accessor().where(whereOf("city", bound))],
-              ]
-              if (bound.op !== "beginsWith") {
-                queries.push([".within()", accessor().within({ city: withinOf(bound) })])
-              }
-              for (const [via, query] of queries) {
+  // Every operator on every shape, `.where()` and `.within()`, forward and reverse, both casings:
+  // one test per casing, shape and combinator, each 230 (`.where()`) or 210 (`.within()`) queries.
+  // As one test they were 3520 queries, over its 240 s budget when other suites shared DynamoDB
+  // Local and the machine (#243).
+  for (const [casing, makeCasingDb] of [
+    ["lowercase", makeDb],
+    ["uppercase", makeUpperDb],
+  ] as const) {
+    for (const shape of SHAPES) {
+      for (const via of [".where()", ".within()"] as const) {
+        it.effect(
+          `every operator on ${shape.index}, ${via}, forward and reverse, ${casing}`,
+          () =>
+            Effect.gen(function* () {
+              const db = yield* makeCasingDb
+              const accessors = db.entities.Places as unknown as Record<
+                string,
+                (pins: object) => any
+              >
+              const inPins = (place: Place) =>
+                Object.entries(shape.pins).every(([k, v]) => place[k as keyof Place] === v)
+              for (const bound of boundsOf(casing, OPERANDS)) {
+                if (via === ".within()" && bound.op === "beginsWith") continue
+                const want = PLACES.filter(
+                  (place) => inPins(place) && oracle(casing, bound, place.city),
+                )
+                  .map((place) => place.id)
+                  .sort()
+                const accessor = () => accessors[shape.index]!({ store: "s-1", ...shape.pins })
+                const query =
+                  via === ".where()"
+                    ? accessor().where(whereOf("city", bound))
+                    : accessor().within({ city: withinOf(bound) })
                 for (const reverse of [false, true]) {
                   const got: ReadonlyArray<Place> = yield* (
                     reverse ? query.reverse() : query
@@ -514,12 +521,11 @@ describeConnected("#171 sort key escaping and E7 — connected", () => {
                   ).toEqual(want)
                 }
               }
-            }
-          }
-        }
-      }).pipe(provide) as Effect.Effect<void, unknown>,
-    240_000,
-  )
+            }).pipe(provide) as Effect.Effect<void, unknown>,
+        )
+      }
+    }
+  }
 
   it.effect(
     "a time-series primary key: bounds on [zone, device] skip every item's events",
@@ -576,27 +582,31 @@ describeConnected("#171 sort key escaping and E7 — connected", () => {
     240_000,
   )
 
-  it.effect(".history().where() on a string orderBy returns exactly the events it means", () =>
-    Effect.gen(function* () {
-      const db = yield* makeDb
-      const casing = AppSchema.casing
-      const cased = (text: string) => DynamoSchema.applyCasing(text, casing)
-      const order = (a: string, b: string) => compareUtf8(cased(a), cased(b))
-      for (const bound of boundsOf(casing, [...STAMPS, "a ", "c"])) {
-        const want = STAMPS.filter((stamp) => oracle(casing, bound, stamp)).sort(order)
-        for (const reverse of [false, true]) {
-          const query = db.entities.Notes.history({ deviceId: "d-1", channel: "a" }).where(
-            whereOf("stamp", bound) as never,
-          )
-          const got = yield* (reverse ? query.reverse() : query).collect()
-          expect(
-            got.map((note) => `${note.channel}:${note.stamp}`),
-            `${JSON.stringify(bound)}${reverse ? " reversed" : ""}`,
-          ).toEqual((reverse ? [...want].reverse() : want).map((stamp) => `a:${stamp}`))
-        }
-      }
-    }).pipe(provide),
-  )
+  // One test per direction, each 231 queries: as one test they were 462, over its 30 s budget when
+  // other suites shared DynamoDB Local and the machine (#243).
+  for (const reverse of [false, true]) {
+    it.effect(
+      `.history().where() on a string orderBy returns exactly the events it means, ${reverse ? "reversed" : "forward"}`,
+      () =>
+        Effect.gen(function* () {
+          const db = yield* makeDb
+          const casing = AppSchema.casing
+          const cased = (text: string) => DynamoSchema.applyCasing(text, casing)
+          const order = (a: string, b: string) => compareUtf8(cased(a), cased(b))
+          for (const bound of boundsOf(casing, [...STAMPS, "a ", "c"])) {
+            const want = STAMPS.filter((stamp) => oracle(casing, bound, stamp)).sort(order)
+            const query = db.entities.Notes.history({ deviceId: "d-1", channel: "a" }).where(
+              whereOf("stamp", bound) as never,
+            )
+            const got = yield* (reverse ? query.reverse() : query).collect()
+            expect(
+              got.map((note) => `${note.channel}:${note.stamp}`),
+              `${JSON.stringify(bound)}${reverse ? " reversed" : ""}`,
+            ).toEqual((reverse ? [...want].reverse() : want).map((stamp) => `a:${stamp}`))
+          }
+        }).pipe(provide),
+    )
+  }
 
   it.effect(
     "an empty .within() interval on a last composite sends nothing",
