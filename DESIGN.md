@@ -1229,8 +1229,10 @@ absent, then on as many of its other attributes as fit: an entity's in
 by as many of the absent ones as fit (`preferredGuard`). Whether the stamp
 proves the row is the member's configuration, not the row's: a timestamped
 member's row written before it stamped one is guarded on `updatedAt` still
-absent. A stamp or version stored under another name (`field:`) is guarded by
-that name.
+absent. In that fallback an `updatedAt` stored under another name (`field:`) is
+guarded by the attribute it's stored in, as a version is by the attribute
+`versioned: { field }` names. A row its whole guard fits holds the stamp among
+the attributes it was read with, and the request is 1.39.0's.
 
 A guard sees a write only through its terms. The move puts the row back as it
 read it, so a write it doesn't see is lost, as on 1.39.0:

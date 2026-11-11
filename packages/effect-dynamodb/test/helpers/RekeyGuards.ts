@@ -9,6 +9,8 @@
  *   with a row too wide to guard whole: the requests `rekey` sends.
  * - **A wide entity row whose `updatedAt` or version is stored under another name**, and an update
  *   that lands between `rekey`'s read and its move: whether the move kept the update.
+ * - **An entity row whose stamps are stored under other names**, with a unique constraint and
+ *   soft delete: the requests `rekey` sends, and a delete afterwards.
  * - **An aggregate whose first wave moved**, and an update that lands before its root's move and
  *   adds a row too wide to guard whole, or one whose run stopped before its root's move and was
  *   updated so before the next: where the aggregate ends up.
@@ -37,6 +39,8 @@ export interface Api {
 export interface Outcome {
   /** The requests `rekey` sent, whole, in order: for the cases that pin them. */
   readonly requests?: ReadonlyArray<{ readonly command: string; readonly input: unknown }>
+  /** The requests a delete sent after the move, whole, in order: for the cases that pin them. */
+  readonly deleteRequests?: ReadonlyArray<{ readonly command: string; readonly input: unknown }>
   /** The rows afterwards, as stored, by key: for the cases that pin them. */
   readonly rows?: ReadonlyArray<Record<string, unknown>>
   /** `rekey`'s report: rows moved, and each conflict's reason and key. */
@@ -56,6 +60,7 @@ export const CASES = [
   "aggregate, timestamps, a row too wide to guard whole: the move's requests",
   "wide entity, updatedAt stored as zzTime: an update lands before the move",
   "wide entity, version stored as zzVer: an update lands before the move",
+  "entity, stamps stored as zzTime and zzMade, unique and soft delete: the move's and a delete's requests",
   "aggregate part-moved: an update adds a wide row before the root's move",
   "aggregate part-moved by a run cut short: an update adds a wide row, and rekey runs again",
   "stream flipped by a run cut short: a wide event lands under its old key, and rekey runs again",
@@ -213,6 +218,42 @@ const wideEntityRace = (api: Api, renamed: "updatedAt" | "version") =>
     }
   })
 
+const renamedStampRequests = (api: Api) =>
+  Effect.gen(function* () {
+    const world = (escapeKeys: boolean) => {
+      const schema = api.DynamoSchema.make({ name: "guards", version: 1, escapeKeys })
+      const Item = api.Entity.make({
+        entityType: "Item",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+        model: api.DynamoModel.configure(
+          Schema.Struct({
+            id: Schema.String,
+            code: Schema.String,
+            note: Schema.optionalKey(Schema.String),
+            createdAt: Schema.DateTimeUtc,
+            updatedAt: Schema.DateTimeUtc,
+          }),
+          { createdAt: { field: "zzMade" }, updatedAt: { field: "zzTime" } },
+        ),
+        timestamps: true,
+        unique: { code: ["code"] },
+        softDelete: true,
+      })
+      const Main = api.Table.make({ schema, entities: { Item } })
+      return { Main, client: api.DynamoClient.make({ entities: { Item }, tables: { Main } }) }
+    }
+    const table = makeRecordingTable()
+    yield* on(api, world(false), table.client, (db) =>
+      db.entities.Item.put({ id: "a b", code: "c" }),
+    )
+    yield* TestClock.adjust(Duration.seconds(1))
+    table.take()
+    const report = yield* on(api, world(true), table.client, (db) => db.tables.Main.rekey())
+    const requests = table.take()
+    yield* on(api, world(true), table.client, (db) => db.entities.Item.delete({ id: "a b" }))
+    return { requests, deleteRequests: table.take(), ...reportOf(report) }
+  })
+
 const partMovedAggregate = (api: Api, cutShort: boolean) =>
   Effect.gen(function* () {
     const world = (escapeKeys: boolean) => {
@@ -353,6 +394,8 @@ export const capture = (api: Api, name: Case): Effect.Effect<Outcome> => {
         return wideEntityRace(api, "updatedAt")
       case "wide entity, version stored as zzVer: an update lands before the move":
         return wideEntityRace(api, "version")
+      case "entity, stamps stored as zzTime and zzMade, unique and soft delete: the move's and a delete's requests":
+        return renamedStampRequests(api)
       case "aggregate part-moved: an update adds a wide row before the root's move":
         return partMovedAggregate(api, false)
       case "aggregate part-moved by a run cut short: an update adds a wide row, and rekey runs again":

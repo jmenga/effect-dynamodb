@@ -5453,9 +5453,9 @@ const makeImpl = <
             ...new Set([
               ...Object.keys(read),
               ...Object.keys(data.modelFields as object).map(resolveDbName),
-              ...[systemFields.createdAt, systemFields.updatedAt]
-                .filter((f): f is string => typeof f === "string")
-                .map(resolveDbName),
+              ...[systemFields.createdAt, systemFields.updatedAt].filter(
+                (f): f is string => typeof f === "string",
+              ),
               ...gsiKeyFields(),
               ...vectorKeyFields(),
             ]),
