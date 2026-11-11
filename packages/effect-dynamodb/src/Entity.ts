@@ -362,9 +362,11 @@ import {
   getSchemaFields,
   inferDefaultEncoding,
   makePathValueEncoder,
+  type PathSetValue,
   primaryKeyComposites,
   type ResolvedSystemFields,
   resolveUniqueFields,
+  type UnionClause,
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import type {
   AppendInputType,
@@ -2921,6 +2923,15 @@ const makeImpl = <
   }
 
   /**
+   * A `pathSet` value as it's written ({@link PathSetValue}): by the schema at its path, or, where
+   * that refuses it, by another member of a union on the way that takes it (#238), which
+   * {@link unionRefusal} judges with the update's other clauses.
+   */
+  const encodePathSet = (segments: ReadonlyArray<string | number>, value: unknown): PathSetValue =>
+    entryOfPath(segments) !== undefined
+      ? { encoded: value, issue: undefined, otherWay: false, check: () => undefined }
+      : pathValues.pathSet(segments, value)
+  /**
    * A `pathSet` or `pathSubtract` that names another attribute in place of a value: it has no
    * operand of its own. The other path operations always write their `value`, whatever else the
    * operation object holds.
@@ -4009,6 +4020,13 @@ const makeImpl = <
         const { segments, value } = operand
         // An untyped position is looked through where the operand is marshalled (`unstorableOperand`).
         if (!customFields.has(String(segments[0])) || entryOfPath(segments) !== undefined) continue
+        if (op === "pathSet of") {
+          // Read back by the way the value is written by (#238).
+          const written = encodePathSet(segments, value)
+          const issue = written.check(asRead(written.encoded))
+          if (issue !== undefined) return notReadBack(`${op} "${segments.join(".")}"`, issue)
+          continue
+        }
         const { encoded } = encodePathValue(segments, value, kind)
         const read = asRead(encoded)
         const issue =
@@ -4110,7 +4128,9 @@ const makeImpl = <
         const value =
           kind === undefined
             ? operand.value
-            : encodePathValue(operand.segments, operand.value, kind).encoded
+            : op === "pathSet of"
+              ? encodePathSet(operand.segments, operand.value).encoded
+              : encodePathValue(operand.segments, operand.value, kind).encoded
         if (kind !== undefined) {
           const lost = lostOperand(op, operand.segments, value)
           if (lost !== undefined) return lost
@@ -4271,6 +4291,11 @@ const makeImpl = <
       if (read.issue !== undefined) return { operation: "update.append", issue: read.issue }
       append[field] = read.encoded
     }
+    // The first `pathSet` the schema at its path refuses and another member of a union on the way
+    // takes (#238): how 1.40.0 refused the update, which stands where the union can't take it.
+    let refusedBefore: RefusedOperand | undefined
+    // The `pathSet`s, by index, so taken.
+    const otherWays = new Set<number>()
     const each = (
       operation: string,
       ops:
@@ -4286,16 +4311,25 @@ const makeImpl = <
       copies = false,
     ): ReadonlyArray<unknown> | RefusedOperand => {
       const values: Array<unknown> = []
-      for (const op of ops ?? []) {
+      for (const [index, op] of (ops ?? []).entries()) {
         // A copy writes another attribute's value: there's nothing to encode.
         if (copies && isCopy(op)) {
           values.push(undefined)
           continue
         }
-        const { encoded, issue } = encodePathValue(op.segments, op.value, kind)
-        if (issue !== undefined) return { operation, issue }
-        const read = operandAsRead(op.segments, "path", kind, op.value, encoded)
-        if (read.issue !== undefined) return { operation, issue: read.issue }
+        const written: {
+          readonly encoded: unknown
+          readonly issue: unknown
+        } & Partial<PathSetValue> = copies
+          ? encodePathSet(op.segments, op.value)
+          : encodePathValue(op.segments, op.value, kind)
+        if (written.issue !== undefined) return refusedBefore ?? { operation, issue: written.issue }
+        if (written.otherWay === true) {
+          refusedBefore ??= { operation, issue: written.refusedBefore }
+          otherWays.add(index)
+        }
+        const read = operandAsRead(op.segments, "path", kind, op.value, written.encoded)
+        if (read.issue !== undefined) return refusedBefore ?? { operation, issue: read.issue }
         values.push(read.encoded)
       }
       return values
@@ -4327,6 +4361,8 @@ const makeImpl = <
         })
       }
     }
+    const refused = unionRefusal(uState, pathSets, otherWays, refusedBefore)
+    if (refused !== undefined) return refused
     const byField = (record: globalThis.Record<string, unknown> | undefined) => {
       const out: globalThis.Record<string, unknown> = Object.create(null)
       for (const [field, value] of Object.entries(record ?? {})) {
@@ -4404,6 +4440,69 @@ const makeImpl = <
     return absent === undefined
       ? undefined
       : new ValidationError({ entityType, operation: absent.operation, cause: absent.cause })
+  }
+
+  /**
+   * A path write into a union's member, judged with the update's other clauses in the same field
+   * (#238): refused where no member of each union on the way reads what they leave there together
+   * (`readTogether`), every clause judged where the schema says what a member reads after it.
+   * Where a value is taken only by another member than the schema at its path (`refusedBefore`,
+   * which 1.40.0 refused), a clause the schema can't judge leaves it refused as 1.40.0 refused it;
+   * otherwise such a clause is taken as read, and the update is sent as 1.40.0 sent it.
+   */
+  const unionRefusal = (
+    uState: UpdateState,
+    pathSets: ReadonlyArray<unknown>,
+    otherWays: ReadonlySet<number>,
+    refusedBefore: RefusedOperand | undefined,
+  ): RefusedOperand | undefined => {
+    const sets = uState.pathSets ?? []
+    const judgedPath = (segments: ReadonlyArray<string | number>) =>
+      segments.length > 1 && entryOfPath(segments) === undefined
+    const fields = new Set(
+      sets
+        .filter(
+          (op) => !isCopy(op) && judgedPath(op.segments) && pathValues.passesUnion(op.segments),
+        )
+        .map((op) => String(op.segments[0])),
+    )
+    if (fields.size === 0) return undefined
+    const clauses = clausesOf(uState)
+    let refusal: RefusedOperand | undefined
+    for (const field of fields) {
+      const inField = (segments: ReadonlyArray<string | number>) =>
+        clauseAt(segments) === `field:${field}`
+      const judged: Array<UnionClause> = []
+      let otherWay = false
+      for (const [index, op] of sets.entries()) {
+        if (!inField(op.segments)) continue
+        if (otherWays.has(index)) otherWay = true
+        judged.push(
+          isCopy(op) || !judgedPath(op.segments)
+            ? { _tag: "Other", segments: op.segments }
+            : { _tag: "Value", segments: op.segments, encoded: pathSets[index] },
+        )
+      }
+      const removals = (uState.pathRemoves ?? []).filter(inField)
+      for (const segments of removals) {
+        judged.push({ _tag: judgedPath(segments) ? "Removal" : "Other", segments })
+      }
+      // Every other clause in the field (an increment, an append, a write of all of it, …) is one
+      // the schema can't judge.
+      const rest = clauses.filter((clause) => clause.at === `field:${field}`).length
+      for (let i = judged.length; i < rest; i++) judged.push({ _tag: "Other", segments: [field] })
+      if (pathValues.readTogether(judged, !otherWay)) continue
+      // A value only another member takes, beside what the schema can't judge or what no member
+      // reads with it: refused as 1.40.0 refused the update.
+      if (otherWay) return refusedBefore
+      refusal ??= {
+        operation: "update.pathSet",
+        issue:
+          `the path operations on "${field}" leave a value no member of its union reads: what ` +
+          "one of them needs a member to hold, another removes or refuses. Nothing was sent.",
+      }
+    }
+    return refusal
   }
 
   /**

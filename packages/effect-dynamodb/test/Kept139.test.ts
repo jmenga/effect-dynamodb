@@ -34,6 +34,7 @@ import {
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
 import { storedNaNKeySuite } from "./helpers/StoredNaNKeys.js"
+import { unionPathWritesSuite } from "./helpers/UnionPathWrites.js"
 import { wideShardAppendSuite } from "./helpers/WideShardAppend.js"
 
 describe("an appendInput that may leave a sharded index's composite out", () => {
@@ -134,4 +135,8 @@ describe("a sparse map entry in a query's, a scan's and a collection's filter an
 
 describe("an aggregate list filter below a struct that renames its keys as they're stored", () => {
   aggregateListFiltersSuite(openRecordingTable)
+})
+
+describe("a path write into a union's member", () => {
+  unionPathWritesSuite(openRecordingTable)
 })

@@ -47,6 +47,7 @@ import {
   lackDecision,
   numericTypeWithStringEncoding,
   ReadsAbsentAs,
+  rowCanLack,
   storedList,
   transformWireKind as transformWireKindImpl,
 } from "./SchemaAccessors.js"
@@ -3385,6 +3386,113 @@ export const containedOperand =
   }
 
 /**
+ * A `pathSet` value as it's written (#238): `encoded` by the schema at its path, or, where that
+ * refuses it, by the first other member of a union on the way that takes it (`otherWay`, with the
+ * issue the schema at its path raised, which is how 1.40.0 refused it, as `refusedBefore`).
+ * `issue` is `undefined` when some way takes it; `check` validates a value at the way that did.
+ *
+ * @internal
+ */
+export interface PathSetValue {
+  readonly encoded: unknown
+  readonly issue: unknown
+  readonly otherWay: boolean
+  readonly refusedBefore?: unknown
+  readonly check: (encoded: unknown) => unknown
+}
+
+/**
+ * One clause of an update inside a field, as a union on the way judges it (#238): a value written
+ * at a path (`encoded`, as sent), a property removed, or anything else (a copy, an increment, a
+ * list position removed, the whole field), which the schema can't judge.
+ *
+ * @internal
+ */
+export type UnionClause =
+  | {
+      readonly _tag: "Value"
+      readonly segments: ReadonlyArray<string | number>
+      readonly encoded: unknown
+    }
+  | { readonly _tag: "Removal"; readonly segments: ReadonlyArray<string | number> }
+  | { readonly _tag: "Other"; readonly segments: ReadonlyArray<string | number> }
+
+/** What holds a way's end: a struct, a record, or something else. */
+type UnionParent = "struct" | "record" | "other"
+
+type UnionWayAt = {
+  readonly _tag: "At"
+  readonly original: Schema.Top
+  readonly asDeclared: boolean
+  readonly parent: UnionParent
+}
+
+/**
+ * A way to a path's end through the unions on it ({@link makePathValueEncoder}'s `waysTo`): `At`
+ * the schema there; `Unread`, a plain struct without the next property, which reads past whatever
+ * is under it; `CannotHold`, a scalar, a list given a property or a struct given a position, which
+ * holds nothing there (a value there isn't one it reads, and DynamoDB refuses a path through one);
+ * `Unknown`, anything else.
+ */
+type UnionWay = {
+  readonly choices: ReadonlyMap<string, Schema.Top>
+  readonly end: UnionWayAt | { readonly _tag: "Unread" | "CannotHold" | "Unknown" }
+}
+
+/** Whether a node carries nothing a read runs: no transformation, no check. */
+const plainNode = (ast: SchemaAST.AST): boolean =>
+  ast.checks === undefined &&
+  ast.encoding === undefined &&
+  (ast as { readonly encodingChecks?: unknown }).encodingChecks === undefined
+
+/** The members of a plain union, each union among them in turn; any other schema alone. */
+const membersOf = (schema: Schema.Top): ReadonlyArray<Schema.Top> => {
+  const members = (schema as { readonly members?: unknown }).members
+  if (!SchemaAST.isUnion(schema.ast) || !plainNode(schema.ast) || !Array.isArray(members)) {
+    return [schema]
+  }
+  return (members as ReadonlyArray<Schema.Top>).flatMap(membersOf)
+}
+
+const SCALAR_TAGS: ReadonlySet<string> = new Set([
+  "Null",
+  "Undefined",
+  "String",
+  "Number",
+  "Boolean",
+  "BigInt",
+  "Symbol",
+  "Literal",
+  "UniqueSymbol",
+  "Enum",
+  "TemplateLiteral",
+])
+
+/** What holds a path's next segment: a plain struct, a plain record, or something else. */
+const parentOf = (member: Schema.Top): UnionParent => {
+  const ast = member.ast
+  if (!SchemaAST.isObjects(ast) || !plainNode(ast)) return "other"
+  if (ast.indexSignatures.length === 0) return "struct"
+  return ast.propertySignatures.length === 0 ? "record" : "other"
+}
+
+/** A way's end where a member doesn't hold the path's next segment ({@link UnionWay}). */
+const missingAt = (
+  member: Schema.Top,
+  segment: string | number,
+): { readonly _tag: "Unread" | "CannotHold" | "Unknown" } => {
+  const ast = member.ast
+  if (!plainNode(ast)) return { _tag: "Unknown" }
+  if (SCALAR_TAGS.has(ast._tag)) return { _tag: "CannotHold" }
+  if (SchemaAST.isArrays(ast))
+    return { _tag: typeof segment === "string" ? "CannotHold" : "Unknown" }
+  if (SchemaAST.isObjects(ast) && ast.indexSignatures.length === 0) {
+    return { _tag: typeof segment === "string" ? "Unread" : "CannotHold" }
+  }
+  return { _tag: "Unknown" }
+}
+
+/**
  * Encoders for the VALUES of path-based updates (`pathSet`, `pathAppend`,
  * `pathPrepend`, `pathIfNotExists`) and record-based `append` (#133).
  *
@@ -3443,6 +3551,19 @@ export const makePathValueEncoder = (
   readonly validate: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
   /** `validate` for each element of a list value (append / prepend). */
   readonly validateElements: (segments: ReadonlyArray<string | number>, encoded: unknown) => unknown
+  /**
+   * A `pathSet` value, encoded as it's written ({@link PathSetValue}): by the schema at its path, or,
+   * where that refuses it, by the first other member of a union on the way that takes it (#238).
+   */
+  readonly pathSet: (segments: ReadonlyArray<string | number>, value: unknown) => PathSetValue
+  /**
+   * Whether the values a union on the way reads can take what an update's clauses inside one field
+   * leave there ({@link UnionClause}), together (#238). `uncertain` answers a clause the schema
+   * can't judge.
+   */
+  readonly readTogether: (clauses: ReadonlyArray<UnionClause>, uncertain: boolean) => boolean
+  /** Whether a path passes a union of several members. */
+  readonly passesUnion: (segments: ReadonlyArray<string | number>) => boolean
 } => {
   const recordFields = writeFields
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
@@ -3803,6 +3924,119 @@ export const makePathValueEncoder = (
     operandForms.set(key, result)
     return result
   }
+  /**
+   * Every way to the end of a path through the model's schema, by the member it takes at each union
+   * of several members on the way (`choices`, keyed by where the union is: the path up to the map
+   * it reads). Within a union's member a path is followed as {@link childAtSegment} follows it.
+   */
+  const waysTo = (segments: ReadonlyArray<string | number>): ReadonlyArray<UnionWay> => {
+    const [head, ...rest] = segments
+    if (typeof head !== "string") return []
+    const start: Schema.Top | undefined = refTargets[head] ?? modelFields[head]
+    if (start === undefined) return []
+    const ways: Array<UnionWay> = []
+    const walk = (
+      schema: Schema.Top,
+      depth: number,
+      choices: ReadonlyMap<string, Schema.Top>,
+      asDeclared: boolean,
+      parent: UnionParent,
+    ): void => {
+      if (depth === rest.length) {
+        ways.push({ choices, end: { _tag: "At", original: schema, asDeclared, parent } })
+        return
+      }
+      const segment = rest[depth]!
+      const opt = optionalField(schema)
+      const members = membersOf(opt?.union ?? opt?.inner ?? schema)
+      // Through a later member of an optional union, a path is written as declared, as
+      // `originalAt` writes it ({@link writesFirstMemberOnly}).
+      const first = opt?.union === undefined ? undefined : new Set(membersOf(opt.inner))
+      const at = JSON.stringify(segments.slice(0, depth + 1))
+      for (const member of members) {
+        const chosen = members.length > 1 ? new Map(choices).set(at, member) : choices
+        const declared = asDeclared || (first !== undefined && !first.has(member))
+        const child = childAtSegment(member, segment)
+        if (child !== undefined) walk(child, depth + 1, chosen, declared, parentOf(member))
+        else ways.push({ choices: chosen, end: missingAt(member, segment) })
+      }
+    }
+    walk(start, 0, new Map(), false, "other")
+    return ways
+  }
+  const wayStored = new Map<Schema.Top, Schema.Top>()
+  const wayDeclared = (way: UnionWayAt): Schema.Top => {
+    if (way.asDeclared) return way.original
+    const found = wayStored.get(way.original)
+    if (found !== undefined) return found
+    const stored = substituteSchemaDeep(way.original, { enforceChecks: true })
+    wayStored.set(way.original, stored)
+    return stored
+  }
+  const wayValidators = new Map<Schema.Top, (encoded: unknown) => unknown>()
+  const wayValidator = (way: UnionWayAt): ((encoded: unknown) => unknown) => {
+    const stored = wayDeclared(way)
+    const found = wayValidators.get(stored)
+    if (found !== undefined) return found
+    const decode = Schema.decodeUnknownExit(stored as Schema.Codec<any>)
+    const fn = (encoded: unknown): unknown => {
+      const exit = decode(asStored(encoded))
+      return exit._tag === "Success" ? undefined : exit.cause
+    }
+    wayValidators.set(stored, fn)
+    return fn
+  }
+  const wayEncoders = new Map<Schema.Top, (value: unknown) => unknown>()
+  const wayEncoder = (way: UnionWayAt): ((value: unknown) => unknown) => {
+    const stored = wayDeclared(way)
+    const found = wayEncoders.get(stored)
+    if (found !== undefined) return found
+    const fn = leafAwareEncoder(way.original, stored)
+    wayEncoders.set(stored, fn)
+    return fn
+  }
+  /** Whether the member a way takes reads what one clause leaves at its end. */
+  const admits = (way: UnionWay, clause: UnionClause): boolean | "unknown" => {
+    if (clause._tag === "Other") return "unknown"
+    const { end } = way
+    switch (end._tag) {
+      case "Unread":
+        return true
+      case "CannotHold":
+        return false
+      case "Unknown":
+        return "unknown"
+      case "At":
+        if (clause._tag === "Value") return wayValidator(end)(clause.encoded) === undefined
+        if (typeof clause.segments[clause.segments.length - 1] !== "string") return "unknown"
+        if (end.parent === "record") return true
+        if (end.parent === "struct") return rowCanLack(end.original)
+        return "unknown"
+    }
+  }
+  const readTogether = (clauses: ReadonlyArray<UnionClause>, uncertain: boolean): boolean => {
+    const options = clauses.map((clause) =>
+      waysTo(clause.segments).filter((way) => {
+        const verdict = admits(way, clause)
+        return verdict === "unknown" ? uncertain : verdict
+      }),
+    )
+    const agree = (
+      held: ReadonlyMap<string, Schema.Top>,
+      choices: ReadonlyMap<string, Schema.Top>,
+    ): boolean => [...choices].every(([at, member]) => (held.get(at) ?? member) === member)
+    const search = (index: number, held: ReadonlyMap<string, Schema.Top>): boolean => {
+      if (index === options.length) return true
+      // A clause with no way the walk follows is one the schema can't judge.
+      if (options[index]!.length === 0 && waysTo(clauses[index]!.segments).length === 0) {
+        return uncertain && search(index + 1, held)
+      }
+      return options[index]!.some(
+        (way) => agree(held, way.choices) && search(index + 1, new Map([...held, ...way.choices])),
+      )
+    }
+    return search(0, new Map())
+  }
   return {
     operand: (segments, value, kind) => {
       const forms = formsAt(segments)
@@ -3817,6 +4051,32 @@ export const makePathValueEncoder = (
       }
       return chosen === undefined ? value : chosen.stored
     },
+    pathSet: (segments, value) => {
+      const first = schemaAt(segments)
+      const encoded = encoderFor(`v:${JSON.stringify(segments)}`, () => first)
+      const firstValidator = validatorFor(`v:${JSON.stringify(segments)}`, () => first?.stored)
+      const written = encoded === null ? value : encoded(value)
+      const check = (read: unknown) => (firstValidator === null ? undefined : firstValidator(read))
+      const issue = check(written)
+      if (issue === undefined) return { encoded: written, issue, otherWay: false, check }
+      for (const way of waysTo(segments)) {
+        if (way.end._tag !== "At") continue
+        const other = wayEncoder(way.end)(value)
+        const taken = wayValidator(way.end)
+        if (taken(other) === undefined) {
+          return {
+            encoded: other,
+            issue: undefined,
+            otherWay: true,
+            refusedBefore: issue,
+            check: taken,
+          }
+        }
+      }
+      return { encoded: written, issue, otherWay: false, check }
+    },
+    readTogether,
+    passesUnion: (segments) => waysTo(segments).some((way) => way.choices.size > 0),
     validate: (segments, encoded) => {
       const fn = validatorFor(`v:${JSON.stringify(segments)}`, () => schemaAt(segments)?.stored)
       return fn === null ? undefined : fn(encoded)

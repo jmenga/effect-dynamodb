@@ -4205,6 +4205,40 @@ List `append` / `prepend` validate each element, but cannot enforce list-level
 checks such as `maxLength`: DynamoDB builds the list server-side. `ADD`,
 `DELETE` and `SUBTRACT` are unchanged.
 
+**A path write into a union's member (#238).** The schema at a path is the one
+`childAtSegment` reaches by taking, at each union on the way, the first member
+that holds the next segment, and through 1.40.0 that member alone checked a
+`pathSet` value: `pathSet(["tag", "kind"], "b")` on
+`Union([{ kind: "a", x }, { kind: "b", y }])` was refused with `Expected "a"`
+whatever the row held, as was `pathSet(["vary", "v"], "tt")` on
+`Union([{ v: number }, { v: string }])`. A value that member refuses is now
+written as the first other way through the unions on the path takes it
+(`pathSet` and `waysTo` in `makePathValueEncoder`: each member of each plain
+union), encoded and validated there; a value no way takes is refused as
+before, with the first member's issue. Every `pathSet` into a union's member is
+then judged with the update's other clauses in the same field (`unionRefusal`
+in `Entity.ts`, `readTogether`): one member of each union on the way must read
+what all of them leave there, a value valid where the member declares the path
+(a plain struct that doesn't declare it reads past it) and a removed property
+the member can lack (`rowCanLack`); a scalar or a list holds no path below it.
+Where the schema can't say (a member that isn't a plain struct, record or
+scalar; a removed list position; an increment, an append, a copy or a write of
+the whole field beside it), a value only another member takes stays refused as
+1.40.0 refused it, and beside values the first member takes the update is sent
+as 1.40.0 sent it. So `tag.kind = "b"`, alone or beside `tag.y = 2`, is sent,
+as `tag.kind = "a"` was; beside `pathRemove(["tag", "y"])` (`b` requires `y`),
+`tag.y = "s"` or `pathAdd(["tag", "y"], 1)` it is refused as on 1.40.0; and
+`tag.kind = "a"` beside `pathRemove(["tag", "x"])` is refused with nothing
+sent (`ValidationError` `update.pathSet`), where 1.40.0 applied it and left a
+row no read takes. A path write reads nothing of the row, so a tag written
+alone keeps whatever else the row holds: on a row holding the other member the
+update is applied and its read-back reports a row that no longer matches the
+model, as 1.40.0's `tag.kind = "a"` does on a row holding `b` (a transaction
+reads nothing back and succeeds). Each request is the one 1.40.0 sent for the
+same paths, but for the value (`test/fixtures/union-path-writes-1.40.0.json`,
+`helpers/UnionPathWrites.ts`, alone and in a transaction, on the recording
+table and DynamoDB Local).
+
 **Path operations on key and unique fields (#133).** DynamoDB evaluates a path
 operation, so compiling one on an index composite or unique field would change
 the attribute while its keys and sentinel stayed put. `normalizeDerivedPathOps`
