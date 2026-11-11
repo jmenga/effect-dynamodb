@@ -7,8 +7,9 @@
  * whole as `sr`, it reported success and wrote entries a read never sees, because a read takes `sr`
  * in their place (and a condition the caller gave, where it held, let the rest of the write
  * through). The head sends the same request with `attribute_not_exists(sr)` beside its own
- * condition, and answers its refusal on such a row with a `ValidationError` (`EDD-9150`): nothing
- * is written. On a row holding entries, or no row, the guard holds and the upsert does what 1.40.0
+ * condition, and answers its refusal on such a row with a `ValidationError` (`EDD-9150`), nothing
+ * written, where the rest of the condition holds on the row; where it doesn't, the upsert fails on
+ * the caller's condition, as 1.40.0 did. On a row holding entries, or no row, the guard holds and the upsert does what 1.40.0
  * did. An upsert writing no entry (`counts: {}`), and every upsert of an entity whose sparse map
  * isn't renamed, is sent as 1.40.0 sent it. `fixtures/renamed-sparse-map-upserts-1.40.0.json`
  * holds what the published 1.40.0 did in each case.
@@ -169,12 +170,13 @@ export const renamedSparseMapUpsertsSuite = (open: OpenTable) => {
         const name = `${on}: ${label}`
         const was = upsertFixture.cases[name]!
         const renamed = entity !== "Unrenamed"
-        const refused = renamed && entries && seed === "put"
+        // Refused where the caller's condition holds: where it doesn't, the caller's verdict wins.
+        const refused = renamed && entries && seed === "put" && was.outcome.ok !== undefined
         it.effect(
           !renamed || !entries
             ? `${name}: as 1.40.0`
             : refused
-              ? `${name}: refused (EDD-9150), where 1.40.0 ${was.outcome.ok !== undefined ? "reported success and lost the entries" : "failed on the caller's condition"}`
+              ? `${name}: refused (EDD-9150), where 1.40.0 reported success and lost the entries`
               : `${name}: guarded, and otherwise as 1.40.0`,
           () =>
             Effect.gen(function* () {
@@ -385,6 +387,210 @@ export const renamedSparseMapCopiesSuite = (open: OpenTable) => {
           )
         }
       }
+    }
+  }
+}
+
+const verdictFixture = JSON.parse(
+  readFileSync(
+    new URL("../fixtures/renamed-sparse-map-verdicts-1.40.0.json", import.meta.url),
+    "utf8",
+  ),
+) as { readonly cases: Record<string, Captured> }
+
+const verdictDefinitions = () => {
+  const model = DynamoModel.configure(Schema.Struct(fields), {
+    counts: { storedAs: DynamoModel.SparseMap(), field: "sr" },
+  } as never)
+  return {
+    Plain: Entity.make({ model, entityType: "Plain", primaryKey } as never),
+    Versioned: Entity.make({
+      model,
+      entityType: "Versioned",
+      primaryKey,
+      versioned: true,
+    } as never),
+  } as Record<string, any>
+}
+
+/**
+ * Updates writing an entry (`set({ counts: { b: 2 } })`) without reading a row `put` created, which
+ * holds the map whole: the form guard refuses each, and its refusal is answered only where the rest
+ * of the condition holds on the row the refusal returned. `refused`: the caller's condition and
+ * version hold, and 1.40.0 reported success and lost the entry (or, for a condition on the entry,
+ * judged it as `counts#a`, which the row doesn't hold) — `EDD-9150`. `caller's`: they don't, and
+ * the update fails as 1.40.0 failed.
+ */
+const verdicts: ReadonlyArray<
+  readonly [
+    label: string,
+    entities: ReadonlyArray<string>,
+    op: (u: any) => any,
+    head: "refused" | "caller's",
+    condition?: string,
+  ]
+> = [
+  [
+    "set({ counts: { b: 2 } })",
+    ["Plain", "Versioned"],
+    (u) => u.set({ counts: { b: 2 } }),
+    "refused",
+  ],
+  [
+    "set({ counts: { b: 2 } }) condition notExists(t.note), which holds",
+    ["Plain", "Versioned"],
+    (u) => u.set({ counts: { b: 2 } }).condition((t: any, { notExists }: any) => notExists(t.note)),
+    "refused",
+  ],
+  [
+    "set({ counts: { b: 2 } }) condition exists(t.note), which doesn't hold",
+    ["Plain", "Versioned"],
+    (u) => u.set({ counts: { b: 2 } }).condition((t: any, { exists }: any) => exists(t.note)),
+    "caller's",
+  ],
+  [
+    "set({ counts: { b: 2 } }) condition counts.entry('a') = 1, which holds",
+    ["Plain", "Versioned"],
+    (u) =>
+      u.set({ counts: { b: 2 } }).condition((t: any, { eq }: any) => eq(t.counts.entry("a"), 1)),
+    "refused",
+    "(((attribute_exists(#e0)) AND (#e1.#e2 = :e3)) OR ((attribute_not_exists(#e4)) AND (#e5 = :e6)))",
+  ],
+  [
+    "set({ counts: { b: 2 } }) condition counts.entry('a') = 9, which doesn't hold",
+    ["Plain", "Versioned"],
+    (u) =>
+      u.set({ counts: { b: 2 } }).condition((t: any, { eq }: any) => eq(t.counts.entry("a"), 9)),
+    "caller's",
+    "(((attribute_exists(#e0)) AND (#e1.#e2 = :e3)) OR ((attribute_not_exists(#e4)) AND (#e5 = :e6)))",
+  ],
+  [
+    "set({ counts: { b: 2 } }) condition between(counts.entry('a'), 0, 2) or exists(t.note), which holds",
+    ["Plain", "Versioned"],
+    (u) =>
+      u
+        .set({ counts: { b: 2 } })
+        .condition((t: any, { between, exists, or }: any) =>
+          or(between(t.counts.entry("a"), 0, 2), exists(t.note)),
+        ),
+    "refused",
+    "((((attribute_exists(#e0)) AND (#e1.#e2 BETWEEN :e3 AND :e4)) OR ((attribute_not_exists(#e5)) AND (#e6 BETWEEN :e7 AND :e8))) OR (attribute_exists(#e9)))",
+  ],
+  [
+    "set({ counts: { b: 2 } }) expectedVersion(1), the stored version",
+    ["Versioned"],
+    (u) => u.set({ counts: { b: 2 } }).expectedVersion(1),
+    "refused",
+  ],
+  [
+    "set({ counts: { b: 2 } }) expectedVersion(5), a stale version",
+    ["Versioned"],
+    (u) => u.set({ counts: { b: 2 } }).expectedVersion(5),
+    "caller's",
+  ],
+  [
+    "set({ counts: { b: 2 } }) expectedVersion(5) condition notExists(t.note)",
+    ["Versioned"],
+    (u) =>
+      u
+        .set({ counts: { b: 2 } })
+        .expectedVersion(5)
+        .condition((t: any, { notExists }: any) => notExists(t.note)),
+    "caller's",
+  ],
+]
+
+export const renamedSparseMapVerdictsSuite = (open: OpenTable) => {
+  for (const [label, entities, op, head, condition] of verdicts) {
+    for (const entity of entities) {
+      const name = `${entity}, a row put created: ${label}`
+      const was = verdictFixture.cases[name]!
+      it.effect(
+        head === "refused"
+          ? `${name}: refused (EDD-9150), where 1.40.0 ${was.outcome.ok !== undefined ? "reported success and lost the entry" : "judged the entry as counts#a and failed on the condition"}`
+          : `${name}: fails on the caller's ${was.outcome.fail === "OptimisticLockError" ? "version" : "condition"}, as 1.40.0`,
+        () =>
+          Effect.gen(function* () {
+            const definitions = verdictDefinitions()
+            const MainTable = Table.make({
+              schema: DynamoSchema.make({ name: "sr", version: 1 }),
+              entities: definitions,
+            } as never)
+            const log: Array<unknown> = []
+            yield* onTable(
+              recordingRequests(open, log),
+              0,
+              MainTable,
+              { entities: definitions },
+              (db, table) =>
+                Effect.gen(function* () {
+                  yield* db.entities[entity].put({ id: "a", counts: { a: 1 } }).asEffect()
+                  const rowsBefore = rowsOf(yield* table.rows)
+                  const readBefore = outcomeOf(
+                    yield* Effect.exit(db.entities[entity].get({ id: "a" })),
+                  )
+                  log.length = 0
+                  const exit = yield* Effect.exit(
+                    Effect.suspend(() => op(db.entities[entity].update({ id: "a" })).asEffect()),
+                  )
+                  const sent = log.map((request) => wholeOf(request, table.name)) as Array<any>
+                  const read = outcomeOf(yield* Effect.exit(db.entities[entity].get({ id: "a" })))
+                  const rows = rowsOf(yield* table.rows)
+                  // One request, as 1.40.0's, but for the form guard beside its condition (and a
+                  // condition on the entry, which follows the read's precedence).
+                  expect(sent.length).toBe(1)
+                  const { ConditionExpression, ExpressionAttributeNames, ...rest } =
+                    sent[0].updateItem
+                  const wasUpdate = (was.sent[0] as any).updateItem
+                  const {
+                    ConditionExpression: wasCondition,
+                    ExpressionAttributeNames: wasNames,
+                    ...wasRest
+                  } = wasUpdate
+                  if (condition === undefined) {
+                    expect(rest).toEqual(wasRest)
+                    expect(ConditionExpression).toBe(
+                      wasCondition.replace(
+                        "attribute_exists(#exists)",
+                        "attribute_exists(#exists) AND attribute_not_exists(#fm0)",
+                      ),
+                    )
+                    expect(ExpressionAttributeNames).toEqual({ ...wasNames, "#fm0": "sr" })
+                  } else {
+                    const { ExpressionAttributeValues, ...others } = rest
+                    const { ExpressionAttributeValues: wasValues, ...wasOthers } = wasRest
+                    expect(others).toEqual(wasOthers)
+                    expect(ConditionExpression).toContain(
+                      `${condition} AND attribute_exists(#exists) AND attribute_not_exists(#fm0)`,
+                    )
+                    expect(ExpressionAttributeNames["#fm0"]).toBe("sr")
+                    expect(Object.values(ExpressionAttributeValues)).toEqual(
+                      expect.arrayContaining(Object.values(wasValues)),
+                    )
+                  }
+                  if (head === "caller's") {
+                    expect(outcomeOf(exit)).toEqual(was.outcome)
+                    expect(rows).toEqual(was.rows)
+                    expect(read).toEqual(was.read)
+                    return
+                  }
+                  // Nothing written: the row reads as it did.
+                  const says = outcomeOf(exit, Number.POSITIVE_INFINITY).says as string
+                  expect(outcomeOf(exit).fail).toBe("ValidationError")
+                  expect(says).toContain("[EDD-9150]")
+                  expect(rows).toEqual(rowsBefore)
+                  expect(read).toEqual(readBefore)
+                  expect(readBefore).toEqual({
+                    ok: {
+                      id: "a",
+                      counts: { a: 1 },
+                      ...(entity === "Versioned" && { version: 1 }),
+                    },
+                  })
+                }),
+            )
+          }),
+      )
     }
   }
 }

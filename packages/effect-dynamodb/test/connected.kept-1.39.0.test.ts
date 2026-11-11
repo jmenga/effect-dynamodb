@@ -39,6 +39,7 @@ import { renamedSparseMapSuite } from "./helpers/RenamedSparseMap.js"
 import {
   renamedSparseMapCopiesSuite,
   renamedSparseMapUpsertsSuite,
+  renamedSparseMapVerdictsSuite,
 } from "./helpers/RenamedSparseMapWrites.js"
 import { selectBesideSparseMapsSuite } from "./helpers/SelectBesideSparseMaps.js"
 import { selectSparseMapsSuite } from "./helpers/SelectSparseMaps.js"
@@ -164,6 +165,13 @@ describeConnected("an upsert of a sparse map a field: rename stores whole", () =
 describeConnected("a copy from an entry of a sparse map a field: rename stores whole", () => {
   renamedSparseMapCopiesSuite(openTable)
 })
+
+describeConnected(
+  "an update of a sparse map a field: rename stores whole: whose verdict a refusal gives",
+  () => {
+    renamedSparseMapVerdictsSuite(openTable)
+  },
+)
 
 describeConnected("a path below a struct that renames its keys as they're stored", () => {
   nestedKeyEncodingsSuite(openTable)

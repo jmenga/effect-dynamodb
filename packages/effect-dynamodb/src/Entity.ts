@@ -135,6 +135,7 @@ import {
   wholeRowsOf,
 } from "./internal/BoundQuery.js"
 import * as Capacity from "./internal/Capacity.js"
+import { conditionHolds } from "./internal/ConditionHolds.js"
 import {
   isNumeric,
   memberKind,
@@ -11091,8 +11092,18 @@ const makeImpl = <
                   )
                 : undefined
               if (fallback !== undefined) return fallback
+              // The form guard is answered only where the rest of the condition holds on the row
+              // returned: the caller's condition and the version keep their own verdicts (#238).
               const wholeMap = held === undefined ? storedWholeMap(stored) : undefined
-              if (wholeMap !== undefined) {
+              if (
+                wholeMap !== undefined &&
+                conditionHolds(
+                  condParts.filter((part) => !formConditions.includes(part)).join(" AND "),
+                  stored as globalThis.Record<string, AttributeValue>,
+                  names,
+                  values,
+                ) !== false
+              ) {
                 return new ValidationError({
                   entityType,
                   operation: "update",
@@ -12660,14 +12671,24 @@ const makeImpl = <
             if (isAwsConditionalCheckFailed(err.cause)) {
               const corrupt = versionCorruption(err.cause.Item, "upsert")
               if (corrupt !== undefined) return corrupt
-              const stored = err.cause.Item as globalThis.Record<string, unknown> | undefined
+              const stored = err.cause.Item
+              // The form guard is answered only where the rest of the condition holds on the row
+              // returned: the caller's condition and the key guards keep their own verdicts.
               const wholeMap =
                 stored === undefined
                   ? undefined
                   : [...entriesWritten].find((field) =>
                       Object.hasOwn(stored, renamedMapAttribute(field)!),
                     )
-              if (wholeMap !== undefined) {
+              if (
+                wholeMap !== undefined &&
+                conditionHolds(
+                  condParts.filter((part) => !formGuards.includes(part)).join(" AND "),
+                  stored as globalThis.Record<string, AttributeValue>,
+                  names,
+                  values,
+                ) !== false
+              ) {
                 return new ValidationError({
                   entityType,
                   operation: "upsert",
