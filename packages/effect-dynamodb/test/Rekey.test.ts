@@ -35,6 +35,7 @@ import * as Table from "../src/Table.js"
 import { clientLayer, serviceOf, withConsumedCapacity } from "./helpers/CapacityMock.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
+import { storedRows } from "./helpers/StoredRows.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1098,6 +1099,8 @@ describe.each([
           pk: { S: pk.old },
           data: { S: "different" },
         })
+        // The dry run judges the rows left as the real run's drain does.
+        const dry = yield* rekey(w, table, { dryRun: true })
         const report = yield* rekey(w, table)
         expect(report.conflicts).toEqual([
           expect.objectContaining({
@@ -1107,8 +1110,43 @@ describe.each([
             key: { pk: pk.old, sk },
           }),
         ])
+        expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
         expect(table.items.has(`${pk.old}|${sk}`)).toBe(true)
       }),
+    )
+
+    it.effect(
+      "a snapshot left there older than the moved stream's is taken, the newer one kept, in the dry run too",
+      () =>
+        Effect.gen(function* () {
+          const table = makeRecordingTable()
+          yield* seed(w, table)
+          const pk = ledgerPk(w, -4)
+          yield* w.SnappedLedger.writeSnapshot(ledger(-4), { total: 6 }, 3).pipe(
+            Effect.provide(layerOf(w, table)),
+          )
+          const [written] = [...table.items].find(
+            ([key, row]) => key.startsWith(`${pk.now}|`) && row.asOfVersion !== undefined,
+          )!
+          const snapshotSk = written.slice(pk.now.length + 1)
+          relocate(table, written, { pk: pk.old, sk: snapshotSk })
+          yield* rekey(w, table)
+          const moved = table.items.get(`${pk.now}|${snapshotSk}`)!
+          // As a run that stopped after the flip leaves it, with a snapshot written at the
+          // current key since: the one under the old key is older.
+          table.items.set(`${pk.now}|${snapshotSk}`, { ...moved, asOfVersion: { N: "4" } })
+          table.items.set(`${pk.old}|${snapshotSk}`, { ...moved, pk: { S: pk.old } })
+          const newer = storedRows([table.items.get(`${pk.now}|${snapshotSk}`)!])
+          const before = storedRows(table.items.values())
+          const dry = yield* rekey(w, table, { dryRun: true })
+          expect(storedRows(table.items.values())).toEqual(before)
+          const report = yield* rekey(w, table)
+          expect(report.conflicts).toEqual([])
+          expect(report.byMember.Ledger?.moved.stream).toBe(1)
+          expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(report))
+          expect(table.items.has(`${pk.old}|${snapshotSk}`)).toBe(false)
+          expect(storedRows([table.items.get(`${pk.now}|${snapshotSk}`)!])).toEqual(newer)
+        }),
     )
 
     it.effect(

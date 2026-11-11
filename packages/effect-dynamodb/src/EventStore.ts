@@ -51,6 +51,7 @@ import type {
   GlobalSecondaryIndex,
   LocalSecondaryIndex,
   Projection,
+  PutItemCommandInput,
 } from "@aws-sdk/client-dynamodb"
 import { Compression } from "@effect-dynamodb/schema/Compression.js"
 import { isPackedConfig, type PackedConfig } from "@effect-dynamodb/schema/DynamoModel.js"
@@ -5479,48 +5480,70 @@ export const makeStream = <
       const cancelled = (error: DynamoClientError) =>
         isAwsConditionalCheckFailed(error.cause) ? Effect.succeed(false) : Effect.fail(error)
       /**
-       * A dry run's move of `rows`, planned: each copied to `to` (a snapshot `to` holds newer is
-       * kept) and taken from `from`, as the real run's copy, flip and drain leave them.
+       * The copy of `row` to `to` a move sends over `held`, what `to` holds at its key: where
+       * nothing is (or only a row whose TTL has passed), or, a snapshot, over an older one, so a
+       * copy never regresses it. `undefined` where `to` holds it already: a copy an earlier attempt
+       * or run made, or a snapshot as new.
        */
-      const planMove = (rows: ReadonlyArray<Record<string, AttributeValue>>): Rekey.RekeyTally => {
+      const copyOver = (
+        row: Record<string, AttributeValue>,
+        held: Record<string, AttributeValue> | undefined,
+      ): PutItemCommandInput | undefined => {
+        if (held === undefined) {
+          return {
+            TableName: ctx.tableName,
+            Item: copyOf(row),
+            ConditionExpression: "attribute_not_exists(#pk) OR #ttl <= :now",
+            ExpressionAttributeNames: { "#pk": "pk", "#ttl": ttlAttribute },
+            ExpressionAttributeValues: { ":now": { N: String(nowSeconds) } },
+          }
+        }
+        if (skOf(row) !== snapshotSk || asOfOf(row) <= asOfOf(held)) return undefined
+        return {
+          TableName: ctx.tableName,
+          Item: copyOf(row),
+          ConditionExpression: "#asOf < :asOf",
+          ExpressionAttributeNames: { "#asOf": "asOfVersion" },
+          ExpressionAttributeValues: { ":asOf": row.asOfVersion ?? { N: "0" } },
+        }
+      }
+      /**
+       * A dry run's move of `rows`, planned over `there`, what `to` holds: each copy the real run
+       * sends ({@link copyOver}), and each row taken from `from`, as its copy, flip and drain
+       * leave them.
+       */
+      const planMove = (
+        rows: ReadonlyArray<Record<string, AttributeValue>>,
+        there: ReadonlyMap<string, Record<string, AttributeValue>>,
+      ): Rekey.RekeyTally => {
         ctx.plan(
-          rows.flatMap(
-            (row): ReadonlyArray<TransactWriteItem> => [
-              { Put: { TableName: ctx.tableName, Item: copyOf(row) } },
+          rows.flatMap((row): ReadonlyArray<TransactWriteItem> => {
+            const put = copyOver(row, there.get(skOf(row)))
+            return [
+              ...(put === undefined ? [] : [{ Put: put }]),
               {
                 Delete: {
                   TableName: ctx.tableName,
                   Key: toAttributeMap({ pk: from, sk: skOf(row) }),
                 },
               },
-            ],
-          ),
+            ]
+          }),
         )
         return Rekey.mergeTallies({ moved: { stream: rows.length } }, strongestGaps(rows))
       }
       /**
-       * Copy `row` to `to`: where nothing is (or only a row whose TTL has
-       * passed) — or, a snapshot, over an older one (`older`), so a copy never
-       * regresses it. `false` when a write got there first.
+       * Copy `row` to `to` over `held` ({@link copyOver}). `false` when a write got there first.
        */
-      const copy = (row: Record<string, AttributeValue>, older?: Record<string, AttributeValue>) =>
-        client
-          .putItem({
-            TableName: ctx.tableName,
-            Item: copyOf(row),
-            ...(older === undefined
-              ? {
-                  ConditionExpression: "attribute_not_exists(#pk) OR #ttl <= :now",
-                  ExpressionAttributeNames: { "#pk": "pk", "#ttl": ttlAttribute },
-                  ExpressionAttributeValues: { ":now": { N: String(nowSeconds) } },
-                }
-              : {
-                  ConditionExpression: "#asOf < :asOf",
-                  ExpressionAttributeNames: { "#asOf": "asOfVersion" },
-                  ExpressionAttributeValues: { ":asOf": row.asOfVersion ?? { N: "0" } },
-                }),
-          })
-          .pipe(Effect.as(true), Effect.catch(cancelled))
+      const copy = (
+        row: Record<string, AttributeValue>,
+        held: Record<string, AttributeValue> | undefined,
+      ) => {
+        const request = copyOver(row, held)
+        return request === undefined
+          ? Effect.succeed(true)
+          : client.putItem(request).pipe(Effect.as(true), Effect.catch(cancelled))
+      }
       /**
        * `row` as read, whole, or, a row too wide for that, the strongest guard that fits, as
        * 1.39.0 sent: only a stream already part-moved deletes one (`unguardedRows`).
@@ -5569,6 +5592,38 @@ export const makeStream = <
           .pipe(Effect.as(true), Effect.catch(cancelled))
 
       /**
+       * What `to` holds, by sort key, once the stream lives there, and, when a row of `left` (its
+       * rows still under `from`) is held there differently, the conflicts: a row `to` holds
+       * differently (an event or sentinel written under both keys) is left with the rest. A
+       * snapshot only grows newer. The real run's drain and a dry run's plan both judge by it.
+       */
+      const toDrain = (left: ReadonlyArray<Record<string, AttributeValue>>) =>
+        Effect.map(readAll(to), (rows) => {
+          const there = new Map(rows.map((row) => [skOf(row), row]))
+          const differing = left.filter((row) => {
+            const held = there.get(skOf(row))
+            if (held === undefined || sameRow(copyOf(row), held)) return false
+            return skOf(row) !== snapshotSk
+          })
+          return {
+            there,
+            refused:
+              differing.length === 0
+                ? undefined
+                : Rekey.mergeTallies(
+                    ...differing.map((row) =>
+                      conflict(
+                        "bothKeys",
+                        "a row of it is under both partition keys, and the two differ; the rows " +
+                          "under its old key are left as they are.",
+                        skOf(row),
+                      ),
+                    ),
+                  ),
+          }
+        })
+
+      /**
        * Bring every row still under `from` over, once the stream lives at
        * `to`: a row `to` lacks is copied (a command sentinel written beside
        * the flip), a snapshot newer than `to`'s copied over it, and then each
@@ -5581,35 +5636,10 @@ export const makeStream = <
        */
       const drain = Effect.gen(function* () {
         const left = yield* readOwn
-        const there = new Map((yield* readAll(to)).map((row) => [skOf(row), row]))
-        const differing: Array<Record<string, AttributeValue>> = []
+        const { there, refused } = yield* toDrain(left)
+        if (refused !== undefined) return refused
         for (const row of left) {
-          const held = there.get(skOf(row))
-          if (held === undefined || sameRow(copyOf(row), held)) continue
-          if (skOf(row) === snapshotSk) continue
-          differing.push(row)
-        }
-        if (differing.length > 0) {
-          return Rekey.mergeTallies(
-            ...differing.map((row) =>
-              conflict(
-                "bothKeys",
-                "a row of it is under both partition keys, and the two differ; the rows " +
-                  "under its old key are left as they are.",
-                skOf(row),
-              ),
-            ),
-          )
-        }
-        for (const row of left) {
-          const held = there.get(skOf(row))
-          const copied =
-            held === undefined
-              ? yield* copy(row)
-              : skOf(row) === snapshotSk && asOfOf(row) > asOfOf(held)
-                ? yield* copy(row, held)
-                : true
-          if (!copied) return undefined
+          if (!(yield* copy(row, there.get(skOf(row))))) return undefined
         }
         const ordered = [
           ...left.filter((row) => versionOf(row) > 1).sort((a, b) => versionOf(b) - versionOf(a)),
@@ -5688,18 +5718,11 @@ export const makeStream = <
               )
             }
           }
-          if (ctx.dryRun) return Rekey.mergeTallies(tally, planMove(rows))
+          if (ctx.dryRun) return Rekey.mergeTallies(tally, planMove(rows, there))
           // COPY
           let copiedAll = true
           for (const row of rows) {
-            const held = there.get(skOf(row))
-            const copied =
-              held === undefined
-                ? yield* copy(row)
-                : skOf(row) === snapshotSk && asOfOf(row) > asOfOf(held)
-                  ? yield* copy(row, held)
-                  : true
-            if (!copied) {
+            if (!(yield* copy(row, there.get(skOf(row))))) {
               copiedAll = false
               break
             }
@@ -5781,7 +5804,9 @@ export const makeStream = <
           // A write landed in between: copy again.
           if (!won) continue
         } else if (ctx.dryRun) {
-          return Rekey.mergeTallies(tally, planMove(rows))
+          // The drain's judgement and copies, over the rows just read.
+          const { there, refused } = yield* toDrain(rows)
+          return Rekey.mergeTallies(tally, refused ?? planMove(rows, there))
         }
         // DELETE
         const drained = yield* drain

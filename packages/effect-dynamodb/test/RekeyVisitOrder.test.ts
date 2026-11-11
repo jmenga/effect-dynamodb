@@ -22,6 +22,7 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import { gatedLayer } from "./helpers/GatedClient.js"
+import { cutShort, OUTBOX_INDEX, partMovedWorld, writtenOff } from "./helpers/PartMoved.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { rekeyOutcome } from "./helpers/RekeyOutcome.js"
 import {
@@ -355,5 +356,76 @@ describe("rekey under one setting throughout leaves a live item's sentinel to it
         expect(runs.restored).toBe("Failure")
       }),
     )
+  }
+})
+
+/** A dry run, a run and a second run with escaping on over `rows`, in an order of `seed`'s. */
+const runOn = (
+  rows: ReadonlyArray<Row>,
+  options: { readonly segments: number; readonly concurrency: number },
+  seed: number,
+) =>
+  Effect.gen(function* () {
+    const table = makeRecordingTable({ indexes: OUTBOX_INDEX })
+    for (const row of rows) table.items.set(`${row.pk?.S}|${row.sk?.S}`, row)
+    const on = partMovedWorld(true)
+    const layer = Layer.merge(
+      gatedLayer(table.client as DynamoClientService, scanOrder(seed)),
+      on.MainTable.layer({ name: "t" }),
+    )
+    const run = { ...options, pageSize: 3, streams: on.streams }
+    return yield* Effect.gen(function* () {
+      const db = yield* on.client
+      const dry: Table.RekeyReport = yield* db.tables.MainTable.rekey({ ...run, dryRun: true })
+      const untouched = storedOf(table.items.values())
+      const real: Table.RekeyReport = yield* db.tables.MainTable.rekey(run)
+      const after = storedOf(table.items.values())
+      const again: Table.RekeyReport = yield* db.tables.MainTable.rekey(run)
+      return { dry, untouched, real, after, again }
+    }).pipe(Effect.provide(layer)) as Effect.Effect<{
+      dry: Table.RekeyReport
+      untouched: ReadonlyArray<string>
+      real: Table.RekeyReport
+      after: ReadonlyArray<string>
+      again: Table.RekeyReport
+    }>
+  })
+
+describe("rekey from a table a run cut short left part-moved finishes it in one run", () => {
+  // Every unit kind, cut after each of the writes a run sends, in an order of its own: the next
+  // run, in any order, says in its dry run what it does, and leaves the rows an uncut run leaves.
+  for (const segments of [1, 2, 3, 5]) {
+    for (const seed of [0, 1, 2, 3]) {
+      for (const concurrency of [1, 4]) {
+        it.effect(`${segments} segment(s), order ${seed}, ${concurrency} at once`, () =>
+          Effect.gen(function* () {
+            const written = yield* writtenOff
+            const finished = yield* runOn(written, { segments: 1, concurrency: 1 }, 0)
+            expect(finished.real.conflicts).toEqual([])
+            const cut = { segments: 6 - segments, concurrency: 5 - concurrency }
+            let after = 0
+            for (; ; after++) {
+              const start = yield* cutShort(written, after, cut, scanOrder(seed + 1))
+              if (start === undefined) break
+              const runs = yield* runOn(start, { segments, concurrency }, seed)
+              const at = `cut after ${after} write(s)`
+              expect(runs.untouched, at).toEqual(storedOf(start))
+              expect(decided(runs.dry), at).toEqual(decided(runs.real))
+              expect(runs.real.conflicts, at).toEqual([])
+              expect(runs.real.scanned, at).toBe(start.length)
+              expect(runs.after, at).toEqual(finished.after)
+              expect(
+                Object.values(runs.again.moved).every((n) => n === 0),
+                at,
+              ).toBe(true)
+              expect(runs.again.sentinelsMoved, at).toBe(0)
+              expect(runs.again.conflicts, at).toEqual([])
+            }
+            // A run sends a write or more for each unit: the run was cut at each.
+            expect(after).toBeGreaterThan(20)
+          }),
+        )
+      }
+    }
   }
 })
