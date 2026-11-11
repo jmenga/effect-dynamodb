@@ -21,6 +21,7 @@ export const arithmeticModel = Schema.Struct({
   n: Schema.optional(Schema.Number),
   bigs: Schema.optional(Schema.ReadonlySet(Schema.BigInt)),
   ns: Schema.optional(Schema.ReadonlySet(Schema.Number)),
+  strs: Schema.optional(Schema.ReadonlySet(Schema.String)),
   bins: Schema.optional(Schema.ReadonlySet(Schema.Uint8Array)),
 })
 
@@ -180,6 +181,27 @@ export const arithmeticCases: ReadonlyArray<ArithmeticCase> = [
     stored: { NS: ["1", "2", "3"] },
   },
   {
+    name: "number set {1, 2} less {2, 5}",
+    seed: { ns: new Set([1, 2]) },
+    apply: (u) => u.deleteFromSet({ ns: new Set([2, 5]) }),
+    attribute: "ns",
+    stored: { NS: ["1"] },
+  },
+  {
+    name: "string set {a} + {a, b}",
+    seed: { strs: new Set(["a"]) },
+    apply: (u) => u.add({ strs: new Set(["a", "b"]) }),
+    attribute: "strs",
+    stored: { SS: ["a", "b"] },
+  },
+  {
+    name: "string set {a, b} less {a}",
+    seed: { strs: new Set(["a", "b"]) },
+    apply: (u) => u.deleteFromSet({ strs: new Set(["a"]) }),
+    attribute: "strs",
+    stored: { SS: ["b"] },
+  },
+  {
     name: "binary set {[1]} + {[1], [2]}",
     seed: { bins: new Set([bytes(1)]) },
     apply: (u) => u.add({ bins: new Set([bytes(1), bytes(2)]) }),
@@ -190,6 +212,21 @@ export const arithmeticCases: ReadonlyArray<ArithmeticCase> = [
     name: "binary set {[1], [2]} less {[1]}",
     seed: { bins: new Set([bytes(1), bytes(2)]) },
     apply: (u) => u.deleteFromSet({ bins: new Set([bytes(1)]) }),
+    attribute: "bins",
+    stored: { BS: [bytes(2)] },
+  },
+  // A `Buffer` is a `Uint8Array`: its members are compared by their bytes all the same.
+  {
+    name: "binary set {[1]} + Buffer {[1], [2]}",
+    seed: { bins: new Set([bytes(1)]) },
+    apply: (u) => u.add({ bins: new Set([Buffer.from([1]), Buffer.from([2])]) }),
+    attribute: "bins",
+    stored: { BS: [bytes(1), bytes(2)] },
+  },
+  {
+    name: "binary set {[1], [2]} less Buffer {[1]}",
+    seed: { bins: new Set([bytes(1), bytes(2)]) },
+    apply: (u) => u.deleteFromSet({ bins: new Set([Buffer.from([1])]) }),
     attribute: "bins",
     stored: { BS: [bytes(2)] },
   },
