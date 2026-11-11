@@ -674,7 +674,7 @@ Returns `RefNotFound` if a ref ID doesn't resolve. Each sub-aggregate group is i
 
 Returns `ConditionalCheckFailed` if the aggregate already exists. Its root item's guard cancels the first transaction, so nothing is written: not the root, not an edge, not a sub-aggregate row. Earlier versions overwrote the root and left behind any old rows the new aggregate didn't rewrite. To replace an aggregate, `update` it, or `delete` it first. Each sub-aggregate is still its own transaction, so if a later one fails, the ones before it stay written.
 
-The guard is on the root item only. Edge and sub-aggregate rows left without a root, for example by an earlier write that failed partway, don't stop `create`. `get` then reads them back together with the new aggregate's rows, merging stale edges into it. Before creating an aggregate where an earlier write may have failed partway, `delete` its key: `delete` removes every row in the partition, orphans included. The library doesn't check for orphan rows on `create`, because that would add a partition read to every create.
+The guard is on the root item only. Edge and sub-aggregate rows left without a root, for example by an earlier write that failed partway, don't stop `create`. `get` then reads them back together with the new aggregate's rows, merging stale edges into it. Before creating an aggregate where an earlier write may have failed partway, `delete` its key: `delete` removes every row of the aggregate's entity types in the partition, orphans included. The library doesn't check for orphan rows on `create`, because that would add a partition read to every create.
 
 #### update — Diff and Write
 
@@ -755,13 +755,13 @@ The mutation function can return either a class instance (from spreading `curren
 
 #### delete — Remove All Items
 
-Remove all items in the aggregate's partition:
+Remove the aggregate's items from its partition:
 
 ```typescript region="aggregate-delete" example="guide-aggregates.ts"
 yield* MatchAggregate.delete({ id: "bgt-2025-test-1" })
 ```
 
-Queries all items in the partition and batch-deletes them.
+Queries the partition and batch-deletes every row whose entity type (`__edd_e__`) is one of the aggregate's own: its root's, each edge's and each sub-aggregate's, whoever wrote them. Any other row in the partition, an entity's or another aggregate's, stays. A partition holding none of the aggregate's rows fails with `AggregateAssemblyError`, as an empty one does. Up to 1.40.0, `delete` removed every row in the partition.
 
 #### list — Page Through Aggregates
 

@@ -4913,6 +4913,19 @@ it is documented instead (`delete` the key first). `delete` retries the
 `UnprocessedItems` of its `BatchWriteItem`s with `Batch.write`'s backoff and
 bound (5 retries), then fails with a `DynamoError`.
 
+**`delete` deletes the aggregate's own rows (#241).** It deletes the rows of the
+partition read whose `__edd_e__` is one of the aggregate's entity types
+(`ownedTypes`: its root's, each edge's and each sub-aggregate's, recursively),
+and leaves every other row there: an entity's, another aggregate's, one with no
+type. The read is the one 1.40.0 sent, nothing is keyed by value, and every row
+of its types is deleted, whoever wrote it, as before; a partition holding only
+its own rows gets the requests 1.40.0 sent, byte for byte
+(`fixtures/aggregate-delete-1.40.0.json`). A partition holding none of its rows
+fails with `AggregateAssemblyError` ("No items found"), as an empty one does,
+and nothing is deleted. Up to 1.40.0 it deleted every row the read returned,
+foreign rows included. It reads the same with `ownsRows` or without it
+(`AggregateDeleteRows.test.ts`, `connected.aggregate-delete-rows.test.ts`).
+
 **What `create` hydrates, and by what key.** An edge with an `entity` is given
 ids where its input takes them: a `one` or `ref` edge's `${field}Id`, the
 elements of a `many` edge given as ids, and the `${field}Id` of a `many`
@@ -5583,7 +5596,8 @@ its keys. A field whose codec stores every number as 0 decomposes 50 and 60 alik
 the other is a no-op, whatever key the stored row is under. A no-op writes nothing, with the option or
 without it.
 
-Neither `update` nor `rekey` deletes or moves a row the value doesn't key (`delete` has its own rule):
+Neither `update` nor `rekey` deletes or moves a row the value doesn't key (`delete` has its own rule,
+§7 "`delete` deletes the aggregate's own rows"):
 a row a custom `decompose` left under a key it no longer composes, or an edge row its `assemble` drops.
 An encoding `decompose`'s rows are such rows: decomposing the value read keys them elsewhere (`f / 10`
 once more: a row stored under 50 reads as 50, which is keyed 5). So an `update` that removes such an

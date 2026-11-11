@@ -555,7 +555,10 @@ export interface Aggregate<
     ) => Schema.Schema.Type<TSchema> | TSchema["Iso"],
   ) => Effect.Effect<Schema.Schema.Type<TSchema>, AggregateWriteError, DynamoClient | TableConfig>
 
-  /** Delete an aggregate — removes all items in the partition. */
+  /**
+   * Delete an aggregate: every row in its partition whose entity type is one of the aggregate's
+   * own (its root's, each edge's and each sub-aggregate's). Any other row there stays.
+   */
   readonly delete: (
     key: TKey,
   ) => Effect.Effect<void, AggregateAssemblyError | DynamoClientError, DynamoClient | TableConfig>
@@ -2450,6 +2453,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
    * the rows of them it reads beyond the ones its value keys, and `rekey` reports them.
    */
   const ownsRows = config.ownsRows === true
+  /** The aggregate's entity types: `delete` deletes only the rows of these, option or not. */
   const ownedTypes: ReadonlySet<string> = new Set(nodeTypes)
 
   /**
@@ -4244,7 +4248,13 @@ const makeAggregate = <TSchema extends Schema.Top>(
             ),
           )
 
-          if (allItems.length === 0) {
+          // Only the aggregate's own rows (DESIGN.md §7 "delete"): a row of another entity type in
+          // its partition is an entity's or another aggregate's, and stays. Nothing is keyed by
+          // value, so every row of the aggregate's types is deleted, whoever wrote it.
+          const ownItems = allItems.filter(
+            (item) => typeof item.__edd_e__ === "string" && ownedTypes.has(item.__edd_e__),
+          )
+          if (ownItems.length === 0) {
             return yield* new AggregateAssemblyError({
               aggregate: aggregateName,
               reason: "No items found for aggregate key",
@@ -4252,7 +4262,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             })
           }
 
-          yield* deleteAllItems(client, tableConfig.name, allItems, config.pk.field)
+          yield* deleteAllItems(client, tableConfig.name, ownItems, config.pk.field)
         }),
 
       list: (filter, options) =>
@@ -7525,7 +7535,7 @@ const placeRows = (
 }
 
 // ---------------------------------------------------------------------------
-// Internal: Delete all items in an aggregate partition
+// Internal: Delete an aggregate's rows from its partition
 // ---------------------------------------------------------------------------
 
 const deleteAllItems = (
