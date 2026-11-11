@@ -325,6 +325,129 @@ describe("pathIsRequired", () => {
     ["below a list's element", Schema.Array(Address), [0, "city"], true],
     ["an optional property below a list's element", Schema.Array(Address), [0, "zip"], false],
     ["a tuple's element", Schema.Tuple([Schema.String, Schema.Number]), [1], true],
+    ["a fixed tuple's first position", Schema.Tuple([Schema.String, Schema.Number]), [0], true],
+    // The list closes up: what's left reads when the stored list held the optional position too,
+    // which only a read says. Published 1.39.0 sent the removal, and the row read back.
+    [
+      "a required position before an optional one",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+      [0],
+      false,
+    ],
+    [
+      "a required position before an optional key",
+      Schema.Tuple([Schema.String, Schema.optionalKey(Schema.String)]),
+      [0],
+      false,
+    ],
+    [
+      "a tuple's required position before a rest",
+      Schema.TupleWithRest(Schema.Tuple([Schema.String]), [Schema.String]),
+      [0],
+      false,
+    ],
+    ["below a fixed tuple's position", Schema.Tuple([Address]), [0, "city"], true],
+    [
+      "a fixed tuple's position, in a union with a shorter one that may read what's left",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.String]), Schema.Tuple([Schema.String])]),
+      [0],
+      false,
+    ],
+    [
+      "a fixed tuple's position, in a union with a member no list can be",
+      Schema.NullOr(Schema.Tuple([Schema.String, Schema.String])),
+      [0],
+      true,
+    ],
+    // Judged by length alone, over every list the path reaches: refused only when no list one
+    // shorter than a list holding the position is a length some member accepts.
+    [
+      "the last position, in a union with a shorter one that reads what's left",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.String]), Schema.Tuple([Schema.String])]),
+      [1],
+      false,
+    ],
+    [
+      "a one-position tuple's position, in a union with the empty tuple",
+      Schema.Union([Schema.Tuple([Schema.String]), Schema.Tuple([])]),
+      [0],
+      false,
+    ],
+    [
+      "a position of tuples of one length: no member accepts one shorter",
+      Schema.Union([
+        Schema.Tuple([Schema.String, Schema.String]),
+        Schema.Tuple([Schema.Number, Schema.Number]),
+      ]),
+      [0],
+      true,
+    ],
+    [
+      "the other position of tuples of one length",
+      Schema.Union([
+        Schema.Tuple([Schema.String, Schema.String]),
+        Schema.Tuple([Schema.Number, Schema.Number]),
+      ]),
+      [1],
+      true,
+    ],
+    [
+      "a fixed tuple's position, in a union with an array",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.String]), Schema.Array(Schema.String)]),
+      [1],
+      false,
+    ],
+    ["a list's position", Schema.Array(Schema.String), [0], false],
+    [
+      "a position of a tuple inside a tuple, with an optional position",
+      Schema.Tuple([Schema.Tuple([Schema.String, Schema.optional(Schema.String)])]),
+      [0, 0],
+      false,
+    ],
+    [
+      "tuples in a union's struct members, one shorter than the other",
+      Schema.Union([
+        Schema.Struct({ p: Schema.Tuple([Schema.String, Schema.String]) }),
+        Schema.Struct({ p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 1],
+      false,
+    ],
+    [
+      "tuples of one length in a tagged union's members",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({
+          kind: Schema.Literal("b"),
+          p: Schema.Tuple([Schema.Number, Schema.Number]),
+        }),
+      ]),
+      ["p", 0],
+      true,
+    ],
+    // Length alone can't see a value in a position that can't hold it, or a tag ruling out the
+    // member that reads what's left: sent, as 1.39.0 sent them.
+    [
+      "a required position before an optional one of another type",
+      Schema.Tuple([Schema.String, Schema.optional(Schema.Number)]),
+      [0],
+      false,
+    ],
+    [
+      "tuples of two lengths in a tagged union's members",
+      Schema.Union([
+        Schema.Struct({
+          kind: Schema.Literal("a"),
+          p: Schema.Tuple([Schema.String, Schema.String]),
+        }),
+        Schema.Struct({ kind: Schema.Literal("b"), p: Schema.Tuple([Schema.String]) }),
+      ]),
+      ["p", 0],
+      false,
+    ],
     ["a recursive schema's required property", Tree, ["next", "value"], true],
     ["a recursive schema's optional property", Tree, ["next", "next"], false],
     [

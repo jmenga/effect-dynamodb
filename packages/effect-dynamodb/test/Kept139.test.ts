@@ -44,3 +44,7 @@ describe("an appendInput that may leave out many of a sharded index's composites
 describe("a pathRemove below a union", () => {
   pathClearSuite("union-clears")(openRecordingTable)
 })
+
+describe("a pathRemove of a list position", () => {
+  pathClearSuite("tuple-clears")(openRecordingTable)
+})

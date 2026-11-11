@@ -1298,26 +1298,66 @@ const pathVerdict = (ast: SchemaAST.AST, segments: ReadonlyArray<string | number
   }
   if (SchemaAST.isArrays(ast)) {
     if (typeof head !== "number") return "absent"
-    const element = ast.elements[head]
-    if (element !== undefined && ast.rest.length === 0) {
-      return below(element, SchemaAST.isOptional(element))
-    }
-    // A list closes up when an element is removed, so which element is gone
-    // says nothing about the row; only what's below an element can be judged.
-    const repeated = element ?? ast.rest[0]
-    return repeated === undefined
-      ? "absent"
-      : rest.length > 0
-        ? pathVerdict(repeated, rest)
-        : "open"
+    const element = ast.elements[head] ?? ast.rest[0]
+    return element === undefined ? "absent" : pathVerdict(element, rest)
   }
   return "absent"
 }
 
+/** The lists a value of `ast` can hold at `segments`, through unions and recursive schemas. */
+const listsAt = (
+  ast: SchemaAST.AST,
+  segments: ReadonlyArray<string | number>,
+): ReadonlyArray<SchemaAST.Arrays> => {
+  if (SchemaAST.isSuspend(ast)) return listsAt(ast.thunk(), segments)
+  if (SchemaAST.isUnion(ast)) return ast.types.flatMap((member) => listsAt(member, segments))
+  const [head, ...rest] = segments
+  if (head === undefined) return SchemaAST.isArrays(ast) ? [ast] : []
+  if (SchemaAST.isObjects(ast)) {
+    if (typeof head !== "string") return []
+    const held =
+      ast.propertySignatures.find((signature) => signature.name === head)?.type ??
+      ast.indexSignatures[0]?.type
+    return held === undefined ? [] : listsAt(held, rest)
+  }
+  if (SchemaAST.isArrays(ast)) {
+    if (typeof head !== "number") return []
+    const element = ast.elements[head] ?? ast.rest[0]
+    return element === undefined ? [] : listsAt(element, rest)
+  }
+  return []
+}
+
+/**
+ * Whether removing `position` leaves a list none of `lists`, the lists a value can hold there,
+ * reads, judged by length alone. A list closes up when an element is removed, so what's left is
+ * one shorter: taken from a list of a length one of them accepts with the position in it, it's
+ * read if one of them accepts that length less one. A tuple accepts from its required positions
+ * to all of them, and a tuple with a rest or an array any length from its required positions on.
+ */
+const positionIsRequired = (lists: ReadonlyArray<SchemaAST.Arrays>, position: number): boolean => {
+  const lengths = lists.map((list) => ({
+    min:
+      list.elements.filter((element) => !SchemaAST.isOptional(element)).length +
+      Math.max(0, list.rest.length - 1),
+    max: list.rest.length > 0 ? Number.POSITIVE_INFINITY : list.elements.length,
+  }))
+  const holding = lengths.filter((list) => list.max > position)
+  return (
+    holding.length > 0 &&
+    !holding.some((list) => {
+      const shortest = Math.max(list.min, position + 1) - 1
+      return lengths.some(
+        (other) => Math.max(shortest, other.min) <= Math.min(list.max - 1, other.max),
+      )
+    })
+  )
+}
+
 /**
  * Whether removing `segments`, a path inside this field, leaves a value the
- * field's schema refuses: the last segment is a property (or a fixed tuple
- * element) the stored side requires.
+ * field's schema refuses: the last segment is a property the stored side
+ * requires, or a list position no list one shorter can be read after.
  *
  * It walks the stored side of the schema, so a `Schema.Class` and a `ref`
  * field are seen through and a decoding default counts as optional. A union
@@ -1326,12 +1366,31 @@ const pathVerdict = (ast: SchemaAST.AST, segments: ReadonlyArray<string | number
  * value is stored only a read says. A member that can't hold the path (a
  * scalar, `null`) doesn't count, since DynamoDB refuses the removal on its
  * value. A property whose absent attribute is one of its values
- * ({@link absentReading}) is not required. `false` means the schema can't say the
- * row breaks: a record's keys, a list's elements, and anything opaque (a
- * `Schema.declare`, a set, a `.check()` such as a minimum length, which is a
- * verdict on the value and not its shape).
+ * ({@link absentReading}) is not required.
+ *
+ * A list closes up when an element is removed, so a position is judged by
+ * length alone, over every list the path can reach through unions, a tuple in
+ * a union's struct members included: required only when no list of a length
+ * one of them accepts with the position in it, less one, is a length one of
+ * them accepts. Removing any position of a `[string, string]` is required;
+ * `f[0]` of a `[string, string?]`, either position of
+ * `Union([[string, string], [string]])` and an array's element aren't. Length
+ * alone can't see that what's left puts a value where its position can't
+ * hold it (`f[0]` of a `[string, number?]`), or is a list only a member a tag
+ * rules out accepts, so those aren't either, as 1.39.0 sent them.
+ *
+ * `false` means the schema can't say the row breaks: a record's keys, a
+ * list's elements, and anything opaque (a `Schema.declare`, a set, a
+ * `.check()` such as a minimum length, which is a verdict on the value and not
+ * its shape).
  */
 export const pathIsRequired = (
   field: Schema.Top,
   segments: ReadonlyArray<string | number>,
-): boolean => pathVerdict(SchemaAST.toEncoded(field.ast), segments) === "required"
+): boolean => {
+  const ast = SchemaAST.toEncoded(field.ast)
+  const last = segments[segments.length - 1]
+  return typeof last === "number"
+    ? positionIsRequired(listsAt(ast, segments.slice(0, -1)), last)
+    : pathVerdict(ast, segments) === "required"
+}

@@ -106,3 +106,7 @@ describeConnected("an appendInput that may leave out many of a sharded index's c
 describeConnected("a pathRemove below a union", () => {
   pathClearSuite("union-clears")(openTable)
 })
+
+describeConnected("a pathRemove of a list position", () => {
+  pathClearSuite("tuple-clears")(openTable)
+})

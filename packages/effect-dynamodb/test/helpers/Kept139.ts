@@ -2,16 +2,17 @@
  * What published 1.39.0 did, replayed: the table, the steps and the comparison shared by the
  * scenarios that pin a behaviour 1.39.0 had (`OptionalShardAppend.ts`, `StoredNaNKeys.ts`,
  * `AggregateCreateStamps.ts`). Each fixture holds, for a scenario, every step's outcome and the
- * table's rows after it, as a scratch script captured them from the published 1.39.0 against
+ * table's rows after it (and, in `tuple-clears`, the requests it sent), as a scratch script
+ * captured them from the published 1.39.0 against
  * DynamoDB Local. A scenario runs the same steps here, on a recording table (`Kept139.test.ts`)
  * and on DynamoDB Local (`connected.kept-1.39.0.test.ts`), and compares.
  */
 
 import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Cause, DateTime, Duration, Effect, Exit, type Layer } from "effect"
+import { Cause, DateTime, Duration, Effect, Exit, Layer } from "effect"
 import { TestClock } from "effect/testing"
-import { DynamoClient } from "../../src/DynamoClient.js"
+import { DynamoClient, type DynamoClientService } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
 import { makeRecordingTable } from "./RecordingTable.js"
 
@@ -28,6 +29,8 @@ export interface Step {
   readonly step: string
   readonly outcome: Outcome
   readonly rows: ReadonlyArray<Row>
+  /** The requests the step sent, where the fixture keeps them. */
+  readonly requests?: ReadonlyArray<unknown>
 }
 
 /** A fixture captured from the published 1.39.0: `fixtures/<name>-1.39.0.json`. */
@@ -125,8 +128,15 @@ export type StepOf = readonly [
   map?: (value: any) => unknown,
 ]
 
-/** Each step's outcome and the table's rows after it. A step that throws when built is `throws`. */
-export const runSteps = (table: ScenarioTable, steps: ReadonlyArray<StepOf>) =>
+/**
+ * Each step's outcome and the table's rows after it, and with `requests` (which hands over what was
+ * sent since it was last asked), what the step sent. A step that throws when built is `throws`.
+ */
+export const runSteps = (
+  table: ScenarioTable,
+  steps: ReadonlyArray<StepOf>,
+  requests?: () => ReadonlyArray<unknown>,
+) =>
   Effect.gen(function* () {
     const out: Array<Step> = []
     for (const [step, make, map = plain] of steps) {
@@ -137,10 +147,58 @@ export const runSteps = (table: ScenarioTable, steps: ReadonlyArray<StepOf>) =>
         const message = String((error as Error)?.message)
         outcome = { throws: codeOf(message) ?? message.slice(0, 120) }
       }
-      out.push({ step, outcome, rows: sortedRows(yield* table.rows) })
+      const rows = sortedRows(yield* table.rows)
+      out.push(
+        requests === undefined
+          ? { step, outcome, rows }
+          : { step, outcome, rows, requests: requests() },
+      )
     }
     return out
   })
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+/** A request as the fixtures hold it: the table's name and each UUID (a row's token) set aside. */
+const plainRequest = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(plainRequest)
+    : value !== null && typeof value === "object"
+      ? Object.fromEntries(
+          Object.entries(value).map(([name, held]) => [
+            name,
+            name === "TableName" ? "<table>" : plainRequest(held),
+          ]),
+        )
+      : typeof value === "string" && UUID.test(value)
+        ? "<uuid>"
+        : value
+
+/** `open`, with every request sent to its tables kept in `log`, as `{ [operation]: input }`. */
+export const recordingRequests =
+  (open: OpenTable, log: Array<unknown>): OpenTable =>
+  (MainTable) =>
+    Effect.map(open(MainTable), (table) => ({
+      ...table,
+      layer: Layer.effect(
+        DynamoClient,
+        Effect.gen(function* () {
+          const client = yield* DynamoClient
+          return Object.fromEntries(
+            Object.entries(client).map(([name, operation]) => [
+              name,
+              typeof operation === "function"
+                ? (input: unknown) =>
+                    Effect.suspend(() => {
+                      log.push({ [name]: plainRequest(JSON.parse(JSON.stringify(input ?? null))) })
+                      return operation.call(client, input)
+                    })
+                : operation,
+            ]),
+          ) as unknown as DynamoClientService
+        }),
+      ).pipe(Layer.provide(table.layer)),
+    }))
 
 /**
  * Run `body` against a client over `members` on an empty table of `MainTable`, with the clock at
