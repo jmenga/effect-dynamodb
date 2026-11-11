@@ -290,11 +290,19 @@ describeConnected("the row token on DynamoDB Local (#237)", () => {
           reads++
           racing = true
           yield* RaceB.apply(invoices[next++]!).pipe(
-            Effect.ensuring(Effect.sync(() => void (racing = false))),
+            Effect.ensuring(
+              Effect.sync(() => {
+                racing = false
+              }),
+            ),
           )
         })
         const exit = yield* Effect.exit(A.apply((yield* Orders.read({ id }))[0]!)).pipe(
-          Effect.ensuring(Effect.sync(() => void (pending.each = undefined))),
+          Effect.ensuring(
+            Effect.sync(() => {
+              pending.each = undefined
+            }),
+          ),
         )
         // One read per attempt: the first, then one per retry.
         expect(reads).toBe(retries + 1)
