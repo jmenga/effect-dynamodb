@@ -244,7 +244,8 @@ describeConnected(
                   entities: { Docs },
                   tables: { MainTable },
                 } as never)
-                let n = 0
+                // The ids this key had when one test ran every key, so the requests are the same.
+                let n = KEYS.indexOf(key) * ENTRY_OPS.length * 2
                 for (const op of ENTRY_OPS) {
                   for (const present of [true, false]) {
                     const id = `a${n++}`
