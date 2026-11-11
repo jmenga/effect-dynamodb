@@ -2430,6 +2430,8 @@ interface EntityLike {
   readonly _sparseFieldNames?: ReadonlyArray<string> | undefined
   /** A stored row as every read sees it: sparse maps rebuilt, renamed fields under their names. */
   readonly _toDomainView?: ((raw: Record<string, unknown>) => Record<string, unknown>) | undefined
+  /** The sparse map a read takes a stored attribute for, if any (#238). */
+  readonly _sparseMapOf?: ((attribute: string) => string | undefined) | undefined
   /**
    * The entity's refs: a `${ref}Id` composite is not stored on the item, but
    * the ref it names is, as a map holding the referenced identifier.

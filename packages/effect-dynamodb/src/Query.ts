@@ -1147,31 +1147,43 @@ export const selectProjected = <A>(
 /**
  * @internal A select no `ProjectionExpression` can express (#238): a sparse map is stored one
  * attribute per entry (`<prefix>#<key>`), and a projection can't name attributes by prefix. The
- * rows are read whole, and `decode` rebuilds each one as a read does and trims it to what was
- * selected ({@link projectRow}). `storedPaths` are the selected paths under their stored names:
- * a path inside a packed attribute is refused as a projection's is, and the raw-row hook runs only
- * where a projection of them would run it.
+ * rows are read whole. Each row is first cut to what a projection of `storedPaths` would return
+ * ({@link projectRow}: the other selected paths, under their stored names), and that goes through
+ * exactly what a projected row goes through: the raw-row hook, given what it reads to dispatch
+ * (taken back off after it ran, as off a projected row), and only where a projection of
+ * `storedPaths` would run it. Nothing the select doesn't name is unpacked, decompressed or
+ * checked. `decode` gets that, and the whole row, from which it takes the sparse maps selected.
  */
 export const selectWhole = <A>(
   self: Query<A>,
   storedPaths: ReadonlyArray<ReadonlyArray<string | number>>,
-  decode: (raw: Record<string, unknown>) => unknown,
+  decode: (projected: Record<string, unknown>, raw: Record<string, unknown>) => unknown,
 ): Query<Record<string, unknown>> => {
   if (self._state.predicates.length > 0) {
     throw new Error(rejectPredicateWithProjection("select() after filterBy()"))
   }
   refusePackedProjection(self._state, storedPaths)
-  const rawRow = rawRowDecoder(projectedRawRow(self._state.rawRow, storedPaths))
+  const hook = projectedRawRow(self._state.rawRow, storedPaths)
+  const reads = hook?.reads ?? []
   return new QueryImpl<Record<string, unknown>>({
     ...self._state,
     projection: undefined,
     projectionPaths: undefined,
     selectsWholeRows: true,
-    decoder: (raw) =>
-      Effect.map(
-        rawRow(raw),
-        (row) => decode(row as Record<string, unknown>) as Record<string, unknown>,
-      ),
+    decoder: (raw) => {
+      const projected = projectRow(raw, storedPaths)
+      if (hook === undefined)
+        return Effect.succeed(decode(projected, raw) as Record<string, unknown>)
+      const borrowed = reads.filter(
+        (attribute) => !Object.hasOwn(projected, attribute) && Object.hasOwn(raw, attribute),
+      )
+      for (const attribute of borrowed) projected[attribute] = raw[attribute]
+      return Effect.map(hook(projected), (row) => {
+        const hooked = row as Record<string, unknown>
+        for (const attribute of borrowed) delete hooked[attribute]
+        return decode(hooked, raw) as Record<string, unknown>
+      })
+    },
   })
 }
 

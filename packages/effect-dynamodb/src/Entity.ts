@@ -876,6 +876,12 @@ export interface Entity<
     raw: globalThis.Record<string, unknown>,
   ) => globalThis.Record<string, unknown>
 
+  /**
+   * @internal The sparse map field a read takes a stored attribute for: an entry's attribute
+   * (`<prefix>#<key>`), or the attribute a `field:` rename stores a map under whole.
+   */
+  readonly _sparseMapOf: (attribute: string) => string | undefined
+
   /** @internal Entity schema version baked into composed keys. */
   readonly _entityVersion: number
 
@@ -2628,6 +2634,15 @@ const makeImpl = <
   } = data
   /** Which stored attributes are this entity's sparse map entries, as a row's reader takes them. */
   const sparseEntries = sparseReader(sparseFields)
+  /** The attributes `field:` renames store sparse maps under whole, by attribute. */
+  const sparseRenames = new Map(
+    Object.keys(sparseFields).flatMap((field) =>
+      Object.hasOwn(data.fieldRenames, field) ? [[data.fieldRenames[field]!, field] as const] : [],
+    ),
+  )
+  /** The sparse map a read takes a stored attribute for: an entry's, or one stored whole. */
+  const sparseMapOf = (attribute: string): string | undefined =>
+    sparseRenames.get(attribute) ?? sparseEntries.entryOf(attribute)?.field
   // Encoders for path-addressed update values (`pathSet`, `pathAppend`, …) and
   // record-based `append`, which bypass the update schema (#133).
   const pathValues = makePathValueEncoder(
@@ -18495,6 +18510,7 @@ const makeImpl = <
     _storedFormAt: storedFormAt,
     _sparseFieldNames: Object.keys(sparseFields),
     _toDomainView: toDomainView,
+    _sparseMapOf: sparseMapOf,
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
