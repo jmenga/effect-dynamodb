@@ -1,0 +1,78 @@
+{
+  "generatedFrom": "effect-dynamodb@1.39.0",
+  "note": "Captured once from published effect-dynamodb 1.39.0 on DynamoDB Local. Never regenerate it.",
+  "describes": "Published effect-dynamodb@1.39.0 and @effect-dynamodb/schema@1.39.0 with effect@4.1.2. One table on DynamoSchema { name: rx, version: 1 } holding the entity SoftU: model { id: String, f: Duration }, primary key pk [id] / sk [f], softDelete: true, unique byF: [f], index byF (gsi1: pk [id], sk [f]). After put { id: a, f: Duration.millis(1500) }, a soft delete and a restore of that item, every row: the item restored under f_[object object] with its index key, the sentinel the restore wrote under [object object], and the one put wrote, which the soft delete didn't release.",
+  "rows": [
+    {
+      "sk": {
+        "S": "$rx#v1#softu.byf"
+      },
+      "_entity_sk": {
+        "S": "$rx#v1#softu#f_[object object]"
+      },
+      "pk": {
+        "S": "$rx#v1#softu.byf#[object object]"
+      },
+      "_entity_pk": {
+        "S": "$rx#v1#softu#id_a"
+      },
+      "__edd_e__": {
+        "S": "SoftU._unique.byF"
+      }
+    },
+    {
+      "sk": {
+        "S": "$rx#v1#softu.byf"
+      },
+      "_entity_sk": {
+        "S": "$rx#v1#softu#f_1500 millis"
+      },
+      "pk": {
+        "S": "$rx#v1#softu.byf#1500 millis"
+      },
+      "_entity_pk": {
+        "S": "$rx#v1#softu#id_a"
+      },
+      "__edd_e__": {
+        "S": "SoftU._unique.byF"
+      }
+    },
+    {
+      "gsi1sk": {
+        "S": "$rx#v1#softu#f_[object object]"
+      },
+      "f": {
+        "M": {
+          "~effect/Duration": {
+            "S": "~effect/Duration"
+          },
+          "value": {
+            "M": {
+              "millis": {
+                "N": "1500"
+              },
+              "_tag": {
+                "S": "Millis"
+              }
+            }
+          }
+        }
+      },
+      "__edd_e__": {
+        "S": "SoftU"
+      },
+      "gsi1pk": {
+        "S": "$rx#v1#softu#id_a"
+      },
+      "sk": {
+        "S": "$rx#v1#softu#f_[object object]"
+      },
+      "id": {
+        "S": "a"
+      },
+      "pk": {
+        "S": "$rx#v1#softu#id_a"
+      }
+    }
+  ]
+}

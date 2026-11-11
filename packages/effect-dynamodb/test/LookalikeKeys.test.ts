@@ -11,14 +11,20 @@
  *
  * The rows are published 1.39.0's own (`fixtures/lookalike-keys-1.39.0.json`): the head writes them
  * byte for byte, finds them, restores a 1.39.0 tombstone under the key `put` wrote, releases a
- * 1.39.0 sentinel, and `rekey` finds every one where it belongs. Measured with published 1.40.0 on
+ * 1.39.0 sentinel, and `rekey` finds every one where it belongs, and moves the item 1.39.0's
+ * `restore` left under `[object object]` to the key `put` wrote. Measured with published 1.40.0 on
  * the same rows: `get` found them, but `restore` composed `[object object]`, a unique delete left
  * the sentinel, and `rekey` skipped five of the seven rows as keys it didn't recognise.
  */
+
+import { readFileSync } from "node:fs"
 import { it } from "@effect/vitest"
-import { DateTime, Effect, Exit, Option, Schema } from "effect"
+import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
+import { Cause, DateTime, Duration, Effect, Exit, Option, Schema } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
+import * as Entity from "../src/Entity.js"
+import * as Table from "../src/Table.js"
 import {
   asHeadLeavesIt,
   comparable,
@@ -134,22 +140,67 @@ describe("look-alike key composites, against the rows published 1.39.0 wrote", (
       ),
     )
 
-    // 1.39.0's restore wrote the item under a key `put` never wrote: its stored values compose
-    // another one, so `rekey` doesn't take that key for the item's, and reports the row.
-    it.effect(
-      `${name}: rekey leaves the row 1.39.0's restore keyed by the map, and reports it`,
-      () =>
-        on(field, captured.stages.restored, (db, rows) =>
-          Effect.gen(function* () {
-            const report = yield* db.tables.Main.rekey()
-            expect(report.skipped.unrecognizedKey).toBe(1)
-            expect(Object.values(report.moved).every((n) => n === 0)).toBe(true)
-            expect(report.conflicts).toEqual([])
-            expect(comparable(rows())).toEqual(comparable(captured.stages.restored))
-          }),
-        ),
+    // 1.39.0's restore wrote the item under the map's text, `[object object]`: a key `put` never
+    // wrote, which nothing reaches. `rekey` reads that text as an earlier position of the row
+    // (`restoredObjectReading`, a rekey-only reading) and moves it to the key the instance composes.
+    it.effect(`${name}: rekey moves the row 1.39.0's restore keyed by the map to put's key`, () =>
+      on(field, captured.stages.restored, (db, rows) =>
+        Effect.gen(function* () {
+          const key = { id: "a", f: make() }
+          const before = yield* Effect.exit(db.entities.Soft.get(key))
+          expect(Exit.isFailure(before) && (Cause.squash(before.cause) as any)._tag).toBe(
+            "ItemNotFound",
+          )
+          const dry = yield* db.tables.Main.rekey({ dryRun: true })
+          expect(dry.moved.item).toBe(1)
+          expect(comparable(rows())).toEqual(comparable(captured.stages.restored))
+          const report = yield* db.tables.Main.rekey()
+          expect(report.moved).toEqual({ ...dry.moved, item: 1 })
+          expect(
+            Object.values(report.moved as Record<string, number>).reduce((a, n) => a + n, 0),
+          ).toBe(1)
+          expect(Object.values(report.skipped).every((n) => n === 0)).toBe(true)
+          expect(report.conflicts).toEqual([])
+          const moved = comparable(asHeadLeavesIt(captured, "restored"))
+          expect(comparable(rows())).toEqual(moved)
+          const got = yield* db.entities.Soft.get(key)
+          expect(isInstanceOf(got.f, make(), field)).toBe(true)
+          const again = yield* db.tables.Main.rekey()
+          expect(Object.values(again.moved).every((n) => n === 0)).toBe(true)
+          expect(Object.values(again.skipped).every((n) => n === 0)).toBe(true)
+          expect(again.conflicts).toEqual([])
+          expect(comparable(rows())).toEqual(moved)
+        }),
+      ),
     )
   }
+
+  it.effect("rekey resumed page by page moves 1.39.0's restored row as one run does", () => {
+    const captured = fixture.Duration!
+    const { field, make } = kindOf("Duration")
+    return on(field, captured.stages.restored, (db, rows) =>
+      Effect.gen(function* () {
+        let moved = 0
+        let resume: string | undefined
+        let pages = 0
+        do {
+          const report = yield* db.tables.Main.rekey({
+            pageSize: 1,
+            maxPages: 1,
+            ...(resume === undefined ? {} : { resume }),
+          })
+          moved += report.moved.item
+          expect(report.conflicts).toEqual([])
+          resume = Option.getOrUndefined(report.resume)
+          pages++
+        } while (resume !== undefined && pages < 50)
+        expect(resume).toBeUndefined()
+        expect(moved).toBe(1)
+        expect(comparable(rows())).toEqual(comparable(asHeadLeavesIt(captured, "restored")))
+        yield* db.entities.Soft.get({ id: "a", f: make() })
+      }),
+    )
+  })
 
   for (const name of ["BigDecimal", "BigDecimal past 2^53"]) {
     const { field, make } = kindOf(name)
@@ -181,6 +232,89 @@ describe("look-alike key composites, against the rows published 1.39.0 wrote", (
         }),
       ),
     )
+  }
+})
+
+describe("rekey over 1.39.0's restore of an item with a unique constraint and an index", () => {
+  /** `fixtures/restored-unique-1.39.0.json`: what 1.39.0's put, soft delete and restore left. */
+  const restored = JSON.parse(
+    readFileSync(new URL("./fixtures/restored-unique-1.39.0.json", import.meta.url), "utf8"),
+  ).rows as ReadonlyArray<Row>
+  const key = { id: "a", f: Duration.millis(1500) }
+  const keyed = (rows: ReadonlyArray<Row>) =>
+    rows
+      .map(
+        (row) =>
+          `${row.pk!.S}|${row.sk!.S}${row.gsi1sk ? ` ${row.gsi1sk.S}` : ""}` +
+          `${row._entity_sk ? ` -> ${row._entity_sk.S}` : ""}`,
+      )
+      .sort()
+
+  // The item moves with its index key. The sentinel 1.39.0's restore wrote under `[object object]`
+  // names the key the item left, so it's left and counted; releasing it is the orphaned
+  // reservations' work (#240). The value stays reserved by the sentinel put wrote, which names the
+  // item's key under the text put composed: with `escapeKeys` off that's where the item moves, and
+  // turned on, that sentinel moves with the item, as the item's own under other key text.
+  for (const [escapeKeys, item, sentinel, sentinelsMoved] of [
+    [false, "f_1500 millis", "1500 millis", 0],
+    [true, "f_1500%20millis", "1500%20millis", 1],
+  ] as const) {
+    it.effect(`escapeKeys ${escapeKeys}: moves the item, its index key and put's sentinel`, () => {
+      const SoftU = Entity.make({
+        model: Schema.Struct({ id: Schema.String, f: Schema.Duration }),
+        entityType: "SoftU",
+        primaryKey: {
+          pk: { field: "pk", composite: ["id"] },
+          sk: { field: "sk", composite: ["f"] },
+        },
+        softDelete: true,
+        unique: { byF: ["f"] },
+        indexes: {
+          byF: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["id"] },
+            sk: { field: "gsi1sk", composite: ["f"] },
+          },
+        },
+      })
+      const Main = Table.make({
+        schema: DynamoSchema.make({ name: "rx", version: 1, escapeKeys }),
+        entities: { SoftU },
+      })
+      const table = makeRecordingTable({ indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" } } })
+      for (const row of restored) {
+        table.items.set(`${row.pk!.S}|${row.sk!.S}`, structuredClone(row) as never)
+      }
+      const rows = () => [...table.items.values()] as unknown as ReadonlyArray<Row>
+      return Effect.gen(function* () {
+        const db = yield* DynamoClient.make({ entities: { SoftU }, tables: { Main } })
+        expect(Exit.isFailure(yield* Effect.exit(db.entities.SoftU.get(key)))).toBe(true)
+        const report = yield* db.tables.Main.rekey()
+        expect(report.moved.item).toBe(1)
+        expect(report.sentinelsMoved).toBe(sentinelsMoved)
+        expect(report.skipped.unrecognizedKey).toBe(1)
+        expect(report.conflicts).toEqual([])
+        const after = [
+          `$rx#v1#softu#id_a|$rx#v1#softu#${item} $rx#v1#softu#${item}`,
+          `$rx#v1#softu.byf#${sentinel}|$rx#v1#softu.byf -> $rx#v1#softu#${item}`,
+          "$rx#v1#softu.byf#[object object]|$rx#v1#softu.byf -> $rx#v1#softu#f_[object object]",
+        ]
+        expect(keyed(rows())).toEqual(after)
+        yield* db.entities.SoftU.get(key)
+        const taken = yield* Effect.exit(db.entities.SoftU.put({ id: "b", f: key.f }).asEffect())
+        expect(Exit.isFailure(taken) && (Cause.squash(taken.cause) as any)._tag).toBe(
+          "UniqueConstraintViolation",
+        )
+        const again = yield* db.tables.Main.rekey()
+        expect(Object.values(again.moved).every((n) => n === 0)).toBe(true)
+        expect(again.sentinelsMoved).toBe(0)
+        expect(again.skipped.unrecognizedKey).toBe(1)
+        expect(keyed(rows())).toEqual(after)
+        // A delete releases the value put reserved.
+        yield* db.entities.SoftU.delete(key).asEffect()
+        yield* db.entities.SoftU.put({ id: "c", f: key.f }).asEffect()
+      }).pipe(Effect.provide(Main.layer({ name: "rx" })), Effect.provide(table.layer))
+    })
   }
 })
 

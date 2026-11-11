@@ -70,6 +70,7 @@ import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacke
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
 import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
+import { restoredObjectReading } from "@effect-dynamodb/schema/internal/RestoredKeyText.js"
 import {
   type AbsentReading,
   absentReading,
@@ -13727,8 +13728,10 @@ const makeImpl = <
   /**
    * A row's values in the key form, then in 1.39.0's where that differs (`keyForm139`), then with
    * each zone under the name it was given where a value names one so (`givenZoneReading`: the text
-   * 1.38.0 to 1.40.0 composed on Effect 4.1.3): the records each key text a row may be stored under
-   * is composed from.
+   * 1.38.0 to 1.40.0 composed on Effect 4.1.3), then with each composite stored as a map the key
+   * form makes an instance of under the map's text (`restoredObjectReading`: what 1.39.0's and
+   * 1.40.0's `restore` composed, `[object object]`): the records each key text a row may be stored
+   * under is composed from.
    */
   const rowKeyForms = (
     values: globalThis.Record<string, unknown>,
@@ -13745,7 +13748,12 @@ const makeImpl = <
       ? [rowKeyForm, rowKeyForm139]
       : [rowKeyForm]
     const given = givenZoneReading(rowKeyForm, values, readsKey)
-    return given === undefined ? readings : [...readings, given]
+    const restored = restoredObjectReading(rowKeyForm, values, readsKey)
+    return [
+      ...readings,
+      ...(given === undefined ? [] : [given]),
+      ...(restored === undefined ? [] : [restored]),
+    ]
   }
 
   type RowTargets = {
@@ -14713,7 +14721,9 @@ const makeImpl = <
           "item",
           values,
           read!,
-          (key) => sameStoredKey(key, from),
+          // Its sentinels name the key it's stored under, or, where 1.39.0's `restore` moved it
+          // (`restoredObjectReading`), the item's key under the text `put` composed.
+          (key) => sameStoredKey(key, from) || targets.isLive(key),
           to,
           true,
           undefined,

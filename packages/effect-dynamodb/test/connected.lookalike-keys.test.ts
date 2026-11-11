@@ -2,7 +2,8 @@
  * Effect's look-alike types as key composites against DynamoDB Local (#242 §2): the connected twin
  * of `LookalikeKeys.test.ts`, over the rows published 1.39.0 stored
  * (`fixtures/lookalike-keys-1.39.0.json`, definitions and steps in `helpers/LookalikeKeys.ts`). The
- * head writes 1.39.0's rows, restores and updates them as its own, and `rekey` moves none of them;
+ * head writes 1.39.0's rows, restores and updates them as its own, `rekey` moves none of them, and
+ * moves the item 1.39.0's `restore` left under `[object object]` to the key `put` wrote;
  * a cookie stays refused.
  *
  * Prerequisites:
@@ -137,6 +138,28 @@ describeConnected("look-alike key composites against DynamoDB Local", () => {
           expect(report.indexKeys.lagging).toBe(0)
           expect(report.conflicts).toEqual([])
           expect(comparable(yield* rows)).toEqual(comparable(captured.stages.put))
+        }),
+      ),
+    )
+
+    it.effect(`${name}: rekey moves the row 1.39.0's restore keyed by the map to put's key`, () =>
+      on(field, captured.stages.restored, (db, rows) =>
+        Effect.gen(function* () {
+          const key = { id: "a", f: make() }
+          expect(Exit.isFailure(yield* Effect.exit(db.entities.Soft.get(key)))).toBe(true)
+          const report = yield* db.tables.Main.rekey()
+          expect(report.moved.item).toBe(1)
+          expect(
+            Object.values(report.moved as Record<string, number>).reduce((a, n) => a + n, 0),
+          ).toBe(1)
+          expect(Object.values(report.skipped).every((n) => n === 0)).toBe(true)
+          expect(report.conflicts).toEqual([])
+          const moved = comparable(asHeadLeavesIt(captured, "restored"))
+          expect(comparable(yield* rows)).toEqual(moved)
+          yield* db.entities.Soft.get(key)
+          const again = yield* db.tables.Main.rekey()
+          expect(Object.values(again.moved).every((n) => n === 0)).toBe(true)
+          expect(comparable(yield* rows)).toEqual(moved)
         }),
       ),
     )

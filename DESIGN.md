@@ -1844,9 +1844,21 @@ composed from the value given (`fixtures/lookalike-keys-1.39.0.json`). A
 cookie's key text is its whole printed form, options and all. 1.39.0 composed
 the map's own text: a `restore` put the item back under `[object object]`,
 where `get` didn't find it, and a delete left its unique-constraint sentinel
-behind. A row 1.39.0's (or 1.40.0's) `restore` left under `[object object]` is
-under a key no value composes; `rekey` leaves it and counts it as
-`unrecognizedKey`. A list or
+behind. `rekey` moves an item 1.39.0's (or 1.40.0's) `restore` left under
+`[object object]` to the key `put` wrote, its index keys with it: a reading of
+the row for `rekey` alone (`restoredObjectReading`,
+`internal/RestoredKeyText.ts`) gives each composite stored as a map the key form
+makes an instance of its map's text, the text that `restore` composed, so the
+key is an earlier position of the row, moved from under the usual guards, in a
+dry run counted only. Nothing else composes that text for a write (`EDD-9162`).
+The sentinel that `restore` wrote under `[object object]` names the key the item
+left: `rekey` leaves it and counts it as `unrecognizedKey`. The value stays
+reserved by the sentinel `put` wrote, which that `restore`'s soft delete didn't
+release. It names the item's key under the text `put` composed, which the item
+moves to, so with `escapeKeys` off it is already in place. With `escapeKeys`
+turned on, a moving item takes as its own a sentinel naming any of its keys under
+other text (`isLive`), not only the key it's stored under, so that sentinel moves
+with it (`fixtures/restored-unique-1.39.0.json`). A list or
 struct of `Schema.BigInt` beneath a step (a decoding default, a transformation)
 comes back holding numbers, `[5]` for `[5n]`, which the field refuses; every
 entity read lifts them back (`legacyReads`), and the key form does the same

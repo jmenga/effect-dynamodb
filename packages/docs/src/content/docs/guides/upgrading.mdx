@@ -101,6 +101,14 @@ A projection's row tombstones and outbox items hold no values, so `rekey` can't 
 
 The name a zone is keyed under is the one the runtime's `Intl` resolves it to, and has been since 1.38.0: `Asia/Kolkata` resolves to `Asia/Calcutta` on Node 24, and `Etc/UTC` to `UTC`. So it depends on the runtime's time zone data. A runtime that resolves a zone to another name (a newer ICU, or one that follows the ECMA-402 change to stop canonicalising, as Firefox does) keys the same zone under another text, and a row keyed under one isn't found by a key composed under the other. Keep the runtimes that read and write a table on one time zone data release, and check it when you upgrade the runtime.
 
+## Items 1.39.0's `restore` keyed by `[object object]`
+
+A key composite holding one of Effect's look-alikes (a `Duration`, `BigDecimal`, time zone, `UrlParams`, `SemVer` / `SemVerRange`, address or DNS record, or an `Option` or `Result` holding one) is stored as a map. 1.39.0's `put` keyed the item by the value's text (`1500 millis`), but its `restore` composed the key again from the tombstone, which held the map, and put the item back under `…#f_[object object]`, with its index keys. `get`, a query by the value and a delete don't find it there, on 1.40.0 or 1.41.0. A restore by 1.40.0 of a tombstone 1.39.0 wrote did the same.
+
+`rekey` reads such an item's stored map as the text that `restore` composed, recognises `[object object]` as an earlier place of the row, and moves it to the key `put` wrote, its index keys with it, with the usual guards, dry run, report and resume. Afterwards `get` finds it, and a second run moves nothing.
+
+The unique-constraint sentinel that `restore` wrote under `[object object]` names the key the item left, so `rekey` leaves it and counts it as `skipped.unrecognizedKey`, on every run. The value stays reserved: 1.39.0's soft delete didn't release the sentinel `put` wrote, which names the item's key as `put` wrote it. With `escapeKeys` off that's where the item moves, and with it turned on, that sentinel moves with the item. No write composes `[object object]` since 1.41.0 (`EDD-9162`), so the leftover sentinel holds nothing back.
+
 ## Turning `escapeKeys` on over existing data
 
 1. **Set `escapeKeys: true`** in a build, and deploy it everywhere without serving traffic from it yet.
