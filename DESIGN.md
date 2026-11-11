@@ -3456,11 +3456,14 @@ read runs it as an Effect, so a reader or encoder that can't finish (an
 asynchronous step, a defect) says nothing, and the operand is sent as 1.40.0
 sent it. The write schema's check above follows the same rule, so such a
 schema's operand is sent at every position, encoded where its encoder runs;
-1.39.0 and 1.40.0 died on it at a field, below a struct and in an `.append()`. `readersAt`'s soundness
-(no reader reads the operand ⇒ no row holding it decodes) is property-tested
-with Effect's decoder as the oracle (`ReadersAt.property.test.ts`). An operand
-one of the readers reads may still be wrong for the union member a row holds,
-as it always was.
+1.39.0 and 1.40.0 died on it at a field, below a struct and in an `.append()`. `readersAt`
+is property-tested in both directions with Effect's decoder as the oracle
+(`ReadersAt.property.test.ts`): no reader reads the operand ⇒ no row holding it
+decodes, and every reader reads it ⇒ every row holding it decodes. The one class
+the second can't check is an operand some readers read and others don't, at a
+position a union's members read differently: whether a row holding it reads
+depends on the member the row holds, which the readers don't see, so it may still
+be wrong for that member, as it always was.
 
 **Retain entities.** The `versioned: { retain: true }` update branch builds the
 new item in memory and writes it in a transaction with the snapshot; it used to

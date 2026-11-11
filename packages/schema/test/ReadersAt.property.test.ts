@@ -1,15 +1,24 @@
 /**
- * An update's operand is refused only where no row holding it reads (#236), with Effect's own
- * decoder as the oracle. Wherever `readersAt` resolves a position and none of its readers reads an
- * operand, every sampled value of the field the write applies to (the container is there and of
- * the kind DynamoDB needs) is one the field's schema refuses once the operand is written there as
- * DynamoDB writes it: `SET` replaces a property or a list position, and writes past a list's end
- * at its end; `list_append` adds elements at either end of a list.
+ * What `readersAt` says of an update's operand, with Effect's own decoder as the oracle (#236), in
+ * both directions. Wherever it resolves a position, for every sampled value of the field the write
+ * applies to (the container is there and of the kind DynamoDB needs), with the operand written
+ * there as DynamoDB writes it (`SET` replaces a property or a list position, and writes past a
+ * list's end at its end; `list_append` adds elements at either end of a list):
+ *
+ * - an operand none of the readers reads is one no such row reads (a refusal is never wrong);
+ * - an operand every reader reads is one every such row reads (the readers ask no more than the
+ *   read does).
+ *
+ * One class of position can't be checked the second way, and is counted rather than checked: one
+ * a union reaches through members that read it differently (`Union([Struct({ p: String }),
+ * Struct({ p: Number })])` at `p`), with an operand some of their readers read and others don't.
+ * Whether a row holding it reads depends on the member the row holds, which the readers don't
+ * see: it is taken, as an operand one of them reads always was (an operand none reads is still
+ * refused, and checked above).
  *
  * Schemas and values come from `helpers/GeneratedSchemas.ts`, as `PathIsRequired.property.test.ts`
  * builds them; a failure names the seed that rebuilds its schema. Operands are the values sampled
- * values hold, at any depth, and a few fixed ones. This asserts soundness only: a refusal is never
- * wrong. It doesn't ask that every operand leaving a row that can't be read is refused.
+ * values hold, at any depth, and a few fixed ones.
  */
 import { Exit, Schema, type SchemaAST } from "effect"
 import { describe, expect, it } from "vitest"
@@ -108,11 +117,14 @@ type Finding = {
 }
 
 describe("readersAt, against Effect's decoder", () => {
-  it(`refuses no operand a row holding it reads, over ${SCHEMAS} generated schemas`, () => {
+  it(`refuses only what no row reads, and takes what every row reads, over ${SCHEMAS} generated schemas`, () => {
     const findings: Array<Finding> = []
     let resolved = 0
     let refusals = 0
     let checked = 0
+    let accepted = 0
+    let checkedAccepted = 0
+    let unchecked = 0
     let sampled = 0
     for (let seed = FIRST_SEED; seed < FIRST_SEED + SCHEMAS; seed++) {
       const random = generator(seed)
@@ -155,11 +167,14 @@ describe("readersAt, against Effect's decoder", () => {
             const written = kind === "value" ? [operand] : Array.isArray(operand) ? operand : []
             if (kind === "elements" && written.length === 0) continue
             const refused = written.some((one) => !readers.some((ast) => reads(ast, one)))
-            if (!refused) continue
-            refusals++
+            if (refused) refusals++
+            else if (written.every((one) => readers.every((ast) => reads(ast, one)))) accepted++
+            else {
+              unchecked++
+              continue
+            }
             for (const value of values) {
               if (!applies(value, path, kind)) continue
-              checked++
               const after =
                 kind === "value"
                   ? [set(value, path, operand)]
@@ -173,8 +188,32 @@ describe("readersAt, against Effect's decoder", () => {
                         ...(containerAt(value, path) as Array<unknown>),
                       ]),
                     ]
-              if (after.some(readsWhole)) {
-                findings.push({ seed, field: label, path, kind, operand, value, problem: "reads" })
+              if (refused) {
+                checked++
+                if (after.some(readsWhole)) {
+                  findings.push({
+                    seed,
+                    field: label,
+                    path,
+                    kind,
+                    operand,
+                    value,
+                    problem: "reads",
+                  })
+                }
+              } else {
+                checkedAccepted++
+                if (!after.every(readsWhole)) {
+                  findings.push({
+                    seed,
+                    field: label,
+                    path,
+                    kind,
+                    operand,
+                    value,
+                    problem: "doesn't read",
+                  })
+                }
               }
             }
           }
@@ -182,11 +221,15 @@ describe("readersAt, against Effect's decoder", () => {
       }
     }
     expect(findings.slice(0, 5)).toEqual([])
-    // Not vacuous: most schemas sampled values, many positions resolved, many operands refused,
-    // and many refusals checked against a value the write applies to.
+    // Not vacuous: most schemas sampled values, many positions resolved, many operands refused
+    // and taken, and many of each checked against a value the write applies to. The operands a
+    // union's members read differently, taken unchecked, are few.
     expect(sampled).toBeGreaterThan(SCHEMAS * 0.8)
     expect(resolved).toBeGreaterThan(1000)
     expect(refusals).toBeGreaterThan(10_000)
     expect(checked).toBeGreaterThan(100_000)
+    expect(accepted).toBeGreaterThan(10_000)
+    expect(checkedAccepted).toBeGreaterThan(100_000)
+    expect(unchecked).toBeLessThan(accepted / 4)
   }, 120_000)
 })
