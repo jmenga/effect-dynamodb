@@ -1264,133 +1264,251 @@ export const holdsAbsentValue = (
 export const rowCanLack = (field: Schema.Top): boolean =>
   rowOmits(field) || absentReading(field) !== undefined
 
-/** The verdict on a path, as far as a schema can tell. */
-type PathVerdict = "required" | "open" | "absent"
+/**
+ * A node the removal guard models exactly as a read decodes it. A removal below a field is
+ * refused only when the walk from the field to the removed property or position passes through
+ * these alone; any other node makes the verdict unknown, and the removal is sent as 1.39.0 sent
+ * it:
+ *
+ * - a struct: one or more fixed properties, and no index signature (`Schema.Struct({})` reads
+ *   any value but `null` and `undefined`, so it isn't one);
+ * - a record: one index signature, keyed by plain `Schema.String`, and no fixed property;
+ * - a list: an array, or a tuple whose rest, if it has one, is one element with nothing after it;
+ * - a union, as each of its members;
+ * - a scalar (`null`, `undefined`, a string, number, boolean, bigint or symbol, a literal, a
+ *   unique symbol, an enum, a template literal), which holds no path;
+ * - a `Schema.Class`, as its struct;
+ * - a `Schema.suspend`, as what it suspends, looked at before it's unwrapped.
+ *
+ * Each only when it carries no transformation (a decoding default and a key rename are ones) and
+ * no check (`checks` or `encodingChecks`). A constructor default takes no part in a read.
+ * Anything else is unknown: `Schema.Unknown`, `Schema.Any`, a declaration, a record with several
+ * index signatures or a key that isn't plain `Schema.String`, a struct with an index signature, a
+ * tuple with elements after its rest, a transformed or checked node, and any node kind this
+ * doesn't know.
+ */
+type Modelled =
+  | { readonly _tag: "Struct"; readonly ast: SchemaAST.Objects }
+  | { readonly _tag: "Record"; readonly value: SchemaAST.AST }
+  | { readonly _tag: "List"; readonly ast: SchemaAST.Arrays }
+  | { readonly _tag: "Union"; readonly members: ReadonlyArray<SchemaAST.AST> }
+  | { readonly _tag: "Suspend"; readonly suspended: SchemaAST.AST }
+  | { readonly _tag: "Scalar" }
 
-const pathVerdict = (ast: SchemaAST.AST, segments: ReadonlyArray<string | number>): PathVerdict => {
-  const head = segments[0]
-  if (head === undefined) return "open"
-  const rest = segments.slice(1)
-  const below = (member: SchemaAST.AST, optional: boolean): PathVerdict =>
-    rest.length > 0 ? pathVerdict(member, rest) : optional ? "open" : "required"
-  if (SchemaAST.isSuspend(ast)) return pathVerdict(ast.thunk(), segments)
-  if (SchemaAST.isUnion(ast)) {
-    const verdicts = ast.types
-      .map((member) => pathVerdict(member, segments))
-      .filter((verdict) => verdict !== "absent")
-    if (verdicts.length === 0) return "absent"
-    return verdicts.every((verdict) => verdict === "required") ? "required" : "open"
-  }
-  if (SchemaAST.isObjects(ast)) {
-    if (typeof head !== "string") return "absent"
-    const property = ast.propertySignatures.find((signature) => signature.name === head)
-    if (property !== undefined) {
-      const lackable =
-        SchemaAST.isOptional(property.type) ||
-        absentReading(Schema.make<Schema.Top>(property.type)) !== undefined
-      return below(property.type, lackable)
+const SCALARS: ReadonlySet<string> = new Set([
+  "Null",
+  "Undefined",
+  "String",
+  "Number",
+  "Boolean",
+  "BigInt",
+  "Symbol",
+  "Literal",
+  "UniqueSymbol",
+  "Enum",
+  "TemplateLiteral",
+])
+
+/** Whether a node carries nothing of its own a read runs: no transformation, no check. */
+const bare = (ast: SchemaAST.AST): boolean =>
+  ast.checks === undefined &&
+  ast.encoding === undefined &&
+  (ast as { readonly encodingChecks?: unknown }).encodingChecks === undefined
+
+/** What the guard models a node as ({@link Modelled}), or `undefined` for one it doesn't. */
+const modelled = (ast: SchemaAST.AST): Modelled | undefined => {
+  if (SchemaAST.isDeclaration(ast)) return classStruct(ast)
+  if (!bare(ast)) return undefined
+  switch (ast._tag) {
+    case "Objects": {
+      if (ast.indexSignatures.length === 0) {
+        return ast.propertySignatures.length > 0 ? { _tag: "Struct", ast } : undefined
+      }
+      const [index, ...more] = ast.indexSignatures
+      return index !== undefined &&
+        more.length === 0 &&
+        ast.propertySignatures.length === 0 &&
+        index.parameter._tag === "String" &&
+        bare(index.parameter)
+        ? { _tag: "Record", value: index.type }
+        : undefined
     }
-    const index = ast.indexSignatures[0]
-    if (index !== undefined) return rest.length > 0 ? pathVerdict(index.type, rest) : "open"
-    // A value of this doesn't hold the property: removing it changes nothing, so the row reads as
-    // it did. Removing below it is a path DynamoDB refuses on such a value.
-    return rest.length > 0 ? "absent" : "open"
+    case "Arrays":
+      return ast.rest.length <= 1 ? { _tag: "List", ast } : undefined
+    case "Union":
+      return { _tag: "Union", members: ast.types }
+    case "Suspend":
+      return { _tag: "Suspend", suspended: ast.thunk() }
+    default:
+      return SCALARS.has(ast._tag) ? { _tag: "Scalar" } : undefined
   }
-  if (SchemaAST.isArrays(ast)) {
-    if (typeof head !== "number") return "absent"
-    const element = ast.elements[head] ?? ast.rest[0]
-    return element === undefined ? "absent" : pathVerdict(element, rest)
-  }
-  return "absent"
 }
 
-/** The lists a value of `ast` can hold at `segments`, through unions and recursive schemas. */
-const listsAt = (
+/**
+ * A `Schema.Class`, as its struct: a declaration read by reading a struct and making an instance
+ * of what that gives, with one step that only maps the value, and no check of its own.
+ */
+const classStruct = (ast: SchemaAST.Declaration): Modelled | undefined => {
+  const [link, ...more] = ast.encoding ?? []
+  if (link === undefined || more.length > 0) return undefined
+  if (ast.checks !== undefined || ast.encodingChecks !== undefined) return undefined
+  const transformation = link.transformation as {
+    readonly _tag: string
+    readonly decode?: { readonly _tag?: string }
+  }
+  if (transformation._tag !== "Transformation" || transformation.decode?._tag !== "Transform") {
+    return undefined
+  }
+  const struct = modelled(link.to)
+  return struct?._tag === "Struct" ? struct : undefined
+}
+
+/**
+ * Where a value can be at the end of a path, one entry per way through the schema to it:
+ *
+ * - `At`: a modelled node, a value of which is there;
+ * - `Unread`: a struct without the path's next property, which doesn't read what a value holds
+ *   under it, so it may read whatever a removal there leaves;
+ * - `Unknown`: the way passed a node the guard doesn't model.
+ *
+ * A way the path can't take (a property of a list or a scalar, a position of a struct, a position
+ * past a tuple's last) has no entry: a value there that held the path isn't one this reads, and
+ * DynamoDB refuses the removal on one that doesn't.
+ */
+type End =
+  | { readonly _tag: "At"; readonly node: Modelled }
+  | { readonly _tag: "Unread" }
+  | { readonly _tag: "Unknown" }
+
+const endsOf = (
   ast: SchemaAST.AST,
   segments: ReadonlyArray<string | number>,
-): ReadonlyArray<SchemaAST.Arrays> => {
-  if (SchemaAST.isSuspend(ast)) return listsAt(ast.thunk(), segments)
-  if (SchemaAST.isUnion(ast)) return ast.types.flatMap((member) => listsAt(member, segments))
+  ends: Array<End>,
+  seen: ReadonlySet<SchemaAST.AST> = new Set(),
+): void => {
+  const node = seen.has(ast) ? undefined : modelled(ast)
+  if (node === undefined) {
+    ends.push({ _tag: "Unknown" })
+    return
+  }
+  if (node._tag === "Union" || node._tag === "Suspend") {
+    const within = new Set(seen).add(ast)
+    for (const member of node._tag === "Union" ? node.members : [node.suspended]) {
+      endsOf(member, segments, ends, within)
+    }
+    return
+  }
   const [head, ...rest] = segments
-  if (head === undefined) return SchemaAST.isArrays(ast) ? [ast] : []
-  if (SchemaAST.isObjects(ast)) {
-    if (typeof head !== "string") return []
-    const held =
-      ast.propertySignatures.find((signature) => signature.name === head)?.type ??
-      ast.indexSignatures[0]?.type
-    return held === undefined ? [] : listsAt(held, rest)
+  if (head === undefined) {
+    ends.push({ _tag: "At", node })
+    return
   }
-  if (SchemaAST.isArrays(ast)) {
-    if (typeof head !== "number") return []
-    const element = ast.elements[head] ?? ast.rest[0]
-    return element === undefined ? [] : listsAt(element, rest)
+  if (node._tag === "Struct" && typeof head === "string") {
+    const property = node.ast.propertySignatures.find((signature) => signature.name === head)
+    if (property === undefined) ends.push({ _tag: "Unread" })
+    else endsOf(property.type, rest, ends)
+  } else if (node._tag === "Record" && typeof head === "string") {
+    endsOf(node.value, rest, ends)
+  } else if (node._tag === "List" && typeof head === "number") {
+    const element = node.ast.elements[head] ?? node.ast.rest[0]
+    if (element !== undefined) endsOf(element, rest, ends)
   }
-  return []
 }
 
 /**
- * Whether removing `position` leaves a list none of `lists`, the lists a value can hold there,
- * reads, judged by length alone. A list closes up when an element is removed, so what's left is
- * one shorter: taken from a list of a length one of them accepts with the position in it, it's
- * read if one of them accepts that length less one. A tuple accepts from its required positions
- * to all of them, and a tuple with a rest or an array any length from its required positions on.
+ * The verdict on removing a property or a list position below a field:
+ *
+ * - `required`: no value the field reads, that holds what's above it, reads after the removal;
+ * - `readable`: one may, or one without it is left as it was;
+ * - `unheld`: no value holds what's above it, so DynamoDB refuses the removal;
+ * - `unknown`: the walk passed a node the guard doesn't model ({@link Modelled}).
  */
-const positionIsRequired = (lists: ReadonlyArray<SchemaAST.Arrays>, position: number): boolean => {
-  const lengths = lists.map((list) => ({
-    min:
-      list.elements.filter((element) => !SchemaAST.isOptional(element)).length +
-      Math.max(0, list.rest.length - 1),
-    max: list.rest.length > 0 ? Number.POSITIVE_INFINITY : list.elements.length,
-  }))
-  const holding = lengths.filter((list) => list.max > position)
-  return (
-    holding.length > 0 &&
-    !holding.some((list) => {
-      const shortest = Math.max(list.min, position + 1) - 1
-      return lengths.some(
-        (other) => Math.max(shortest, other.min) <= Math.min(list.max - 1, other.max),
-      )
-    })
-  )
+type Removal = "required" | "readable" | "unheld" | "unknown"
+
+/**
+ * Removing a property `name` from the maps at `ends`. A struct requires it when a row can't be
+ * without it ({@link rowCanLack}, asked of the property as of a field). A record never does, and
+ * a struct without it holds no such value, so removing it leaves the value as it was. Lists and
+ * scalars hold no property, so a value of theirs that held one isn't one this reads.
+ */
+const propertyRemoval = (ends: ReadonlyArray<End>, name: string): Removal => {
+  if (ends.some((end) => end._tag === "Unknown")) return "unknown"
+  let held = false
+  for (const end of ends) {
+    if (end._tag === "Unread") return "readable"
+    if (end._tag !== "At") continue
+    const { node } = end
+    if (node._tag === "Record") return "readable"
+    if (node._tag !== "Struct") continue
+    const property = node.ast.propertySignatures.find((signature) => signature.name === name)
+    if (property === undefined || rowCanLack(Schema.make<Schema.Top>(property.type))) {
+      return "readable"
+    }
+    held = true
+  }
+  return held ? "required" : "unheld"
 }
 
 /**
- * Whether removing `segments`, a path inside this field, leaves a value the
- * field's schema refuses: the last segment is a property the stored side
- * requires, or a list position no list one shorter can be read after.
+ * Removing list position `position` from the lists at `ends`. A list closes up when an element
+ * is removed, so what's left is one shorter, and is judged by length alone: a list accepts from
+ * its required positions to all of them, or with a rest any length from its required positions
+ * on. Readable when some list may be too short to hold the position (DynamoDB leaves it as it
+ * was), or one shorter than a length some list accepts is a length some list accepts. An element
+ * that can fill a missing one ({@link mayReadMissingKey}) makes the lengths unknown. Structs,
+ * records and scalars hold no list, so a value of theirs that held one isn't one this reads.
+ */
+const positionRemoval = (ends: ReadonlyArray<End>, position: number): Removal => {
+  if (ends.some((end) => end._tag === "Unknown")) return "unknown"
+  if (ends.some((end) => end._tag === "Unread")) return "readable"
+  const lengths: Array<{ readonly min: number; readonly max: number }> = []
+  for (const end of ends) {
+    if (end._tag !== "At" || end.node._tag !== "List") continue
+    const { elements, rest } = end.node.ast
+    if (elements.some((element) => mayReadMissingKey(element))) return "unknown"
+    lengths.push({
+      min: elements.filter((element) => !SchemaAST.isOptional(element)).length,
+      max: rest.length > 0 ? Number.POSITIVE_INFINITY : elements.length,
+    })
+  }
+  if (lengths.length === 0) return "unheld"
+  if (lengths.some((list) => list.min <= position)) return "readable"
+  const shorter = (list: { readonly min: number; readonly max: number }) =>
+    lengths.some((other) => other.min <= list.max - 1 && list.min - 1 <= other.max)
+  return lengths.some(shorter) ? "readable" : "required"
+}
+
+/**
+ * Whether removing `segments`, a path inside this field, leaves a value the field's schema
+ * refuses, for every value it reads that holds the path, while none that holds what's above it
+ * is without it. Refused only when the walk from the field passes through nodes it models exactly
+ * as a read decodes them ({@link Modelled}); `false` for anything else, and the removal is sent
+ * as 1.39.0 sent it.
  *
- * It walks the stored side of the schema, so a `Schema.Class` and a `ref`
- * field are seen through and a decoding default counts as optional. A union
- * requires a property only when every member that holds properties requires
- * it: a value of a member without it is left as it was, and which member's
- * value is stored only a read says. A member that can't hold the path (a
- * scalar, `null`) doesn't count, since DynamoDB refuses the removal on its
- * value. A property whose absent attribute is one of its values
- * ({@link absentReading}) is not required.
+ * The walk takes every way through the schema to the path, through unions at every level, so a
+ * value one member holds is judged against every member: a struct member without a property on
+ * the way doesn't read what a value holds under it, so it may read what's left, and the removal
+ * is sent. A property is required when a row can't be without it ({@link rowCanLack}): a required
+ * key nothing fills, whose absent attribute isn't one of its values. A list position is judged by
+ * length alone ({@link positionRemoval}): removing any position of a `[string, string]` is
+ * required; `f[0]` of a `[string, string?]`, either position of
+ * `Union([[string, string], [string]])` and an array's element aren't. Length alone can't see
+ * that what's left puts a value where its position can't hold it (`f[0]` of a
+ * `[string, number?]`), or is a list only a member a tag rules out accepts, so those aren't
+ * either, as 1.39.0 sent them.
  *
- * A list closes up when an element is removed, so a position is judged by
- * length alone, over every list the path can reach through unions, a tuple in
- * a union's struct members included: required only when no list of a length
- * one of them accepts with the position in it, less one, is a length one of
- * them accepts. Removing any position of a `[string, string]` is required;
- * `f[0]` of a `[string, string?]`, either position of
- * `Union([[string, string], [string]])` and an array's element aren't. Length
- * alone can't see that what's left puts a value where its position can't
- * hold it (`f[0]` of a `[string, number?]`), or is a list only a member a tag
- * rules out accepts, so those aren't either, as 1.39.0 sent them.
- *
- * `false` means the schema can't say the row breaks: a record's keys, a
- * list's elements, and anything opaque (a `Schema.declare`, a set, a
- * `.check()` such as a minimum length, which is a verdict on the value and not
- * its shape).
+ * `false` means the schema can't say every such row breaks: a record's keys, a list's elements,
+ * a path no value holds (DynamoDB refuses it, as on 1.39.0), and anything the walk doesn't model.
  */
 export const pathIsRequired = (
   field: Schema.Top,
   segments: ReadonlyArray<string | number>,
 ): boolean => {
-  const ast = SchemaAST.toEncoded(field.ast)
   const last = segments[segments.length - 1]
-  return typeof last === "number"
-    ? positionIsRequired(listsAt(ast, segments.slice(0, -1)), last)
-    : pathVerdict(ast, segments) === "required"
+  if (last === undefined) return false
+  const ends: Array<End> = []
+  endsOf(field.ast, segments.slice(0, -1), ends)
+  const removal =
+    typeof last === "number" ? positionRemoval(ends, last) : propertyRemoval(ends, last)
+  return removal === "required"
 }

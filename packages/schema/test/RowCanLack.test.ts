@@ -494,10 +494,147 @@ describe("pathIsRequired", () => {
       ["city"],
       true,
     ],
+    // A struct member without a property on the way doesn't read what's under it, so it may read
+    // what the removal leaves of another member's value: sent, as 1.39.0 sent it.
     [
-      "below a property a union's other member lacks: DynamoDB refuses the path there",
+      "below a property a union's other member lacks",
       Schema.Union([Schema.Struct({ a: Address }), Schema.Struct({ other: Schema.String })]),
       ["a", "city"],
+      false,
+    ],
+    [
+      "below a property a union's other member lacks, that member reading what's left",
+      Schema.Union([
+        Schema.Struct({ a: Address, b: Schema.String }),
+        Schema.Struct({ b: Schema.String }),
+      ]),
+      ["a", "city"],
+      false,
+    ],
+    // DynamoDB leaves a list too short to hold the position as it was, so the row still reads.
+    [
+      "a position a union's shorter list doesn't hold",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.String, Schema.String]), Schema.Tuple([])]),
+      [2],
+      false,
+    ],
+    // A node the guard doesn't model exactly makes the verdict unknown, and the removal is sent.
+    [
+      "below a tuple's elements after its rest",
+      Schema.TupleWithRest(Schema.Tuple([]), [
+        Schema.Tuple([Schema.String, Schema.String]),
+        Schema.Array(Schema.String),
+      ]),
+      [0, 0],
+      false,
+    ],
+    [
+      "a record with two index signatures, the always-unreadable entry",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(
+          Schema.TemplateLiteral(["open-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+        ),
+        Schema.Record(
+          Schema.TemplateLiteral(["fixed-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.String]),
+        ),
+      ]),
+      ["fixed-k", 0],
+      false,
+    ],
+    [
+      "a record with two index signatures, the other way round, the readable entry",
+      Schema.StructWithRest(Schema.Struct({}), [
+        Schema.Record(
+          Schema.TemplateLiteral(["fixed-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.String]),
+        ),
+        Schema.Record(
+          Schema.TemplateLiteral(["open-", Schema.String]),
+          Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+        ),
+      ]),
+      ["open-k", 0],
+      false,
+    ],
+    [
+      "a record keyed by a template literal",
+      Schema.Record(Schema.TemplateLiteral(["k-", Schema.String]), Address),
+      ["k-1", "city"],
+      false,
+    ],
+    [
+      "a struct with an index signature",
+      Schema.StructWithRest(Address, [Schema.Record(Schema.String, Schema.String)]),
+      ["city"],
+      false,
+    ],
+    [
+      "a fixed tuple, in a union with an Unknown member",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.String]), Schema.Unknown]),
+      [0],
+      false,
+    ],
+    [
+      "a struct's property, in a union with an Unknown member",
+      Schema.Union([Schema.Struct({ x: Schema.String, y: Schema.String }), Schema.Unknown]),
+      ["x"],
+      false,
+    ],
+    [
+      "a fixed tuple, in a union with the empty struct, which reads any value but null",
+      Schema.Union([Schema.Tuple([Schema.String, Schema.String]), Schema.Struct({})]),
+      [0],
+      false,
+    ],
+    ["a checked struct", Address.check(Schema.makeFilter(() => true)), ["city"], false],
+    [
+      "a struct whose keys are renamed",
+      Address.pipe(Schema.encodeKeys({ city: "City" })),
+      ["city"],
+      false,
+    ],
+    [
+      "below a struct with a decoding default",
+      Schema.Struct({
+        a: Address.pipe(Schema.withDecodingDefaultKey(Effect.succeed({ city: "c" }))),
+      }),
+      ["a", "city"],
+      false,
+    ],
+    [
+      "a fixed tuple that recovers a failed read",
+      Schema.Tuple([Schema.String, Schema.String]).pipe(
+        Schema.catchDecoding(() => Effect.succeedSome(["a", "b"] as const)),
+      ),
+      [0],
+      false,
+    ],
+    [
+      "a fixed tuple whose element may fill a missing one",
+      Schema.Tuple([
+        Schema.String,
+        Schema.String.pipe(Schema.withDecodingDefaultKey(Effect.succeed("d"))),
+      ]),
+      [0],
+      false,
+    ],
+    // A transformation on the removed property itself is judged as a field's is: a required key
+    // nothing fills can't be lacked.
+    [
+      "a required property whose value is transformed",
+      Schema.Struct({ n: Schema.NumberFromString, m: Schema.String }),
+      ["n"],
+      true,
+    ],
+    [
+      "a tagged struct's required property",
+      Schema.Union([
+        Schema.TaggedStruct("A", { x: Schema.String }),
+        Schema.TaggedStruct("B", { x: Schema.String, y: Schema.String }),
+      ]),
+      ["x"],
       true,
     ],
     ["a nested set", Schema.Struct({ s: Schema.ReadonlySet(Schema.String) }), ["s"], false],

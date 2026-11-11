@@ -16486,6 +16486,7103 @@
      ]
     }
    ]
+  },
+  "f: TupleWithRest([], [[string, string], string[]]), holding [[\"first\",\"second\"]]: pathRemove f[0][0]": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "first",
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": [
+           {
+            "L": [
+             {
+              "S": "first"
+             },
+             {
+              "S": "second"
+             }
+            ]
+           }
+          ]
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[0][0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: TupleWithRest([], [[string, string], string[]]), holding [[\"first\",\"second\"]]: pathRemove f[0][0], in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "first",
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": [
+           {
+            "L": [
+             {
+              "S": "first"
+             },
+             {
+              "S": "second"
+             }
+            ]
+           }
+          ]
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "REMOVE #pr0[0][0]",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#pr0": "f",
+            "#exists": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: TupleWithRest([], [[string, string], string[]]), holding [[\"first\",\"second\"]]: pathRemove f[0][0], retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "first",
+         "second"
+        ]
+       ],
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "query": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+        "ExpressionAttributeNames": {
+         "#pk": "pk",
+         "#sk": "sk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         ":prefix": {
+          "S": "$kept#v1#doc#v#"
+         }
+        },
+        "ScanIndexForward": false,
+        "Limit": 1,
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": [
+              {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             ]
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": [
+              {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             ]
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "second"
+        ]
+       ],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[0][0]",
+           "ExpressionAttributeNames": {
+            "#u0": "version",
+            "#pr0": "f",
+            "#retainVer": "version",
+            "#inc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":vzero": {
+             "N": "0"
+            },
+            ":vinc": {
+             "N": "1"
+            },
+            ":retainVer": {
+             "N": "1"
+            },
+            ":inc": {
+             "S": "<uuid>"
+            }
+           },
+           "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "f": {
+             "L": [
+              {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             ]
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            },
+            "id": {
+             "S": "one"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "version": {
+             "N": "1"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        [
+         "second"
+        ]
+       ],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: TupleWithRest([], [[string, string], string[]]), holding [[\"first\",\"second\"]]: pathRemove f[0][0], with a unique constraint": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        [
+         "first",
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "email": {
+             "S": "one@example.com"
+            },
+            "f": {
+             "L": [
+              {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             ]
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "pk": {
+             "S": "$kept#v1#doc.email#one@example.com"
+            },
+            "sk": {
+             "S": "$kept#v1#doc.email"
+            },
+            "__edd_e__": {
+             "S": "Doc._unique.email"
+            },
+            "_entity_pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "_entity_sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#sentinel_pk)",
+           "ExpressionAttributeNames": {
+            "#sentinel_pk": "pk"
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        [
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[0][0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        [
+         "second"
+        ]
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [open-*]: [string, string?], [fixed-*]: [string, string] }, holding {\"fixed-k\":[\"first\",\"second\"]}: pathRemove f.fixed-k[0]": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "fixed-k": [
+         "first",
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "M": {
+           "fixed-k": {
+            "L": [
+             {
+              "S": "first"
+             },
+             {
+              "S": "second"
+             }
+            ]
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0.#pr1[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#pr1": "fixed-k",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [open-*]: [string, string?], [fixed-*]: [string, string] }, holding {\"fixed-k\":[\"first\",\"second\"]}: pathRemove f.fixed-k[0], in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "fixed-k": [
+         "first",
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "M": {
+           "fixed-k": {
+            "L": [
+             {
+              "S": "first"
+             },
+             {
+              "S": "second"
+             }
+            ]
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "REMOVE #pr0.#pr1[0]",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#pr0": "f",
+            "#pr1": "fixed-k",
+            "#exists": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [open-*]: [string, string?], [fixed-*]: [string, string] }, holding {\"fixed-k\":[\"first\",\"second\"]}: pathRemove f.fixed-k[0], retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "fixed-k": [
+         "first",
+         "second"
+        ]
+       },
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "query": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+        "ExpressionAttributeNames": {
+         "#pk": "pk",
+         "#sk": "sk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         ":prefix": {
+          "S": "$kept#v1#doc#v#"
+         }
+        },
+        "ScanIndexForward": false,
+        "Limit": 1,
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "M": {
+              "fixed-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "M": {
+              "fixed-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0.#pr1[0]",
+           "ExpressionAttributeNames": {
+            "#u0": "version",
+            "#pr0": "f",
+            "#pr1": "fixed-k",
+            "#retainVer": "version",
+            "#inc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":vzero": {
+             "N": "0"
+            },
+            ":vinc": {
+             "N": "1"
+            },
+            ":retainVer": {
+             "N": "1"
+            },
+            ":inc": {
+             "S": "<uuid>"
+            }
+           },
+           "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "f": {
+             "M": {
+              "fixed-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            },
+            "id": {
+             "S": "one"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "version": {
+             "N": "1"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [open-*]: [string, string?], [fixed-*]: [string, string] }, holding {\"fixed-k\":[\"first\",\"second\"]}: pathRemove f.fixed-k[0], with a unique constraint": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": {
+        "fixed-k": [
+         "first",
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "email": {
+             "S": "one@example.com"
+            },
+            "f": {
+             "M": {
+              "fixed-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "pk": {
+             "S": "$kept#v1#doc.email#one@example.com"
+            },
+            "sk": {
+             "S": "$kept#v1#doc.email"
+            },
+            "__edd_e__": {
+             "S": "Doc._unique.email"
+            },
+            "_entity_pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "_entity_sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#sentinel_pk)",
+           "ExpressionAttributeNames": {
+            "#sentinel_pk": "pk"
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0.#pr1[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#pr1": "fixed-k",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "fail": "ValidationError",
+      "message": "Missing key"
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "M": {
+         "fixed-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [fixed-*]: [string, string], [open-*]: [string, string?] }, holding {\"open-k\":[\"first\",\"second\"]}: pathRemove f.open-k[0]": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "first",
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "M": {
+           "open-k": {
+            "L": [
+             {
+              "S": "first"
+             },
+             {
+              "S": "second"
+             }
+            ]
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0.#pr1[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#pr1": "open-k",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [fixed-*]: [string, string], [open-*]: [string, string?] }, holding {\"open-k\":[\"first\",\"second\"]}: pathRemove f.open-k[0], in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "first",
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "M": {
+           "open-k": {
+            "L": [
+             {
+              "S": "first"
+             },
+             {
+              "S": "second"
+             }
+            ]
+           }
+          }
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "REMOVE #pr0.#pr1[0]",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#pr0": "f",
+            "#pr1": "open-k",
+            "#exists": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [fixed-*]: [string, string], [open-*]: [string, string?] }, holding {\"open-k\":[\"first\",\"second\"]}: pathRemove f.open-k[0], retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "first",
+         "second"
+        ]
+       },
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "query": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+        "ExpressionAttributeNames": {
+         "#pk": "pk",
+         "#sk": "sk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         ":prefix": {
+          "S": "$kept#v1#doc#v#"
+         }
+        },
+        "ScanIndexForward": false,
+        "Limit": 1,
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "M": {
+              "open-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "M": {
+              "open-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "second"
+        ]
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0.#pr1[0]",
+           "ExpressionAttributeNames": {
+            "#u0": "version",
+            "#pr0": "f",
+            "#pr1": "open-k",
+            "#retainVer": "version",
+            "#inc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":vzero": {
+             "N": "0"
+            },
+            ":vinc": {
+             "N": "1"
+            },
+            ":retainVer": {
+             "N": "1"
+            },
+            ":inc": {
+             "S": "<uuid>"
+            }
+           },
+           "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "f": {
+             "M": {
+              "open-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            },
+            "id": {
+             "S": "one"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "version": {
+             "N": "1"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": {
+        "open-k": [
+         "second"
+        ]
+       },
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: { [fixed-*]: [string, string], [open-*]: [string, string?] }, holding {\"open-k\":[\"first\",\"second\"]}: pathRemove f.open-k[0], with a unique constraint": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": {
+        "open-k": [
+         "first",
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "email": {
+             "S": "one@example.com"
+            },
+            "f": {
+             "M": {
+              "open-k": {
+               "L": [
+                {
+                 "S": "first"
+                },
+                {
+                 "S": "second"
+                }
+               ]
+              }
+             }
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "pk": {
+             "S": "$kept#v1#doc.email#one@example.com"
+            },
+            "sk": {
+             "S": "$kept#v1#doc.email"
+            },
+            "__edd_e__": {
+             "S": "Doc._unique.email"
+            },
+            "_entity_pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "_entity_sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#sentinel_pk)",
+           "ExpressionAttributeNames": {
+            "#sentinel_pk": "pk"
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": {
+        "open-k": [
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0.#pr1[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#pr1": "open-k",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": {
+        "open-k": [
+         "second"
+        ]
+       }
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "M": {
+         "open-k": {
+          "L": [
+           {
+            "S": "second"
+           }
+          ]
+         }
+        }
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], unknown]), holding [\"first\",\"second\"]: pathRemove f[0]": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "first",
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], unknown]), holding [\"first\",\"second\"]: pathRemove f[0], in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "first",
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "REMOVE #pr0[0]",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#pr0": "f",
+            "#exists": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], unknown]), holding [\"first\",\"second\"]: pathRemove f[0], retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "first",
+        "second"
+       ],
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "query": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+        "ExpressionAttributeNames": {
+         "#pk": "pk",
+         "#sk": "sk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         ":prefix": {
+          "S": "$kept#v1#doc#v#"
+         }
+        },
+        "ScanIndexForward": false,
+        "Limit": 1,
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[0]",
+           "ExpressionAttributeNames": {
+            "#u0": "version",
+            "#pr0": "f",
+            "#retainVer": "version",
+            "#inc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":vzero": {
+             "N": "0"
+            },
+            ":vinc": {
+             "N": "1"
+            },
+            ":retainVer": {
+             "N": "1"
+            },
+            ":inc": {
+             "S": "<uuid>"
+            }
+           },
+           "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            },
+            "id": {
+             "S": "one"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "version": {
+             "N": "1"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], unknown]), holding [\"first\",\"second\"]: pathRemove f[0], with a unique constraint": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        "first",
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "email": {
+             "S": "one@example.com"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "pk": {
+             "S": "$kept#v1#doc.email#one@example.com"
+            },
+            "sk": {
+             "S": "$kept#v1#doc.email"
+            },
+            "__edd_e__": {
+             "S": "Doc._unique.email"
+            },
+            "_entity_pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "_entity_sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#sentinel_pk)",
+           "ExpressionAttributeNames": {
+            "#sentinel_pk": "pk"
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], {}]), holding [\"first\",\"second\"]: pathRemove f[0]": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "first",
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], {}]), holding [\"first\",\"second\"]: pathRemove f[0], in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "first",
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": [
+           {
+            "S": "first"
+           },
+           {
+            "S": "second"
+           }
+          ]
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "REMOVE #pr0[0]",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#pr0": "f",
+            "#exists": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], {}]), holding [\"first\",\"second\"]: pathRemove f[0], retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "first",
+        "second"
+       ],
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "query": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+        "ExpressionAttributeNames": {
+         "#pk": "pk",
+         "#sk": "sk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         ":prefix": {
+          "S": "$kept#v1#doc#v#"
+         }
+        },
+        "ScanIndexForward": false,
+        "Limit": 1,
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[0]",
+           "ExpressionAttributeNames": {
+            "#u0": "version",
+            "#pr0": "f",
+            "#retainVer": "version",
+            "#inc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":vzero": {
+             "N": "0"
+            },
+            ":vinc": {
+             "N": "1"
+            },
+            ":retainVer": {
+             "N": "1"
+            },
+            ":inc": {
+             "S": "<uuid>"
+            }
+           },
+           "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            },
+            "id": {
+             "S": "one"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "version": {
+             "N": "1"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [
+        "second"
+       ],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string], {}]), holding [\"first\",\"second\"]: pathRemove f[0], with a unique constraint": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        "first",
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "first"
+         },
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "email": {
+             "S": "one@example.com"
+            },
+            "f": {
+             "L": [
+              {
+               "S": "first"
+              },
+              {
+               "S": "second"
+              }
+             ]
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "pk": {
+             "S": "$kept#v1#doc.email#one@example.com"
+            },
+            "sk": {
+             "S": "$kept#v1#doc.email"
+            },
+            "__edd_e__": {
+             "S": "Doc._unique.email"
+            },
+            "_entity_pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "_entity_sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#sentinel_pk)",
+           "ExpressionAttributeNames": {
+            "#sentinel_pk": "pk"
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[0]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": [
+        "second"
+       ]
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": [
+         {
+          "S": "second"
+         }
+        ]
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string, string], []]), holding []: pathRemove f[2]": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": []
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[2]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string, string], []]), holding []: pathRemove f[2], in a transaction": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "putItem": {
+        "TableName": "<table>",
+        "Item": {
+         "id": {
+          "S": "one"
+         },
+         "f": {
+          "L": []
+         },
+         "__edd_e__": {
+          "S": "Doc"
+         },
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": null
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "REMOVE #pr0[2]",
+           "ConditionExpression": "attribute_exists(#exists)",
+           "ExpressionAttributeNames": {
+            "#pr0": "f",
+            "#exists": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string, string], []]), holding []: pathRemove f[2], retained": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [],
+       "version": 1
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "1"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "query": {
+        "TableName": "<table>",
+        "KeyConditionExpression": "#pk = :pk AND begins_with(#sk, :prefix)",
+        "ExpressionAttributeNames": {
+         "#pk": "pk",
+         "#sk": "sk"
+        },
+        "ExpressionAttributeValues": {
+         ":pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         ":prefix": {
+          "S": "$kept#v1#doc#v#"
+         }
+        },
+        "ScanIndexForward": false,
+        "Limit": 1,
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": []
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "f": {
+             "L": []
+            },
+            "version": {
+             "N": "1"
+            },
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Update": {
+           "TableName": "<table>",
+           "Key": {
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "UpdateExpression": "SET #u0 = if_not_exists(#u0, :vzero) + :vinc REMOVE #pr0[2]",
+           "ExpressionAttributeNames": {
+            "#u0": "version",
+            "#pr0": "f",
+            "#retainVer": "version",
+            "#inc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":vzero": {
+             "N": "0"
+            },
+            ":vinc": {
+             "N": "1"
+            },
+            ":retainVer": {
+             "N": "1"
+            },
+            ":inc": {
+             "S": "<uuid>"
+            }
+           },
+           "ConditionExpression": "#retainVer = :retainVer AND #inc = :inc",
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "__edd_i__": {
+             "S": "<uuid>"
+            },
+            "f": {
+             "L": []
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "sk": {
+             "S": "$kept#v1#doc#v#0000001"
+            },
+            "id": {
+             "S": "one"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "version": {
+             "N": "1"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#snap) OR (#snapVer = :snapVer AND #snapInc = :snapInc)",
+           "ExpressionAttributeNames": {
+            "#snap": "pk",
+            "#snapVer": "version",
+            "#snapInc": "__edd_i__"
+           },
+           "ExpressionAttributeValues": {
+            ":snapVer": {
+             "N": "1"
+            },
+            ":snapInc": {
+             "S": "<uuid>"
+            }
+           }
+          }
+         }
+        ]
+       }
+      },
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "f": [],
+       "version": 2
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       },
+       "version": {
+        "N": "2"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "__edd_i__": {
+        "S": "<token>"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc#v#0000001"
+       },
+       "version": {
+        "N": "1"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "f: Union([[string, string, string], []]), holding []: pathRemove f[2], with a unique constraint": {
+   "loads": true,
+   "steps": [
+    {
+     "step": "put",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "ConsistentRead": true
+       }
+      },
+      {
+       "transactWriteItems": {
+        "TransactItems": [
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "id": {
+             "S": "one"
+            },
+            "email": {
+             "S": "one@example.com"
+            },
+            "f": {
+             "L": []
+            },
+            "__edd_e__": {
+             "S": "Doc"
+            },
+            "pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#pk)",
+           "ExpressionAttributeNames": {
+            "#pk": "pk"
+           },
+           "ReturnValuesOnConditionCheckFailure": "ALL_OLD"
+          }
+         },
+         {
+          "Put": {
+           "TableName": "<table>",
+           "Item": {
+            "pk": {
+             "S": "$kept#v1#doc.email#one@example.com"
+            },
+            "sk": {
+             "S": "$kept#v1#doc.email"
+            },
+            "__edd_e__": {
+             "S": "Doc._unique.email"
+            },
+            "_entity_pk": {
+             "S": "$kept#v1#doc#id_one"
+            },
+            "_entity_sk": {
+             "S": "$kept#v1#doc"
+            }
+           },
+           "ConditionExpression": "attribute_not_exists(#sentinel_pk)",
+           "ExpressionAttributeNames": {
+            "#sentinel_pk": "pk"
+           }
+          }
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "step": "clear",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "updateItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        },
+        "UpdateExpression": "REMOVE #pr0[2]",
+        "ExpressionAttributeNames": {
+         "#pr0": "f",
+         "#exists": "pk"
+        },
+        "ConditionExpression": "attribute_exists(#exists)",
+        "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+        "ReturnValues": "ALL_NEW"
+       }
+      }
+     ]
+    },
+    {
+     "step": "get",
+     "outcome": {
+      "ok": {
+       "id": "one",
+       "email": "one@example.com",
+       "f": []
+      }
+     },
+     "rows": [
+      {
+       "__edd_e__": {
+        "S": "Doc"
+       },
+       "email": {
+        "S": "one@example.com"
+       },
+       "f": {
+        "L": []
+       },
+       "id": {
+        "S": "one"
+       },
+       "pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "sk": {
+        "S": "$kept#v1#doc"
+       }
+      },
+      {
+       "__edd_e__": {
+        "S": "Doc._unique.email"
+       },
+       "_entity_pk": {
+        "S": "$kept#v1#doc#id_one"
+       },
+       "_entity_sk": {
+        "S": "$kept#v1#doc"
+       },
+       "pk": {
+        "S": "$kept#v1#doc.email#one@example.com"
+       },
+       "sk": {
+        "S": "$kept#v1#doc.email"
+       }
+      }
+     ],
+     "requests": [
+      {
+       "getItem": {
+        "TableName": "<table>",
+        "Key": {
+         "pk": {
+          "S": "$kept#v1#doc#id_one"
+         },
+         "sk": {
+          "S": "$kept#v1#doc"
+         }
+        }
+       }
+      }
+     ]
+    }
+   ]
   }
  }
 }

@@ -1,16 +1,19 @@
 /**
  * A clear below a field, refused only when the row couldn't be read afterwards. Published 1.39.0
  * refused none of these: it sent each, and some left a row it then couldn't read
- * (`fixtures/union-clears-1.39.0.json`, `fixtures/tuple-clears-1.39.0.json`, which also keeps the
- * requests each step sent). Every clear 1.39.0 completed with a row that reads back does what it
- * did, standalone, in a transaction and on a retained entity, and the tuple clears on an entity
- * with a unique constraint too. One whose row couldn't be read is refused before anything is sent
- * where the schema shows no stored value survives it, and sent as 1.39.0 sent it where which value
- * is stored decides (a tagged union's member, how many positions a tuple holds), which only a read
- * would say. A list position is judged by length alone, so a removal that leaves a length the
- * field accepts is sent as 1.39.0 sent it even where what's left can't be read (a value in a
- * position that can't hold it, a list only a member its tag rules out accepts). Run on a recording
- * table (`Kept139.test.ts`) and on DynamoDB Local (`connected.kept-1.39.0.test.ts`).
+ * (`fixtures/union-clears-1.39.0.json`, `fixtures/tuple-clears-1.39.0.json`, which also keep the
+ * requests each step sent where a step has them). Every clear 1.39.0 completed with a row that
+ * reads back does what it did, standalone, in a transaction and on a retained entity, and the
+ * tuple clears and the clears marked `everyMode` on an entity with a unique constraint too. One
+ * whose row couldn't be read is refused before anything is sent where the schema shows no stored
+ * value survives it, and sent as 1.39.0 sent it where which value is stored decides (a tagged
+ * union's member, how many positions a tuple holds), which only a read would say. A list position
+ * is judged by length alone, so a removal that leaves a length the field accepts is sent as 1.39.0
+ * sent it even where what's left can't be read (a value in a position that can't hold it, a list
+ * only a member its tag rules out accepts). A clear whose way to the path passes a node the guard
+ * doesn't model (`Schema.Unknown`, a record with two index signatures, a tuple with elements
+ * after its rest) is sent as 1.39.0 sent it, whatever the row reads. Run on a recording table
+ * (`Kept139.test.ts`) and on DynamoDB Local (`connected.kept-1.39.0.test.ts`).
  */
 
 import { it } from "@effect/vitest"
@@ -31,6 +34,11 @@ import {
 
 const XY = Schema.Struct({ x: Schema.Number, y: Schema.String })
 const T2 = Schema.Tuple([Schema.String, Schema.String])
+const open = Schema.Record(
+  Schema.TemplateLiteral(["open-", Schema.String]),
+  Schema.Tuple([Schema.String, Schema.optional(Schema.String)]),
+)
+const fixed = Schema.Record(Schema.TemplateLiteral(["fixed-", Schema.String]), T2)
 
 /** Each field by its label in a scenario's name. */
 const fields: Record<string, Schema.Top> = {
@@ -60,6 +68,29 @@ const fields: Record<string, Schema.Top> = {
     Schema.Struct({ kind: Schema.Literal("a"), p: T2 }),
     Schema.Struct({ kind: Schema.Literal("b"), p: Schema.Tuple([Schema.Number, Schema.Number]) }),
   ]),
+  "TupleWithRest([], [[string, string], string[]])": Schema.TupleWithRest(Schema.Tuple([]), [
+    T2,
+    Schema.Array(Schema.String),
+  ]),
+  "{ [open-*]: [string, string?], [fixed-*]: [string, string] }": Schema.StructWithRest(
+    Schema.Struct({}),
+    [open, fixed],
+  ),
+  "{ [fixed-*]: [string, string], [open-*]: [string, string?] }": Schema.StructWithRest(
+    Schema.Struct({}),
+    [fixed, open],
+  ),
+  "Union([[string, string], unknown])": Schema.Union([T2, Schema.Unknown]),
+  "Union([[string, string], {}])": Schema.Union([T2, Schema.Struct({})]),
+  "Union([[string, string, string], []])": Schema.Union([
+    Schema.Tuple([Schema.String, Schema.String, Schema.String]),
+    Schema.Tuple([]),
+  ]),
+  "Union([{ x, y }, unknown])": Schema.Union([XY, Schema.Unknown]),
+  "Union([{ a: { x, y }, b }, { b }])": Schema.Union([
+    Schema.Struct({ a: XY, b: Schema.String }),
+    Schema.Struct({ b: Schema.String }),
+  ]),
 }
 
 type Update = any
@@ -80,6 +111,8 @@ interface Clear {
   readonly op: Op
   /** Also run on a `versioned: { retain: true }` entity, and there in a transaction. */
   readonly retained?: true
+  /** A union clear also run on a retained entity and on one with a unique constraint. */
+  readonly everyMode?: true
   /** Refused here, where 1.39.0 sent it and left a row it couldn't read. */
   readonly refused?: true
   /** Sent as 1.39.0 sent it, leaving a row that can't be read, as on 1.39.0. */
@@ -124,6 +157,20 @@ const clears: Record<string, ReadonlyArray<Clear>> = {
       refused: true,
     },
     { field: "Union([{ x, y }, { y }])", seed: { x: 1, y: "kept" }, op: removeF, refused: true },
+    // `Schema.Unknown` reads what's left, and the guard doesn't model it: sent.
+    {
+      field: "Union([{ x, y }, unknown])",
+      seed: { x: 1, y: "kept" },
+      op: pathRemoveX,
+      everyMode: true,
+    },
+    // The member without `a` doesn't read what's under it, so it reads what's left.
+    {
+      field: "Union([{ a: { x, y }, b }, { b }])",
+      seed: { a: { x: 1, y: "kept" }, b: "kept" },
+      op: pathRemoveAt("a", "x"),
+      everyMode: true,
+    },
   ],
   "tuple-clears": [
     // The list closes up, and what's left is a list the field reads.
@@ -146,11 +193,34 @@ const clears: Record<string, ReadonlyArray<Clear>> = {
     },
     { field: "Union([[string], []])", seed: ["first"], op: pathRemoveAt(0) },
     { field: "string[]", seed: ["first", "second"], op: pathRemoveAt(0) },
+    // `Struct({})` reads any value but `null`, a list included.
+    { field: "Union([[string, string], {}])", seed: ["first", "second"], op: pathRemoveAt(0) },
+    // A list too short to hold the position: DynamoDB leaves it as it was.
+    { field: "Union([[string, string, string], []])", seed: [], op: pathRemoveAt(2) },
+    // A node the guard doesn't model on the way: sent, and what's left reads.
+    {
+      field: "TupleWithRest([], [[string, string], string[]])",
+      seed: [["first", "second"]],
+      op: pathRemoveAt(0, 0),
+    },
+    {
+      field: "{ [fixed-*]: [string, string], [open-*]: [string, string?] }",
+      seed: { "open-k": ["first", "second"] },
+      op: pathRemoveAt("open-k", 0),
+    },
+    { field: "Union([[string, string], unknown])", seed: ["first", "second"], op: pathRemoveAt(0) },
     // The same removal, on a list holding only the required position: only a read would tell.
     { field: "[string, string?]", seed: ["first"], op: pathRemoveAt(0), unreadable: true },
     // What's left is a length the field accepts: length alone can't see that "second"'s place
     // holds a number, or that the tag rules out the member reading a list of one.
     { field: "[string, number?]", seed: ["first", 1], op: pathRemoveAt(0), unreadable: true },
+    // A record with two index signatures isn't modelled, so this is sent whatever the row reads.
+    {
+      field: "{ [open-*]: [string, string?], [fixed-*]: [string, string] }",
+      seed: { "fixed-k": ["first", "second"] },
+      op: pathRemoveAt("fixed-k", 0),
+      unreadable: true,
+    },
     {
       field: 'Union([{ kind: "a", p: [string, string] }, { kind: "b", p: [string] }])',
       seed: tagged,
@@ -187,14 +257,20 @@ const nameOf = (clear: Clear, { transaction, retain, unique }: Mode) =>
   `${transaction ? ", in a transaction" : ""}${retain ? ", retained" : ""}` +
   `${unique ? ", with a unique constraint" : ""}`
 
-/** Standalone and in a transaction; the tuple clears also on a retained entity and on a unique one. */
-const modesOf = (name: keyof typeof clears, clear: Clear): ReadonlyArray<Mode> => [
-  {},
-  { transaction: true },
-  ...(name === "tuple-clears" || clear.retained ? [{ retain: true } as const] : []),
-  ...(name === "tuple-clears" ? [{ unique: true } as const] : []),
-  ...(clear.retained ? [{ transaction: true, retain: true } as const] : []),
-]
+/**
+ * Standalone and in a transaction; the tuple clears and those marked `everyMode` also on a
+ * retained entity and on a unique one.
+ */
+const modesOf = (name: keyof typeof clears, clear: Clear): ReadonlyArray<Mode> => {
+  const every = name === "tuple-clears" || clear.everyMode === true
+  return [
+    {},
+    { transaction: true },
+    ...(every || clear.retained ? [{ retain: true } as const] : []),
+    ...(every ? [{ unique: true } as const] : []),
+    ...(clear.retained ? [{ transaction: true, retain: true } as const] : []),
+  ]
+}
 
 /** The clears of `fixture`, each a test against a table `open` makes. */
 export const pathClearSuite = (name: keyof typeof clears) => (open: OpenTable) => {
