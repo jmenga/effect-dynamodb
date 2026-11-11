@@ -12,7 +12,7 @@
 
 import { it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Config, Effect, Exit, Layer, Schema } from "effect"
+import { Config, Effect, Exit, Layer, Option, Schema } from "effect"
 import { afterAll, beforeAll, describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -43,8 +43,15 @@ const ClientLayer = DynamoClient.layer({
 const stamp = Date.now()
 const tables = { events: `rt-events-${stamp}`, read: `rt-read-${stamp}` }
 
-/** Run `hook` once, right after the next `GetItem` of the read model's table returns. */
-const pending: { hook?: Effect.Effect<unknown, unknown> | undefined } = {}
+/**
+ * Run `hook` once, right after the next `GetItem` of the read model's table returns; `each` after
+ * every one, while it's set.
+ */
+const pending: {
+  hook?: Effect.Effect<unknown, unknown> | undefined
+  // The fiber that reads the row provides what it needs.
+  each?: Effect.Effect<unknown, unknown, any> | undefined
+} = {}
 const HookedClient = Layer.effect(
   DynamoClient,
   Effect.map(Effect.service(DynamoClient), (inner) => ({
@@ -52,8 +59,12 @@ const HookedClient = Layer.effect(
     getItem: (input: Parameters<typeof inner.getItem>[0]) =>
       inner.getItem(input).pipe(
         Effect.tap(() => {
+          if (input.TableName !== tables.read) return Effect.void
+          if (pending.each !== undefined) {
+            return Effect.orDie(pending.each) as Effect.Effect<void>
+          }
           const hook = pending.hook
-          if (input.TableName !== tables.read || hook === undefined) return Effect.void
+          if (hook === undefined) return Effect.void
           pending.hook = undefined
           return Effect.orDie(hook)
         }),
@@ -88,7 +99,22 @@ const Rows = Entity.make({
   entityType: "Row",
   primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
 })
-const ReadTable = Table.make({ schema: AppSchema, entities: { Rows } })
+/** Rows two projections race on: B writes after each of A's reads. */
+const Raced = Schema.Struct({
+  id: Schema.String,
+  total: Schema.Number,
+  a: Schema.optional(Schema.Number),
+  ra: Schema.optional(Schema.Number),
+  b: Schema.optional(Schema.Number),
+  rb: Schema.optional(Schema.Number),
+})
+type Raced = typeof Raced.Type
+const Races = Entity.make({
+  model: Raced,
+  entityType: "Race",
+  primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+})
+const ReadTable = Table.make({ schema: AppSchema, entities: { Rows, Races } })
 const evolve = (state: Row, event: { readonly data: Placed }) =>
   Effect.succeed({ ...state, total: state.total + event.data.amount })
 const A = EventStore.projection({
@@ -111,6 +137,23 @@ const M = EventStore.multiProjection({
   revision: "rm",
   retry: 0,
 })
+
+const raced = (from: typeof Orders, checkpoint: "a" | "b", retry?: number) =>
+  EventStore.projection({
+    stream: from,
+    readModel: Races,
+    key: (id: { readonly id: string }) => ({ id: id.id }),
+    initial: (id: { readonly id: string }): Raced => ({ id: id.id, total: 0 }),
+    evolve: (state: Raced, event: { readonly data: Placed }) =>
+      Effect.succeed({ ...state, total: state.total + event.data.amount }),
+    checkpoint,
+    revision: checkpoint === "a" ? "ra" : "rb",
+    ...(retry !== undefined && { retry }),
+  })
+/** A with two retries, A with the default schedule (12), and B, which writes `retry: 0`. */
+const RaceA2 = raced(Orders, "a", 2)
+const RaceADefault = raced(Orders, "a")
+const RaceB = raced(Invoices, "b", 0)
 
 const TestLayer = Layer.mergeAll(
   HookedClient,
@@ -215,5 +258,78 @@ describeConnected("the row token on DynamoDB Local (#237)", () => {
           map: { "invoice#x": 1, "invoice#y": 1 },
         })
       }).pipe(Effect.provide(TestLayer)),
+  )
+
+  // Live: the default schedule waits between retries, and `it.effect`'s test clock never moves.
+  it.live.each([
+    ["two retries", 2],
+    ["the default schedule", 12],
+  ] as const)(
+    "A losing every race (%s): retries re-read the row, then the caller sees ConcurrentModification",
+    ([, retries]) => {
+      const A = retries === 2 ? RaceA2 : RaceADefault
+      const id = `race-${retries}`
+      const raceKey = { pk: { S: `$rowtoken#v1#race#id_${id}` }, sk: { S: "$rowtoken#v1#race" } }
+      return Effect.gen(function* () {
+        yield* Orders.append({ id }, [new Placed({ amount: 1 })], 0)
+        yield* Invoices.append(
+          { id },
+          Array.from({ length: retries + 2 }, (_, i) => new Placed({ amount: 10 * (i + 1) })),
+          0,
+        )
+        const invoices = yield* Invoices.read({ id })
+        // B writes first, so the row carries the token.
+        yield* RaceB.apply(invoices[0]!)
+        // Then B writes once more after each of A's reads: every write A makes has lost.
+        let next = 1
+        let reads = 0
+        let racing = false
+        // B's own read of the row comes through here too: it doesn't race itself.
+        pending.each = Effect.gen(function* () {
+          if (racing) return
+          reads++
+          racing = true
+          yield* RaceB.apply(invoices[next++]!).pipe(
+            Effect.ensuring(Effect.sync(() => void (racing = false))),
+          )
+        })
+        const exit = yield* Effect.exit(A.apply((yield* Orders.read({ id }))[0]!)).pipe(
+          Effect.ensuring(Effect.sync(() => void (pending.each = undefined))),
+        )
+        // One read per attempt: the first, then one per retry.
+        expect(reads).toBe(retries + 1)
+        const error = Exit.isFailure(exit) ? (exit.cause as any).reasons?.[0]?.error : undefined
+        expect(error).toMatchObject({
+          _tag: "ConcurrentModification",
+          entityType: "Race",
+          key: { id },
+        })
+        // The write was conditioned on the token it read: the token is what changed.
+        expect(error.attributes).toEqual(["__edd_rt__"])
+        // As on 1.40.0, a projection's carries no row: the next read is the retry's.
+        expect(Option.isNone(error.current)).toBe(true)
+        const client = yield* DynamoClient
+        const { Item } = yield* client.getItem({
+          TableName: tables.read,
+          Key: raceKey,
+          ConsistentRead: true,
+        })
+        const stored = fromAttributeMap(Item!) as Record<string, unknown>
+        // Every one of B's writes landed, and none of A's.
+        expect(stored).toMatchObject({ b: retries + 2, rb: retries + 2 })
+        expect(stored.a).toBeUndefined()
+        expect(stored.total).toBe(
+          Array.from({ length: retries + 2 }, (_, i) => 10 * (i + 1)).reduce((x, y) => x + y, 0),
+        )
+        // The race over, A's next attempt lands.
+        yield* A.apply((yield* Orders.read({ id }))[0]!)
+        const { Item: after } = yield* client.getItem({
+          TableName: tables.read,
+          Key: raceKey,
+          ConsistentRead: true,
+        })
+        expect(fromAttributeMap(after!)).toMatchObject({ a: 1, b: retries + 2 })
+      }).pipe(Effect.provide(TestLayer))
+    },
   )
 })
