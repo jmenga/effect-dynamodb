@@ -1,10 +1,11 @@
 /**
- * A discriminator the library writes on an edge's rows stays out of the edge's value on a read
- * (#241). A sub-aggregate's discriminator is written on every row beneath it, and a `one` edge's
- * on its row. A value decoded through a struct drops it anyway; a value that keeps what it's given
- * (`Schema.Unknown`, a declaration, a union member falling back to one) was handed it back inside,
- * by 1.39.0 and 1.40.0 alike. A value that can hold it (a struct declaring the name, a record)
- * keeps it as before, and a custom `assemble` is still handed it.
+ * The attributes the library writes on an edge's rows beside its value stay out of the value on a
+ * read (#241): a sub-aggregate's discriminator, written on every row beneath it, a `one` edge's own
+ * discriminator, and the aggregate's key attributes not named `pk` or `sk` (here the collection
+ * sort key's mirror, `csk`). A value decoded through a struct drops them anyway; a value that
+ * keeps what it's given (`Schema.Unknown`, a declaration, a union member falling back to one) was
+ * handed them back inside, by 1.39.0 and 1.40.0 alike. A value that can hold one (a struct
+ * declaring the name, a record) keeps it as before, and a custom `assemble` is still handed them.
  *
  * Nothing written changes: `create` and a no-op `update` send and store what 1.40.0 did, and the
  * no-op `update` still sends only its read. A union member that renames a field and is given its
@@ -75,6 +76,8 @@ const isObject = (x: unknown): x is object => typeof x === "object" && x !== nul
 type Shape = {
   readonly model: Schema.Top
   readonly edges: Record<string, unknown>
+  /** The aggregate's `collection`, when it isn't `{ name: "agg" }`. */
+  readonly collection?: unknown
   readonly input: unknown
   /** What a read returns. */
   readonly read: unknown
@@ -190,6 +193,45 @@ export const shapes: Record<string, () => Shape> = {
   },
 }
 
+/** Assembled off the local index `lsi1`, whose sort key is the collection sort key's mirror. */
+const mirrored = { name: "agg", index: "lsi1", sk: { field: "csk", composite: [] } }
+/** The local index every table has, for the shapes assembled off it. */
+export const INDEX = { name: "lsi1", sk: "csk" } as const
+
+shapes["an Unknown element, the collection sort key mirrored in csk"] = () => ({
+  model: Schema.Struct({ id: Schema.String, lines: Schema.Array(Schema.Unknown) }),
+  edges: { lines: sheets() },
+  collection: mirrored,
+  input: { id: "a", lines: [note] },
+  read: { id: "a", lines: [note] },
+  published: { id: "a", lines: [{ ...note, csk: "$disc#v1#sheet#0000000000000001" }] },
+})
+shapes["an Unknown one edge, the collection sort key mirrored in csk"] = () => ({
+  model: Schema.Struct({ id: Schema.String, note: Schema.Unknown }),
+  edges: { note: Aggregate.one({ entityType: "Note" } as never) },
+  collection: mirrored,
+  input: { id: "a", note: { text: "n" } },
+  read: { id: "a", note: { text: "n" } },
+  published: { id: "a", note: { text: "n", csk: "$disc#v1#note" } },
+})
+shapes["a struct element declaring csk, the collection sort key mirrored in csk"] = () => {
+  // The struct holds `csk`, so it keeps what the row holds there: the mirror, as before.
+  const read = { id: "a", lines: [{ qty: 1, csk: "$disc#v1#sheet#0000000000000001" }] }
+  return {
+    model: Schema.Struct({
+      id: Schema.String,
+      lines: Schema.Array(
+        Schema.Struct({ qty: Schema.Number, csk: Schema.optional(Schema.String) }),
+      ),
+    }),
+    edges: { lines: sheets() },
+    collection: mirrored,
+    input: { id: "a", lines: [{ qty: 1 }] },
+    read,
+    published: read,
+  }
+}
+
 export interface Harness {
   /** Run `body` on a fresh, empty table named `tableName`. */
   readonly onTable: <A, E>(
@@ -224,7 +266,7 @@ const run = (harness: Harness, shape: Shape) =>
         table: Main,
         schema,
         pk: { field: "pk", composite: ["id"] },
-        collection: { name: "agg" },
+        collection: shape.collection ?? { name: "agg" },
         root: { entityType: "Root" },
         edges: shape.edges,
       })

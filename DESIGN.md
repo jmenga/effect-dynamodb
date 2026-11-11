@@ -4926,21 +4926,26 @@ and nothing is deleted. Up to 1.40.0 it deleted every row the read returned,
 foreign rows included. It reads the same with `ownsRows` or without it
 (`AggregateDeleteRows.test.ts`, `connected.aggregate-delete-rows.test.ts`).
 
-**A discriminator stays out of an edge's value on a read (#241).** Every row
-beneath a sub-aggregate carries its discriminator, and a `one` edge's row its
-own; assembly hands an edge its rows without them when its value can't hold
-them (`discriminatorsBeside`, computed once per node in `resolveNode`, applied
-by `besideValue` beside the timestamps `stampsToStrip` removes). Whether a value
-can hold a name is `namesHeld` on its schema: a property of a struct or class on
-either side of a transformation, in any union member, or any name for a record.
-Decoding through a struct drops an attribute it doesn't declare, so this only
-changes a value that keeps what it's given (`Schema.Unknown`, a declaration, a
-union member that falls back to one, such as one renaming a field whose row
-holds the domain name): 1.39.0 and 1.40.0 handed the discriminator back inside
-it. A value that declares the name keeps it, and a custom `assemble` is handed
-the rows as before (the aggregates guide documents what it gets). Nothing
-written changes: the decomposed rows still carry the discriminator, so a no-op
-`update` writes nothing (`AggregateDiscriminatorRead.test.ts`,
+**What the library writes beside an edge's value stays out of it on a read
+(#241).** Every row beneath a sub-aggregate carries its discriminator, a `one`
+edge's row its own, and every row the aggregate's partition key attribute and,
+with a collection index, the collection sort key's mirror. Assembly has always
+removed `__edd_e__`, the attributes named `pk` and `sk`, those beginning with
+`gsi` or `lsi`, and undeclared stamps; it now also hands an edge its rows
+without the static discriminators and the key attributes under other names
+(`PK`, `csk`) when its value can't hold them (`attributesBeside`, computed once
+per node in `resolveNode`, applied by `besideValue` beside the timestamps
+`stampsToStrip` removes). Whether a value can hold a name is `namesHeld` on its
+schema: a property of a struct or class on either side of a transformation, in
+any union member, or any name for a record. Decoding through a struct drops an
+attribute it doesn't declare, so this only changes a value that keeps what it's
+given (`Schema.Unknown`, a declaration, a union member that falls back to one,
+such as one renaming a field whose row holds the domain name): 1.39.0 and 1.40.0
+handed those attributes back inside it. A value that declares the name keeps it
+(a struct field named like the mirror reads the key text, as before), and a
+custom `assemble` is handed the rows as before (the aggregates guide documents
+what it gets). Nothing written changes: the decomposed rows still carry them, so
+a no-op `update` writes nothing (`AggregateDiscriminatorRead.test.ts`,
 `connected.aggregate-discriminator-read.test.ts`, against
 `fixtures/aggregate-discriminator-read-1.39.0.json`). Context attributes are
 written on those rows by design and still read back into such a value.

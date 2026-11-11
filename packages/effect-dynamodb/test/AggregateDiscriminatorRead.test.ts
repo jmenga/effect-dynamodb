@@ -5,7 +5,7 @@
  */
 
 import { Effect, Layer } from "effect"
-import { Main, suite } from "./helpers/AggregateDiscriminatorRead.js"
+import { INDEX, Main, suite } from "./helpers/AggregateDiscriminatorRead.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 
 const tables = new Map<string, ReturnType<typeof makeRecordingTable>>()
@@ -14,7 +14,7 @@ let made = 0
 suite({
   onTable: (body) => {
     const tableName = `discriminator-read-${made++}`
-    const table = makeRecordingTable()
+    const table = makeRecordingTable({ indexes: { [INDEX.name]: { pk: "pk", sk: INDEX.sk } } })
     tables.set(tableName, table)
     return body(tableName).pipe(
       Effect.provide(Layer.merge(table.layer, Main.layer({ name: tableName }))),

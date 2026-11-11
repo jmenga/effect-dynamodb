@@ -12,7 +12,7 @@ import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { Config, Effect, Layer } from "effect"
 import { describe } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
-import { Main, suite } from "./helpers/AggregateDiscriminatorRead.js"
+import { INDEX, Main, suite } from "./helpers/AggregateDiscriminatorRead.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -71,6 +71,17 @@ const harness = {
           AttributeDefinitions: [
             { AttributeName: "pk", AttributeType: "S" },
             { AttributeName: "sk", AttributeType: "S" },
+            { AttributeName: INDEX.sk, AttributeType: "S" },
+          ],
+          LocalSecondaryIndexes: [
+            {
+              IndexName: INDEX.name,
+              KeySchema: [
+                { AttributeName: "pk", KeyType: "HASH" },
+                { AttributeName: INDEX.sk, KeyType: "RANGE" },
+              ],
+              Projection: { ProjectionType: "ALL" },
+            },
           ],
         }),
         () =>

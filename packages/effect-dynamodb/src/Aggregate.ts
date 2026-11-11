@@ -283,10 +283,10 @@ interface ResolvedNode {
   readonly discriminator?: Record<string, unknown>
   readonly ownDiscriminator?: Record<string, unknown>
   /**
-   * An edge's discriminator attributes its value can't hold ({@link discriminatorsBeside}): every
-   * row of the edge carries them, and a read takes them off the row before handing the value back.
+   * The attributes the library writes on every row of an edge beside its value, that the value
+   * can't hold ({@link attributesBeside}): a read takes them off the row before handing it back.
    */
-  readonly discriminatorsBeside?: ReadonlySet<string> | undefined
+  readonly beside?: ReadonlySet<string> | undefined
   readonly children: ReadonlyArray<ResolvedNode>
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
@@ -1719,6 +1719,12 @@ const makeAggregate = <TSchema extends Schema.Top>(
       edges: config.edges,
       parentFields: schemaFields,
       resolveRef,
+      keyAttributes: [
+        config.pk.field,
+        ...(config.collection.index === undefined || config.collection.sk === undefined
+          ? []
+          : [config.collection.sk.field]),
+      ].filter((name) => name !== "pk" && name !== "sk"),
     }),
   )
   // Rows that hold a stamp in the domain object: what `update` returns has to say what it wrote.
@@ -4645,7 +4651,12 @@ interface ResolveNodeArgs {
   /** The aggregate's ref resolver, shared with its `decodeSchema`. */
   readonly resolveRef?: RefResolver | undefined
   readonly discriminator?: Record<string, unknown> | undefined
-  readonly discriminatorsBeside?: ReadonlySet<string> | undefined
+  /**
+   * The aggregate's key attributes on every row that aren't named `pk` or `sk`: its partition key's
+   * attribute, and its collection sort key's mirror with a collection index.
+   */
+  readonly keyAttributes?: ReadonlyArray<string> | undefined
+  readonly beside?: ReadonlySet<string> | undefined
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
   readonly decomposeInput?: ((written: Written) => Option.Option<unknown>) | undefined
@@ -4735,6 +4746,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     entityType,
     fieldName,
     keyAttrEncoders,
+    keyAttributes,
     ownDiscriminator,
     parentFields,
     refIdentifierField,
@@ -4767,7 +4779,8 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             edges: {},
             discriminator: mergedDisc,
             ownDiscriminator: edge.discriminator,
-            discriminatorsBeside: discriminatorsBeside(mergedDisc, parentField),
+            keyAttributes,
+            beside: attributesBeside(mergedDisc, keyAttributes, parentField),
             ownFields: valueFields,
             valueSchema:
               modelOf(edge.entity?.model) ??
@@ -4812,8 +4825,10 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             cardinality: "many",
             edges: {},
             discriminator,
-            discriminatorsBeside: discriminatorsBeside(
+            keyAttributes,
+            beside: attributesBeside(
               discriminator,
+              keyAttributes,
               manyElementSchema(parentFields, field),
             ),
             assemble: edge.assemble,
@@ -4872,6 +4887,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
           edges: bound.aggregate.edges,
           parentFields: subFields,
           resolveRef,
+          keyAttributes,
           discriminator: inherited,
           ownDiscriminator: bound.discriminator,
           // The sub-aggregate root item carries the sub-schema's own (non-edge)
@@ -4897,9 +4913,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     // Absent optionals stay absent under `exactOptionalPropertyTypes`.
     ...(discriminator !== undefined && { discriminator }),
     ...(ownDiscriminator !== undefined && { ownDiscriminator }),
-    ...(args.discriminatorsBeside !== undefined && {
-      discriminatorsBeside: args.discriminatorsBeside,
-    }),
+    ...(args.beside !== undefined && { beside: args.beside }),
     children,
     ...(assemble !== undefined && { assemble }),
     ...(decompose !== undefined && { decompose }),
@@ -5301,34 +5315,42 @@ const stampsToStrip = (
 
 /**
  * The attributes of an edge's row a read takes off before handing back its value: the timestamps
- * it doesn't declare ({@link stampsToStrip}) and the discriminators it can't hold
- * ({@link discriminatorsBeside}).
+ * it doesn't declare ({@link stampsToStrip}) and the attributes the library writes beside it that
+ * it can't hold ({@link attributesBeside}).
  */
 const besideValue = (node: ResolvedNode, systemAttrs: ReadonlySet<string>): ReadonlySet<string> => {
   const stamps = stampsToStrip(node, systemAttrs)
-  const beside = node.discriminatorsBeside
+  const beside = node.beside
   return beside === undefined ? stamps : new Set([...stamps, ...beside])
 }
 
 /**
- * The static discriminator attributes the library writes on every row of an edge whose value
- * (`value`, the edge's field or a `many` edge's element) can't hold them (#241). Each is stored
- * beside the value, and a read takes it off again: the value is what the caller gave. A value that
- * can hold one keeps it on a read, as before: a struct or class declaring a field of that name (on
- * either side of a transformation, in any union member), or a record. Decoding through a struct
- * drops an attribute it doesn't declare anyway, so this matters to a value that keeps what it's
- * given: `Schema.Unknown`, a declaration, or a union member falling back to one.
+ * The attributes the library writes on every row of an edge, beside a value (`value`, the edge's
+ * field or a `many` edge's element) that can't hold them (#241): its static discriminator values
+ * (a sub-aggregate's, on every row beneath it, and a `one` edge's own), and the aggregate's key
+ * attributes not named `pk` or `sk` (`keyAttributes`). A read takes each off again, so the value is
+ * what the caller gave. A value that can hold one keeps it on a read, as before: a struct or class
+ * declaring a field of that name (on either side of a transformation, in any union member), or a
+ * record. Decoding through a struct drops an attribute it doesn't declare anyway, so this matters
+ * to a value that keeps what it's given: `Schema.Unknown`, a declaration, or a union member falling
+ * back to one.
  */
-const discriminatorsBeside = (
+const attributesBeside = (
   discriminator: Record<string, unknown> | undefined,
+  keyAttributes: ReadonlyArray<string> | undefined,
   value: Schema.Top | undefined,
 ): ReadonlySet<string> | undefined => {
-  if (discriminator === undefined || value === undefined) return undefined
+  if (value === undefined) return undefined
+  const written = [
+    ...Object.entries(discriminator ?? {})
+      .filter(([, given]) => typeof given !== "function")
+      .map(([name]) => name),
+    ...(keyAttributes ?? []),
+  ]
+  if (written.length === 0) return undefined
   const held = namesHeld(value.ast)
   if (held === "any") return undefined
-  const beside = Object.entries(discriminator)
-    .filter(([name, given]) => typeof given !== "function" && !held.has(name))
-    .map(([name]) => name)
+  const beside = written.filter((name) => !held.has(name))
   return beside.length === 0 ? undefined : new Set(beside)
 }
 

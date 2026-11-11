@@ -3,7 +3,7 @@
     "effect-dynamodb@1.39.0",
     "effect-dynamodb@1.40.0"
   ],
-  "note": "Captured once from published effect-dynamodb 1.39.0 and 1.40.0 on DynamoDB Local (helpers/AggregateDiscriminatorRead.ts runs the same shapes). Never regenerate.",
+  "note": "Captured once from published effect-dynamodb 1.39.0 and 1.40.0 on DynamoDB Local, on a table with a local index lsi1 sorted by csk (helpers/AggregateDiscriminatorRead.ts runs the same shapes). Never regenerate.",
   "1.39.0": {
     "a union member renaming a field, given its domain value": {
       "create": {
@@ -1776,6 +1776,587 @@
               }
             ]
           }
+        }
+      }
+    },
+    "an Unknown element, the collection sort key mirrored in csk": {
+      "create": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "note": "n"
+            }
+          ]
+        }
+      },
+      "requests": [
+        {
+          "command": "TransactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "a"
+                    },
+                    "__edd_e__": {
+                      "S": "Root"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#root"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#agg"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#pk)",
+                  "ExpressionAttributeNames": {
+                    "#pk": "pk"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "qty": {
+                      "N": "1"
+                    },
+                    "note": {
+                      "S": "n"
+                    },
+                    "__edd_e__": {
+                      "S": "Sheet"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "note": {
+            "S": "n"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "note": "n",
+              "csk": "$disc#v1#sheet#0000000000000001",
+              "qty": 1
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "note": "n",
+              "csk": "$disc#v1#sheet#0000000000000001",
+              "qty": 1
+            }
+          ]
+        }
+      },
+      "updateRequests": [
+        {
+          "command": "Query",
+          "input": {
+            "TableName": "<table>",
+            "IndexName": "lsi1",
+            "KeyConditionExpression": "#pk = :pk",
+            "ExpressionAttributeNames": {
+              "#pk": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":pk": {
+                "S": "$disc#v1#agg#a"
+              }
+            }
+          }
+        }
+      ],
+      "updateRows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "note": {
+            "S": "n"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "getAfterUpdate": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "note": "n",
+              "csk": "$disc#v1#sheet#0000000000000001",
+              "qty": 1
+            }
+          ]
+        }
+      }
+    },
+    "an Unknown one edge, the collection sort key mirrored in csk": {
+      "create": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "text": "n"
+          }
+        }
+      },
+      "requests": [
+        {
+          "command": "TransactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "a"
+                    },
+                    "__edd_e__": {
+                      "S": "Root"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#root"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#agg"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#pk)",
+                  "ExpressionAttributeNames": {
+                    "#pk": "pk"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "text": {
+                      "S": "n"
+                    },
+                    "__edd_e__": {
+                      "S": "Note"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#note"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#note"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "sk": {
+            "S": "$disc#v1#note"
+          },
+          "csk": {
+            "S": "$disc#v1#note"
+          },
+          "text": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Note"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "csk": "$disc#v1#note",
+            "text": "n"
+          }
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "csk": "$disc#v1#note",
+            "text": "n"
+          }
+        }
+      },
+      "updateRequests": [
+        {
+          "command": "Query",
+          "input": {
+            "TableName": "<table>",
+            "IndexName": "lsi1",
+            "KeyConditionExpression": "#pk = :pk",
+            "ExpressionAttributeNames": {
+              "#pk": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":pk": {
+                "S": "$disc#v1#agg#a"
+              }
+            }
+          }
+        }
+      ],
+      "updateRows": [
+        {
+          "sk": {
+            "S": "$disc#v1#note"
+          },
+          "csk": {
+            "S": "$disc#v1#note"
+          },
+          "text": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Note"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        }
+      ],
+      "getAfterUpdate": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "csk": "$disc#v1#note",
+            "text": "n"
+          }
+        }
+      }
+    },
+    "a struct element declaring csk, the collection sort key mirrored in csk": {
+      "create": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1
+            }
+          ]
+        }
+      },
+      "requests": [
+        {
+          "command": "TransactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "a"
+                    },
+                    "__edd_e__": {
+                      "S": "Root"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#root"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#agg"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#pk)",
+                  "ExpressionAttributeNames": {
+                    "#pk": "pk"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "qty": {
+                      "N": "1"
+                    },
+                    "__edd_e__": {
+                      "S": "Sheet"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "csk": "$disc#v1#sheet#0000000000000001"
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "csk": "$disc#v1#sheet#0000000000000001"
+            }
+          ]
+        }
+      },
+      "updateRequests": [
+        {
+          "command": "Query",
+          "input": {
+            "TableName": "<table>",
+            "IndexName": "lsi1",
+            "KeyConditionExpression": "#pk = :pk",
+            "ExpressionAttributeNames": {
+              "#pk": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":pk": {
+                "S": "$disc#v1#agg#a"
+              }
+            }
+          }
+        }
+      ],
+      "updateRows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "getAfterUpdate": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "csk": "$disc#v1#sheet#0000000000000001"
+            }
+          ]
         }
       }
     }
@@ -3940,6 +4521,587 @@
               }
             ]
           }
+        }
+      }
+    },
+    "an Unknown element, the collection sort key mirrored in csk": {
+      "create": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "note": "n"
+            }
+          ]
+        }
+      },
+      "requests": [
+        {
+          "command": "TransactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "a"
+                    },
+                    "__edd_e__": {
+                      "S": "Root"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#root"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#agg"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#pk)",
+                  "ExpressionAttributeNames": {
+                    "#pk": "pk"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "qty": {
+                      "N": "1"
+                    },
+                    "note": {
+                      "S": "n"
+                    },
+                    "__edd_e__": {
+                      "S": "Sheet"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "note": {
+            "S": "n"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "note": "n",
+              "csk": "$disc#v1#sheet#0000000000000001",
+              "qty": 1
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "note": "n",
+              "csk": "$disc#v1#sheet#0000000000000001",
+              "qty": 1
+            }
+          ]
+        }
+      },
+      "updateRequests": [
+        {
+          "command": "Query",
+          "input": {
+            "TableName": "<table>",
+            "IndexName": "lsi1",
+            "KeyConditionExpression": "#pk = :pk",
+            "ExpressionAttributeNames": {
+              "#pk": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":pk": {
+                "S": "$disc#v1#agg#a"
+              }
+            }
+          }
+        }
+      ],
+      "updateRows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "note": {
+            "S": "n"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "getAfterUpdate": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "note": "n",
+              "csk": "$disc#v1#sheet#0000000000000001",
+              "qty": 1
+            }
+          ]
+        }
+      }
+    },
+    "an Unknown one edge, the collection sort key mirrored in csk": {
+      "create": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "text": "n"
+          }
+        }
+      },
+      "requests": [
+        {
+          "command": "TransactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "a"
+                    },
+                    "__edd_e__": {
+                      "S": "Root"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#root"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#agg"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#pk)",
+                  "ExpressionAttributeNames": {
+                    "#pk": "pk"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "text": {
+                      "S": "n"
+                    },
+                    "__edd_e__": {
+                      "S": "Note"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#note"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#note"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "sk": {
+            "S": "$disc#v1#note"
+          },
+          "csk": {
+            "S": "$disc#v1#note"
+          },
+          "text": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Note"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "csk": "$disc#v1#note",
+            "text": "n"
+          }
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "csk": "$disc#v1#note",
+            "text": "n"
+          }
+        }
+      },
+      "updateRequests": [
+        {
+          "command": "Query",
+          "input": {
+            "TableName": "<table>",
+            "IndexName": "lsi1",
+            "KeyConditionExpression": "#pk = :pk",
+            "ExpressionAttributeNames": {
+              "#pk": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":pk": {
+                "S": "$disc#v1#agg#a"
+              }
+            }
+          }
+        }
+      ],
+      "updateRows": [
+        {
+          "sk": {
+            "S": "$disc#v1#note"
+          },
+          "csk": {
+            "S": "$disc#v1#note"
+          },
+          "text": {
+            "S": "n"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Note"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        }
+      ],
+      "getAfterUpdate": {
+        "ok": {
+          "id": "a",
+          "note": {
+            "csk": "$disc#v1#note",
+            "text": "n"
+          }
+        }
+      }
+    },
+    "a struct element declaring csk, the collection sort key mirrored in csk": {
+      "create": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1
+            }
+          ]
+        }
+      },
+      "requests": [
+        {
+          "command": "TransactWriteItems",
+          "input": {
+            "TransactItems": [
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "id": {
+                      "S": "a"
+                    },
+                    "__edd_e__": {
+                      "S": "Root"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#root"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#agg"
+                    }
+                  },
+                  "ConditionExpression": "attribute_not_exists(#pk)",
+                  "ExpressionAttributeNames": {
+                    "#pk": "pk"
+                  }
+                }
+              },
+              {
+                "Put": {
+                  "TableName": "<table>",
+                  "Item": {
+                    "qty": {
+                      "N": "1"
+                    },
+                    "__edd_e__": {
+                      "S": "Sheet"
+                    },
+                    "pk": {
+                      "S": "$disc#v1#agg#a"
+                    },
+                    "sk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    },
+                    "csk": {
+                      "S": "$disc#v1#sheet#0000000000000001"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "rows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "get": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "csk": "$disc#v1#sheet#0000000000000001"
+            }
+          ]
+        }
+      },
+      "update": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "csk": "$disc#v1#sheet#0000000000000001"
+            }
+          ]
+        }
+      },
+      "updateRequests": [
+        {
+          "command": "Query",
+          "input": {
+            "TableName": "<table>",
+            "IndexName": "lsi1",
+            "KeyConditionExpression": "#pk = :pk",
+            "ExpressionAttributeNames": {
+              "#pk": "pk"
+            },
+            "ExpressionAttributeValues": {
+              ":pk": {
+                "S": "$disc#v1#agg#a"
+              }
+            }
+          }
+        }
+      ],
+      "updateRows": [
+        {
+          "sk": {
+            "S": "$disc#v1#root"
+          },
+          "csk": {
+            "S": "$disc#v1#agg"
+          },
+          "id": {
+            "S": "a"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "__edd_e__": {
+            "S": "Root"
+          }
+        },
+        {
+          "sk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "csk": {
+            "S": "$disc#v1#sheet#0000000000000001"
+          },
+          "pk": {
+            "S": "$disc#v1#agg#a"
+          },
+          "qty": {
+            "N": "1"
+          },
+          "__edd_e__": {
+            "S": "Sheet"
+          }
+        }
+      ],
+      "getAfterUpdate": {
+        "ok": {
+          "id": "a",
+          "lines": [
+            {
+              "qty": 1,
+              "csk": "$disc#v1#sheet#0000000000000001"
+            }
+          ]
         }
       }
     }
