@@ -10,6 +10,7 @@
 import { describe } from "vitest"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
+import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import { openRecordingTable } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
@@ -57,6 +58,10 @@ describe("a pathRemove below a sparse map's entry", () => {
 
 describe("a path naming a renamed field whose name holds '#', or a sparse map's entry", () => {
   hashFieldNamesSuite(openRecordingTable, { projects: false })
+})
+
+describe("a sparse map's entry named through the map, beside a field named as it", () => {
+  entryBesideFieldSuite(openRecordingTable)
 })
 
 describe("a select naming a sparse map field", () => {

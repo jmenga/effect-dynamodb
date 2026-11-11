@@ -3896,10 +3896,30 @@ attribute name while a filter and a projection renamed it, so with a model field
 `a#b` stored as `stored`, `pathSet(["a#b"])` set a top-level `a#b` no read looks
 at and a condition on `t["a#b"]` tested an attribute `put` never stores
 (`test/fixtures/hash-field-names-1.39.0.json`, `helpers/HashFieldNames.ts`). A
-sparse map's entry (`<prefix>#<key>`) names no model field, so it resolves to
-itself and is named as before; the refusal of a `pathRemove` of an entry asks
+sparse map's entry (`<prefix>#<key>`) named through its map is the entry's
+attribute, never a field's rename: a model field may carry the same name
+(`a#b` stored as `stored`, beside a map `g` stored under the prefix `a`, whose
+entry `b` is the attribute `a#b`), and only a bare first segment the caller
+spells `a#b` names that field. `.entry("b")` (in a condition, and the
+segments of a path write it built), `.set({ g: { b } })`,
+`removeEntries("g", ["b"])` and `clearMap("g")` name the attribute `a#b`. The
+path `.entry()` built carries that it's an entry (`entryOfPath` in
+`internal/PathBuilder.ts`, by the segments' identity), so nothing re-derives it
+from the spelling, and every path below it carries it too. With the rename of
+every first segment and no such mark, a condition on `t.g.entry("b")` tested
+`stored`: a delete guarded on the entry fired where the entry didn't hold, and
+an update was refused where it did
+(`test/fixtures/entry-beside-field-1.40.0.json`, `helpers/EntryBesideField.ts`,
+plain, retained, unique and in a transaction). 1.40.0 took the entry's
+attribute for the field on one path: a path write on segments `.entry()` built,
+on an entity whose unique constraint names the field, rewrote it as a write of
+the field; it writes the entry. The refusal of a `pathRemove` of an entry asks
 about the attribute the path names after the rename, as `.remove()`'s does, so
-a field named like an entry is removed where it's stored. An aggregate's `list` filter compiles with no
+a bare segment naming a field spelled like an entry removes the field where
+it's stored, and one `.entry()` built is refused as an entry's, naming
+`.removeEntries`. An entry whose key holds `#` (`x#y`) can't be named by
+`.entry()`, which refuses such a key, as before; `.removeEntries("g", ["x#y"])`
+removes it. An aggregate's `list` filter compiles with no
 rename at any level, and `.history().where()` is a sort-key condition, so
 neither is affected. A path with no segment below the first spelled as a
 renamed field sends the requests it always sent

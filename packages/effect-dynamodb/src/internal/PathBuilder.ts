@@ -195,15 +195,43 @@ export type PathBuilder<Root, Model, Keys extends ReadonlyArray<string | number>
 export const isPath = (value: unknown): value is Path =>
   typeof value === "object" && value !== null && PathTag in value
 
+/** @internal A sparse map's entry, as `.entry(key)` named it: the map's field and the entry's key. */
+export interface PathEntry {
+  readonly field: string
+  readonly key: string
+}
+
+/**
+ * The paths whose first segment `.entry(key)` built (#238), by identity. The segment is the entry's
+ * attribute (`<prefix>#<key>`), and a model field may carry the same name (stored elsewhere by a
+ * `field:` rename): a segment the caller wrote names that field, one `.entry()` built names the
+ * entry. The builder knows which it made, so the path carries it, and nothing re-derives it from
+ * the spelling.
+ */
+const entries = new WeakMap<ReadonlyArray<string | number>, PathEntry>()
+
+/** @internal The sparse map entry a path's first segment is, when `.entry()` built it. */
+export const entryOfPath = (segments: ReadonlyArray<string | number>): PathEntry | undefined =>
+  entries.get(segments)
+
+/** @internal `segments`, marked as a path below `entry` when there is one. */
+export const withEntry = (
+  segments: ReadonlyArray<string | number>,
+  entry: PathEntry | undefined,
+): ReadonlyArray<string | number> => {
+  if (entry !== undefined) entries.set(segments, entry)
+  return segments
+}
+
 /**
  * Create a PathBuilder proxy that tracks attribute path segments.
  *
  * @param segments - Initial segments (default: [])
  * @param resolveDbName - Optional function to resolve domain names to DynamoDB
  *   attribute names. It names a path's first segment only (`storedPath`): a
- *   segment below it is stored under its own name. A sparse-map entry's segment
- *   (`<prefix>#<key>`) names no model field, so it resolves to itself and
- *   compiles as one placeholder.
+ *   segment below it is stored under its own name. A first segment `.entry()`
+ *   built is the entry's attribute (`<prefix>#<key>`), never a field's name
+ *   ({@link entryOfPath}), and compiles as one placeholder.
  * @param sparseFields - Optional map of sparse-map field names to their
  *   prefix configuration. When the proxy walks into a sparse field at the
  *   first level, the next access is expected to be `.entry(key)`, which
@@ -220,6 +248,8 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
   resolveDbName?: (name: string) => string,
   sparseFields?: globalThis.Record<string, { readonly prefix: string }>,
 ): PathBuilder<Model, Model, Keys> => {
+  // Every path below an entry carries it (`.entry("k").x`, `.entry("k").at(0)`).
+  const entry = entryOfPath(segments)
   const handler: ProxyHandler<object> = {
     get(_target, prop) {
       if (prop === PathTag) return PathTag
@@ -235,7 +265,7 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
       }
       if (prop === "at") {
         return (index: number) =>
-          createPathBuilder([...segments, index], resolveDbName, sparseFields)
+          createPathBuilder(withEntry([...segments, index], entry), resolveDbName, sparseFields)
       }
       if (prop === "entry") {
         // The previous segment must be a top-level field name marked sparse.
@@ -263,14 +293,19 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
           // (e.g. `.views` on a struct bucket) chain normally and compile to
           // dotted nested-Map paths.
           const newSegments = [...segments.slice(0, -1), `${prefix}#${key}`]
-          return createPathBuilder(newSegments, resolveDbName, sparseFields)
+          // A map is a top-level field, so its entry is the path's first segment: marked as one.
+          return createPathBuilder(
+            withEntry(newSegments, newSegments.length === 1 ? { field: last, key } : undefined),
+            resolveDbName,
+            sparseFields,
+          )
         }
       }
       // Pipe/iterator/Symbol access — return undefined to avoid interference
       if (typeof prop === "symbol") return undefined
       if (prop === "pipe" || prop === "toJSON" || prop === "then") return undefined
       if (typeof prop === "string") {
-        return createPathBuilder([...segments, prop], resolveDbName, sparseFields)
+        return createPathBuilder(withEntry([...segments, prop], entry), resolveDbName, sparseFields)
       }
       return undefined
     },
@@ -293,12 +328,22 @@ export const createPathBuilder = <Model, Keys extends ReadonlyArray<string | num
  * names its own schema has: `put` stores `meta.count` as `count` whatever a top-level `count` is
  * renamed to. This is the one place that says so, for an update's path operations, a condition, a
  * filter and a projection alike, so each names the attribute `put` stored.
+ *
+ * A first segment `.entry()` built ({@link entryOfPath}) is the entry's attribute, never a field's
+ * name: it stays as it is, whatever field a rename stores under another name it spells (#238).
  */
 export const storedPath = (
   segments: ReadonlyArray<string | number>,
   head: (name: string) => string,
-): ReadonlyArray<string | number> =>
-  segments.map((segment, i) => (i === 0 && typeof segment === "string" ? head(segment) : segment))
+): ReadonlyArray<string | number> => {
+  const entry = entryOfPath(segments)
+  return withEntry(
+    segments.map((segment, i) =>
+      i === 0 && typeof segment === "string" && entry === undefined ? head(segment) : segment,
+    ),
+    entry,
+  )
+}
 
 /**
  * Compile path segments into DynamoDB ExpressionAttributeNames placeholders.
@@ -308,10 +353,10 @@ export const storedPath = (
  * @param prefix - Placeholder prefix (e.g., "p" for paths, "e" for expressions)
  * @param counter - Mutable counter object for unique placeholder generation
  * @param resolveDbName - Optional function to resolve the path's top-level field to its
- *   DynamoDB attribute name ({@link storedPath}). Every first segment goes through it, as a
- *   filter's and a projection's do: a model field whose own name holds `#` is named by its
- *   rename, and a sparse-map entry's attribute (`<prefix>#<key>`), which names no model field,
- *   resolves to itself.
+ *   DynamoDB attribute name ({@link storedPath}). Every first segment the caller wrote goes
+ *   through it, as a filter's and a projection's do: a model field whose own name holds `#` is
+ *   named by its rename. A sparse-map entry's attribute (`<prefix>#<key>`) that `.entry()` built
+ *   doesn't, whatever field its name spells.
  * @returns The expression path string (e.g., "#p0.#p1" or "#p0[2].#p1")
  */
 export const compilePath = (

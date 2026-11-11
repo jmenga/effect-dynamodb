@@ -181,6 +181,7 @@ import {
 import {
   compilePath,
   createPathBuilder,
+  entryOfPath,
   type PathModel,
   storedPath,
 } from "./internal/PathBuilder.js"
@@ -2666,6 +2667,9 @@ const makeImpl = <
     value: unknown,
     kind: "value" | "elements",
   ): { readonly encoded: unknown; readonly issue: unknown } => {
+    // A sparse map's entry `.entry()` built has no field's schema to encode by, as any entry's
+    // attribute hasn't, whatever field its name spells (#238).
+    if (entryOfPath(segments) !== undefined) return { encoded: value, issue: undefined }
     if (kind === "value") {
       const encoded = pathValues.value(segments, value)
       return { encoded, issue: pathValues.validate(segments, encoded) }
@@ -2845,7 +2849,8 @@ const makeImpl = <
       segments: ReadonlyArray<string | number>,
     ): { readonly field: string; readonly reason: string } | "free" | "refused" => {
       const first = segments[0]
-      if (typeof first !== "string") return "free"
+      // A sparse map's entry `.entry()` built names no field, whatever field its attribute spells.
+      if (typeof first !== "string" || entryOfPath(segments) !== undefined) return "free"
       const head: string = first
       const reason = derivedFrom(head)
       if (reason === undefined) return "free"
@@ -3218,9 +3223,13 @@ const makeImpl = <
 
   /** An update naming, in any operation, a top-level attribute it can't address. */
   const refusedAttributeNames = (uState: UpdateState, ttlAttribute: string): string | undefined => {
+    // An entry `.entry()` built is addressed as an entry, never as a field it spells (#238).
     const heads = (
       ops: ReadonlyArray<{ readonly segments: ReadonlyArray<string | number> }> = [],
-    ) => ops.flatMap(({ segments }) => (typeof segments[0] === "string" ? [segments[0]] : []))
+    ) =>
+      ops.flatMap(({ segments }) =>
+        typeof segments[0] === "string" && entryOfPath(segments) === undefined ? [segments[0]] : [],
+      )
     const named: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
       [".remove()", uState.remove ?? []],
       [".add()", Object.keys(uState.add ?? {})],
@@ -3245,20 +3254,28 @@ const makeImpl = <
     // A sparse map's entries have an operation of their own to clear them. The other
     // path operations address an entry by its stored name, which is how a counter
     // entry is added to, so that name stays open to them.
-    const clearedEntries: ReadonlyArray<readonly [string, ReadonlyArray<string>]> = [
-      [".remove()", uState.remove ?? []],
+    const clearedEntries: ReadonlyArray<
+      readonly [string, ReadonlyArray<ReadonlyArray<string | number>>]
+    > = [
+      [".remove()", (uState.remove ?? []).map((name) => [name])],
       [
         "pathRemove",
-        (uState.pathRemoves ?? []).flatMap((segments) =>
-          segments.length === 1 && typeof segments[0] === "string" ? [segments[0]] : [],
+        (uState.pathRemoves ?? []).filter(
+          (segments) => segments.length === 1 && typeof segments[0] === "string",
         ),
       ],
     ]
-    for (const [op, names] of clearedEntries) {
-      for (const name of names) {
+    for (const [op, paths] of clearedEntries) {
+      for (const path of paths) {
+        const name = String(path[0])
         // The attribute the operation removes decides: each names a field, removed where it's
-        // stored (`compilePath`), and an entry's attribute names no field, so it is its own.
-        const entry = sparseEntries.entryOf(resolveDbName(name))
+        // stored (`compilePath`), and an entry's attribute names no field, so it is its own. An
+        // entry `.entry()` built is that entry, whatever field its attribute spells (#238).
+        const built = entryOfPath(path)
+        const entry =
+          built !== undefined && Object.hasOwn(sparseFields, built.field)
+            ? built
+            : sparseEntries.entryOf(resolveDbName(name))
         if (entry === undefined) continue
         return (
           `${op} of "${name}": "${name}" is an entry of the sparse map "${entry.field}". ` +
@@ -3768,7 +3785,7 @@ const makeImpl = <
         if (op === "pathSet of" && isCopy(operand)) continue
         const { segments, value } = operand
         // An untyped position is looked through where the operand is marshalled (`unstorableOperand`).
-        if (!customFields.has(String(segments[0]))) continue
+        if (!customFields.has(String(segments[0])) || entryOfPath(segments) !== undefined) continue
         const { encoded } = encodePathValue(segments, value, kind)
         const read = asRead(encoded)
         const issue =
@@ -4177,10 +4194,12 @@ const makeImpl = <
     for (const segments of uState.pathRemoves ?? []) {
       const head = segments[0]
       if (typeof head !== "string") continue
-      if (!isModelField(head)) {
+      const built = entryOfPath(segments)
+      if (built !== undefined || !isModelField(head)) {
         // Below a sparse map's entry (`m#k`, then `x`), judged as a read rebuilds the map: the
-        // entry's key, then the rest, against the map's own schema (#238).
-        const entry = segments.length > 1 ? readEntryOf(head) : undefined
+        // entry's key, then the rest, against the map's own schema (#238). One `.entry()` built
+        // is that entry, whatever field its attribute spells.
+        const entry = segments.length > 1 ? readEntryOf(head, built) : undefined
         if (
           entry !== undefined &&
           pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...segments.slice(1)])
@@ -4206,8 +4225,16 @@ const makeImpl = <
    * name. A map a `field:` rename stores whole (`put`) has its attribute read in place of its
    * entries whenever a row holds it, so its entries may not be what a read sees.
    */
-  const readEntryOf = (attribute: string) => {
-    const entry = sparseEntries.entryOf(attribute)
+  const readEntryOf = (
+    attribute: string,
+    built?: { readonly field: string; readonly key: string },
+  ) => {
+    const entry =
+      built !== undefined
+        ? Object.hasOwn(sparseFields, built.field)
+          ? built
+          : undefined
+        : sparseEntries.entryOf(attribute)
     return entry === undefined || Object.hasOwn(data.fieldRenames, entry.field) ? undefined : entry
   }
 
@@ -4552,7 +4579,8 @@ const makeImpl = <
     for (const [op, ops] of pathOps) {
       for (const { segments } of ops) {
         const head = segments[0]
-        if (typeof head === "string" && head in packedFields) return refuse(op, head)
+        if (typeof head !== "string" || entryOfPath(segments) !== undefined) continue
+        if (head in packedFields) return refuse(op, head)
       }
     }
     for (const { field } of uState.sparseRemoveEntries ?? []) {
@@ -6009,12 +6037,12 @@ const makeImpl = <
     for (const ops of pathOps) {
       for (const op of ops) {
         const root = op.segments[0]
-        if (typeof root === "string") touched.add(root)
+        if (typeof root === "string" && entryOfPath(op.segments) === undefined) touched.add(root)
       }
     }
     for (const segments of uState.pathRemoves ?? []) {
       const root = segments[0]
-      if (typeof root === "string") touched.add(root)
+      if (typeof root === "string" && entryOfPath(segments) === undefined) touched.add(root)
     }
     return touched
   }

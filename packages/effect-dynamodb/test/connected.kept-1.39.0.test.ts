@@ -24,6 +24,7 @@ import { DynamoClient } from "../src/DynamoClient.js"
 import * as Table from "../src/Table.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
+import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { optionalShardAppendSuite } from "./helpers/OptionalShardAppend.js"
@@ -124,6 +125,10 @@ describeConnected(
     hashFieldNamesSuite(openTable, { projects: true })
   },
 )
+
+describeConnected("a sparse map's entry named through the map, beside a field named as it", () => {
+  entryBesideFieldSuite(openTable)
+})
 
 describeConnected("a select naming a sparse map field", () => {
   selectSparseMapsSuite(openTable, { dynamodb: true })

@@ -9,7 +9,8 @@
  * `a#b`, which `put` never stores, so it failed whatever the row held. All four now name the
  * attribute `put` stored, and so does the refusal of a `pathRemove` of a sparse map's entry: a
  * field named like one (`a#b` beside a map stored under `a`) is removed where it's stored, as
- * `.remove()` removes it. An entry's attribute names no model field, so it is named as before.
+ * `.remove()` removes it. A sparse map's entry named through the map (`.entry()`, `removeEntries`)
+ * is the entry's attribute whatever field spells it (`EntryBesideField.ts`).
  *
  * `fixtures/hash-field-names-1.39.0.json` holds what the published 1.39.0 did (1.40.0 did the
  * same): the head does the same, except where `expected` says otherwise.
