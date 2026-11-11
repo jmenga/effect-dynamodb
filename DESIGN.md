@@ -7415,33 +7415,88 @@ instance).
     1.39.0 and 1.40.0 guarded a write by the projection's own revision or
     checkpoint alone, so one projection's write replaced another's that
     landed after its read.
+    The token's tags describe the row as it is after each write
+    (`writersAfter`): a layout whose attributes a write drops loses its tag,
+    so a later check never names an attribute that is no longer there.
     A tombstone keeps the bookkeeping (checkpoints, map, owners, revision) of
-    the other layouts that have written the row, as the row stores it
-    (`carriedOf`), so their redelivered events stay recognised; a write over a
-    tombstone carries it over what `initial` gives; a write over a live row
-    fills in what the state left out (a `toItem` that drops it); `create` over
-    a tombstone carries what it holds, the layouts with `removal` first as
-    before, then the others. 1.39.0 and 1.40.0 kept only the remover's, so
-    another projection's redelivery applied again over the tombstone, bringing
-    the removed row back, and a late removal removed a row written after it. A
-    value the write couldn't store (a 1.39.0 tombstone's sparse map holding a
-    key with `#`) isn't carried. Only layouts the row's token records are
-    consulted, so projections writing disjoint rows never gain each other's
-    attributes, and a row written before (no token) carries nothing. A rebuild
-    over a live row carries none: it drops the other projections'
-    contributions to the state, so without their checkpoints they fold their
-    streams again on their next event, and the row converges, as on 1.40.0
-    (`test/EventStore.projection-row-token.test.ts`).
+    the other layouts that have written the row since the token, so their
+    redelivered events stay recognised. One function says what's carried
+    (`carriedOf`: each attribute as the row reads it), and each site stores it
+    as it stores its own: a tombstone natively, a map whole; a row as the
+    entity stores any value of the field, renamed, packed or as sparse
+    entries, an entry whose key sparse storage can't hold left off (`onRow`);
+    so each reader reads what was written. A write over a tombstone
+    carries it over what `initial` gives; `create` over a tombstone carries
+    what it holds, the layouts with `removal` first as before, then the
+    others. 1.39.0 and 1.40.0 kept only the remover's, so another projection's
+    redelivery applied again over the tombstone, bringing the removed row
+    back, and a late removal removed a row written after it. A row last
+    written under 1.40.0 holds no token, so the first removal after upgrading
+    keeps only the remover's, as on 1.40.0. Only layouts the row's token
+    records are consulted, so projections writing disjoint rows never gain
+    each other's attributes (`test/EventStore.projection-carry.test.ts`: each
+    kind of bookkeeping, at each site, then a redelivery, the next event, a
+    removal, `create` and a rebuild, against 1.40.0's outcomes).
+    A write over a live row carries the others' bookkeeping into what it left
+    out only when it keeps every attribute of the row's data (`keepsData`: by
+    attribute name, the values may change; the data is every model field no
+    projection keeps as bookkeeping). One that drops any data attribute the
+    row held writes as 1.40.0 did: the others' bookkeeping and tags go with
+    it, so they fold their streams again on their next or redelivered event
+    and put their part back. Carrying their checkpoints there would say
+    "applied" over data that is gone, for good. Which projection wrote which
+    data attribute is not recorded (the token records who wrote the row, not
+    what each wrote, and no attribute is added for it), so a write that drops
+    only its own optional field drops the others' bookkeeping too: never
+    worse than 1.40.0, and a write keeping a field both add to no longer
+    counts it twice (1.40.0 did). A rebuild over a live row carries none: it
+    drops the other projections' contributions to the state, so they fold
+    again, and the row converges, as on 1.40.0.
+    A row read without a token on a read model whose rows carry one was last
+    written by a process still on 1.40.0 (a rolling deployment), or before the
+    token. The write over it is conditioned on the token's absence and on
+    every projection's bookkeeping as read (`asReadTerm`, `heldTerm`), which
+    each of their writes changes, so it never replaces a write landed since,
+    whichever release made it, and a row 1.40.0 rewrote never wedges: its
+    terms hold until the next write. `create` over a tombstone uses the same
+    term. A write naming a token asks for the row as stored when its
+    condition fails (`ReturnValuesOnConditionCheckFailure: ALL_OLD`), so
+    `ConcurrentModification` names what changed (`changedOf`): the
+    projection's own revision or checkpoint, the token, another's bookkeeping,
+    or the removal stamp. The other direction can't be fixed in this
+    release: a process on 1.40.0 conditions its write on its own revision or
+    checkpoint alone, so a write it read before another projection's replaces
+    it, as on 1.40.0. The token protects a row once every writer of the read
+    model runs 1.41.0 or later (`test/EventStore.projection-row-token.test.ts`,
+    against requests captured from the published 1.40.0,
+    `test/fixtures/projection-rolling-1.40.0.json`).
     A read model with one layout carries no token: its own revision (raised by
     every write and by `create` over a tombstone) or checkpoint serialises its
-    writes, and it sends and stores what 1.40.0 did, but for one term and the
-    read below: a projection with `removal` and no revision writing over a
+    writes, and it sends and stores what 1.40.0 did, but for two terms and the
+    read below. A projection with `removal` and no revision writing over a
     tombstone it read adds `attribute_exists(__edd_removed__)`
     (`tombstoneTerm`), since `create` over the tombstone keeps the checkpoint,
-    which alone let 1.39.0's and 1.40.0's write replace the created row. The
-    layouts are those this program defines: a program defining one projection
-    of several writes no token, checks none and carries nothing, so every
-    program writing a read model's rows must define all of its projections.
+    which alone let 1.39.0's and 1.40.0's write replace the created row. And
+    `create` over a tombstone names it by every projection's bookkeeping as
+    it read it as well as by its removal stamp (`asReadTerm`), since a stamp
+    has a millisecond's resolution: a row written over the tombstone and
+    removed again within one passed 1.39.0's and 1.40.0's guard, and `create`
+    carried the older tombstone's checkpoints. A row token on read models
+    with `removal` would have closed it too, but changes every write of every
+    such read model (an attribute stored, a term sent); the exact guard adds
+    terms to `create`'s condition over a tombstone alone, and no request.
+    The layouts are those this program defines. A program defining one
+    projection of several writes a token only on a row that holds one, and
+    checks a token only where the row holds one: there its write is
+    conditioned on the token it read, so it never replaces a write landed
+    since, and its fresh token keeps the tags of layouts it doesn't define.
+    On a row read without one it conditions its write as 1.40.0 did, on its
+    own checkpoint or revision alone, so another program's write landed since
+    can be replaced, as on 1.40.0 (it can't tell the read model has other
+    projections, and adding a term there would change every single-projection
+    read model's writes). It carries no bookkeeping of layouts it doesn't
+    define. So every program writing a read model's rows must define all of
+    its projections.
   - **`create` over a tombstone** consults the projections with `removal`,
     the one defined last first: each attribute one of them names that the
     tombstone holds is carried, a checkpoint (or map, or owner) as it is and a
@@ -7453,6 +7508,18 @@ instance).
     late redelivery of the removal applied again and removed the created row.
     A projection without `removal` writes no tombstone and is consulted last,
     for what the row token had a tombstone keep of it.
+    Each value goes on the row as the row stores it. A tombstone 1.39.0 wrote
+    holds a sparse checkpoint map whole (so does a current one): `create`
+    writes its entries as the row's sparse entries, so the checkpoints
+    survive and a redelivered event is still `alreadyApplied`; an entry whose
+    key sparse storage can't hold is left off, and the whole-map attribute
+    isn't copied (copied whole, it read on the row as `{}`). No extra request
+    (`test/EventStore.projection-tombstone-layouts.test.ts`, over a tombstone
+    captured from the published 1.39.0,
+    `test/fixtures/projection-tombstone-sparse-map-1.39.0.json`). An explicit
+    migration of the checkpoint format wasn't taken: a tombstone holds its map
+    whole by design, so nothing stored is in the wrong form; only `create`'s
+    copy was, and `create` has the tombstone in hand.
     When a projection's tombstones set the table's TTL attribute, it is never
     carried, so the row doesn't expire with the tombstone. Over a tombstone of
     the projection with `removal` defined last, `create` sends and stores what
@@ -7505,16 +7572,19 @@ instance).
     (`test/EventStore.projection-row-token.test.ts`).
   - **One meaning per attribute on a row two projections write
     (`EDD-9144`).** On a row whose token records another layout, an attribute
-    that layout keeps as bookkeeping and this projection keeps in another role
-    is refused when the row is read, before the projection uses it (1.39.0
-    and 1.40.0 read one projection's revision as another's checkpoint,
-    reported the event `alreadyApplied` and left the row a tombstone); and a
-    write over the live row that gives such an attribute another value,
-    without keeping it in that role, is refused before anything is sent.
-    Rows only one of them has written refuse nothing: projections writing
-    disjoint rows may give one name different meanings, as `EDD-9133`
-    allows. The read-time refusal comes before `alreadyApplied` is decided,
-    so a redelivery is refused too.
+    that layout keeps as bookkeeping, that is on the row, and that this
+    projection keeps in another role is refused when the row is read, before
+    the projection uses it (1.39.0 and 1.40.0 read one projection's revision
+    as another's checkpoint, reported the event `alreadyApplied` and left the
+    row a tombstone); and a write over the live row that gives such an
+    attribute another value, without keeping it in that role, is refused
+    before anything is sent. Rows only one of them has written refuse
+    nothing: projections writing disjoint rows may give one name different
+    meanings, as `EDD-9133` allows. Nor does an attribute the row no longer
+    holds (the token's tags follow the row, above), or a rebuild, which reads
+    none of its old values from the row and so misreads nothing. The
+    read-time refusal comes before `alreadyApplied` is decided, so a
+    redelivery is refused too.
   - **A sparse-map checkpoint field.** Its keys (`<source>#<streamId>`) hold
     `#`, which a sparse map can't store. A tombstone's write is checked as the
     row's write is (`serializeSparseOrFail`, on a copy), so both refuse such a
@@ -8374,7 +8444,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9133` | `internal/TransactableOps.ts` (`addProjectionLayout`, `projectionTtlConflict`), through `internal/ProjectionEngine.ts` (`EventStore.projection` / `multiProjection`, `preflight`) | On a projection read model one of whose projections has `removal`, one stored attribute one projection keeps in two roles: a checkpoint, checkpoint map, checkpoint owner or revision it also uses in another role, compared by stored name. Thrown by the definition that completes the conflict (the projection's own, or the first `removal`), with nothing recorded. Without `removal` nothing is refused, nor are two projections keeping one attribute in different roles. The table's TTL attribute, known only at run time, is checked by every entry point that writes a row (not the drains) before it sends anything: an attribute a projection keeps that is stored as it, while a projection's tombstones set it (`removal.ttl`), fails every projection on the read model with a `ValidationError`. |
 | `EDD-9134` | `internal/ProjectionEngine.ts` (`sharedOutboxKeySpace`, `refuseSharedOutboxKeySpace`), through `DynamoClient.make`, a table's `rekey` and `EventStore.processBatch` | Two read models whose projections' outboxes are on one table, in the same key space (the partition and sort key text their primary keys compose: schema name and version, primary collection, entity type, the composites' labels, and what each composite's type can compose: a number's or bigint's key text, a literal union's members, `true` and `false`, or any text). `DynamoClient.make` (among the entities it binds and its tables' members) and `processBatch` (among the read models of the projections it's handed) refuse two whose keys can be the same with values that hold no `#`: their items would overwrite each other. A defect, before anything runs. Two whose keys meet only through a value holding `#`, or part where one's value can't spell the other's text (a number or a date beside a label), bind and run. `rekey` of the outbox's table asks the same question, with the outboxes of projections defined since the client was made, and of a member of that table claiming the outbox items of a read model's entity type, unless it composes its keys as the read model does (each composite of the same kind of key text, a literal union taken as its kind). 1.40.0's `rekey` also refused two whose items its reader could read as each other's (a value holding `#` included, a literal composite read as any text); from 1.41.0 it decides those item by item (`rekeyOutboxMember`, DESIGN §7 "`rekey`"). A member that is no read model (a projection object built by hand, with its routes and no read model) isn't compared, and runs as on 1.39.0. A `ValidationError`, before it sends anything; `rekey` of other tables runs. Tables are compared by the physical name the context gives them, so two handles on one table are one table. Read models that never meet at one of these can't be checked: key spaces must be distinct per outbox table. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
-| `EDD-9144` | `internal/ProjectionEngine.ts` (`sharedMeaning`), through `EventStore.projection` / `multiProjection` (`apply`, `applyBatch`, `processBatch`, `catchUp`, `rebuild`: every row write) | On a read model whose rows carry the row token (#237: more than one projection layout), a row whose token records another layout that keeps an attribute as bookkeeping (checkpoint, checkpoint map, checkpoint owner, revision) this projection keeps in another role: refused with a `ValidationError` when the row is read, before the projection uses it, and a write over the live row that gives such an attribute another value, without keeping it in that role, refused before anything is sent. Rows the other layout hasn't written refuse nothing (`EDD-9133` allows projections on disjoint rows to give one name different meanings). 1.39.0 and 1.40.0 read the other projection's revision as this one's checkpoint (`alreadyApplied`, the row left a tombstone) or overwrote its bookkeeping. |
+| `EDD-9144` | `internal/ProjectionEngine.ts` (`sharedMeaning`), through `EventStore.projection` / `multiProjection` (`apply`, `applyBatch`, `processBatch`, `catchUp`, `rebuild`: every row write) | On a read model whose rows carry the row token (#237: more than one projection layout), a row whose token records another layout that keeps an attribute as bookkeeping (checkpoint, checkpoint map, checkpoint owner, revision) this projection keeps in another role, the attribute on the row: refused with a `ValidationError` when the row is read, before the projection uses it (not by a rebuild, which reads no old value from the row), and a write over the live row that gives such an attribute another value, without keeping it in that role, refused before anything is sent. Rows the other layout hasn't written refuse nothing (`EDD-9133` allows projections on disjoint rows to give one name different meanings). 1.39.0 and 1.40.0 read the other projection's revision as this one's checkpoint (`alreadyApplied`, the row left a tombstone) or overwrote its bookkeeping. |
 | `EDD-9145` | `internal/ProjectionEngine.ts` (`writeRow`), through a projection's `apply`, `applyBatch`, `processBatch`, `catchUp` and `rebuild`, single- and multi-source | A projection's outbox item whose key held another effect's item (another read model's whose row keys are the same text, another projection's of the read model, or another event's: `outboxGuard` cancelled it) was written beside it, at its key followed by `#<mark>`, and that key is held too, by an item that isn't this effect's (`ALL_OLD` names it). Only the effect writes its mark, so nothing the library writes is there in normal operation. A `ValidationError` naming the read model, its tag, the row, the revision, the item's position, the key, the item's mark and what holds it, asking whether that item was written outside the projection, with DynamoDB's error as the cause; the transaction was cancelled, so nothing was written. |
 | `EDD-9158` | Retired, never released | Allocated during 1.41's development for refusing an entity-level ref's `${field}Id` for an entity keyed by more than one composite, and retired before release: a key whose other composites have an encoding default composes from the identifier alone, and 1.40.0 fetches and stores it. Such an id is fetched under the identifier, as on 1.40.0, and fails as it did where the key can't be composed. Don't reuse the number |
 | `EDD-9159` | `Aggregate.ts` (`givenOverRowReason`, `customOverRowReason`, through `refuseGivenOverRows`), at `create` only (`AggregateDecompositionError`, nothing sent) | A `create` whose input gives, at the top of a row's value (the root's, a sub-aggregate's root, a `one` edge's value, a `many` element, or a `many` edge's value through its custom `decompose` / `assemble`), a value for a name the library writes on that row (`__edd_e__`, the partition key attribute, `sk`, the collection sort key's copy, the root's list keys on a write composing them; on a row beneath the root, a context attribute) that a `get` right after would not return (#241): the row as built, read as a `get` reads it (unpacked, renamed, sparse fields restored, decoded by the member's own schema), compared with the value given (`sameValue`: sets by members, dates by instant, otherwise strictly, `5n` ≠ `5`, `-0` ≠ `0`, `1.5` ≠ `1.50`). A union or `Schema.suspend` root or sub-aggregate is read whole (`nodeReadOf`). Up to 1.40.0 the library's value replaced it and the read handed back something else, or failed. Equal: written as on 1.40.0. Given no value, a name the member places with another schema than the root's is refused only where that read fails (`unreadOverRowReason`, `customUnreadReason`). The value given is looked up under the name the input holds it by (`inputNameIn`: a `many` edge's `inputField`). Not judged: a discriminator, a name the library doesn't write on that row, a nested value, and `update`. `Aggregate.make` refuses nothing. The message names the member and the field and shows the value given and what the read returns (or its failure), each rendered unambiguously |
