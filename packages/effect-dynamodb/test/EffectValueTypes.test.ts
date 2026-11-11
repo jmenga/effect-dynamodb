@@ -9,7 +9,15 @@
  */
 import { describe, expect, it } from "@effect/vitest"
 import { DateTime, Effect } from "effect"
-import { type Cell, CODECS, cellsOf, codecCellsOf, KINDS } from "./helpers/ValueTypeCells.js"
+import {
+  type Cell,
+  CODECS,
+  cellsOf,
+  codecCellsOf,
+  KINDS,
+  UNTYPED,
+  untypedCellsOf,
+} from "./helpers/ValueTypeCells.js"
 
 const TABLE: Readonly<Record<string, Readonly<Record<string, Cell>>>> = {
   DateTimeUtc: {
@@ -147,7 +155,7 @@ const TABLE: Readonly<Record<string, Readonly<Record<string, Cell>>>> = {
   },
   Chunk: {
     typed: "definition refused: EDD-9125",
-    loose: "refused: defect",
+    loose: "refused: ValidationError EDD-9124",
     packed: "refused: ValidationError",
     key: "definition refused: EDD-9125",
     keyText: "definition refused: EDD-9125",
@@ -282,6 +290,204 @@ describe("Effect's zone string codecs, given an alias zone, on every Effect vers
           typed: typed[EFFECT_413 ? "4.1.3" : "4.1.2"],
           ...keys,
         })
+      }),
+    )
+  }
+})
+
+/**
+ * Every Effect collection and data type handed to a field no schema types (`Schema.Unknown`), stored
+ * natively and packed, on every Effect version: each is refused with a `ValidationError`, or stored
+ * whole and read back. A read of an untyped field hands back the map stored, the value's every
+ * enumerable property, which is all it holds once nothing in it is lost (`EDD-9161`): written again,
+ * it stores the same bytes. An instance comes back only where a schema declares it. None dies or
+ * overflows: a `Chunk`, whose empty end holds itself, was a stack overflow natively and is the
+ * `EDD-9124` refusal a `HashSet` gets. Effect 4.1 has no `List`, `SortedSet`, `SortedMap` or
+ * `Either`.
+ */
+const UNTYPED_TABLE: Readonly<Record<string, Readonly<Record<string, Cell>>>> = {
+  Chunk: {
+    loose: "refused: ValidationError EDD-9124",
+    packed: "refused: ValidationError",
+  },
+  "Chunk, empty": {
+    loose: "refused: ValidationError EDD-9124",
+    packed: "refused: ValidationError",
+  },
+  HashSet: {
+    loose: "refused: ValidationError EDD-9124",
+    packed: "refused: ValidationError",
+  },
+  HashMap: {
+    loose: "refused: ValidationError EDD-9124",
+    packed: "refused: ValidationError",
+  },
+  "MutableHashMap, string keys": {
+    loose:
+      '{"M":{"backing":{"M":{"a":{"N":"1"}}},"buckets":{"M":{}},"~effect/MutableHashMap":{"S":"~effect/MutableHashMap"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  "MutableHashMap, an object key": {
+    loose: "refused: ValidationError EDD-9161",
+    packed: "refused: ValidationError",
+  },
+  "MutableHashSet, numbers": {
+    loose: "refused: ValidationError EDD-9161",
+    packed: "refused: ValidationError",
+  },
+  "MutableHashSet, strings": {
+    loose:
+      '{"M":{"keyMap":{"M":{"backing":{"M":{"a":{"BOOL":true}}},"buckets":{"M":{}},"~effect/MutableHashMap":{"S":"~effect/MutableHashMap"}}},"~effect/MutableHashSet":{"S":"~effect/MutableHashSet"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  MutableList: {
+    loose:
+      '{"M":{"head":{"M":{"array":{"L":[{"N":"1"}]},"mutable":{"BOOL":true},"offset":{"N":"0"}}},"tail":{"M":{"array":{"L":[{"N":"1"}]},"mutable":{"BOOL":true},"offset":{"N":"0"}}},"length":{"N":"1"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"head\\":{\\"array\\":[1],\\"mutable\\":true,\\"offset\\":0},\\"tail\\":{\\"array\\":[1],\\"mutable\\":true,\\"offset\\":0},\\"length\\":1}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  MutableRef: {
+    loose: '{"M":{"current":{"N":"1"},"~effect/MutableRef":{"S":"~effect/MutableRef"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  Trie: {
+    loose:
+      '{"M":{"_root":{"M":{"key":{"S":"a"},"count":{"N":"1"},"value":{"M":{"value":{"N":"1"}}}}},"_count":{"N":"1"},"~effect/Trie":{"M":{}}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  Graph: {
+    loose: "refused: ValidationError EDD-9161",
+    packed: "refused: ValidationError",
+  },
+  "Option some": {
+    loose:
+      '{"M":{"value":{"N":"1"},"_tag":{"S":"Some"},"_op":{"S":"Some"},"~effect/Option":{"M":{}}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"_op\\":\\"Some\\",\\"~effect/Option\\":{},\\"value\\":1,\\"_tag\\":\\"Some\\"}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  "Option none": {
+    loose: '{"M":{"_tag":{"S":"None"},"_op":{"S":"None"},"~effect/Option":{"M":{}}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: '{"S":"{\\"_op\\":\\"None\\",\\"~effect/Option\\":{},\\"_tag\\":\\"None\\"}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  "Result success": {
+    loose:
+      '{"M":{"success":{"N":"1"},"_tag":{"S":"Success"},"_op":{"S":"Success"},"~effect/Result":{"M":{}}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"_op\\":\\"Success\\",\\"success\\":1,\\"_tag\\":\\"Success\\",\\"~effect/Result\\":{}}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  "Result failure": {
+    loose:
+      '{"M":{"failure":{"S":"e"},"_tag":{"S":"Failure"},"_op":{"S":"Failure"},"~effect/Result":{"M":{}}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"_op\\":\\"Failure\\",\\"failure\\":\\"e\\",\\"_tag\\":\\"Failure\\",\\"~effect/Result\\":{}}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  "Exit success": {
+    loose:
+      '{"M":{"~effect/Effect/args":{"N":"1"},"~effect/Exit":{"S":"~effect/Exit"},"_tag":{"S":"Success"},"value":{"N":"1"},"~effect/Effect":{"M":{}},"~effect/Effect/identifier":{"S":"Success"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  "Exit failure": {
+    loose:
+      '{"M":{"~effect/Effect/args":{"M":{"~effect/Cause":{"S":"~effect/Cause"},"reasons":{"L":[{"M":{"~effect/Cause/Reason":{"S":"~effect/Cause/Reason"},"annotations":{"M":{}},"_tag":{"S":"Fail"},"error":{"S":"e"}}}]}}},"~effect/Exit":{"S":"~effect/Exit"},"_tag":{"S":"Failure"},"cause":{"M":{"~effect/Cause":{"S":"~effect/Cause"},"reasons":{"L":[{"M":{"~effect/Cause/Reason":{"S":"~effect/Cause/Reason"},"annotations":{"M":{}},"_tag":{"S":"Fail"},"error":{"S":"e"}}}]}}},"~effect/Effect":{"M":{}},"~effect/Effect/identifier":{"S":"Failure"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  "Exit, dying of an Error": {
+    loose: "refused: ValidationError EDD-9161",
+    packed: "refused: ValidationError",
+  },
+  "Cause, a failure": {
+    loose:
+      '{"M":{"~effect/Cause":{"S":"~effect/Cause"},"reasons":{"L":[{"M":{"~effect/Cause/Reason":{"S":"~effect/Cause/Reason"},"annotations":{"M":{}},"_tag":{"S":"Fail"},"error":{"S":"e"}}}]}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  "Cause, dying of an Error": {
+    loose: "refused: ValidationError EDD-9161",
+    packed: "refused: ValidationError",
+  },
+  Duration: {
+    loose:
+      '{"M":{"value":{"M":{"_tag":{"S":"Millis"},"millis":{"N":"1500"}}},"~effect/Duration":{"S":"~effect/Duration"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"~effect/Duration\\":\\"~effect/Duration\\",\\"value\\":{\\"millis\\":1500,\\"_tag\\":\\"Millis\\"}}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  BigDecimal: {
+    loose:
+      '{"M":{"value":{"N":"15"},"scale":{"N":"1"},"~effect/BigDecimal":{"S":"~effect/BigDecimal"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"value\\":15,\\"scale\\":1,\\"~effect/BigDecimal\\":\\"~effect/BigDecimal\\"}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  DateTimeUtc: {
+    loose:
+      '{"M":{"epochMilliseconds":{"N":"0"},"~effect/DateTime":{"S":"~effect/DateTime"},"_tag":{"S":"Utc"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"epochMilliseconds\\":0,\\"~effect/DateTime\\":\\"~effect/DateTime\\",\\"_tag\\":\\"Utc\\"}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  "DateTimeZoned named": {
+    loose:
+      '{"M":{"epochMilliseconds":{"N":"0"},"zone":{"M":{"id":{"S":"Europe/London"},"format":{"M":{}},"~effect/DateTime/TimeZone":{"S":"~effect/DateTime/TimeZone"},"_tag":{"S":"Named"}}},"~effect/DateTime":{"S":"~effect/DateTime"},"_tag":{"S":"Zoned"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed:
+      '{"S":"{\\"~effect/DateTime\\":\\"~effect/DateTime\\",\\"epochMilliseconds\\":0,\\"zone\\":{\\"format\\":{},\\"id\\":\\"Europe/London\\",\\"~effect/DateTime/TimeZone\\":\\"~effect/DateTime/TimeZone\\",\\"_tag\\":\\"Named\\"},\\"_tag\\":\\"Zoned\\"}"}',
+    packedRead: "the map stored, writing the same bytes",
+  },
+  Redacted: {
+    loose: "refused: ValidationError EDD-9161",
+    packed: "refused: ValidationError EDD-9161",
+  },
+  "Data class": {
+    loose: '{"M":{"x":{"N":"1"},"y":{"N":"2"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  "Data tagged class": {
+    loose: '{"M":{"by":{"N":"1"},"_tag":{"S":"Moved"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  "Data tagged error": {
+    loose:
+      '{"M":{"code":{"N":"1"},"_tag":{"S":"Failed"},"name":{"S":"Failed"},"~effect/Effect":{"M":{}},"~effect/Effect/identifier":{"S":"YieldableError"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+  "Schema class": {
+    loose: '{"M":{"name":{"S":"a"}}}',
+    looseRead: "the map stored, writing the same bytes",
+    packed: "refused: ValidationError",
+  },
+}
+
+describe("each Effect type in an untyped field, natively and packed, on every Effect version", () => {
+  it("covers every type", () => {
+    expect(Object.keys(UNTYPED_TABLE)).toEqual(Object.keys(UNTYPED))
+  })
+  for (const name of Object.keys(UNTYPED)) {
+    it.effect(name, () =>
+      Effect.gen(function* () {
+        expect(yield* untypedCellsOf(name)).toEqual(UNTYPED_TABLE[name])
       }),
     )
   }

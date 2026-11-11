@@ -11,11 +11,11 @@ import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
 import { holdsUntyped } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
-import { Cause, Effect, Exit, Layer, Redacted, Schema } from "effect"
+import { Cause, Chunk, Effect, Exit, Layer, Redacted, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import { readBackOf } from "../src/internal/RoundTrip.js"
-import { toAttributeMap } from "../src/Marshaller.js"
+import { isUnstorableValue, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { clientOf, membersOf, PATHS } from "./helpers/CustomDeclarationPaths.js"
 import { mockDynamoClientLayer } from "./helpers/MockDynamoClient.js"
@@ -89,6 +89,41 @@ describe("[EDD-9161] every write path refuses a Date in an untyped field", () =>
       }
     }),
   )
+})
+
+describe("[EDD-9124] a Chunk, which holds itself, on every write path", () => {
+  for (const path of PATHS) {
+    it.effect(`${path.operation}: ${path.name}`, () =>
+      Effect.gen(function* () {
+        const { writes, layer } = recording()
+        const members = membersOf(Schema.Unknown)
+        const provided = Layer.merge(layer, members.Base.layer({ name: "untyped-table" }))
+        const exit = yield* Effect.gen(function* () {
+          const db = yield* clientOf(members)
+          return yield* path.run(db, members, Chunk.make(1, 2))
+        }).pipe(Effect.provide(provided as never), Effect.exit)
+        expect(Exit.isFailure(exit) && Cause.hasDies(exit.cause)).toBe(false)
+        const error = failureOf(exit)
+        expect(error).toBeInstanceOf(ValidationError)
+        expect(String(error.cause?.message ?? error.cause)).toContain("EDD-9124")
+        expect(writes).toEqual([])
+      }),
+    )
+  }
+
+  it("names where it holds itself, and marshals nothing", () => {
+    const error = (() => {
+      try {
+        toAttributeMap({ f: { c: Chunk.make(1) } })
+      } catch (thrown) {
+        return thrown
+      }
+    })()
+    expect(isUnstorableValue(error) && error.describe()).toBe(
+      '"f.c.left.left": it holds a value it\'s inside, so it has no end to store (an Effect Chunk ' +
+        "is one: store Chunk.toReadonlyArray of it). [EDD-9124]",
+    )
+  })
 })
 
 const Json = DynamoModel.Packed({ format: "json" })

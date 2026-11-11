@@ -199,6 +199,56 @@ const withoutCachedNormals = (value: unknown, open = new Set<object>()): unknown
   }
 }
 
+/** {@link dataValuesOf}, with each value's name. */
+const dataEntriesOf = (value: object): ReadonlyArray<readonly [string, unknown]> => {
+  const entries: Array<readonly [string, unknown]> = []
+  const named = new Set<string>()
+  for (let at: object | null = value; at !== null; at = Object.getPrototypeOf(at)) {
+    const descriptors = Object.getOwnPropertyDescriptors(at)
+    for (const key of Object.keys(descriptors)) {
+      if (named.has(key)) continue
+      named.add(key)
+      const descriptor = descriptors[key]!
+      if (descriptor.enumerable && "value" in descriptor) entries.push([key, descriptor.value])
+    }
+  }
+  return entries
+}
+
+/**
+ * The path to the first part of a value that holds a value it's inside, depth first as marshalling
+ * walks it, or `undefined`. Marshalling follows such a part until the stack runs out, as it does an
+ * Effect `Chunk`, whose empty end holds itself. Only looked for once marshalling has refused the
+ * value, and read from data descriptors, so no getter is called.
+ */
+const cycleIn = (
+  value: unknown,
+  path: ReadonlyArray<string | number> = [],
+  open = new Set<object>(),
+): ReadonlyArray<string | number> | undefined => {
+  if (typeof value !== "object" || value === null || isOpaque(value)) return undefined
+  if (open.has(value)) return path
+  open.add(value)
+  try {
+    const parts: ReadonlyArray<readonly [string | number, unknown]> = Array.isArray(value)
+      ? value.map((element, index) => [index, element] as const)
+      : value instanceof Map
+        ? [...value].map(([key, entry]) => [String(key), entry] as const)
+        : dataEntriesOf(value)
+    for (const [key, part] of parts) {
+      const found = cycleIn(part, [...path, key], open)
+      if (found !== undefined) return found
+    }
+    return undefined
+  } finally {
+    open.delete(value)
+  }
+}
+
+const HOLDS_ITSELF =
+  "it holds a value it's inside, so it has no end to store (an Effect Chunk is one: store " +
+  "Chunk.toReadonlyArray of it)."
+
 /** A part marshalling reached that this can't reach without running a getter, or at all. */
 const UNREACHED = Symbol("unreached")
 
@@ -374,7 +424,8 @@ const NO_EMPTY_SET =
  * ({@link withoutCachedNormals}). An item holding no such decimal
  * ({@link holdsCachedCycle}, which calls no getter) goes on exactly as before.
  * Whatever is still refused has no attribute to leave out, and throws
- * {@link UnstorableValue}. What marshalling makes of a cookie is then given the
+ * {@link UnstorableValue}, as does a value holding one it's inside ({@link cycleIn}), which
+ * marshalling follows until the stack runs out. What marshalling makes of a cookie is then given the
  * cookie's expiry, and what it makes of a named zone the zone's name ({@link finishingInstances}).
  */
 const marshallStorable = (item: Record<string, unknown>): Record<string, AttributeValue> => {
@@ -383,9 +434,11 @@ const marshallStorable = (item: Record<string, unknown>): Record<string, Attribu
   try {
     marshalled = marshall(item, MARSHALL_OPTIONS)
   } catch {
-    written = withoutEmptySets(
-      holdsCachedCycle(item) ? withoutCachedNormals(item) : item,
-    ) as Record<string, unknown>
+    const fresh = holdsCachedCycle(item) ? withoutCachedNormals(item) : item
+    // Followed further, a value holding itself would run the stack out here too.
+    const cycle = cycleIn(fresh)
+    if (cycle !== undefined) throw new UnstorableValue({ path: cycle, reason: HOLDS_ITSELF })
+    written = withoutEmptySets(fresh) as Record<string, unknown>
     try {
       marshalled = marshall(written, MARSHALL_OPTIONS)
     } catch (cause) {

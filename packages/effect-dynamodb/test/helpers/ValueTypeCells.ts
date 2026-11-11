@@ -15,11 +15,18 @@ import {
   Duration,
   Effect,
   Exit,
+  Graph,
   HashMap,
   HashSet,
+  MutableHashMap,
+  MutableHashSet,
+  MutableList,
+  MutableRef,
   Option,
   Redacted,
+  Result,
   Schema,
+  Trie,
 } from "effect"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
@@ -41,6 +48,8 @@ export const madeAs413 = (given: string, resolving: string): DateTime.TimeZone =
 
 class Point extends Data.Class<{ readonly x: number; readonly y: number }> {}
 class Moved extends Data.TaggedClass("Moved")<{ readonly by: number }> {}
+class Failed extends Data.TaggedError("Failed")<{ readonly code: number }> {}
+class Person extends Schema.Class<Person>("Person")({ name: Schema.String }) {}
 
 /** A value type: its schema, and a value of it made afresh on each call. */
 interface Kind {
@@ -285,5 +294,83 @@ export const codecCellsOf = (name: string): Effect.Effect<Record<string, Cell>> 
       event: event.sk.S,
       historyEq: `${bounded.length} event`,
     }
+  }).pipe(Effect.provide(Main.layer({ name: "vt" })), Effect.provide(table.layer)) as never
+}
+
+/**
+ * Every Effect collection and data type that can be handed to a field no schema types, made afresh
+ * on each call. Effect 4.1 has no `List`, `SortedSet`, `SortedMap` or `Either` (`Result` is its
+ * either), so they aren't here.
+ */
+export const UNTYPED: Readonly<Record<string, () => unknown>> = {
+  Chunk: () => Chunk.make(1, 2),
+  "Chunk, empty": () => Chunk.empty(),
+  HashSet: () => HashSet.make(1, 2),
+  HashMap: () => HashMap.make(["a", 1]),
+  "MutableHashMap, string keys": () => MutableHashMap.make(["a", 1] as const),
+  "MutableHashMap, an object key": () => MutableHashMap.make([{ k: 1 }, 1] as const),
+  "MutableHashSet, numbers": () => MutableHashSet.make(1, 2),
+  "MutableHashSet, strings": () => MutableHashSet.make("a"),
+  MutableList: () => {
+    const list = MutableList.make<number>()
+    MutableList.append(list, 1)
+    return list
+  },
+  MutableRef: () => MutableRef.make(1),
+  Trie: () => Trie.make(["a", 1] as const),
+  Graph: () =>
+    Graph.directed<string, string>((graph) => {
+      Graph.addNode(graph, "a")
+    }),
+  "Option some": () => Option.some(1),
+  "Option none": () => Option.none(),
+  "Result success": () => Result.succeed(1),
+  "Result failure": () => Result.fail("e"),
+  "Exit success": () => Exit.succeed(1),
+  "Exit failure": () => Exit.fail("e"),
+  "Exit, dying of an Error": () => Exit.die(new Error("boom")),
+  "Cause, a failure": () => Cause.fail("e"),
+  "Cause, dying of an Error": () => Cause.die(new Error("boom")),
+  Duration: () => Duration.millis(1500),
+  BigDecimal: () => BigDecimal.fromStringUnsafe("1.5"),
+  DateTimeUtc: () => DateTime.makeUnsafe(0),
+  "DateTimeZoned named": () => DateTime.makeZonedUnsafe(0, { timeZone: "Europe/London" }),
+  Redacted: () => Redacted.make("s"),
+  "Data class": () => new Point({ x: 1, y: 2 }),
+  "Data tagged class": () => new Moved({ by: 1 }),
+  "Data tagged error": () => new Failed({ code: 1 }),
+  "Schema class": () => new Person({ name: "a" }),
+}
+
+/**
+ * For one of {@link UNTYPED}, in a `Schema.Unknown` field stored natively (`loose`) and packed: the
+ * attribute stored, or the refusal; and what a read hands back (`looseRead`, `packedRead`): the map
+ * stored, which written again stores the same bytes, or what came back instead.
+ */
+export const untypedCellsOf = (name: string): Effect.Effect<Record<string, Cell>> => {
+  const make = UNTYPED[name]!
+  const Values = valuesOf({ schema: Schema.Unknown, make }, false)
+  const Main = Table.make({ schema, entities: { Values } } as never) as any
+  const table = makeRecordingTable()
+  const row = (id: string): any => table.items.get(`$vt#v1#v#id_${id}|$vt#v1#v`)
+  return Effect.gen(function* () {
+    const db: any = yield* DynamoClient.make({ entities: { Values }, tables: { Main } } as never)
+    const cells: Record<string, Cell> = {}
+    for (const field of ["loose", "packed"]) {
+      const exit = yield* Effect.exit(
+        db.entities.Values.put({ id: field, [field]: make() }).asEffect(),
+      )
+      const refused = said(exit)
+      cells[field] = refused ?? JSON.stringify(row(field)?.[field])
+      if (refused !== undefined) continue
+      const read = (yield* db.entities.Values.get({ id: field }))[field]
+      const again = `${field}-again`
+      yield* db.entities.Values.put({ id: again, [field]: read }).asEffect()
+      cells[`${field}Read`] =
+        JSON.stringify(row(again)?.[field]) === cells[field]
+          ? "the map stored, writing the same bytes"
+          : JSON.stringify(read)
+    }
+    return cells
   }).pipe(Effect.provide(Main.layer({ name: "vt" })), Effect.provide(table.layer)) as never
 }
