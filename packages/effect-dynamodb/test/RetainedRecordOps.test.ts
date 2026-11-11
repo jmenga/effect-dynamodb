@@ -4,8 +4,9 @@
  * `.deleteFromSet()` to the row they read, where any other update sends them as an expression for
  * DynamoDB to apply (#236). Where DynamoDB refuses the expression (an attribute the row doesn't
  * hold for `#f - :v` and `list_append`, a value of another kind for any of them) the update that
- * reads first is refused the same way, with DynamoDB's words, after its read and with nothing
- * written. It used to store `-v` or the operand alone, append a string's characters, add a number
+ * reads first is refused the same way, after its read and with nothing written. Its message is the
+ * library's, in DynamoDB Local's wording (`ABSENT`, `KIND`): what this test checks is the library's
+ * text, never that the service words it so. It used to store `-v` or the operand alone, append a string's characters, add a number
  * to a string, and die on the `NaN` a string less a number is.
  * `connected.retained-record-ops.test.ts` holds the two paths side by side on DynamoDB Local.
  */

@@ -3477,7 +3477,8 @@ first (one changing a unique field, one computing an index composite), as
 DynamoDB applies their expressions: where it refuses one (`#f - :v` or
 `list_append` on an attribute the row lacks, or any of them on a value of
 another kind: a string, a set of the other kind, `NULL`), the update fails with
-`DynamoValidationError` (DynamoDB's own words, `operation` `TransactWriteItems`)
+`DynamoValidationError` (`operation` `TransactWriteItems`, its message the
+library's in DynamoDB Local's wording, which the service's may not match)
 and writes nothing (`expressionRefusal`, #236), as the same update of an entity
 without the configuration fails. It used to
 store `-v` or the operand alone, append a string's characters (a row that no
@@ -3493,6 +3494,26 @@ mixing a bigint with a number read back, store a JavaScript float
 (`0.30000000000000004`), and compare a bigint or binary set's members by
 identity, so a union held a member twice (refused by DynamoDB) and a difference
 removed nothing.
+A set operand of `.add()`, `.deleteFromSet()`, `pathAdd` and `pathDelete` is
+sent, on every path, and applied to a row read, as the set at its position stores
+its members (`setOperand`): a `Schema.ReadonlySet(Schema.NumberFromString)`
+operand is sent as strings, where the position is read exactly and exactly one
+form of the set reads back there; anything else is sent as given. It is never
+refused, since a set operand is not the value stored. A `NumberValue`
+(`@aws-sdk/util-dynamodb`) operand is the number its text holds. Through 1.40.0
+the first was sent as numbers, which DynamoDB refuses as a set of the other kind
+(on a row without the attribute it stored a number set, and the row no longer
+read), and a retained update applied it as given (a difference removed
+nothing); a retained `.add()` of a `NumberValue` died, and a set of them was a
+union holding a member twice (refused) or a difference removing nothing.
+An update that sets an attribute and also changes it by `.subtract()`, `.add()`
+or `.append()` (`.set({ m: 9 }).subtract({ m: 1 })`) is sent with two
+overlapping paths wherever its record operations go into the expression (a plain
+entity's, a unique one's, setting the unique field or not), and DynamoDB refuses
+it (`DynamoValidationError`, nothing written); where the update applies them to
+the row it read and writes the result (a retained entity's, one computing an
+index composite), they apply in order, the set and then the change (`8`).
+Unchanged from 1.40.0, and pinned by `connected.overlapping-record-ops.test.ts`.
 Path operations combined with a unique-constraint change, or with a computed
 change to an index composite, are rejected with a `ValidationError`: both are
 read-then-write updates that cannot carry path expressions. Record retain

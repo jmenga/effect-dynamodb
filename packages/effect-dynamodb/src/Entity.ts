@@ -2478,8 +2478,9 @@ const makeImpl = <
    * `list_append(#f, :v)`, `ADD`, `DELETE`) on a row without it, or holding a value of a kind the
    * expression doesn't take (`fits`): what an update that applies the record operation to the row
    * it read (a retained entity's, one changing a unique field, one computing an index composite)
-   * answers where the same operation sent as an expression would be refused. In DynamoDB's own
-   * words, named `TransactWriteItems`, the request a retained update sends. `undefined` when the
+   * answers where the same operation sent as an expression would be refused. Its message is the
+   * library's, in DynamoDB Local's wording (the service's may differ, and nothing depends on it),
+   * named `TransactWriteItems`, the request a retained update sends. `undefined` when the
    * expression applies.
    */
   const expressionRefusal = (before: unknown, fits: boolean): DynamoValidationError | undefined =>
