@@ -471,6 +471,21 @@ type AppendCas = {
 }
 
 /**
+ * An update's operands in the form they're written (`encodeOperands`): `.append()`'s by field,
+ * each path operation's at its index (a `pathSet` copy's is `undefined`).
+ */
+type EncodedOperands = {
+  readonly append: globalThis.Record<string, unknown>
+  readonly pathSets: ReadonlyArray<unknown>
+  readonly pathAppends: ReadonlyArray<unknown>
+  readonly pathPrepends: ReadonlyArray<unknown>
+  readonly pathIfNotExists: ReadonlyArray<unknown>
+}
+
+/** An update's operand its write schema refuses at its path: the operation, and the schema's issue. */
+type RefusedOperand = { readonly operation: string; readonly issue: unknown }
+
+/**
  * How many attempts an `append` on a string-encoded numeric `orderBy` makes in
  * all, reading and writing again after a concurrent write moved the item under
  * it (#171 E9) — and how many times any `append` sends its transaction while
@@ -2393,6 +2408,15 @@ const makeImpl = <
     const encoded = pathValues.elements(segments, value)
     return { encoded, issue: pathValues.validateElements(segments, encoded) }
   }
+  /**
+   * A `pathSet` or `pathSubtract` that names another attribute in place of a value: it has no
+   * operand of its own. The other path operations always write their `value`, whatever else the
+   * operation object holds.
+   */
+  const isCopy = (op: {
+    readonly isPath?: boolean
+    readonly valueSegments?: ReadonlyArray<string | number> | undefined
+  }): boolean => Boolean(op.isPath && op.valueSegments)
   const hasPathOps = (uState: UpdateState): boolean =>
     [
       uState.pathSets,
@@ -3231,6 +3255,8 @@ const makeImpl = <
     type Operand = {
       readonly segments: ReadonlyArray<string | number>
       readonly value: unknown
+      readonly isPath?: boolean
+      readonly valueSegments?: ReadonlyArray<string | number> | undefined
     }
     const operands: ReadonlyArray<
       readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements"]
@@ -3249,7 +3275,10 @@ const makeImpl = <
       ["pathIfNotExists of", uState.pathIfNotExists, "value"],
     ]
     for (const [op, ops, kind] of operands) {
-      for (const { segments, value } of ops ?? []) {
+      for (const operand of ops ?? []) {
+        // A copy writes another attribute's value: it holds no value of its own to read back.
+        if (op === "pathSet of" && isCopy(operand)) continue
+        const { segments, value } = operand
         if (!readBacks.has(String(segments[0]))) continue
         const { encoded } = encodePathValue(segments, value, kind)
         const read = asRead(encoded)
@@ -3294,6 +3323,8 @@ const makeImpl = <
     type Operand = {
       readonly segments: ReadonlyArray<string | number>
       readonly value: unknown
+      readonly isPath?: boolean
+      readonly valueSegments?: ReadonlyArray<string | number> | undefined
     }
     const pathOps: ReadonlyArray<
       readonly [string, ReadonlyArray<Operand> | undefined, "value" | "elements" | undefined]
@@ -3308,6 +3339,8 @@ const makeImpl = <
     ]
     for (const [op, ops, kind] of pathOps) {
       for (const operand of ops ?? []) {
+        // A copy, or a subtraction of another attribute's value, writes no value of its own.
+        if ((op === "pathSet of" || op === "pathSubtract of") && isCopy(operand)) continue
         const value =
           kind === undefined
             ? operand.value
@@ -3331,6 +3364,59 @@ const makeImpl = <
       if (unstorable !== undefined) return refused(".cascade() filter on", unstorable)
     }
     return undefined
+  }
+
+  /**
+   * An update's operands written as values of its fields — `.append()`'s entries and the values of
+   * `pathSet` (a copy excepted), `pathAppend`, `pathPrepend` and `pathIfNotExists` — in the form
+   * they're written, each checked against the write schema at its path. Decided once, before the
+   * update reads or sends anything: the first one the schema refuses refuses the update, and the
+   * write sends the rest as encoded here. Each path operation's value is at its operation's index.
+   */
+  const encodeOperands = (uState: UpdateState): EncodedOperands | RefusedOperand => {
+    // Keyed by a name the caller supplies: no prototype, so `__proto__` is a key like any other.
+    const append: globalThis.Record<string, unknown> = Object.create(null)
+    for (const [field, value] of Object.entries(uState.append ?? {})) {
+      const { encoded, issue } = encodePathValue([field], value, "elements")
+      if (issue !== undefined) return { operation: "update.append", issue }
+      append[field] = encoded
+    }
+    const each = (
+      operation: string,
+      ops:
+        | ReadonlyArray<{
+            readonly segments: ReadonlyArray<string | number>
+            readonly value: unknown
+            readonly isPath?: boolean
+            readonly valueSegments?: ReadonlyArray<string | number> | undefined
+          }>
+        | undefined,
+      kind: "value" | "elements",
+      /** Whether the operation can copy another attribute's value: only `pathSet`. */
+      copies = false,
+    ): ReadonlyArray<unknown> | RefusedOperand => {
+      const values: Array<unknown> = []
+      for (const op of ops ?? []) {
+        // A copy writes another attribute's value: there's nothing to encode.
+        if (copies && isCopy(op)) {
+          values.push(undefined)
+          continue
+        }
+        const { encoded, issue } = encodePathValue(op.segments, op.value, kind)
+        if (issue !== undefined) return { operation, issue }
+        values.push(encoded)
+      }
+      return values
+    }
+    const pathSets = each("update.pathSet", uState.pathSets, "value", true)
+    if ("issue" in pathSets) return pathSets
+    const pathAppends = each("update.pathAppend", uState.pathAppends, "elements")
+    if ("issue" in pathAppends) return pathAppends
+    const pathPrepends = each("update.pathPrepend", uState.pathPrepends, "elements")
+    if ("issue" in pathPrepends) return pathPrepends
+    const pathIfNotExists = each("update.pathIfNotExists", uState.pathIfNotExists, "value")
+    if ("issue" in pathIfNotExists) return pathIfNotExists
+    return { append, pathSets, pathAppends, pathPrepends, pathIfNotExists }
   }
 
   /**
@@ -7239,8 +7325,19 @@ const makeImpl = <
               encodedUpdates as globalThis.Record<string, unknown>,
             )
           : undefined
+      // The operands written as values of a field, in the form they're written: refused here if
+      // the schema refuses one, before anything is read or sent, and written as encoded here.
+      const operands = encodeOperands(uState)
+      if ("issue" in operands) {
+        return yield* new ValidationError({
+          entityType,
+          operation: operands.operation,
+          cause: operands.issue,
+        })
+      }
       return {
         uState,
+        operands,
         removedToDefault,
         immutables,
         upsertable,
@@ -7469,6 +7566,7 @@ const makeImpl = <
         encodedKey,
         missingItem,
         encodedUpdates,
+        operands,
       } = prepared
       const client = yield* Capacity.client
       const tableName = tc.name
@@ -7652,18 +7750,10 @@ const makeImpl = <
           }
         }
         if (uState.append) {
-          for (const [attr, val] of Object.entries(uState.append)) {
+          for (const attr of Object.keys(uState.append)) {
             const [holder, key] = slot(attr)
             const existing = (held(holder, key) as Array<unknown>) ?? []
-            const appended = encodePathValue([attr], val, "elements")
-            if (appended.issue !== undefined) {
-              return yield* new ValidationError({
-                entityType,
-                operation: "update.append",
-                cause: appended.issue,
-              })
-            }
-            hold(holder, key, [...existing, ...(appended.encoded as ReadonlyArray<unknown>)])
+            hold(holder, key, [...existing, ...(operands.append[attr] as ReadonlyArray<unknown>)])
           }
         }
         if (uState.deleteFromSet) {
@@ -8583,19 +8673,11 @@ const makeImpl = <
 
       // APPEND → synthesize SET #field = list_append(#field, :val)
       if (uState.append) {
-        for (const [attr, val] of Object.entries(uState.append)) {
+        for (const attr of Object.keys(uState.append)) {
           const nameKey = `#u${counter}`
           const valKey = `:u${counter}`
           names[nameKey] = resolveDbName(attr)
-          const appended = encodePathValue([attr], val, "elements")
-          if (appended.issue !== undefined) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.append",
-              cause: appended.issue,
-            })
-          }
-          values[valKey] = toAttributeValue(appended.encoded)
+          values[valKey] = toAttributeValue(operands.append[attr])
           setClauses.push(`${nameKey} = list_append(${nameKey}, ${valKey})`)
           counter++
         }
@@ -8735,22 +8817,14 @@ const makeImpl = <
 
       // Path SET operations
       if (uState.pathSets) {
-        for (const op of uState.pathSets) {
+        for (const [i, op] of uState.pathSets.entries()) {
           const pathExpr = compilePath(op.segments, names, "ps", pathCounter, resolveDbName)
           if (op.isPath && op.valueSegments) {
             const srcExpr = compilePath(op.valueSegments, names, "ps", pathCounter, resolveDbName)
             setClauses.push(`${pathExpr} = ${srcExpr}`)
           } else {
             const valKey = `:ps${pathCounter.value++}`
-            const set = encodePathValue(op.segments, op.value, "value")
-            if (set.issue !== undefined) {
-              return yield* new ValidationError({
-                entityType,
-                operation: "update.pathSet",
-                cause: set.issue,
-              })
-            }
-            values[valKey] = toAttributeValue(set.encoded)
+            values[valKey] = toAttributeValue(operands.pathSets[i])
             setClauses.push(`${pathExpr} = ${valKey}`)
           }
         }
@@ -8773,54 +8847,30 @@ const makeImpl = <
 
       // Path APPEND operations
       if (uState.pathAppends) {
-        for (const op of uState.pathAppends) {
+        for (const [i, op] of uState.pathAppends.entries()) {
           const pathExpr = compilePath(op.segments, names, "pa", pathCounter, resolveDbName)
           const valKey = `:pa${pathCounter.value++}`
-          const appended = encodePathValue(op.segments, op.value, "elements")
-          if (appended.issue !== undefined) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.pathAppend",
-              cause: appended.issue,
-            })
-          }
-          values[valKey] = toAttributeValue(appended.encoded)
+          values[valKey] = toAttributeValue(operands.pathAppends[i])
           setClauses.push(`${pathExpr} = list_append(${pathExpr}, ${valKey})`)
         }
       }
 
       // Path PREPEND operations
       if (uState.pathPrepends) {
-        for (const op of uState.pathPrepends) {
+        for (const [i, op] of uState.pathPrepends.entries()) {
           const pathExpr = compilePath(op.segments, names, "pp", pathCounter, resolveDbName)
           const valKey = `:pp${pathCounter.value++}`
-          const prepended = encodePathValue(op.segments, op.value, "elements")
-          if (prepended.issue !== undefined) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.pathPrepend",
-              cause: prepended.issue,
-            })
-          }
-          values[valKey] = toAttributeValue(prepended.encoded)
+          values[valKey] = toAttributeValue(operands.pathPrepends[i])
           setClauses.push(`${pathExpr} = list_append(${valKey}, ${pathExpr})`)
         }
       }
 
       // Path if_not_exists operations
       if (uState.pathIfNotExists) {
-        for (const op of uState.pathIfNotExists) {
+        for (const [i, op] of uState.pathIfNotExists.entries()) {
           const pathExpr = compilePath(op.segments, names, "pi", pathCounter, resolveDbName)
           const valKey = `:pi${pathCounter.value++}`
-          const ifAbsent = encodePathValue(op.segments, op.value, "value")
-          if (ifAbsent.issue !== undefined) {
-            return yield* new ValidationError({
-              entityType,
-              operation: "update.pathIfNotExists",
-              cause: ifAbsent.issue,
-            })
-          }
-          values[valKey] = toAttributeValue(ifAbsent.encoded)
+          values[valKey] = toAttributeValue(operands.pathIfNotExists[i])
           setClauses.push(`${pathExpr} = if_not_exists(${pathExpr}, ${valKey})`)
         }
       }
