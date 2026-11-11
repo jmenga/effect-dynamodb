@@ -3931,8 +3931,12 @@ a bare segment naming a field spelled like an entry removes the field where
 it's stored, and one `.entry()` built is refused as an entry's, naming
 `.removeEntries`. An entry whose key holds `#` (`x#y`) can't be named by
 `.entry()`, which refuses such a key, as before; `.removeEntries("g", ["x#y"])`
-removes it. A query's, a scan's and a collection's `filter` and `select` take
-`.entry()` too, since #238: every query path builder knows its entity's sparse
+removes it. So a field spelled like an entry wins for a bare segment, and the
+entry stays reachable through `.entry()` (a key without `#`) and
+`removeEntries` (any key): `test/SparseEntries.test.ts` pins both with a field
+`data#x` stored as `counter` beside the entry `x`, and a field `data#x#y`
+beside the entry `x#y`. A query's, a scan's and a collection's `filter` and
+`select` take `.entry()` too, since #238: every query path builder knows its entity's sparse
 maps (through 1.40.0 none did, so `.entry()` threw in every query callback). A
 filter on `t.g.entry("b")` names the attribute a condition names, and asks the
 row where it holds a map a `field:` rename stores whole (`entryForms`). In a

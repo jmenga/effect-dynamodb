@@ -289,6 +289,58 @@ describe("an operation naming a field is judged by the attribute the field is st
     )
   }
 
+  // The field wins only for a bare `data#x#y` segment: named through the map, `x#y` is the
+  // entry, stored as `data#x#y` beside `counter`. A put refuses a key holding `#`, so the row gets
+  // the entry by hand, as an entry written by its attribute stores it.
+  const withEntry = (table: ReturnType<typeof makeRecordingTable>) => {
+    const [key, row] = [...table.items][0] as [string, Record<string, any>]
+    table.items.set(key, { ...row, "data#x#y": { N: "3" } })
+    return key
+  }
+
+  it.effect("a get reads the field from `counter` and the entry `x#y` from `data#x#y`", () =>
+    onRow((db, table) =>
+      Effect.gen(function* () {
+        withEntry(table)
+        expect(yield* db.entities.Docs.get({ id: "a" })).toEqual({
+          id: "a",
+          data: { ok: 1, "x#y": 3 },
+          "data#x#y": 1,
+        })
+      }),
+    ),
+  )
+
+  it.effect("removeEntries of `x#y` removes the entry and leaves the field", () =>
+    onRow((db, table) =>
+      Effect.gen(function* () {
+        const key = withEntry(table)
+        yield* db.entities.Docs.update({ id: "a" }).removeEntries("data", ["x#y"]).asEffect()
+        const [update] = table.requests
+        expect(update!.input.UpdateExpression).toMatch(/^REMOVE #\w+$/)
+        // Beside the guard's `pk`.
+        expect(Object.values(update!.input.ExpressionAttributeNames)).toEqual(["data#x#y", "pk"])
+        expect(table.items.get(key)!.counter).toEqual({ N: "1" })
+        expect(table.items.get(key)!["data#x#y"]).toBeUndefined()
+        expect(yield* db.entities.Docs.get({ id: "a" })).toEqual({
+          id: "a",
+          data: { ok: 1 },
+          "data#x#y": 1,
+        })
+      }),
+    ),
+  )
+
+  it.effect("`.entry()` refuses the key `x#y`, as it refuses any key holding '#'", () =>
+    onRow((db) =>
+      Effect.gen(function* () {
+        expect(() =>
+          db.entities.Docs.scan().filter((t: any, { eq }: any) => eq(t.data.entry("x#y"), 3)),
+        ).toThrow(/must not contain '#'/)
+      }),
+    ),
+  )
+
   for (const [name, remove] of [
     [".remove() of an entry's attribute", (update: any) => update.remove(["data#ok"])],
     ["pathRemove of an entry's attribute", (update: any) => update.pathRemove(["data#ok"])],
@@ -356,6 +408,76 @@ describe("a stored row is read in one order: its sparse entries, then its names"
     ) as Record<string, any>
   const retained = { versioned: { retain: true } }
   const both = { data: { safe: 1, x: 99 }, "data#x": 7 }
+
+  // A bare `data#x` segment names the field (`counter`); `.entry("x")` and `removeEntries` name the
+  // entry (`data#x`), each on a plain entity.
+  describe("the field wins for a bare segment, the entry through the map", () => {
+    const names = (table: ReturnType<typeof makeRecordingTable>) =>
+      table.requests
+        .filter((request) => request.command === "UpdateItem" || request.command === "Scan")
+        .flatMap((request) => Object.values(request.input.ExpressionAttributeNames ?? {}))
+        // The update's guard names `pk`, the scan's ownership filter `__edd_e__`.
+        .filter((name) => name !== "pk" && name !== "__edd_e__")
+
+    it.effect("pathSet of the bare segment `data#x` sets the field", () =>
+      onRow("data#x", {}, both, (db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Docs.update({ id: "a" })
+            .pathSet({ segments: ["data#x"], value: 8, isPath: false })
+            .asEffect()
+          expect(names(table)).toEqual(["counter"])
+          expect(live(table).counter).toEqual({ N: "8" })
+          expect(live(table)["data#x"]).toEqual({ N: "99" })
+        }),
+      ),
+    )
+
+    it.effect("removeEntries of `x` removes the entry and leaves the field", () =>
+      onRow("data#x", {}, both, (db, table) =>
+        Effect.gen(function* () {
+          yield* db.entities.Docs.update({ id: "a" }).removeEntries("data", ["x"]).asEffect()
+          expect(names(table)).toEqual(["data#x"])
+          expect(live(table).counter).toEqual({ N: "7" })
+          expect(live(table)["data#x"]).toBeUndefined()
+        }),
+      ),
+    )
+
+    it.effect('a condition on `.entry("x")` tests the entry, not the field', () =>
+      onRow("data#x", {}, both, (db, table) =>
+        Effect.gen(function* () {
+          const update = (value: number) =>
+            db.entities.Docs.update({ id: "a" })
+              .set({ note: "new" })
+              .condition((t: any, { eq }: any) => eq(t.data.entry("x"), value))
+              .asEffect()
+          const refused: any = yield* Effect.flip(update(7))
+          expect(refused._tag).toBe("ConditionalCheckFailed")
+          yield* update(99)
+          expect(names(table)).toContain("data#x")
+          expect(names(table)).not.toContain("counter")
+          expect(live(table).note).toEqual({ S: "new" })
+        }),
+      ),
+    )
+
+    it.effect('a scan\'s filter on `.entry("x")` tests the entry, not the field', () =>
+      onRow("data#x", {}, both, (db, table) =>
+        Effect.gen(function* () {
+          const scan = (value: number) =>
+            db.entities.Docs.scan()
+              .filter((t: any, { eq }: any) => eq(t.data.entry("x"), value))
+              .collect()
+          expect(yield* scan(7)).toEqual([])
+          expect(yield* scan(99)).toEqual([
+            { id: "a", note: "ok", data: { safe: 1, x: 99 }, "data#x": 7 },
+          ])
+          expect(names(table)).toContain("data#x")
+          expect(names(table)).not.toContain("counter")
+        }),
+      ),
+    )
+  })
 
   // A retained entity's update reads the row and writes it whole. It mapped the names first, so
   // `counter` became `data#x` and was then taken for the entry: the entry got the field's value
