@@ -1243,8 +1243,9 @@ run counts the result in `report.indexKeys` and per member, for no read: `missin
 conditioned on the row existing and on each key it writes and each composite those keys come from, as read or
 absent (`repairRequest`), so a writer changing any of them wins. On a failed condition it reads once
 consistently, judges again and tries once more, then counts the keys in `skipped`; `repaired` counts the keys
-written. A key DynamoDB refuses is a `failed` conflict. A dry run makes no write and counts `repaired` as what
-it would write, judging what the move would leave for a row that moves.
+written. A key DynamoDB refuses is a `failed` conflict. A dry run makes no write and counts no `repaired`: its
+`missing`, `truncated` and `lagging` are what a run would write, judged on what the move would leave for a row
+that moves.
 
 | Composites on the row | Stored key | `sparse` | `preserve` |
 |---|---|---|---|
@@ -1276,9 +1277,10 @@ compares bytes and never truncates. For the same reason a move keeps a half abse
 Aggregates compose their own rows and never called the gate; sentinels and history rows have no index keys.
 
 **A dry run agrees with the real run.** It judges the row the move would write (`movedRowOf`), and
-follows a chain: what holds a row's current key is judged by its own handler (`Rekey.displace`,
-counting nothing and claiming nothing, since the scan counts it when it reaches it), and what would
-stop it is reported, for it and for the row it holds up. Rootless aggregate rows are
+follows a chain: what holds a row's current key is judged first as its own unit
+(`RekeyRowContext.yieldTo`, through its member's `holder`, or the handler's own unit for it), once per
+run (`RekeyRowContext.judge`) and counted under its member when it settles, so the scan finds it settled
+when it reaches it; and what would stop it is reported, for it and for the row it holds up. Rootless aggregate rows are
 judged after the scan, so a dry run agrees with the real run whichever order the scan met them; a run
 that didn't read the whole table reports them as `rootNotSeen`, since a later page could bring the root in.
 
