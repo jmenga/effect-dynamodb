@@ -777,7 +777,7 @@ describe("GeoSearch", () => {
       }
     })
 
-    it("bound enrich is the same as unbound enrich", () => {
+    it("bound enrich is the same as unbound enrich", async () => {
       // enrich is pure — no need to provide layers
       const input: Entity.Input<typeof Vehicles> = {
         vehicleId: "v-bind-enrich",
@@ -789,7 +789,7 @@ describe("GeoSearch", () => {
       // We need to bind to test, but enrich should produce same result
       const unboundEnriched = VehicleGeo.enrich(input)
 
-      Effect.runPromise(
+      await Effect.runPromise(
         Effect.gen(function* () {
           const bound = yield* GeoIndex.bind(VehicleGeo)
           const boundEnriched = bound.enrich(input)
