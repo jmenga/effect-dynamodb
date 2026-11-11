@@ -15,7 +15,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { Effect, Exit, Layer, Schema } from "effect"
+import { Data, Effect, Exit, Layer, Schema } from "effect"
 import { beforeEach } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
@@ -1296,9 +1296,117 @@ describe("a sparse checkpoint map and events that are all skipped", () => {
 })
 
 /**
+ * The two other folds that add no key to a sparse checkpoint map, beside every event skipped: an
+ * instance whose `evolve` fails, the row's other instances still written; and events `evolve`
+ * rejects (`terminal`), alone, on a row that doesn't exist. Neither is refused, as on 1.39.0 and
+ * 1.40.0, so a check of the key before the row is read would refuse what they complete.
+ */
+describe("a sparse checkpoint map and folds that add no key", () => {
+  const Model = Schema.Struct({
+    id: Schema.String,
+    total: Schema.Number,
+    cp: Schema.optional(Schema.Number),
+    owner: Schema.optional(Schema.String),
+    rev: Schema.optional(Schema.Number),
+    map: Schema.Record(Schema.String, Schema.Number),
+  })
+  type Row = typeof Model.Type
+  class Refused extends Data.TaggedError("Refused")<{ readonly terminal: boolean }> {}
+  const setup = (mapped: boolean) => {
+    const Rows = Entity.make({
+      model: DynamoModel.configure(Model, {
+        map: { storedAs: DynamoModel.SparseMap({ prefix: "sparsecp" }) },
+      }),
+      entityType: "SparseNoKey",
+      primaryKey: {
+        pk: { field: "pk", composite: ["id"] },
+        sk: { field: "sk", composite: [] },
+      },
+    })
+    const RowTable = Table.make({
+      schema: DynamoSchema.make({ name: "nokey", version: 1 }),
+      entities: { Rows },
+    })
+    const projection = EventStore.multiProjection({
+      readModel: Rows,
+      initial: (key): Row => ({ id: key.id, total: 0, map: {} }),
+      sources: (source) => ({
+        order: source(Orders, {
+          key: () => ({ id: "shared" }),
+          // A negative amount fails: a terminal failure for `t*`, any other otherwise.
+          evolve: (state: Row, event: EventStore.StreamEvent<LedgerEvent>) =>
+            event.data._tag === "Placed" && event.data.amount < 0
+              ? Effect.fail(new Refused({ terminal: event.streamId.startsWith("t") }))
+              : Effect.succeed({
+                  ...state,
+                  total: state.total + (event.data._tag === "Placed" ? event.data.amount : 0),
+                }),
+          terminal: (error: Refused) => error.terminal,
+        }),
+      }),
+      checkpoints: mapped
+        ? { field: "map", sources: { order: { field: "cp", instanceField: "owner" } } }
+        : { field: "map" },
+      revision: "rev",
+    })
+    return { RowTable, projection }
+  }
+  const layer = (RowTable: ReturnType<typeof setup>["RowTable"]) =>
+    Layer.mergeAll(
+      InMemoryClient,
+      EventsTable.layer({ name: "events" }),
+      RowTable.layer({ name: "nokey" }),
+    )
+  const rows = () =>
+    [...store.entries()]
+      .filter(([key]) => key.startsWith("nokey|"))
+      .map(([, item]) => fromAttributeMap(item) as Record<string, unknown>)
+
+  it.effect("an instance whose evolve fails: the row's other instance is written", () => {
+    const { RowTable, projection } = setup(true)
+    return Effect.gen(function* () {
+      yield* Orders.append({ orderId: "e1" }, [new Placed({ amount: 1 })], 0)
+      yield* Orders.append({ orderId: "e2" }, [new Placed({ amount: -1 })], 0)
+      const events = [
+        ...(yield* Orders.read({ orderId: "e1" })),
+        ...(yield* Orders.read({ orderId: "e2" })),
+      ]
+      const result = yield* projection.applyBatch(
+        events.map((event) => ({ stream: "order" as const, event })),
+      )
+      // The second instance would take the map (the first holds the field), but fails first.
+      expect(result.outcomes.map((o) => o._tag)).toEqual(["Applied", "Failed"])
+      expect(JSON.stringify(result.outcomes[1])).toContain("Refused")
+      expect(rows()).toEqual([
+        expect.objectContaining({ id: "shared", total: 1, cp: 1, owner: "e1", rev: 1 }),
+      ])
+    }).pipe(Effect.provide(layer(RowTable)))
+  })
+
+  it.effect("rejections alone, on a row that doesn't exist: applied, nothing written", () => {
+    const { RowTable, projection } = setup(false)
+    return Effect.gen(function* () {
+      yield* Orders.append({ orderId: "t1" }, [new Placed({ amount: -1 })], 0)
+      const events = yield* Orders.read({ orderId: "t1" })
+      resetCalls()
+      const result = yield* projection.applyBatch(
+        events.map((event) => ({ stream: "order" as const, event })),
+      )
+      expect(result.outcomes.map((o) => o._tag)).toEqual(["Applied"])
+      expect(JSON.stringify(result.outcomes)).toContain("Refused")
+      expect(calls.putItem + calls.transactWriteItems + calls.updateItem + calls.deleteItem).toBe(0)
+      expect(rows()).toEqual([])
+    }).pipe(Effect.provide(layer(RowTable)))
+  })
+})
+
+/**
  * A source with a checkpoint field of its own takes the map only when another instance owns the
  * field, which the row decides. A sparse map can't hold that key either: the write is refused,
- * after the reads, with nothing written.
+ * after the reads, with nothing written — for a live event, a removal and `rebuild` alike. The key
+ * can't be judged before the read (DESIGN.md, "A sparse-map checkpoint field"): the row names the
+ * field's owner, and a fold that writes no key (every event skipped, `evolve` failing, rejections
+ * alone on a row that doesn't exist) is applied, as on 1.39.0 and 1.40.0.
  */
 describe("a source's second instance falling back to a sparse checkpoint map", () => {
   const Model = Schema.Struct({
@@ -1310,7 +1418,7 @@ describe("a source's second instance falling back to a sparse checkpoint map", (
     map: Schema.Record(Schema.String, Schema.Number),
   })
   type Row = typeof Model.Type
-  const setup = () => {
+  const setup = (removal: boolean) => {
     const Rows = Entity.make({
       model: DynamoModel.configure(Model, {
         map: { storedAs: DynamoModel.SparseMap({ prefix: "sparsecp" }) },
@@ -1335,60 +1443,129 @@ describe("a source's second instance falling back to a sparse checkpoint map", (
           evolve: (state: Row, event: EventStore.StreamEvent<LedgerEvent>) =>
             Effect.succeed(
               event.data._tag === "Cancelled"
-                ? state
+                ? removal
+                  ? EventStore.removeRow
+                  : state
                 : { ...state, total: state.total + event.data.amount },
             ),
         }),
       }),
       checkpoints: { field: "map", sources: { order: { field: "cp", instanceField: "owner" } } },
       revision: "rev",
+      ...(removal && { removal: {} }),
     })
     return { RowTable, projection }
   }
   const written = () =>
     calls.putItem + calls.transactWriteItems + calls.updateItem + calls.deleteItem
 
-  it.effect("applyBatch and rebuild are refused by the write, and nothing is written", () => {
-    const { RowTable, projection } = setup()
-    return Effect.gen(function* () {
-      yield* Orders.append({ orderId: "f1" }, [new Placed({ amount: 1 })], 0)
-      yield* Orders.append({ orderId: "f2" }, [new Placed({ amount: 2 })], 0)
-      const first = yield* Orders.read({ orderId: "f1" })
-      const second = yield* Orders.read({ orderId: "f2" })
-      // The first instance takes the source's field: no map entry, so the row is written.
-      const applied = yield* projection.applyBatch(
-        first.map((event) => ({ stream: "order" as const, event })),
-      )
-      expect(applied.outcomes[0]?._tag).toBe("Applied")
-      const before = new Map(store)
-      resetCalls()
-      const live = yield* projection.applyBatch(
-        second.map((event) => ({ stream: "order" as const, event })),
-      )
-      expect(JSON.stringify(live.outcomes)).toContain("ValidationError")
-      expect(JSON.stringify(live.outcomes)).toContain("order#f2")
-      expect(written()).toBe(0)
-      resetCalls()
-      const rebuilt = yield* Effect.exit(
-        projection.rebuild(
-          { id: "shared" },
-          { instances: { order: [{ orderId: "f1" }, { orderId: "f2" }] } },
-        ),
-      )
-      expect(JSON.stringify(rebuilt)).toContain("ValidationError")
-      expect(JSON.stringify(rebuilt)).toContain("order#f2")
-      expect(written()).toBe(0)
-      expect(new Map(store)).toEqual(before)
-    }).pipe(
-      Effect.provide(
-        Layer.mergeAll(
-          InMemoryClient,
-          EventsTable.layer({ name: "events" }),
-          RowTable.layer({ name: "fallback" }),
-        ),
-      ),
-    )
+  /** Every request, as the projection handed it to the client, in order. */
+  const requests: Array<{ readonly operation: string; readonly input: unknown }> = []
+  const Recording = Layer.effect(
+    DynamoClient,
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      return new Proxy(client, {
+        get: (target, operation) => {
+          const value = Reflect.get(target, operation)
+          if (typeof value !== "function") return value
+          return (input: unknown) => {
+            requests.push({ operation: String(operation), input })
+            return value.call(target, input)
+          }
+        },
+      })
+    }),
+  ).pipe(Layer.provide(InMemoryClient))
+
+  /** The row's read, as every attempt sends it. */
+  const rowRead = {
+    operation: "getItem",
+    input: {
+      TableName: "fallback",
+      Key: {
+        pk: { S: "$fallback#v1#sparsefallback#id_shared" },
+        sk: { S: "$fallback#v1#sparsefallback" },
+      },
+      ConsistentRead: true,
+    },
+  }
+  /** An instance's events, as `rebuild` reads them. */
+  const eventsRead = (orderId: string) => ({
+    operation: "query",
+    input: {
+      TableName: "events",
+      KeyConditionExpression: "#pk = :pk AND begins_with(#sk, :sk)",
+      FilterExpression: "#eddE IN (:et0)",
+      ExpressionAttributeNames: { "#eddE": "__edd_e__", "#pk": "pk", "#sk": "sk" },
+      ExpressionAttributeValues: {
+        ":et0": { S: "order.event" },
+        ":pk": { S: `$layouts#v1#order#${orderId}` },
+        ":sk": { S: "$layouts#v1#order.event_1#" },
+      },
+      ConsistentRead: true,
+      ScanIndexForward: true,
+    },
   })
+
+  for (const removal of [false, true]) {
+    it.effect(
+      `applyBatch and rebuild of ${removal ? "a removal" : "a live event"} are refused by the write, after the reads, and nothing is written`,
+      () => {
+        const { RowTable, projection } = setup(removal)
+        return Effect.gen(function* () {
+          yield* Orders.append({ orderId: "f1" }, [new Placed({ amount: 1 })], 0)
+          yield* Orders.append(
+            { orderId: "f2" },
+            [removal ? new Cancelled({}) : new Placed({ amount: 2 })],
+            0,
+          )
+          const first = yield* Orders.read({ orderId: "f1" })
+          const second = yield* Orders.read({ orderId: "f2" })
+          // The first instance takes the source's field: no map entry, so the row is written.
+          const applied = yield* projection.applyBatch(
+            first.map((event) => ({ stream: "order" as const, event })),
+          )
+          expect(applied.outcomes[0]?._tag).toBe("Applied")
+          const before = new Map(store)
+          resetCalls()
+          requests.length = 0
+          const live = yield* projection.applyBatch(
+            second.map((event) => ({ stream: "order" as const, event })),
+          )
+          expect(live.outcomes.map((o) => o._tag)).toEqual(["Failed"])
+          expect(JSON.stringify(live.outcomes)).toContain("ValidationError")
+          expect(JSON.stringify(live.outcomes)).toContain("order#f2")
+          // One read of the row, then the refusal.
+          expect(requests).toEqual([rowRead])
+          expect(written()).toBe(0)
+          resetCalls()
+          requests.length = 0
+          const rebuilt = yield* Effect.exit(
+            projection.rebuild(
+              { id: "shared" },
+              { instances: { order: [{ orderId: "f1" }, { orderId: "f2" }] } },
+            ),
+          )
+          expect(Exit.isFailure(rebuilt)).toBe(true)
+          expect(JSON.stringify(rebuilt)).toContain("ValidationError")
+          expect(JSON.stringify(rebuilt)).toContain("order#f2")
+          // Each instance's events, then the row, then the refusal.
+          expect(requests).toEqual([eventsRead("f1"), eventsRead("f2"), rowRead])
+          expect(written()).toBe(0)
+          expect(new Map(store)).toEqual(before)
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              Recording,
+              EventsTable.layer({ name: "events" }),
+              RowTable.layer({ name: "fallback" }),
+            ),
+          ),
+        )
+      },
+    )
+  }
 })
 
 describe("a read model with one projection", () => {

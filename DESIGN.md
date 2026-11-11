@@ -7421,6 +7421,21 @@ instance).
     written. What's stored is the tombstone as 1.39.0 stored it: a map left
     empty is kept whole, `{"M":{}}`. A write that adds no key (every event
     skipped, or an instance holding its source's own field) isn't refused.
+    The key can't be judged before the row is read, so the refusal comes
+    after the reads, for a live event, a removal and `rebuild` alike (one
+    `GetItem`; `rebuild`, each instance's `Query`, then the `GetItem`), as on
+    1.40.0 and, for live events, 1.39.0. Whether an instance's checkpoint goes
+    in the map at all is the row's to say when its source has a field of its
+    own (the map takes it only while another instance owns the field), and
+    whether the write adds the key is the fold's. A check before the read
+    would have to refuse every instance that might add one, and so would
+    refuse three folds that add none and complete: an instance whose events
+    are all skipped (applied, nothing written); an instance whose `evolve`
+    fails (reported, and the row's other instances still written); and events
+    `evolve` rejects (`terminal`), alone, on a row that doesn't exist (applied,
+    nothing written). Pinned in
+    `test/EventStore.projection-tombstone-layouts.test.ts`, the requests sent
+    before the refusal included.
 - **The outbox** writes effects as items (`<entityType>#outbox`, sort key
   `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
   in the row's transaction. `drain` claims the head item (a conditional update
