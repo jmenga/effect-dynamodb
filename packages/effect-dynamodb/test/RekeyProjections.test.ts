@@ -1337,6 +1337,44 @@ describe("[EDD-9134] a read model whose outbox is on another table, sharing its 
     )
   })
 
+  it.effect("EventStore.processBatch runs a projection object built by hand, as 1.39.0 did", () => {
+    // Its routes and nothing else: no read model to compare. 1.39.0 ran it; 1.40.0 died with a
+    // `TypeError` reading the read model of `undefined`.
+    const OutboxTable = Table.make({ schema: On.schema, entities: {} })
+    const A = ledger(On.Accounts, "a", true, OutboxTable)
+    const B = ledger(On.Accounts, "a", true, OutboxTable)
+    const routes = Symbol.for("effect-dynamodb/EventProjection/Routes")
+    const byHand = (projection: object) => ({
+      [routes]: (projection as Record<symbol, unknown>)[routes],
+    })
+    const process = (projections: Record<string, unknown>) =>
+      EventStore.processBatch([], { projections: projections as any, source: "lambda" }).pipe(
+        Effect.map((result) => result.response),
+        Effect.catchDefect((defect) => Effect.succeed(String(defect))),
+      )
+    return Effect.gen(function* () {
+      expect(yield* process({ a: byHand(A.Remote) })).toEqual({ batchItemFailures: [] })
+      expect(yield* process({ a: byHand(A.Remote), b: B.Remote })).toEqual({
+        batchItemFailures: [],
+      })
+      // The read models it is handed are still compared.
+      expect(yield* process({ a: A.Remote, b: B.Remote, c: byHand(A.Remote) })).toContain(
+        `[EDD-9134] EventStore.processBatch: the read model of "a" writes its projection's ` +
+          `outbox items into another table ("o"), where the read model of "b" writes its own`,
+      )
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          makeRecordingTable().layer,
+          On.EventsTable.layer({ name: "t" }),
+          A.ReadTable.layer({ name: "ra" }),
+          B.ReadTable.layer({ name: "rb" }),
+          OutboxTable.layer({ name: "o" }),
+        ),
+      ),
+    )
+  })
+
   it.effect("EventStore.processBatch compares tables by the names its context gives them", () => {
     const Outbox1 = Table.make({ schema: On.schema, entities: {} })
     const Outbox2 = Table.make({ schema: On.schema, entities: {} })

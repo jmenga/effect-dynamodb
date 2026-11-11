@@ -561,11 +561,12 @@ const sameKeys = (a: unknown, b: unknown): boolean => {
  *   the read model's (`sameKeys`) moves them where the read model would, and isn't refused.
  *
  * Read models that never meet at a site that sees several at once can't be checked: their key
- * spaces must be kept apart by whoever defines them.
+ * spaces must be kept apart by whoever defines them. Neither can a member that is no read model (a
+ * projection object built by hand, carrying its routes but no read model): it runs as on 1.39.0.
  */
 export const sharedOutboxKeySpace = (
   site: string,
-  members: ReadonlyArray<readonly [name: string, entity: unknown]>,
+  given: ReadonlyArray<readonly [name: string, entity: unknown]>,
   scope:
     | "plain"
     | {
@@ -577,6 +578,7 @@ export const sharedOutboxKeySpace = (
 ): Effect.Effect<string | undefined> =>
   Effect.gen(function* () {
     const plain = scope === "plain"
+    const members = given.filter(([, entity]) => typeof entity === "object" && entity !== null)
     // Every table a member's outbox is on, by its physical name.
     const names = new Map<string, string | undefined>()
     for (const [, entity] of members) {
