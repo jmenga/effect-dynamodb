@@ -13,15 +13,24 @@
  * conditions its write on a row token the row holds.
  */
 
+import { readFileSync } from "node:fs"
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import { Effect, Exit, Layer, Schema } from "effect"
 import { beforeEach, vi } from "vitest"
+import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
-import { hooks, InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
+import {
+  calls,
+  hooks,
+  InMemoryClient,
+  resetCalls,
+  resetStore,
+  store,
+} from "./helpers/InMemoryTables.js"
 
 class Placed extends Schema.TaggedClass<Placed>()("Placed", { amount: Schema.Number }) {}
 class Cancelled extends Schema.TaggedClass<Cancelled>()("Cancelled", {}) {}
@@ -494,6 +503,177 @@ describe("a program defining one of the read model's projections (#237)", () => 
       expect(store.get("read|$token#v1#row#id_x|$token#v1#row")).not.toHaveProperty("__edd_rt__")
     }).pipe(Effect.provide(alone.layer))
   })
+})
+
+/**
+ * A rolling deployment (#237): processes still on 1.40.0 write the read model beside this release.
+ * Their writes are replayed as published 1.40.0 sent them (`projection-rolling-1.40.0.json`, A and
+ * B as `setup` defines them, each run's steps one `apply` each), so the pins never depend on a
+ * build of 1.40.0.
+ */
+describe("a rolling deployment: a process still on 1.40.0 writes the read model (#237)", () => {
+  interface Step {
+    readonly step: string
+    readonly requests: ReadonlyArray<{ readonly command: string; readonly input: any }>
+    readonly item: Record<string, any>
+  }
+  const fixture = JSON.parse(
+    readFileSync(new URL("./fixtures/projection-rolling-1.40.0.json", import.meta.url), "utf8"),
+  ) as { readonly version: string; readonly runs: Record<string, ReadonlyArray<Step>> }
+  /** The put 1.40.0 sent at `step` of `run`. */
+  const putOf = (run: string, step: number) =>
+    fixture.runs[run]![step]!.requests.find((request) => request.command === "PutItem")!.input
+  /** Send a request 1.40.0 sent, as it sent it. */
+  const send = (input: unknown) =>
+    Effect.gen(function* () {
+      const client = yield* DynamoClient
+      yield* client.putItem(structuredClone(input) as never)
+    })
+  const twoLayouts = () =>
+    setup({ checkpoint: "a", revision: "ra" }, { checkpoint: "b", revision: "rb" })
+  const history = Effect.gen(function* () {
+    yield* Orders.append({ id: "x" }, [new Placed({ amount: 1 }), new Placed({ amount: 2 })], 0)
+    yield* Invoices.append({ id: "x" }, [new Placed({ amount: 5 }), new Placed({ amount: 7 })], 0)
+    return { orders: yield* Orders.read({ id: "x" }), invoices: yield* Invoices.read({ id: "x" }) }
+  })
+
+  it("replays what published 1.40.0 sent", () => {
+    expect(fixture.version).toBe("1.40.0")
+    // A's write at its second event, conditioned on its own revision alone.
+    expect(putOf("a0 a1", 1)).toMatchObject({
+      ConditionExpression: "#e0 = :e1",
+      ExpressionAttributeNames: { "#e0": "ra" },
+      ExpressionAttributeValues: { ":e1": { N: "1" } },
+    })
+  })
+
+  it.effect(
+    "not fixable: a 1.40.0 write from a read taken before this release's write replaces it",
+    () => {
+      const { A, B, layer, row } = twoLayouts()
+      return Effect.gen(function* () {
+        const { orders, invoices } = yield* history
+        yield* A.apply(orders[0]!)
+        yield* B.apply(invoices[0]!)
+        expect(untokened(row("x"))).toMatchObject({ total: 6, a: 1, b: 1 })
+        // The 1.40.0 process read the row at A's first event, before B's write, and writes A's
+        // second: guarded by A's revision alone, which B's write left alone, it lands.
+        yield* send(putOf("a0 a1", 1))
+        // B's part is gone, its checkpoint with it, and the token: the row is as the 1.40.0
+        // process read it, plus A's event.
+        expect(row("x")).toEqual(fromAttributeMap(fixture.runs["a0 a1"]![1]!.item))
+        // Nothing wedges, and B's next event folds its stream again from the checkpoint it lost.
+        const next = yield* B.apply(invoices[1]!)
+        expect(next.applied.map((event) => event.version)).toEqual([1, 2])
+        expect(untokened(row("x"))).toMatchObject({ total: 15, a: 2, b: 2 })
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect(
+    "this release's write that read the row before a 1.40.0 write fails, and lands on its retry",
+    () => {
+      const { A, layer, row, between } = twoLayouts()
+      return Effect.gen(function* () {
+        const { orders } = yield* history
+        yield* A.apply(orders[0]!)
+        expect(row("x")?.__edd_rt__).toBeDefined()
+        // A 1.40.0 process writes B's first event after A's read: no token on the row.
+        between(send(putOf("a0 b0 b1", 1)))
+        const exit = yield* Effect.exit(A.apply(orders[1]!))
+        expect(failureOf(exit)).toMatchObject({
+          _tag: "ConcurrentModification",
+          attributes: ["__edd_rt__"],
+        })
+        expect(row("x")).toEqual(fromAttributeMap(fixture.runs["a0 b0 b1"]![1]!.item))
+        yield* A.apply(orders[1]!)
+        expect(untokened(row("x"))).toMatchObject({ total: 8, a: 2, ra: 2, b: 1, rb: 1 })
+        expect(row("x")?.__edd_rt__).toBeDefined()
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect(
+    "this release's write over a row a 1.40.0 process wrote fails when it writes again first",
+    () => {
+      const { A, layer, row, between } = twoLayouts()
+      return Effect.gen(function* () {
+        const { orders } = yield* history
+        // The row as 1.40.0 left it after A's first event and B's: no token.
+        const written = fixture.runs["a0 b0 b1"]![1]!.item
+        store.set(`read|${written.pk.S}|${written.sk.S}`, structuredClone(written))
+        // The 1.40.0 process writes B's second event after A's read.
+        between(send(putOf("a0 b0 b1", 2)))
+        // A row without a token proves nothing by its absence: the write names every projection's
+        // bookkeeping as it read it, which B's write changed. Without that, it landed guarded by
+        // A's revision and the token's absence, and B's 7 was lost (total 8, b 1).
+        const exit = yield* Effect.exit(A.apply(orders[1]!))
+        expect(failureOf(exit)).toMatchObject({
+          _tag: "ConcurrentModification",
+          attributes: ["b", "rb"],
+        })
+        expect(row("x")).toEqual(fromAttributeMap(fixture.runs["a0 b0 b1"]![2]!.item))
+        yield* A.apply(orders[1]!)
+        expect(untokened(row("x"))).toMatchObject({ total: 15, a: 2, ra: 2, b: 2, rb: 2 })
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  it.effect(
+    "`create` over a 1.40.0 tombstone fails when one written since holds other values",
+    () => {
+      // Every removal stamp is one instant, here and in the capture, as two in one millisecond are.
+      const { Rows, A, layer, row, between } = setup(
+        { checkpoint: "a", removal: true },
+        { checkpoint: "b", revision: "rb" },
+      )
+      const run = "removal: a0 a1 a2 a3"
+      vi.useFakeTimers({ toFake: ["Date"], now: 0 })
+      return Effect.gen(function* () {
+        yield* Orders.append(
+          { id: "x" },
+          [
+            new Placed({ amount: 1 }),
+            new Cancelled({}),
+            new Placed({ amount: 4 }),
+            new Cancelled({}),
+          ],
+          0,
+        )
+        const orders = yield* Orders.read({ id: "x" })
+        // The tombstone 1.40.0 wrote at A's removal: no token.
+        const tombstone = fixture.runs[run]![1]!.item
+        store.set(`read|${tombstone.pk.S}|${tombstone.sk.S}`, structuredClone(tombstone))
+        // After `create` reads it, the 1.40.0 process brings the row back and removes it again.
+        between(Effect.andThen(send(putOf(run, 2)), send(putOf(run, 3))))
+        // The tombstone's marker, stamp and the token's absence all hold: `create` names the values
+        // it read too. Without them it replaced the second tombstone, keeping the first's checkpoint
+        // 2, so events 3 and 4 were applied again.
+        const exit = yield* Effect.exit(Rows.create({ id: "x", total: 10 }).asEffect())
+        expect(String(exit)).toContain("ConditionalCheckFailed")
+        expect(row("x")).toEqual(fromAttributeMap(fixture.runs[run]![3]!.item))
+        expect((yield* A.apply(orders[2]!)).alreadyApplied).toHaveLength(1)
+      }).pipe(Effect.provide(layer), Effect.ensuring(Effect.sync(() => vi.useRealTimers())))
+    },
+  )
+
+  it.effect(
+    "this release's write over a row a 1.40.0 process wrote names what it read, once",
+    () => {
+      const { A, layer, row } = twoLayouts()
+      return Effect.gen(function* () {
+        const { orders } = yield* history
+        const written = fixture.runs["a0 b0 b1"]![1]!.item
+        store.set(`read|${written.pk.S}|${written.sk.S}`, structuredClone(written))
+        resetCalls()
+        yield* A.apply(orders[1]!)
+        // One read and one write, as 1.40.0 sent; the next write names the token it wrote.
+        expect([calls.getItem, calls.putItem]).toEqual([1, 1])
+        expect(untokened(row("x"))).toMatchObject({ total: 8, a: 2, b: 1, rb: 1 })
+        expect(row("x")?.__edd_rt__).toBeDefined()
+      }).pipe(Effect.provide(layer))
+    },
+  )
 })
 
 describe("a worker draining the outbox of a read model whose rows carry the row token", () => {

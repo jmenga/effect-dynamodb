@@ -92,6 +92,52 @@ export const rowTokenTerm = (read: AttributeValue | undefined): RawCondition =>
     ? { expression: "attribute_not_exists(#eddRt)", names: { "#eddRt": ROW_TOKEN }, values: {} }
     : { expression: "#eddRt = :eddRt", names: { "#eddRt": ROW_TOKEN }, values: { ":eddRt": read } }
 
+/**
+ * @internal The term naming each attribute of `names` as `item` holds it, or its absence (#237).
+ * Every projection write changes the projection's revision, else its checkpoint, whichever library
+ * wrote it, so a row read without a row token is proven as read by the projections' bookkeeping.
+ */
+export const heldTerm = (
+  item: Record<string, AttributeValue>,
+  names: Iterable<string>,
+): RawCondition | undefined => {
+  const terms: Array<string> = []
+  const placeholders: Record<string, string> = {}
+  const values: Record<string, AttributeValue> = {}
+  let i = 0
+  for (const name of names) {
+    placeholders[`#eddTb${i}`] = name
+    const value = Object.hasOwn(item, name) ? item[name] : undefined
+    if (value === undefined) terms.push(`attribute_not_exists(#eddTb${i})`)
+    else {
+      terms.push(`#eddTb${i} = :eddTb${i}`)
+      values[`:eddTb${i}`] = value
+    }
+    i++
+  }
+  return terms.length === 0
+    ? undefined
+    : { expression: terms.join(" AND "), names: placeholders, values }
+}
+
+/**
+ * @internal The term proving a row a write read (`item`, as stored) is still as read (#237): the
+ * row token it held; else the projections' bookkeeping `names` as it held them (`heldTerm`) and,
+ * on a read model whose rows carry the token (`rowTokened`), the token's absence. A row without a
+ * token was last written by a process still on 1.40.0, which writes none, or before the token:
+ * the bookkeeping proves a write by either landed since, the token's absence one by this release.
+ */
+export const asReadTerm = (
+  entity: object,
+  item: Record<string, AttributeValue>,
+  names: Iterable<string>,
+): RawCondition | undefined => {
+  const read = item[ROW_TOKEN]
+  if (read !== undefined) return rowTokenTerm(read)
+  const held = heldTerm(item, names)
+  return rowTokened(entity) ? andRaw(rowTokenTerm(undefined), held) : held
+}
+
 /** @internal Both conditions, either of which may be absent. Their placeholders must differ. */
 export const andRaw = (
   a: RawCondition | undefined,
@@ -308,11 +354,11 @@ export const projectionTtlConflict = (
  * On a read model whose rows carry the row token (`rowTokened`), or when the tombstone holds one,
  * it also holds the bookkeeping of the other projections that had written the row (#237): those of
  * projections without `removal` are carried after, each attribute the others haven't named, in
- * the same way. The row gets a fresh token recording the projections whose bookkeeping it holds,
- * and `term` names the tombstone's own (`rowTokenTerm`), so a tombstone written since fails it.
- * Without a token, `term` names every value carried as the tombstone holds it (or its absence):
- * the removal stamp alone has a millisecond's resolution, so a row written over the tombstone and
- * removed again within one would pass it, and its newer checkpoints be lost to the older ones.
+ * the same way. The row gets a fresh token recording the projections whose bookkeeping it holds.
+ * `term` proves the tombstone is still as read (`asReadTerm`): its token, else every projection's
+ * bookkeeping as it holds it (or its absence), so a tombstone written since fails it. The removal
+ * stamp alone has a millisecond's resolution, so a row written over the tombstone and removed
+ * again within one would pass it, and its newer checkpoints be lost to the older ones.
  */
 export const overTombstone = (
   entity: {
@@ -398,6 +444,7 @@ export const overTombstone = (
       }
     }
     const read = Item[ROW_TOKEN]
+    const term = asReadTerm(entity, Item, taken)
     if (rowTokened(entity) || read !== undefined) {
       // The projections whose bookkeeping the row holds: those this program doesn't define kept.
       const known = new Map(layouts.map((layout) => [layoutTag(layout), layout]))
@@ -412,28 +459,8 @@ export const overTombstone = (
         )
       })
       item[ROW_TOKEN] = yield* freshRowToken(writers)
-      return Option.some({
-        guard: tombstoneGuard(entity.entityType, tomb),
-        term: rowTokenTerm(read),
-      })
     }
-    // Without a token, the tombstone's every value this write carries, as read.
-    const terms: Array<string> = []
-    const names: Record<string, string> = {}
-    const values: Record<string, AttributeValue> = {}
-    for (const [i, name] of [...taken].entries()) {
-      names[`#eddTb${i}`] = name
-      const value = Object.hasOwn(Item, name) ? Item[name] : undefined
-      if (value === undefined) terms.push(`attribute_not_exists(#eddTb${i})`)
-      else {
-        terms.push(`#eddTb${i} = :eddTb${i}`)
-        values[`:eddTb${i}`] = value
-      }
-    }
-    return Option.some({
-      guard: tombstoneGuard(entity.entityType, tomb),
-      term: terms.length === 0 ? undefined : { expression: terms.join(" AND "), names, values },
-    })
+    return Option.some({ guard: tombstoneGuard(entity.entityType, tomb), term })
   })
 
 /** The guard naming a tombstone by its marker and removal stamp. */

@@ -1170,7 +1170,39 @@ const inKeyOrder = (
 const ROW_TOKEN = "__edd_rt__"
 
 /** A condition naming the row token read, after the write's own. */
-const TOKEN_TERM = /^\((.*)\) AND \((?:attribute_not_exists\(#eddRt\)|#eddRt = :eddRt)\)$/s
+/** Whether `text`'s parentheses balance. */
+const balanced = (text: string): boolean => {
+  let depth = 0
+  for (const char of text) {
+    if (char === "(") depth++
+    else if (char === ")" && --depth < 0) return false
+  }
+  return depth === 0
+}
+
+/**
+ * A condition `(guard) AND (term)` split at the term proving the row as read (#237): the row token
+ * read, or, for a row read without one, its absence and the projections' bookkeeping as read
+ * (`#eddTb…`), with the tombstone's (`#eddRm`). The guard, or `undefined` for a condition without
+ * one.
+ */
+const withoutTokenTerm = (condition: string): string | undefined => {
+  const separator = ") AND ("
+  for (let i = condition.indexOf(separator); i >= 0; i = condition.indexOf(separator, i + 1)) {
+    const guard = condition.slice(1, i)
+    const term = condition.slice(i + separator.length, -1)
+    if (
+      condition.startsWith("(") &&
+      condition.endsWith(")") &&
+      balanced(guard) &&
+      balanced(term) &&
+      term.includes("#eddRt") &&
+      !guard.includes("#eddRt")
+    )
+      return guard
+  }
+  return undefined
+}
 
 /**
  * A `Put`'s item and condition without the row token, and without the request for the item as
@@ -1179,13 +1211,18 @@ const TOKEN_TERM = /^\((.*)\) AND \((?:attribute_not_exists\(#eddRt\)|#eddRt = :
 const putWithoutRowToken = (put: Record<string, any> | undefined) => {
   if (put === undefined) return
   if (put.Item !== undefined) delete put.Item[ROW_TOKEN]
-  const condition = TOKEN_TERM.exec(put.ConditionExpression ?? "")
-  if (condition === null) return
-  put.ConditionExpression = condition[1]
+  const guard = withoutTokenTerm(put.ConditionExpression ?? "")
+  if (guard === undefined) return
+  const term = (put.ConditionExpression as string).slice(guard.length + 7)
+  put.ConditionExpression = guard
   delete put.ReturnValuesOnConditionCheckFailure
-  delete put.ExpressionAttributeNames["#eddRt"]
+  for (const name of Object.keys(put.ExpressionAttributeNames)) {
+    if (term.includes(name) && !guard.includes(name)) delete put.ExpressionAttributeNames[name]
+  }
   if (put.ExpressionAttributeValues === undefined) return
-  delete put.ExpressionAttributeValues[":eddRt"]
+  for (const name of Object.keys(put.ExpressionAttributeValues)) {
+    if (term.includes(name) && !guard.includes(name)) delete put.ExpressionAttributeValues[name]
+  }
   if (Object.keys(put.ExpressionAttributeValues).length === 0) delete put.ExpressionAttributeValues
 }
 

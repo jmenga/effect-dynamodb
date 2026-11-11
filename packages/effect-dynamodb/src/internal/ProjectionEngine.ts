@@ -74,6 +74,7 @@ import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
   addProjectionLayout,
   andRaw,
+  asReadTerm,
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
@@ -384,7 +385,7 @@ interface Row {
   readonly tombstone: boolean
   readonly createdAt: unknown
   /** The item as read: its row token, and another projection's bookkeeping as stored (#237). */
-  readonly item?: Record<string, AttributeValue> | undefined
+  readonly item: Record<string, AttributeValue>
 }
 
 /**
@@ -1561,6 +1562,8 @@ export const makeEngine = (config: EngineConfig) => {
     guardRaw: RawCondition,
     token: AttributeValue | undefined,
     tokenTerm: RawCondition | undefined,
+    held: ReadonlyArray<readonly [field: string, stored: string]>,
+    readItem: Record<string, AttributeValue> | undefined,
     overRead: RawCondition | undefined,
     current: Option.Option<unknown> | undefined,
   ): ReadonlyArray<string> => {
@@ -1584,6 +1587,17 @@ export const makeEngine = (config: EngineConfig) => {
           token === undefined
             ? item?.[ROW_TOKEN] === undefined
             : item?.[ROW_TOKEN] !== undefined && attributeValueEquals(item[ROW_TOKEN], token),
+      ])
+    }
+    for (const [field, stored] of held) {
+      const was =
+        readItem !== undefined && Object.hasOwn(readItem, stored) ? readItem[stored] : undefined
+      parts.push([
+        field,
+        (item) =>
+          was === undefined
+            ? item?.[stored] === undefined
+            : item?.[stored] !== undefined && attributeValueEquals(item[stored], was),
       ])
     }
     if (overRead !== undefined) parts.push([REMOVED_AT, (item) => item?.[REMOVED_AT] !== undefined])
@@ -1657,6 +1671,27 @@ export const makeEngine = (config: EngineConfig) => {
     return out
   }
 
+  /**
+   * Every projection's bookkeeping attribute on the read model (each field and its stored name,
+   * once), but the one `guardRaw` already names: what proves a row read without a row token is
+   * as read (`asReadTerm`, #237).
+   */
+  const heldBookkeeping = (
+    guardRaw: RawCondition,
+  ): ReadonlyArray<readonly [field: string, stored: string]> => {
+    const seen = new Set<string>([guardRaw.names["#g"]!])
+    const out: Array<readonly [string, string]> = []
+    for (const layout of projectionLayoutsOf(readModel) ?? []) {
+      for (const [field] of layout.roles) {
+        const stored = dbName(field)
+        if (seen.has(stored)) continue
+        seen.add(stored)
+        out.push([field, stored])
+      }
+    }
+    return out
+  }
+
   /** The row (or tombstone) and any outbox items, written as one conditional unit. */
   const writeRow = (
     key: unknown,
@@ -1676,19 +1711,36 @@ export const makeEngine = (config: EngineConfig) => {
       // program defining only this projection writes it too, so it never replaces another's write
       // landed since its read), a fresh one recording the projections whose bookkeeping the row
       // holds after this write (`writersAfter`), and the term naming the one read.
-      const read = Option.isSome(row) ? row.value.item?.[ROW_TOKEN] : undefined
+      const read = Option.isSome(row) ? row.value.item[ROW_TOKEN] : undefined
       const tokened = rowTokened(readModel) || read !== undefined
       const token = tokened
         ? yield* freshRowToken(
             writersAfter(read, Option.isSome(target) ? target.value : { ...kept, ...carried }),
           )
         : undefined
-      const tokenTerm = tokened ? rowTokenTerm(read) : undefined
-      // Without a row token, a projection keeping no revision, writing over a tombstone it read,
-      // names the tombstone: `create` over it keeps the checkpoint, which alone would let this
-      // write replace the row the `create` wrote (#237).
+      // A row read without a token, where rows carry one, was last written by a process still on
+      // 1.40.0 (which writes none) or before the token: the term names every projection's
+      // bookkeeping as read too (`asReadTerm`), which each of their writes changes, so this write
+      // never replaces one landed since its read, whichever library made it (#237).
+      const held: ReadonlyArray<readonly [string, string]> =
+        tokened && read === undefined && Option.isSome(row) ? heldBookkeeping(condition.raw) : []
+      const tokenTerm = !tokened
+        ? undefined
+        : Option.isSome(row)
+          ? asReadTerm(
+              readModel,
+              row.value.item,
+              held.map(([, stored]) => stored),
+            )
+          : rowTokenTerm(undefined)
+      // A row read without a token, a tombstone, names it: `create` over it keeps the checkpoints,
+      // which alone would let this write replace the row the `create` wrote (#237). With one
+      // projection keeping a revision, `create` changes it, and the write sends what 1.40.0 did.
       const overRead =
-        !tokened && config.revision === undefined && Option.isSome(row) && row.value.tombstone
+        Option.isSome(row) &&
+        row.value.tombstone &&
+        read === undefined &&
+        (tokened || config.revision === undefined)
           ? tombstoneTerm
           : undefined
       const term = andRaw(tokenTerm, overRead)
@@ -1697,7 +1749,15 @@ export const makeEngine = (config: EngineConfig) => {
       // did (#237).
       const returnOld = tokenTerm !== undefined
       const failed = (current: Option.Option<unknown> | undefined) =>
-        changedOf(condition.raw, read, tokenTerm, overRead, current)
+        changedOf(
+          condition.raw,
+          read,
+          tokenTerm,
+          held,
+          Option.isSome(row) ? row.value.item : undefined,
+          overRead,
+          current,
+        )
       // A write for a row read absent, on a read model whose rows may be tombstones, proves the
       // key still holds nothing, as the transaction's put does: `create` never takes the place
       // of a tombstone written since, which 1.39.0 and 1.40.0 replaced, the removal lost (#237).
@@ -2402,11 +2462,11 @@ export const makeEngine = (config: EngineConfig) => {
     readonly value: unknown
   }> => {
     if (Option.isNone(row)) return []
-    const writers = new Set(rowWriters(row.value.item?.[ROW_TOKEN]))
+    const writers = new Set(rowWriters(row.value.item[ROW_TOKEN]))
     writers.delete(ownTag)
     if (writers.size === 0) return []
     const values = row.value.tombstone
-      ? (fromAttributeMap(row.value.item ?? {}) as Record<string, unknown>)
+      ? (fromAttributeMap(row.value.item) as Record<string, unknown>)
       : row.value.values
     const out: Array<{
       readonly layout: ProjectionLayout
