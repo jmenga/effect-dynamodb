@@ -168,7 +168,11 @@ import { SecureRandom } from "effect/crypto"
 import type { Aggregate as AggregateType, BoundAggregate } from "./Aggregate.js"
 import { bind as aggregateBind, ownershipConflict } from "./Aggregate.js"
 import type { BoundEntity, Entity as EntityType } from "./Entity.js"
-import { bind as entityBind, fromDefinition as entityFromDefinition } from "./Entity.js"
+import {
+  bind as entityBind,
+  fromDefinition as entityFromDefinition,
+  storedRefIdOf,
+} from "./Entity.js"
 import {
   type BoundQueryConfig,
   BoundQueryImpl,
@@ -487,12 +491,19 @@ const BOUND_OPERATORS: ReadonlySet<string> = new Set(["eq", "between", "gt", "gt
  * inside the stored ref, which is the value the key was composed from —
  * through the accessor's encoder for a numeric field stored as a string, so a
  * stored `"950000"` reads as `950000`. `undefined` when the row lacks it.
+ *
+ * A stored ref holds its id in the referenced entity's stored form, which is
+ * not always the form the key was composed from (a date key stored as epoch
+ * milliseconds, keyed as its ISO text): read as a value of that entity's key
+ * (`storedRefIdOf`), then keyed as a caller's value is (#241). Up to 1.40.0 it
+ * was compared as stored, and a bound on such an id matched no row.
  */
 const storedKeyForm = (
   args: {
     readonly entityLike: EntityLike
     readonly encoderSource: Schema.Top
     readonly compositeKeyForm: CompositeKeyForm
+    readonly domainKeyForm: CompositeKeyForm
   },
   field: string,
 ): {
@@ -511,6 +522,12 @@ const storedKeyForm = (
       const value = ref === undefined ? row[attribute] : row[attribute]?.M?.[ref.keyField]
       if (value === undefined) return undefined
       const stored = value.S ?? value.N
+      if (ref !== undefined && stored !== undefined) {
+        const held =
+          value.S ?? (wantsBigInt ? BigInt(value.N as string) : Number(value.N as string))
+        const id = storedRefIdOf(ref, held)
+        if (Option.isSome(id)) return args.domainKeyForm(field, id.value)
+      }
       if (typeNumeric && stored !== undefined) return args.compositeKeyForm(field, stored)
       if (value.S !== undefined) return value.S
       if (value.N !== undefined) return wantsBigInt ? BigInt(value.N) : Number(value.N)
@@ -2415,6 +2432,7 @@ interface EntityLike {
         readonly fieldName: string
         readonly idFieldName: string
         readonly keyField: string
+        readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
       }>
     | undefined
   readonly _schema: DynamoSchema.DynamoSchema

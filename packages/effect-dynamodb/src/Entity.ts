@@ -48,7 +48,7 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import type { RefEntity } from "@effect-dynamodb/schema/internal/AggregateEdges.js"
-import { refIdAttribute } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
+import { keyValueOf, refIdAttribute } from "@effect-dynamodb/schema/internal/AggregateSchemas.js"
 import {
   compositeKeyFormKind,
   keyFormValueKind,
@@ -2359,6 +2359,30 @@ interface ResolvedRef {
 
 /** @internal A definition that has had its operations attached (has `.get`). */
 const isOperational = (e: { readonly get?: unknown }): boolean => typeof e.get === "function"
+
+/**
+ * @internal A ref's id as the stored ref holds it, as a value of the referenced entity's key (#241).
+ * The stored ref is the referenced item in its entity's stored form ({@link refDataOf}), while a
+ * `${field}Id` is keyed as it's given, so a key stored in another form (a date stored as epoch
+ * milliseconds) is read back through that entity's own field. `None` when the stored value is no
+ * value of the key (a row written otherwise), which a caller reads as it's stored. What `rekey`
+ * judges a row's index keys by ({@link storedRefId}) and a `.within()` row check reads a stored
+ * ref's id by.
+ */
+export const storedRefIdOf = (
+  ref: {
+    readonly keyField: string
+    readonly refEntity: { readonly schemas: { readonly modelSchema: Schema.Top } }
+  },
+  stored: unknown,
+): Option.Option<unknown> => {
+  const field = getSchemaFields(ref.refEntity.schemas.modelSchema)?.[ref.keyField]
+  return field === undefined ? Option.none() : keyValueOf(field, stored)
+}
+
+/** @internal {@link storedRefIdOf}, or the value as it's stored when it's no value of the key. */
+const storedRefId = (ref: Parameters<typeof storedRefIdOf>[0], stored: unknown): unknown =>
+  Option.getOrElse(storedRefIdOf(ref, stored), () => stored)
 
 /**
  * @internal What a ref stores of the item it names: the referenced entity's domain item encoded
@@ -7494,8 +7518,14 @@ const makeImpl = <
         const id = decoded[ref.idFieldName] as string
         return Effect.gen(function* () {
           // Fetched under the key composite the id is a value of, as an aggregate edge's id is
-          // (#214, #241): the referenced entity's identifier needn't be its key.
-          const keyInput = { [ref.keyField]: id }
+          // (#214, #241): the referenced entity's identifier needn't be its key. `get` takes the
+          // key's own value, and the id here is in its stored form, which for a transformed key is
+          // another (`"5"` of a `NumberFromString`): read through `keyValueOf`, as an aggregate
+          // edge's id is. Up to 1.40.0 the stored form was handed over, and `get` refused it. An id
+          // that is no value of the key is handed over as it is, and `get` refuses it as before.
+          const keyInput = {
+            [ref.keyField]: Option.getOrElse(keyValueOf(ref.keySchema, id), () => id),
+          }
           // Use asModel to convert EntityGet to Effect<ModelType>
           const getEffect = asModel(ref.refEntity.get(keyInput) as EntityGet<any, any, any, any>)
           const model = yield* getEffect.pipe(
@@ -7679,10 +7709,14 @@ const makeImpl = <
           targetSchema,
           target.entityType,
           cascadeIdx.indexDef,
-          // The id as the key holds it, not its text: a number key's `5` composes the key `put`
-          // wrote (`teamid_0000000000000005`), where `"5"` composed `teamid_5` and found nothing,
-          // up to 1.40.0.
-          keyFormFor(target, { [matchingRef.idFieldName]: sourceId }),
+          // The id as a value of the key, through the target's own key form, as a `put` naming
+          // the source composed it, not its text: a number key's `5` composes the key `put` wrote
+          // (`teamid_0000000000000005`), where `"5"` composed `teamid_5` and found nothing, up to
+          // 1.40.0. The domain value, not the source key's stored form: a date stored as epoch
+          // milliseconds is keyed by the source in that form and by the target in its own (#241).
+          keyFormFor(target, {
+            [matchingRef.idFieldName]: sourceDomainData[sourceIdentifierField] ?? sourceId,
+          }),
         ).partitions
 
         // Build query parameters
@@ -14690,7 +14724,7 @@ const makeImpl = <
       const id = (values[ref.fieldName] as globalThis.Record<string, unknown> | undefined)?.[
         ref.keyField
       ]
-      if (id !== undefined) withIds[ref.idFieldName] = id
+      if (id !== undefined) withIds[ref.idFieldName] = storedRefId(ref, id)
     }
     return withIds
   }

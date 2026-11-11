@@ -499,6 +499,16 @@ const jsonCodecOf = (field: Schema.Top): Schema.Top | null => {
 export const refIdValue = (entity: RefEntity, value: unknown): Option.Option<unknown> => {
   const field = refIdField(entity)
   if (field === undefined) return typeof value === "string" ? Option.some(value) : Option.none()
+  return keyValueOf(field, value)
+}
+
+/**
+ * A value given for a key composite whose field is `field`, as a value of that field: the value
+ * itself when it is one, or what it decodes to from its JSON or stored form. `None` when it is
+ * neither. What an aggregate edge's id ({@link refIdValue}) and an entity-level ref's
+ * `${field}Id` name are both read through it (#214, #241).
+ */
+export const keyValueOf = (field: Schema.Top, value: unknown): Option.Option<unknown> => {
   const codec = field as Schema.Codec<unknown>
   if (Schema.is(codec)(value)) return Option.some(value)
   const json = jsonCodecOf(field)
