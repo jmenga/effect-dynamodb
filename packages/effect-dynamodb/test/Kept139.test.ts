@@ -14,7 +14,7 @@ import { describe } from "vitest"
 import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
-import { clearWritesSuite } from "./helpers/ClearWrites.js"
+import { clearWritesSuite, retainedEntryRemovalsSuite } from "./helpers/ClearWrites.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
 import { entryInQueriesSuite } from "./helpers/EntryInQueries.js"
 import { entrySelectsSuite } from "./helpers/EntrySelects.js"
@@ -113,6 +113,10 @@ describe("a select of a sparse map's entry", () => {
 
 describe("a clearMap with another write to the map", () => {
   clearWritesSuite(openRecordingTable)
+})
+
+describe("a retained entity's removal of a sparse map's entries", () => {
+  retainedEntryRemovalsSuite(openRecordingTable)
 })
 
 describe("a path below a struct that renames its keys as they're stored", () => {

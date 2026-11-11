@@ -316,3 +316,102 @@ export const clearWritesSuite = (open: OpenTable) => {
     }
   }
 }
+
+const removalFixture = JSON.parse(
+  readFileSync(new URL("../fixtures/retained-entry-removals-1.40.0.json", import.meta.url), "utf8"),
+) as { readonly cases: Record<string, Captured> }
+
+/**
+ * A retained entity's `.removeEntries()` (#238), which writes the item whole and the version it
+ * replaces as a snapshot. On a row holding a renamed map whole (`sr`), 1.40.0 removed the entry
+ * from the read row's own map, which the snapshot is written from: the snapshot of version 1 lost
+ * the entry too, and `versions()` read it without it. The head removes it from a copy; the rest of
+ * what it sends and stores is 1.40.0's (`fixtures/retained-entry-removals-1.40.0.json`).
+ */
+export const retainedEntryRemovalsSuite = (open: OpenTable) => {
+  for (const entity of ["Retained", "RetainedUnrenamed"]) {
+    const rows = entity === "RetainedUnrenamed" ? ["unrenamed"] : ["whole", "entries", "both"]
+    for (const row of rows) {
+      for (const [label, op] of [
+        ["removeEntries('counts', ['a'])", (u: any) => u.removeEntries("counts", ["a"])],
+        [
+          "removeEntries('counts', ['a']).set({ counts: { b: 2 } })",
+          (u: any) => u.removeEntries("counts", ["a"]).set({ counts: { b: 2 } }),
+        ],
+      ] as const) {
+        for (const inTransaction of [false, true]) {
+          const name = `${entity}, ${row === "unrenamed" ? "a row put created" : `the map ${row}`}: ${label}${inTransaction ? ", in a transaction" : ""}`
+          const was = removalFixture.cases[name]!
+          // Where 1.40.0's snapshot lost the entry: the map whole, the entry removed alone.
+          const lost = (row === "whole" || row === "both") && !label.includes(".set(")
+          it.effect(
+            lost
+              ? `${name}: the version snapshot keeps the map as it was, where 1.40.0's lost the entry`
+              : `${name}: as 1.40.0`,
+            () =>
+              Effect.gen(function* () {
+                const entities = definitions()
+                const MainTable = Table.make({
+                  schema: DynamoSchema.make({ name: "cw", version: 1 }),
+                  entities,
+                } as never)
+                const log: Array<unknown> = []
+                const got = yield* onTable(
+                  recordingRequests(open, log),
+                  0,
+                  MainTable,
+                  { entities },
+                  (db, table) =>
+                    Effect.gen(function* () {
+                      yield* seeds[row]!(db, entity, table.name)
+                      const before = rowsOf(yield* table.rows)
+                      log.length = 0
+                      const exit = yield* Effect.exit(
+                        Effect.suspend(() => {
+                          const update = op(db.entities[entity].update({ id: "a" }))
+                          return inTransaction
+                            ? Transaction.transactWrite([update])
+                            : update.asEffect()
+                        }),
+                      )
+                      const sent = log.map((request) => wholeOf(request, table.name)) as Array<any>
+                      const read = yield* Effect.exit(db.entities[entity].get({ id: "a" }))
+                      return {
+                        before,
+                        captured: {
+                          outcome: outcomeOf(exit),
+                          sent,
+                          rows: rowsOf(yield* table.rows),
+                          read: outcomeOf(read),
+                        } satisfies Captured,
+                      }
+                    }),
+                )
+                const { captured } = got
+                if (!lost) {
+                  expect(captured).toEqual(was)
+                  return
+                }
+                // The snapshot's map: the row's, before the write. Everything else as 1.40.0's.
+                const snapshotOf = (rows: ReadonlyArray<any>) =>
+                  rows.findIndex((stored) => String(stored.sk.S).includes("#v#"))
+                const at = snapshotOf(captured.rows)
+                expect(at).toBeGreaterThanOrEqual(0)
+                expect(captured.rows[at].sr).toEqual(got.before[0].sr)
+                expect(captured.rows[at].sr).toEqual({ M: { a: { N: "1" } } })
+                const fields = new Set(
+                  captured.sent.flatMap((request, i) => differing(request, was.sent[i])),
+                )
+                expect(captured.sent.length).toBe(was.sent.length)
+                expect([...fields]).toEqual(["transactWriteItems.TransactItems.1.Put.Item.sr.M.a"])
+                expect({ ...captured, rows: [], sent: [] }).toEqual({ ...was, rows: [], sent: [] })
+                expect(captured.rows.filter((_, i) => i !== at)).toEqual(
+                  was.rows.filter((_: unknown, i: number) => i !== snapshotOf(was.rows)),
+                )
+              }),
+          )
+        }
+      }
+    }
+  }
+}

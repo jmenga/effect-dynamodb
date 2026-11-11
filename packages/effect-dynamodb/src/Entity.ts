@@ -9361,13 +9361,20 @@ const makeImpl = <
             delete newItem[attr]
           }
         }
-        // Sparse-map removes: drop named entries from the in-memory Record.
+        // Sparse-map removes: drop named entries from a copy of the in-memory Record. The map a
+        // row holds whole (a `field:` rename's attribute) is the read row's own object, which the
+        // version snapshot is written from: removed in place, the snapshot lost the entries too.
         if (uState.sparseRemoveEntries) {
           for (const op of uState.sparseRemoveEntries) {
             if (!hasSparseFields || !(op.field in sparseFields)) continue
             const bucket = newItem[op.field] as globalThis.Record<string, unknown> | undefined
             if (!bucket) continue
-            for (const k of op.keys) delete bucket[k]
+            const kept: globalThis.Record<string, unknown> = Object.assign(
+              Object.create(null),
+              bucket,
+            )
+            for (const k of op.keys) delete kept[k]
+            newItem[op.field] = kept
           }
         }
         // Where a record operation's attribute is in the row as read: an operation naming a
