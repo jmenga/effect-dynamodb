@@ -545,6 +545,19 @@ type RefusedOperand = { readonly operation: string; readonly issue: unknown }
 const APPEND_GUARD_ATTEMPTS = 8
 
 /**
+ * Whether the rest of a sort key after the snapshot prefix (`#v#`) is a snapshot's: a version,
+ * after an item segment when the key has sort key composites. The segment is any text, a line
+ * break included (`s`): a composite's text may hold one.
+ */
+const isSnapshotSkRest = (rest: string): boolean => /^(?:.*#)?\d{7,}$/s.test(rest)
+
+/**
+ * Whether the rest of a sort key after the tombstone prefix (`#deleted#`) is a tombstone's: a
+ * timestamp, after an item segment that may hold any text, a line break included.
+ */
+const isTombstoneSkRest = (rest: string): boolean => /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/s.test(rest)
+
+/**
  * A transaction DynamoDB cancelled for contention alone: another transaction
  * was in flight on one of its items (`TransactionConflict`), and no condition
  * evaluated false. Nothing was written, and sent again it can apply, so it is
@@ -6307,10 +6320,10 @@ const makeImpl = <
     const historyShaped = (sk: string): boolean =>
       (isRetainEnabled() &&
         sk.startsWith(versions) &&
-        /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) ||
+        isSnapshotSkRest(sk.slice(versions.length))) ||
       (isSoftDeleteEnabled() &&
         sk.startsWith(tombstones) &&
-        /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))) ||
+        isTombstoneSkRest(sk.slice(tombstones.length))) ||
       (config.timeSeries !== undefined &&
         sk.startsWith(bare) &&
         sk.slice(bare.length).includes(eventMarker))
@@ -13610,14 +13623,11 @@ const makeImpl = <
   /** What a row's sort key says it is, for a row whose values compose no key to say it by. */
   const storedRowKind = (sk: string): RowKind => {
     const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
-    if (sk.startsWith(versions) && /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) {
+    if (sk.startsWith(versions) && isSnapshotSkRest(sk.slice(versions.length))) {
       return "snapshot"
     }
     const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
-    if (
-      sk.startsWith(tombstones) &&
-      /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))
-    ) {
+    if (sk.startsWith(tombstones) && isTombstoneSkRest(sk.slice(tombstones.length))) {
       return "tombstone"
     }
     return timeSeriesConfig !== undefined && sk.includes("#e#") ? "event" : "item"
@@ -13761,7 +13771,7 @@ const makeImpl = <
       }
     | undefined => {
     const versions = DynamoSchema.composeVersionKeyPrefix(schema, entityType)
-    if (sk.startsWith(versions) && /^(?:.*#)?\d{7,}$/.test(sk.slice(versions.length))) {
+    if (sk.startsWith(versions) && isSnapshotSkRest(sk.slice(versions.length))) {
       if (!sk.slice(versions.length).includes("#")) {
         return {
           kind: "snapshot",
@@ -13786,10 +13796,7 @@ const makeImpl = <
       }
     }
     const tombstones = DynamoSchema.composeDeletedKeyPrefix(schema, entityType)
-    if (
-      sk.startsWith(tombstones) &&
-      /^(?:.*#)?\d{4}-\d\d-\d\dT[^#]*$/.test(sk.slice(tombstones.length))
-    ) {
+    if (sk.startsWith(tombstones) && isTombstoneSkRest(sk.slice(tombstones.length))) {
       if (!sk.slice(tombstones.length).includes("#")) {
         return {
           kind: "tombstone",

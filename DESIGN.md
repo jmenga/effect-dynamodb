@@ -2045,7 +2045,12 @@ history: the sort key composed from its own stored composites
 (`liveSkOf(toDomainView(composites))`, only those attributes unmarshalled) is not
 its stored sort key, or they don't compose, AND the sort key has a history
 layout — `#v#[…#]<7+ digits>` (retain), `#deleted#[…#]<ISO timestamp>`
-(softDelete), or `#e#` after the live key less its composites (timeSeries). A
+(softDelete), or `#e#` after the live key less its composites (timeSeries). The
+`…` item segment is any text, a line break included (`isSnapshotSkRest`,
+`isTombstoneSkRest`, also what `rekey` reads a row's kind by): a string composite
+can hold one, and a `UrlParams` composite's text always does. Up to 1.40.0 the
+layout test stopped at a line break, so such a snapshot or tombstone was read as
+an item and `rekey` skipped it as `unrecognizedKey`. A
 live row composes its own key, whatever its values or collection names hold
 (`#e#`, `deleted`, `v`); a row the current composer can't reproduce (an unpadded
 number composite written by 1.15, a row missing a composite) isn't history-shaped
