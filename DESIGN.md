@@ -3255,7 +3255,9 @@ left out when compiled. Anywhere else — under `or` (which it would make match
 everything) or `not` (nothing), or an `or()` with no parts (nothing) — it has
 no reading that keeps what the caller wrote, so `emptyPartProblem` refuses it
 with a `ValidationError` before anything is sent: in `EntityPut` / `Update` /
-`Delete` when they run, per op in `transactWrite`, in `append`, for filters
+`Delete` when they run, per op in `transactWrite` (a planned update's or
+delete's too, before any op of the transaction reads: planning compiles it
+only after the reads, so it died in `compileExpr`, #236), in `append`, for filters
 when a query runs, and for aggregate `list` filters. An `isIn` with no values
 is not refused (#144): it compiles to `IN ()`, DynamoDB rejects it as a syntax
 error, and the rejection is diagnosed into a `ValidationError` naming the
