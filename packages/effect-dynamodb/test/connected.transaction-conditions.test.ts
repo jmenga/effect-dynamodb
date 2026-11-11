@@ -1,7 +1,9 @@
 /**
  * A transaction's conditions, against DynamoDB Local (#236): a planned op's condition with an
  * empty part where none may be (`or()` with no parts, a `NaN` operand) is refused with a
- * `ValidationError` and nothing is written, where the transaction used to die with a defect.
+ * `ValidationError` and nothing is written, where the transaction used to die with a defect. And
+ * `Transaction.check` with a compiled condition (`Expression.condition`) names the attribute a
+ * renamed field is stored in, so it holds on a row holding the value.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -144,4 +146,39 @@ describeConnected("a transaction's conditions, on DynamoDB Local", () => {
       ),
     )
   }
+
+  it.effect("Transaction.check of a compiled condition names a renamed field's attribute", () =>
+    onTable(
+      Lib.Entity.make({
+        model: Lib.DynamoModel.configure(
+          Schema.Struct({ id: Schema.String, count: Schema.Number }),
+          { count: { field: "renamed" } },
+        ),
+        entityType: "R",
+        primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
+      } as never) as any,
+      (db, scan) =>
+        Effect.gen(function* () {
+          yield* db.entities.E.put({ id: "a", count: 1 }).asEffect()
+          const check = (condition: Lib.Expression.ExpressionResult, id: string) =>
+            Effect.exit(
+              Lib.Transaction.transactWrite([
+                Lib.Transaction.check(db.entities.E.get({ id: "a" }), condition),
+                db.entities.E.put({ id, count: 2 }),
+              ]),
+            )
+          // The row holds `renamed: 1`: the check holds, and `b` is written.
+          expect(
+            Exit.isSuccess(yield* check(Lib.Expression.condition({ eq: { count: 1 } }), "b")),
+          ).toBe(true)
+          // And it fails where the value differs, writing nothing.
+          const exit = yield* check(Lib.Expression.condition({ eq: { count: 2 } }), "c")
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit)) {
+            expect((Cause.squash(exit.cause) as any)._tag).toBe("TransactionCancelled")
+          }
+          expect((yield* scan).map((row) => row.id?.S).sort()).toEqual(["a", "b"])
+        }),
+    ),
+  )
 })

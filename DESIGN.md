@@ -3334,6 +3334,14 @@ the first segment it names the property as written. Through 1.39.0 one such
 path reached the stored key by coincidence, when the nested struct encoded a
 property to the name a top-level field of the same spelling was renamed to; it
 now names the property, like every other path below a key-encoded struct.
+`Transaction.check` takes a compiled condition (`Expression.condition`), which
+is built with no entity to rename by, so it named a renamed field as the field,
+which no row holds: a comparison failed whatever the row held, and
+`attribute_not_exists` held whatever it held (also on 1.39.0). It now applies
+the same rule to the names it is given (`storedNames` in `Transaction.ts`,
+#236): a placeholder used only as a path's first segment, naming a renamed
+model field, names the stored attribute; one below a first segment (`#t.#c`),
+one used at both, and a name no field is renamed from are sent as given.
 
 **Path-addressed values are encoded (#133).** `pathSet`, `pathAppend`,
 `pathPrepend`, `pathIfNotExists` and record-based `append` (including the
