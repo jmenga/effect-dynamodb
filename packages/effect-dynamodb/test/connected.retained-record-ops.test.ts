@@ -105,6 +105,10 @@ const entity = (config: ReadFirstUpdate | undefined) =>
         tags: Schema.optional(Schema.Array(Schema.String)),
         notes: Schema.optional(Schema.Array(Schema.String)),
         labels: Schema.optional(Schema.ReadonlySet(Schema.String)),
+        ns: Schema.optional(Schema.ReadonlySet(Schema.Number)),
+        nul: Schema.optional(Schema.NullOr(Schema.Number)),
+        nlist: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
+        nset: Schema.optional(Schema.NullOr(Schema.ReadonlySet(Schema.String))),
         data: Schema.Record(Schema.String, Schema.Number),
         lists: Schema.Record(Schema.String, Schema.Array(Schema.String)),
       }),
@@ -130,6 +134,17 @@ const cases: ReadonlyArray<readonly [name: string, apply: (u: any) => any]> = [
   ["add a number to a set", (u) => u.add({ labels: 2 })],
   ["add a set of numbers to a set of strings", (u) => u.add({ labels: new Set([2]) })],
   ["delete from a string", (u) => u.deleteFromSet({ name: new Set(["x"]) })],
+  ["delete from a number", (u) => u.deleteFromSet({ n: new Set([5]) })],
+  [
+    "delete a set of numbers from a set of strings",
+    (u) => u.deleteFromSet({ labels: new Set([2]) }),
+  ],
+  ["delete a set of strings from a set of numbers", (u) => u.deleteFromSet({ ns: new Set(["1"]) })],
+  ["add a number to NULL", (u) => u.add({ nul: 2 })],
+  ["subtract from NULL", (u) => u.subtract({ nul: 2 })],
+  ["append to NULL", (u) => u.append({ nlist: ["x"] })],
+  ["add a set to NULL", (u) => u.add({ nset: new Set(["x"]) })],
+  ["delete from NULL", (u) => u.deleteFromSet({ nset: new Set(["x"]) })],
   [
     "operations on values the row holds",
     (u) =>
@@ -161,6 +176,10 @@ const outcome = (
         n: 5,
         tags: ["t"],
         labels: new Set(["l"]),
+        ns: new Set([1]),
+        nul: null,
+        nlist: null,
+        nset: null,
         data: { y: 1 },
         lists: {},
       }).asEffect()
@@ -189,6 +208,8 @@ const outcome = (
         read: {
           ...read,
           labels: read.labels === undefined ? undefined : [...(read.labels as Set<string>)],
+          ns: read.ns === undefined ? undefined : [...(read.ns as Set<number>)],
+          nset: read.nset instanceof Set ? [...(read.nset as Set<string>)] : read.nset,
         },
       }
     }),

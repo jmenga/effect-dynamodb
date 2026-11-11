@@ -36,6 +36,10 @@ const definitions = (config: ReadFirstUpdate) => {
       tags: Schema.optional(Schema.Array(Schema.String)),
       notes: Schema.optional(Schema.Array(Schema.String)),
       labels: Schema.optional(Schema.ReadonlySet(Schema.String)),
+      ns: Schema.optional(Schema.ReadonlySet(Schema.Number)),
+      nul: Schema.optional(Schema.NullOr(Schema.Number)),
+      nlist: Schema.optional(Schema.NullOr(Schema.Array(Schema.String))),
+      nset: Schema.optional(Schema.NullOr(Schema.ReadonlySet(Schema.String))),
       data: Schema.Record(Schema.String, Schema.Number),
       lists: Schema.Record(Schema.String, Schema.Array(Schema.String)),
     }),
@@ -57,18 +61,97 @@ const definitions = (config: ReadFirstUpdate) => {
 const ABSENT = "The provided expression refers to an attribute that does not exist in the item"
 const KIND = "An operand in the update expression has an incorrect data type"
 
-const refused: ReadonlyArray<readonly [name: string, says: string, apply: (u: any) => any]> = [
-  ["subtract from an attribute the row lacks", ABSENT, (u) => u.subtract({ m: 2 })],
-  ["append to an attribute the row lacks", ABSENT, (u) => u.append({ notes: ["x"] })],
-  ["subtract from a sparse map's entry the row lacks", ABSENT, (u) => u.subtract({ "data#x": 2 })],
-  ["append to a sparse map's entry the row lacks", ABSENT, (u) => u.append({ "lists#x": ["x"] })],
-  ["append to a string", KIND, (u) => u.append({ name: ["x"] })],
-  ["subtract from a string", KIND, (u) => u.subtract({ name: 2 })],
-  ["add a number to a string", KIND, (u) => u.add({ name: 2 })],
-  ["add a set to a string", KIND, (u) => u.add({ name: new Set(["x"]) })],
-  ["add a number to a set", KIND, (u) => u.add({ labels: 2 })],
-  ["add a set of numbers to a set of strings", KIND, (u) => u.add({ labels: new Set([2]) })],
-  ["delete from a string", KIND, (u) => u.deleteFromSet({ name: new Set(["x"]) })],
+/**
+ * Each operation DynamoDB refuses, its message in DynamoDB Local's wording, and what 1.40.0 did on
+ * these paths (measured on DynamoDB Local; one answer on all three but where noted).
+ */
+const refused: ReadonlyArray<
+  readonly [name: string, says: string, apply: (u: any) => any, on140: string]
+> = [
+  ["subtract from an attribute the row lacks", ABSENT, (u) => u.subtract({ m: 2 }), "stored -2"],
+  [
+    "append to an attribute the row lacks",
+    ABSENT,
+    (u) => u.append({ notes: ["x"] }),
+    "stored the operand alone",
+  ],
+  [
+    "subtract from a sparse map's entry the row lacks",
+    ABSENT,
+    (u) => u.subtract({ "data#x": 2 }),
+    "stored -2",
+  ],
+  [
+    "append to a sparse map's entry the row lacks",
+    ABSENT,
+    (u) => u.append({ "lists#x": ["x"] }),
+    "stored the operand alone",
+  ],
+  [
+    "append to a string",
+    KIND,
+    (u) => u.append({ name: ["x"] }),
+    "wrote the string's characters and the operand as a list, then failed: the row no longer reads",
+  ],
+  [
+    "subtract from a string",
+    KIND,
+    (u) => u.subtract({ name: 2 }),
+    "died on NaN (an index composite computed: ValidationError)",
+  ],
+  ["add a number to a string", KIND, (u) => u.add({ name: 2 }), 'stored "abc2"'],
+  [
+    "add a set to a string",
+    KIND,
+    (u) => u.add({ name: new Set(["x"]) }),
+    "wrote the set, then failed: the row no longer reads",
+  ],
+  [
+    "add a number to a set",
+    KIND,
+    (u) => u.add({ labels: 2 }),
+    'wrote "[object Set]2", then failed: the row no longer reads',
+  ],
+  [
+    "add a set of numbers to a set of strings",
+    KIND,
+    (u) => u.add({ labels: new Set([2]) }),
+    'stored the union, "2" a string',
+  ],
+  [
+    "delete from a string",
+    KIND,
+    (u) => u.deleteFromSet({ name: new Set(["x"]) }),
+    "wrote the row unchanged",
+  ],
+  [
+    "delete from a number",
+    KIND,
+    (u) => u.deleteFromSet({ n: new Set([5]) }),
+    "wrote the row unchanged",
+  ],
+  [
+    "delete a set of numbers from a set of strings",
+    KIND,
+    (u) => u.deleteFromSet({ labels: new Set([2]) }),
+    "wrote the row unchanged",
+  ],
+  [
+    "delete a set of strings from a set of numbers",
+    KIND,
+    (u) => u.deleteFromSet({ ns: new Set(["1"]) }),
+    "wrote the row unchanged",
+  ],
+  ["add a number to NULL", KIND, (u) => u.add({ nul: 2 }), "stored 2"],
+  ["subtract from NULL", KIND, (u) => u.subtract({ nul: 2 }), "stored -2"],
+  ["append to NULL", KIND, (u) => u.append({ nlist: ["x"] }), "stored the operand alone"],
+  ["add a set to NULL", KIND, (u) => u.add({ nset: new Set(["x"]) }), "stored the set"],
+  [
+    "delete from NULL",
+    KIND,
+    (u) => u.deleteFromSet({ nset: new Set(["x"]) }),
+    "wrote the row unchanged",
+  ],
 ]
 
 /** Seeds `a` and `b`, then sends `apply`'s update of `a`, alone or in a transaction. */
@@ -97,6 +180,10 @@ const run = (
       n: 5,
       tags: ["t"],
       labels: new Set(["l"]),
+      ns: new Set([1]),
+      nul: null,
+      nlist: null,
+      nset: null,
       data: { y: 1 },
       lists: {},
     }).asEffect()
@@ -124,8 +211,8 @@ describe.each(
 )("$name: a record operation is refused where DynamoDB refuses it (#236)", (config) => {
   for (const transaction of [false, true]) {
     const where = transaction ? "in a transaction" : "alone"
-    for (const [name, says, apply] of refused) {
-      it.effect(`${name}, ${where}`, () =>
+    for (const [name, says, apply, on140] of refused) {
+      it.effect(`${name}, ${where} | 1.40.0: ${on140}`, () =>
         run(config, transaction, apply, ({ exit, commands, written }) => {
           expect(Exit.isFailure(exit)).toBe(true)
           if (Exit.isFailure(exit)) {
