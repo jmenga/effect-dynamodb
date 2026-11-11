@@ -77,8 +77,13 @@ export interface RekeyRowContext {
   /** Write the index keys that differ ({@link RekeyOptions.repairIndexKeys}), or only count them. */
   readonly repairIndexKeys: boolean
   /**
+   * Judge the unique sentinels no row holds, and report them ({@link RekeyOptions.reservations}):
+   * without, such a sentinel is `unrecognizedKey`, as 1.40.0 counted it, and nothing more is read.
+   */
+  readonly reservations: boolean
+  /**
    * Delete the unique sentinels no row holds ({@link RekeyOptions.releaseOrphanedReservations}), or
-   * only count them.
+   * only count them. Implies {@link reservations}.
    */
   readonly releaseOrphanedReservations: boolean
   /** Writes to the table are stopped ({@link RekeyOptions.writesStopped}): see {@link unprovableRow}. */
@@ -1651,6 +1656,12 @@ export const run = (args: {
           ? `journalCapacity must be at most ${MAX_JOURNAL_CAPACITY}; received ${options.journalCapacity}.`
           : undefined)
       if (problem !== undefined) return yield* optionError(problem)
+      if (options.releaseOrphanedReservations === true && options.writesStopped !== true) {
+        return yield* optionError(
+          "releaseOrphanedReservations needs writesStopped: true. Releasing is a maintenance step: " +
+            "stop every writer to the table first, another cleanup releasing reservations included.",
+        )
+      }
 
       let positions: Array<Position>
       if (options.resume !== undefined) {
@@ -1698,6 +1709,7 @@ export const run = (args: {
         tableName,
         dryRun,
         repairIndexKeys: options.repairIndexKeys === true,
+        reservations: options.reservations === true || options.releaseOrphanedReservations === true,
         releaseOrphanedReservations: options.releaseOrphanedReservations === true,
         writesStopped: options.writesStopped === true,
         sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),

@@ -7,8 +7,9 @@
  * aggregates whose partitions chain, and a unique sentinel no row holds where a moving sentinel goes —
  * and every run must report the same, leave the same rows, agree with its dry run, and leave a
  * second run nothing to do. With `releaseOrphanedReservations` the sentinel no row holds is released
- * and the moving one takes its key; without, it's reported and the move is refused, whichever of the
- * two the scan meets first.
+ * and the moving one takes its key; without, the move is refused, whichever of the two the scan
+ * meets first, and the sentinel is reported with `reservations`, or counted `unrecognizedKey` as
+ * 1.40.0 counted it.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -154,9 +155,11 @@ const decided = (report: Table.RekeyReport) => {
 const storedOf = (rows: Iterable<Row>) => storedRows(rows)
 
 describe.each([
-  ["releasing", true],
-  ["reporting", false],
-] as const)("rekey's outcome doesn't depend on the order it meets the rows in, %s orphans", (_, release) => {
+  ["releasing", "release"],
+  ["reporting", "report"],
+  ["leaving", "leave"],
+] as const)("rekey's outcome doesn't depend on the order it meets the rows in, %s orphans", (_, mode) => {
+  const release = mode === "release"
   const first = new Map<string, unknown>()
   for (const segments of [1, 2, 3, 5]) {
     for (const seed of [0, 1, 2, 3]) {
@@ -175,7 +178,8 @@ describe.each([
               segments,
               concurrency,
               pageSize: 3,
-              releaseOrphanedReservations: release,
+              ...(mode === "release" && { releaseOrphanedReservations: true, writesStopped: true }),
+              ...(mode === "report" && { reservations: true }),
             }
             const runs = yield* Effect.gen(function* () {
               const db = yield* on.client
@@ -191,12 +195,16 @@ describe.each([
             expect(runs.untouched).toEqual(storedOf(rows))
             expect(decided(runs.dry)).toEqual(decided(runs.real))
             // Every chain moves in one run, every row counted once. m4's sentinels are released,
-            // and m3's email takes its key; or they're reported, and m3's stays where it is.
+            // and m3's email takes its key; or they're reported, or counted `unrecognizedKey`, and
+            // m3's stays where it is.
             expect(runs.real.reservations).toMatchObject(
-              release
+              mode === "release"
                 ? { orphaned: 2, released: 2, skipped: 0, undecided: 0 }
-                : { orphaned: 2, released: 0, skipped: 0, undecided: 0 },
+                : mode === "report"
+                  ? { orphaned: 2, released: 0, skipped: 0, undecided: 0 }
+                  : { orphaned: 0, released: 0, skipped: 0, undecided: 0 },
             )
+            expect(runs.real.skipped.unrecognizedKey).toBe(mode === "leave" ? 2 : 0)
             expect(runs.real.conflicts.map((conflict) => conflict.reason)).toEqual(
               release ? [] : ["taken"],
             )

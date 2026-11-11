@@ -14887,10 +14887,10 @@ const makeImpl = <
               }
             }
           }
-          if (kind === "tombstone" && !preserveUnique()) {
+          if (kind === "tombstone" && !preserveUnique() && ctx.reservations) {
             // A sentinel a tombstone without `preserveUnique` names is one no row holds
             // ({@link orphanedByTombstone}): judged first, as the scan judges it. Released, it
-            // doesn't move; otherwise it moves as it is.
+            // doesn't move; otherwise it moves as it is, as it always does without `reservations`.
             const from = sentinelKeyRecord(found.key)
             yield* judgeReservationRow(ctx, found.held, constraintName, constraintDef, from)
             if (ctx.vacated(toAttributeMap(from))) continue
@@ -15511,7 +15511,7 @@ const makeImpl = <
           : named(sentinel, owner, false)
             ? Effect.sync(() => leftToOwner(sentinel, owner)).pipe(
                 Effect.andThen(
-                  orphanedByTombstone(owner) && constraintDef !== undefined
+                  ctx.reservations && orphanedByTombstone(owner) && constraintDef !== undefined
                     ? Effect.as(
                         judgeReservationRow(ctx, sentinel, constraintName, constraintDef, at),
                         {},
@@ -15540,7 +15540,9 @@ const makeImpl = <
       ) {
         return { skipped: { unrecognizedKey: 1 } }
       }
-      // No row holds it, as far as the scan's reads say: judged as its unit, counted when it settles.
+      // No row holds it, as far as the scan's reads say. Without `reservations`, counted as 1.40.0
+      // counted it, with nothing more read; with it, judged as its unit, counted when it settles.
+      if (!ctx.reservations) return { skipped: { unrecognizedKey: 1 } }
       yield* judgeReservationRow(ctx, fresh, constraintName, constraintDef, at)
       return {}
     })

@@ -1063,11 +1063,12 @@ export interface RekeyReservation {
 }
 
 /**
- * Unique sentinels no row holds, and ones `rekey` couldn't judge. `orphaned` and `undecided` are
- * counted on every run; `released` and `skipped` only with
- * {@link RekeyOptions.releaseOrphanedReservations}. `orphaned` counts every one found, so it
- * includes those `released` and `skipped`. Each sentinel is judged once a run, however the run
- * reaches it.
+ * Unique sentinels no row holds, and ones `rekey` couldn't judge, counted only with
+ * {@link RekeyOptions.reservations} (or `releaseOrphanedReservations`): without, every count is 0,
+ * and such a sentinel is counted in `skipped.unrecognizedKey`, as 1.40.0 counted it. `released`
+ * and `skipped` are counted only with {@link RekeyOptions.releaseOrphanedReservations}. `orphaned`
+ * counts every one found, so it includes those `released` and `skipped`. Each sentinel is judged
+ * once a run, however the run reaches it.
  */
 export interface RekeyReservationCounts {
   readonly orphaned: number
@@ -1207,15 +1208,25 @@ export interface RekeyOptions {
    */
   readonly repairIndexKeys?: boolean | undefined
   /**
+   * Judge the unique sentinels no row holds, and count them in {@link RekeyReport.reservations}.
+   * Default `false`: the run sends what 1.40.0 sent, and counts such a sentinel in
+   * `skipped.unrecognizedKey`, as 1.40.0 did. Judging reads more than that: under `preserveUnique`,
+   * a sentinel whose item is gone or holds another value costs a query for the item's tombstones,
+   * and one that looks orphaned is read again. It writes nothing.
+   */
+  readonly reservations?: boolean | undefined
+  /**
    * Also delete the unique sentinels {@link RekeyReport.reservations} finds no row holding
-   * (`orphaned`), so their values can be taken again. Default `false`: the run counts them and
-   * deletes nothing. Each is one transaction: the sentinel's `Delete`, conditioned on its
-   * back-pointer (and TTL, when it has one) as read, so a reservation claimed in between is never
-   * deleted, and a `ConditionCheck` that the row it names is still absent, or still holds the values
-   * read. On a failed condition the sentinel is read once and judged again, then counted in
-   * `skipped`. Only a sentinel of a known entity and constraint, under the schema's own key prefix,
-   * is ever judged. An orphaned sentinel holding the current key of another item's sentinel is
-   * judged, and released, before that sentinel moves there.
+   * (`orphaned`), so their values can be taken again. Implies {@link reservations}. Default
+   * `false`: nothing is deleted. A maintenance step: it needs {@link writesStopped}, with every
+   * writer to the table stopped — another run releasing reservations counts as one — and fails
+   * with a `ValidationError` (`EDD-9098`) before anything is read without it. Each release is one
+   * transaction: the sentinel's `Delete`, conditioned on its back-pointer (and TTL, when it has
+   * one) as read, so a reservation claimed in between is never deleted, and a `ConditionCheck`
+   * that the row it names is still absent, or still holds the values read. On a failed condition
+   * the sentinel is read once and judged again. Only a sentinel of a known entity and constraint,
+   * under the schema's own key prefix, is ever judged. An orphaned sentinel holding the current
+   * key of another item's sentinel is judged, and released, before that sentinel moves there.
    */
   readonly releaseOrphanedReservations?: boolean | undefined
   /**

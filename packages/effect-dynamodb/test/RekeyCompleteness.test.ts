@@ -195,7 +195,7 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
   const w = world(escapeKeys)
 
   it.effect(
-    "a unique sentinel with no row behind it is an orphaned reservation, on every run",
+    "a unique sentinel with no row behind it is an orphaned reservation, on every run that judges reservations",
     () => {
       const table = tableOf()
       return Effect.gen(function* () {
@@ -206,7 +206,17 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         )
         const before = storedOf(table)
         expect(before).toHaveLength(1)
-        const { dry, real } = yield* dryThenReal(db)
+        // Without `reservations`, counted as 1.40.0 counted it.
+        const plain = yield* dryThenReal(db)
+        expect(plain.real.skipped.unrecognizedKey).toBe(1)
+        expect(plain.real.reservations).toMatchObject({
+          orphaned: 0,
+          released: 0,
+          skipped: 0,
+          undecided: 0,
+        })
+        expect(rekeyOutcome(plain.dry)).toEqual(rekeyOutcome(plain.real))
+        const { dry, real } = yield* dryThenReal(db, { reservations: true })
         expect(real.skipped.unrecognizedKey).toBe(0)
         expect(real.reservations).toMatchObject({
           orphaned: 1,
@@ -216,7 +226,9 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         })
         expect(real.reservations.entries.map((entry) => entry.outcome)).toEqual(["orphaned"])
         expect(rekeyOutcome(dry)).toEqual(rekeyOutcome(real))
-        expect((yield* db.tables.MainTable.rekey()).reservations.orphaned).toBe(1)
+        expect(
+          (yield* db.tables.MainTable.rekey({ reservations: true })).reservations.orphaned,
+        ).toBe(1)
         expect(storedOf(table)).toEqual(before)
       }).pipe(on(w, table))
     },
@@ -237,7 +249,8 @@ describe.each(SETTINGS)("rows `rekey` can't place are counted, %s", (_direction,
         __edd_e__: "Account._unique.email",
       })
       const before = storedOf(table)
-      const { dry, real } = yield* dryThenReal(db)
+      expect((yield* dryThenReal(db)).real.skipped.unrecognizedKey).toBe(1)
+      const { dry, real } = yield* dryThenReal(db, { reservations: true })
       expect(real.conflicts).toEqual([])
       expect(real.skipped.unrecognizedKey).toBe(0)
       expect(real.reservations).toMatchObject({

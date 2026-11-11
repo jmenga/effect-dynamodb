@@ -195,6 +195,12 @@ const ZERO = { orphaned: 0, released: 0, skipped: 0, undecided: 0 }
 const rekey = (db: any, options: Table.RekeyOptions = {}) =>
   db.tables.MainTable.rekey(options) as Effect.Effect<Table.RekeyReport, unknown>
 
+/** Judge reservations and report them, deleting nothing. */
+const JUDGE = { reservations: true } as const
+
+/** Release orphaned reservations: a maintenance step, with writes stopped. */
+const RELEASE = { releaseOrphanedReservations: true, writesStopped: true } as const
+
 // ---------------------------------------------------------------------------
 // The rows 1.39.0 left
 // ---------------------------------------------------------------------------
@@ -228,14 +234,20 @@ const entriesOf = (report: Table.RekeyReport) =>
 
 export const fixtureScenarios: ReadonlyArray<RepairScenario> = [
   ...bothSettings(
-    "the rows 1.39.0 left are counted on every run, and nothing is written",
+    "the rows 1.39.0 left are counted on every run that judges reservations, and nothing is written",
     (h, on) => {
       const w = world(on)
       return h.on(w, (table) =>
         Effect.gen(function* () {
           yield* seedAll(table)
           const db = yield* w.client
-          const report = yield* rekey(db)
+          // Without `reservations`, as 1.40.0 counted them: the two no row names are
+          // `unrecognizedKey`, and the one a tombstone names is left to it.
+          const plain = yield* rekey(db)
+          expect(plain.reservations).toEqual({ ...ZERO, entries: [] })
+          expect(plain.skipped.unrecognizedKey).toBe(2)
+          expect(writesOf(table)).toEqual([])
+          const report = yield* rekey(db, JUDGE)
           expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 3 })
           // By member, then key, whatever order the scan met them in.
           expect(report.reservations.entries).toEqual(entriesOf(report))
@@ -256,7 +268,7 @@ export const fixtureScenarios: ReadonlyArray<RepairScenario> = [
           expect(writesOf(table)).toEqual([])
           expect(yield* table.rows()).toEqual(ROWS_139)
           // And again: counting changes nothing.
-          expect((yield* rekey(db)).reservations).toMatchObject({ ...ZERO, orphaned: 3 })
+          expect((yield* rekey(db, JUDGE)).reservations).toMatchObject({ ...ZERO, orphaned: 3 })
         }),
       )
     },
@@ -269,7 +281,7 @@ export const fixtureScenarios: ReadonlyArray<RepairScenario> = [
         Effect.gen(function* () {
           yield* seedAll(table)
           const db = yield* w.client
-          const dry = yield* rekey(db, { dryRun: true, releaseOrphanedReservations: true })
+          const dry = yield* rekey(db, { ...RELEASE, dryRun: true })
           expect(dry.reservations).toMatchObject({ ...ZERO, orphaned: 3, released: 3 })
           expect(entriesOf(dry).map((entry) => entry.outcome)).toEqual([
             "released",
@@ -278,7 +290,7 @@ export const fixtureScenarios: ReadonlyArray<RepairScenario> = [
           ])
           expect(writesOf(table)).toEqual([])
           table.clear()
-          const real = yield* rekey(db, { releaseOrphanedReservations: true })
+          const real = yield* rekey(db, RELEASE)
           expect(rekeyOutcome(real)).toEqual(rekeyOutcome(dry))
           const rows = yield* table.rows()
           for (const { key } of ORPHANS_139) expect(has(rows, key), key.pk).toBe(false)
@@ -314,7 +326,7 @@ export const fixtureScenarios: ReadonlyArray<RepairScenario> = [
           expect(yield* failsWith(db.entities.Holders.put({ id: "k", n: 11n }).asEffect())).toBe(
             "UniqueConstraintViolation",
           )
-          expect((yield* rekey(db, { releaseOrphanedReservations: true })).reservations).toEqual({
+          expect((yield* rekey(db, RELEASE)).reservations).toEqual({
             ...ZERO,
             entries: [],
           })
@@ -340,7 +352,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
           yield* db.entities.Holders.delete({ id: "h2" }).asEffect()
           const before = yield* table.rows()
           expect(has(before, sentinelKey("holder", 41))).toBe(true)
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(report.reservations).toEqual({ ...ZERO, entries: [] })
           expect(yield* table.rows()).toEqual(before)
           expect(yield* failsWith(db.entities.Holders.put({ id: "z", n: 41n }).asEffect())).toBe(
@@ -364,7 +376,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
         const seat2 = { pk: kept._entity_pk.S, sk: kept._entity_sk.S.replace(/1$/, "2") }
         expect(seat2.sk).not.toBe(kept._entity_sk.S)
         yield* table.seed(sentinelRow("seat", 32, seat2))
-        const report = yield* rekey(db, { releaseOrphanedReservations: true })
+        const report = yield* rekey(db, RELEASE)
         expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1, released: 1 })
         expect(report.reservations.entries[0]).toMatchObject({
           key: sentinelKey("seat", 32),
@@ -392,7 +404,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
           // A write outside the library pointed seat 1's reservation at seat 2, which isn't there.
           const seat2 = { pk: kept._entity_pk.S, sk: kept._entity_sk.S.replace(/1$/, "2") }
           yield* table.seed(sentinelRow("seat", 31, seat2))
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1, released: 1 })
           expect(has(yield* table.rows(), sentinelKey("seat", 31))).toBe(false)
           // Seat 1's tombstone takes the value back when it is restored.
@@ -425,7 +437,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
           })
           yield* table.seed(sentinelRow("seat", 32, seat2))
           table.clear()
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(report.reservations).toMatchObject({ ...ZERO, undecided: 1 })
           expect(report.reservations.entries[0]).toMatchObject({
             key: sentinelKey("seat", 32),
@@ -461,9 +473,9 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
             _entity_pk: { S: itemKey("handle", "a").pk },
             _entity_sk: { S: itemKey("handle", "a").sk },
           })
-          const dry = yield* rekey(db, { dryRun: true, releaseOrphanedReservations: true })
+          const dry = yield* rekey(db, { ...RELEASE, dryRun: true })
           expect(dry.reservations).toEqual({ ...ZERO, entries: [] })
-          const real = yield* rekey(db, { releaseOrphanedReservations: true })
+          const real = yield* rekey(db, RELEASE)
           expect(real.reservations).toEqual({ ...ZERO, entries: [] })
           expect(real.sentinelsMoved).toBe(1)
           const rows = yield* table.rows()
@@ -505,7 +517,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
             message: "The row it names doesn't exist.",
           }
           // Released, it doesn't move.
-          const dry = yield* rekey(db, { dryRun: true, releaseOrphanedReservations: true })
+          const dry = yield* rekey(db, { ...RELEASE, dryRun: true })
           expect(dry.sentinelsMoved).toBe(0)
           expect(dry.reservations).toEqual({
             ...ZERO,
@@ -514,7 +526,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
             entries: [{ ...entry, outcome: "released" }],
           })
           // Otherwise it moves as it did, the value still reserved, and is reported.
-          const counted = yield* rekey(db)
+          const counted = yield* rekey(db, JUDGE)
           expect(counted.sentinelsMoved).toBe(1)
           expect(counted.reservations).toEqual({
             ...ZERO,
@@ -525,7 +537,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
           expect(
             yield* failsWith(db.entities.Tags.put({ id: "u", handle: "x y" }).asEffect()),
           ).toBe("UniqueConstraintViolation")
-          const released = yield* rekey(db, { releaseOrphanedReservations: true })
+          const released = yield* rekey(db, RELEASE)
           expect(released.sentinelsMoved).toBe(0)
           expect(released.reservations).toEqual({
             ...ZERO,
@@ -554,7 +566,7 @@ export const heldScenarios: ReadonlyArray<RepairScenario> = [
           // A write outside the library changed the value: the old sentinel is left.
           yield* table.seed(itemRow("renamed", "c", { N: "8" }, "num"))
           table.clear()
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1, released: 1 })
           const [release] = transactsOf(table)
           const check = release!.input.TransactItems[1].ConditionCheck
@@ -590,7 +602,7 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
               ? Effect.andThen(table.seed(itemRow("account", "z", { N: "5" })), table.seed(claimed))
               : Effect.void
           })
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(writes).toBe(1)
           expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1 })
           expect(report.reservations.entries[0]!.outcome).toBe("orphaned")
@@ -616,7 +628,7 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
             writes++
             return writes === 1 ? table.seed(itemRow("account", "a", { N: "5" })) : Effect.void
           })
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(writes).toBe(1)
           expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1 })
           expect(has(yield* table.rows(), sentinelKey("account", 5))).toBe(true)
@@ -636,7 +648,7 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
           writes++
           return writes === 1 ? table.seed(itemRow("renamed", "c", { N: "7" }, "num")) : Effect.void
         })
-        const report = yield* rekey(db, { releaseOrphanedReservations: true })
+        const report = yield* rekey(db, RELEASE)
         expect(writes).toBe(1)
         expect(report.reservations).toMatchObject({ ...ZERO, orphaned: 1 })
         expect(has(yield* table.rows(), sentinelKey("renamed", 7))).toBe(true)
@@ -662,7 +674,7 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
               __edd_d__: { SS: [`other${writes}`] },
             })
           })
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(writes).toBe(2)
           expect(report.reservations).toMatchObject({
             ...ZERO,
@@ -694,7 +706,7 @@ export const racingScenarios: ReadonlyArray<RepairScenario> = [
               ? table.seed(sentinelRow("pass", 5, owner, { _ttl: { N: "2000" } }))
               : Effect.void
           })
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           // The first release named the expiry it read, and lost; the second names the new one.
           const transacts = transactsOf(table)
           expect(transacts).toHaveLength(2)
@@ -769,7 +781,7 @@ export const untouchedScenarios: ReadonlyArray<RepairScenario> = [
       Effect.gen(function* () {
         const db = yield* w.client
         yield* table.seed(sentinelRow("account", 21, undefined))
-        const report = yield* rekey(db, { releaseOrphanedReservations: true })
+        const report = yield* rekey(db, RELEASE)
         expect(report.reservations).toMatchObject({ ...ZERO, undecided: 1 })
         expect(report.reservations.entries[0]).toMatchObject({
           key: sentinelKey("account", 21),
@@ -789,7 +801,7 @@ export const untouchedScenarios: ReadonlyArray<RepairScenario> = [
         yield* db.entities.Members.put({ id: "q", n: 50n }).asEffect()
         yield* table.seed(sentinelRow("account", 22, itemKey("member", "q")))
         table.clear()
-        const report = yield* rekey(db, { releaseOrphanedReservations: true })
+        const report = yield* rekey(db, RELEASE)
         expect(report.reservations).toMatchObject({ ...ZERO, undecided: 1 })
         expect(report.reservations.entries[0]!.message).toBe(
           'The row it names is a "Member" row, not a "Account".',
@@ -822,7 +834,7 @@ export const untouchedScenarios: ReadonlyArray<RepairScenario> = [
           }
           yield* table.seed(row)
           yield* table.seed(inherited)
-          const report = yield* rekey(db, { releaseOrphanedReservations: true })
+          const report = yield* rekey(db, RELEASE)
           expect(report.reservations).toEqual({ ...ZERO, entries: [] })
           expect(report.skipped.unrecognizedKey).toBe(2)
           expect(yield* table.rows()).toEqual([inherited, row])
@@ -846,7 +858,7 @@ export const untouchedScenarios: ReadonlyArray<RepairScenario> = [
         const halfway = { ...row, sk: { S: "$vu#v1#account.number" } }
         yield* table.seed(row)
         yield* table.seed(halfway)
-        const report = yield* rekey(db, { releaseOrphanedReservations: true })
+        const report = yield* rekey(db, RELEASE)
         expect(report.reservations).toEqual({ ...ZERO, entries: [] })
         expect(report.skipped.unrecognizedKey).toBe(2)
         expect(yield* table.rows()).toEqual([row, halfway])
@@ -867,7 +879,7 @@ export const recordingOnlyScenarios: ReadonlyArray<RepairScenario> = [
         const db = yield* w.client
         yield* table.seed(itemRow("account", "a", { N: "NaN" }))
         yield* table.seed(orphanOf5)
-        const report = yield* rekey(db, { releaseOrphanedReservations: true })
+        const report = yield* rekey(db, RELEASE)
         expect(report.reservations).toMatchObject({ ...ZERO, undecided: 1 })
         expect(report.reservations.entries[0]!.owner).toEqual(itemKey("account", "a"))
         expect(writesOf(table)).toEqual([])

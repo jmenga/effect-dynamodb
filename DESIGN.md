@@ -1106,9 +1106,9 @@ row for a rerun or count it differently: a reservation whose named row is
 missing is `undecided` once the journal is full (`journalFull`), since the run
 can't tell whether it moved that row, so no release is sent that a run with
 room wouldn't send. The journal reads and writes nothing: over a table with nothing to
-move, a run sends exactly the requests 1.40.0 sent
-(`test/fixtures/rekey-requests-1.40.0.json`, from the published package;
-`RekeyQuietRequests.test.ts` and its connected twin).
+move, a run without `reservations` sends exactly the requests 1.40.0 sent
+(`test/fixtures/rekey-requests-1.40.0.json` and `rekey-requests-reservations-1.40.0.json`,
+from the published package; `RekeyQuietRequests.test.ts` and its connected twin).
 
 **Idempotence.** A row moves only when it is stored under a key its values
 composed under another form and that key differs from the one they compose now. The scan is
@@ -1399,7 +1399,7 @@ substitutions.
 |---|---|
 | Item under other text | `moveItem`: a consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the old item under `deleteGuard`, unique sentinels moved or re-pointed (`sentinelRekeys`). Another value's old row at the target moves first (`clearTarget`). The same item already at the target is `bothKeys` only if it is still at its old key when read again. A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys`. After the move, a half it couldn't recompose (a truncated sort key before a gap a later composite fills, which `preserve` keeps) is rewritten as for an item at its current key, in the same run (`rekeyAfterMove`, reading the item only when the predicted move, `movedRowOf`, leaves one); a dry run counts it from that prediction |
 | Item at its current key | GSI halves and vector partitions whose stored text is exactly another form's text and differs from the current text are rewritten by one `UpdateItem`, conditioned on the item existing, each half still holding that text and the composites the row holds as read (`indexKeysRewritten`). A sharded index's partition key is the exception: it is composed and compared whatever it holds, which is what moves rows into the layout, and one whose values can't compose it is left, the conflict `uncomposable` unless it is already in the current layout. A Z-order sort half keeps its address, one the index policy left behind its values, one kept for a value since cleared, and a table key attribute are not touched. Unique sentinels whose text changed are put at the current key and the old one released (`rekeySentinels`, `sentinelsMoved`) |
-| Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One no row holds is an orphaned reservation, and one nothing can judge is `undecided` (both in `report.reservations`, below), at one or two extra reads per sentinel on every run. A sentinel of a constraint the entity doesn't declare, or not under the schema's own key prefix, is `unrecognizedKey` |
+| Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One no row holds is, with the `reservations` option, an orphaned reservation, and one nothing can judge is `undecided` (both in `report.reservations`, below); without it, `unrecognizedKey`, as 1.40.0 counted it, for the requests 1.40.0 sent. Reading it back costs one or two reads per sentinel on every run. A sentinel of a constraint the entity doesn't declare, or not under the schema's own key prefix, is `unrecognizedKey` |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
 | Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, whole, `wholeRowGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned the same way); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
@@ -1459,7 +1459,8 @@ rows below no root, met by a run that didn't read the whole table (`maxPages`, `
 say the root isn't there, since a root at its old key on a page it didn't read could claim them, so a run
 over the whole table judges them; only that run counts them `unrecognizedKey`.
 
-**Orphaned reservations, and `releaseOrphanedReservations`.** A unique sentinel of a declared constraint,
+**Orphaned reservations: `reservations` and `releaseOrphanedReservations`.** With `reservations: true`
+(off by default), a unique sentinel of a declared constraint,
 under the schema's own key prefix (its sort key is the constraint's under some form, and its partition key
 starts with it), is held when the row its back-pointer (`_entity_pk` / `_entity_sk`) names is of its entity and
 composes the sentinel's key under some form (`holdsSentinel`), or, with `preserveUnique`, when a tombstone of
@@ -1469,18 +1470,26 @@ the row is gone, or it holds another value or none. That is exactly what a corre
 releases, which is what a `Schema.BigInt` unique field on 1.39 and earlier didn't (a delete composed the
 sentinel from the number DynamoDB handed back, and a soft delete without `preserveUnique` kept it).
 `undecided`: no back-pointer, a row of another type behind it, or values that compose no sentinel key under some
-form, so nothing says what they'd give. Every run counts both in `report.reservations` and per member, with an
-entry per sentinel (member, constraint, key, back-pointer, outcome, why), for no read beyond what a sentinel
-already costs: one that looks orphaned is read again consistently and judged again first, since a move of its row
-takes it along.
+form, so nothing says what they'd give. Such a run counts both in `report.reservations` and per member, with an
+entry per sentinel (member, constraint, key, back-pointer, outcome, why): under `preserveUnique` a sentinel whose
+row is gone or holds another value costs a query for that row's tombstones, and one that looks orphaned is read
+again consistently and judged again first, since a move of its row takes it along. Without the option nothing is
+judged, and a run sends exactly what 1.40.0 sent (`RekeyQuietRequests.test.ts`, over
+`fixtures/rekey-requests-reservations-1.40.0.json`: keys used again after each kind of delete, and the rows 1.39.0
+left): a sentinel no row holds is `unrecognizedKey`, and one a tombstone names is left to the tombstone, as in
+1.40.0. Reporting is opt-in because judging reads more than 1.40.0 did on exactly the tables that have such
+sentinels.
 
 A sentinel is judged once a run, as its own unit (`Rekey.reservationUnit`, apart from the `rowUnit` that moves
 it), by whatever meets it first, so the report doesn't depend on the order: the scan; a tombstone without
 `preserveUnique` moving it (`orphanedByTombstone`), which moves it as 1.40.0 did, the value staying reserved,
-unless it was released; or, with the option, a move whose current sentinel key it holds. Without the option that
-move is `taken`, as in 1.40.0, and the sentinel is reported.
+unless it was released; or, with `releaseOrphanedReservations`, a move whose current sentinel key it holds.
+Without that option the move is `taken`, as in 1.40.0, and the sentinel is reported.
 
-`rekey({ releaseOrphanedReservations: true })`, off by default, deletes the orphans: one `TransactWriteItems`
+`rekey({ releaseOrphanedReservations: true, writesStopped: true })`, off by default, implies `reservations`
+and deletes the orphans. It is a maintenance step: without `writesStopped: true` the run fails with a
+`ValidationError` (`EDD-9098`) before anything is read, since a value is only safely free with every writer
+stopped, a second run releasing reservations included. The guards below hold even when that promise is broken: one `TransactWriteItems`
 each, the sentinel's `Delete` conditioned on the back-pointer and the TTL attribute as read (or absent), so a
 claim in between, a TTL'd reservation expired and taken again included, is never deleted, and a
 `ConditionCheck` on the row it names: absent, or its `__edd_e__`, the constraint's stored attributes (renames
@@ -3832,8 +3841,8 @@ writes for a changed value carries its constraint's `ttl`, as a put's does.
 A reservation no row holds any more (a release that never happened, as a delete
 of a `Schema.BigInt` unique value on 1.39 and earlier left it, or a write outside
 the library that changed the value) is reported by `rekey` in
-`report.reservations` and released with `releaseOrphanedReservations` (§7, "Orphaned
-reservations"), under the same ownership rule.
+`report.reservations` with `reservations: true`, and released with
+`releaseOrphanedReservations` and `writesStopped` (§7, "Orphaned reservations"), under the same ownership rule.
 
 **`upsert` that reads first.** One `UpdateItem` cannot write, rotate or check a
 sentinel, snapshot the replaced item, or tell whether to store a default or keep

@@ -9,7 +9,8 @@
  *   - A bounded run (`maxPages`) resumed until the table is done
  *   - A rerun moves nothing
  *   - `rekey({ repairIndexKeys: true })`: write an index key its row's values compose and it lacks
- *   - `rekey({ releaseOrphanedReservations: true })`: delete a unique sentinel no row holds
+ *   - `rekey({ reservations: true })`: report a unique sentinel no row holds
+ *   - `rekey({ releaseOrphanedReservations: true, writesStopped: true })`: delete it, writers stopped
  *   - `rekey` under the default moves them back, the same way
  *   - An entity keyed by a codec whose `encode` takes its own output: 1.39.0's rows need `rekey`
  *
@@ -325,33 +326,47 @@ const program = Effect.gen(function* () {
   assertEq(taken._tag, "UniqueConstraintViolation", "the number is still reserved")
 
   // #region reservations
-  // `rekey` counts unique sentinels no row holds. `releaseOrphanedReservations`
-  // deletes them, so their values can be taken again: dry run first.
+  // With `reservations`, `rekey` judges and reports unique sentinels no row holds.
   const orphans = yield* db.tables.MainTable.rekey({
-    dryRun: true,
-    releaseOrphanedReservations: true,
+    reservations: true,
     streams: [Calibrations],
   })
-  // orphans.reservations → { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: [...] }
+  // orphans.reservations → { orphaned: 1, released: 0, skipped: 0, undecided: 0, entries: [...] }
   // orphans.reservations.entries[0].message → "The row it names doesn't exist."
+
+  // Releasing them is a maintenance step: stop every writer to the table first, then
+  // dry run, then run.
+  const releases = yield* db.tables.MainTable.rekey({
+    dryRun: true,
+    releaseOrphanedReservations: true,
+    writesStopped: true,
+    streams: [Calibrations],
+  })
+  // releases.reservations → { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: [...] }
 
   const released = yield* db.tables.MainTable.rekey({
     releaseOrphanedReservations: true,
+    writesStopped: true,
     streams: [Calibrations],
   })
   // released.reservations → the same, and the number can be taken again
   // #endregion
   assertEq(
     { ...orphans.reservations, entries: orphans.reservations.entries.length },
-    { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: 1 },
-    "what the dry run says",
+    { orphaned: 1, released: 0, skipped: 0, undecided: 0, entries: 1 },
+    "what the report says",
   )
   assertEq(
     orphans.reservations.entries[0]?.message,
     "The row it names doesn't exist.",
     "and why",
   )
-  assertEq(released.reservations, orphans.reservations, "the run agrees")
+  assertEq(
+    { ...releases.reservations, entries: releases.reservations.entries.length },
+    { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: 1 },
+    "what the dry run says",
+  )
+  assertEq(released.reservations, releases.reservations, "the run agrees")
   yield* db.entities.Tickets.put({ ticketId: "t-2", number: 5n })
   yield* Console.log(`Released: ${JSON.stringify(released.reservations.entries[0]?.key)}`)
 

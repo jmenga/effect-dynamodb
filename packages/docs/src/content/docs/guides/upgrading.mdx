@@ -138,7 +138,7 @@ The report counts:
 | `indexKeysRewritten` | Items at their current table key whose index keys or vector partitions held other text, rewritten in place |
 | `sentinelsMoved` | Unique-constraint sentinels moved to their current keys |
 | `indexKeys` | Index keys of an item at its current table key that aren't what its values compose: `missing`, `truncated`, `lagging` and `ambiguous`, on every run, and `repaired` and `skipped` with `repairIndexKeys` (see [Repairing index keys](#repairing-index-keys)) |
-| `reservations` | Unique-constraint sentinels no row holds: `orphaned` and `undecided`, on every run, and `released` and `skipped` with `releaseOrphanedReservations`, with an entry for each (see [Releasing orphaned reservations](#releasing-orphaned-reservations)) |
+| `reservations` | Unique-constraint sentinels no row holds, with the `reservations` option: `orphaned` and `undecided`, and `released` and `skipped` with `releaseOrphanedReservations`, with an entry for each (see [Releasing orphaned reservations](#releasing-orphaned-reservations)). Without the option, every count is 0 |
 | `guardGaps` | Rows moved, with writes going on, under a guard that can miss a write: `stamp`, `sparse` and `strongest` (see [Writes during a run](#writes-during-a-run)) |
 | `conflicts` | Rows left where they are, and why, each listed once per run (see [Conflicts](#conflicts)) |
 | `skipped` | Rows `rekey` didn't move: `notLibrary` (no `__edd_e__`), `unregistered` (a type the client doesn't know, or an outbox item on its own table whose projection isn't defined where `rekey` runs, or whose read model the client doesn't know), `unrecognizedKey` (see [What `rekey` can't move](#what-rekey-cant-move)), `rootNotSeen` (an aggregate row with no root in its partition, met by a run that didn't read the whole table; a run over the whole table judges it) |
@@ -170,7 +170,8 @@ const report = yield* db.tables.MainTable.rekey({
 |--------|---------|-------------|
 | `dryRun` | `false` | Count what would move, reading but writing nothing |
 | `repairIndexKeys` | `false` | Write the index keys `indexKeys` counts (see [Repairing index keys](#repairing-index-keys)) |
-| `releaseOrphanedReservations` | `false` | Delete the unique-constraint sentinels `reservations` counts as `orphaned` (see [Releasing orphaned reservations](#releasing-orphaned-reservations)) |
+| `reservations` | `false` | Judge the unique-constraint sentinels no row holds, and count them in `reservations` (see [Releasing orphaned reservations](#releasing-orphaned-reservations)) |
+| `releaseOrphanedReservations` | `false` | Also delete the ones counted `orphaned`. Implies `reservations`, and needs `writesStopped: true` (see [Releasing orphaned reservations](#releasing-orphaned-reservations)) |
 | `segments` | `1` | Parallel scan segments, each scanned by its own fiber |
 | `concurrency` | `4` | Rows of one scan page handled at once, per segment |
 | `pageSize` | DynamoDB's (1 MB pages) | The scan's `Limit` |
@@ -330,82 +331,38 @@ From v1.7.2 through 1.38, an update naming no composite of an index half that mi
 
 1.39 stops new damage. Rows already damaged stay that way until a write names the half's composites, the item is put again, or you repair them. A key can also lag its values without damage: `.set({ b })` on `sk: [a, b]` under `preserve` leaves the key at the old `b`.
 
-**Every run counts these**, in `report.indexKeys` and for each member, from the row the scan already read. With `repairIndexKeys: true` it writes them too. Dry run first: it finds the same keys and writes nothing, so its `repaired` is 0. What a run would write is its `missing`, `truncated` and `lagging`.
-
-```typescript region="repair" example="guide-upgrade.ts"
-// `rekey` counts index keys that aren't what their row's values compose.
-// `repairIndexKeys` writes them: dry run first, to see what it would write.
-const repairs = yield* db.tables.MainTable.rekey({
-  dryRun: true,
-  repairIndexKeys: true,
-  streams: [Calibrations],
-})
-// repairs.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 0, skipped: 0 }
-
-const repaired = yield* db.tables.MainTable.rekey({
-  repairIndexKeys: true,
-  streams: [Calibrations],
-})
-// repaired.indexKeys → { missing: 1, truncated: 0, lagging: 0, ambiguous: 0, repaired: 1, skipped: 0 }
-```
-
-The correct key is what a `put` of the row's values writes now, composed the same way. Each half of each secondary index is judged by itself:
-
-| Count | The row has | With `repairIndexKeys` |
-|-------|-------------|------------------------|
-| `missing` | No key, and every composite of the whole index | Writes it |
-| `truncated` | A key that's the start of what its composites compose | Writes it |
-| `lagging` | Any other key that differs: behind its values, or under `sparse` a key its values no longer compose | Writes it, or under `sparse` removes it or writes the part that composes |
-| `ambiguous` | No key on a `sparse` half with two or more composites outside the primary key, and all of them on the row | **Leaves it** |
-| `repaired` | | Keys written: `missing`, `truncated` and `lagging`, less those a writer changed first. A dry run writes none and counts none |
-| `skipped` | | Keys left to a writer that changed the row, twice |
-
-**A `sparse` row counted `ambiguous` may be that way on purpose.** A writer naming `timestamp` and not `alertState` on `sk: [alertState, timestamp]` takes the row out of the index and leaves both values on it: a current-alerts query shouldn't list it, whatever `alertState` still says. Two writers each naming one composite leave the same bytes. Nothing tells them apart, so they're counted and left. A write naming every composite of the half puts such a row back.
-
-**Keys over a value the library stamps are judged too.** An earlier release's `put` composed its keys before stamping, so a row with `sk: [createdAt]` or `[updatedAt]`, or a `retain` entity's `[version]`, went without a key unless the caller supplied the value: on any index holding one, the row was silently missing from every query. They're counted as `missing`, and repairing brings them in. Under `sparse`, `[status, region, updatedAt]` with both values on the row and no key is `ambiguous`, as for any half with two or more composites outside the primary key.
-
-**`lagging` is repaired under `preserve`.** A key behind its values isn't promised to stay there: it's stale until the next write that can compose it. If your application relies on a pin on the old value finding the row, that pin stops finding it: check the dry run's count first.
-
-These are left, and aren't counted:
-
-- A half missing a composite under `preserve`, whatever its key holds. That's what the policy promises.
-- A sort key cut before composites the row really doesn't have, on a hierarchy like `[country, city]`. It's what the update path writes.
-- A half with no key where the other half of its index can't compose: `put` writes no entry there.
-- A key holding `updatedAt` that's behind its value, with everything else in the key as the row says. An update that can't compose the half [leaves it](/effect-dynamodb/guides/index-policy/#keys-over-values-the-library-stamps), so that's a healthy row. A key under another status, say, is rewritten once from the row's `updatedAt`, and a later run has nothing to do.
-- A half stored in an attribute of the table's primary key: no write ever names one.
-- Values that compose no key (`NaN` with `escapeKeys: true`, a Z-order value a dimension can't place). A `put` would refuse them too.
-
-A Z-order half is all or nothing and compares bytes, so a value within one quantization level writes nothing. Only an item at its current table key is judged: snapshots, tombstones and events have no index keys, sentinels have none, and aggregates compose their own rows and never had this damage. An item `rekey` moves is judged where it lands.
-
-**A writer always wins.** Each repair is one `UpdateItem` a row, conditioned on each key it writes and each composite those keys come from, as read, or on their absence. If a writer changes one of them first, `rekey` reads the item again, judges it again and tries once more. Lost a second time, the keys are counted in `skipped`, and a later run picks them up. A key DynamoDB refuses (over its length limit) is the conflict `failed`, and the run goes on.
-
-## Releasing orphaned reservations
-
-Up to 1.39, deleting an item left the reservation (the unique-constraint sentinel) of a unique field holding a `bigint` below 2^53 stored as a number, such as a `Schema.BigInt`. An update changing such a value left the old one, and so did a soft delete without `preserveUnique`. The value couldn't be taken again: every later `put` of it failed with `UniqueConstraintViolation`. 1.40 releases them as it should. A reservation an earlier release left stays until you release it, as does one left by a write outside the library that changed the value.
-
-**Every run counts these**, in `report.reservations` and for each member, with an entry for each naming its key, the item it names and why. With `releaseOrphanedReservations: true` it deletes them too. Dry run first: it reports the same and writes nothing.
+**With `reservations: true` a run counts these**, in `report.reservations` and for each member, with an entry for each naming its key, the item it names and why, and writes nothing. Without it a run judges none and sends exactly the requests 1.40.0 sent: such a sentinel is counted in `skipped.unrecognizedKey`, as 1.40.0 counted it, and every `reservations` count is 0.
 
 ```typescript region="reservations" example="guide-upgrade.ts"
-// `rekey` counts unique sentinels no row holds. `releaseOrphanedReservations`
-// deletes them, so their values can be taken again: dry run first.
+// With `reservations`, `rekey` judges and reports unique sentinels no row holds.
 const orphans = yield* db.tables.MainTable.rekey({
-  dryRun: true,
-  releaseOrphanedReservations: true,
+  reservations: true,
   streams: [Calibrations],
 })
-// orphans.reservations → { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: [...] }
+// orphans.reservations → { orphaned: 1, released: 0, skipped: 0, undecided: 0, entries: [...] }
 // orphans.reservations.entries[0].message → "The row it names doesn't exist."
-
+// Releasing them is a maintenance step: stop every writer to the table first, then
+// dry run, then run.
+const releases = yield* db.tables.MainTable.rekey({
+  dryRun: true,
+  releaseOrphanedReservations: true,
+  writesStopped: true,
+  streams: [Calibrations],
+})
+// releases.reservations → { orphaned: 1, released: 1, skipped: 0, undecided: 0, entries: [...] }
 const released = yield* db.tables.MainTable.rekey({
   releaseOrphanedReservations: true,
+  writesStopped: true,
   streams: [Calibrations],
 })
 // released.reservations → the same, and the number can be taken again
 ```
 
+**Releasing is a maintenance step.** `releaseOrphanedReservations: true` deletes the ones counted `orphaned`, so their values can be taken again, and needs `writesStopped: true`: stop every writer to the table first. Without `writesStopped` the run fails with a `ValidationError` (`EDD-9098`) before anything is read. Every cleanup counts as a writer, a second run releasing reservations included: run one at a time. Dry run first: it reports the same and writes nothing.
+
 A sentinel names the item that reserved it. It's held when that item's values compose the sentinel's key, under the key text the setting composes or any text `rekey` moves from. With `softDelete: { preserveUnique: true }` a tombstone of that item holds it the same way, since the soft delete kept the reservation on purpose, so it's never released and `restore` can take it back. Without `preserveUnique` a soft delete releases its reservations, so a tombstone holds none. One an earlier release's soft delete left is reported, and still moves with the tombstone when its key text changes, so the value stays taken until you release it. Released, it doesn't move.
 
-A move whose unique value's current key holds a reservation no row holds is the conflict `taken`, and the reservation is reported. With `releaseOrphanedReservations` the reservation is released first, and the move goes ahead in the same run. Each reservation is judged once a run, whichever reaches it first, so the report doesn't depend on the order the scan meets the rows in.
+A move whose unique value's current key holds a reservation no row holds is the conflict `taken`, and with `reservations` the reservation is reported. With `releaseOrphanedReservations` the reservation is released first, and the move goes ahead in the same run. Each reservation is judged once a run, whichever reaches it first, so the report doesn't depend on the order the scan meets the rows in.
 
 | Count | The sentinel | With `releaseOrphanedReservations` |
 |-------|--------------|------------------------------------|
@@ -416,13 +373,13 @@ A move whose unique value's current key holds a reservation no row holds is the 
 
 `orphaned` counts every one found, so it includes those `released` and `skipped`. Only a sentinel of a constraint the entity declares, under the schema's own key prefix, is judged. Another application's sentinels on a shared table, or another schema's, are left alone and counted in `skipped.unrecognizedKey`.
 
-**A claim always wins.** Each release is one transaction: the sentinel's delete, conditioned on it still naming the item `rekey` read it naming (and still carrying the same expiry, for a constraint with a `ttl`), and a check that the item is still absent, or still holds the values `rekey` read. If a write claims the value, or gives the item back its value, first, `rekey` reads the sentinel again, judges it again and tries once more; one held by then is left and still reported, and one lost a second time is counted in `skipped`.
+**A claim always wins**, even if a writer breaks the promise `writesStopped` makes. Each release is one transaction: the sentinel's delete, conditioned on it still naming the item `rekey` read it naming (and still carrying the same expiry, for a constraint with a `ttl`), and a check that the item is still absent, or still holds the values `rekey` read. If a write claims the value, or gives the item back its value, first, `rekey` reads the sentinel again, judges it again and tries once more; one held by then is left and still reported, and one lost a second time is counted in `skipped`.
 
 ## Cost
 
 `rekey` scans the whole table, so a run reads every row once (an eventually consistent scan: half a read unit per 4 KB). Each row that moves costs strongly consistent reads of it and of its current key (an item one more, the move's own) and a two-item transaction (twice the write units of each item), plus its sentinels; a stream costs reading it, its copy, the flip and the deletes. An item under its current key costs nothing more, unless its index keys hold other text (one `UpdateItem`) or a unique value's sentinel text changed (strongly consistent reads of its old and current sentinels per such constraint). A soft-deleted item that kept its sentinels costs the same reads for each constraint whose value's text, or whose item key's text, changed: the sentinels name the item's key. Every aggregate is read whole, under both partition keys when its key text changed, moved or not, and one that moves costs a two-item write per row that moves (twice the write units), in transactions of up to 100 items and 4 MB. A sentinel costs one or two reads to find its row. A dry run makes the same reads, and writes nothing.
 
-Counting `reservations` costs nothing beyond those reads, except under `preserveUnique`, where a sentinel whose item is gone or holds another value costs one more query for the item's tombstones. One that looks orphaned is read again before it's counted. A release costs a two-item transaction (twice the write units), and a strongly consistent read and a second transaction if a write got there first.
+Counting `reservations` (the option) costs nothing beyond those reads, except under `preserveUnique`, where a sentinel whose item is gone or holds another value costs one more query for the item's tombstones. One that looks orphaned is read again before it's counted. A release costs a two-item transaction (twice the write units), and a strongly consistent read and a second transaction if a write got there first.
 
 Counting `indexKeys` costs nothing beyond the scan, and so does `repairIndexKeys` on a table with nothing to repair: judging is composing strings from a row already read. A row with keys to repair costs one `UpdateItem`, and a strongly consistent read and a second `UpdateItem` if a writer got there first.
 
@@ -455,10 +412,10 @@ Index keys belong in [dedicated attributes](/effect-dynamodb/guides/indexes/#sha
 
 ## Changes to `rekey` in 1.41
 
-- **One outcome whatever the order.** Each row, aggregate and stream is judged once a run, by whichever visit reaches it first: the scan, or the move of a row it's in the way of. Up to 1.40.0 both judged it, so what the report said, and in a chain of keys spelling each other's what moved, could depend on the order the scan returned rows in, on `segments` and on `concurrency`: a row could be reported twice or two ways, or counted `unchanged` after the run moved it. A dry run now sees what its earlier decisions would have written, so it reports what the run does. Over a table with nothing to move, a run sends exactly the requests 1.40.0 sent.
+- **One outcome whatever the order.** Each row, aggregate and stream is judged once a run, by whichever visit reaches it first: the scan, or the move of a row it's in the way of. Up to 1.40.0 both judged it, so what the report said, and in a chain of keys spelling each other's what moved, could depend on the order the scan returned rows in, on `segments` and on `concurrency`: a row could be reported twice or two ways, or counted `unchanged` after the run moved it. A dry run now sees what its earlier decisions would have written, so it reports what the run does. Over a table with nothing to move, a run without `reservations` sends exactly the requests 1.40.0 sent.
 - **`scanned`** counts each row stored when the run met it, once, and never a row the run put.
 - **A dry run with `repairIndexKeys` counts no key `repaired`.** 1.40.0 counted the keys it would have written.
-- **`reservations`** counts the unique-constraint sentinels no row holds, on every run, and [`releaseOrphanedReservations`](#releasing-orphaned-reservations) deletes them. 1.40.0 counted such a sentinel in `skipped.unrecognizedKey`, or, one naming a tombstone, not at all.
+- **`reservations: true`** judges and counts the unique-constraint sentinels no row holds, and [`releaseOrphanedReservations`](#releasing-orphaned-reservations), with writes stopped, deletes them. Without the option a run counts such a sentinel in `skipped.unrecognizedKey`, or, one naming a tombstone, not at all, as 1.40.0 did.
 - **Two writes a move used to lose now cancel it**: a `reembed` landing on a versioned item with a vector index, and a write adding a field of an aggregate node declared as an annotated class or a union. The rest are counted in [`guardGaps`](#writes-during-a-run).
 
 ## Changes to `rekey` in 1.40
