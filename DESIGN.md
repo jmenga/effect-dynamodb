@@ -5178,6 +5178,7 @@ becomes `{M:{}}`, and a `bigint` becomes `{N:"5"}`.
 | **Which attributes** | Any field holding a wire transform **at any depth** (`containsWireTransform`): a leaf transform, a `Schema.Class`, a self date or `Redacted`, or an `Array` / `Struct` / `Union` / `Record` / `Tuple` containing one. Gating on the top-level AST (pre-#133) skipped every container, since an `Arrays` / `Objects` / `Union` node carries no encoding of its own; that included `Schema.optional(X)` and `NullOr(X)` around a transform. Fields with nothing to encode get no encoder and their bytes are unchanged. |
 | **One encoder per field** | A `storedAs` annotation or inferred date default wins, except for a union mixing a date with a non-date member (`Union([DateTimeUtcFromString, Number])`, `isMixedDateUnion`), whose non-date values a date encoder would throw on. Otherwise the field is encoded through the same substituted, tolerant schema the read path decodes it with (`substituteSchemaDeep` + the aggregate's ref resolver), falling back to the field's own `encode`, then `decode → encode`. |
 | **Which schema** | The schema the decomposed value actually has: the root model's fields for the root, a `one` edge's entity model (or the model field's own class when the edge has no entity), the array **element** for a `many` edge (`PlayerSheet`, not `Player`), a sub-aggregate's own schema for its root item. Encoders are keyed by the element's field names, so a custom `decompose` that **renames** fields escapes them: the renamed values are stored in domain form (a `DateTime` as a map). This is a known limitation; the read path still lifts those maps. |
+| **A `many` element that shows no fields** | An element whose schema shows no fields of its own (a union, `Schema.NullOr`, or a transformation of the whole element such as `Schema.encodeKeys` or a struct decoded to another) has one encoder for the whole element instead (`wholeElementEncoder`, #241): the encoder `buildAttrEncoders` gives a field holding it, so it's encoded once, through the schema a read decodes it with. Where that encoder doesn't take the element, the per-field encoders run, as up to 1.40.0. Not for an opaque ref element (encoded as the entity's model), an element with nothing to encode, or an edge with a custom `decompose`. Below. |
 | **Per attribute, not per aggregate** | The aggregate is never encoded as a whole before decomposition: key composition needs Type-side values (`numericTypeWithStringEncoding`). |
 | **Union members** | `substituteSchemaDeep` walks `Union`, `Record`, `Tuple`, `TupleWithRest` and `StructWithRest` in every mode (`walkedContainer`), rebuilding each container kind around substituted children with the original node's annotations and `.check()` refinements (`withMetadataOf`). Under `tolerantTransforms` (aggregates) every transformed leaf is substituted; for entity derivation only self-date and `Redacted` leaves are. Union members follow the union rules in §8 (Self dates nested in containers): a self date accepts only its own wire kind, its domain or a legacy map; on a storage-kind collision only its exact canonical form, decoded first; an epoch date next to a numeric member is rejected (**EDD-9058**). The collision set propagates into nested unions. A transform date member keeps its own decode, so a stored `5` in `Union([DateTimeUtcFromString, Number])` stays a number. |
 | **Keys unchanged** | A `many` edge's `sk.composite` and the root's list-index composites are read from a second encoder set (`buildKeyAttrEncoders`) that keeps the pre-#133 top-level-only behaviour. Composed keys are therefore byte-identical to earlier versions; only stored attribute values gained the deeper encoding. The exception is an `entity:` edge under `escapeKeys: true` (below). |
@@ -5226,6 +5227,25 @@ refused with the error a plain edge gives (`refuseSharedSortKeys`, judged over t
 sends: an `update` decomposes the old and new values without refusing, so a write of another group
 goes ahead), and `rekey` reports the aggregate `failed` with that reason and moves nothing. An
 `update` removing or changing one of them repairs the group.
+
+**A `many` element that shows no fields (#241).** An element whose schema is a union (a member
+renaming a field among them, `line` stored and `text` held), `Schema.NullOr`, or a transformation of
+the whole element (`Schema.encodeKeys`, a struct decoded to another) has no fields for
+`buildAttrEncoders` to key encoders by. Up to 1.40.0 it was stored as the domain value it held, on
+1.39.0 too: `text` under its domain name, a `Schema.NumberFromString` in a member as `N`, a
+`Schema.DateTimeUtcFromString` as a `DateTime`'s internal fields. `wholeElementEncoder` gives such an
+element the encoder `buildAttrEncoders` gives a field holding it, and `storedElement` runs exactly one
+encoding per element: that one, or the per-field encoders where it doesn't take the element (the
+element is then stored as 1.40.0 stored it). The key is read off the element as before (`keyAttrs`),
+so no key moves. A read decodes either form through the tolerant decode it always used: a member's
+transformation reads the stored form, and its type side takes the domain value a row 1.40.0 wrote
+holds. A transformation reads only its own fields, so a sub-aggregate's discriminator, which 1.40.0
+read back inside such an element, stays out of one stored in its stored form. Rows switch a group at a
+time: both sides of an update's diff are decomposed with the same encoders, so a no-op writes
+nothing, and a changed group's rows are written in the stored form. Until each group is next changed,
+one attribute can hold the domain value on some rows and the stored form on others (`text` and
+`line`, `N` and `S`), which a filter or a secondary index of the caller's own on it has to allow for.
+`test/fixtures/aggregate-whole-elements-1.40.0.json` holds what 1.40.0 and 1.39.0 stored.
 
 **Ref resolution.** `DynamoModel.ref` annotates with `Schema.annotate`, which
 drops a `Schema.Class`'s `.fields`, so the schema walker cannot recurse into an
