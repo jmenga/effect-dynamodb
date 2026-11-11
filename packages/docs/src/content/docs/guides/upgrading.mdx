@@ -175,6 +175,7 @@ const report = yield* db.tables.MainTable.rekey({
 | `resume` | none | A `resume` token (the string) from an earlier run, or the last one `onProgress` received |
 | `streams` | `[]` | The event streams on the table, bound or not |
 | `onProgress` | none | Called after each scan page, once every row of it is handled |
+| `writesStopped` | `false` | Nothing else writes to the table: a row nothing proves unchanged moves under the strongest guard that fits, instead of being reported `unguarded` |
 
 A request that fails fails the run with its `DynamoClientError` (a throttled request is retried by the AWS SDK first). Resume from the last token `onProgress` delivered: the run redoes at most the pages that were in flight, and redoing a page moves nothing twice.
 
@@ -272,6 +273,7 @@ A stream's rows are recognized by their stored stream id. A stream id of several
 | `taken` | Another row holds its current key: one `rekey` doesn't recognize as another value's old row, or one that can't move itself | Look at the row that holds it. A row `rekey` can move out of the way is moved first |
 | `contended` | Concurrent writes changed it on every attempt, a drainer is delivering an outbox item, or an event another stream id's write landed on its partition follows its last | Run `rekey` again. For an event that landed, read the partition with the raw client and move or delete that event by hand |
 | `failed` | It can't be moved as stored: its values no longer decode or place a key, a stream id reads as two different ids, or a write was refused | `message` says why: fix the row, then run `rekey` again |
+| `unguarded` | Too wide for one condition to prove it unchanged when it moves (DynamoDB's limits on one expression), with no version or `updatedAt` the library stamps to stand in. Nothing of it is written, nor of an aggregate or stream holding it while nothing of that has moved. One already part-moved is finished, as 1.39.0 finished it | Stop writes to the table, then run `rekey({ writesStopped: true })` |
 | `uncomposable` | Its values can't compose its key: its own key holds `NaN`, which has no key text with `escapeKeys: true`, or a key composite holds a value no form of its schema takes, such as a stored number its declared kind can't hold exactly (`EDD-9050`, in `message`). Or its key on a [sharded index](/effect-dynamodb/guides/sharding/#adopting-sharding-on-a-populated-index) is from another layout, and its values can't compose a current one (a `by` attribute was cleared) | Write the value with an `update` (for a number its kind can't hold, one it can, or declare a kind that holds it), or give it the missing values, or remove them from the index with `.remove()`, then run `rekey` again |
 
 Until a conflicting row moves, no read finds it.
@@ -377,6 +379,13 @@ Counting `indexKeys` costs nothing beyond the scan, and so does `repairIndexKeys
 An inverted index over strings is broken in 1.37.0 and 1.38.0: a value with a space, `%` or another character a sort key escapes overwrites a table key, with each attribute holding the text of the half that wrote it last. **1.39.0 fixes it:** both roles build one text under either setting. `rekey` recognises the row those releases left and moves it, an escape in each half included.
 
 Index keys belong in [dedicated attributes](/effect-dynamodb/guides/indexes/#sharing-a-key-attribute): an inverted index is supported, not encouraged.
+
+## Changes to `rekey` in 1.40
+
+- **A write that adds a declared attribute to an aggregate row cancels its move.** The move is guarded on the row as read, as in 1.39.0, and now also on each attribute the row's entity type declares that the row didn't hold still being absent, so a write that sets one between `rekey`'s read and its move is moved with the row, as an entity's item already was. With no such attribute the request is 1.39.0's.
+- **`unguarded`**: a row too wide for one condition to prove it unchanged, with no version or `updatedAt` the library stamps on it, is left where it is and reported as the conflict `unguarded`. 1.39.0 moved it under a partial guard, and could lose a write that landed during the move. An aggregate row whose node declares its own `updatedAt` other than a date holds the caller's value there, so it is one: 1.39.0 stored its stamp over that value and couldn't read the aggregate back (or, the field optional, read it without the value). An aggregate or event stream part of which has already moved is finished as 1.39.0 finished it. To move the row, stop writes to the table and run `rekey` with `writesStopped: true`.
+- **`writesStopped`**: tells `rekey` nothing else writes to the table, so it moves such a row under the strongest guard that fits, as 1.39.0 did. Set it only while writes are stopped.
+- **What a move still doesn't see, as in 1.39.0:** a write that only adds an attribute the library can't list from the member's declarations (one written outside the library, a sparse map's entry, a field of an aggregate node declared as an annotated class or a union); and, on a row guarded by its version or `updatedAt`, a write that leaves them as they were, such as `reembed`, one landing within the stamp's resolution, or one from outside the library. The move puts the row back as it read it, without that write. To rule these out, stop writes to the table for the run.
 
 ## Definitions refused in 1.39
 

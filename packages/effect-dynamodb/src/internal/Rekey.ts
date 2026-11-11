@@ -43,6 +43,7 @@ import {
   toBase64Url,
   type WireValue,
 } from "./Cursor.js"
+import type { UnprovableRow } from "./ExpressionLimits.js"
 
 type Item = Record<string, AttributeValue>
 
@@ -52,6 +53,8 @@ export interface RekeyRowContext {
   readonly dryRun: boolean
   /** Write the index keys that differ ({@link RekeyOptions.repairIndexKeys}), or only count them. */
   readonly repairIndexKeys: boolean
+  /** Writes to the table are stopped ({@link RekeyOptions.writesStopped}): see {@link unprovableRow}. */
+  readonly writesStopped: boolean
   /**
    * Whether this run has read every page of the table: it started at the beginning and is past the
    * end. A run bounded by `maxPages`, or started from `resume`, hasn't, so what it didn't find says
@@ -73,6 +76,20 @@ export interface RekeyRowContext {
     work: Effect.Effect<RekeyTally, E, R>,
   ) => Effect.Effect<RekeyTally, E, R>
 }
+
+/**
+ * What a move does with a row it can't prove unchanged ({@link UnprovableRow}): with writes to the
+ * table stopped, nothing can change it, so it moves under the strongest guard that fits; otherwise
+ * it's left and reported `unguarded`, unless its aggregate or stream is already part-moved.
+ */
+export const unprovableRow = (ctx: RekeyRowContext): UnprovableRow =>
+  ctx.writesStopped ? "strongest" : "report"
+
+/** A row left where it is because nothing proves it unchanged when it moves ({@link unprovableRow}). */
+export const UNGUARDED_MESSAGE =
+  "It can't be proven unchanged in one condition: guarded whole, it's over DynamoDB's limits on " +
+  "one expression, and it has no version or updatedAt the library stamps to stand in. It's left " +
+  "where it is: stop writes to the table, then run rekey with writesStopped: true."
 
 /**
  * How many rows still to move a row's own move goes through first: one chain, `foo%20bar`'s row
@@ -417,6 +434,7 @@ export const run = (args: {
         tableName,
         dryRun,
         repairIndexKeys: options.repairIndexKeys === true,
+        writesStopped: options.writesStopped === true,
         sawWholeTable: () => startedAtTheBeginning && positions.every((position) => position === 1),
         claim: (unit) => {
           if (claimed.has(unit)) return false

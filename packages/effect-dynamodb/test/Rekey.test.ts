@@ -369,6 +369,11 @@ const snapshot = (table: Recording) => new Map(table.items)
 
 const ZERO = { item: 0, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
 
+/** More raw attributes than one condition can name. */
+const wideAttributes = toAttributeMap(
+  Object.fromEntries(Array.from({ length: 300 }, (_, i) => [`raw${i}`, `v${i}`])),
+)
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -826,6 +831,38 @@ describe.each([
       }),
     )
 
+    it.effect(
+      "a tombstone too wide to guard whole, of an entity with no updatedAt, is left and reported; with writes stopped it moves",
+      () =>
+        Effect.gen(function* () {
+          const table = makeRecordingTable()
+          const { name, card } = yield* seedTombstones(w, table)
+          const tombstone = [...table.items.keys()].find((key) => key.startsWith(`${card.old}|`))!
+          table.items.set(tombstone, { ...table.items.get(tombstone)!, ...wideAttributes })
+          const held = new Map(table.items)
+          for (const dryRun of [true, false]) {
+            const report = yield* rekey(w, table, { dryRun })
+            expect(report.conflicts.map((c) => [c.member, c.kind, c.reason, c.key])).toEqual([
+              [
+                "Card",
+                "tombstone",
+                "unguarded",
+                { pk: card.old, sk: tombstone.slice(card.old.length + 1) },
+              ],
+            ])
+            expect(table.items.get(tombstone)).toEqual(held.get(tombstone))
+            expect(table.items.get(at(name.current))).toEqual(held.get(at(name.current)))
+          }
+          const report = yield* rekey(w, table, { writesStopped: true })
+          expect(report.conflicts).toEqual([])
+          expect(report.moved.tombstone).toBe(1)
+          expect([...table.items.keys()].filter((key) => key.startsWith(`${card.old}|`))).toEqual(
+            [],
+          )
+          expect(table.items.get(at(name.current))?._entity_pk?.S).toBe(card.now)
+        }),
+    )
+
     it.effect("a reservation another item holds is a conflict, and nothing moves", () =>
       Effect.gen(function* () {
         const table = makeRecordingTable()
@@ -946,6 +983,103 @@ describe.each([
           expect(again.moved.stream).toBe(1)
           expect(table.items.get(`${pk.now}|${snapshotSk}`)?.asOfVersion?.N).toBe("3")
           expect(table.items.has(`${pk.old}|${snapshotSk}`)).toBe(false)
+        }),
+    )
+
+    const streamRows = (table: Recording, pk: { readonly now: string; readonly old: string }) =>
+      [...table.items].filter(
+        ([key]) => key.startsWith(`${pk.old}|`) || key.startsWith(`${pk.now}|`),
+      )
+
+    it.effect(
+      "a row too wide to guard whole leaves the stream, reported before anything is copied; with writes stopped it moves",
+      () =>
+        Effect.gen(function* () {
+          const table = makeRecordingTable()
+          yield* seed(w, table)
+          const pk = ledgerPk(w, -4)
+          const second = [...table.items.keys()].find(
+            (key) => key.startsWith(`${pk.old}|`) && table.items.get(key)!.version?.N === "2",
+          )!
+          const sk = second.slice(pk.old.length + 1)
+          table.items.set(second, { ...table.items.get(second)!, ...wideAttributes })
+          const before = streamRows(table, pk)
+          for (const dryRun of [true, false]) {
+            table.take()
+            const report = yield* rekey(w, table, { dryRun })
+            expect(report.conflicts).toEqual([
+              expect.objectContaining({
+                member: "Ledger",
+                kind: "stream",
+                reason: "unguarded",
+                key: { pk: pk.old, sk },
+                message: expect.stringContaining("writesStopped: true"),
+              }),
+            ])
+            expect(report.byMember.Ledger?.moved.stream).toBe(0)
+            expect(streamRows(table, pk)).toEqual(before)
+            // Nothing of it was copied: no write names its current partition.
+            const writes = table.requests.filter((r) =>
+              ["PutItem", "DeleteItem", "UpdateItem", "TransactWriteItems"].includes(r.command),
+            )
+            expect(JSON.stringify(writes)).not.toContain(JSON.stringify(pk.now))
+          }
+          const report = yield* rekey(w, table, { writesStopped: true })
+          expect(report.conflicts).toEqual([])
+          expect(report.byMember.Ledger?.moved.stream).toBe(3)
+          expect([...table.items.keys()].filter((key) => key.startsWith(`${pk.old}|`))).toEqual([])
+          expect(table.items.get(`${pk.now}|${sk}`)?.raw299).toEqual({ S: "v299" })
+        }),
+    )
+
+    it.effect(
+      "a row too wide to guard whole, left under a moved stream's old key, moves under the strongest guard that fits",
+      () =>
+        Effect.gen(function* () {
+          const table = makeRecordingTable()
+          yield* seed(w, table)
+          const pk = ledgerPk(w, -4)
+          yield* rekey(w, table)
+          // As a run that stopped after the flip leaves it, with a wide command sentinel
+          // written under the old key beside the flip.
+          const firstKey = [...table.items.keys()].find(
+            (key) => key.startsWith(`${pk.now}|`) && table.items.get(key)!.version?.N === "1",
+          )!
+          const firstSk = firstKey.slice(pk.now.length + 1)
+          table.items.set(`${pk.old}|${firstSk}`, {
+            ...table.items.get(firstKey)!,
+            pk: { S: pk.old },
+            __edd_moved__: { S: pk.now },
+          })
+          const commandSk = DynamoSchema.composeKey(w.schema, "Ledger.command", ["c-9"])
+          table.items.set(`${pk.old}|${commandSk}`, {
+            ...toAttributeMap({
+              pk: pk.old,
+              sk: commandSk,
+              __edd_e__: "ledger.command",
+              streamId: "-4",
+              commandId: "c-9",
+              version: 3,
+            }),
+            ...wideAttributes,
+          })
+          // The stream is part-moved: it's finished, as 1.39.0 finished it, with writes going on.
+          const before = streamRows(table, pk)
+          const dry = yield* rekey(w, table, { dryRun: true })
+          expect(dry.conflicts).toEqual([])
+          expect(dry.byMember.Ledger?.moved.stream).toBe(2)
+          expect(streamRows(table, pk)).toEqual(before)
+          table.take()
+          const report = yield* rekey(w, table)
+          expect(report.conflicts).toEqual([])
+          expect(report.byMember.Ledger?.moved.stream).toBe(2)
+          expect([...table.items.keys()].filter((key) => key.startsWith(`${pk.old}|`))).toEqual([])
+          expect(table.items.get(`${pk.now}|${commandSk}`)?.raw299).toEqual({ S: "v299" })
+          // The wide row's delete is conditioned on the strongest guard that fits.
+          const deleted = table.requests.find(
+            (r) => r.command === "DeleteItem" && (r.input as any).Key.sk.S === commandSk,
+          )?.input as any
+          expect(deleted.ConditionExpression).toMatch(/^attribute_exists\(#gpk\) AND /)
         }),
     )
 

@@ -1206,6 +1206,89 @@ row: over one whose TTL has passed), a Delete or in-place rewrite only while
 the row is as read. A write that lands in between wins, and the move reads
 again or reports the row (`contended`).
 
+**What "as read" proves.** A Delete or rewrite is guarded on the whole row: it
+exists, every attribute it was read with holds the value read, and each
+attribute its member can write that it was read without is still absent. What a
+member can write is what the library enumerates from its declarations. For an
+unversioned entity the guard is `deleteGuard`'s, as 1.39.0 sent it: its model's
+fields, its index keys, vector attributes and timestamps. For an aggregate row,
+a stream row, and a projection's row tombstone or outbox item it is
+`wholeRowGuard` (`internal/ExpressionLimits.ts`): the guard 1.39.0 sent, byte
+for byte (`updatedAt` first; a drainer's claim still absent), followed by each
+absent attribute; with none it is the request 1.39.0 sent. An aggregate row's
+are its node's fields, the context fields and discriminators a row beneath the
+root carries, the index keys, the timestamps and `__edd_e__`
+(`writableAttributes`); a stream row's and a projection row's, none more. A
+versioned entity's item is guarded on its version and incarnation, as 1.39.0
+guarded it.
+
+A row too wide for its whole guard (DynamoDB's limits on one expression) is
+guarded, when its member stamps an `updatedAt`, on that stamp, held or still
+absent, then on as many of its other attributes as fit: an entity's in
+`deleteGuard`'s fallback order, an aggregate row's as 1.39.0 sent them, followed
+by as many of the absent ones as fit (`preferredGuard`). Whether the stamp
+proves the row is the member's configuration (an aggregate's, for each node),
+not the row's: a timestamped member's row written before it stamped one is
+guarded on `updatedAt` still absent. In that fallback an `updatedAt` stored under another name (`field:`) is
+guarded by the attribute it's stored in, as a version is by the attribute
+`versioned: { field }` names. A row its whole guard fits holds the stamp among
+the attributes it was read with, and the request is 1.39.0's.
+
+A guard sees a write only through its terms. The move puts the row back as it
+read it, so a write it doesn't see is lost, as on 1.39.0:
+
+- a write that only adds an attribute the library can't enumerate: one no
+  declaration names (written outside the library), a sparse map's entry, or a
+  field of an aggregate node the walk doesn't read (an annotated class, a
+  union's members);
+- on a row guarded by its stamp (a versioned item, or a wide row guarded on its
+  `updatedAt`), a write that leaves the stamp as it was: `reembed`, which sets
+  the vector alone; one landing within the stamp's resolution (the same
+  millisecond, or the same second for an `updatedAt` stored as epoch seconds);
+  and one from outside the library.
+
+A wide row with no version and no `updatedAt` the library stamps on it, and a
+stream row or a projection's row tombstone or outbox item too wide to guard
+whole, is one nothing proves unchanged. That covers an aggregate row whose node
+declares its own `updatedAt` other than a date (`rowStampsOf`): it holds the
+caller's value, which a write of the library leaves as it was. 1.39.0 stored its
+stamp over that value, so declared required the aggregate couldn't be read and
+`rekey` reported it `failed`, and declared optional it read back without the
+value (`test/fixtures/rekey-guards-1.39.0.json`). `Rekey.unprovableRow` decides it, by
+`RekeyOptions.writesStopped`:
+
+- **Writes going on** (the default): the row is left where it is and reported
+  `unguarded`, before anything of it is written, and in a dry run too. An
+  aggregate or a stream is left as it is only while nothing of it has moved,
+  each such row reported: an aggregate with no row moved in this run and none
+  read at a current key other than its old one; a stream not flipped, with no
+  row under its current partition key that belongs there. One already
+  part-moved, in this run or a run cut short, is finished under the strongest
+  guard that fits, as 1.39.0 finished it: left across two keys, a read under
+  either misses rows. A projection's row tombstone or outbox item is judged
+  alone.
+- **Writes stopped** (`writesStopped: true`): nothing can change the row, so it
+  moves under the strongest guard that fits, as 1.39.0 sent.
+
+The strongest guard that fits is 1.39.0's (`asReadGuard`): as many of the row's
+attributes as fit, so a concurrent write to one it leaves out is lost.
+
+A soft, retain or unique delete with no `updatedAt` on a wide row is not a move:
+it keeps sending the strongest guard that fits (Guarded read-then-write), as
+1.39.0 did, and a concurrent write to an attribute left out of it is lost.
+
+**Within DynamoDB's limit on substitutions.** One expression's
+`ExpressionAttributeNames` and `ExpressionAttributeValues` may hold 2 MB
+together. 1.39.0's guard names the row's own attributes and values: at most the
+400 KB the row holds, with a placeholder each. The whole-row guard adds names
+only, one absence term each, and an attribute name can be up to 64 KB, so a
+member declaring long names could take it past 2 MB where 1.39.0's guard
+wasn't. `wholeRowGuard` measures its substitutions (`substitutionsFit`,
+`EXPRESSION_MAX_SUBSTITUTION_BYTES`), and over the limit it is no guard: the row
+is one too wide to guard whole. `preferredGuard` appends an absence term only
+while its substitutions fit. Neither sends a request DynamoDB refuses for its
+substitutions.
+
 | Row | Move |
 |---|---|
 | Item under other text | `moveItem`: a consistent read of the row (the scan's may be stale: a move this run made can have taken it along), then one transaction — Put at the current key `attribute_not_exists`, every GSI half recomposed under the index policy, Delete of the old item under `deleteGuard`, unique sentinels moved or re-pointed (`sentinelRekeys`). Another value's old row at the target moves first (`clearTarget`). The same item already at the target is `bothKeys` only if it is still at its old key when read again. A Put cancelled on an existing current item while the Delete's guard passed is `bothKeys`. After the move, a half it couldn't recompose (a truncated sort key before a gap a later composite fills, which `preserve` keeps) is rewritten as for an item at its current key, in the same run (`rekeyAfterMove`, reading the item only when the predicted move, `movedRowOf`, leaves one); a dry run counts it from that prediction |
@@ -1213,8 +1296,8 @@ again or reports the row (`contended`).
 | Unique-constraint sentinel | A sentinel the scan reaches (`rekeySentinelRow`) is read back to the row it names, under each form: a sentinel its row's values compose moves with its row or on its own. One with no row behind it and no tombstone keeping it, or whose row's values compose no such sentinel, is `unrecognizedKey`, at one or two extra reads per sentinel on every run |
 | Version snapshot, soft-delete tombstone, time-series event | `moveHistoryRow`: consistent read; one transaction: Put at the current key (`attribute_not_exists`), Delete of the old row under `deleteGuard`. A history row keeps its layout (unsegmented, pre-#133, rows move their partition key only). A snapshot whose current key holds the same snapshot (`sameSnapshotAs`: version, incarnation, `updatedAt`) is a copy: one transaction checks the copy is still there and the same and deletes the old row as read, counted as moved. A cancelled transaction reads again, up to `GUARDED_PUT_ATTEMPTS` |
 | Tombstone's preserved sentinels (`preserveUnique`) | They name the item's live key, not the tombstone (`restore` re-claims them by it): a sentinel held for the item's old or current live key under its old key is put at its current key and the old one released; one at its current key naming the old live key is re-pointed (`SET _entity_pk, _entity_sk`, conditioned on the pointer as read). In the tombstone's move transaction, or — a tombstone already at its current key — in their own (`sentinelsMoved`). Another item's sentinel at the current key is `taken` and nothing moves |
-| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, `asReadGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned as read); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
-| Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read (`asReadGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
+| Aggregate | The root row's handler (claimed once per aggregate) runs `rekeyCore`: every partition its values composed read consistently; each built row placed — under its current key, an old key, both, or (an alias chain in an unchanged partition, `placeRows`) where the chain's one free key says. A row under its old key moves (Put at the current key `attribute_not_exists`, Delete of the old row conditioned on it being as read, whole, `wholeRowGuard`); a row whose collection or list index attributes hold other text is rewritten (`UpdateItem` conditioned the same way); `created` and `updated` kept as stored. A built row writes what the value decomposes to, but a custom `decompose`'s row (`custom` in `locateRows`) is written as stored, its keys and collection sort key mirror replaced (`itemOf`): decomposing the value read back needn't give what it holds (a `decompose` renaming a transformed field would store it decoded once more on every run, as 1.39.0 did). A move whose target is another move's source waits for it (waves); a wave's writes go in order in transactions of up to 100 items, 4,194,304 bytes by the exact size model and 16,777,216 bytes of request body (`internal/ItemSize.ts` `packRequests`), a move's Put and Delete always in one. **The root moves last**, so a run cut short leaves it where the next run finds the aggregate. A cancelled transaction reads again, up to `REKEY_ATTEMPTS` (3), then `contended`. A row under both keys, or a placement that can't be told, is `bothKeys` and nothing is written. A write moving the aggregate between the partition reads shows its rows under both: with rows in both, the partitions are read again, and while a row read under the old partition has gone from it the attempt starts over; a row placed under both is checked under its old key the same way. An aggregate moves the rows its value decomposes to; any other row stays where it is, unreported, since another member may write rows of its entity types in the partition. With `ownsRows` (§7 "Which rows in its partition are an aggregate's") it moves exactly the same rows and sends the same requests; any other row of its types it reads can't be placed from what's stored, so it's a `failed` conflict (nothing of the aggregate moves) when its own partition key changes, and counted `unrecognizedKey` otherwise. A row below a root the scan never saw is judged after the scan (`rekeyRowBelowRoot`, `rekeyFinish`): counted `unrecognizedKey` if still there, or `rootNotSeen` when the run didn't read the whole table (`maxPages`, `resume`), since a root at its old key on a page it didn't read could still claim the row |
+| Projection row tombstone, outbox item | `rekeyProjectionRow`. Its key — its own, or `__edd_row_pk__` / `__edd_row_sk__` — is read back by its mark (`valuelessMove`); no single reading is `unrecognizedKey`. When the values compose another key it moves as a row (`moveValueless`): Put, marked for the setting, at the row's current key plus the item's own suffix (`#outbox#<revision>#<n>`), `attribute_not_exists`, the row key and the sparse index sort key it holds rewritten; Delete of the old row as read, whole (`wholeRowGuard`), with no claim taken since. An outbox item a drainer holds (`__edd_claimed_until__` not passed) is left: `contended`, until it is delivered. Another value's old row in the way — the row, a tombstone or an outbox item — moves first, by its own kind's handler; any other row there is `taken`. Counted as `tombstone` / `outbox` |
 | Event stream | Copy → flip → delete (below), from whichever of its rows the scan reaches first (claimed once per stream) |
 
 **Stream move.** A stream row's keys come from its `streamId` text: every way
@@ -1240,7 +1323,8 @@ moved or gone — a run that stopped after the flip, a write beside it) reads
 both partitions again: a row the current key lacks is copied (a command
 sentinel), a snapshot newer than the current one copied over it, and a row the
 current key holds differently is `bothKeys` and nothing is deleted. Then each
-old row is deleted while it is as read (`asReadGuard`): events from the head
+old row is deleted while it is as read, whole (`wholeRowGuard`), or, a row too wide for
+that, under the strongest guard that fits, since the stream is part-moved: events from the head
 down, the other rows, event 1 last. A delete that loses to a write reads again.
 
 **Conflicts** (`RekeyConflict`: member, kind, stored key, target, message):
@@ -1250,7 +1334,9 @@ holds the target), `contended` (concurrent writes on every attempt, or the attem
 `failed` (a `ValidationError` from the move, e.g. values that no longer decode or place a key, or an
 aggregate that doesn't assemble), `uncomposable` (a sharded key from another layout whose values can't
 compose a current one; a row whose own key holds a value with no key text, `NaN` under `escapeKeys: true`, or one of whose key
-composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal). An aggregate whose root is under both
+composites holds a value no form of its schema takes, `EDD-9050`: `message` carries the refusal),
+`unguarded` (a row nothing proves unchanged, with writes going on, of a member nothing of which has moved:
+What "as read" proves; `message` says to stop writes and run with `writesStopped: true`). An aggregate whose root is under both
 partition keys ("Multiple root items found") is `bothKeys`; one whose root or
 rows are gone since the scan read them (moved or deleted by a write) is
 nothing. A `DynamoClientError` fails the run.
@@ -3381,7 +3467,11 @@ computed on the actual condition, including the caller's `.condition()`
 width: when the full guard does not fit, `deleteGuard` falls back to the
 strongest guard that fits. That is `attribute_exists(pk)`, then `updatedAt`
 unchanged (with timestamps), then as many attributes as fit, unique-constraint
-fields first, then the model's fields, then the rest. With timestamps, every
+fields first, then the model's fields, then the rest. Without timestamps that
+guard proves nothing about the attributes it leaves out, and the delete sends it
+anyway, as 1.39.0 did; `rekey`'s moves send it only with writes stopped or to
+finish an aggregate or stream already part-moved (§7 "`rekey`", What "as read"
+proves). With timestamps, every
 library write changes `updatedAt`, so any concurrent library update is detected
 except one in the same millisecond with an identical `updatedAt`. A writer
 outside the library that leaves `updatedAt` alone can change unguarded

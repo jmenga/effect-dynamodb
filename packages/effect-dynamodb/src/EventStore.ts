@@ -104,7 +104,7 @@ import { attributeValueEquals } from "./internal/AttributeValueEquals.js"
 import * as Capacity from "./internal/Capacity.js"
 import { type EventProjection, ProjectionRoutes, type Route } from "./internal/EventProjection.js"
 import { type Expr, eq } from "./internal/Expr.js"
-import { asReadGuard } from "./internal/ExpressionLimits.js"
+import { asReadGuard, wholeRowGuard } from "./internal/ExpressionLimits.js"
 import {
   itemBytes,
   jsonBytes,
@@ -5417,6 +5417,7 @@ export const makeStream = <
       const client = yield* Capacity.client
       const firstSk = composeEventSk(1)
       const nowSeconds = DateTime.toEpochSeconds(yield* DateTime.now)
+      const unprovable = Rekey.unprovableRow(ctx)
       const live = (row: Record<string, AttributeValue>) => {
         const ttl = row[ttlAttribute]?.N
         return ttl === undefined || Number(ttl) > nowSeconds
@@ -5461,7 +5462,7 @@ export const makeStream = <
         row.__edd_e__?.S === entityType ? Number(row.version?.N ?? 0) : 0
       const asOfOf = (row: Record<string, AttributeValue>) => Number(row.asOfVersion?.N ?? 0)
       const conflict = (
-        reason: "bothKeys" | "taken" | "contended",
+        reason: "bothKeys" | "taken" | "contended" | "unguarded",
         message: string,
         sk = firstSk,
       ): Rekey.RekeyTally => ({
@@ -5501,13 +5502,39 @@ export const makeStream = <
                 }),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
-      /** Delete `row` at `from` while it is as read. `false` when a write changed it. */
+      /**
+       * `row` as read, whole, or, a row too wide for that, the strongest guard that fits, as
+       * 1.39.0 sent: only a stream already part-moved deletes one (`unguardedRows`).
+       */
+      const guardOfRow = (row: Record<string, AttributeValue>) =>
+        wholeRowGuard(row, "pk", [], [], []) ?? asReadGuard(row, "pk", [])
+      /**
+       * With writes going on (`unprovable`), the rows of a stream nothing of which has moved that
+       * are too wide to guard whole, each reported `unguarded`, before anything is copied: its rows
+       * move together, so one leaves the stream as it is. One already part-moved (a row of it under
+       * `to`, or flipped) is finished under the strongest guard that fits (`guardOfRow`).
+       */
+      const unguardedRows = (rows: ReadonlyArray<Record<string, AttributeValue>>) => {
+        if (unprovable === "strongest") return undefined
+        const unguarded = rows.filter((row) => wholeRowGuard(row, "pk", [], [], []) === undefined)
+        if (unguarded.length === 0) return undefined
+        return Rekey.mergeTallies(
+          ...unguarded.map((row) =>
+            conflict(
+              "unguarded",
+              `${Rekey.UNGUARDED_MESSAGE} The stream's other rows are left with it.`,
+              skOf(row),
+            ),
+          ),
+        )
+      }
+      /** Delete `row` at `from` while it is as read (`guardOfRow`). `false` when a write changed it. */
       const remove = (row: Record<string, AttributeValue>) =>
         client
           .deleteItem({
             TableName: ctx.tableName,
             Key: toAttributeMap({ pk: from, sk: skOf(row) }),
-            ...asReadGuard(row, "pk", []),
+            ...guardOfRow(row),
           })
           .pipe(Effect.as(true), Effect.catch(cancelled))
 
@@ -5576,6 +5603,11 @@ export const makeStream = <
         const flipped = first === undefined || first[MOVED_ATTRIBUTE] !== undefined
         if (!flipped) {
           const atTarget = yield* readAll(to)
+          // Nothing of it has moved while no row of it is under `to` (`unguardedRows`).
+          if (!atTarget.some((row) => !elsewhere(row))) {
+            const refused = unguardedRows(rows)
+            if (refused !== undefined) return Rekey.mergeTallies(tally, refused)
+          }
           // Another stream under other key text moves out first.
           const stale = atTarget.find(elsewhere)
           if (stale !== undefined) {
