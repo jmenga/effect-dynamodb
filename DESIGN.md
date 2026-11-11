@@ -1066,7 +1066,10 @@ only whose row is there now: an item a read model wrote before another's row
 replaced the first's at one key (their items overwrite each other only through
 a value holding `#`) goes with the row. What stays refused is the pair whose
 items overwrite each other with ordinary values: no item can be told apart
-there, by tag or by row, since each write replaces the other's. Tables are
+there, by tag or by row, since each write replaces the other's. An ownership
+mapping supplied by the application (item key to read model) wasn't taken: it
+would have to be built from the same rows `rekey` reads, by hand, for a
+population that drains away by itself. Tables are
 compared by the physical name the context gives them (two handles on one table
 are one table), or by handle when it gives none. Read models that never meet at
 one of those sites, bound separately or in different programs, can't be
