@@ -36,8 +36,12 @@ const definitions = (config: ReadFirstUpdate) => {
       notes: Schema.optional(Schema.Array(Schema.String)),
       labels: Schema.optional(Schema.ReadonlySet(Schema.String)),
       data: Schema.Record(Schema.String, Schema.Number),
+      lists: Schema.Record(Schema.String, Schema.Array(Schema.String)),
     }),
-    { data: { storedAs: DynamoModel.SparseMap() } },
+    {
+      data: { storedAs: DynamoModel.SparseMap() },
+      lists: { storedAs: DynamoModel.SparseMap() },
+    },
   )
   const E = Entity.make({
     model,
@@ -56,6 +60,7 @@ const refused: ReadonlyArray<readonly [name: string, says: string, apply: (u: an
   ["subtract from an attribute the row lacks", ABSENT, (u) => u.subtract({ m: 2 })],
   ["append to an attribute the row lacks", ABSENT, (u) => u.append({ notes: ["x"] })],
   ["subtract from a sparse map's entry the row lacks", ABSENT, (u) => u.subtract({ "data#x": 2 })],
+  ["append to a sparse map's entry the row lacks", ABSENT, (u) => u.append({ "lists#x": ["x"] })],
   ["append to a string", KIND, (u) => u.append({ name: ["x"] })],
   ["subtract from a string", KIND, (u) => u.subtract({ name: 2 })],
   ["add a number to a string", KIND, (u) => u.add({ name: 2 })],
@@ -92,8 +97,9 @@ const run = (
       tags: ["t"],
       labels: new Set(["l"]),
       data: { y: 1 },
+      lists: {},
     }).asEffect()
-    yield* db.entities.E.put({ id: "b", name: "b", data: {} }).asEffect()
+    yield* db.entities.E.put({ id: "b", name: "b", data: {}, lists: {} }).asEffect()
     const stored = structuredClone([...table.items])
     table.take()
     const op = apply(config.prefix(db.entities.E.update({ id: "a" })))

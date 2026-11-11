@@ -4,8 +4,9 @@
  * DynamoDB Local, beside the same update of an entity without the configuration (#236). The first
  * applies `.subtract()`, `.append()`, `.add()` and `.deleteFromSet()` to the row it read; the
  * other sends them as an expression. Both now end the same way: where DynamoDB refuses the
- * expression, both fail with its `DynamoValidationError` and its words, and neither row changes;
- * where it applies it, both rows read back the same.
+ * expression, both fail with `DynamoValidationError` and neither row changes; where it applies it,
+ * both rows read back the same. The refusal's message is not compared: the update that reads first
+ * gives DynamoDB Local's wording, which the service's need not match.
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -105,8 +106,12 @@ const entity = (config: ReadFirstUpdate | undefined) =>
         notes: Schema.optional(Schema.Array(Schema.String)),
         labels: Schema.optional(Schema.ReadonlySet(Schema.String)),
         data: Schema.Record(Schema.String, Schema.Number),
+        lists: Schema.Record(Schema.String, Schema.Array(Schema.String)),
       }),
-      { data: { storedAs: Lib.DynamoModel.SparseMap() } },
+      {
+        data: { storedAs: Lib.DynamoModel.SparseMap() },
+        lists: { storedAs: Lib.DynamoModel.SparseMap() },
+      },
     ),
     entityType: "E",
     primaryKey: { pk: { field: "pk", composite: ["id"] }, sk: { field: "sk", composite: [] } },
@@ -117,6 +122,7 @@ const cases: ReadonlyArray<readonly [name: string, apply: (u: any) => any]> = [
   ["subtract from an attribute the row lacks", (u) => u.subtract({ m: 2 })],
   ["append to an attribute the row lacks", (u) => u.append({ notes: ["x"] })],
   ["subtract from a sparse map's entry the row lacks", (u) => u.subtract({ "data#x": 2 })],
+  ["append to a sparse map's entry the row lacks", (u) => u.append({ "lists#x": ["x"] })],
   ["append to a string", (u) => u.append({ name: ["x"] })],
   ["subtract from a string", (u) => u.subtract({ name: 2 })],
   ["add a number to a string", (u) => u.add({ name: 2 })],
@@ -156,8 +162,9 @@ const outcome = (
         tags: ["t"],
         labels: new Set(["l"]),
         data: { y: 1 },
+        lists: {},
       }).asEffect()
-      yield* db.entities.E.put({ id: "b", name: "b", data: {} }).asEffect()
+      yield* db.entities.E.put({ id: "b", name: "b", data: {}, lists: {} }).asEffect()
       const before = yield* scan
       const op = apply(config.prefix(db.entities.E.update({ id: "a" })))
       const exit = yield* Effect.exit(
@@ -178,7 +185,6 @@ const outcome = (
       return {
         ok: Exit.isSuccess(exit),
         error: failure?._tag,
-        says: failure?.cause?.message,
         changed,
         read: {
           ...read,
