@@ -1,6 +1,6 @@
 {
  "generatedFrom": "effect-dynamodb@1.40.0",
- "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Doc: { id, note (stored as nt), f: Record<string, number> stored as a sparse map under m, chosen: { x } packed JSON, other: { text } packed JSON compressed by gzip from 0 bytes, tags: string[] }, written by a client with gzip() and seeded with { id: 'a', note: 'n1', f: { k: 1, j: 2 }, chosen: { x: 2 }, other: { text: 500 a's }, tags: [t0, t1, t2] }; `other` then left as written (compressed past what the reader takes), or overwritten raw with invalid JSON, or with a B value whose header names zstd. Each select is a scan by a client with gzip({ maxOutputLength: 128 }): its outcome and the requests it sent (filter, projection and names). The cases named Kept: are scans of an entity with versioned: { retain: true } (Kept: { id, note stored as nt, f sparse under m, secret: DynamoModel.Hidden(String), target: a ref to Target { targetId identifier, label } }), put with { id: 'a', note: 'n1', f: { k: 1, j: 2 }, secret: 's', targetId: 't1' } over a Target { targetId: 't1', label: 'L' } and then updated with set({ note: 'n2', f: { k: 3 } }), so a version snapshot sits beside the live row. The cases named collection, are queries of the collection cats (index gsi1: pk gsi1pk over cat, sk gsi1sk over id) over Doc { id, cat, note stored as nt, f sparse under m } and Note { id, cat, note, label stored as lb }, holding { id: 'a', cat: 'c', note: 'n', f: { k: 1, j: 2 } } and { id: 'b', cat: 'c', note: 'p', label: 'q' }, with the requests' index, key condition, filter, projection and names. Never regenerate it: it is the record of what 1.40.0 did.",
+ "note": "Captured once from the published effect-dynamodb@1.40.0 and @effect-dynamodb/schema@1.40.0, installed outside the repo and run by a scratch script against DynamoDB Local. Doc: { id, note (stored as nt), f: Record<string, number> stored as a sparse map under m, chosen: { x } packed JSON, other: { text } packed JSON compressed by gzip from 0 bytes, tags: string[] }, written by a client with gzip() and seeded with { id: 'a', note: 'n1', f: { k: 1, j: 2 }, chosen: { x: 2 }, other: { text: 500 a's }, tags: [t0, t1, t2] }; `other` then left as written (compressed past what the reader takes), or overwritten raw with invalid JSON, or with a B value whose header names zstd. Each select is a scan by a client with gzip({ maxOutputLength: 128 }): its outcome and every request it sent, whole and in order; the table's name is replaced by <table>. The cases named Kept: are scans of an entity with versioned: { retain: true } (Kept: { id, note stored as nt, f sparse under m, secret: DynamoModel.Hidden(String), target: a ref to Target { targetId identifier, label } }), put with { id: 'a', note: 'n1', f: { k: 1, j: 2 }, secret: 's', targetId: 't1' } over a Target { targetId: 't1', label: 'L' } and then updated with set({ note: 'n2', f: { k: 3 } }), so a version snapshot sits beside the live row. The cases named collection, are queries of the collection cats (index gsi1: pk gsi1pk over cat, sk gsi1sk over id) over Doc { id, cat, note stored as nt, f sparse under m } and Note { id, cat, note, label stored as lb }, holding { id: 'a', cat: 'c', note: 'n', f: { k: 1, j: 2 } } and { id: 'b', cat: 'c', note: 'p', label: 'q' }, with every request whole. Never regenerate it: it is the record of what 1.40.0 did.",
  "cases": {
   "Kept: select(['f', 'note'])": {
    "outcome": {
@@ -13,6 +13,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj0, #proj1, #proj2",
       "ExpressionAttributeNames": {
@@ -20,6 +21,11 @@
        "#proj0": "f",
        "#proj1": "nt",
        "#proj2": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -36,12 +42,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj0, #proj1",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj0": "nt",
        "#proj1": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -58,6 +70,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_secret, #proj_sk",
       "ExpressionAttributeNames": {
@@ -65,6 +78,11 @@
        "#proj_f": "f",
        "#proj_secret": "secret",
        "#proj_sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -81,12 +99,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_secret, #proj_sk",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_secret": "secret",
        "#proj_sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -106,6 +130,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_target, #proj_sk, #proj___edd_e__",
       "ExpressionAttributeNames": {
@@ -114,6 +139,11 @@
        "#proj_target": "target",
        "#proj_sk": "sk",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -133,6 +163,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_target, #proj_sk, #proj___edd_e__",
       "ExpressionAttributeNames": {
@@ -140,6 +171,11 @@
        "#proj_target": "target",
        "#proj_sk": "sk",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -156,6 +192,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_version, #proj_sk",
       "ExpressionAttributeNames": {
@@ -163,6 +200,11 @@
        "#proj_f": "f",
        "#proj_version": "version",
        "#proj_sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -179,12 +221,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_version, #proj_sk",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_version": "version",
        "#proj_sk": "sk"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Kept"
+       }
       }
      }
     }
@@ -201,11 +249,17 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_nt",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_nt": "nt"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -222,12 +276,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_nt",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_f": "f",
        "#proj_nt": "nt"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -244,11 +304,17 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#projn0",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#projn0": "m#k"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -265,12 +331,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #projn1",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_f": "f",
        "#projn1": "m#k"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -287,12 +359,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj0, #proj1",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj0": "f",
        "#proj1": "nt"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -310,6 +388,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_pk, #proj___edd_e__",
       "ExpressionAttributeNames": {
@@ -317,6 +396,11 @@
        "#proj_f": "f",
        "#proj_pk": "pk",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -335,12 +419,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_chosen, #proj___edd_e__",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_chosen": "chosen",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -359,6 +449,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_chosen, #proj___edd_e__",
       "ExpressionAttributeNames": {
@@ -366,6 +457,11 @@
        "#proj_f": "f",
        "#proj_chosen": "chosen",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -379,6 +475,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_other, #proj___edd_e__",
       "ExpressionAttributeNames": {
@@ -386,6 +483,11 @@
        "#proj_f": "f",
        "#proj_other": "other",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -405,6 +507,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj0[2], #proj1[0], #proj2",
       "ExpressionAttributeNames": {
@@ -412,6 +515,11 @@
        "#proj0": "tags",
        "#proj1": "tags",
        "#proj2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -431,6 +539,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj0, #proj1[2], #proj2[0], #proj3",
       "ExpressionAttributeNames": {
@@ -439,6 +548,11 @@
        "#proj1": "tags",
        "#proj2": "tags",
        "#proj3": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -452,6 +566,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj0[0], #proj1[0], #proj2",
       "ExpressionAttributeNames": {
@@ -459,6 +574,11 @@
        "#proj0": "tags",
        "#proj1": "tags",
        "#proj2": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -472,6 +592,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj0, #proj1[0], #proj2[0], #proj3",
       "ExpressionAttributeNames": {
@@ -480,6 +601,11 @@
        "#proj1": "tags",
        "#proj2": "tags",
        "#proj3": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -498,12 +624,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_chosen, #proj___edd_e__",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_chosen": "chosen",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -522,6 +654,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_chosen, #proj___edd_e__",
       "ExpressionAttributeNames": {
@@ -529,6 +662,11 @@
        "#proj_f": "f",
        "#proj_chosen": "chosen",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -547,12 +685,18 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_chosen, #proj___edd_e__",
       "ExpressionAttributeNames": {
        "#eddE": "__edd_e__",
        "#proj_chosen": "chosen",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -571,6 +715,7 @@
    "sent": [
     {
      "scan": {
+      "TableName": "<table>",
       "FilterExpression": "#eddE IN (:et0)",
       "ProjectionExpression": "#proj_f, #proj_chosen, #proj___edd_e__",
       "ExpressionAttributeNames": {
@@ -578,6 +723,11 @@
        "#proj_f": "f",
        "#proj_chosen": "chosen",
        "#proj___edd_e__": "__edd_e__"
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       }
       }
      }
     }
@@ -597,6 +747,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -605,7 +756,19 @@
        "#eddE": "__edd_e__",
        "#pk": "gsi1pk",
        "#proj0": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -624,6 +787,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -633,7 +797,19 @@
        "#pk": "gsi1pk",
        "#proj0": "f",
        "#proj1": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -656,6 +832,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -666,7 +843,19 @@
        "#proj0": "nt",
        "#proj1": "note",
        "#proj2": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -689,6 +878,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -700,7 +890,19 @@
        "#proj1": "nt",
        "#proj2": "note",
        "#proj3": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -719,6 +921,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -727,7 +930,19 @@
        "#eddE": "__edd_e__",
        "#pk": "gsi1pk",
        "#proj0": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -746,6 +961,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -755,7 +971,19 @@
        "#pk": "gsi1pk",
        "#proj0": "f",
        "#proj1": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -774,6 +1002,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -782,7 +1011,19 @@
        "#eddE": "__edd_e__",
        "#pk": "gsi1pk",
        "#proj0": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -801,6 +1042,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -810,7 +1052,19 @@
        "#pk": "gsi1pk",
        "#proj0": "f",
        "#proj1": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]
@@ -829,6 +1083,7 @@
    "sent": [
     {
      "query": {
+      "TableName": "<table>",
       "IndexName": "gsi1",
       "KeyConditionExpression": "#pk = :pk",
       "FilterExpression": "#eddE IN (:et0, :et1)",
@@ -838,7 +1093,19 @@
        "#pk": "gsi1pk",
        "#proj0": "f",
        "#proj1": "__edd_e__"
-      }
+      },
+      "ExpressionAttributeValues": {
+       ":et0": {
+        "S": "Doc"
+       },
+       ":et1": {
+        "S": "Note"
+       },
+       ":pk": {
+        "S": "$sel#v1#cats#cat_c"
+       }
+      },
+      "ScanIndexForward": true
      }
     }
    ]

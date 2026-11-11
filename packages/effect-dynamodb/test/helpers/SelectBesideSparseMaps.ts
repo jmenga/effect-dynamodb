@@ -7,8 +7,9 @@
  * name came back absent, and handed the whole row to the packed-storage hook, so an unselected
  * field it couldn't read failed the select.
  *
- * `fixtures/select-beside-sparse-maps-1.40.0.json` holds what the published 1.40.0 did. The head
- * sends the same requests, less the projection where the select names the map, and returns the
+ * `fixtures/select-beside-sparse-maps-1.40.0.json` holds what the published 1.40.0 did, every
+ * request whole. The head sends the same requests, less the projection (`ProjectionExpression` and
+ * the names only it used) where the select names the map, and returns the
  * same items, each with the map as a read rebuilds it; on a collection, as 1.40.0 did, other paths
  * are taken by domain name only, and a stored name reads as absent. One exception: two selected paths that
  * overlap (`tags[0]` twice). DynamoDB refuses that projection, and does for the head too where no
@@ -23,6 +24,8 @@ import * as Zlib from "../../src/compression/zlib.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, recordingRequests } from "./Kept139.js"
+import { wholeOf } from "./RenamedSparseMapWrites.js"
+import { differingPaths } from "./WholeDiff.js"
 
 interface Captured {
   readonly outcome: { readonly ok?: ReadonlyArray<Record<string, unknown>> }
@@ -314,6 +317,30 @@ const withoutProjection = (sent: Captured["sent"]): Captured["sent"] =>
     ),
   )
 
+/** Where each request names its projection: the expression and each name only it used. */
+const projectionPaths = (sent: Captured["sent"]): ReadonlyArray<string> =>
+  sent.flatMap((request, at) =>
+    Object.entries(request).flatMap(([operation, input]) => {
+      const kept = withoutProjection([{ [operation]: input }])[0]![operation]!
+      const names = Object.keys(input.ExpressionAttributeNames as object).filter(
+        (name) => !Object.hasOwn(kept.ExpressionAttributeNames as object, name),
+      )
+      return [
+        `[${at}].${operation}.ProjectionExpression`,
+        ...names.map((name) => `[${at}].${operation}.ExpressionAttributeNames.${name}`),
+      ]
+    }),
+  )
+
+/** Where each item gains the map: `ok[i].f`, or a collection's `ok.Docs[i].f`. */
+const mapPaths = (outcome: Captured["outcome"]): ReadonlyArray<string> => {
+  const items = outcome.ok as any
+  if (items === undefined) return []
+  return Array.isArray(items)
+    ? items.map((_: unknown, at: number) => `ok[${at}].f`)
+    : items.Docs.map((_: unknown, at: number) => `ok.Docs[${at}].f`)
+}
+
 /** The map each select of `f` adds: the row's entries, as a read rebuilds them. */
 const mapOf = (name: string) => (name.startsWith("Kept: ") ? { k: 3, j: 2 } : { k: 1, j: 2 })
 
@@ -345,24 +372,6 @@ const expected = (name: string, select: string): Captured => {
   }
   return { outcome: { ok: items.map((item: object) => ({ f: mapOf(name), ...item })) }, sent }
 }
-
-const PARTS = [
-  "IndexName",
-  "KeyConditionExpression",
-  "FilterExpression",
-  "ProjectionExpression",
-  "ExpressionAttributeNames",
-] as const
-
-const partsOf = (request: unknown): Record<string, Record<string, unknown>> =>
-  Object.fromEntries(
-    Object.entries(request as Record<string, Record<string, unknown>>).map(([operation, input]) => [
-      operation,
-      Object.fromEntries(
-        PARTS.filter((part) => input[part] !== undefined).map((part) => [part, input[part]]),
-      ),
-    ]),
-  )
 
 const outcomeOf = (exit: Exit.Exit<unknown, unknown>): Captured["outcome"] => {
   if (Exit.isSuccess(exit)) return { ok: JSON.parse(JSON.stringify(exit.value ?? null)) }
@@ -404,11 +413,27 @@ export const selectBesideSparseMapsSuite = (
                 const query = yield* run({ raw, table: table.name })
                 log.length = 0
                 const exit = yield* Effect.exit(Effect.suspend(() => query()))
-                return { outcome: outcomeOf(exit), sent: log.map(partsOf) }
+                return {
+                  outcome: outcomeOf(exit),
+                  sent: log.map((request) => wholeOf(request, table.name)) as Captured["sent"],
+                }
               }),
           )
           expect(got.sent).toEqual(want.sent)
           if (options.dynamodb || namesMap(select)) expect(got.outcome).toEqual(want.outcome)
+          // The fields the head changes, named: the projection, and each item's map.
+          const was = fixture.cases[name]!
+          const changed = differingPaths(was.sent, got.sent)
+          expect(changed).toEqual(namesMap(select) ? projectionPaths(was.sent) : [])
+          if (options.dynamodb || namesMap(select)) {
+            expect(differingPaths(was.outcome, got.outcome)).toEqual(
+              !namesMap(select)
+                ? []
+                : select === "select((t) => [t.f, t.tags.at(0), t.tags.at(0)])"
+                  ? ["fail", "says", "ok"]
+                  : mapPaths(was.outcome),
+            )
+          }
         }),
     )
   }
