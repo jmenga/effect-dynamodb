@@ -12,9 +12,9 @@ const tables = new Map<string, ReturnType<typeof makeRecordingTable>>()
 let made = 0
 
 suite({
-  onTable: (body) => {
+  onTable: (body, pk) => {
     const tableName = `row-key-fields-${made++}`
-    const table = makeRecordingTable()
+    const table = makeRecordingTable({ pk })
     tables.set(tableName, table)
     return body(tableName).pipe(
       Effect.provide(Layer.merge(table.layer, Main.layer({ name: tableName }))),

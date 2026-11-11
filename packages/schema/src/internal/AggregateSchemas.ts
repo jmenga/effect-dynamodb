@@ -158,6 +158,71 @@ export const storedFieldNames = (schema: Schema.Top): ReadonlySet<string> => {
   return names
 }
 
+/**
+ * Whether a value of `ast` may be absent: optional, `undefined`, `null`, `Unknown` or `Any`, or a
+ * union or suspension with such a member. A stored value of such a schema may hold nothing there.
+ */
+const mayBeAbsent = (ast: SchemaAST.AST, seen: Set<SchemaAST.AST> = new Set()): boolean => {
+  if (SchemaAST.isOptional(ast)) return true
+  if (seen.has(ast)) return false
+  seen.add(ast)
+  if (
+    SchemaAST.isUndefined(ast) ||
+    SchemaAST.isNull(ast) ||
+    SchemaAST.isUnknown(ast) ||
+    SchemaAST.isAny(ast)
+  ) {
+    return true
+  }
+  if (SchemaAST.isUnion(ast)) return ast.types.some((member) => mayBeAbsent(member, seen))
+  if (SchemaAST.isSuspend(ast)) {
+    try {
+      return mayBeAbsent(SchemaAST.toEncoded(ast.thunk()), seen)
+    } catch {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * The names every stored value of `schema` holds (#241): the fields of its stored side that are
+ * neither optional nor nullable, through classes and suspensions; through a union, those every
+ * member holds. A value that may be absent itself (optional, nullable, `Unknown`), a record's keys
+ * and a declaration give none. What {@link storedFieldNames} declares that this doesn't is held by
+ * some writes only, and judged on the value a write holds.
+ */
+export const certainlyStoredNames = (schema: Schema.Top): ReadonlySet<string> => {
+  const seen = new Set<SchemaAST.AST>()
+  const visit = (ast: SchemaAST.AST): ReadonlySet<string> => {
+    if (seen.has(ast) || mayBeAbsent(ast)) return new Set()
+    seen.add(ast)
+    if (SchemaAST.isObjects(ast)) {
+      const names = new Set<string>()
+      for (const property of ast.propertySignatures) {
+        if (typeof property.name === "string" && !mayBeAbsent(property.type)) {
+          names.add(property.name)
+        }
+      }
+      return names
+    }
+    if (SchemaAST.isUnion(ast)) {
+      const [first, ...rest] = ast.types.map(visit)
+      if (first === undefined) return new Set()
+      return new Set([...first].filter((name) => rest.every((member) => member.has(name))))
+    }
+    if (SchemaAST.isSuspend(ast)) {
+      try {
+        return visit(SchemaAST.toEncoded(ast.thunk()))
+      } catch {
+        return new Set()
+      }
+    }
+    return new Set()
+  }
+  return visit(SchemaAST.toEncoded(schema.ast))
+}
+
 /** The kinds of row an aggregate writes, by how a read hands back the value one holds. */
 export type RowKind = "root" | "subAggregate" | "edge"
 
@@ -177,15 +242,18 @@ const ROOT_INDEX_ATTRIBUTES: ReadonlySet<string> = new Set([
   "lsi2sk",
 ])
 
+/** The names a read takes off every row, whatever its value declares: its type and the table's key. */
+const ROW_RESERVED: ReadonlySet<string> = new Set(["__edd_e__", "pk", "sk"])
+
 /**
- * Whether a read takes the attribute `name` off a row of `kind` before handing back the value it
- * holds, whatever the value declares: `__edd_e__`, `pk` and `sk` everywhere; on the root's row the
- * index keys `gsi1pk` … `gsi5sk`, `lsi1sk` and `lsi2sk`; on a sub-aggregate's root row any name
- * starting `pk`, `sk`, `gsi` or `lsi`; on an edge's row any name starting `gsi` or `lsi`. The rule
- * each read has applied through 1.40.0 (#241), the one place it's stated.
+ * Whether a read up to 1.40.0 took the attribute `name` off a row of `kind` before handing back the
+ * value it holds, whatever the value declared: `__edd_e__`, `pk` and `sk` everywhere; on the root's
+ * row the index keys `gsi1pk` … `gsi5sk`, `lsi1sk` and `lsi2sk`; on a sub-aggregate's root row any
+ * name starting `pk`, `sk`, `gsi` or `lsi`; on an edge's row any name starting `gsi` or `lsi`.
+ * {@link readTakesOff} applies it to a name the value doesn't declare (#241).
  */
-export const readTakesOff = (kind: RowKind, name: string): boolean => {
-  if (name === "__edd_e__" || name === "pk" || name === "sk") return true
+export const takenOffThrough140 = (kind: RowKind, name: string): boolean => {
+  if (ROW_RESERVED.has(name)) return true
   switch (kind) {
     case "root":
       return ROOT_INDEX_ATTRIBUTES.has(name)
@@ -199,6 +267,43 @@ export const readTakesOff = (kind: RowKind, name: string): boolean => {
     case "edge":
       return name.startsWith("gsi") || name.startsWith("lsi")
   }
+}
+
+/**
+ * What a read knows of a row an aggregate writes (#241): its kind, the names its value declares at
+ * that position (`declaredValueNames`, by stored name; none where its schema can't be seen into)
+ * and the key attributes the library writes on a row of that kind ({@link rowKeysOn}).
+ */
+export type ReadRow = {
+  readonly kind: RowKind
+  readonly declared: ReadonlySet<string>
+  readonly keys: ReadonlySet<string>
+}
+
+/** A row's {@link ReadRow}: `declared` is what `declaredValueNames` gives for its value. */
+export const readRowOf = (
+  kind: RowKind,
+  config: RowKeyConfig,
+  declared: Iterable<string> | undefined,
+): ReadRow => ({
+  kind,
+  declared: new Set(declared ?? []),
+  keys: new Set(rowKeysOn(kind, config).map(([name]) => name)),
+})
+
+/**
+ * Whether a read takes the attribute `name` off a row before handing back the value it holds
+ * (#241): `__edd_e__`, `pk` and `sk` always; a name 1.40.0 took off ({@link takenOffThrough140})
+ * unless the row's value declares it at that position and the library writes no key attribute of
+ * that name there. A name the value doesn't declare is taken off as on 1.40.0, another writer's
+ * index key included. A declared field named like a key attribute the library writes there is the
+ * collision `EDD-9159` refuses (`valueFieldsOverRowKeys`), which asks this too. The one statement
+ * of the rule: every read, and the refusal of a write whose value a read would lose, ask it.
+ */
+export const readTakesOff = (row: ReadRow, name: string): boolean => {
+  if (ROW_RESERVED.has(name)) return true
+  if (!takenOffThrough140(row.kind, name)) return false
+  return row.keys.has(name) || !row.declared.has(name)
 }
 
 /**
@@ -264,53 +369,84 @@ export const listKeyAttributes = (config: RowKeyConfig): ReadonlyArray<RowKeyAtt
       ]
 
 /**
- * The key attributes of a row of `kind` (`written`) a value declaring `names` has a field of, by
- * what a read does with each ({@link readTakesOff}): `misread`, handed back, so the field reads the
- * library's key text whatever was given, on every row; `lost`, taken off, so a value given there
- * reads back without it, and one given none reads as it was.
+ * The key attributes the library writes on a row of `kind` (#241): those of every row
+ * ({@link rowKeyAttributes}) and, on the root's, its list keys (sparse, but named whether or not a
+ * write composes them).
+ */
+export const rowKeysOn = (kind: RowKind, config: RowKeyConfig): ReadonlyArray<RowKeyAttribute> => [
+  ...rowKeyAttributes(config),
+  ...(kind === "root" ? listKeyAttributes(config) : []),
+]
+
+/**
+ * The key attributes of a row (`written`, among those {@link rowKeysOn} names for it) its value
+ * declares a field of, by what a read does with each ({@link readTakesOff}): `misread`, handed back,
+ * so the field reads the library's key text whatever was given, on every row; `lost`, taken off, so
+ * a value given there reads back without it, and one given none reads as it was.
  */
 export const valueFieldsOverRowKeys = (
-  kind: RowKind,
+  row: ReadRow,
   written: ReadonlyArray<RowKeyAttribute>,
-  names: Iterable<string>,
 ): {
   readonly misread: ReadonlyArray<RowKeyAttribute>
   readonly lost: ReadonlyArray<RowKeyAttribute>
 } => {
-  const declared = new Set(names)
   const misread: Array<RowKeyAttribute> = []
   const lost: Array<RowKeyAttribute> = []
   for (const entry of written) {
-    if (!declared.has(entry[0])) continue
-    if (readTakesOff(kind, entry[0])) lost.push(entry)
+    if (!row.declared.has(entry[0])) continue
+    if (readTakesOff(row, entry[0])) lost.push(entry)
     else misread.push(entry)
   }
   return { misread, lost }
 }
 
 /**
- * `[EDD-9159]`, at make: a row's value declaring a field named like a key attribute the aggregate
- * writes on every row ({@link rowKeyAttributes}) that a read hands back (#241). The library writes
- * the key text over the value's own, so the field reads it back whatever the caller gave, on every
- * row: 1.40.0 misread each. Only an actual collision: a field the value's stored side declares
- * (`storedFieldNames`) of a name the row is written with. A record's keys, a declaration and a custom
- * `decompose`'s rows (what it returns isn't the element's schema) aren't. Refused at write, where
- * the value is known (`Aggregate.ts`): a field the read takes off (`pk`, `sk`, …), which loses only
- * a value given there; a discriminator, which collides only with a value other than its own; and a
- * list key ({@link listKeyAttributes}), written only when every list composite has a value. The
- * value of each kind of row is named as the operational `resolveNode` names it
- * ({@link declaredValueNames}).
+ * `[EDD-9159]`, at make: a row's value whose every write stores a field named like a key attribute
+ * the aggregate writes on every row ({@link rowKeyAttributes}), or on the root's every row (its list
+ * keys, when every list composite is a field every write stores), that a read hands back (#241). The
+ * library writes the key text over the value's own, so the field reads it back whatever the caller
+ * gave, on every row: 1.40.0 misread each. Only where every write certainly stores the name
+ * ({@link certainValueNames}): a field of the value's stored side, required and not nullable, held
+ * by every member of a union. A field some writes may leave empty (an optional or nullable one, one
+ * union member's), a record's keys, a declaration and a custom `decompose`'s rows (what it returns
+ * isn't the element's schema) are judged on the value a write holds (`Aggregate.ts`): refused where
+ * it holds another value there than the row stores. The value of each kind of row is named as the
+ * operational `resolveNode` names it ({@link declaredValueNames}).
  */
 export const refuseValueFieldsOnRowAttributes = (
   aggregate: string,
   rootSchema: Schema.Top,
   config: RowKeyConfig & {
     readonly edges: Record<string, AggregateEdge | BoundSubAggregate<any, any>>
+    readonly list?:
+      | {
+          readonly pk: { readonly composite?: ReadonlyArray<string> }
+          readonly sk: { readonly composite?: ReadonlyArray<string> }
+        }
+      | undefined
   },
 ): void => {
-  const refuse = (owner: string, kind: RowKind, names: Iterable<string> | undefined): void => {
-    if (names === undefined) return
-    const [first] = valueFieldsOverRowKeys(kind, rowKeyAttributes(config), names).misread
+  const refuse = (
+    owner: string,
+    kind: RowKind,
+    names: Iterable<string> | undefined,
+    certain: ReadonlySet<string> | undefined,
+  ): void => {
+    if (names === undefined || certain === undefined) return
+    // The list keys are sparse: every write stores them only where every list composite is a field
+    // every write of the root stores.
+    const list = config.list
+    const listCertain =
+      kind === "root" &&
+      list !== undefined &&
+      [...(list.pk.composite ?? []), ...(list.sk.composite ?? [])].every((composite) =>
+        certain.has(composite),
+      )
+    const [first] = valueFieldsOverRowKeys(readRowOf(kind, config, names), [
+      ...rowKeyAttributes(config),
+      ...(listCertain ? listKeyAttributes(config) : []),
+    ]).misread.filter(([name]) => certain.has(name))
     if (first === undefined) return
     throw new Error(
       `[EDD-9159] Aggregate "${aggregate}": ${owner} declares a field "${first[0]}", which is also ` +
@@ -328,12 +464,18 @@ export const refuseValueFieldsOnRowAttributes = (
       if (!("_tag" in edge)) continue
       const here = [...path, name].join(".")
       if (edge._tag === "OneEdge") {
-        refuse(`the value of edge "${here}"`, "edge", declaredValueNames.one(fields, name))
+        refuse(
+          `the value of edge "${here}"`,
+          "edge",
+          declaredValueNames.one(fields, name),
+          certainValueNames.one(fields, name),
+        )
       } else if (edge._tag === "ManyEdge") {
         refuse(
           `an element of edge "${here}"`,
           "edge",
           declaredValueNames.many(fields, name, edge as ManyEdge),
+          certainValueNames.many(fields, name, edge as ManyEdge),
         )
       } else if (edge._tag === "BoundSubAggregate") {
         const bound = edge as BoundSubAggregate<any>
@@ -342,14 +484,59 @@ export const refuseValueFieldsOnRowAttributes = (
           `the sub-aggregate at "${here}"`,
           subAggregateRowKind(bound.aggregate.edges),
           declaredValueNames.own(subFields, bound.aggregate.edges),
+          certainValueNames.own(subFields, bound.aggregate.edges),
         )
         walk(subFields, bound.aggregate.edges, [...path, name])
       }
     }
   }
   const rootFields = getSchemaFields(unwrapModel(rootSchema))
-  refuse("its root", "root", declaredValueNames.own(rootFields, config.edges))
+  refuse(
+    "its root",
+    "root",
+    declaredValueNames.own(rootFields, config.edges),
+    certainValueNames.own(rootFields, config.edges),
+  )
   walk(rootFields, config.edges, [])
+}
+
+/**
+ * The names every write of each kind of row's value stores ({@link certainlyStoredNames}), as
+ * {@link declaredValueNames} names the value: the root's and a sub-aggregate's own fields that are
+ * neither optional nor nullable, a `one` edge's value, a `many` edge's element (none with a custom
+ * `decompose`). `undefined` where nothing is.
+ */
+export const certainValueNames = {
+  own: (
+    fields: Record<string, Schema.Top> | undefined,
+    edges: Record<string, unknown>,
+  ): ReadonlySet<string> =>
+    new Set(
+      Object.entries(fields ?? {})
+        .filter(
+          ([name, field]) =>
+            !Object.hasOwn(edges, name) &&
+            !isFieldOptional(field) &&
+            !mayBeAbsent(SchemaAST.toEncoded(field.ast)),
+        )
+        .map(([name]) => name),
+    ),
+  one: (
+    fields: Record<string, Schema.Top> | undefined,
+    edgeName: string,
+  ): ReadonlySet<string> | undefined => {
+    const value = own(fields, edgeName)
+    return value === undefined ? undefined : certainlyStoredNames(value)
+  },
+  many: (
+    fields: Record<string, Schema.Top> | undefined,
+    edgeName: string,
+    edge: { readonly decompose?: unknown },
+  ): ReadonlySet<string> | undefined => {
+    if (edge.decompose !== undefined) return undefined
+    const element = manyElementSchema(fields, edgeName)
+    return element === undefined ? undefined : certainlyStoredNames(element)
+  },
 }
 
 /**

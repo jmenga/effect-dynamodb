@@ -1774,14 +1774,21 @@ export const sharedPartitionSuite = (backend: Backend) => {
     it.effect("removing A's element sends what 1.39.0 sent, and A's row stays", () =>
       Effect.gen(function* () {
         const w = yield* world(backend, concurrentDefine, { name: "concurrent", seed: created })
+        const read = yield* w.step((db) => db.aggregates.A.get({ id: "p" }))
         const done = yield* w.step((db) =>
           db.aggregates.A.update({ id: "p" }, ({ state }: any) => ({ ...state, lines: [] })),
         )
         const expected = atForeign(scenario, "remove a")
-        expect(done.result).toEqual(expected.result)
         expect(done.requests).toEqual(named(expected.requests))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(done.rows).toContainEqual(created.find(lineOf("a")))
+        // A's row stays, so the update returns it, as a get after it reads it. 1.39.0 returned the
+        // state as mutated, without it.
+        expect(done.result).toEqual(read.result)
+        expect((yield* w.step((db) => db.aggregates.A.get({ id: "p" }))).result).toEqual(
+          done.result,
+        )
+        expect(expected.result).toEqual({ ok: { ...(read.result as any).ok, lines: [] } })
         yield* w.opened.close
       }),
     )
@@ -1790,6 +1797,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
       Effect.gen(function* () {
         const w = yield* world(backend, concurrentDefine, { name: "concurrent", seed: created })
         const taken = atForeign(scenario, "b takes the key").rows.find(lineOf("b"))!
+        const read = yield* w.step((db) => db.aggregates.A.get({ id: "p" }))
         w.hooks.before = (command) => {
           if (command !== "TransactWriteItems") return undefined
           w.hooks.before = undefined
@@ -1799,7 +1807,10 @@ export const sharedPartitionSuite = (backend: Backend) => {
           db.aggregates.A.update({ id: "p" }, ({ state }: any) => ({ ...state, lines: [] })),
         )
         const expected = atForeign(scenario, "race remove a")
-        expect(done.result).toEqual(expected.result)
+        // What the update leaves of what it read: A's row, which it doesn't delete. 1.39.0 returned
+        // the state as mutated, without it.
+        expect(done.result).toEqual(read.result)
+        expect(expected.result).toEqual({ ok: { ...(read.result as any).ok, lines: [] } })
         expect(done.requests).toEqual(named(expected.requests))
         expect(done.rows).toEqual(byKey(expected.rows))
         expect(done.rows).toContainEqual(taken)
@@ -1966,14 +1977,21 @@ export const sharedPartitionSuite = (backend: Backend) => {
             name: "guard",
             seed: created,
           })
+          const read = yield* w.step((db) => db.aggregates.A.get({ id: "p q" }))
           const done = yield* w.step((db) =>
             db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
           )
           const expected = atClaimed(scenario, "remove a")
-          expect(done.result).toEqual(expected.result)
           expect(done.requests).toEqual(named(expected.requests))
           expect(done.rows).toEqual(byKey(expected.rows))
           expect(done.rows.map((row) => row.sk?.S)).toContain(lineKey)
+          // A's row stays, so the update returns it, as a get after it reads it. 1.39.0 returned
+          // the state as mutated, without it.
+          expect(done.result).toEqual(read.result)
+          expect((yield* w.step((db) => db.aggregates.A.get({ id: "p q" }))).result).toEqual(
+            done.result,
+          )
+          expect(expected.result).toEqual({ ok: { ...(read.result as any).ok, lines: [] } })
           yield* w.opened.close
         }),
       )
@@ -1986,6 +2004,7 @@ export const sharedPartitionSuite = (backend: Backend) => {
               name: "guard",
               seed: created,
             })
+            const read = yield* w.step((db) => db.aggregates.A.get({ id: "p q" }))
             w.hooks.before = (command) => {
               if (command !== "TransactWriteItems") return undefined
               w.hooks.before = undefined
@@ -1995,7 +2014,10 @@ export const sharedPartitionSuite = (backend: Backend) => {
               db.aggregates.A.update({ id: "p q" }, ({ state }: any) => ({ ...state, lines: [] })),
             )
             const expected = atClaimed(scenario, "race remove a")
-            expect(done.result).toEqual(expected.result)
+            // What the update leaves of what it read: A's row, which it doesn't delete. 1.39.0
+            // returned the state as mutated, without it.
+            expect(done.result).toEqual(read.result)
+            expect(expected.result).toEqual({ ok: { ...(read.result as any).ok, lines: [] } })
             expect(done.requests).toEqual(named(expected.requests))
             expect(done.rows).toEqual(byKey(expected.rows))
             expect(done.rows).toContainEqual(taken)

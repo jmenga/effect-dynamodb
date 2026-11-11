@@ -39,7 +39,7 @@ const sent = new Map<string, Array<string>>()
 let made = 0
 
 const harness = {
-  onTable: <A, E>(body: (tableName: string) => Effect.Effect<A, E, any>) => {
+  onTable: <A, E>(body: (tableName: string) => Effect.Effect<A, E, any>, pk = "pk") => {
     const tableName = `aggregate-row-key-fields-${Date.now()}-${made++}`
     const commands: Array<string> = []
     sent.set(tableName, commands)
@@ -62,11 +62,11 @@ const harness = {
           TableName: tableName,
           BillingMode: "PAY_PER_REQUEST",
           KeySchema: [
-            { AttributeName: "pk", KeyType: "HASH" },
+            { AttributeName: pk, KeyType: "HASH" },
             { AttributeName: "sk", KeyType: "RANGE" },
           ],
           AttributeDefinitions: [
-            { AttributeName: "pk", AttributeType: "S" },
+            { AttributeName: pk, AttributeType: "S" },
             { AttributeName: "sk", AttributeType: "S" },
           ],
         }),

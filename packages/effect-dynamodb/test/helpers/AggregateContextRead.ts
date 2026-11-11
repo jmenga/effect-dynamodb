@@ -1,12 +1,13 @@
 /**
  * Context attributes, and a value that keeps what it's given (#241). An aggregate's `context` copies
- * root fields onto every edge's row. A value that keeps what it's given (`Schema.Unknown`) came back
- * with them inside, on 1.39.0 and 1.40.0 alike; it now reads back as given, as it does beside a
- * discriminator or a key attribute. Because the read takes such an attribute off, a value holding a
- * key of one of those names would read back without it, so a write whose value holds one is refused
- * (`EDD-9159`), nothing sent: holding another value, 1.40.0 read back the library's; holding the
- * same, 1.40.0 read it back, and the read can't tell it from the library's. A value that declares
- * the context field reads the root's value back, the copy `context` exists for, as before; a custom
+ * root fields onto every edge's row. A value that keeps what it's given (`Schema.Unknown`, a record)
+ * is stored as the row's attributes, so its row is its value: a read hands it back with the row's
+ * context attributes inside, as on 1.39.0 and 1.40.0, since nothing stored tells them from the
+ * value's own. Such a value holding a context attribute whose value differs from the one the row
+ * stores would read back changed, so that write is refused (`EDD-9159`), nothing sent; holding the
+ * row's value, or none, it is written byte-identically to 1.40.0. A discriminator is the library's
+ * to fill: written with its value whatever the value holds, as on 1.40.0. A value that declares the
+ * context field reads the root's value back, the copy `context` exists for, as before; a custom
  * `assemble` is handed the rows with them, as before.
  *
  * `fixtures/aggregate-context-read-1.40.0.json` holds what published 1.39.0 and 1.40.0 did for each
@@ -55,8 +56,6 @@ type Shape = {
   /** Refused at `create`, nothing sent, with this message, naming `member`. */
   readonly refused?: string
   readonly member?: string
-  /** What a read returns now. */
-  readonly read?: unknown
 }
 
 const S = Schema.String
@@ -66,10 +65,9 @@ const one = () => (Aggregate.one as any)({ entityType: "Note" })
 const root = (fields: Record<string, Schema.Top>) =>
   Schema.Struct({ id: S, tenantId: S, ...fields })
 
-const holds = (member: string, name: string, what: string) =>
-  `[EDD-9159] "${member}" holds a key "${name}" in its value, which is also ${what}. The library ` +
-  "writes that attribute on the row over the value's own, and a read takes it off a value that " +
-  "keeps what it's given"
+const misread = (member: string, name: string, held: string, what: string, library: string) =>
+  `[EDD-9159] "${member}" gives "${name}" the value ${held} at the top of its value, which is also ` +
+  `${what}. The library writes ${library} there over the value's own, and a read hands that back`
 const CONTEXT = "a context attribute the aggregate copies onto its rows"
 
 const unknownOne = (note: Record<string, unknown>, now: Partial<Shape>) => (): Shape => ({
@@ -88,9 +86,8 @@ const structOne = (note: Record<string, unknown>) => (): Shape => ({
   model: root({ note: Schema.Struct({ text: S, tenantId: Schema.optional(S) }) }),
   edges: { note: one() },
   input: { id: "a", tenantId: "t1", note },
-  read: { id: "a", tenantId: "t1", note: { text: "n", tenantId: "t1" } },
 })
-const subUnknown = (line: Record<string, unknown>, now: Partial<Shape>) => (): Shape => {
+const subUnknown = (line: Record<string, unknown>) => (): Shape => {
   const Part = Schema.Struct({ lines: Schema.Array(Schema.Unknown) })
   const Sub = (Aggregate.make as any)(Part, {
     root: { entityType: "Part" },
@@ -101,34 +98,25 @@ const subUnknown = (line: Record<string, unknown>, now: Partial<Shape>) => (): S
     edges: { part: Sub.with({ discriminator: { side: 1 } }) },
     input: { id: "a", tenantId: "t1", part: { lines: [line] } },
     context: [],
-    ...now,
   }
 }
 
 export const shapes: Record<string, () => Shape> = {
-  "an Unknown one edge holding no tenantId": unknownOne(
-    { text: "n" },
-    { read: { id: "a", tenantId: "t1", note: { text: "n" } } },
-  ),
-  "an Unknown one edge holding the root's tenantId": unknownOne(
-    { text: "n", tenantId: "t1" },
-    { refused: holds("note", "tenantId", CONTEXT), member: "note" },
-  ),
+  // The row is the value: it reads back with the row's context attributes, as on 1.40.0.
+  "an Unknown one edge holding no tenantId": unknownOne({ text: "n" }, {}),
+  "an Unknown one edge holding the root's tenantId": unknownOne({ text: "n", tenantId: "t1" }, {}),
   "an Unknown one edge holding another tenantId": unknownOne(
     { text: "n", tenantId: "other" },
-    { refused: holds("note", "tenantId", CONTEXT), member: "note" },
+    { refused: misread("note", "tenantId", '"other"', CONTEXT, '"t1"'), member: "note" },
   ),
-  "an Unknown element holding no tenantId": unknownMany(
-    { qty: 1, text: "n" },
-    { read: { id: "a", tenantId: "t1", lines: [{ qty: 1, text: "n" }] } },
-  ),
+  "an Unknown element holding no tenantId": unknownMany({ qty: 1, text: "n" }, {}),
   "an Unknown element holding the root's tenantId": unknownMany(
     { qty: 1, text: "n", tenantId: "t1" },
-    { refused: holds("lines", "tenantId", CONTEXT), member: "lines" },
+    {},
   ),
   "an Unknown element holding another tenantId": unknownMany(
     { qty: 1, text: "n", tenantId: "other" },
-    { refused: holds("lines", "tenantId", CONTEXT), member: "lines" },
+    { refused: misread("lines", "tenantId", '"other"', CONTEXT, '"t1"'), member: "lines" },
   ),
   // A custom `assemble` is handed the rows with the context attributes: written and read as before.
   "an Unknown element with a custom assemble holding another tenantId": () => ({
@@ -140,7 +128,6 @@ export const shapes: Record<string, () => Shape> = {
       }),
     },
     input: { id: "a", tenantId: "t1", lines: [{ qty: 1, text: "n", tenantId: "other" }] },
-    read: { id: "a", tenantId: "t1", lines: [{ qty: 1, text: "n", tenantId: "t1" }] },
   }),
   // A value declaring the context field reads the root's value back, the copy `context` makes.
   "a struct one edge declaring tenantId, given none": structOne({ text: "n" }),
@@ -159,22 +146,30 @@ export const shapes: Record<string, () => Shape> = {
       model: root({ part: Part }),
       edges: { part: Sub.with({ discriminator: { side: 1 } }) },
       input: { id: "a", tenantId: "t1", part: { name: "p", tenantId: "other" } },
-      read: { id: "a", tenantId: "t1", part: { name: "p", tenantId: "t1" } },
     }
   },
-  "sub-aggregate, an Unknown element holding its discriminator's value": subUnknown(
-    { qty: 1, text: "n", side: 1 },
-    { refused: holds("lines", "side", "a discriminator its rows carry"), member: "lines" },
-  ),
-  "sub-aggregate, an Unknown element holding another value in its discriminator": subUnknown(
-    { qty: 1, text: "n", side: 2 },
-    { refused: holds("lines", "side", "a discriminator its rows carry"), member: "lines" },
-  ),
+  // The discriminator is the library's to fill, whatever the value holds, as on 1.40.0.
+  "sub-aggregate, an Unknown element holding its discriminator's value": subUnknown({
+    qty: 1,
+    text: "n",
+    side: 1,
+  }),
+  "sub-aggregate, an Unknown element holding another value in its discriminator": subUnknown({
+    qty: 1,
+    text: "n",
+    side: 2,
+  }),
   "an Unknown one edge holding csk, the collection sort key's copy": unknownOne(
     { text: "n", csk: "mine" },
     {
       collection: { name: "ctx", index: INDEX.name, sk: { field: INDEX.sk, composite: [] } },
-      refused: holds("note", "csk", "an attribute holding one of the aggregate's keys"),
+      refused: misread(
+        "note",
+        "csk",
+        '"mine"',
+        "the attribute holding the collection sort key's copy",
+        '"$ctx#v1#note"',
+      ),
       member: "note",
     },
   ),
@@ -234,11 +229,12 @@ export const suite = (
       const then = published["1.40.0"][label]!
       const shape = define()
       if (shape.refused !== undefined) {
-        it(`${label}: 1.40.0 stored it; the write is refused, nothing sent`, () =>
+        it(`${label}: 1.40.0 read back the library's value, not the one given; the write is refused, nothing sent`, () =>
           Effect.runPromise(
             harness.onTable((tableName) =>
               Effect.gen(function* () {
                 expect(judged(then.create)).toEqual({ ok: shape.input })
+                expect(judged(then.get)).not.toEqual({ ok: shape.input })
                 const A = yield* bind(shape)
                 yield* harness.commands(tableName)
                 const exit = yield* Effect.exit(A.create(shape.input))
@@ -257,7 +253,7 @@ export const suite = (
           ))
         continue
       }
-      it(`${label}: stores what 1.40.0 did, and reads back the value`, () =>
+      it(`${label}: stores and reads back what 1.40.0 did`, () =>
         Effect.runPromise(
           harness.onTable((tableName) =>
             Effect.gen(function* () {
@@ -279,7 +275,7 @@ export const suite = (
                 ["noop", noop],
                 ["getAfterUpdate", getAfterUpdate],
               ] as const) {
-                expect({ step, ...judged(now) }).toEqual({ step, ok: shape.read })
+                expect({ step, ...judged(now) }).toEqual({ step, ...judged(then[step]) })
               }
             }),
           ),
@@ -304,29 +300,43 @@ export const suite = (
         ),
       ))
 
-    it("an update putting the context's name into a value that keeps what it's given is refused", () =>
-      Effect.runPromise(
-        harness.onTable((tableName) =>
-          Effect.gen(function* () {
-            const A = yield* bind(shapes["an Unknown one edge holding no tenantId"]!())
-            yield* A.create({ id: "a", tenantId: "t1", note: { text: "n" } })
-            const before = bySortKey(yield* harness.rows(tableName))
-            yield* harness.commands(tableName)
-            const exit = yield* Effect.exit(
-              A.update({ id: "a" }, ({ state }: any) => ({
-                ...state,
-                note: { ...state.note, tenantId: "t1" },
-              })),
-            )
-            const error = Cause.squash((exit as Exit.Failure<unknown, unknown>).cause) as {
-              _tag?: string
-              reason?: string
-            }
-            expect(error._tag).toBe("AggregateDecompositionError")
-            expect(error.reason).toContain(holds("note", "tenantId", CONTEXT))
-            expect(yield* harness.commands(tableName)).toEqual(["Query"])
-            expect(bySortKey(yield* harness.rows(tableName))).toEqual(before)
-          }),
-        ),
-      ))
+    for (const [given, refused] of [
+      ["t1", false],
+      ["other", true],
+    ] as const) {
+      it(`an update putting the context's name into a value that keeps what it's given, holding ${given}: ${refused ? "refused, nothing written" : "accepted, as 1.40.0, and returns what a get reads"}`, () =>
+        Effect.runPromise(
+          harness.onTable((tableName) =>
+            Effect.gen(function* () {
+              const A = yield* bind(shapes["an Unknown one edge holding no tenantId"]!())
+              yield* A.create({ id: "a", tenantId: "t1", note: { text: "n" } })
+              const before = bySortKey(yield* harness.rows(tableName))
+              yield* harness.commands(tableName)
+              const exit = yield* Effect.exit(
+                A.update({ id: "a" }, ({ state }: any) => ({
+                  ...state,
+                  note: { ...state.note, tenantId: given },
+                })),
+              )
+              // The row holds `t1` already: nothing to write either way.
+              expect(yield* harness.commands(tableName)).toEqual(["Query"])
+              expect(bySortKey(yield* harness.rows(tableName))).toEqual(before)
+              if (!refused) {
+                const read = { id: "a", tenantId: "t1", note: { text: "n", tenantId: "t1" } }
+                expect(outcome(exit)).toEqual({ ok: read })
+                expect(outcome(yield* Effect.exit(A.get({ id: "a" })))).toEqual({ ok: read })
+                return
+              }
+              const error = Cause.squash((exit as Exit.Failure<unknown, unknown>).cause) as {
+                _tag?: string
+                reason?: string
+              }
+              expect(error._tag).toBe("AggregateDecompositionError")
+              expect(error.reason).toContain(
+                misread("note", "tenantId", '"other"', CONTEXT, '"t1"'),
+              )
+            }),
+          ),
+        ))
+    }
   })
