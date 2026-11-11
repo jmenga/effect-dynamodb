@@ -1,0 +1,999 @@
+{
+ "writtenBy": {
+  "effect-dynamodb": "1.39.0",
+  "effect": "4.1.2"
+ },
+ "off": {
+  "schema": {
+   "name": "kp",
+   "version": 1,
+   "escapeKeys": false
+  },
+  "id": {
+   "orderId": "o 1"
+  },
+  "seed": {
+   "events": [
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "amount": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Placed"
+       }
+      }
+     },
+     "__edd_wt__": {
+      "S": "412c7b89111106302b1ccc5555225d5f"
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000001"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o 1"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:06.607Z"
+     }
+    }
+   ],
+   "read": [
+    {
+     "__edd_row_pk__": {
+      "S": "$kp#v1#effected#orderid_x:o 1"
+     },
+     "streamId": {
+      "S": "o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected#outbox"
+     },
+     "effect": {
+      "M": {
+       "note": {
+        "S": "Placed v1"
+       }
+      }
+     },
+     "sk": {
+      "S": "$kp#v1#effected#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:o 1"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_row_sk__": {
+      "S": "$kp#v1#effected"
+     }
+    },
+    {
+     "total": {
+      "N": "5"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected"
+     },
+     "sk": {
+      "S": "$kp#v1#effected"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:x:o 1"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kp#v1#removable"
+     },
+     "total": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$kp#v1#removable#orderid_x:x:o 1"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Removable"
+     }
+    }
+   ]
+  },
+  "steps": [
+   {
+    "label": "1 placed",
+    "A": {
+     "ok": {
+      "key": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1"
+       }
+      },
+      "applied": [
+       {
+        "streamId": "o 1",
+        "version": 1,
+        "eventType": "Placed",
+        "data": {
+         "_tag": "Placed",
+         "amount": 5
+        },
+        "timestamp": "2026-11-09T06:39:06.607Z"
+       }
+      ],
+      "rejected": [],
+      "skipped": [],
+      "state": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1",
+        "total": 5,
+        "version": 1
+       }
+      },
+      "version": 1,
+      "removed": false
+     }
+    },
+    "B": {
+     "ok": {
+      "key": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1"
+       }
+      },
+      "applied": [
+       {
+        "streamId": "o 1",
+        "version": 1,
+        "eventType": "Placed",
+        "data": {
+         "_tag": "Placed",
+         "amount": 5
+        },
+        "timestamp": "2026-11-09T06:39:06.607Z"
+       }
+      ],
+      "rejected": [],
+      "skipped": [],
+      "state": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1",
+        "total": 5,
+        "version": 1,
+        "rev": 1
+       }
+      },
+      "version": 1,
+      "removed": false
+     }
+    }
+   },
+   {
+    "label": "2 added",
+    "A": {
+     "failed": "ConcurrentModification"
+    },
+    "B": {
+     "failed": "ConcurrentModification"
+    }
+   },
+   {
+    "label": "3 cancelled",
+    "A": {
+     "ok": {
+      "key": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1"
+       }
+      },
+      "applied": [
+       {
+        "streamId": "o 1",
+        "version": 1,
+        "eventType": "Placed",
+        "data": {
+         "_tag": "Placed",
+         "amount": 5
+        },
+        "timestamp": "2026-11-09T06:39:06.607Z"
+       },
+       {
+        "streamId": "o 1",
+        "version": 2,
+        "eventType": "Added",
+        "data": {
+         "_tag": "Added",
+         "amount": 3
+        },
+        "timestamp": "2026-11-09T06:39:06.636Z"
+       },
+       {
+        "streamId": "o 1",
+        "version": 3,
+        "eventType": "Cancelled",
+        "data": {
+         "_tag": "Cancelled"
+        },
+        "timestamp": "2026-11-09T06:39:09.319Z"
+       }
+      ],
+      "rejected": [],
+      "skipped": [],
+      "state": {
+       "_id": "Option",
+       "_tag": "None"
+      },
+      "version": 3,
+      "removed": true
+     }
+    },
+    "B": {
+     "failed": "ConcurrentModification"
+    }
+   }
+  ],
+  "final": {
+   "events": [
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "amount": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Placed"
+       }
+      }
+     },
+     "__edd_wt__": {
+      "S": "412c7b89111106302b1ccc5555225d5f"
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000001"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o 1"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:06.607Z"
+     }
+    },
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "amount": {
+        "N": "3"
+       },
+       "_tag": {
+        "S": "Added"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000002"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o 1"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:06.636Z"
+     }
+    },
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "_tag": {
+        "S": "Cancelled"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000003"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o 1"
+     },
+     "eventType": {
+      "S": "Cancelled"
+     },
+     "version": {
+      "N": "3"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:09.319Z"
+     }
+    }
+   ],
+   "read": [
+    {
+     "__edd_row_pk__": {
+      "S": "$kp#v1#effected#orderid_x:o 1"
+     },
+     "streamId": {
+      "S": "o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected#outbox"
+     },
+     "effect": {
+      "M": {
+       "note": {
+        "S": "Placed v1"
+       }
+      }
+     },
+     "sk": {
+      "S": "$kp#v1#effected#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:o 1"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_row_sk__": {
+      "S": "$kp#v1#effected"
+     }
+    },
+    {
+     "total": {
+      "N": "5"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected"
+     },
+     "sk": {
+      "S": "$kp#v1#effected"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:x:o 1"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kp#v1#removable"
+     },
+     "__edd_removed__": {
+      "S": "2026-11-09T06:39:09.330Z"
+     },
+     "pk": {
+      "S": "$kp#v1#removable#orderid_x:o 1"
+     },
+     "version": {
+      "N": "3"
+     },
+     "__edd_e__": {
+      "S": "Removable#tombstone"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kp#v1#removable"
+     },
+     "total": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$kp#v1#removable#orderid_x:x:o 1"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Removable"
+     }
+    }
+   ]
+  },
+  "gets": {
+   "A": {
+    "ok": {
+     "orderId": "o 1",
+     "total": 5,
+     "version": 1
+    }
+   },
+   "B": {
+    "ok": {
+     "orderId": "o 1",
+     "total": 5,
+     "version": 1,
+     "rev": 1
+    }
+   }
+  }
+ },
+ "on": {
+  "schema": {
+   "name": "kp",
+   "version": 1,
+   "escapeKeys": true
+  },
+  "id": {
+   "orderId": "o 1"
+  },
+  "seed": {
+   "events": [
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "amount": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Placed"
+       }
+      }
+     },
+     "__edd_wt__": {
+      "S": "6158521b5c42b86df954284cbfadb530"
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000001"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o%201"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:10.868Z"
+     }
+    }
+   ],
+   "read": [
+    {
+     "__edd_row_pk__": {
+      "S": "$kp#v1#effected#orderid_x:o%201"
+     },
+     "streamId": {
+      "S": "o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected#outbox"
+     },
+     "effect": {
+      "M": {
+       "note": {
+        "S": "Placed v1"
+       }
+      }
+     },
+     "sk": {
+      "S": "$kp#v1#effected#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:o%201"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_row_sk__": {
+      "S": "$kp#v1#effected"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     }
+    },
+    {
+     "total": {
+      "N": "5"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected"
+     },
+     "sk": {
+      "S": "$kp#v1#effected"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:x:o%201"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kp#v1#removable"
+     },
+     "total": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$kp#v1#removable#orderid_x:x:o%201"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Removable"
+     }
+    }
+   ]
+  },
+  "steps": [
+   {
+    "label": "1 placed",
+    "A": {
+     "ok": {
+      "key": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1"
+       }
+      },
+      "applied": [
+       {
+        "streamId": "o 1",
+        "version": 1,
+        "eventType": "Placed",
+        "data": {
+         "_tag": "Placed",
+         "amount": 5
+        },
+        "timestamp": "2026-11-09T06:39:10.868Z"
+       }
+      ],
+      "rejected": [],
+      "skipped": [],
+      "state": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1",
+        "total": 5,
+        "version": 1
+       }
+      },
+      "version": 1,
+      "removed": false
+     }
+    },
+    "B": {
+     "ok": {
+      "key": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1"
+       }
+      },
+      "applied": [
+       {
+        "streamId": "o 1",
+        "version": 1,
+        "eventType": "Placed",
+        "data": {
+         "_tag": "Placed",
+         "amount": 5
+        },
+        "timestamp": "2026-11-09T06:39:10.868Z"
+       }
+      ],
+      "rejected": [],
+      "skipped": [],
+      "state": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1",
+        "total": 5,
+        "version": 1,
+        "rev": 1
+       }
+      },
+      "version": 1,
+      "removed": false
+     }
+    }
+   },
+   {
+    "label": "2 added",
+    "A": {
+     "failed": "ConcurrentModification"
+    },
+    "B": {
+     "failed": "ConcurrentModification"
+    }
+   },
+   {
+    "label": "3 cancelled",
+    "A": {
+     "ok": {
+      "key": {
+       "_id": "Option",
+       "_tag": "Some",
+       "value": {
+        "orderId": "o 1"
+       }
+      },
+      "applied": [
+       {
+        "streamId": "o 1",
+        "version": 1,
+        "eventType": "Placed",
+        "data": {
+         "_tag": "Placed",
+         "amount": 5
+        },
+        "timestamp": "2026-11-09T06:39:10.868Z"
+       },
+       {
+        "streamId": "o 1",
+        "version": 2,
+        "eventType": "Added",
+        "data": {
+         "_tag": "Added",
+         "amount": 3
+        },
+        "timestamp": "2026-11-09T06:39:10.891Z"
+       },
+       {
+        "streamId": "o 1",
+        "version": 3,
+        "eventType": "Cancelled",
+        "data": {
+         "_tag": "Cancelled"
+        },
+        "timestamp": "2026-11-09T06:39:13.610Z"
+       }
+      ],
+      "rejected": [],
+      "skipped": [],
+      "state": {
+       "_id": "Option",
+       "_tag": "None"
+      },
+      "version": 3,
+      "removed": true
+     }
+    },
+    "B": {
+     "failed": "ConcurrentModification"
+    }
+   }
+  ],
+  "final": {
+   "events": [
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "amount": {
+        "N": "5"
+       },
+       "_tag": {
+        "S": "Placed"
+       }
+      }
+     },
+     "__edd_wt__": {
+      "S": "6158521b5c42b86df954284cbfadb530"
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000001"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o%201"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:10.868Z"
+     }
+    },
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "amount": {
+        "N": "3"
+       },
+       "_tag": {
+        "S": "Added"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000002"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o%201"
+     },
+     "eventType": {
+      "S": "Added"
+     },
+     "version": {
+      "N": "2"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:10.891Z"
+     }
+    },
+    {
+     "streamId": {
+      "S": "o 1"
+     },
+     "data": {
+      "M": {
+       "_tag": {
+        "S": "Cancelled"
+       }
+      }
+     },
+     "__edd_e__": {
+      "S": "order.event"
+     },
+     "sk": {
+      "S": "$kp#v1#order.event_1#0000000003"
+     },
+     "pk": {
+      "S": "$kp#v1#order#o%201"
+     },
+     "eventType": {
+      "S": "Cancelled"
+     },
+     "version": {
+      "N": "3"
+     },
+     "timestamp": {
+      "S": "2026-11-09T06:39:13.610Z"
+     }
+    }
+   ],
+   "read": [
+    {
+     "__edd_row_pk__": {
+      "S": "$kp#v1#effected#orderid_x:o%201"
+     },
+     "streamId": {
+      "S": "o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected#outbox"
+     },
+     "effect": {
+      "M": {
+       "note": {
+        "S": "Placed v1"
+       }
+      }
+     },
+     "sk": {
+      "S": "$kp#v1#effected#outbox#000000000001#0000"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:o%201"
+     },
+     "source": {
+      "S": "projection"
+     },
+     "eventType": {
+      "S": "Placed"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_row_sk__": {
+      "S": "$kp#v1#effected"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     }
+    },
+    {
+     "total": {
+      "N": "5"
+     },
+     "rev": {
+      "N": "1"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "__edd_e__": {
+      "S": "Effected"
+     },
+     "sk": {
+      "S": "$kp#v1#effected"
+     },
+     "pk": {
+      "S": "$kp#v1#effected#orderid_x:x:o%201"
+     },
+     "version": {
+      "N": "1"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kp#v1#removable"
+     },
+     "__edd_removed__": {
+      "S": "2026-11-09T06:39:13.623Z"
+     },
+     "pk": {
+      "S": "$kp#v1#removable#orderid_x:o%201"
+     },
+     "version": {
+      "N": "3"
+     },
+     "__edd_kt__": {
+      "N": "2"
+     },
+     "__edd_e__": {
+      "S": "Removable#tombstone"
+     }
+    },
+    {
+     "sk": {
+      "S": "$kp#v1#removable"
+     },
+     "total": {
+      "N": "5"
+     },
+     "pk": {
+      "S": "$kp#v1#removable#orderid_x:x:o%201"
+     },
+     "orderId": {
+      "S": "x:o 1"
+     },
+     "version": {
+      "N": "1"
+     },
+     "__edd_e__": {
+      "S": "Removable"
+     }
+    }
+   ]
+  },
+  "gets": {
+   "A": {
+    "ok": {
+     "orderId": "o 1",
+     "total": 5,
+     "version": 1
+    }
+   },
+   "B": {
+    "ok": {
+     "orderId": "o 1",
+     "total": 5,
+     "version": 1,
+     "rev": 1
+    }
+   }
+  }
+ }
+}

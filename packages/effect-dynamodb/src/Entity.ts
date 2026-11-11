@@ -961,7 +961,7 @@ export interface Entity<
   ) => Effect.Effect<Rekey.RekeyTally | undefined, DynamoClientError, DynamoClient | TableConfig>
   /**
    * @internal The mark (`__edd_kt__`) a projection's row tombstone or outbox item takes for the
-   * read-model row at `key` (key form): `KeyText136.markOf`.
+   * read-model row at `key` (a domain key record, `_domainKeyForm`): `KeyText136.markOf`.
    */
   readonly _keyTextMark: (key: globalThis.Record<string, unknown>) => 2 | undefined
 
@@ -3932,20 +3932,20 @@ const makeImpl = <
     return keyReaders[1].has(attr)
   }
 
+  const unencodable = (attr: string, value: unknown, reason?: string): never => {
+    if (reason !== undefined) {
+      return refuseInexact(`Composite "${attr}" on entity "${entityType}"`, value, reason)
+    }
+    throw new Error(
+      `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to its ` +
+        `stored form. The attribute's schema carries an encoding transformation, so the ` +
+        `stored key holds the ENCODED value, but ${JSON.stringify(String(value))} encodes ` +
+        `under neither encode nor decode->encode. Supply a value of the attribute's own type.`,
+    )
+  }
   const compositeKeyForm = makeCompositeKeyForm(
     schemas.inputSchema as unknown as Schema.Top,
-    (attr, value, reason) => {
-      if (reason !== undefined) {
-        return refuseInexact(`Composite "${attr}" on entity "${entityType}"`, value, reason)
-      }
-      throw new Error(
-        `[EDD-9050] Composite "${attr}" on entity "${entityType}" could not be encoded to ` +
-          `its stored form. The attribute's schema carries an encoding transformation, so ` +
-          `the stored key holds the ENCODED value, but ${JSON.stringify(String(value))} ` +
-          `encodes under neither encode nor decode->encode. Supply a value of the ` +
-          `attribute's own type.`,
-      )
-    },
+    unencodable,
     // A record handed here can be a whole row read back (restore, a retain update, rekey): what
     // no key reads is never key text, so a field stored in a form its schema can't take again
     // is left as it is.
@@ -4066,11 +4066,26 @@ const makeImpl = <
   /**
    * `keyForm` of a caller's DOMAIN key record: each composite first put into
    * the form `put` stores it in, as `put`'s encode and `get`'s `encodeKey` do,
-   * so a codec `encode` takes on its own output composes the key `put` wrote.
-   * Every other composite composes exactly what `keyForm` alone does.
+   * so a domain value that also reads as its codec's stored text (`"x:MiX"`
+   * for a codec prepending `x:`) composes the key `put` wrote for it. Every
+   * other composite composes exactly what `keyForm` alone does.
    */
   const domainKeyForm = (record: globalThis.Record<string, unknown>) =>
     keyForm(compositeStoredForm(record))
+
+  /**
+   * The key form 1.39.0 composed from a stored record: a codec whose `encode`
+   * takes its own output keyed its stored text encoded once more (`x:x:mix`
+   * for `"MiX"` stored `"x:MiX"`). Only `rekey` composes it, to find a row
+   * 1.39.0 stored under that text and move it to `keyForm`'s.
+   */
+  const compositeKeyForm139 = makeCompositeKeyForm(
+    schemas.inputSchema as unknown as Schema.Top,
+    unencodable,
+    { text139: true, reads: readsKey },
+  )
+  const keyForm139 = (record: globalThis.Record<string, unknown>) =>
+    toCompositeKeyRecord(compositeKeyForm139, record)
 
   // -------------------------------------------------------------------------
   // Write-limit diagnosis (#144)
@@ -4426,10 +4441,16 @@ const makeImpl = <
   ) =>
     composeKeysOrFail(entityType, "upsert", () => {
       const keys = { ...composed }
-      const form = keyForm(record)
+      const recordKeyForm = keyForm(record)
       for (const [indexName, index] of Object.entries(allIndexes)) {
         if (indexName === "primary" || index.pk.field in composed) continue
-        const known = KeyComposer.composeKnownHalves(schema, entityType, entityVersion, index, form)
+        const known = KeyComposer.composeKnownHalves(
+          schema,
+          entityType,
+          entityVersion,
+          index,
+          recordKeyForm,
+        )
         for (const [field, composites] of halvesOf(index)) {
           const value = known[field]
           if (
@@ -11919,8 +11940,10 @@ const makeImpl = <
     const zorder = KeyComposer.isZOrderHalf(indexDef.sk)
     const indexQuery = (rawPk: globalThis.Record<string, unknown>) => {
       // Normalise composites to their key form before composing — same rule
-      // and same function the write path uses (see `CompositeCodec`).
-      const pkKeyForm = keyForm(rawPk)
+      // and same function the write path uses (see `CompositeCodec`). They are
+      // the caller's DOMAIN values: the key `put` wrote for one is the key form
+      // of the value it stores.
+      const pkKeyForm = domainKeyForm(rawPk)
       // One partition, or a sharded index's several (#183).
       const read = KeyComposer.composeReadPartitions(schema, entityType, indexDef, pkKeyForm)
       const pkValue = read.partitions[0]!
@@ -12898,6 +12921,26 @@ const makeImpl = <
   /** Bytes as text, one character a byte, for {@link kindReading}. */
   const bytesText = (bytes: Uint8Array): string => String.fromCharCode(...bytes)
 
+  /**
+   * A row's values in the key form, then in 1.39.0's where that differs (`keyForm139`): the
+   * records each key text a row may be stored under is composed from.
+   */
+  const rowKeyForms = (
+    values: globalThis.Record<string, unknown>,
+  ): ReadonlyArray<globalThis.Record<string, unknown>> => {
+    const rowKeyForm = keyForm(values)
+    const rowKeyForm139 = keyForm139(values)
+    return Object.keys(rowKeyForm139).some(
+      (attr) =>
+        !Object.is(
+          rowKeyForm139[attr],
+          Object.hasOwn(rowKeyForm, attr) ? rowKeyForm[attr] : undefined,
+        ),
+    )
+      ? [rowKeyForm, rowKeyForm139]
+      : [rowKeyForm]
+  }
+
   type RowTargets = {
     readonly kind: RowKind
     /** Where the row belongs now. */
@@ -12911,6 +12954,12 @@ const makeImpl = <
      * or what its values compose under another text, a numeric composite as either kind.
      */
     readonly isLive: (key: StoredKey) => boolean
+    /**
+     * For a row 1.39.0 keyed by a codec's doubled text (`keyForm139`): where its values' stored
+     * text puts the same row under each other text, from which another row (a read model's removal
+     * tombstone, or a write since) may move to `current` too ({@link clearTarget}).
+     */
+    readonly elsewhere: ReadonlyArray<StoredKey>
   }
 
   /** What a row's sort key says it is, for a row whose values compose no key to say it by. */
@@ -12946,63 +12995,98 @@ const makeImpl = <
     try {
       const primary = config.indexes.primary
       const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
-      const rowKeyForm = keyForm(values)
       const live = composePrimaryKey(values) as StoredKey
+      const rowKeyForm = keyForm(values)
+      // Each reading of the values a key text was composed from: the key form, and the one up to
+      // 1.39.0 (`keyForm139`), which keyed a codec whose `encode` takes its own output by its
+      // stored text encoded once more.
+      const readings = rowKeyForms(values)
       const now: KeyText136.KeyForm = { pk: schema, sk: schema }
       type At = (
         form: KeyText136.KeyForm,
         key: StoredKey,
         record: globalThis.Record<string, unknown>,
       ) => StoredKey
-      /** Is `key` where `at` puts a row of some reading of the values, under some form? */
-      const placed = (key: StoredKey, at: At, fields: ReadonlyArray<string>) =>
-        keyFormsOf().some(
-          (form) =>
-            kindReading(
-              row,
-              rowKeyForm,
-              fields,
-              (kindKeyForm) => {
-                const placedAt = at(
-                  form,
-                  KeyText136.composeAt(
+      /**
+       * Is `key` where `atOf(reading)` puts a row of some kind reading of some reading of the
+       * values, under some form?
+       */
+      const placed = (
+        key: StoredKey,
+        atOf: (reading: globalThis.Record<string, unknown>) => At,
+        fields: ReadonlyArray<string>,
+        among: ReadonlyArray<globalThis.Record<string, unknown>> = readings,
+      ) =>
+        among.some((reading) => {
+          const at = atOf(reading)
+          return keyFormsOf().some(
+            (form) =>
+              kindReading(
+                row,
+                reading,
+                fields,
+                (kindKeyForm) => {
+                  const placedAt = at(
                     form,
-                    entityType,
-                    entityVersion,
-                    primary,
+                    KeyText136.composeAt(
+                      form,
+                      entityType,
+                      entityVersion,
+                      primary,
+                      kindKeyForm,
+                    ) as StoredKey,
                     kindKeyForm,
-                  ) as StoredKey,
-                  kindKeyForm,
-                )
-                return keySegments(placedAt[rekeyPk], placedAt[rekeySk])
-              },
-              storedKeyText(key),
-            ) !== undefined,
-        )
+                  )
+                  return keySegments(placedAt[rekeyPk], placedAt[rekeySk])
+                },
+                storedKeyText(key),
+              ) !== undefined,
+          )
+        })
+      const itemAt = (): At => (_, at) => at
       const isLive = (key: StoredKey) =>
-        sameStoredKey(key, live) || placed(key, (_, at) => at, primaryTextFields)
+        sameStoredKey(key, live) || placed(key, itemAt, primaryTextFields)
       const targets = (
         kind: RowKind,
-        at: At,
+        atOf: (reading: globalThis.Record<string, unknown>) => At,
         fields: ReadonlyArray<string> = primaryTextFields,
       ): RowTargets => {
-        const current = at(now, live, rowKeyForm)
+        const current = atOf(rowKeyForm)(now, live, rowKeyForm)
+        const under139 = readings.length > 1 && !placed(stored, atOf, fields, [rowKeyForm])
         return {
           kind,
           current,
-          old: sameStoredKey(stored, current) || placed(stored, at, fields) ? stored : undefined,
+          old: sameStoredKey(stored, current) || placed(stored, atOf, fields) ? stored : undefined,
           live,
           isLive,
+          elsewhere: !under139
+            ? []
+            : keyFormsOf().flatMap((form) => {
+                try {
+                  const at = atOf(rowKeyForm)(
+                    form,
+                    KeyText136.composeAt(form, entityType, entityVersion, primary, rowKeyForm),
+                    rowKeyForm,
+                  )
+                  return sameStoredKey(at, current) || sameStoredKey(at, stored) ? [] : [at]
+                } catch {
+                  return []
+                }
+              }),
         }
       }
-      const history = historyLayout(stored[rekeySk]!, values, rowKeyForm)
-      if (sameStoredKey(stored, live)) return targets("item", (_, key) => key)
+      const layoutOf = (reading: globalThis.Record<string, unknown>) =>
+        historyLayout(stored[rekeySk]!, values, reading)
+      const history = layoutOf(rowKeyForm)
+      // A history layout's place, from the reading a key text was composed from.
+      const historyAt = (reading: globalThis.Record<string, unknown>): At => layoutOf(reading)!.at
+      if (sameStoredKey(stored, live)) return targets("item", itemAt)
       // A history row under its current key, which nothing else composes.
       if (history !== undefined && sameStoredKey(stored, history.at(now, live, rowKeyForm))) {
-        return targets(history.kind, history.at, history.fields)
+        return targets(history.kind, historyAt, history.fields)
       }
-      if (isLive(stored)) return targets("item", (_, key) => key)
-      return history === undefined ? undefined : targets(history.kind, history.at, history.fields)
+      if (isLive(stored)) return targets("item", itemAt)
+      return history === undefined ? undefined : targets(history.kind, historyAt, history.fields)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       return Capacity.isRefusedValue(error) || message.startsWith("[EDD-9050]")
@@ -13186,6 +13270,35 @@ const makeImpl = <
         : {}
     })
 
+  /**
+   * The first row at one of `elsewhere` that moves to `to`, and that row as it would be there.
+   */
+  const movingThereToo = (
+    ctx: Rekey.RekeyRowContext,
+    elsewhere: ReadonlyArray<StoredKey>,
+    to: StoredKey,
+  ) =>
+    Effect.gen(function* () {
+      const client = yield* Capacity.client
+      for (const key of elsewhere) {
+        const { Item: row } = yield* client.getItem({
+          TableName: ctx.tableName,
+          Key: toAttributeMap(key),
+          ConsistentRead: true,
+        })
+        if (row === undefined) continue
+        const plan = isValueless(row) ? valuelessMove(row, { pk: rekeyPk, sk: rekeySk }) : undefined
+        if (typeof plan === "object" && sameStoredKey(plan.to, to)) {
+          return { row, at: plan.moved(row) }
+        }
+        const targets = plan === undefined ? rowTargets(row) : undefined
+        if (targets !== undefined && sameStoredKey(targets.current, to)) {
+          return { row, at: { ...row, ...toAttributeMap(to) } }
+        }
+      }
+      return undefined
+    })
+
   /** A row is left because what holds its current key has to move first, and can't. */
   const cantMoveHolder = (kind: RowKind, from: StoredKey, to: StoredKey) =>
     rekeyConflict(kind, "taken", from, to, "A row that can't move holds its current key.")
@@ -13195,6 +13308,11 @@ const makeImpl = <
    * under other key text) moves out first. A tally of what moved, or the
    * conflict that leaves the row where it is. `copy`: whether the row at `to`
    * is a copy of the moving one, which the move then only deletes (`twin`).
+   *
+   * `elsewhere` ({@link RowTargets.elsewhere}): a row 1.39.0 keyed by a codec's doubled text moves
+   * to `to` after a row there that moves there too, whichever the scan reaches first, so a read
+   * model's removal tombstone, not the row it removed, ends up at `to`, and the report is the
+   * same in every order. In a dry run nothing moves: that row is judged as if at `to`.
    */
   const clearTarget = (
     ctx: Rekey.RekeyRowContext,
@@ -13203,6 +13321,7 @@ const makeImpl = <
     to: StoredKey,
     depth: number,
     copy?: (held: StoredRow) => boolean,
+    elsewhere: ReadonlyArray<StoredKey> = [],
   ): Effect.Effect<
     | { readonly cleared: true; readonly tally: Rekey.RekeyTally }
     | { readonly cleared: false; readonly tally: Rekey.RekeyTally }
@@ -13212,11 +13331,29 @@ const makeImpl = <
   > =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
-      const { Item: held } = yield* client.getItem({
+      const { Item: atTarget } = yield* client.getItem({
         TableName: ctx.tableName,
         Key: toAttributeMap(to),
         ConsistentRead: true,
       })
+      const first =
+        atTarget === undefined && depth < Rekey.DISPLACE_DEPTH
+          ? yield* movingThereToo(ctx, elsewhere, to)
+          : undefined
+      if (first !== undefined) {
+        const tally = yield* Rekey.displace(ctx, (under) => rekeyRow(first.row, under, depth + 1))
+        if ((tally.conflicts ?? []).length > 0) {
+          return {
+            cleared: false,
+            tally: Rekey.mergeTallies(tally, cantMoveHolder(kind, from, to)),
+          }
+        }
+        if (!ctx.dryRun) {
+          const after = yield* clearTarget(ctx, kind, from, to, depth, copy)
+          return { ...after, tally: Rekey.mergeTallies(tally, after.tally) }
+        }
+      }
+      const held = atTarget ?? first?.at
       if (held === undefined) return { cleared: true, tally: {} }
       const occupant = occupantOf(held, to)
       if (occupant === "same" && copy?.(held) === true) return { cleared: "twin", tally: {} }
@@ -13304,6 +13441,7 @@ const makeImpl = <
           to,
           depth,
           same === undefined ? undefined : (held) => sameSnapshotHeld(held, read!),
+          targets.elsewhere,
         )
         tally = Rekey.mergeTallies(tally, room.tally)
         if (room.cleared === "twin") {
@@ -13747,7 +13885,7 @@ const makeImpl = <
         if (targets?.kind !== "item" || !sameStoredKey(targets.current, to)) {
           return Rekey.mergeTallies(tally, yield* movedAway(ctx, to))
         }
-        const room = yield* clearTarget(ctx, "item", from, to, depth)
+        const room = yield* clearTarget(ctx, "item", from, to, depth, undefined, targets.elsewhere)
         tally = Rekey.mergeTallies(tally, room.tally)
         if (!room.cleared) return tally
         const values = toDomainView(fromAttributeMap(read!) as globalThis.Record<string, unknown>)
@@ -13870,9 +14008,10 @@ const makeImpl = <
    * unless it is already in the current layout.
    */
   const staleIndexKeys = (row: StoredRow) => {
-    const rowKeyForm = keyForm(
-      toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>),
-    )
+    const values = toDomainView(fromAttributeMap(row) as globalThis.Record<string, unknown>)
+    const rowKeyForm = keyForm(values)
+    // The texts a key may be stored under: each form's, from the key form and from 1.39.0's.
+    const rowKeyFormsThen = rowKeyForms(values)
     const composing = <A>(compose: () => A | undefined): A | undefined => {
       try {
         return compose()
@@ -13892,8 +14031,9 @@ const makeImpl = <
     }
     const forms = KeyText136.forms(schema)
     /**
-     * Is `stored` what some reading of the row's values composes under some form: the values, or
-     * them with some of `fields` as the other numeric kind ({@link kindReading})?
+     * Is `stored` what some reading of the row's values composes under some form: the values in
+     * the key form or in 1.39.0's ({@link rowKeyForms}), or either with some of `fields` as the
+     * other numeric kind ({@link kindReading})?
      */
     const composedUnder = (
       fields: ReadonlyArray<string>,
@@ -13903,10 +14043,12 @@ const makeImpl = <
       ) => string | undefined,
       stored: string,
     ) =>
-      forms.some(
-        (form) =>
-          kindReading(row, rowKeyForm, fields, (record) => under(form, record), stored) !==
-          undefined,
+      rowKeyFormsThen.some((reading) =>
+        forms.some(
+          (form) =>
+            kindReading(row, reading, fields, (record) => under(form, record), stored) !==
+            undefined,
+        ),
       )
     const consider = (
       field: string,
@@ -15070,6 +15212,13 @@ const makeImpl = <
         if (there !== undefined) {
           // Another value's row left at its current key moves out first.
           if (occupantOf(there, counted) !== "stale") {
+            // Or it is this row, moved there since the read by another row's move (counted then).
+            const { Item: left } = yield* client.getItem({
+              TableName: ctx.tableName,
+              Key: toAttributeMap(from),
+              ConsistentRead: true,
+            })
+            if (left === undefined) return tally
             return Rekey.mergeTallies(
               tally,
               rekeyConflict(kind, "taken", from, to, "Another row holds its current key."),
@@ -15271,7 +15420,13 @@ const makeImpl = <
     _liveRows: liveRows,
     _rekeyProjectionRow: rekeyProjectionRow,
     _keyTextMark: (key: globalThis.Record<string, unknown>) =>
-      KeyText136.markOf(schema, entityType, entityVersion, config.indexes.primary, keyForm(key)),
+      KeyText136.markOf(
+        schema,
+        entityType,
+        entityVersion,
+        config.indexes.primary,
+        domainKeyForm(key),
+      ),
     [Rekey.RekeyHandler]: rekeyHandler,
     _attachPrototype: attachPrototype,
     _overTombstone: (item: globalThis.Record<string, unknown>) =>
@@ -15535,7 +15690,9 @@ export const bind = <
                 >
                 // Snapshots / tombstones live in the same partition under a
                 // rewritten SK — their SK cannot be recomposed from the record.
-                const decodedKeyForm = keyFormFor(entity, decoded)
+                // `decoded` holds domain values: the keys `put` wrote for them
+                // are the key form of the values it stores.
+                const decodedKeyForm = entity._domainKeyForm(decoded)
                 const liveSk = KeyComposer.composeSk(
                   boundSchema,
                   entity.entityType,
@@ -15749,14 +15906,14 @@ export const bind = <
           // We need the `currentSk` + prefix. The user's `key` lets us derive
           // `currentSk` via the same primary SK composer used by `history()`.
           // `key` is the caller's Type-side key; the stored SK was composed
-          // from the encoded form, so normalise it the same way
-          // `composePrimaryKey` does before recomposing.
+          // from the encoded form, so compose it as `get` does: the key form of
+          // the value `put` stores (`_domainKeyForm`).
           const currentSk = KeyComposer.composeSk(
             schemaRef,
             entityTypeRef,
             1,
             primary,
-            keyFormFor(entityInternals, key as globalThis.Record<string, unknown>),
+            entity._domainKeyForm(key as globalThis.Record<string, unknown>),
           )
           const prefix = KeyComposer.composeEventSkPrefix(currentSk, schemaRef.casing)
           // Exactly as `Entity.append` composes the event's sort key: the value

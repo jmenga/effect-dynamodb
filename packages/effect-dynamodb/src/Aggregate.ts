@@ -1783,17 +1783,27 @@ const makeAggregate = <TSchema extends Schema.Top>(
   // domain objects, so without this a `DateEpochMs` composite would key on its
   // ISO form here and its epoch form on the entity path, and a numeric
   // composite with a string encoding would not be zero-padded on either.
-  const compositeKeyForm = makeCompositeKeyForm(schema, (attr, value, reason) => {
-    if (reason !== undefined) {
-      return refuseInexact(`Composite "${attr}" on aggregate "${aggregateName}"`, value, reason)
-    }
-    throw new Error(
-      `[EDD-9050] Composite "${attr}" on aggregate "${aggregateName}" could not be put into ` +
-        `its key form. The attribute's schema carries an encoding transformation, but ` +
-        `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode. ` +
-        `Supply a value of the attribute's own type.`,
-    )
-  })
+  //
+  // 1.39.0's form (`text139`): a codec `encode` takes on its own output (a
+  // number scaled, `x:` prepended) is encoded whatever it's given. The
+  // aggregate's keys are its own — `create`, `get`, `list` and `rekey` all
+  // compose them here, from domain values, encoded once — so no other path
+  // missed what it wrote, and they keep every byte.
+  const compositeKeyForm = makeCompositeKeyForm(
+    schema,
+    (attr, value, reason) => {
+      if (reason !== undefined) {
+        return refuseInexact(`Composite "${attr}" on aggregate "${aggregateName}"`, value, reason)
+      }
+      throw new Error(
+        `[EDD-9050] Composite "${attr}" on aggregate "${aggregateName}" could not be put into ` +
+          `its key form. The attribute's schema carries an encoding transformation, but ` +
+          `${JSON.stringify(String(value))} resolves under neither encode nor decode->encode. ` +
+          `Supply a value of the attribute's own type.`,
+      )
+    },
+    { text139: true },
+  )
   // Only the attributes a key is ever composed from are put into key form. The
   // rest of the record is never read off the result, and normalising it could
   // only fail: a stored value that breaks a field's `.check()` (#133) made

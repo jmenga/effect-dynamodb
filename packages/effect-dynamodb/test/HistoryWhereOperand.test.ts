@@ -12,7 +12,9 @@
  * `connected.read-back-keys.test.ts`, checks the `ValidationError` it's diagnosed into).
  *
  * The rows are what published 1.39.0 stored (`helpers/ReadBackKeys.ts`); `append` stores the same
- * rows here.
+ * rows here, except an `x10` orderBy's with escaped keys: 1.39.0 keyed each event by the value it
+ * stores divided by ten once more (`0.9` for `90`, stored as `9`), and `append` keys the value it
+ * stores (`9`), where `rekey` moves 1.39.0's events (`historyMoved`).
  */
 
 import { it } from "@effect/vitest"
@@ -23,7 +25,9 @@ import { KEY_TOP, keyJustBelow } from "../src/internal/RangePlanner.js"
 import {
   byKey,
   historyDefinitions,
+  historyMoved,
   historyRows,
+  historyRowsNow,
   historyShapes,
   type Row,
 } from "./helpers/ReadBackKeys.js"
@@ -44,11 +48,11 @@ const seeded = (rows: ReadonlyArray<Row>) => {
 describe("history .where() bounds compose as append composes the event key", () => {
   for (const { name, Kind, values } of historyShapes) {
     for (const escapeKeys of [false, true]) {
-      const { rows, prefix, events } = historyRows(name, escapeKeys)
+      const { rows, prefix, events } = historyRowsNow(name, escapeKeys)
       const event = (value: unknown) => events[values.indexOf(value as never)]!
       const on = <A, E>(
         table: ReturnType<typeof makeRecordingTable>,
-        body: (e: any) => Effect.Effect<A, E, any>,
+        body: (e: any, db: any) => Effect.Effect<A, E, any>,
       ) => {
         const { E, Main } = historyDefinitions(name, Kind, escapeKeys)
         return Effect.gen(function* () {
@@ -56,22 +60,41 @@ describe("history .where() bounds compose as append composes the event key", () 
             entities: { E },
             tables: { Main },
           } as never) as Effect.Effect<any, never, any>
-          return yield* body(db.entities.E)
+          return yield* body(db.entities.E, db)
         }).pipe(
           Effect.provide(Main.layer({ name: "t" })),
           Effect.provide(table.layer),
         ) as Effect.Effect<A, unknown>
       }
 
-      it.effect(`${name}, escapeKeys ${escapeKeys}: append stores the rows 1.39.0 stored`, () => {
-        const table = makeRecordingTable()
-        return on(table, (e) =>
-          Effect.gen(function* () {
-            for (const n of values) yield* e.append({ id: "x", n }).asEffect()
-            expect(byKey([...table.items.values()] as never)).toEqual(byKey(rows))
-          }),
-        )
-      })
+      const moved = historyMoved(name, escapeKeys)
+      it.effect(
+        `${name}, escapeKeys ${escapeKeys}: append stores the rows 1.39.0 stored${moved ? ", keyed by the value it stores" : ""}`,
+        () => {
+          const table = makeRecordingTable()
+          return on(table, (e) =>
+            Effect.gen(function* () {
+              for (const n of values) yield* e.append({ id: "x", n }).asEffect()
+              expect(byKey([...table.items.values()] as never)).toEqual(byKey(rows))
+            }),
+          )
+        },
+      )
+
+      if (moved) {
+        it.effect(`${name}, escapeKeys ${escapeKeys}: rekey moves 1.39.0's events there`, () => {
+          const table = seeded(historyRows(name, escapeKeys).rows)
+          return on(table, (_e, db) =>
+            Effect.gen(function* () {
+              const report = yield* db.tables.Main.rekey()
+              expect(report.moved.event).toBe(values.length)
+              expect(report.conflicts).toEqual([])
+              expect(report.skipped.unrecognizedKey).toBe(0)
+              expect(byKey([...table.items.values()] as never)).toEqual(byKey(rows))
+            }),
+          )
+        })
+      }
 
       it.effect(`${name}, escapeKeys ${escapeKeys}: eq names each event's key`, () => {
         const table = seeded(rows)

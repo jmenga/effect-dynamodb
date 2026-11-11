@@ -36,6 +36,8 @@ import {
   fixture,
   JUDGED_AS_139,
   json,
+  KEYED_TWICE_BY_139,
+  keyedOnce,
   NINTH,
   NOW_FETCHED,
   OWN_KEY_WHOLE,
@@ -208,7 +210,10 @@ describeConnected(
         Effect.gen(function* () {
           const { create, rows, get } = yield* run(SHAPES[label]!())
           expect(Exit.isSuccess(create)).toBe(true)
-          const seeded = fixture.shapes[label]!.seeded
+          // 1.39.0 keyed a codec `encode` takes on its own output by its stored text encoded once
+          // more: a `put` keys the stored text now, which `create` fetches.
+          const written = fixture.shapes[label]!.seeded
+          const seeded = KEYED_TWICE_BY_139.has(label) ? written.map(keyedOnce) : written
           expect(byKey(rows.filter((row) => row.__edd_e__?.S === "Line"))).toEqual(byKey(seeded))
           const edge = rows.find((row) => row.__edd_e__?.S === "AggLine")!
           expect({ lineId: edge.lineId, f: edge.f }).toEqual({

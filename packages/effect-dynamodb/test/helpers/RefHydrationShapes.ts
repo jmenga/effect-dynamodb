@@ -1785,9 +1785,22 @@ export const UNFETCHABLE = [
   "one, an entity keyed by two composites",
 ]
 /**
+ * Shapes keyed by a codec `encode` takes on its own output, which 1.39.0's `put` keyed by its stored
+ * text encoded once more (`lineid_x:x:mix`). A `put` now keys the stored text (`lineid_x:mix`), where
+ * `create` fetches it, and `rekey` moves 1.39.0's rows there (`KeyCodecPaths.test.ts`).
+ */
+export const KEYED_TWICE_BY_139: ReadonlySet<string> = new Set([
+  "one, an entity keyed by a string codec",
+])
+/** A row 1.39.0 wrote for one of {@link KEYED_TWICE_BY_139}, at the key a `put` gives it now. */
+export const keyedOnce = (row: Row): Row => ({
+  ...row,
+  pk: { S: row.pk!.S!.replace("#lineid_x:x:", "#lineid_x:") },
+})
+/**
  * An id of the key composite's own type, which 1.39.0 dropped (so a required edge failed decoding
  * and an optional one was created without it), or fetched under a key `Entity.put` never wrote (a
- * string codec, which `put` applies twice, or keys as stored inside a wrapper): each is now fetched
+ * string codec, or one inside a wrapper, which `put` keys by its stored text): each is now fetched
  * by the key `put` wrote.
  */
 export const NOW_FETCHED = [

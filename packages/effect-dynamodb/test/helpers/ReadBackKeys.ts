@@ -230,11 +230,34 @@ export const historyRows = (name: string, escapeKeys: boolean) => {
   const pk = `$${schemaName}#v1#e#id_x`
   const prefix = `$${schemaName}#v1#e#e#`
   const rows = fixture.history.filter((row) => row.pk.S === pk)
-  // Appended in ascending order, each stored as a number or a string holding one.
-  const events = rows
+  return { rows, prefix, events: eventsOf(rows, prefix) }
+}
+
+/** The event rows among `rows`, in append order: ascending, each stored as a number or a string. */
+const eventsOf = (rows: ReadonlyArray<Row>, prefix: string) =>
+  rows
     .filter((row) => row.sk.S.startsWith(prefix))
     .sort((a, b) => Number(a.n.S ?? a.n.N) - Number(b.n.S ?? b.n.N))
-  return { rows, prefix, events }
+
+/**
+ * Whether 1.39.0 keyed a shape's events by other text than `append` does now: an `x10` orderBy's,
+ * with escaped keys, by its stored value divided by ten once more (`0.9` for `90`, stored as `9`).
+ * `append` keys the value it stores (`9`), and `rekey` moves 1.39.0's events there.
+ */
+export const historyMoved = (name: string, escapeKeys: boolean) => name === "x10" && escapeKeys
+
+/** {@link historyRows}, keyed as `append` keys them now ({@link historyMoved}). */
+export const historyRowsNow = (name: string, escapeKeys: boolean) => {
+  const stored = historyRows(name, escapeKeys)
+  if (!historyMoved(name, escapeKeys)) return stored
+  const { rows, prefix } = stored
+  // A whole number below 1e16 keys its 16 zero-padded digits.
+  const now = rows.map((row) =>
+    row.sk.S.startsWith(prefix)
+      ? { ...row, sk: { S: `${prefix}${String(row.n.N).padStart(16, "0")}` } }
+      : row,
+  )
+  return { rows: now, prefix, events: eventsOf(now, prefix) }
 }
 
 export const historyDefinitions = (name: string, Kind: Schema.Top, escapeKeys: boolean) => {

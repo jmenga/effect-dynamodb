@@ -10,6 +10,7 @@
  *   - A rerun moves nothing
  *   - `rekey({ repairIndexKeys: true })`: write an index key its row's values compose and it lacks
  *   - `rekey` under the default moves them back, the same way
+ *   - An entity keyed by a codec whose `encode` takes its own output: 1.39.0's rows need `rekey`
  *
  * Prerequisites:
  *   docker run -p 8000:8000 amazon/dynamodb-local
@@ -18,7 +19,7 @@
  *   npx tsx examples/guide-upgrade.ts
  */
 
-import { Config, Console, Effect, Layer, Option, Ref, Schema } from "effect"
+import { Config, Console, Effect, Layer, Option, Ref, Schema, SchemaGetter } from "effect"
 
 // Import from source (use "effect-dynamodb" when published)
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
@@ -58,6 +59,19 @@ class Sensor extends Schema.Class<Sensor>("Sensor")({
   offset: Schema.Number,
 }) {}
 
+// A codec whose `encode` takes its own output: it prepends `badge:`, and `decode` strips it.
+const BadgeId = Schema.String.pipe(
+  Schema.decodeTo(Schema.String, {
+    decode: SchemaGetter.transform((s: string) => s.slice("badge:".length)),
+    encode: SchemaGetter.transform((s: string) => `badge:${s}`),
+  }),
+)
+
+class Badge extends Schema.Class<Badge>("Badge")({
+  badgeId: BadgeId,
+  holder: Schema.String,
+}) {}
+
 class Calibrated extends Schema.TaggedClass<Calibrated>()("Calibrated", {
   offset: Schema.Number,
 }) {}
@@ -84,14 +98,22 @@ const membersUnder = (schema: DynamoSchema.DynamoSchema) => {
     versioned: { retain: true },
     softDelete: true,
   })
-  const MainTable = Table.make({ schema, entities: { Sensors } })
+  const Badges = Entity.make({
+    model: Badge,
+    entityType: "Badge",
+    primaryKey: {
+      pk: { field: "pk", composite: ["badgeId"] },
+      sk: { field: "sk", composite: [] },
+    },
+  })
+  const MainTable = Table.make({ schema, entities: { Sensors, Badges } })
   const Calibrations = EventStore.makeStream({
     table: MainTable,
     streamName: "Calibrations",
     events: [Calibrated],
     streamId: { composite: ["siteId"] },
   })
-  return { Sensors, MainTable, Calibrations }
+  return { Sensors, Badges, MainTable, Calibrations }
 }
 
 const Default = membersUnder(DefaultSchema)
@@ -104,7 +126,7 @@ const { Sensors, MainTable, Calibrations } = membersUnder(AppSchema)
 const program = Effect.gen(function* () {
   yield* Console.log("=== Setup: a table written with the default ===\n")
   const before = yield* DynamoClient.make({
-    entities: { Sensors: Default.Sensors },
+    entities: { Sensors: Default.Sensors, Badges: Default.Badges },
     tables: { MainTable: Default.MainTable },
   })
   // A table left by an earlier, interrupted run is started afresh.
@@ -282,6 +304,42 @@ const program = Effect.gen(function* () {
   const backHome = yield* before.entities.Sensors.get({ siteId: "north", sensorId: -3 })
   assertEq(backHome.label, "intake valve", "found again under the default")
   yield* Console.log(`Moved back: ${JSON.stringify(backAgain.moved)}`)
+
+  // --- An entity keyed by a codec (1.40.0) ---
+  yield* Console.log("\n=== An entity keyed by a codec ===\n")
+
+  // What 1.39.0 wrote: the badge's row keyed by its stored text encoded once more.
+  yield* before.entities.Badges.put({ badgeId: "b7", holder: "ana" })
+  const badgeKey = { pk: { S: "$upgrade#v1#badge#badgeid_badge:b7" }, sk: { S: "$upgrade#v1#badge" } }
+  const { Item: written } = yield* raw.getItem({ TableName: tableName, Key: badgeKey })
+  assertEq(written?.badgeId?.S, "badge:b7", "put stores the encoded value, under its key")
+  yield* raw.putItem({
+    TableName: tableName,
+    Item: { ...written, pk: { S: "$upgrade#v1#badge#badgeid_badge:badge:b7" } },
+  })
+  yield* raw.deleteItem({ TableName: tableName, Key: badgeKey })
+
+  // #region codec
+  // 1.39.0 keyed the badge "b7" by `badge:badge:b7`, and 1.40.0 keys it `badge:b7`:
+  // its rows aren't found until `rekey` has moved them, whatever `escapeKeys` says.
+  const notYet = yield* before.entities.Badges.get({ badgeId: "b7" }).pipe(Effect.flip)
+  // notYet._tag → "ItemNotFound"
+  const codecRun = yield* before.tables.MainTable.rekey({ streams: [Default.Calibrations] })
+  // codecRun.moved → { item: 1, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
+  const badge = yield* before.entities.Badges.get({ badgeId: "b7" })
+  // badge.holder → "ana"
+  // #endregion
+  assertEq(notYet._tag, "ItemNotFound", "1.39.0's row isn't found before rekey")
+  assertEq(
+    codecRun.moved,
+    { item: 1, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 },
+    "rekey moves the badge",
+  )
+  assertEq(codecRun.conflicts.length, 0, "with no conflicts")
+  assertEq(badge.holder, "ana", "found after rekey")
+  const { Item: moved139 } = yield* raw.getItem({ TableName: tableName, Key: badgeKey })
+  assertEq(moved139?.badgeId?.S, "badge:b7", "at the key put writes")
+  yield* Console.log(`Moved: ${JSON.stringify(codecRun.moved)}`)
 
   // --- Cleanup ---
   yield* Console.log("\n=== Cleanup ===\n")

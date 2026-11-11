@@ -1,6 +1,6 @@
 ---
 title: "Upgrading"
-description: "Key text in 1.x: nothing to do from 1.36, rekey from 1.37.0 or 1.38.0, and how to turn escapeKeys on over existing data with rekey."
+description: "Key text in 1.x: nothing to do from 1.36, rekey from 1.37.0 or 1.38.0, rekey for entities keyed by a codec in 1.40.0, and how to turn escapeKeys on over existing data with rekey."
 ---
 
 import { Aside } from "@astrojs/starlight/components"
@@ -32,7 +32,7 @@ A new table has no rows under other text, so setting `escapeKeys: true` on one n
 
 ## From 1.36 or earlier
 
-Nothing to do. The default composes the key text 1.36 composed, for strings and numbers, so every row is where the library looks for it. Upgrade and deploy.
+Nothing to do, unless an entity is [keyed by a codec](#entities-keyed-by-a-codec-1400): the default composes the key text 1.36 composed, for strings and numbers, so every row is where the library looks for it. Upgrade and deploy.
 
 ## From 1.37.0 or 1.38.0
 
@@ -52,6 +52,37 @@ A row 1.36 wrote that those releases hadn't moved yet is handled the same way: `
 An [inverted index](#what-1370-and-1380-did-to-an-inverted-index) needs `rekey` too: 1.39.0 fixes what they did to its rows, and `rekey` moves the rows they left.
 
 The `legacyKeys` option and the key fallback those releases had are gone, along with `ItemNotMoved` (`EDD-9097`). Remove `legacyKeys` from `DynamoSchema.make`. An instance of either release still running writes their text, so run `rekey` again once the last one has gone.
+
+## Entities keyed by a codec (1.40.0)
+
+1.40.0 corrects the key of an entity whose key composite is a codec that `encode` takes on its own output. **Run `rekey` on every table holding one before it serves traffic on 1.40.0, whatever `escapeKeys` says**, from 1.39.0 or any earlier release.
+
+These are the codecs whose `encode` takes what it returns and changes it again: `Schema.StringFromBase64`, `StringFromBase64Url`, `StringFromHex` and `StringFromUriComponent`, and a custom codec such as one that prepends a prefix and whose `decode` strips it, or one that scales a number. Every other codec keeps its keys: one whose `encode` gives back what it's given, such as `Schema.Trim`, and one whose `encode` refuses its own output, such as `Schema.NumberFromString` or a date codec.
+
+`put` stores such a value encoded. Up to 1.39.0 it keyed the row by that stored text encoded once more: a badge `"b7"` under a codec that prepends `badge:` was stored `badge:b7` and keyed `badge:badge:b7`. Only the entity's own `get`, `update` and `delete` found it. Queries, collections, history, batch and transaction operations and projections composed `badge:b7`, and found nothing. From 1.40.0 every path keys it `badge:b7`.
+
+```typescript region="codec" example="guide-upgrade.ts"
+// 1.39.0 keyed the badge "b7" by `badge:badge:b7`, and 1.40.0 keys it `badge:b7`:
+// its rows aren't found until `rekey` has moved them, whatever `escapeKeys` says.
+const notYet = yield* before.entities.Badges.get({ badgeId: "b7" }).pipe(Effect.flip)
+// notYet._tag → "ItemNotFound"
+const codecRun = yield* before.tables.MainTable.rekey({ streams: [Default.Calibrations] })
+// codecRun.moved → { item: 1, snapshot: 0, tombstone: 0, outbox: 0, event: 0, aggregate: 0, stream: 0 }
+const badge = yield* before.entities.Badges.get({ badgeId: "b7" })
+// badge.holder → "ana"
+```
+
+Until `rekey` has run, a `get`, `update` or `delete` of a row 1.39.0 wrote finds nothing, and a `put` of the same key writes a second row beside it, which `rekey` then reports as `bothKeys` and leaves. `rekey` moves every kind of row 1.39.0 keyed this way, to where a write puts it now:
+
+- live items' table keys;
+- index keys, Z-order prefix segments included, and vector and geo partitions, rewritten in place;
+- version snapshots and soft-delete tombstones;
+- time-series events;
+- a projection's read-model rows.
+
+Unique-constraint sentinels, and a projection's row tombstones and outbox items, already held the stored text, and keep their keys. So does an aggregate keyed by such a codec: only its own operations compose its keys, each from the value it holds, encoded once. A projection row whose new key holds the tombstone 1.39.0 wrote for it is reported `taken` and left: on 1.39.0, a removal tombstoned the stored text's key and left the row beside it, so the tombstone is the projection's state, and the row is left over. Turning `escapeKeys` on in the same pass moves the tombstone and the row to one key: the tombstone takes it, whichever `rekey` reaches first, and so does the row a write put beside one 1.39.0 wrote, which leaves 1.39.0's reported `bothKeys`.
+
+**One `rekey` pass handles both changes.** Turning `escapeKeys` on in the same release moves each row straight to the escaped text of the value it stores.
 
 ## Turning `escapeKeys` on over existing data
 
@@ -201,7 +232,7 @@ Going back gives up what the setting gave you, and a set of rows that were told 
 
 ## What moves, and how
 
-`rekey` recognises a row by composing the keys its own values had under each text: the 1.36 text (the default's), that of 1.37.0 and 1.38.0 (partition key as it is, sort key escaped, numeric text) and `escapeKeys: true`'s. Each kind of row moves so that it ends up exactly where a write of it would put it. Every write is conditioned on what the move read: a row is put only where nothing is (a stream's snapshot only over an older one, a stream row also over one whose TTL has passed), and deleted or rewritten only while it is as read.
+`rekey` recognises a row by composing the keys its own values had under each text: the 1.36 text (the default's), that of 1.37.0 and 1.38.0 (partition key as it is, sort key escaped, numeric text) and `escapeKeys: true`'s, each also with a [codec key composite](#entities-keyed-by-a-codec-1400)'s stored text encoded once more, as up to 1.39.0. Each kind of row moves so that it ends up exactly where a write of it would put it. Every write is conditioned on what the move read: a row is put only where nothing is (a stream's snapshot only over an older one, a stream row also over one whose TTL has passed), and deleted or rewritten only while it is as read.
 
 **A key that stored both numeric kinds.** A key composite declared `Schema.Union([Schema.Number, Schema.BigInt])` before 1.40.0 composed each value's own kind's text: `5` as 16 digits, `5n` as 38. 1.40.0 refuses that union in a key (`EDD-9128`), so you declare the one kind the field holds, and a row written with the other kind is then under text its value doesn't compose. A row whose key isn't its current text is also read with its numeric values as the other kind, and `rekey` moves such a row, whatever kind of row it is, to the text of the value as it reads back. It does the same for a row whose `Schema.Unknown` key holds a `bigint` below 2^53, which reads back as a number. A row already under its key costs nothing more. Two items whose values read back as one, such as `3` and `3n`, are both left and reported as `bothKeys`. Two rows of an aggregate's `many` edge that read back as one element compose one sort key, so the aggregate is `failed` with the decomposition error a write gets, as 1.39.0 fails any edge elements composing one sort key, and nothing moves: read the partition with the raw client, delete the row you don't want, and run `rekey` again. A row holding a number the kind you declare can't hold exactly, a `bigint` past 2^53 once you declare `Schema.Number` or a fraction once you declare `Schema.BigInt`, reads as no value of that kind. It's reported as the conflict `uncomposable` and left where it is with its unique sentinels, never moved to the key of a rounded value. 1.39.0 left it too, counting the `bigint` as `unrecognizedKey` and the fraction as unchanged.
 

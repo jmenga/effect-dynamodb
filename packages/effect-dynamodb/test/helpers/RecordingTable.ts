@@ -73,6 +73,13 @@ const passes = (input: Record<string, any>, item: Item | undefined) =>
     input.ExpressionAttributeValues ?? {},
   )
 
+/**
+ * A key attribute's value as text that sorts as DynamoDB sorts it: a string as it is, bytes (a
+ * Z-order `B` sort key) one character per byte, which compares byte by byte.
+ */
+const keyText = (value: AttributeValue | undefined): string =>
+  value?.S ?? (value?.B === undefined ? "" : Buffer.from(value.B).toString("latin1"))
+
 const sortKeyHolds = (
   condition: string | undefined,
   item: Item,
@@ -82,15 +89,15 @@ const sortKeyHolds = (
   if (condition === undefined) return true
   const between = /^(#\w+) BETWEEN (:\w+) AND (:\w+)$/.exec(condition)
   if (between) {
-    const value = item[names[between[1]!]!]?.S ?? ""
-    return value >= values[between[2]!]!.S! && value <= values[between[3]!]!.S!
+    const value = keyText(item[names[between[1]!]!])
+    return value >= keyText(values[between[2]!]) && value <= keyText(values[between[3]!])
   }
   const begins = /^begins_with\((#\w+), (:\w+)\)$/.exec(condition)
-  if (begins) return (item[names[begins[1]!]!]?.S ?? "").startsWith(values[begins[2]!]!.S!)
+  if (begins) return keyText(item[names[begins[1]!]!]).startsWith(keyText(values[begins[2]!]))
   const comparison = /^(#\w+) (<=|>=|=|<|>) (:\w+)$/.exec(condition)
   if (comparison) {
-    const value = item[names[comparison[1]!]!]?.S ?? ""
-    const operand = values[comparison[3]!]!.S!
+    const value = keyText(item[names[comparison[1]!]!])
+    const operand = keyText(values[comparison[3]!])
     switch (comparison[2]) {
       case "=":
         return value === operand
@@ -203,7 +210,7 @@ export const makeRecordingTable = (options?: {
         const values = input.ExpressionAttributeValues ?? {}
         const kc = /^(#\w+) = (:\w+)(?: AND (.*))?$/.exec(input.KeyConditionExpression ?? "")!
         const pk = values[kc[2]!]!.S
-        const sortOf = (item: Item) => item[index.sk]?.S ?? ""
+        const sortOf = (item: Item) => keyText(item[index.sk])
         const tableKey = (item: Item) => keyOf(item)
         let rows = [...items.values()]
           .filter(

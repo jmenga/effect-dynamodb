@@ -31,7 +31,9 @@ import {
   exactKindDefinitions,
   exactKindRows,
   historyDefinitions,
+  historyMoved,
   historyRows,
+  historyRowsNow,
   historyShapes,
   type Row,
   refusedConflicts,
@@ -342,29 +344,50 @@ describeConnected("the key written is the key composed from the row read back (c
   describe("history .where() bounds compose as append composes the event key", () => {
     for (const { name, Kind, values } of historyShapes) {
       for (const escapeKeys of [false, true]) {
-        const { rows } = historyRows(name, escapeKeys)
+        // An `x10` orderBy's events with escaped keys are keyed by the value they store, where
+        // `rekey` moves 1.39.0's (`historyMoved`).
+        const { rows } = historyRowsNow(name, escapeKeys)
+        const moved = historyMoved(name, escapeKeys)
         const { E, Main } = historyDefinitions(name, Kind, escapeKeys)
 
-        it.effect(`${name}, escapeKeys ${escapeKeys}: append stores the rows 1.39.0 stored`, () =>
-          withTable([], {}, (table) =>
-            bound(table, Main, { entities: { E } }, (db) =>
-              Effect.gen(function* () {
-                if (values.length === 1) {
-                  // An `Option` is stored as a map, and DynamoDB refuses append's ordering guard
-                  // (`<`) on a map, as it did on 1.39.0: DynamoDB holds no such event. The bounds
-                  // are checked below on the rows the fixture puts directly.
-                  const failed = yield* Effect.flip(
-                    db.entities.E.append({ id: "x", n: values[0] }).asEffect(),
-                  )
-                  expect((failed as any)._tag).toBe("DynamoValidationError")
-                  expect(yield* table.rows).toEqual([])
-                  return
-                }
-                for (const n of values) yield* db.entities.E.append({ id: "x", n }).asEffect()
-                expect(yield* table.rows).toEqual(byKey(rows))
-              }),
+        if (moved) {
+          it.effect(`${name}, escapeKeys ${escapeKeys}: rekey moves 1.39.0's events`, () =>
+            withTable(historyRows(name, escapeKeys).rows, {}, (table) =>
+              bound(table, Main, { entities: { E } }, (db) =>
+                Effect.gen(function* () {
+                  const report = yield* db.tables.Main.rekey()
+                  expect(report.moved.event).toBe(values.length)
+                  expect(report.conflicts).toEqual([])
+                  expect(report.skipped.unrecognizedKey).toBe(0)
+                  expect(yield* table.rows).toEqual(byKey(rows))
+                }),
+              ),
             ),
-          ),
+          )
+        }
+
+        it.effect(
+          `${name}, escapeKeys ${escapeKeys}: append stores the rows 1.39.0 stored${moved ? ", keyed by the value it stores" : ""}`,
+          () =>
+            withTable([], {}, (table) =>
+              bound(table, Main, { entities: { E } }, (db) =>
+                Effect.gen(function* () {
+                  if (values.length === 1) {
+                    // An `Option` is stored as a map, and DynamoDB refuses append's ordering guard
+                    // (`<`) on a map, as it did on 1.39.0: DynamoDB holds no such event. The bounds
+                    // are checked below on the rows the fixture puts directly.
+                    const failed = yield* Effect.flip(
+                      db.entities.E.append({ id: "x", n: values[0] }).asEffect(),
+                    )
+                    expect((failed as any)._tag).toBe("DynamoValidationError")
+                    expect(yield* table.rows).toEqual([])
+                    return
+                  }
+                  for (const n of values) yield* db.entities.E.append({ id: "x", n }).asEffect()
+                  expect(yield* table.rows).toEqual(byKey(rows))
+                }),
+              ),
+            ),
         )
 
         it.effect(`${name}, escapeKeys ${escapeKeys}: the bounds find what they say`, () =>

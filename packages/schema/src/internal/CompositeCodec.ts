@@ -43,12 +43,36 @@ import {
   numericTypeWithStringEncoding,
 } from "./SchemaAccessors.js"
 
+/** The same encoded composite value: a scalar, or a `Date` of the same instant. */
+const sameValue = (a: unknown, b: unknown): boolean =>
+  Object.is(a, b) || (a instanceof Date && b instanceof Date && a.getTime() === b.getTime())
+
 /**
  * Normalises one composite attribute value into its key form. Accepts a value
  * from either side — the write path holds encoded records, the read path holds
  * domain values — and lands both on the same result.
  */
 export type CompositeKeyForm = (attr: string, value: unknown) => unknown
+
+/**
+ * How {@link makeCompositeKeyForm} keys a codec whose `encode` takes its own output, and which
+ * attributes it refuses a value of.
+ */
+export interface CompositeKeyFormOptions {
+  /**
+   * The key form 1.39.0 had: such a codec's value encoded whatever it is, its
+   * stored text included (`x:x:mix` for `"MiX"` stored `"x:MiX"`). `rekey` asks
+   * for it to find a row 1.39.0's `put` stored under that text, and an
+   * aggregate, whose keys only its own paths compose, keys with it as it did
+   * (one encode of a domain value).
+   */
+  readonly text139?: boolean
+  /**
+   * The attributes a key is composed from, when the records normalised hold
+   * others too ({@link makeCompositeKeyForm}).
+   */
+  readonly reads?: ((attr: string) => boolean) | undefined
+}
 
 /**
  * The refusal of a composite's number its declared kind can't hold exactly (the
@@ -91,6 +115,19 @@ export const refuseInexact = (composite: string, value: unknown, reason: string)
  *    neither takes, the same two from the numeric kind the Encoded side is
  *    stored as: a row read back holds a stored `bigint` as a number.
  *
+ *    A codec whose `encode` takes its own output (`x:` prepended,
+ *    `Schema.StringFromBase64`, a number scaled) takes its stored text too, so
+ *    `encode` alone can't tell the two sides apart. A value that is its own
+ *    stored text (`encode(decode(value))` is the value) is that text, keyed as
+ *    it is: `put` holds `"x:MiX"` for `"MiX"` and keys `x:mix`. Up to 1.39.0
+ *    it was encoded once more, so `put` keyed `x:x:mix` (`text139` composes
+ *    that, for `rekey`, and keeps an aggregate's keys, which only its own
+ *    paths compose, from domain values). A domain value can be such a text as
+ *    well (`"x:MiX"` itself): a path holding domain values encodes them first
+ *    ({@link makeCompositeDomainKeyForm}), so the key form only ever sees
+ *    stored text from it. A codec whose `encode` refuses its own output never
+ *    reaches this: its stored text takes the `decode -> encode` fallback.
+ *
  * `onError` fires when the value of an attribute a key is composed from
  * reaches neither target form — refuse loudly rather than compose a key that
  * silently matches nothing. `reason` says why, when it's a number its numeric
@@ -103,8 +140,9 @@ export const refuseInexact = (composite: string, value: unknown, reason: string)
 export const makeCompositeKeyForm = (
   source: Schema.Top,
   onError: (attr: string, value: unknown, reason?: string) => never,
-  options?: { readonly reads?: ((attr: string) => boolean) | undefined },
+  options?: CompositeKeyFormOptions,
 ): CompositeKeyForm => {
+  const keysStoredText = options?.text139 !== true
   const fields = getSchemaFields(source)
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
   const reads = options?.reads
@@ -187,9 +225,23 @@ export const makeCompositeKeyForm = (
     // Case 3b — target is the Encoded side.
     const encode = Schema.encodeUnknownOption(codec)
     const decode = Schema.decodeUnknownOption(codec)
+    /** Is `value` its own stored text: what `encode` gives for what it decodes to? */
+    const isStoredText = (value: unknown): boolean => {
+      const decoded = decode(value)
+      if (Option.isNone(decoded)) return false
+      const reencoded = encode(decoded.value)
+      return Option.isSome(reencoded) && sameValue(reencoded.value, value)
+    }
     const toEncoded = (value: unknown): Option.Option<unknown> => {
       const direct = encode(value)
-      if (Option.isSome(direct)) return direct
+      if (Option.isSome(direct)) {
+        // `encode` takes the value and changes it: a domain value, or, for a codec whose
+        // `encode` takes its own output, its stored text, which is its key text.
+        if (keysStoredText && !sameValue(direct.value, value) && isStoredText(value)) {
+          return Option.some(value)
+        }
+        return direct
+      }
       return Option.flatMap(decode(value), (decoded) => encode(decoded))
     }
     // The stored form, as case 3a takes it (`OptionFromNullOr(BigInt)`, a
@@ -909,12 +961,11 @@ export const kindReadingOf = (
  * wrote for it.
  *
  * `put` encodes its input (`encode`, else `decode -> encode`), then composes
- * keys through the key-form normaliser. For a codec that `encode` takes on its
- * own output (`x:` prepended by `encode`, stripped by `decode`; a number scaled
- * by `encode`), the normaliser encodes once more, so `put` stores the key of the
- * value encoded twice. A path handing the caller's value straight to the
- * normaliser encoded it once and composed a key no `put` writes: `Batch.get` of
- * an item `put` wrote returned null.
+ * keys through the key-form normaliser, which keys that stored text as it is.
+ * For a codec that `encode` takes on its own output (`x:` prepended by
+ * `encode`, stripped by `decode`; a number scaled by `encode`), a caller's
+ * value is therefore encoded here first, once: the normaliser can't tell
+ * `"x:MiX"` given as a domain value from `"MiX"`'s stored text.
  *
  * A codec inside a wrapper (`Schema.optional(Schema.NumberFromString)`, a union
  * of a codec and a literal) is encoded here too, as `put` encodes it. The
@@ -932,6 +983,12 @@ export const kindReadingOf = (
 export const makeCompositeStoredForm = (
   source: Schema.Top,
 ): ((record: Record<string, unknown>) => Record<string, unknown>) => {
+  const storedForm = compositeStoredForm(source)
+  return (record) => toCompositeKeyRecord(storedForm, record)
+}
+
+/** {@link makeCompositeStoredForm}, one attribute at a time. */
+const compositeStoredForm = (source: Schema.Top): CompositeKeyForm => {
   const fields = getSchemaFields(source)
   const cache = new Map<string, ((value: unknown) => unknown) | null>()
 
@@ -965,12 +1022,31 @@ export const makeCompositeStoredForm = (
     return fn
   }
 
-  const storedForm: CompositeKeyForm = (attr, value) => {
+  return (attr, value) => {
     if (value === undefined || value === null) return value
     const fn = resolve(attr)
     return fn === null ? value : fn(value)
   }
-  return (record) => toCompositeKeyRecord(storedForm, record)
+}
+
+/**
+ * The key form of a caller's DOMAIN value: {@link makeCompositeStoredForm}'s
+ * stored form, then `makeCompositeKeyForm`'s key form — what `Entity.put`
+ * composes for the value: encode a domain value once, then key that text.
+ * Every path that composes a key from values a caller gives (an accessor's
+ * composites, a `.where()` or `.within()` bound, a collection's or a vector
+ * index's partition, a geo search's filter, a multi-item op's key, a
+ * projection's row) composes through it, so it finds what `put` wrote. Except
+ * for a domain value that is also its codec's stored text (`"x:MiX"`), it is
+ * exactly the key form.
+ */
+export const makeCompositeDomainKeyForm = (
+  source: Schema.Top,
+  onError: (attr: string, value: unknown, reason?: string) => never,
+): CompositeKeyForm => {
+  const keyForm = makeCompositeKeyForm(source, onError)
+  const storedForm = compositeStoredForm(source)
+  return (attr, value) => keyForm(attr, storedForm(attr, value))
 }
 
 /**

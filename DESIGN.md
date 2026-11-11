@@ -884,6 +884,19 @@ internal) gives each as a pair of schemas whose composers give its partition and
 attributes (an inverted index): each attribute holds the text of the half that wrote it last, so
 `pk` is escaped and `sk` raw (`KeyText136.invertedForm137`).
 
+**A codec whose `encode` takes its own output, up to 1.39.0.** Under each form above, 1.39.0 and
+earlier keyed such a composite by its stored text encoded once more (`x:x:mix` for `"MiX"`, §7 "A
+codec whose `encode` takes its own output"). `rekey` composes a row's keys from its values under both
+key forms, the current one and 1.39.0's (`makeCompositeKeyForm`'s `text139`, `keyForm139` in
+`Entity.ts`), under each form above, so it finds every place 1.39.0 put one: a live item's table key,
+its index keys and Z-order prefix segments, its vector partitions (a geo index's partition is an index
+key), its version snapshots' and tombstones' item segments, a time-series event's key, and a
+projection's read-model row, which is an item of the read model. One pass moves both at once:
+`escapeKeys` turned on over 1.39.0's rows moves each to the escaped text of its stored value. A row
+whose corrected key another row holds stays where it is, the conflict `taken`: 1.39.0's projection
+tombstoned the stored text's key, where the row now belongs. Unique sentinels, projection row
+tombstones and outbox items already held the stored text, and keep their keys.
+
 Only `rekey` looks for any of these. **There is no fallback and nothing is promised until `rekey`
 finishes.** With a value whose key text changed:
 
@@ -905,7 +918,9 @@ has no rows under other text, and there two values never share a key: `test/Alia
 **What upgrading means.** From 1.36 or earlier: nothing, the default composes the same text. From
 1.37.0 or 1.38.0: the default reverses their change, so a row with an escapable character in a sort
 key, a number whose text they changed, or a time-series event of a string-encoded numeric `orderBy`
-needs `rekey`, under the default or with the flag set.
+needs `rekey`, under the default or with the flag set. From 1.39.0 or earlier, an entity
+with a key composite whose codec's `encode` takes its own output needs `rekey`, whatever `escapeKeys`
+says.
 
 `KeyText136` composes exactly the bytes 1.36 wrote for every key kind (`serializeValue136`
 through the same structural composers, and the time-series event sort key from the encoded
@@ -924,7 +939,9 @@ that of `escapeKeys: true` when it differs from off's. `rekey` reads the key bac
 `db.tables.<Table>.rekey(options?)` (`TableOperations.rekey`) is the only migration of key text. It
 moves every row under text the setting doesn't compose to the text it does, in either direction: off
 moves rows from 1.37.0, 1.38.0 and `escapeKeys: true` back to 1.36's text, and on moves rows from
-1.36, 1.37.0, 1.38.0 and off to escaped text. Every row is moved or counted, never silently left. Run
+1.36, 1.37.0, 1.38.0 and off to escaped text. Under either setting it moves a row 1.39.0 keyed by a
+codec's stored text encoded once more to the stored text's key. Every row is moved or counted, never
+silently left. Run
 it once every instance runs this release under the setting (another instance writes its own text
 again); dry run first. It returns a `RekeyReport` (`Table.ts`) and fails with `ValidationError`
 (`EDD-9098`) for a bad option or resume token, or with the `DynamoClientError` of a request that
@@ -1368,20 +1385,60 @@ left its sentinel behind. A field once declared both and now one kind keeps rows
 under the other kind's text, and `rekey` moves them ("Rows under the other
 numeric kind's text", under `rekey`).
 
-**A codec whose `encode` takes its own output is encoded twice.** `Entity.put`
-encodes its input (`inputSchema`), then applies the key form, whose fallback
-assumes encoding is idempotent. For a codec prepending `x:` it isn't: `"MiX"`
-is stored with the key text `x:x:mix`. The entity's own `get` and `delete` do
-the same (`encodeKey`, then the key form), so they find it. A multi-item op
-takes the caller's DOMAIN key the same way: `composePrimaryKeyOrFail` (`Batch.get`,
-`Batch.write` deletes, `transactGet`, `transactWrite` deletes and condition
-checks) composes through `_domainKeyForm` =
-`_keyForm ∘ makeCompositeStoredForm`, the stored form `put` encodes first
-(applied to transformed, non-numeric composites only; every other composite
-passes through as given, so its key is what 1.39.0 composed). Up to 1.39.0 these
-paths applied the key form alone and composed `x:mix`, so they found, deleted and
-checked nothing for such an item. The double encode itself is stored key text and
-is left as it is: correcting it is a key-format change.
+**A codec whose `encode` takes its own output keys its stored text.** A prefix
+codec (`x:` prepended by `encode`, stripped by `decode`), `Schema.StringFromBase64`,
+`StringFromBase64Url`, `StringFromHex`, `StringFromUriComponent` and a number scaled
+by `encode` take their stored text as well as a domain value, so `encode` alone can't
+tell the two sides apart. The key form keys a value that is its own stored text
+(`encode(decode(value))` is the value) as it is: `Entity.put` stores `"MiX"` as
+`x:MiX` under the key text `x:mix`. A key composed from a stored row (the write
+paths, `liveRows`, restore, purge, a row check) holds that text, so it agrees.
+**Up to 1.39.0 the key form encoded such a text once more**, so `put` keyed `"MiX"`
+`x:x:mix`, while every path that composes a key from a caller's values encoded the
+value once and composed `x:mix`: queries, collections, history, versions and the
+multi-item reads found nothing, multi-item deletes and condition checks touched
+nothing, `reembed` rewrote a vector partition out of the partition `put` wrote, and a
+projection read its row at `x:mix`, found none, and failed every event after the
+row's first with `ConcurrentModification` (its `create` met the row), while a removal
+wrote its tombstone at `x:mix` and left the row in place. That key text is corrected
+in 1.40.0, with no switch: the rows 1.39.0 wrote under it are moved by `rekey`
+(below), and until then no key read or write finds them.
+
+A domain value can itself be such a text (`"x:MiX"`, stored `x:x:MiX`, keyed
+`x:x:mix`), so every path that composes a key from DOMAIN values a caller gives goes
+through ONE rule, the **domain key form** (`makeCompositeDomainKeyForm` per
+attribute, `Entity._domainKeyForm` per record): the key form of the stored form
+(`makeCompositeStoredForm`: `encode`, else `decode -> encode`, for transformed,
+non-numeric composites only; every other composite passes through as given). The
+key form alone would take `"x:MiX"` for the stored text of `"MiX"`. The paths: the
+entity's own `get`, `update` and `delete` (`encodeKey`, then the key form); a
+multi-item op's key (`composePrimaryKeyOrFail`: `Batch.get`, `Batch.write` deletes,
+`transactGet`, `transactWrite` deletes and condition checks), which takes the same
+domain values and sends the same key it did on 1.39.0; an index accessor's
+composites, typed (`db.entities.X.byIndex`) and unbound (`X.query.byIndex`);
+`.where()` operands; `.within()` bounds on a composite sort key, and a Z-order
+index's prefix composites and the levels its dimensions' bounds quantize to; a
+collection's partition (`db.collections.*`, `Collection.make`); a vector index's
+`.partition()`; a geo search's composites; the key of `versions`, `deleted.list`,
+`history` and `history().where()` (the event `orderBy` value included); the keys
+`reembed` recomposes from a decoded item; and the key a projection reads its
+read-model row at, tombstones it at and keys its outbox items under, which is the
+key the read model's `put` writes.
+
+For every composite whose `encode` refuses its own output, the domain key form IS
+the key form, and the key form of a stored value is what it was, so nothing else
+changes in what is sent or stored. A Z-order dimension's `FilterExpression`
+compares the stored attribute, so its operands stay in the stored form. Rows
+holding no values were already keyed by the stored text: a unique sentinel holds
+it, and a projection's row tombstone and outbox items were keyed by it, so they
+keep their keys. Turning `escapeKeys` on in the same pass, a row 1.39.0 keyed and
+one keyed by the stored text under the old text (the read model's removal
+tombstone, or a write's row beside 1.39.0's) move to one key: the doubled-text
+row's move first moves the other one there (`RowTargets.elsewhere`, `clearTarget`;
+a dry run judges it as if moved), so the second holds the key and 1.39.0's row is
+`taken` or `bothKeys`, whichever `rekey` reaches first. An aggregate composes its own keys from domain values (one encode
+for a root's composite, none for an edge's sort key), and only its own paths compose
+them, so it keeps 1.39.0's key form (`text139`) and every byte.
 
 ### Isolated vs Clustered Key Prefixes
 

@@ -87,10 +87,10 @@ export interface GeoEntity<A, P> {
   readonly indexes: Record<string, KeyComposer.IndexDefinition>
   readonly schemas: { readonly recordSchema: Schema.Codec<any> }
   /**
-   * The entity's composite key-form normaliser — search must compose GSI keys
-   * exactly as `put` wrote them (#111).
+   * The key form of a DOMAIN record — search must compose GSI keys exactly as
+   * `put` wrote them (#111), from the key form of the values `put` stores.
    */
-  readonly _keyForm: (record: Record<string, unknown>) => Record<string, unknown>
+  readonly _domainKeyForm: (record: Record<string, unknown>) => Record<string, unknown>
   readonly put: (input: A) => P
 }
 

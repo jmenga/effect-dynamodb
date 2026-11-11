@@ -51,7 +51,9 @@ import {
   fixture,
   JUDGED_AS_139,
   json,
+  KEYED_TWICE_BY_139,
   keyedBy,
+  keyedOnce,
   lineClass,
   lines,
   NINTH,
@@ -264,7 +266,13 @@ describe("aggregate create hydrates an edge's entity by the key its id is", () =
         const { create, requests, sent, rows, get } = yield* run(SHAPES[label]!())
         expect(Exit.isSuccess(create)).toBe(true)
         expect(requests).toEqual(["BatchGetItem", "TransactWriteItems"])
-        const seeded = fixture.shapes[label]!.seeded
+        const written = fixture.shapes[label]!.seeded
+        // 1.39.0 keyed a codec `encode` takes on its own output by its stored text encoded once more.
+        expect(written.some((row) => row.pk!.S!.includes("x:x:"))).toBe(
+          KEYED_TWICE_BY_139.has(label),
+        )
+        const seeded = KEYED_TWICE_BY_139.has(label) ? written.map(keyedOnce) : written
+        expect(byKey(rows.filter((row) => row.__edd_e__?.S === "Line"))).toEqual(byKey(seeded))
         expect(batchGetKeys(sent)).toEqual(seeded.map(keyOf))
         // The edge's row holds the entity's attributes as `put` stored them.
         const edge = rows.find((row) => row.__edd_e__?.S === "AggLine")!

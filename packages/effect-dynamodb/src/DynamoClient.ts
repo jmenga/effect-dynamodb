@@ -131,6 +131,7 @@ import {
   type KeyFormValueKind,
   keyFormValueKind,
   keyFormValueKindOf,
+  makeCompositeDomainKeyForm,
   makeCompositeKeyForm,
   refuseInexact,
   toCompositeKeyRecord,
@@ -567,6 +568,8 @@ const planCompositeWithin = <A>(args: {
   readonly indexDef: IndexDefinition
   readonly encoderSource: Schema.Top
   readonly compositeKeyForm: CompositeKeyForm
+  /** A bound's key form: the key form of the value `put` stores for it. */
+  readonly domainKeyForm: CompositeKeyForm
   /** The accessor's composites, in key form. */
   readonly pinnedKeyForm: Record<string, unknown>
   readonly pkValue: string
@@ -574,7 +577,7 @@ const planCompositeWithin = <A>(args: {
   readonly bounds: Record<string, unknown>
   readonly options: WithinOptions | undefined
 }): Query.Query<A> => {
-  const { entityLike, accessor, indexDef, compositeKeyForm, pinnedKeyForm } = args
+  const { entityLike, accessor, indexDef, domainKeyForm, pinnedKeyForm } = args
   const sk = indexDef.sk.composite
   const n = sk.length
   const p = sk.findIndex((attr) => pinnedKeyForm[attr] === undefined)
@@ -646,7 +649,7 @@ const planCompositeWithin = <A>(args: {
     }
     const expected = kindOf(field)
     const keyForm = (value: unknown): unknown => {
-      const converted = compositeKeyForm(field, value)
+      const converted = domainKeyForm(field, value)
       if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
         return refuse(
           `the bound on "${field}" is ${JSON.stringify(String(value))} (${typeof value}), but ` +
@@ -1003,13 +1006,15 @@ const planZOrderWithin = <A>(args: {
   readonly indexDef: IndexDefinition
   readonly encoderSource: Schema.Top
   readonly compositeKeyForm: CompositeKeyForm
+  /** A bound's key form: the key form of the value `put` stores for it. */
+  readonly domainKeyForm: CompositeKeyForm
   readonly pkValue: string
   readonly plans: ZOrderPlans
   readonly query: Query.Query<A>
   readonly bounds: Record<string, unknown>
   readonly options: WithinOptions | undefined
 }): Query.Query<A> => {
-  const { entityLike, accessor, indexDef, compositeKeyForm } = args
+  const { entityLike, accessor, indexDef, domainKeyForm } = args
   const refuse = (why: string): never => {
     throw new Error(
       `[EDD-9093] .within() on index "${accessor}" of entity "${entityLike.entityType}": ${why}`,
@@ -1028,7 +1033,7 @@ const planZOrderWithin = <A>(args: {
   const fields = getSchemaFields(args.encoderSource)
   /** `value` in the field's key form: `[EDD-9050]` from the encoder, `[EDD-9093]` for the wrong type. */
   const keyForm = (field: string, value: unknown): unknown => {
-    const converted = compositeKeyForm(field, value)
+    const converted = domainKeyForm(field, value)
     const schema = fields?.[field]
     const expected = schema === undefined ? undefined : keyFormValueKind(schema)
     if (expected !== undefined && keyFormValueKindOf(converted) !== expected) {
@@ -1396,16 +1401,17 @@ const planZOrderWithin = <A>(args: {
 }
 
 /**
- * The composite key form for an arbitrary entity-like value — the same rule
- * `Entity` applies to its own keys (`internal/CompositeCodec.ts`).
+ * The key form of a caller's DOMAIN record for an arbitrary entity-like value —
+ * the key `put` wrote for those values (`internal/CompositeCodec.ts`,
+ * `makeCompositeDomainKeyForm`), as `Entity._domainKeyForm` composes it.
  */
-const entityKeyForm = (
+const entityDomainKeyForm = (
   entityLike: { readonly model?: unknown; readonly schemas?: { readonly inputSchema?: unknown } },
   record: Record<string, unknown>,
 ): Record<string, unknown> => {
   const source = (entityLike.schemas?.inputSchema ?? entityLike.model) as Schema.Top | undefined
   if (source === undefined) return record
-  const form = makeCompositeKeyForm(source, (attr, value, reason) => {
+  const form = makeCompositeDomainKeyForm(source, (attr, value, reason) => {
     if (reason !== undefined) return refuseInexact(`Composite "${attr}"`, value, reason)
     throw new Error(
       `[EDD-9050] Composite "${attr}" could not be put into its key form: ` +
@@ -2622,7 +2628,7 @@ const makeFromConfig = (config: {
       // composing keys. The raw model is not equivalent — entity derivation
       // substitutes date/Redacted fields with their wire transforms.
       const encoderSource = entityLike.schemas.inputSchema ?? entityLike.model
-      const compositeKeyForm = makeCompositeKeyForm(encoderSource, (attr, value, reason) => {
+      const unencodable = (attr: string, value: unknown, reason?: string): never => {
         if (reason !== undefined) {
           return refuseInexact(
             `Composite "${attr}" on index "${_indexName}" of entity "${entityLike.entityType}"`,
@@ -2637,7 +2643,11 @@ const makeFromConfig = (config: {
             `the ENCODED value, but ${JSON.stringify(String(value))} encodes under neither ` +
             `encode nor decode->encode. Supply a value of the attribute's own type.`,
         )
-      })
+      }
+      const compositeKeyForm = makeCompositeKeyForm(encoderSource, unencodable)
+      // The caller's composites and bounds are DOMAIN values: the key `put` wrote for one is
+      // the key form of the value it stores (`Entity._domainKeyForm`).
+      const domainKeyForm = makeCompositeDomainKeyForm(encoderSource, unencodable)
 
       // A Z-order sort key (#171) is a binary address: its prefix composites
       // and dimensions are bounded with `.within()`, never pinned by the
@@ -2667,7 +2677,7 @@ const makeFromConfig = (config: {
           }
         }
         validateQueryComposites(_indexName, accessorDef, rawComposites)
-        const compositesKeyForm = toCompositeKeyRecord(compositeKeyForm, rawComposites)
+        const compositesKeyForm = toCompositeKeyRecord(domainKeyForm, rawComposites)
         // One partition, or a sharded index's several (#183).
         const read = KeyComposer.composeReadPartitions(
           entityLike._schema,
@@ -2856,7 +2866,7 @@ const makeFromConfig = (config: {
             },
             prefixText,
             targetAttr,
-            mapBound(condition, (value) => compositeKeyForm(targetAttr, value)),
+            mapBound(condition, (value) => domainKeyForm(targetAttr, value)),
             { clampToPrefix: pinnedCount > 0 },
           )
         }
@@ -2878,6 +2888,7 @@ const makeFromConfig = (config: {
                     indexDef,
                     encoderSource,
                     compositeKeyForm,
+                    domainKeyForm,
                     pkValue,
                     plans: zorderPlans!,
                     query: q,
@@ -2893,6 +2904,7 @@ const makeFromConfig = (config: {
                     indexDef,
                     encoderSource,
                     compositeKeyForm,
+                    domainKeyForm,
                     pinnedKeyForm: compositesKeyForm,
                     pkValue,
                     query: q,
@@ -2993,7 +3005,7 @@ const makeFromConfig = (config: {
           )
         }
         const vqConfig: BoundVectorQueryConfig = {
-          keyForm: (record: Record<string, unknown>) => entityKeyForm(entityLike, record),
+          keyForm: (record: Record<string, unknown>) => entityDomainKeyForm(entityLike, record),
           entityType: entityLike.entityType,
           logicalName,
           definition,
@@ -3103,7 +3115,7 @@ const makeFromConfig = (config: {
           firstMember.entityLike._schema,
           firstMember.entityLike.entityType,
           indexDef,
-          entityKeyForm(firstMember.entityLike, composites),
+          entityDomainKeyForm(firstMember.entityLike, composites),
           { prune: false },
         )
 

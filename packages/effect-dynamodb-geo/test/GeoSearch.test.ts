@@ -1,5 +1,6 @@
+import { readFileSync } from "node:fs"
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Schema, SchemaGetter } from "effect"
 import { DynamoClient, DynamoError, DynamoSchema, Entity, Table } from "effect-dynamodb"
 import * as h3 from "h3-js"
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -613,6 +614,96 @@ describe("GeoSearch", () => {
       expect(await Effect.runPromise(nearby(7))).toEqual([])
       expect(mockQuery).toHaveBeenCalled()
     })
+  })
+
+  describe("a pkFilter composite whose codec encode takes its own output", () => {
+    // `put` keys such a composite by its stored text (`depot_x:d 1`). 1.39.0's `put` encoded it
+    // once more (`depot_x:x:d 1`) and its search encoded the caller's `depot` once, so it found
+    // nothing; `rekey` rewrites the partition 1.39.0 wrote (`KeyCodecPaths.test.ts`).
+    const fixture = JSON.parse(
+      readFileSync(new URL("./fixtures/key-codec-geo-1.39.0.json", import.meta.url), "utf8"),
+    )
+    const Prefixed = Schema.String.pipe(
+      Schema.decodeTo(Schema.String, {
+        decode: SchemaGetter.transform((s: string) => s.slice(2)),
+        encode: SchemaGetter.transform((s: string) => `x:${s}`),
+      }),
+    )
+    /** The entity 1.39.0 wrote the row with: one per table, which it is registered on. */
+    const fleet = () =>
+      Entity.make({
+        model: Schema.Struct({
+          vehicleId: Schema.String,
+          depot: Prefixed,
+          latitude: Schema.Number,
+          longitude: Schema.Number,
+          timestamp: Schema.Number,
+          cell: Schema.optional(Schema.String),
+          parentCell: Schema.optional(Schema.String),
+          timePartition: Schema.optional(Schema.String),
+        }),
+        entityType: "FleetVehicle",
+        primaryKey: {
+          pk: { field: "pk", composite: ["vehicleId"] },
+          sk: { field: "sk", composite: [] },
+        },
+        indexes: {
+          byCell: {
+            name: "gsi1",
+            pk: { field: "gsi1pk", composite: ["depot", "parentCell", "timePartition"] },
+            sk: { field: "gsi1sk", composite: ["cell"] },
+          },
+        },
+      })
+
+    for (const setting of ["off", "on"] as const) {
+      const written = fixture[setting]
+      const Fleet = fleet()
+      const FleetTable = Table.make({
+        schema: DynamoSchema.make({ name: "kc", version: 1, escapeKeys: setting === "on" }),
+        entities: { Fleet },
+      })
+      const FleetGeo = GeoIndex.make({
+        entity: Fleet,
+        index: "byCell",
+        coordinates: (item) => ({ latitude: item.latitude, longitude: item.longitude }),
+        fields: {
+          cell: { field: "cell", resolution: 15 },
+          parentCell: { field: "parentCell", resolution: 3 },
+          timePartition: { field: "timePartition", source: "timestamp", bucket: "hourly" },
+        },
+      })
+      const search = () =>
+        Effect.runPromise(
+          FleetGeo.nearby({
+            center: written.center,
+            radius: 1000,
+            unit: "m",
+            timeWindow: { start: written.now, end: written.now + 1000 },
+            pkFilter: { depot: "D 1" },
+          }).pipe(
+            Effect.provide(Layer.merge(TestDynamoClient, FleetTable.layer({ name: "geo-fleet" }))),
+          ),
+        )
+      const [row] = written.rows
+      const text = setting === "on" ? "d%201" : "d 1"
+
+      it(`escapeKeys ${setting}: searches the partition put writes, which rekey moves 1.39.0's row to`, async () => {
+        expect(written.reads["nearby({ pkFilter: { depot } })"]).toEqual({ ok: 0 })
+        expect(row.gsi1pk.S).toContain(`#depot_x:x:${text}#`)
+        store.set(`gsi1|${row.gsi1pk.S}|${row.gsi1sk.S}`, row)
+        expect(await search()).toEqual([])
+
+        const rekeyed = { ...row, gsi1pk: { S: row.gsi1pk.S.replace("depot_x:x:", "depot_x:") } }
+        store.set(`gsi1|${rekeyed.gsi1pk.S}|${rekeyed.gsi1sk.S}`, rekeyed)
+        const hits = await search()
+        expect(hits.map((hit: any) => hit.item.vehicleId)).toEqual(["v1"])
+        expect(
+          mockQuery.mock.calls.map(([input]) => input.ExpressionAttributeValues[":pk"].S),
+        ).toContain(rekeyed.gsi1pk.S)
+        expect(rekeyed.gsi1pk.S).toContain(`#depot_x:${text}#`)
+      })
+    }
   })
 
   describe("GeoIndex.bind", () => {
