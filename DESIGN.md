@@ -1061,9 +1061,15 @@ be reported twice, two ways, or counted as `unchanged` after the run moved it.
 - **`scanned` counts each row stored when the run met it, once**: when the scan
   returns it, or when the run takes it (moves it away, or writes over it as read)
   before the scan reaches it. Rows the run put aren't counted, so over a table
-  nothing else writes to, `scanned` is the number of rows stored when the run
-  started, in a dry run and a real run alike. A row the run moved isn't
-  `unchanged`, whichever member meets it after.
+  nothing else writes to, `scanned` of a run over the whole table is the number
+  of rows stored when the run started, in a dry run and a real run alike. A row
+  the run moved isn't `unchanged`, whichever member meets it after. Counts are
+  per run: a run started from a `resume` token starts with an empty journal, so a
+  row an earlier slice moved to a key the later slice's scan reaches is a row
+  stored when the later one started, counted by both (`moved` by the first,
+  `unchanged` by the second). Summed over the slices, `scanned` can exceed the
+  rows the table holds. Carrying the journal in the token would make the token
+  as large as the journal.
 - **A dry run plans the writes a real run sends** (`RekeyRowContext.plan`): it
   sends none, but notes what each would do if it succeeded as far as the run
   knows (no row the plan placed where it asks for none, none the plan took where

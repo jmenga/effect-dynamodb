@@ -209,7 +209,7 @@ do {
 
 A token holds the table name and each segment's position. Its segment count wins over the default: a token from a run with `segments: 4` resumes four segments, and passing a different `segments` with it fails. A token of another table, a malformed token, or a `segments`, `concurrency`, `pageSize` or `maxPages` that isn't a positive integer fails with a `ValidationError` (`EDD-9098`) before anything is read.
 
-Every count is of the run that returned it: add up the reports of a resumed run's slices yourself. Aggregate edge rows with no root in their partition are judged at the end of each run. A run that didn't read the whole table can't say a later page wouldn't bring the root in, so it counts them in `skipped.rootNotSeen`, and only a run over the whole table counts them in `skipped.unrecognizedKey`.
+Every count is of the run that returned it: add up the reports of a resumed run's slices yourself. Each slice starts with nothing remembered, so a row one slice moves to a key a later slice's scan reaches is counted by both, `moved` by the first and `unchanged` by the second: summed over the slices, `scanned` can be more than the rows the table holds. Aggregate edge rows with no root in their partition are judged at the end of each run. A run that didn't read the whole table can't say a later page wouldn't bring the root in, so it counts them in `skipped.rootNotSeen`, and only a run over the whole table counts them in `skipped.unrecognizedKey`.
 
 ## Rerun
 
