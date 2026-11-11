@@ -7419,7 +7419,14 @@ instance).
   with an expiring claim), delivers it, deletes it on its claim, and repeats:
   in order per row, at least once. `deliver` on `applyBatch` / `processBatch`
   drains after the write; `drainPending` sweeps through a sparse
-  `outbox.index`.
+  `outbox.index`. The index is keyed by entity type alone, so read models of one
+  entity type sharing it (another schema or primary collection) list each
+  other's items: `drainPending` drains only the rows in its read model's key
+  space, as `rekey`'s reader takes it under every setting, and leaves the
+  others' items unclaimed for their drainers. Its requests are the ones 1.40.0
+  sent. On 1.39.0 and 1.40.0 it claimed another read model's head item, failed
+  to decode it with its own schema, and left the claim, so that read model's
+  drainer stopped there until the claim expired.
 - **`EventStore.processBatch`** routes through each projection's internal
   routes (one per source stream; `bindProjection` wraps their decode and apply
   in its context), so single- and multi-source projections share one feed.

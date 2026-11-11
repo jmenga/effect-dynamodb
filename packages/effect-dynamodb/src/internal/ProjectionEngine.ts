@@ -1780,7 +1780,25 @@ export const makeEngine = (config: EngineConfig) => {
     return drainRaw(String(rowKey[primary.pk.field]), String(rowKey[primary.sk.field]), deliver)
   }
 
-  /** Every row with pending effects, through the outbox's sparse index, drained. */
+  /**
+   * Whether an outbox item's row (`__edd_row_pk__`, `__edd_row_sk__`) is a row of this read model:
+   * its key is in the read model's key space as `rekey`'s reader takes it (`keySpaceOf`, `"read"`),
+   * under every setting a row can have been written under. The outbox index is keyed by entity
+   * type alone, so read models of one entity type sharing it (another schema or primary
+   * collection, say) list each other's items there. Every row when the read model's key space
+   * can't be composed.
+   */
+  const ownRowOf = (): ((pk: string, sk: string) => boolean) => {
+    const space = keySpaceOf(readModel, "read")
+    if (space === undefined) return () => true
+    const whole = (text: string): KeyComposer.KeySpace => ({ text, after: [], open: false })
+    return (pk, sk) => spacesMeet(space, { pk: whole(pk), sk: whole(sk) })
+  }
+
+  /**
+   * Every row of this read model with pending effects, through the outbox's sparse index, drained.
+   * Rows of another read model the index lists (`ownRowOf`) are left to its drainer.
+   */
   const drainPending = <E, R>(
     deliver: (effect: any, meta: OutboxMeta) => Effect.Effect<void, E, R>,
   ) =>
@@ -1795,6 +1813,7 @@ export const makeEngine = (config: EngineConfig) => {
       }
       const client = yield* Capacity.client
       const TableName = yield* outboxTable
+      const ownRow = ownRowOf()
       const rows = new Map<string, readonly [string, string]>()
       let start: Record<string, AttributeValue> | undefined
       do {
@@ -1810,7 +1829,7 @@ export const makeEngine = (config: EngineConfig) => {
           const raw = fromAttributeMap(item) as Record<string, unknown>
           const pk = String(raw[ROW_PK])
           const sk = String(raw[ROW_SK])
-          rows.set(`${pk}\u0000${sk}`, [pk, sk])
+          if (ownRow(pk, sk)) rows.set(`${pk}\u0000${sk}`, [pk, sk])
         }
         start = page.LastEvaluatedKey
       } while (start !== undefined)
