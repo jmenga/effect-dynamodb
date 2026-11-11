@@ -3071,7 +3071,7 @@ export const makeStream = <
                   new ValidationError({
                     entityType: errorEntityType,
                     operation,
-                    cause: notReadBack("The value", issue),
+                    cause: notReadBack(undefined, issue),
                   }),
               ),
             ),

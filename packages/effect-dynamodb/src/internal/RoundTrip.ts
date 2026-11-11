@@ -1,16 +1,28 @@
 /**
- * Whether what a write stores reads back, for a value of a custom declaration (`EDD-9126`).
+ * Whether what a write stores reads back, for a value of a custom declaration (`EDD-9126`), and
+ * whether DynamoDB stores a value at a position no schema types at all (`EDD-9161`).
  *
  * A `Schema.instanceOf` and a duck-typed `Schema.declare` have the same AST, and only the second reads
  * back, so a model can't be judged when it loads (`EDD-9125` judges Effect's own declarations). What
  * can be judged is the value: what the marshaller makes of it, unmarshalled, is what a read would
  * hand the schema. The test is whether that decodes, never whether the value is an instance.
  *
- * A schema holding no custom declaration has no check at all, so what it costs is the scan when it's
- * built, and its requests are the ones it always sent.
+ * A value at a position no schema types is stored as given, so only the value can say whether
+ * DynamoDB stores it: one holding a part it doesn't (`LostValues`) is refused, and the same function
+ * refuses it in a packed field. A schema holding neither has no check at all, so what it costs is the
+ * scan when it's built, and its requests are the ones it always sent.
  */
 
-import { holdsCustomDeclaration } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import {
+  isLostAt,
+  lostIn,
+  lostPath,
+  lostRefusal,
+} from "@effect-dynamodb/schema/internal/LostValues.js"
+import {
+  holdsCustomDeclaration,
+  holdsUntyped,
+} from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { Cause, Effect, Schema } from "effect"
 import { fromAttributeMap, toAttributeMap } from "../Marshaller.js"
 
@@ -22,14 +34,23 @@ export const asRead = (encoded: unknown): unknown =>
 export type ReadBack = (encoded: unknown) => Effect.Effect<void, unknown>
 
 /**
- * The check for a schema's stored values, or `undefined` when it holds no custom declaration. A value
- * the marshaller refuses isn't this check's to judge: the write's own marshalling reports it
- * (`EDD-9124`).
+ * The check for a schema's stored values, or `undefined` when it holds neither a custom declaration
+ * nor an untyped position. A value at an untyped position is first looked through for a part
+ * DynamoDB doesn't store (`lostIn`), which fails with that part (`EDD-9161`); a custom declaration's
+ * value is then read back. A value the marshaller refuses isn't this check's to judge: the write's
+ * own marshalling reports it (`EDD-9124`).
  */
 export const readBackOf = (stored: Schema.Top, read: () => Schema.Top): ReadBack | undefined => {
-  if (!holdsCustomDeclaration(stored.ast)) return undefined
-  const decode = Schema.decodeUnknownEffect(read() as Schema.Codec<unknown>)
+  const custom = holdsCustomDeclaration(stored.ast)
+  const untyped = holdsUntyped(stored.ast)
+  if (!custom && !untyped) return undefined
+  const decode = custom ? Schema.decodeUnknownEffect(read() as Schema.Codec<unknown>) : undefined
   return (encoded) => {
+    if (untyped) {
+      const lost = lostIn(encoded)
+      if (lost !== undefined) return Effect.fail(lost)
+    }
+    if (decode === undefined) return Effect.void
     let value: unknown
     try {
       value = asRead(encoded)
@@ -85,9 +106,22 @@ export const readBackRefusal = (what: string, value: unknown, readsAs: string): 
   )
 }
 
-/** The refusal in words: `what` is what the value is, and `issue` what a read made of it. */
-export const notReadBack = (what: string, issue: unknown): string =>
-  `${what} wouldn't read back: a custom declaration's value is stored as the map the marshaller ` +
-  `makes of it, and a read fails on that: ${issueOf(issue)}. Nothing was written. A class of your ` +
-  "own reads back when it's decoded from what's stored, such as a struct with Schema.decodeTo. " +
-  "[EDD-9126]"
+/**
+ * The refusal in words: `what` is what the value is, and `issue` what a read made of it, or the part
+ * of it DynamoDB doesn't store (`EDD-9161`), named from `root`. Without `what`, a part DynamoDB doesn't
+ * store is named by its path alone.
+ */
+export const notReadBack = (what: string | undefined, issue: unknown, root = "value"): string => {
+  if (isLostAt(issue)) {
+    const refused = lostRefusal(lostPath(root, issue.path), issue)
+    return what === undefined
+      ? `${refused[0]!.toUpperCase()}${refused.slice(1)}`
+      : `${what}: ${refused}`
+  }
+  return (
+    `${what ?? "The value"} wouldn't read back: a custom declaration's value is stored as the map ` +
+    `the marshaller makes of it, and a read fails on that: ${issueOf(issue)}. Nothing was written. ` +
+    "A class of your own reads back when it's decoded from what's stored, such as a struct with " +
+    "Schema.decodeTo. [EDD-9126]"
+  )
+}

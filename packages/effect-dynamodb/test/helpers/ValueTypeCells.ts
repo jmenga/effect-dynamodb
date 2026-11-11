@@ -100,7 +100,7 @@ const said = (exit: Exit.Exit<unknown, unknown>): string | undefined => {
   if (Exit.isSuccess(exit)) return undefined
   const error = Cause.squash(exit.cause) as any
   const message = String(error?.cause?.message ?? error?.message ?? "")
-  const code = /\[EDD-\d+\]/.exec(message)?.[0] ?? /EDD-\d+/.exec(JSON.stringify(error))?.[0]
+  const code = /EDD-\d+/.exec(message)?.[0] ?? /EDD-\d+/.exec(JSON.stringify(error))?.[0]
   return `refused: ${error?._tag ?? "defect"}${code === undefined ? "" : ` ${code}`}`
 }
 

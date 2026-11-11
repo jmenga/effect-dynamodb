@@ -183,6 +183,19 @@ That covers every write that stores the value: `put`, `create`, `upsert`, `updat
 
 Rows an earlier release stored aren't touched. They stay as they are and still fail on read.
 
+#### Untyped fields
+
+A `Schema.Unknown` or `Schema.Any` field, or a position of one anywhere in a field, stores the value as given, so only the value can say whether DynamoDB keeps it. A value holding a part DynamoDB doesn't store fails its write with a `ValidationError` (`EDD-9161`) naming the path, and nothing is written:
+
+- a `Date`, valid or not, and a `RegExp`, which the marshaller writes as an empty map that reads back as `{}`;
+- a `WeakMap`, `WeakSet`, `WeakRef`, `FinalizationRegistry` or `Promise`, whose content isn't in its properties;
+- an `Error` holding a message or a cause, which aren't among its enumerable properties;
+- a `Redacted`, whose value is held outside it, so only its marker would be stored;
+- a `Map` with a key that isn't a string, whose keys would read back as text;
+- binary data other than a `Uint8Array`, such as an `ArrayBuffer`, a `DataView` or a `Float64Array`.
+
+Every write that stores the value is covered, the same ones as for a declaration of your own above. A packed field refuses the same values in the same words. Declare the field instead (`Schema.Date`, `Schema.DateTimeUtc`, `Schema.Redacted`), or store what you need of the value. A cookie's expiry is stored as ISO text, so a cookie isn't refused. A list holding `undefined`, a function or a hole still closes up, as it always has: the elements after it move up. Everything else is stored as the map of its enumerable properties and read back as that map, an instance of a class of your own included. Rows an earlier release stored as `{}` read as `{}`. A model with no untyped position pays nothing for this.
+
 #### Container checks
 
 A `.check()` refinement on an array, a struct or a class built over a checked struct is enforced on every write when the container holds a date or another value the library substitutes, for example `Schema.Array(Schema.DateTimeUtc).check(Schema.isMaxLength(1))`. That covers `put`, `create`, `update` and `.set()`, path operations, `.append()`, Batch and Transaction. A violating value fails with a `ValidationError`. Earlier versions silently dropped these checks, so rows that break them may already exist. Reads don't enforce them, so those rows still read, and the next write that sets the field to a valid value repairs them.

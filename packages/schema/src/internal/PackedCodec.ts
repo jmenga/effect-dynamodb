@@ -38,6 +38,7 @@ import { Effect, Schema, SchemaAST } from "effect"
 import type { CompressionRegistry } from "../Compression.js"
 import type { CompressionCodec, PackedConfig } from "../DynamoModel.js"
 import { CompressorNotRegistered, ValidationError } from "../Errors.js"
+import { type Lost, lostAs, lostRefusal } from "./LostValues.js"
 import { storedFormOf, ZONE_MARKER, zoneEntriesWritten } from "./StoredForm.js"
 
 export { BETA_DATE_MARKER, DATE_MARKER, ZONE_MARKER } from "./StoredForm.js"
@@ -216,15 +217,31 @@ class NotJson extends Error {
   constructor(
     readonly path: string,
     readonly what: string,
+    message?: string,
   ) {
     super(
-      `the value at ${path} is ${what}, which JSON cannot represent. Packed storage holds ` +
-        `JSON only: store this field natively, or give it a JSON-shaped schema ` +
-        `(e.g. DateTimeUtcFromString, BigIntFromString, Uint8ArrayFromBase64, an array instead ` +
-        `of a set).`,
+      message ??
+        `the value at ${path} is ${what}, which JSON cannot represent. Packed storage holds ` +
+          `JSON only: store this field natively, or give it a JSON-shaped schema ` +
+          `(e.g. DateTimeUtcFromString, BigIntFromString, Uint8ArrayFromBase64, an array instead ` +
+          `of a set).`,
     )
   }
 }
+
+/** A value DynamoDB doesn't store however it's written, refused as a native write refuses it. */
+const notStored = (path: string, lost: Lost): NotJson =>
+  new NotJson(path, lost.what, lostRefusal(path, lost))
+
+/**
+ * What JSON can't hold whatever it holds: a map, or binary data. Refused as not JSON, ahead of what a
+ * native write would lose of one ({@link lostAs}), which a packed field never stores either way.
+ */
+const isNeverJson = (value: object): boolean =>
+  value instanceof Map ||
+  value instanceof ArrayBuffer ||
+  ArrayBuffer.isView(value) ||
+  (typeof SharedArrayBuffer === "function" && value instanceof SharedArrayBuffer)
 
 const isPlainObject = (value: object): boolean => {
   const proto = Object.getPrototypeOf(value)
@@ -264,6 +281,9 @@ const written = (value: unknown, path: string, stack: Set<object>, forms: Forms)
     case "object": {
       if (value === null) return value
       if (stack.has(value)) throw new NotJson(path, "a circular reference")
+      // What no storage holds is refused with the words a native write refuses it in (`LostValues`).
+      const lost = isNeverJson(value) ? undefined : lostAs(value)
+      if (lost !== undefined) throw notStored(path, lost)
       if (Array.isArray(value)) {
         stack.add(value)
         let copy: Array<unknown> | undefined

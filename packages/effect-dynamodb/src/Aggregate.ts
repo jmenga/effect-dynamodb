@@ -62,6 +62,7 @@ import {
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import { readingInstances } from "@effect-dynamodb/schema/internal/InstanceReads.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
 import { KeyValueError } from "@effect-dynamodb/schema/internal/NumericKey.js"
 import { isDispatchEligible } from "@effect-dynamodb/schema/internal/PackedCodec.js"
 import {
@@ -70,6 +71,7 @@ import {
   getSchemaFields,
   hasEncodingTransformation,
   holdsCustomDeclaration,
+  holdsUntyped,
   refuseUnreadable,
 } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import { refuseAggregateKeyInTableKey } from "@effect-dynamodb/schema/internal/SharedKeyAttribute.js"
@@ -2037,6 +2039,35 @@ const makeAggregate = <TSchema extends Schema.Top>(
     })
 
   const holdsCustom = holdsCustomDeclaration(schema.ast)
+  const holdsUntypedValue = holdsUntyped(schema.ast)
+
+  /**
+   * Refuses a write whose rows hold, where no schema types a value, a part DynamoDB doesn't store
+   * (`EDD-9161`): a `Date` is written as an empty map and reads back as `{}`. Only an aggregate whose
+   * model holds such a position pays for the walk.
+   */
+  const refuseLost = (
+    groups: ReadonlyArray<TransactionGroup>,
+    operation: string,
+  ): Effect.Effect<void, ValidationError> => {
+    if (!holdsUntypedValue) return Effect.void
+    for (const group of groups) {
+      for (const item of group.items) {
+        for (const [attr, value] of Object.entries(item.attributes)) {
+          const lost = lostIn(value)
+          if (lost === undefined) continue
+          return Effect.fail(
+            new ValidationError({
+              entityType: aggregateName,
+              operation,
+              cause: notReadBack(`Field "${attr}" of "${item.member}"`, lost, attr),
+            }),
+          )
+        }
+      }
+    }
+    return Effect.void
+  }
 
   /**
    * Refuses the rows of a write that wouldn't read back: the rows it's about to write, through the read
@@ -2848,6 +2879,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
         ),
       )
       yield* refuseOtherKindKeys(newGroups, "aggregate.update")
+      yield* refuseLost(newGroups, "aggregate.update")
       yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
@@ -4014,6 +4046,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             ),
           )
           yield* refuseOtherKindKeys(groups, "aggregate.create")
+          yield* refuseLost(groups, "aggregate.create")
           yield* refuseNotReadBack(
             dynamoGroups,
             assembled,

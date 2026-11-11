@@ -67,10 +67,13 @@ import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypt
 import { packedIndexRefusal } from "@effect-dynamodb/schema/internal/EntityPacked.js"
 import { failingAsBefore, issueDecoding } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import * as KeyText136 from "@effect-dynamodb/schema/internal/KeyText136.js"
+import { lostIn } from "@effect-dynamodb/schema/internal/LostValues.js"
 import {
   type AbsentReading,
   absentReading,
   absentStored,
+  holdsCustomDeclaration,
+  holdsUntyped,
   type OperandKind,
   pathIsRequired,
   readersAt,
@@ -3228,8 +3231,9 @@ const makeImpl = <
   }
 
   /**
-   * The fields that can hold a value of a custom declaration, each with what checks one reads back.
-   * Empty for a model with none, which pays nothing more on a write.
+   * The fields that can hold a value of a custom declaration, or a value at a position no schema
+   * types, each with what checks one reads back (`readBackOf`). Empty for a model with neither, which
+   * pays nothing more on a write.
    */
   const readBacks: ReadonlyMap<string, ReadBack> = new Map(
     Object.entries(data.modelFields as globalThis.Record<string, Schema.Top>).flatMap(
@@ -3242,6 +3246,22 @@ const makeImpl = <
         const readBack = read === undefined ? undefined : readBackOf(schema, () => read)
         return readBack === undefined ? [] : [[field, readBack] as const]
       },
+    ),
+  )
+
+  /** The fields holding a position no schema types, whose values are looked through (`EDD-9161`). */
+  const untypedFields: ReadonlySet<string> = new Set(
+    [...readBacks.keys()].filter((field) =>
+      holdsUntyped((data.modelFields as globalThis.Record<string, Schema.Top>)[field]!.ast),
+    ),
+  )
+
+  /** The fields holding a custom declaration, whose path operands are read back (`EDD-9126`). */
+  const customFields: ReadonlySet<string> = new Set(
+    [...readBacks.keys()].filter((field) =>
+      holdsCustomDeclaration(
+        (data.modelFields as globalThis.Record<string, Schema.Top>)[field]!.ast,
+      ),
     ),
   )
 
@@ -3263,7 +3283,7 @@ const makeImpl = <
                   new ValidationError({
                     entityType,
                     operation,
-                    cause: notReadBack(`Field "${field}"`, issue),
+                    cause: notReadBack(`Field "${field}"`, issue, field),
                   }),
               ),
             ),
@@ -3474,6 +3494,13 @@ const makeImpl = <
         const { segments, value } = operand
         if (!readBacks.has(String(segments[0]))) continue
         const { encoded } = encodePathValue(segments, value, kind)
+        if (untypedFields.has(String(segments[0]))) {
+          const lost = lostIn(encoded)
+          if (lost !== undefined) {
+            return notReadBack(`${op} "${segments.join(".")}"`, lost, segments.join("."))
+          }
+        }
+        if (!customFields.has(String(segments[0]))) continue
         const read = asRead(encoded)
         const issue =
           kind === "value"

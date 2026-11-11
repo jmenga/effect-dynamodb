@@ -139,8 +139,8 @@ const TABLE: Readonly<Record<string, Readonly<Record<string, Cell>>>> = {
   },
   Redacted: {
     typed: '{"S":"s"}',
-    loose: '{"M":{"~effect/Redacted":{"M":{}}}}',
-    packed: "refused: ValidationError",
+    loose: "refused: ValidationError EDD-9161",
+    packed: "refused: ValidationError EDD-9161",
     key: '{"S":"s"}',
     keyText: '{"S":"$vt#v1#v#key_s"}',
     aggregateUpdate: "Query",
