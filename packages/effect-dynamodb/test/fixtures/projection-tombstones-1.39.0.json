@@ -1,0 +1,450 @@
+{
+  "writtenBy": {
+    "effect-dynamodb": "1.39.0",
+    "effect": "4.1.2"
+  },
+  "requests": [
+    {
+      "operation": "getItem",
+      "input": {
+        "TableName": "read",
+        "Key": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o1"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConsistentRead": true
+      }
+    },
+    {
+      "operation": "putItem",
+      "input": {
+        "TableName": "read",
+        "Item": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o1"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          },
+          "__edd_e__": {
+            "S": "Summary#tombstone"
+          },
+          "__edd_removed__": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "rev": {
+            "N": "1"
+          },
+          "version": {
+            "N": "2"
+          },
+          "_ttl": {
+            "N": "604800"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(#g)",
+        "ExpressionAttributeNames": {
+          "#g": "rev"
+        }
+      }
+    },
+    {
+      "operation": "getItem",
+      "input": {
+        "TableName": "read",
+        "Key": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o1"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConsistentRead": true
+      }
+    },
+    {
+      "operation": "putItem",
+      "input": {
+        "TableName": "read",
+        "Item": {
+          "orderId": {
+            "S": "o1"
+          },
+          "total": {
+            "N": "9"
+          },
+          "version": {
+            "N": "2"
+          },
+          "rev": {
+            "N": "2"
+          },
+          "createdAt": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "updatedAt": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "__edd_e__": {
+            "S": "Summary"
+          },
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o1"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+        "ExpressionAttributeNames": {
+          "#e0": "__edd_e__",
+          "#e2": "__edd_removed__"
+        },
+        "ExpressionAttributeValues": {
+          ":e1": {
+            "S": "Summary#tombstone"
+          },
+          ":e3": {
+            "S": "1970-01-01T00:00:00.000Z"
+          }
+        }
+      }
+    },
+    {
+      "operation": "getItem",
+      "input": {
+        "TableName": "read",
+        "Key": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o1"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConsistentRead": true
+      }
+    },
+    {
+      "operation": "getItem",
+      "input": {
+        "TableName": "read",
+        "Key": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o1"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConsistentRead": true
+      }
+    },
+    {
+      "operation": "putItem",
+      "input": {
+        "TableName": "read",
+        "Item": {
+          "orderId": {
+            "S": "o1"
+          },
+          "total": {
+            "N": "1"
+          },
+          "version": {
+            "N": "0"
+          },
+          "rev": {
+            "N": "0"
+          },
+          "createdAt": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "updatedAt": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "__edd_e__": {
+            "S": "Summary"
+          },
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o1"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+        "ExpressionAttributeNames": {
+          "#e0": "pk",
+          "#e1": "sk"
+        }
+      }
+    },
+    {
+      "operation": "getItem",
+      "input": {
+        "TableName": "read",
+        "Key": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o2"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConsistentRead": true
+      }
+    },
+    {
+      "operation": "putItem",
+      "input": {
+        "TableName": "read",
+        "Item": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o2"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          },
+          "__edd_e__": {
+            "S": "Summary#tombstone"
+          },
+          "__edd_removed__": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "rev": {
+            "N": "1"
+          },
+          "version": {
+            "N": "2"
+          },
+          "_ttl": {
+            "N": "604800"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(#g)",
+        "ExpressionAttributeNames": {
+          "#g": "rev"
+        }
+      }
+    },
+    {
+      "operation": "getItem",
+      "input": {
+        "TableName": "read",
+        "Key": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o2"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConsistentRead": true
+      }
+    },
+    {
+      "operation": "transactWriteItems",
+      "input": {
+        "TransactItems": [
+          {
+            "Put": {
+              "TableName": "read",
+              "Item": {
+                "orderId": {
+                  "S": "o2"
+                },
+                "total": {
+                  "N": "4"
+                },
+                "version": {
+                  "N": "2"
+                },
+                "rev": {
+                  "N": "2"
+                },
+                "__edd_e__": {
+                  "S": "Summary"
+                },
+                "pk": {
+                  "S": "$tomb#v1#summary#orderid_o2"
+                },
+                "sk": {
+                  "S": "$tomb#v1#summary"
+                },
+                "createdAt": {
+                  "S": "1970-01-01T00:00:00.000Z"
+                },
+                "updatedAt": {
+                  "S": "1970-01-01T00:00:00.000Z"
+                }
+              },
+              "ConditionExpression": "(#e0 = :e1) AND (#e2 = :e3)",
+              "ExpressionAttributeNames": {
+                "#e0": "__edd_e__",
+                "#e2": "__edd_removed__"
+              },
+              "ExpressionAttributeValues": {
+                ":e1": {
+                  "S": "Summary#tombstone"
+                },
+                ":e3": {
+                  "S": "1970-01-01T00:00:00.000Z"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "operation": "getItem",
+      "input": {
+        "TableName": "read",
+        "Key": {
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o3"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConsistentRead": true
+      }
+    },
+    {
+      "operation": "putItem",
+      "input": {
+        "TableName": "read",
+        "Item": {
+          "orderId": {
+            "S": "o3"
+          },
+          "total": {
+            "N": "2"
+          },
+          "version": {
+            "N": "0"
+          },
+          "rev": {
+            "N": "0"
+          },
+          "createdAt": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "updatedAt": {
+            "S": "1970-01-01T00:00:00.000Z"
+          },
+          "__edd_e__": {
+            "S": "Summary"
+          },
+          "pk": {
+            "S": "$tomb#v1#summary#orderid_o3"
+          },
+          "sk": {
+            "S": "$tomb#v1#summary"
+          }
+        },
+        "ConditionExpression": "(attribute_not_exists(#e0)) AND (attribute_not_exists(#e1))",
+        "ExpressionAttributeNames": {
+          "#e0": "pk",
+          "#e1": "sk"
+        }
+      }
+    }
+  ],
+  "items": [
+    {
+      "__edd_e__": {
+        "S": "Summary"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "orderId": {
+        "S": "o1"
+      },
+      "pk": {
+        "S": "$tomb#v1#summary#orderid_o1"
+      },
+      "rev": {
+        "N": "2"
+      },
+      "sk": {
+        "S": "$tomb#v1#summary"
+      },
+      "total": {
+        "N": "9"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      }
+    },
+    {
+      "__edd_e__": {
+        "S": "Summary"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "orderId": {
+        "S": "o2"
+      },
+      "pk": {
+        "S": "$tomb#v1#summary#orderid_o2"
+      },
+      "rev": {
+        "N": "2"
+      },
+      "sk": {
+        "S": "$tomb#v1#summary"
+      },
+      "total": {
+        "N": "4"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "2"
+      }
+    },
+    {
+      "__edd_e__": {
+        "S": "Summary"
+      },
+      "createdAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "orderId": {
+        "S": "o3"
+      },
+      "pk": {
+        "S": "$tomb#v1#summary#orderid_o3"
+      },
+      "rev": {
+        "N": "0"
+      },
+      "sk": {
+        "S": "$tomb#v1#summary"
+      },
+      "total": {
+        "N": "2"
+      },
+      "updatedAt": {
+        "S": "1970-01-01T00:00:00.000Z"
+      },
+      "version": {
+        "N": "0"
+      }
+    }
+  ]
+}

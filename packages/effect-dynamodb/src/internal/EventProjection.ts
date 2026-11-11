@@ -926,7 +926,9 @@ export const resolveOutbox = (
  * version), `softDelete` (removal is `removal` tombstones) and `timeSeries`
  * read models throw `[EDD-9081]`, as do a field the model lacks, a
  * non-integer offset, `removal` / `outbox` on a read model with `unique`
- * constraints, and `outbox` without `revision`.
+ * constraints, and `outbox` without `revision`. When a projection on the read
+ * model has `removal`, a checkpoint attribute that is also this projection's
+ * revision throws `[EDD-9133]`.
  *
  * @example
  * ```ts
@@ -1201,6 +1203,7 @@ export const projection = <
     streamId: Id,
   ): Effect.Effect<ProjectionCaughtUp<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
+      yield* engine.preflight("catchUp")
       // The latest event that addresses a row — usually the head, one page.
       const pages = yield* Query.paginate(
         stream.query
@@ -1256,6 +1259,7 @@ export const projection = <
     streamId: Id,
   ): Effect.Effect<ProjectionRebuilt<S, TEvent, StreamMetadata<TMetadata>, K, E>, Err, Req> =>
     Effect.gen(function* () {
+      yield* engine.preflight("rebuild")
       const events = (yield* stream.read(streamId, { consistentRead: true })) as Array<Ev>
       const delivered = new Set(events.map((e) => e.version))
       const rows = new Map<string, { key: K; events: Array<Ev> }>()

@@ -52,13 +52,18 @@ import { condition as entityCondition } from "./EntityCombinators.js"
 import type { EntityPutImpl } from "./EntityOps.js"
 import { notReadBack, readBackOf } from "./RoundTrip.js"
 import {
+  addProjectionLayout,
   OUTBOX_CLAIM as CLAIM_TOKEN,
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
   KEY_TEXT,
   marshalOrFail,
+  type ProjectionRole,
+  projectionTtlChecked,
+  projectionTtlConflict,
   OUTBOX_ROW_PK as ROW_PK,
   OUTBOX_ROW_SK as ROW_SK,
+  serializeSparseOrFail,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
 
@@ -143,6 +148,7 @@ export interface EngineEntity {
   readonly create: (input: any) => any
   readonly _tableTag: any
   readonly _renameToDynamo: (item: Record<string, unknown>) => void
+  readonly _serializeSparseFields: (item: Record<string, unknown>) => void
   readonly _attachPrototype?: ((decoded: any) => any) | undefined
   readonly _multiItemWriteFeatures?: ReadonlyArray<string> | undefined
   readonly schemas: any
@@ -363,16 +369,33 @@ export const makeEngine = (config: EngineConfig) => {
     return [...kept]
   })()
 
-  // Resolved when it runs: an entity's table is set when it is registered on
-  // one, which may come after the projection is defined.
-  // Rows may be tombstones (#154): the entity's `create` takes one's place,
-  // keeping these fields — the checkpoints — and the revision one higher.
-  if (config.removal !== undefined) {
-    ;(readModel as { _projectionTombstones?: unknown })._projectionTombstones = {
-      kept: keptFields.filter((f) => f !== config.revision?.field),
-      revision: config.revision?.field,
+  // Each attribute the projection keeps on a row, with its role: the checkpoints, then the
+  // revision, as a tombstone stores them. An attribute in two roles is listed in each, and refused
+  // (`[EDD-9133]`, `addProjectionLayout`) when the read model's rows may be tombstones.
+  const roles: Array<readonly [string, ProjectionRole]> = []
+  const giveRole = (field: string, role: ProjectionRole) => {
+    if (!roles.some(([named, held]) => named === field && held === role)) roles.push([field, role])
+  }
+  if (config.checkpoints.kind === "scalar") giveRole(config.checkpoints.field, "checkpoint")
+  else {
+    if (config.checkpoints.map !== undefined) giveRole(config.checkpoints.map, "checkpoint map")
+    for (const f of Object.values(config.checkpoints.fields)) {
+      giveRole(f.field, "checkpoint")
+      giveRole(f.instanceField, "checkpoint owner")
     }
   }
+  if (config.revision !== undefined) giveRole(config.revision.field, "revision")
+
+  // Recorded beside the layouts of the read model's other projections, whether or not it has
+  // `removal`, for the checks of `[EDD-9133]`. Rows may be tombstones (#154) when one has
+  // `removal`: the entity's `create` takes one's place, keeping the checkpoints of the projection
+  // with `removal` that wrote it, with its revision one higher (`overTombstone`).
+  addProjectionLayout(readModel, {
+    label: config.label,
+    roles,
+    removal: config.removal !== undefined,
+    ttl: config.removal?.ttl !== undefined,
+  })
 
   // Every projection's outbox, kept on the read model, one entry per distinct layout, the one defined
   // last at the end: a second projection doesn't hide the first's, which stays callable, and one
@@ -739,6 +762,9 @@ export const makeEngine = (config: EngineConfig) => {
             (DateTime.toEpochMillis(now) + Dur.toMillis(config.removal.ttl)) / 1000,
           )
         }
+        // A sparse-map key is refused as the row's own write refuses it. The check flattens a
+        // copy: what's stored is the tombstone as 1.39.0 stored it, an empty map whole.
+        yield* serializeSparseOrFail(readModel, { ...tomb }, `${config.label}.write`)
         rowItem = yield* marshalOrFail(entityType, `${config.label}.write`, () =>
           toAttributeMap(tomb),
         )
@@ -836,6 +862,33 @@ export const makeEngine = (config: EngineConfig) => {
           `${to}: a strongly consistent read did not return them. Was the stream written ` +
           "outside `append`?",
       }),
+    )
+
+  /**
+   * `[EDD-9133]` once the table's TTL attribute is known: an attribute a projection keeps on the
+   * read model's rows that is stored as the TTL attribute, which a projection's tombstones set. The
+   * two would overwrite each other, and a row could expire. Every entry point that writes a row
+   * runs it before it sends anything, whatever the data: `applyRow` for each row, and `catchUp` and
+   * `rebuild` first (`operation` names the entry point). The drains write no row and don't run it:
+   * a worker providing only its outbox's table delivers as on 1.39.0.
+   */
+  const preflight = (operation: string): Effect.Effect<void, ValidationError, any> =>
+    Effect.suspend(() =>
+      // The table is resolved only when there is something to check.
+      !projectionTtlChecked(readModel)
+        ? Effect.void
+        : Effect.flatMap(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => {
+            const problem = projectionTtlConflict(readModel, resolveTtlAttributeName(tc))
+            return problem === undefined
+              ? Effect.void
+              : Effect.fail(
+                  new ValidationError({
+                    entityType,
+                    operation: `${config.label}.${operation}`,
+                    cause: problem,
+                  }),
+                )
+          }),
     )
 
   const withRetry = <X>(attempt: Effect.Effect<X, any, any>): Effect.Effect<X, any, any> =>
@@ -1228,7 +1281,7 @@ export const makeEngine = (config: EngineConfig) => {
         failed,
       }
     })
-    return withRetry(attempt)
+    return Effect.andThen(preflight("apply"), withRetry(attempt))
   }
 
   /** The fields the library owns, re-applied after `toItem`. */
@@ -1413,6 +1466,7 @@ export const makeEngine = (config: EngineConfig) => {
       ),
     drain,
     drainPending,
+    preflight,
     call,
   }
 }
