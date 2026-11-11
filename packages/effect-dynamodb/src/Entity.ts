@@ -14659,6 +14659,38 @@ const makeImpl = <
     })
 
   /**
+   * The row holding `sentinel`, found at `at`: the row its back-pointer names
+   * ({@link sentinelOwnerRow}). Under `preserveUnique` the item's live row and each of its
+   * tombstones hold a sentinel naming the item, so when the row named holds none at `at`, the one
+   * of its tombstones that does, if any. Reads the tombstones only then.
+   */
+  const sentinelHolderRow = (
+    tableName: string,
+    sentinel: StoredRow,
+    constraintName: string,
+    constraintDef: UniqueConstraintDef,
+    at: SentinelKey,
+  ) =>
+    Effect.gen(function* () {
+      const owner = yield* sentinelOwnerRow(tableName, sentinel)
+      const key = sentinelKeyRecord(at)
+      if (
+        owner === undefined ||
+        !preserveUnique() ||
+        holdsSentinel(owner, constraintName, constraintDef, key) !== "no"
+      ) {
+        return owner
+      }
+      const { rows } = yield* tombstonesOf(
+        tableName,
+        keyAt(sentinel._entity_pk!.S!, sentinel._entity_sk!.S!),
+      )
+      return (
+        rows.find((row) => holdsSentinel(row, constraintName, constraintDef, key) !== "no") ?? owner
+      )
+    })
+
+  /**
    * A tombstone without `preserveUnique` holds no reservation: its soft delete released them. A
    * sentinel naming its item, which 1.39 and earlier left behind, still moves with it, as it did
    * (the value stays reserved until it's released), and is judged as one no row holds.
@@ -15038,8 +15070,14 @@ const makeImpl = <
                 yield* judgeReservationRow(ctx, heldNow, constraintName, constraintDef, currentKey)
               }
               if (!ctx.vacated(toAttributeMap(currentKey))) {
-                // Another value's sentinel under other key text moves out first, with its row.
-                const holder = yield* sentinelOwnerRow(ctx.tableName, heldNow)
+                // Another value's sentinel under other key text moves out first.
+                const holder = yield* sentinelHolderRow(
+                  ctx.tableName,
+                  heldNow,
+                  constraintName,
+                  constraintDef,
+                  current,
+                )
                 const holderNow =
                   holder === undefined
                     ? undefined
@@ -15064,10 +15102,12 @@ const makeImpl = <
                   )
                   continue
                 }
-                // The holder's sentinel moves out first, as a unit of its own: with its row when
-                // that row moves too, and otherwise by itself, so two rows holding each other's
-                // sentinel keys under different constraints don't wait on each other.
-                const judged = yield* holderSentinelOut(ctx, holder!, constraintName, current)
+                // The holder's sentinel moves out first, by itself, as a unit of its own, naming its
+                // row where it is (the row's own move points it at its new key): a sentinel waits
+                // only on sentinels, so neither two rows holding each other's sentinel keys under
+                // different constraints nor a row whose sentinel and key both chain (one waiting on
+                // the other's sentinel, the other on its key) wait on each other.
+                const judged = yield* sentinelOut(ctx, holder!, constraintName, current)
                 if (!ctx.vacated(toAttributeMap(currentKey))) {
                   refused(
                     judged === "loop" ? "contended" : "taken",
@@ -15122,7 +15162,17 @@ const makeImpl = <
         ) {
           worked = true
         }
-        if (ownerNow !== undefined && !sameStoredKey(ownerNow, to)) {
+        if (
+          ownerNow !== undefined &&
+          !sameStoredKey(ownerNow, to) &&
+          // The key it names can be the item's under other key text and another item's live row
+          // under the current text: a tombstone without `preserveUnique` leaves it to that row.
+          !(
+            kind === "tombstone" &&
+            !preserveUnique() &&
+            (yield* liveRowHolds(ctx.tableName, ownerNow, constraintName, constraintDef, current))
+          )
+        ) {
           const repoint: TransactWriteItem = {
             Update: {
               TableName: ctx.tableName,
@@ -15902,18 +15952,37 @@ const makeImpl = <
 
   /**
    * Get `holder`'s sentinel of `constraintName`, stored at `at` under other key text, out of
-   * another row's way: with its row, when that row moves too ({@link judgeStoredRow}); otherwise
-   * by itself, as a unit of its own, to the key `holder`'s values compose now.
+   * another row's way: with its row, when that row moves too ({@link judgeStoredRow}); otherwise,
+   * or when that row waits on the caller, by itself, as a unit of its own, to the key `holder`'s
+   * values compose now ({@link sentinelOut}).
    */
   const holderSentinelOut = (
     ctx: Rekey.RekeyRowContext,
     holder: StoredRow,
     constraintName: string,
     at: SentinelKey,
+  ): Effect.Effect<Rekey.Judged, DynamoClientError, DynamoClient | TableConfig> =>
+    Effect.gen(function* () {
+      if (moveWork(holder, ctx, { pk: rekeyPk, sk: rekeySk }) === undefined) {
+        return yield* sentinelOut(ctx, holder, constraintName, at)
+      }
+      const judged = yield* judgeStoredRow(holder, ctx)
+      // The holder's row waits on the caller (through the units each waits on), so it can't move
+      // first: its sentinel moves out by itself, naming the row where it is, and the row's own move
+      // points it at the row's new key later.
+      if (judged === "loop" && !ctx.vacated(toAttributeMap(sentinelKeyRecord(at)))) {
+        return yield* sentinelOut(ctx, holder, constraintName, at)
+      }
+      return judged
+    })
+
+  /** The sentinel of `holder`'s at `at` (`constraintName`'s), moved by itself as a unit of its own. */
+  const sentinelOut = (
+    ctx: Rekey.RekeyRowContext,
+    holder: StoredRow,
+    constraintName: string,
+    at: SentinelKey,
   ): Effect.Effect<Rekey.Judged, DynamoClientError, DynamoClient | TableConfig> => {
-    if (moveWork(holder, ctx, { pk: rekeyPk, sk: rekeySk }) !== undefined) {
-      return judgeStoredRow(holder, ctx)
-    }
     const targets = rowTargets(holder)
     const holderAt = storedKeyOf(holder)
     if (targets === undefined || holderAt === undefined) return Effect.succeed("settled")
