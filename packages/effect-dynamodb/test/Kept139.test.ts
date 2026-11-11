@@ -48,3 +48,7 @@ describe("a pathRemove below a union", () => {
 describe("a pathRemove of a list position", () => {
   pathClearSuite("tuple-clears")(openRecordingTable)
 })
+
+describe("a pathRemove below a sparse map's entry", () => {
+  pathClearSuite("sparse-entry-clears")(openRecordingTable)
+})

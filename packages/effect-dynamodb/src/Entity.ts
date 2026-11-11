@@ -4155,9 +4155,25 @@ const makeImpl = <
    * feeds a key or a sentinel, get their refusal from `normalizeDerivedPathOps`.
    */
   const refusedPathRemove = (uState: UpdateState, lacks: Lacks): string | undefined => {
+    const required = (segments: ReadonlyArray<string | number>) =>
+      `pathRemove on "${segments.map((s) => String(s)).join(".")}": the model requires it, so a ` +
+      "row without it could not be read. Make it optional in the model, or write a new value " +
+      "with .pathSet(). Nothing was sent."
     for (const segments of uState.pathRemoves ?? []) {
       const head = segments[0]
-      if (typeof head !== "string" || !isModelField(head)) continue
+      if (typeof head !== "string") continue
+      if (!isModelField(head)) {
+        // Below a sparse map's entry (`m#k`, then `x`), judged as a read rebuilds the map: the
+        // entry's key, then the rest, against the map's own schema (#238).
+        const entry = segments.length > 1 ? readEntryOf(head) : undefined
+        if (
+          entry !== undefined &&
+          pathIsRequired(modelFieldSchemas[entry.field]!, [entry.key, ...segments.slice(1)])
+        ) {
+          return required(segments)
+        }
+        continue
+      }
       if (segments.length === 1) {
         if (isPrimaryComposite(head)) continue
         const refused = clearRefusal("pathRemove", head, lacks)
@@ -4165,16 +4181,19 @@ const makeImpl = <
         continue
       }
       if (derivedFrom(head) !== undefined) continue
-      if (pathIsRequired(modelFieldSchemas[head]!, segments.slice(1))) {
-        const path = segments.map((s) => String(s)).join(".")
-        return (
-          `pathRemove on "${path}": the model requires it, so a row without it could not be ` +
-          "read. Make it optional in the model, or write a new value with .pathSet(). " +
-          "Nothing was sent."
-        )
-      }
+      if (pathIsRequired(modelFieldSchemas[head]!, segments.slice(1))) return required(segments)
     }
     return undefined
+  }
+
+  /**
+   * The sparse map entry a read takes a stored attribute as: one of a map stored under its own
+   * name. A map a `field:` rename stores whole (`put`) has its attribute read in place of its
+   * entries whenever a row holds it, so its entries may not be what a read sees.
+   */
+  const readEntryOf = (attribute: string) => {
+    const entry = sparseEntries.entryOf(attribute)
+    return entry === undefined || Object.hasOwn(data.fieldRenames, entry.field) ? undefined : entry
   }
 
   /**

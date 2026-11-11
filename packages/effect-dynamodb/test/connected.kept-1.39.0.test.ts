@@ -110,3 +110,7 @@ describeConnected("a pathRemove below a union", () => {
 describeConnected("a pathRemove of a list position", () => {
   pathClearSuite("tuple-clears")(openTable)
 })
+
+describeConnected("a pathRemove below a sparse map's entry", () => {
+  pathClearSuite("sparse-entry-clears")(openTable)
+})
