@@ -38,12 +38,13 @@ const update = (
   item: Item,
   expression: string,
   names: Record<string, string>,
-  values: Record<string, AttributeValue> = {},
+  values?: Record<string, AttributeValue>,
 ) =>
   updateOutcome(item, {
     UpdateExpression: expression,
     ExpressionAttributeNames: names,
-    ExpressionAttributeValues: values,
+    // DynamoDB refuses an empty `ExpressionAttributeValues`, so a value-free update sends none.
+    ...(values !== undefined && { ExpressionAttributeValues: values }),
   })
 
 const updated = (outcome: ReturnType<typeof update>): Item => {
@@ -126,12 +127,16 @@ describe("applyUpdate looks a name up as the item's own attribute", () => {
     expect(Object.getOwnPropertyDescriptor(nested.m!.M, "__proto__")?.value).toEqual({ N: "1" })
   })
 
-  it("an expression it can't read still bumps the version, as before", () => {
-    const next = applyUpdate(row({ a: { N: "1" } }), {
-      UpdateExpression: "SET #a = size(#b)",
-      ExpressionAttributeNames: { "#a": "a", "#b": "b" },
+  it("an update DynamoDB refuses for a function is refused, never approximated", () => {
+    // Before, an expression it couldn't read (here `size()`) only bumped `version`, so the test
+    // passed whatever the update said; DynamoDB refuses it, as measured on DynamoDB Local.
+    expect(
+      refusal(update(row({ a: { N: "1" } }), "SET #a = size(#b)", { "#a": "a", "#b": "b" })),
+    ).toEqual({
+      name: "ValidationException",
+      message:
+        "Invalid UpdateExpression: The function is not allowed in an update expression; function: size",
     })
-    expect(next).toEqual(row({ a: { N: "1" }, version: { N: "2" } }))
   })
 })
 

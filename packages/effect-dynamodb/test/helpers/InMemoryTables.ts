@@ -1,16 +1,14 @@
 /**
- * An in-memory DynamoDB for projection and time-series unit tests — GetItem,
- * PutItem, UpdateItem, DeleteItem, Query and TransactWriteItems (`Put`,
- * `Update`, `Delete` and `ConditionCheck` items), with condition expressions
- * evaluated: `AND` / `OR` / `NOT`, parentheses, `attribute_exists` /
- * `attribute_not_exists`, `=` / `<>` on any values, compared by content as
- * DynamoDB compares them (`sameValue`), and `<` / `<=` / `>` / `>=` on numbers,
- * strings and bytes (`#a.#b` paths included). A query's sort key condition —
- * `BETWEEN`, `begins_with` or a comparison — orders `S` keys as text and `B`
- * keys by their bytes (#171). Updates go through `MockDynamoClient.applyUpdate`;
- * one whose expression the item can't take, or a transaction naming one item
- * twice, is rejected with DynamoDB Local's `ValidationException`, as the
- * library's client reports it (`DynamoValidationError`).
+ * An in-memory DynamoDB for projection and time-series unit tests: GetItem, PutItem, UpdateItem,
+ * DeleteItem, Query and TransactWriteItems, over any number of tables, answered as DynamoDB Local
+ * answers them (`DynamoExpressions`): expressions read and evaluated, requests checked, a
+ * transaction's items taken in order. A request DynamoDB refuses fails with DynamoDB Local's
+ * `ValidationException`, as the library's client reports it (`DynamoValidationError`); a failed
+ * condition with `ConditionalCheckFailedException`; a request this doesn't read is a defect naming
+ * it. `connected.helper-conformance.test.ts` compares the answers with DynamoDB Local's.
+ *
+ * Each table's keys are `pk` / `sk` (`S`) unless `tableKeys` says otherwise; a Query of a
+ * secondary index needs the index's keys in `tableIndexes`.
  */
 
 import type {
@@ -22,11 +20,21 @@ import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
 import { classifyError } from "../../src/DynamoClient.js"
 import {
-  awsValidationException,
-  DDB_REPEATED_ITEM,
-  mockDynamoClientLayer,
-  updateOutcome,
-} from "./MockDynamoClient.js"
+  answering,
+  deleteItem,
+  getItem,
+  type KeySchema,
+  putItem,
+  query,
+  type Tables,
+  transactWrite,
+  UnreadableRequest,
+  updateItem,
+  type WriteOutcome,
+} from "./DynamoExpressions.js"
+import { mockDynamoClientLayer } from "./MockDynamoClient.js"
+
+export { holds, sameValue } from "./DynamoExpressions.js"
 
 export type Item = Record<string, AttributeValue>
 
@@ -75,438 +83,138 @@ export const resetCalls = () => {
 }
 
 /** Key attribute names per table (default `pk` / `sk`). */
-export const tableKeys = new Map<string, { readonly pk: string; readonly sk: string }>()
-const keysOf = (table: string) => tableKeys.get(table) ?? { pk: "pk", sk: "sk" }
+export const tableKeys = new Map<string, KeySchema>()
+/** Secondary indexes' key attribute names, per table, for queries of an index. */
+export const tableIndexes = new Map<string, Readonly<Record<string, KeySchema>>>()
+const keysOf = (table: string): KeySchema => tableKeys.get(table) ?? { pk: "pk", sk: "sk" }
 
+/**
+ * The store key of a table's item (or key): `<table>|<pk>|<sk>`. A key that isn't text, or text
+ * holding `|`, would not name one item alone, so it is a defect here.
+ */
 export const keyOf = (table: string, item: Item) => {
   const k = keysOf(table)
-  return `${table}|${item[k.pk]?.S}|${item[k.sk]?.S}`
-}
-
-const conditionalCheckFailed = (operation: string) =>
-  new DynamoError({
-    operation,
-    cause: Object.assign(new Error("The conditional request failed"), {
-      name: "ConditionalCheckFailedException",
-    }),
-  })
-
-// ---------------------------------------------------------------------------
-// Condition expressions
-// ---------------------------------------------------------------------------
-
-/** `obj[key]` when `obj` holds `key` itself: never a name `Object.prototype` supplies. */
-const own = <V>(obj: Readonly<Record<string, V>>, key: string): V | undefined =>
-  Object.hasOwn(obj, key) ? obj[key] : undefined
-
-type Token = { readonly kind: "word" | "op" | "lp" | "rp" | "comma"; readonly text: string }
-
-const tokenize = (expression: string): Array<Token> => {
-  const tokens: Array<Token> = []
-  const re = /\s*(?:(\()|(\))|(,)|(<>|<=|>=|=|<|>)|([#:A-Za-z_][\w#:.]*))/y
-  re.lastIndex = 0
-  while (re.lastIndex < expression.length) {
-    const m = re.exec(expression)
-    if (m === null) break
-    if (m[1]) tokens.push({ kind: "lp", text: "(" })
-    else if (m[2]) tokens.push({ kind: "rp", text: ")" })
-    else if (m[3]) tokens.push({ kind: "comma", text: "," })
-    else if (m[4]) tokens.push({ kind: "op", text: m[4] })
-    else if (m[5]) tokens.push({ kind: "word", text: m[5] })
-    if (expression.slice(re.lastIndex).trim() === "") break
-  }
-  return tokens
-}
-
-/**
- * A DynamoDB number as sign, significant digits and the power of ten of the
- * first of them, so two spellings of one number (`1.50`, `1.5`, `15E-1`) read
- * alike and none loses digits (a number holds up to 38).
- */
-const decimal = (text: string) => {
-  const m = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(text.trim())
-  if (m === null) throw new Error(`InMemoryTables: not a number ${text}`)
-  const all = `${m[2]}${m[3] ?? ""}`
-  const lead = all.length - all.replace(/^0+/, "").length
-  const digits = all.slice(lead).replace(/0+$/, "")
-  const negative = m[1] === "-" && digits !== ""
-  return { negative, digits, exponent: m[2]!.length - lead + Number(m[4] ?? 0) }
-}
-
-/** Order two DynamoDB numbers by value. */
-const compareNumbers = (a: string, b: string): number => {
-  const [x, y] = [decimal(a), decimal(b)]
-  if (x.negative !== y.negative) return x.negative ? -1 : 1
-  const sign = x.negative ? -1 : 1
-  if (x.digits === "" || y.digits === "") {
-    return x.digits === y.digits ? 0 : sign * (x.digits === "" ? -1 : 1)
-  }
-  if (x.exponent !== y.exponent) return sign * (x.exponent < y.exponent ? -1 : 1)
-  return sign * (x.digits < y.digits ? -1 : x.digits > y.digits ? 1 : 0)
-}
-
-const sameBytes = (a: Uint8Array, b: Uint8Array): boolean =>
-  a.length === b.length && a.every((byte, i) => byte === b[i])
-
-/** Whether two sets hold the same members, by `same`. */
-const sameSet = <A>(a: ReadonlyArray<A>, b: ReadonlyArray<A>, same: (x: A, y: A) => boolean) =>
-  a.every((x) => b.some((y) => same(x, y))) && b.every((y) => a.some((x) => same(x, y)))
-
-/**
- * Whether two attribute values are equal as DynamoDB compares them: by
- * content. A map by its keys and their values (in any order), a list by its
- * elements in order, a set by its members (in any order), a number by its
- * value, bytes by bytes; values of different types are never equal.
- */
-export const sameValue = (a: AttributeValue, b: AttributeValue): boolean => {
-  if (a.S !== undefined || b.S !== undefined) return a.S === b.S
-  if (a.N !== undefined || b.N !== undefined) {
-    return a.N !== undefined && b.N !== undefined && compareNumbers(a.N, b.N) === 0
-  }
-  if (a.B !== undefined || b.B !== undefined) {
-    return a.B !== undefined && b.B !== undefined && sameBytes(a.B, b.B)
-  }
-  if (a.BOOL !== undefined || b.BOOL !== undefined) return a.BOOL === b.BOOL
-  if (a.NULL !== undefined || b.NULL !== undefined) return a.NULL === true && b.NULL === true
-  if (a.SS !== undefined || b.SS !== undefined) {
-    return a.SS !== undefined && b.SS !== undefined && sameSet(a.SS, b.SS, (x, y) => x === y)
-  }
-  if (a.NS !== undefined || b.NS !== undefined) {
-    return (
-      a.NS !== undefined &&
-      b.NS !== undefined &&
-      sameSet(a.NS, b.NS, (x, y) => compareNumbers(x, y) === 0)
+  const parts = [item[k.pk]?.S, item[k.sk]?.S]
+  if (parts.some((part) => part === undefined || part.includes("|"))) {
+    throw new UnreadableRequest(
+      `InMemoryTables keys items by their text keys, which ${JSON.stringify([item[k.pk], item[k.sk]])} can't be`,
     )
   }
-  if (a.BS !== undefined || b.BS !== undefined) {
-    return a.BS !== undefined && b.BS !== undefined && sameSet(a.BS, b.BS, sameBytes)
-  }
-  if (a.L !== undefined || b.L !== undefined) {
-    return (
-      a.L !== undefined &&
-      b.L !== undefined &&
-      a.L.length === b.L.length &&
-      a.L.every((x, i) => sameValue(x, b.L![i]!))
-    )
-  }
-  if (a.M !== undefined && b.M !== undefined) {
-    const [x, y] = [a.M, b.M]
-    const keys = Object.keys(x)
-    return (
-      keys.length === Object.keys(y).length &&
-      keys.every((k) => Object.hasOwn(y, k) && sameValue(x[k]!, y[k]!))
-    )
-  }
-  return false
+  return `${table}|${parts[0]}|${parts[1]}`
 }
 
-/**
- * Order two values for `<`, `<=`, `>`, `>=`: numbers by value, strings by
- * their UTF-8 bytes, bytes by bytes. `undefined` for any other pair: such a
- * comparison never holds.
- */
-const order = (a: AttributeValue, b: AttributeValue): number | undefined => {
-  if (a.N !== undefined && b.N !== undefined) return compareNumbers(a.N, b.N)
-  if (a.S !== undefined && b.S !== undefined)
-    return Buffer.compare(Buffer.from(a.S), Buffer.from(b.S))
-  if (a.B !== undefined && b.B !== undefined) return compareKey(a, b)
-  return undefined
+const tables: Tables = {
+  schema: keysOf,
+  read: (table, key) => store.get(keyOf(table, key)),
 }
 
-const compare = (
-  a: AttributeValue | undefined,
-  b: AttributeValue | undefined,
-  op: string,
-): boolean => {
-  if (a === undefined || b === undefined) return op === "<>" ? a !== b : false
-  if (op === "=") return sameValue(a, b)
-  if (op === "<>") return !sameValue(a, b)
-  const ordered = order(a, b)
-  if (ordered === undefined) return false
-  switch (op) {
-    case "<":
-      return ordered < 0
-    case "<=":
-      return ordered <= 0
-    case ">":
-      return ordered > 0
-    default:
-      return ordered >= 0
-  }
-}
+/** A refusal as the library's client reports it. */
+const failure = (operation: string) => (error: Error) =>
+  Effect.fail(classifyError(operation)(error))
 
-/** Evaluate a condition against `current` (undefined: no item). */
-export const holds = (
-  expression: string | undefined,
-  current: Item | undefined,
-  names: Record<string, string>,
-  values: Record<string, AttributeValue>,
-): boolean => {
-  if (expression === undefined) return true
-  const tokens = tokenize(expression)
-  let i = 0
-  const peek = () => tokens[i]
-  const next = () => tokens[i++]!
-  // Names are looked up as the item's (or the map's) own attributes only.
-  const path = (word: string): AttributeValue | undefined => {
-    const parts = word.split(".").map((p) => (p.startsWith("#") ? own(names, p)! : p))
-    let v: AttributeValue | undefined = current === undefined ? undefined : own(current, parts[0]!)
-    for (const p of parts.slice(1)) v = v?.M === undefined ? undefined : own(v.M, p)
-    return v
-  }
-  const operand = (word: string): AttributeValue | undefined =>
-    word.startsWith(":") ? own(values, word) : path(word)
-  const primary = (): boolean => {
-    const t = next()
-    if (t.kind === "lp") {
-      const v = or()
-      next() // )
-      return v
-    }
-    if (t.text.toUpperCase() === "NOT") return !primary()
-    if (t.text === "attribute_exists" || t.text === "attribute_not_exists") {
-      next() // (
-      const p = next().text
-      next() // )
-      const exists = path(p) !== undefined
-      return t.text === "attribute_exists" ? exists : !exists
-    }
-    if (t.text === "contains" || t.text === "begins_with") {
-      next() // (
-      const left = operand(next().text)
-      next() // ,
-      const right = operand(next().text)
-      next() // )
-      if (left?.S === undefined || right?.S === undefined) return false
-      return t.text === "contains" ? left.S.includes(right.S) : left.S.startsWith(right.S)
-    }
-    if (peek()?.text.toUpperCase() === "IN") {
-      next() // IN
-      next() // (
-      const candidates: Array<string> = []
-      while (peek()?.kind !== "rp") {
-        const c = next()
-        if (c.kind === "word") candidates.push(c.text)
-      }
-      next() // )
-      const left = operand(t.text)
-      return candidates.some((c) => compare(left, operand(c), "="))
-    }
-    const op = next().text
-    const right = next().text
-    return compare(operand(t.text), operand(right), op)
-  }
-  const and = (): boolean => {
-    let v = primary()
-    while (peek()?.text.toUpperCase() === "AND") {
-      next()
-      const r = primary()
-      v = v && r
-    }
-    return v
-  }
-  const or = (): boolean => {
-    let v = and()
-    while (peek()?.text.toUpperCase() === "OR") {
-      next()
-      const r = and()
-      v = v || r
-    }
-    return v
-  }
-  return or()
-}
-
-// ---------------------------------------------------------------------------
-// Operations
-// ---------------------------------------------------------------------------
-
-/**
- * Order two key values as DynamoDB does: a `B` value by its bytes, unsigned
- * (#171); an `S` value as text (every key these tests store is ASCII).
- */
-const compareKey = (a: AttributeValue | undefined, b: AttributeValue | undefined): number => {
-  if (a?.B !== undefined && b?.B !== undefined) {
-    const n = Math.min(a.B.length, b.B.length)
-    for (let i = 0; i < n; i++) if (a.B[i] !== b.B[i]) return a.B[i]! - b.B[i]!
-    return a.B.length - b.B.length
-  }
-  const x = a?.S ?? ""
-  const y = b?.S ?? ""
-  return x < y ? -1 : x > y ? 1 : 0
-}
-
-const startsWithKey = (value: AttributeValue | undefined, prefix: AttributeValue): boolean =>
-  value?.B !== undefined && prefix.B !== undefined
-    ? prefix.B.length <= value.B.length &&
-      compareKey({ B: value.B.subarray(0, prefix.B.length) }, prefix) === 0
-    : value?.S !== undefined && prefix.S !== undefined && value.S.startsWith(prefix.S)
-
-const runQuery = (input: {
-  readonly TableName?: string | undefined
-  readonly IndexName?: string | undefined
-  readonly KeyConditionExpression?: string | undefined
-  readonly FilterExpression?: string | undefined
-  readonly ExpressionAttributeNames?: Record<string, string> | undefined
-  readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
-  readonly ScanIndexForward?: boolean | undefined
-  readonly Limit?: number | undefined
-}) => {
-  const names = input.ExpressionAttributeNames ?? {}
-  const values = input.ExpressionAttributeValues ?? {}
-  const kc = /^(#\w+) = (:\w+)(?: AND (.*))?$/.exec(input.KeyConditionExpression ?? "")!
-  const pkAttr = names[kc[1]!]!
-  const pkValue = values[kc[2]!]!.S
-  const keys = keysOf(input.TableName!)
-  const skAttr = input.IndexName === undefined ? keys.sk : undefined
-  let rows = [...store.entries()]
-    .filter(([key, item]) => key.startsWith(`${input.TableName}|`) && item[pkAttr]?.S === pkValue)
-    .map(([, item]) => item)
-  const sortAttr = skAttr ?? Object.values(names).find((n) => n !== pkAttr) ?? keys.sk
-  rows.sort((a, b) => compareKey(a[sortAttr], b[sortAttr]))
-  const cond = kc[3]
-  if (cond !== undefined) {
-    const between = /^(#\w+) BETWEEN (:\w+) AND (:\w+)$/.exec(cond)
-    const begins = /^begins_with\((#\w+), (:\w+)\)$/.exec(cond)
-    const comparison = /^(#\w+) (<=|>=|=|<|>) (:\w+)$/.exec(cond)
-    if (between) {
-      const attr = names[between[1]!]!
-      const low = values[between[2]!]!
-      const high = values[between[3]!]!
-      rows = rows.filter(
-        (item) =>
-          item[attr] !== undefined &&
-          compareKey(item[attr], low) >= 0 &&
-          compareKey(item[attr], high) <= 0,
-      )
-    } else if (begins) {
-      const attr = names[begins[1]!]!
-      const prefix = values[begins[2]!]!
-      rows = rows.filter((item) => startsWithKey(item[attr], prefix))
-    } else if (comparison) {
-      const attr = names[comparison[1]!]!
-      const operand = values[comparison[3]!]!
-      const holdsFor = (order: number): boolean => {
-        switch (comparison[2]) {
-          case "=":
-            return order === 0
-          case "<":
-            return order < 0
-          case "<=":
-            return order <= 0
-          case ">":
-            return order > 0
-          default:
-            return order >= 0
-        }
-      }
-      rows = rows.filter(
-        (item) => item[attr] !== undefined && holdsFor(compareKey(item[attr], operand)),
-      )
-    } else throw new Error(`mock: unsupported key condition ${cond}`)
-  }
-  if (input.FilterExpression !== undefined) {
-    rows = rows.filter((item) => holds(input.FilterExpression, item, names, values))
-  }
-  if (input.ScanIndexForward === false) rows.reverse()
-  if (input.Limit !== undefined) rows = rows.slice(0, input.Limit)
-  return { Items: rows }
-}
-
-const conditionFails = (
-  table: string,
-  item: Item | undefined,
-  key: string,
-  condition: string | undefined,
-  names: Record<string, string> | undefined,
-  values: Record<string, AttributeValue> | undefined,
-): boolean => {
-  if (condition === undefined) return false
+/** Rejections asked for by `rejection`: the next conditional write fails, or all of them do. */
+const failCondition = () => {
   if (rejection.all) return true
   if (rejection.next > 0) {
     rejection.next--
     return true
   }
-  void table
-  void item
-  return !holds(condition, store.get(key), names ?? {}, values ?? {})
+  return false
+}
+
+const write = (
+  operation: string,
+  table: string,
+  key: Item,
+  outcome: WriteOutcome,
+): Effect.Effect<{ readonly Attributes?: Item }, unknown> => {
+  if (outcome._tag === "ConditionFailed") {
+    return Effect.fail(classifyError(operation)(outcome.error))
+  }
+  if (outcome.item === undefined) store.delete(keyOf(table, key))
+  else store.set(keyOf(table, key), outcome.item)
+  return Effect.succeed(outcome.output)
 }
 
 export const InMemoryClient = mockDynamoClientLayer({
   query: (input) =>
-    Effect.sync(() => {
+    Effect.suspend(() => {
       calls.query++
       queried.push(input.ExpressionAttributeValues ?? {})
-      return runQuery(input) as never
+      const table = input.TableName!
+      const index =
+        input.IndexName === undefined
+          ? undefined
+          : (tableIndexes.get(table)?.[input.IndexName] ??
+            (() => {
+              throw new UnreadableRequest(
+                `InMemoryTables: a query of index ${input.IndexName} of ${table} needs its keys in tableIndexes`,
+              )
+            })())
+      const rows = [...store.entries()]
+        .filter(([key]) => key.startsWith(`${table}|`))
+        .map(([, item]) => item)
+      return answering(
+        () => Effect.succeed(query(input as never, rows, keysOf(table), index) as never),
+        failure("Query"),
+      )
     }),
   getItem: (input) =>
-    Effect.sync(() => {
+    Effect.suspend(() => {
       calls.getItem++
       sent.getItem.push(input)
-      const item = store.get(keyOf(input.TableName!, input.Key!))
-      const run = hooks.afterGet
-      hooks.afterGet = []
-      for (const hook of run) hook(input.TableName!)
-      return (item === undefined ? {} : { Item: item }) as never
+      const table = input.TableName!
+      return answering(() => {
+        const output = getItem(input as never, (key) => store.get(keyOf(table, key)), keysOf(table))
+        const run = hooks.afterGet
+        hooks.afterGet = []
+        for (const hook of run) hook(table)
+        return Effect.succeed(output as never)
+      }, failure("GetItem"))
     }),
   putItem: (input) =>
     Effect.suspend(() => {
       calls.putItem++
-      const key = keyOf(input.TableName!, input.Item!)
-      if (
-        conditionFails(
-          input.TableName!,
-          input.Item,
-          key,
-          input.ConditionExpression,
-          input.ExpressionAttributeNames,
-          input.ExpressionAttributeValues,
+      const table = input.TableName!
+      return answering(() => {
+        const outcome = putItem(
+          input as never,
+          (key) => store.get(keyOf(table, key)),
+          keysOf(table),
+          {
+            failCondition,
+          },
         )
-      ) {
-        return Effect.fail(conditionalCheckFailed("PutItem"))
-      }
-      store.set(key, input.Item!)
-      return Effect.succeed({} as never)
+        return write("PutItem", table, input.Item!, outcome) as never
+      }, failure("PutItem"))
     }),
   updateItem: (input) =>
     Effect.suspend(() => {
       calls.updateItem++
-      const key = keyOf(input.TableName!, input.Key!)
-      if (
-        conditionFails(
-          input.TableName!,
-          undefined,
-          key,
-          input.ConditionExpression,
-          input.ExpressionAttributeNames,
-          input.ExpressionAttributeValues,
+      const table = input.TableName!
+      return answering(() => {
+        const outcome = updateItem(
+          input as never,
+          (key) => store.get(keyOf(table, key)),
+          keysOf(table),
+          { failCondition },
         )
-      ) {
-        return Effect.fail(conditionalCheckFailed("UpdateItem"))
-      }
-      const outcome = updateOutcome(store.get(key) ?? { ...input.Key! }, input)
-      if (outcome._tag === "Refused") return Effect.fail(classifyError("UpdateItem")(outcome.error))
-      store.set(key, outcome.item)
-      return Effect.succeed({} as never)
+        return write("UpdateItem", table, input.Key!, outcome) as never
+      }, failure("UpdateItem"))
     }),
   deleteItem: (input) =>
     Effect.suspend(() => {
       calls.deleteItem++
-      const key = keyOf(input.TableName!, input.Key!)
-      if (
-        conditionFails(
-          input.TableName!,
-          undefined,
-          key,
-          input.ConditionExpression,
-          input.ExpressionAttributeNames,
-          input.ExpressionAttributeValues,
+      const table = input.TableName!
+      return answering(() => {
+        const outcome = deleteItem(
+          input as never,
+          (key) => store.get(keyOf(table, key)),
+          keysOf(table),
+          { failCondition },
         )
-      ) {
-        return Effect.fail(conditionalCheckFailed("DeleteItem"))
-      }
-      store.delete(key)
-      return Effect.succeed({} as never)
+        return write("DeleteItem", table, input.Key!, outcome) as never
+      }, failure("DeleteItem"))
     }),
   transactWriteItems: (input) =>
     Effect.suspend(() => {
@@ -527,57 +235,16 @@ export const InMemoryClient = mockDynamoClientLayer({
           }),
         )
       }
-      const keys = ops.map((op) => {
-        const write = (op.Put ?? op.Update ?? op.Delete ?? op.ConditionCheck)!
-        return keyOf(write.TableName!, op.Put?.Item ?? (write as { Key: Item }).Key)
-      })
-      if (new Set(keys).size !== keys.length) {
-        return Effect.fail(
-          classifyError("TransactWriteItems")(awsValidationException(DDB_REPEATED_ITEM)),
-        )
-      }
-      // All conditions first; then every write.
-      const reasons = ops.map((op, i) => {
-        const write = (op.Put ?? op.Update ?? op.Delete ?? op.ConditionCheck)!
-        return conditionFails(
-          write.TableName!,
-          op.Put?.Item,
-          keys[i]!,
-          write.ConditionExpression,
-          write.ExpressionAttributeNames,
-          write.ExpressionAttributeValues,
-        )
-          ? { Code: "ConditionalCheckFailed" }
-          : { Code: "None" }
-      })
-      // An update whose condition passed but whose expression the item can't take rejects
-      // the whole request, ahead of any other item's failed condition.
-      const updated = ops.map((op, i) =>
-        op.Update === undefined || reasons[i]!.Code !== "None"
-          ? undefined
-          : updateOutcome(store.get(keys[i]!) ?? { ...op.Update.Key! }, op.Update),
-      )
-      const refusal = updated.find((outcome) => outcome?._tag === "Refused")
-      if (refusal?._tag === "Refused") {
-        return Effect.fail(classifyError("TransactWriteItems")(refusal.error))
-      }
-      if (reasons.some((r) => r.Code !== "None")) {
-        return Effect.fail(
-          new DynamoError({
-            operation: "TransactWriteItems",
-            cause: Object.assign(new Error("Transaction cancelled"), {
-              name: "TransactionCanceledException",
-              CancellationReasons: reasons,
-            }),
-          }),
-        )
-      }
-      for (const [i, op] of ops.entries()) {
-        const outcome = updated[i]
-        if (op.Put?.Item !== undefined) store.set(keys[i]!, op.Put.Item)
-        if (outcome?._tag === "Updated") store.set(keys[i]!, outcome.item)
-        if (op.Delete !== undefined) store.delete(keys[i]!)
-      }
-      return Effect.succeed({} as never)
+      return answering(() => {
+        const outcome = transactWrite(input as never, tables, { failCondition })
+        if (outcome._tag === "Cancelled") {
+          return Effect.fail(classifyError("TransactWriteItems")(outcome.error))
+        }
+        for (const each of outcome.writes) {
+          if (each.item === undefined) store.delete(keyOf(each.table, each.key))
+          else store.set(keyOf(each.table, each.key), each.item)
+        }
+        return Effect.succeed({} as never)
+      }, failure("TransactWriteItems"))
     }),
 })

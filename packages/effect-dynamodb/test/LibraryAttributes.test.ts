@@ -147,8 +147,8 @@ describe("EDD-9140: an attribute stored under one the library writes", () => {
     it.effect(`at run time, ${position.name} stored elsewhere keeps the row's type and key`, () => {
       const Docs = Entity.make({ entityType: "Doc", ...position.accepted } as never) as any
       const MainTable = Table.make({ schema, entities: { Docs } }) as any
-      const table = makeRecordingTable()
       const keys = position.accepted.primaryKey as typeof primaryKey
+      const table = makeRecordingTable({ keys: { pk: keys.pk.field, sk: keys.sk.field } })
       const input = position.name.startsWith("a sparse map")
         ? { id: "a", data: { pk: 7, sk: 8 } }
         : { id: "a", tag: "kept" }

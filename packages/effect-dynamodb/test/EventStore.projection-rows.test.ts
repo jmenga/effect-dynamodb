@@ -23,6 +23,7 @@ import {
   resetCalls,
   resetStore,
   store,
+  tableIndexes,
 } from "./helpers/InMemoryTables.js"
 
 const AppSchema = DynamoSchema.make({ name: "rows", version: 1 })
@@ -168,6 +169,7 @@ const TestLayer = Layer.mergeAll(
   OutboxTable.layer({ name: "outbox" }),
 )
 
+tableIndexes.set("outbox", { outbox: { pk: "obpk", sk: "obsk" } })
 beforeEach(() => resetStore())
 
 const seed = (orderId: string, events: ReadonlyArray<OrderEvent>) =>

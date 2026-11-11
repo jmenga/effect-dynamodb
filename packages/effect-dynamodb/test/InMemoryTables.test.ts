@@ -372,7 +372,9 @@ for (const [name, make] of Object.entries(TABLES)) {
           ),
           table.layer,
         )
-        expect(got).toBe("DynamoError: TransactionCanceledException: Transaction cancelled")
+        expect(got).toBe(
+          "DynamoError: TransactionCanceledException: Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]",
+        )
       }),
     )
 

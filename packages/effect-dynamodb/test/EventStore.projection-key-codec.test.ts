@@ -45,7 +45,7 @@ describe.each([
   const w = P.world(now)
   const then = P.world(written)
 
-  /** One recording table holds both tables' rows: their keys never meet. */
+  /** One physical table holds both tables' rows: their keys never meet. */
   const holding = (rows: ReadonlyArray<P.Row>) => {
     const table = makeRecordingTable()
     for (const row of rows) table.items.set(`${row.pk!.S}|${row.sk!.S}`, row)
@@ -57,8 +57,8 @@ describe.each([
       Effect.provide(
         Layer.mergeAll(
           table.layer,
-          w.EventsTable.layer({ name: "events" }),
-          w.ReadTable.layer({ name: "read" }),
+          w.EventsTable.layer({ name: "t" }),
+          w.ReadTable.layer({ name: "t" }),
         ),
       ),
     ) as Effect.Effect<A, unknown, never>
@@ -245,8 +245,8 @@ describe.each([
       Effect.provide(
         Layer.mergeAll(
           Shapes.scanningFirst(table.layer, first),
-          w.EventsTable.layer({ name: "events" }),
-          w.ReadTable.layer({ name: "read" }),
+          w.EventsTable.layer({ name: "t" }),
+          w.ReadTable.layer({ name: "t" }),
         ),
       ),
     ) as Effect.Effect<Omit<Table.RekeyReport, "capacity">, unknown, never>

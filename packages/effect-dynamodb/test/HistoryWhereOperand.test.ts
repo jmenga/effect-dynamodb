@@ -8,17 +8,18 @@
  * composed exactly as `append` composes the event key.
  *
  * Unescaped, a string-encoded number keys its text unpadded, so its events are in text order: a
- * `between` from 9 to 10 is a reversed range there, which DynamoDB rejects (the connected twin,
- * `connected.read-back-keys.test.ts`, checks the `ValidationError` it's diagnosed into).
+ * `between` from 9 to 10 is a reversed range there, which DynamoDB rejects, diagnosed into a
+ * `ValidationError` here as in the connected twin, `connected.read-back-keys.test.ts`.
  *
  * The rows are what published 1.39.0 stored (`helpers/ReadBackKeys.ts`); `append` stores the same
  * rows here, except an `x10` orderBy's with escaped keys: 1.39.0 keyed each event by the value it
  * stores divided by ten once more (`0.9` for `90`, stored as `9`), and `append` keys the value it
- * stores (`9`), where `rekey` moves 1.39.0's events (`historyMoved`).
+ * stores (`9`), where `rekey` moves 1.39.0's events (`historyMoved`). An `Option` orderBy is stored
+ * as a map, and DynamoDB refuses append's ordering guard on it, as it did on 1.39.0.
  */
 
 import { it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Result } from "effect"
 import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import { KEY_TOP, keyJustBelow } from "../src/internal/RangePlanner.js"
@@ -74,6 +75,14 @@ describe("history .where() bounds compose as append composes the event key", () 
           const table = makeRecordingTable()
           return on(table, (e) =>
             Effect.gen(function* () {
+              if (values.length === 1) {
+                // An `Option` is stored as a map, and DynamoDB refuses append's ordering guard
+                // (`<`) on a map, as it did on 1.39.0 (the connected twin checks the same).
+                const failed = yield* Effect.flip(e.append({ id: "x", n: values[0] }).asEffect())
+                expect((failed as any)._tag).toBe("DynamoValidationError")
+                expect(table.items.size).toBe(0)
+                return
+              }
               for (const n of values) yield* e.append({ id: "x", n }).asEffect()
               expect(byKey([...table.items.values()] as never)).toEqual(byKey(rows))
             }),
@@ -123,9 +132,15 @@ describe("history .where() bounds compose as append composes the event key", () 
               const where = (f: (t: any, ops: any) => unknown) =>
                 Effect.gen(function* () {
                   table.take()
-                  const found = yield* e.history({ id: "x" }).where(f).collect()
+                  const found = yield* Effect.result(e.history({ id: "x" }).where(f).collect())
                   const [query] = table.take().filter((request) => request.command === "Query")
-                  return { found: found.map((item: any) => item.n), operands: operands(query!) }
+                  return {
+                    found: Result.isSuccess(found)
+                      ? (found.success as Array<any>).map((item) => item.n)
+                      : undefined,
+                    failure: Result.isFailure(found) ? (found.failure as any) : undefined,
+                    operands: operands(query!),
+                  }
                 })
               const gte = yield* where((t, { gte }) => gte(t.n, hi))
               const lt = yield* where((t, { lt }) => lt(t.n, hi))
@@ -141,7 +156,12 @@ describe("history .where() bounds compose as append composes the event key", () 
                 expect(lt.found).toEqual([lo])
                 expect(between.found).toEqual([lo, hi])
               } else {
+                // DynamoDB rejects the reversed range, and the rejection names both bounds.
                 expect(event(hi).sk.S < event(lo).sk.S).toBe(true)
+                expect(between.failure?._tag).toBe("ValidationError")
+                expect(String(between.failure?.cause?.message)).toContain(
+                  `between's lower bound ${JSON.stringify(event(lo).sk.S)} sorts after its upper bound ${JSON.stringify(event(hi).sk.S)}`,
+                )
               }
             }),
           )

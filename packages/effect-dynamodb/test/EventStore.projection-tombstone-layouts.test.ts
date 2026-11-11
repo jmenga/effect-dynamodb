@@ -29,7 +29,14 @@ import {
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { calls, InMemoryClient, resetCalls, resetStore, store } from "./helpers/InMemoryTables.js"
+import {
+  calls,
+  InMemoryClient,
+  resetCalls,
+  resetStore,
+  store,
+  tableIndexes,
+} from "./helpers/InMemoryTables.js"
 import {
   Cancelled,
   EventsTable,
@@ -55,6 +62,7 @@ const TestLayer = Layer.mergeAll(
   ReadTable.layer({ name: "read" }),
 )
 
+tableIndexes.set("outbox", { outbox: { pk: "opk", sk: "osk" } })
 beforeEach(() => resetStore())
 
 const { firstAndLast, multiSource, transactional, sparse } = scenarios((id) =>
