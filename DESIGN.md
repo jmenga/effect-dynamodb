@@ -990,10 +990,14 @@ literal union's members or of `true` and `false`, a date's (an epoch's number;
 for a date stored as a string, its ISO text, starting with a digit or the sign
 of a wide year, an instant's going on in digits and `-+:.TZ`, a zoned date's in
 any text without `#`, its zone's name included), or, for anything else (a
-string, a field the model doesn't declare), any text. The date's is read off the
-field as the entity stores it (its `DynamoModel` encoding, an Effect date
-schema's default, or its `storedAs`), on the side of the keys a read model
-writes; `rekey`'s reader still takes a date as any text. Two read models whose
+string, a field the model doesn't declare), any text. A date's text is modelled
+only where the library writes it, on the side of the keys a read model writes: a
+`DynamoModel` date schema's encoding, or for an Effect date schema the entity
+stores by its own encoding (`Schema.DateTimeUtc`, `Schema.Date`,
+`Schema.DateTimeZoned`) the default or its `storedAs`. A date with a codec of its
+own (a transform to a date, `Schema.DateTimeUtcFromString` included) writes text
+the library doesn't know (`x_<ISO>`, a week label), so it's any text, as 1.40.0
+took it; `rekey`'s reader still takes a date as any text. Two read models whose
 projections' outboxes are on one table are refused (`EDD-9134`) at two places,
 by two questions. Where they're bound, when the client is made and by
 `EventStore.processBatch`: can a key of one be a key of the other with values

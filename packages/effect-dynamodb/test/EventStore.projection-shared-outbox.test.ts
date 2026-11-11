@@ -8,7 +8,7 @@
 import { describe, expect, it } from "@effect/vitest"
 import * as DynamoModel from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
-import { DateTime, Effect, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Schema, SchemaGetter } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
@@ -272,6 +272,28 @@ describe("drainPending, a read model keyed by a date beside one keyed by a label
           expect(yield* w.bound.pipe(Effect.provide(w.layer))).toContain(
             "[EDD-9134] DynamoClient.make:",
           )
+        }
+      }) as Effect.Effect<void, unknown>,
+  )
+
+  it.effect(
+    "a date with a codec of its own beside a label stays refused, as on 1.40.0",
+    () =>
+      Effect.gen(function* () {
+        // Stored, and keyed, as `x_<ISO>`: `at_x_2026-…` is a key of both.
+        const Labelled = Schema.String.pipe(
+          Schema.decodeTo(Schema.DateTimeUtc, {
+            decode: SchemaGetter.transform((s: string) => DateTime.makeUnsafe(s.slice(2))),
+            encode: SchemaGetter.transform((d: DateTime.Utc) => `x_${DateTime.formatIso(d)}`),
+          }),
+        )
+        for (const dateSchema of [Labelled, Schema.DateTimeUtcFromString]) {
+          for (const escapeKeys of [false, true]) {
+            const w = world(dateSchema, "at_x", escapeKeys)
+            expect(yield* w.bound.pipe(Effect.provide(w.layer))).toContain(
+              "[EDD-9134] DynamoClient.make:",
+            )
+          }
         }
       }) as Effect.Effect<void, unknown>,
   )

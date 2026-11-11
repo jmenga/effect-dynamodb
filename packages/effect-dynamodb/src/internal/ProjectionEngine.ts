@@ -16,7 +16,11 @@
  */
 
 import type { AttributeValue, TransactWriteItem } from "@aws-sdk/client-dynamodb"
-import { type DynamoEncoding, isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
+import {
+  type DynamoEncoding,
+  getEncoding,
+  isConfiguredModel,
+} from "@effect-dynamodb/schema/DynamoModel.js"
 import type * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import {
   ConcurrentModification,
@@ -31,6 +35,7 @@ import {
   keyFormValueKind,
 } from "@effect-dynamodb/schema/internal/CompositeCodec.js"
 import {
+  isSelfDateSchema,
   optionalField,
   readingStreamValues,
   resolveFieldEncoding,
@@ -372,18 +377,22 @@ export const physicalTableName = (tag: TableTag): Effect.Effect<string | undefin
   )
 
 /**
- * The date encoding a composite field is stored under, as the entity resolves it: the field's own
- * (a `DynamoModel` date schema, or an Effect date schema's default), its `storedAs` override, or,
- * for an optional field, its value's. `undefined` for a field that is no date.
+ * The date encoding a composite field is stored under, when the library writes its text: a
+ * `DynamoModel` date schema's own, or, for an Effect date schema the entity stores by its own
+ * encoding (`Schema.DateTimeUtc`, `Schema.Date`, `Schema.DateTimeZoned`), the default or its
+ * `storedAs` override; for an optional field, its value's. `undefined` for a field that is no date,
+ * and for a date with a codec of its own (a transform to a date, `Schema.DateTimeUtcFromString`
+ * included), whose text the library doesn't know: it may hold any text, as 1.40.0 took it.
  */
 const dateEncodingOf = (
   field: Schema.Top,
   override: DynamoEncoding | undefined,
 ): DynamoEncoding | undefined => {
-  const own = resolveFieldEncoding(field, undefined)
-  if (own !== null) return resolveFieldEncoding(field, override) ?? undefined
+  const known = (schema: Schema.Top) =>
+    getEncoding(schema) !== undefined || isSelfDateSchema(schema)
+  if (known(field)) return resolveFieldEncoding(field, override) ?? undefined
   const inner = optionalField(field)?.inner
-  if (inner === undefined || resolveFieldEncoding(inner, undefined) === null) return undefined
+  if (inner === undefined || !known(inner)) return undefined
   return resolveFieldEncoding(inner, override) ?? undefined
 }
 
@@ -392,9 +401,10 @@ const dateEncodingOf = (
  * one side sees it:
  *
  * - `"written"`, the keys its rows are written under: the key text of its literals (a literal
- *   union), of `true` and `false` (a boolean), a number's or bigint's key text, or a date's (an
- *   epoch's number, or the ISO text of a date stored as a string); any other field (a string, a
- *   field the model doesn't declare) may hold any text, `#` included.
+ *   union), of `true` and `false` (a boolean), a number's or bigint's key text, or a date's the
+ *   library encodes (`dateEncodingOf`: an epoch's number, or ISO text); any other field (a string,
+ *   a date with a codec of its own, a field the model doesn't declare) may hold any text, `#`
+ *   included.
  * - `"read"`, the keys `rekey`'s reader takes as its rows' (`KeyText136.readIndexKeys`): a number,
  *   a bigint or a boolean only as text its value composes again, and a literal composite as any
  *   text, which it reads as a string.
