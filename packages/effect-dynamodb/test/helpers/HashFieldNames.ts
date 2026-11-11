@@ -160,6 +160,21 @@ export const expected = (name: string): Captured => {
       const remove = fixture.cases[".remove() of the field, named as an entry"]!
       return { ...remove, sent: namingStored(was.sent) }
     }
+    // A query's path builder knows the entity's sparse maps, so the filter names the entry's
+    // attribute, as the condition does, and finds the row. Through 1.40.0 `.entry()` threw in any
+    // query callback (`EntryInQueries.ts`).
+    case "a filter on an entry":
+      return {
+        ...was,
+        outcome: { ok: [was.read] },
+        sent: [
+          {
+            FilterExpression: "#eddE IN (:et0) AND (#e0.#e1 = :e2)",
+            ExpressionAttributeNames: { "#e0": "m#k", "#e1": "x", "#eddE": "__edd_e__" },
+            ExpressionAttributeValues: { ":e2": { N: "1" }, ":et0": { S: "Doc" } },
+          },
+        ],
+      }
     default:
       return was
   }

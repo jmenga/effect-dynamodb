@@ -28,7 +28,7 @@ import { accompaniedClearsSuite } from "./helpers/AccompaniedClears.js"
 import { aggregateCreateStampsSuite } from "./helpers/AggregateCreateStamps.js"
 import { aggregateStampFormsSuite } from "./helpers/AggregateStampForms.js"
 import { entryBesideFieldSuite } from "./helpers/EntryBesideField.js"
-import { entrySelectsSuite } from "./helpers/EntryInQueries.js"
+import { entryInQueriesSuite } from "./helpers/EntryInQueries.js"
 import { hashFieldNamesSuite } from "./helpers/HashFieldNames.js"
 import type { OpenTable, Row } from "./helpers/Kept139.js"
 import { nestedKeyCollectionSuite, nestedKeyEncodingsSuite } from "./helpers/NestedKeyEncodings.js"
@@ -161,6 +161,9 @@ describeConnected("a path below a struct that renames its keys, in a collection"
   nestedKeyCollectionSuite(openTable)
 })
 
-describeConnected("a select of one sparse map entry, in a query and a collection", () => {
-  entrySelectsSuite(openTable)
-})
+describeConnected(
+  "a sparse map entry in a query's, a scan's and a collection's filter and select",
+  () => {
+    entryInQueriesSuite(openTable)
+  },
+)

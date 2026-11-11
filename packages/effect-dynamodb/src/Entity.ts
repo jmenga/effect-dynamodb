@@ -19198,7 +19198,7 @@ export const bind = <
     // .filter() ergonomics they get from index accessors and `.scan()`.
     const wrapAsBoundQuery = <A>(q: Query.Query<A>, operation: string) => {
       const bqConfig: BoundQueryConfig<unknown> = {
-        pathBuilder: createPathBuilder(),
+        pathBuilder: createPathBuilder(undefined, undefined, boundSparseFieldsForPath),
         conditionOps: createConditionOps(),
         provide,
         ...entityNaming(
@@ -19454,7 +19454,7 @@ export const bind = <
       },
       history: (key: Key) => {
         const q = (entity.history as any as (k: Key) => Query.Query<any>)(key)
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = createPathBuilder(undefined, undefined, boundSparseFieldsForPath)
         const conditionOps = createConditionOps()
         const ts = (entity as unknown as { readonly timeSeries?: TimeSeriesConfig<any> }).timeSeries
         const orderBy = ts?.orderBy

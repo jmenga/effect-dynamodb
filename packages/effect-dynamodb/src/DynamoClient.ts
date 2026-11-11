@@ -109,6 +109,7 @@ import {
   type Compressor,
   make as makeCompressionRegistry,
 } from "@effect-dynamodb/schema/Compression.js"
+import { getSparseFields } from "@effect-dynamodb/schema/DynamoModel.js"
 import * as DynamoSchema from "@effect-dynamodb/schema/DynamoSchema.js"
 import type { EmbedderService } from "@effect-dynamodb/schema/Embedder.js"
 import { Embedder } from "@effect-dynamodb/schema/Embedder.js"
@@ -2481,6 +2482,25 @@ interface EntityLike {
   }
 }
 
+/**
+ * A query's path builder over the members' models: `.entry(key)` on each sparse map field (#238),
+ * baked with the first member's prefix where members declare one field with different ones (a
+ * collection names each member's entry by its own prefix: `collectionNaming`).
+ */
+const queryPathBuilder = (entities: ReadonlyArray<EntityLike>) => {
+  const sparse: Record<string, { readonly prefix: string }> = {}
+  for (const entityLike of entities) {
+    for (const [field, config] of Object.entries(getSparseFields(entityLike.model))) {
+      if (!Object.hasOwn(sparse, field)) sparse[field] = config
+    }
+  }
+  return createPathBuilder(
+    undefined,
+    undefined,
+    Object.keys(sparse).length > 0 ? sparse : undefined,
+  )
+}
+
 /** An entity's domain field names (its record's), when its schema exposes them. */
 const domainFieldsOf = (entityLike: EntityLike): ReadonlySet<string> | undefined => {
   const fields = (entityLike.schemas.recordSchema as unknown as { readonly fields?: object }).fields
@@ -2788,7 +2808,7 @@ const makeFromConfig = (config: {
             )
           : query
 
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder([entityLike])
         const conditionOps = createConditionOps()
 
         // composeSkCondition — compose the user's `.where()` operand into a full
@@ -2987,7 +3007,7 @@ const makeFromConfig = (config: {
           () => accessor(rawComposites) as BoundQueryImpl<unknown, unknown, unknown>,
           (refusal) =>
             new BoundQueryImpl(Query.refused(indexDef.index, refusal), {
-              pathBuilder: createPathBuilder(),
+              pathBuilder: queryPathBuilder([entityLike]),
               conditionOps: createConditionOps(),
               provide,
               ...entityNaming(
@@ -3096,7 +3116,7 @@ const makeFromConfig = (config: {
           keyFields: [entityLike.indexes.primary?.pk.field, entityLike.indexes.primary?.sk.field],
           liveRows: entityLike._liveRows?.(),
         })
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder([entityLike])
         const conditionOps = createConditionOps()
         const bqConfig: BoundQueryConfig<unknown> = {
           pathBuilder,
@@ -3230,7 +3250,7 @@ const makeFromConfig = (config: {
         }
 
         // Wrap in BoundQuery that groups results by entity key
-        const pathBuilder = createPathBuilder()
+        const pathBuilder = queryPathBuilder(members.map((m) => m.entityLike))
         const conditionOps = createConditionOps()
         const collectionProvide = <X, E>(eff: Effect.Effect<X, E, any>) =>
           Effect.provide(eff, ctx) as Effect.Effect<X, E, never>
@@ -3282,7 +3302,7 @@ const makeFromConfig = (config: {
           () => collectionAccessor(composites) as BoundQueryImpl<unknown, unknown, unknown>,
           (refusal) =>
             new BoundQueryImpl(Query.refused(members[0]!.indexDef.index, refusal), {
-              pathBuilder: createPathBuilder(),
+              pathBuilder: queryPathBuilder(members.map((m) => m.entityLike)),
               conditionOps: createConditionOps(),
               provide,
               operation,
