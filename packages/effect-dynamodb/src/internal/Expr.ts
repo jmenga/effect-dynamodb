@@ -560,6 +560,10 @@ export const isEmptyExpr = (expr: Expr): boolean =>
  * nothing — and `or()` with no parts matches nothing at all. Each is refused
  * with a `ValidationError` before anything is sent, never dropped.
  *
+ * An operand naming the path builder itself (`t`, or `t.size()`) names the
+ * whole item, not an attribute, and would compile to an empty name: refused
+ * the same way (`EDD-9149`, #238).
+ *
  * An `isIn()` with no values is not refused here (#144): it compiles to
  * `IN ()`, which DynamoDB rejects as a syntax error, and the rejection is
  * diagnosed (`internal/WriteDiagnosis.ts`, `EmptyIn`) naming the attribute.
@@ -598,6 +602,12 @@ export const emptyPartProblem = (expr: Expr): string | undefined => {
       }
       return emptyPartProblem(expr.expr)
     default:
+      if (namedOperands(expr).some(namesNoAttribute)) {
+        return (
+          "a path with no attribute in it (the path builder itself) names the whole item, " +
+          "which an expression can't compare. Name an attribute, such as t.status. [EDD-9149]"
+        )
+      }
       return emptySetOperands(expr).some(isEmptySetOperand)
         ? "DynamoDB has no empty set, so a row holding one is a row without the attribute. " +
             "Only eq() and ne() can compare with one, by whether the attribute exists. [EDD-9124]"
@@ -645,6 +655,16 @@ const comparedOperands = (expr: Expr): ReadonlyArray<Operand> => {
       return []
   }
 }
+
+/** Every operand a leaf expression names: a comparison's, and an existence or type test's. */
+const namedOperands = (expr: Expr): ReadonlyArray<Operand> =>
+  expr._tag === "exists" || expr._tag === "notExists" || expr._tag === "type"
+    ? [expr.operand]
+    : comparedOperands(expr)
+
+/** Whether an operand is a path (or its size) with no segment: the item itself. */
+const namesNoAttribute = (operand: Operand): boolean =>
+  operand._tag !== "value" && operand.segments.length === 0
 
 /** The operands that can't take an empty set: `eq` and `ne` compile it to an existence test. */
 const emptySetOperands = (expr: Expr): ReadonlyArray<Operand> =>
