@@ -9,7 +9,7 @@ import {
   ValidationError,
 } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
-import { Effect, Schema } from "effect"
+import { Effect, Layer, Schema } from "effect"
 import { describe, expect, vi } from "vitest"
 import * as Entity from "../src/Entity.js"
 import {
@@ -33,6 +33,8 @@ import {
   targetsFor,
   transactItemTarget,
 } from "../src/internal/WriteDiagnosis.js"
+import * as Table from "../src/Table.js"
+import * as Transaction from "../src/Transaction.js"
 import {
   awsTransactionCanceled,
   awsValidationException,
@@ -58,7 +60,7 @@ import {
   ddbTooManyInOperands,
   ddbTooManyOperators,
 } from "./helpers/MockDynamoClient.js"
-import { tooLargeFailure } from "./helpers/RecordingTable.js"
+import { makeRecordingTable, tooLargeFailure } from "./helpers/RecordingTable.js"
 
 const tooLargeCause = () => tooLargeFailure("TransactWriteItems").cause
 
@@ -756,6 +758,72 @@ describe("WriteDiagnosis (#144)", () => {
       const a = put("a")
       const other: TransactWriteItem = { Put: { ...a.Put!, TableName: "u" } }
       expect(diagnose(rejected(DDB_REPEATED_ITEM), transaction([a, other]))).toBeUndefined()
+    })
+
+    describe("P2a through Transaction.transactWrite on the recording table", () => {
+      // The recording table takes a transaction's items in order, as DynamoDB Local does: an
+      // item whose condition fails is that item's cancellation reason, and the repeat is never
+      // reached (`connected.helper-conformance.test.ts`, "tw: one item: …").
+      const Docs = Entity.make({
+        model: Schema.Struct({ docId: Schema.String, n: Schema.Number }),
+        entityType: "Doc",
+        primaryKey: {
+          pk: { field: "pk", composite: ["docId"] },
+          sk: { field: "sk", composite: [] },
+        },
+      })
+      const Main = Table.make({
+        schema: DynamoSchema.make({ name: "wd", version: 1 }),
+        entities: { Docs },
+      })
+      const run = (stored: boolean, ops: ReadonlyArray<"create" | "put">) =>
+        Effect.gen(function* () {
+          const table = makeRecordingTable()
+          const layer = Layer.merge(table.layer, Main.layer({ name: "t" }))
+          if (stored) yield* Docs.put({ docId: "d", n: 1 }).asEffect().pipe(Effect.provide(layer))
+          table.take()
+          const error = yield* Transaction.transactWrite(
+            ops.map((op, i) =>
+              (op === "create" ? Docs.create : Docs.put)({ docId: "d", n: i + 2 }),
+            ),
+          ).pipe(Effect.flip, Effect.provide(layer))
+          const sent = table.take()
+          return { error, sent, stored: [...table.items.values()] }
+        })
+
+      for (const [label, stored, ops, reasons] of [
+        [
+          "the first item's condition fails",
+          true,
+          ["create", "put"],
+          "[ConditionalCheckFailed, None]",
+        ],
+        [
+          "the second item's condition fails on what the first wrote",
+          false,
+          ["put", "create"],
+          "[None, ConditionalCheckFailed]",
+        ],
+      ] as const) {
+        it.effect(
+          `${label}: the table cancels it; the library names the repeat, sending once`,
+          () =>
+            Effect.gen(function* () {
+              const { error, sent, stored: after } = yield* run(stored, ops)
+              expect(sent.map((request) => request.command)).toEqual(["TransactWriteItems"])
+              expect(error._tag).toBe("ValidationError")
+              const failure = error as ValidationError
+              expect(String(failure.cause)).toContain(
+                "the transaction touches one item more than once — operation 0 (Doc) and operation 1 (Doc)",
+              )
+              // What DynamoDB answered is kept: the cancellation, read in order.
+              expect(String(((failure.cause as Error).cause as DynamoError).cause)).toContain(
+                `Transaction cancelled, please refer cancellation reasons for specific reasons ${reasons}`,
+              )
+              expect(after.map((item) => item.n)).toEqual(stored ? [{ N: "1" }] : [])
+            }),
+        )
+      }
     })
   })
 

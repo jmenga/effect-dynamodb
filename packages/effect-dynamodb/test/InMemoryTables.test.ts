@@ -16,6 +16,19 @@
  * - **A request naming one item twice is rejected**: a `BatchGetItem` or `BatchWriteItem` ("Provided
  *   list of item keys contains duplicates"), a transaction ("Transaction request cannot include
  *   multiple operations on one item"). Before, the batches and `TransactGetItems` took it.
+ * - **A transaction's items are taken in order**, each on what the ones before it left: a failed
+ *   condition is that item's cancellation reason (a `ConditionCheck`'s message ends in a full
+ *   stop, a write's doesn't), an update the item can't take refuses the request, and a repeat is
+ *   reported only when the repeated item's condition passes.
+ * - **An item is named by its table and its typed key**, never by `<pk>|<sk>` text: one key in two
+ *   tables is two items, and keys whose text would join to the same text are two keys (which the
+ *   tables, keeping items under that text, name as a defect). A binary key is refused as DynamoDB
+ *   Local refuses it on a table of string keys.
+ * - **A condition refuses an operand `<` can't order** (a map, list, set, boolean or null) and an
+ *   attribute compared with itself, with DynamoDB Local's message, reads list-index paths, and
+ *   finds two missing attributes unequal. Before, it answered false, threw a `TypeError`, and
+ *   answered false.
+ * - **Whitespace is optional**: `SET #a=:v` sets `a`, alone and in a transaction.
  * - **Names are the item's own attributes**: an item without `constructor` doesn't hold it.
  */
 
@@ -29,6 +42,7 @@ import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { keyIdentity, UnreadableRequest } from "./helpers/DynamoExpressions.js"
 import {
   holds,
   InMemoryClient,
@@ -527,6 +541,380 @@ describe("recording table: a request naming one item twice is rejected", () => {
       expect(transactError._tag).toBe("DynamoError")
       expect(String((transactError as { cause: unknown }).cause)).toContain(
         "TransactGetItems reads one item more than once",
+      )
+    }),
+  )
+})
+
+/**
+ * The rows below are rows of `connected.helper-conformance.test.ts`, which sends each to DynamoDB
+ * Local and to both tables: the answers here are DynamoDB Local's.
+ */
+describe("a condition reads list paths, and refuses what DynamoDB Local refuses", () => {
+  const item: Item = {
+    pk: { S: "p" },
+    sk: { S: "s" },
+    n: { N: "5" },
+    m: { M: { k: { N: "1" }, l: { L: [{ N: "1" }, { N: "2" }] } } },
+    l: { L: [{ N: "1" }, { N: "2" }, { M: { a: { N: "1" } } }] },
+    ss: { SS: ["a", "b"] },
+    nul: { NULL: true },
+    bool: { BOOL: true },
+  }
+  const namesOf = (expression: string) =>
+    Object.fromEntries(
+      [...expression.matchAll(/#(\w+)/g)].map((match) => [`#${match[1]}`, match[1]!]),
+    )
+  const answer = (expression: string, values: Record<string, AttributeValue> = {}) => {
+    try {
+      return holds(expression, item, namesOf(expression), values)
+    } catch (error) {
+      return { name: (error as Error).name, message: (error as Error).message }
+    }
+  }
+
+  for (const [expression, values] of [
+    ["#l[0] = :v", { ":v": { N: "1" } }],
+    ["#m.#l[1] = :v", { ":v": { N: "2" } }],
+    ["attribute_not_exists(#l[5])", {}],
+    ["attribute_exists(#l[0])", {}],
+    ["#zz <> #qq", {}],
+  ] as const) {
+    it(`${expression}: holds`, () => {
+      expect(answer(expression, values)).toBe(true)
+    })
+  }
+
+  const operandType = (operator: string, type: string) => ({
+    name: "ValidationException",
+    message: `Invalid ConditionExpression: Incorrect operand type for operator or function; operator or function: ${operator}, operand type: ${type}`,
+  })
+  const distinct = (operator: string, name: string) => ({
+    name: "ValidationException",
+    message: `Invalid ConditionExpression: The first operand must be distinct from the remaining operands for this operator or function; operator: ${operator}, first operand: [${name}]`,
+  })
+  for (const [expression, values, refusal] of [
+    // Only numbers, strings and bytes are ordered: any other operand is refused.
+    ["#m < :v", { ":v": { M: {} } }, operandType("<", "M")],
+    ["#l < :v", { ":v": { L: [] } }, operandType("<", "L")],
+    ["#ss < :v", { ":v": { SS: ["z"] } }, operandType("<", "SS")],
+    ["#bool < :v", { ":v": { BOOL: true } }, operandType("<", "BOOL")],
+    ["#nul <= :v", { ":v": { NULL: true } }, operandType("<=", "NULL")],
+    ["#n < :v", { ":v": { M: {} } }, operandType("<", "M")],
+    ["#n < :v", { ":v": { BOOL: true } }, operandType("<", "BOOL")],
+    // An attribute compared with itself.
+    ["#m <= #m", {}, distinct("<=", "m")],
+    ["#n < #n", {}, distinct("<", "n")],
+    ["#n <> #n", {}, distinct("<>", "n")],
+  ] satisfies ReadonlyArray<
+    readonly [string, Record<string, AttributeValue>, { name: string; message: string }]
+  >) {
+    it(`${expression} ${JSON.stringify(values)}: refused`, () => {
+      expect(answer(expression, values)).toEqual(refusal)
+    })
+  }
+
+  it("between values of different types, `<` fails: numbers, strings and bytes", () => {
+    expect(answer("#n < :v", { ":v": { S: "9" } })).toBe(false)
+  })
+})
+
+/** The failure a request ends in, with its cancellation reasons. */
+const outcomeOf = <A, E>(
+  effect: Effect.Effect<A, E, DynamoClient>,
+  layer: Layer.Layer<DynamoClient>,
+) =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(Effect.provide(effect, layer))
+    if (Exit.isSuccess(exit)) return { ok: exit.value as unknown }
+    const error = Cause.squash(exit.cause) as {
+      readonly cause?: {
+        readonly name?: string
+        readonly message?: string
+        readonly CancellationReasons?: ReadonlyArray<unknown>
+      }
+    }
+    return {
+      name: error.cause?.name,
+      message: error.cause?.message,
+      ...(error.cause?.CancellationReasons !== undefined && {
+        reasons: error.cause.CancellationReasons,
+      }),
+    }
+  })
+
+const cancelledWith = (...reasons: ReadonlyArray<"None" | "Put" | "ConditionCheck">) => ({
+  name: "TransactionCanceledException",
+  message: `Transaction cancelled, please refer cancellation reasons for specific reasons [${reasons
+    .map((reason) => (reason === "None" ? "None" : "ConditionalCheckFailed"))
+    .join(", ")}]`,
+  // A `ConditionCheck`'s reason ends in a full stop; a write's doesn't.
+  reasons: reasons.map((reason) =>
+    reason === "None"
+      ? { Code: "None" }
+      : {
+          Code: "ConditionalCheckFailed",
+          Message: `The conditional request failed${reason === "ConditionCheck" ? "." : ""}`,
+        },
+  ),
+})
+
+for (const [name, make] of Object.entries(TABLES)) {
+  describe(`${name}: a transaction's items are taken in order, each on what the ones before left`, () => {
+    const stored = (): Item => ({ ...key("a"), n: { N: "1" } })
+    const put = (n: string, condition?: string): Record<string, unknown> => ({
+      Put: {
+        TableName: "t",
+        Item: { ...key("a"), n: { N: n } },
+        ...(condition !== undefined && {
+          ConditionExpression: condition,
+          ExpressionAttributeNames: { "#n": "n" },
+          ExpressionAttributeValues: { ":v": { N: "2" } },
+        }),
+      },
+    })
+    const check = (expression: string, value?: string): Record<string, unknown> => ({
+      ConditionCheck: {
+        TableName: "t",
+        Key: key("a"),
+        ConditionExpression: expression,
+        ExpressionAttributeNames: Object.fromEntries(
+          [...expression.matchAll(/#(\w+)/g)].map((match) => [`#${match[1]}`, match[1]!]),
+        ),
+        ...(value !== undefined && { ExpressionAttributeValues: { ":v": { N: value } } }),
+      },
+    })
+    const cases: ReadonlyArray<readonly [string, ReadonlyArray<Record<string, unknown>>, object]> =
+      [
+        [
+          "Put (its condition fails) + Put",
+          [put("5", "#n = :v"), put("6")],
+          cancelledWith("Put", "None"),
+        ],
+        [
+          "Put + ConditionCheck failing on what the Put wrote",
+          [put("5"), check("#n = :v", "1")],
+          cancelledWith("None", "ConditionCheck"),
+        ],
+        [
+          "ConditionCheck (fails) + Put",
+          [check("#n = :v", "2"), put("5")],
+          cancelledWith("ConditionCheck", "None"),
+        ],
+        [
+          "ConditionCheck (fails) + ConditionCheck (fails)",
+          [check("#n = :v", "2"), check("#n = :v", "3")],
+          cancelledWith("ConditionCheck", "ConditionCheck"),
+        ],
+        [
+          "Update (refused) + ConditionCheck (passes): the refusal",
+          [
+            {
+              Update: {
+                TableName: "t",
+                Key: key("a"),
+                UpdateExpression: "SET #x = #zz + :v",
+                ExpressionAttributeNames: { "#x": "x", "#zz": "zz" },
+                ExpressionAttributeValues: { ":v": { N: "1" } },
+              },
+            },
+            check("attribute_exists(#pk)"),
+          ],
+          { name: "ValidationException", message: DDB_UPDATE_MISSING_ATTRIBUTE },
+        ],
+        [
+          "Put + ConditionCheck passing only on what the Put wrote: the repeat",
+          [put("5"), check("#n = :v", "5")],
+          { name: "ValidationException", message: DDB_REPEATED_ITEM },
+        ],
+      ]
+    for (const [label, items, expected] of cases) {
+      it.effect(label, () =>
+        Effect.gen(function* () {
+          const table = make()
+          table.seed(stored())
+          const got = yield* outcomeOf(
+            withClient((client) => client.transactWriteItems({ TransactItems: items as never })),
+            table.layer,
+          )
+          expect(got).toEqual(expected)
+          expect(table.read(key("a"))).toEqual(stored())
+        }),
+      )
+    }
+  })
+
+  describe(`${name}: compact expressions`, () => {
+    // Whitespace around `=` is optional, as on DynamoDB Local.
+    it.effect("SET #a=:v, alone and in a transaction", () =>
+      Effect.gen(function* () {
+        const table = make()
+        table.seed({ ...key("u"), a: { S: "old" }, version: { N: "1" } })
+        const update = {
+          TableName: "t",
+          Key: key("u"),
+          UpdateExpression: "SET #a=:v",
+          ExpressionAttributeNames: { "#a": "a" },
+          ExpressionAttributeValues: { ":v": { S: "new" } },
+        }
+        expect(
+          yield* failureOf(
+            withClient((client) => client.updateItem(update)),
+            table.layer,
+          ),
+        ).toBe("ok")
+        expect(table.read(key("u"))).toEqual({ ...key("u"), a: { S: "new" }, version: { N: "1" } })
+        expect(
+          yield* failureOf(
+            withClient((client) =>
+              client.transactWriteItems({
+                TransactItems: [
+                  {
+                    Update: { ...update, ExpressionAttributeValues: { ":v": { S: "newer" } } },
+                  },
+                ],
+              }),
+            ),
+            table.layer,
+          ),
+        ).toBe("ok")
+        expect(table.read(key("u"))).toEqual({
+          ...key("u"),
+          a: { S: "newer" },
+          version: { N: "1" },
+        })
+      }),
+    )
+  })
+}
+
+describe("an item is named by its table and its typed key", () => {
+  const identity = (table: string, key: Item) => keyIdentity(table, key, ["pk", "sk"])
+
+  it("keys whose text would join to the same text are two keys", () => {
+    expect(identity("t", { pk: { S: "a|b" }, sk: { S: "c" } })).not.toBe(
+      identity("t", { pk: { S: "a" }, sk: { S: "b|c" } }),
+    )
+  })
+
+  it("one key in two tables is two items; its attributes in another order, one", () => {
+    expect(identity("t", key("u"))).not.toBe(identity("t2", key("u")))
+    expect(identity("t", { sk: { S: "x" }, pk: { S: "u" } })).toBe(identity("t", key("u")))
+  })
+
+  it("a key that isn't a string is a defect: these tables take string keys only", () => {
+    expect(() => identity("t", { pk: { S: "a" }, sk: { B: new Uint8Array([1]) } })).toThrow(
+      UnreadableRequest,
+    )
+  })
+
+  const binary = (byte: number): Item => ({ pk: { S: "a" }, sk: { B: new Uint8Array([byte]) } })
+  const typeMismatch = "One or more parameter values were invalid: Type mismatch for key"
+
+  it.effect("recording table: binary sort keys are refused as DynamoDB Local refuses them", () =>
+    Effect.gen(function* () {
+      const table = makeRecordingTable()
+      expect(
+        yield* outcomeOf(
+          withClient((client) =>
+            client.batchGetItem({ RequestItems: { t: { Keys: [binary(1), binary(2)] } } }),
+          ),
+          table.layer,
+        ),
+      ).toEqual({ name: "ValidationException", message: typeMismatch })
+      expect(
+        yield* outcomeOf(
+          withClient((client) =>
+            client.transactGetItems({
+              TransactItems: [
+                { Get: { TableName: "t", Key: binary(1) } },
+                { Get: { TableName: "t", Key: binary(2) } },
+              ],
+            }),
+          ),
+          table.layer,
+        ),
+      ).toEqual({ name: "TransactionCanceledException", message: typeMismatch })
+    }),
+  )
+
+  it.effect("recording table: one key read from two tables is two reads", () =>
+    Effect.gen(function* () {
+      const table = makeRecordingTable()
+      expect(
+        yield* outcomeOf(
+          withClient((client) =>
+            client.transactGetItems({
+              TransactItems: [
+                { Get: { TableName: "t", Key: key("u") } },
+                { Get: { TableName: "t2", Key: key("u") } },
+              ],
+            }),
+          ),
+          table.layer,
+        ),
+      ).toEqual({ ok: { Responses: [{}, {}] } })
+      expect(
+        yield* outcomeOf(
+          withClient((client) =>
+            client.batchGetItem({
+              RequestItems: { t: { Keys: [key("u")] }, t2: { Keys: [key("u")] } },
+            }),
+          ),
+          table.layer,
+        ),
+      ).toEqual({ ok: { Responses: { t: [], t2: [] }, UnprocessedKeys: {} } })
+    }),
+  )
+
+  it.effect("InMemoryClient: one key written in two tables is two items", () =>
+    Effect.gen(function* () {
+      resetStore()
+      expect(
+        yield* outcomeOf(
+          withClient((client) =>
+            client.transactWriteItems({
+              TransactItems: [
+                { Put: { TableName: "t", Item: { ...key("u"), n: { N: "5" } } } },
+                { Put: { TableName: "t2", Item: { ...key("u"), n: { N: "6" } } } },
+              ],
+            }),
+          ),
+          InMemoryClient,
+        ),
+      ).toEqual({ ok: {} })
+      expect(store.get(keyOf("t", key("u")))?.n).toEqual({ N: "5" })
+      expect(store.get(keyOf("t2", key("u")))?.n).toEqual({ N: "6" })
+    }),
+  )
+
+  it.effect("keys holding `|` are a defect the tables name, never a repeat", () =>
+    Effect.gen(function* () {
+      const joined = [
+        { pk: { S: "a|b" }, sk: { S: "c" } },
+        { pk: { S: "a" }, sk: { S: "b|c" } },
+      ]
+      const recording = makeRecordingTable()
+      const read = yield* Effect.exit(
+        Effect.provide(
+          withClient((client) => client.batchGetItem({ RequestItems: { t: { Keys: joined } } })),
+          recording.layer,
+        ),
+      )
+      expect(Exit.isFailure(read) && Cause.squash(read.cause)).toBeInstanceOf(UnreadableRequest)
+      resetStore()
+      const written = yield* Effect.exit(
+        Effect.provide(
+          withClient((client) =>
+            client.transactWriteItems({
+              TransactItems: joined.map((item) => ({ Put: { TableName: "t", Item: item } })),
+            }),
+          ),
+          InMemoryClient,
+        ),
+      )
+      expect(Exit.isFailure(written) && Cause.squash(written.cause)).toBeInstanceOf(
+        UnreadableRequest,
       )
     }),
   )
