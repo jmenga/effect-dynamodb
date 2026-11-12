@@ -3,7 +3,8 @@
  * the names they're stored under and by their own (#238): path operations, conditions, filters and
  * selects.
  *
- * `fixtures/nested-key-encodings-1.40.0.json` holds what the published 1.40.0 did. A path spelled
+ * `fixtures/nested-key-encodings-1.40.0.json` holds what the published 1.40.0 did, every request
+ * whole (GetItem and Query included). A path spelled
  * by stored names (`meta.am`, `outer.in.dp`, and `swap.a` where `encodeKeys({ a: "b", b: "a" })`
  * stores property `b` under `a`) sends what 1.40.0 sent. A path spelled by a property's own name
  * (`meta.amount`), which 1.40.0 sent as written, naming an attribute no row holds, now sends what
@@ -12,15 +13,19 @@
  * (`either.amount`) is sent as written, as before.
  *
  * A removal of a required property, by either name, is refused, nothing sent: 1.40.0 removed it
- * (by its stored name; by its own name it removed nothing) and left a row no read takes.
+ * (by its stored name; by its own name it removed nothing) and left a row no read takes. A struct
+ * whose transformation defaults a key its stored struct may leave out (`defaulted`) renames
+ * nothing: a path into it, and the removal its read defaults, are sent as 1.40.0 sent them.
  */
 
 import { readFileSync } from "node:fs"
 import { it } from "@effect/vitest"
-import { Cause, Effect, Exit, Schema } from "effect"
+import { Cause, Effect, Exit, Schema, SchemaGetter } from "effect"
 import { expect } from "vitest"
 import * as Lib from "../../src/index.js"
 import { type OpenTable, onTable, type Row, recordingRequests } from "./Kept139.js"
+import { wholeOf } from "./RenamedSparseMapWrites.js"
+import { differingPaths } from "./WholeDiff.js"
 
 export interface Captured {
   readonly outcome: unknown
@@ -46,6 +51,17 @@ const Outer = Schema.Struct({ inner: Deep, list: Schema.Array(Deep) }).pipe(
   Schema.encodeKeys({ inner: "in" }),
 )
 const Other = Schema.Struct({ amount: Schema.Number, kind: Schema.Literal("other") })
+/** A transformation that defaults a key its stored struct may leave out: no key rename. */
+const Defaulted = Schema.Struct({ amount: Schema.optionalKey(Schema.Number) }).pipe(
+  Schema.decodeTo(Schema.Struct({ amount: Schema.Number }), {
+    decode: SchemaGetter.transform((value: { readonly amount?: number }) => ({
+      amount: value.amount ?? 0,
+    })),
+    encode: SchemaGetter.transform((value: { readonly amount: number }) => ({
+      amount: value.amount,
+    })),
+  }),
+)
 const model = () =>
   Lib.DynamoModel.configure(
     Schema.Struct({
@@ -57,6 +73,7 @@ const model = () =>
       recs: Schema.Record(Schema.String, Deep),
       either: Schema.Union([Amount, Other]),
       counts: Schema.Record(Schema.String, Deep),
+      defaulted: Defaulted,
     }),
     {
       outer: { field: "ot" },
@@ -82,13 +99,14 @@ const MainTable = Lib.Table.make({
 
 const SEED = {
   id: "a",
-  meta: { amount: 5, note: "n", tags: ["t"] },
+  meta: { amount: 5, note: "n", tags: ["x1"] },
   swap: { a: 1, b: 2 },
   outer: { inner: { deep: 3 }, list: [{ deep: 4 }, { deep: 6 }] },
   maybe: { amount: 7 },
   recs: { k: { deep: 8 } },
   either: { amount: 9 },
   counts: { k: { deep: 10 } },
+  defaulted: { amount: 19 },
 }
 
 type Segments = ReadonlyArray<string | number>
@@ -169,6 +187,10 @@ write("pathSet of a copy, meta.amount from outer.inner.deep", (u) =>
     valueSegments: ["outer", "inner", "deep"],
   }),
 )
+// The transformation is never run to find a rename: `amount` is sent as written, and its removal,
+// which the read defaults, as 1.40.0 sent it.
+write("pathRemove defaulted.amount", (u) => u.pathRemove(["defaulted", "amount"]))
+write("pathSet defaulted.amount", set(["defaulted", "amount"], 20))
 write("pathSet of the entry .entry() built, .dp", (u) =>
   u.pathSet({ segments: entryPath("dp"), value: 18, isPath: false }),
 )
@@ -309,32 +331,6 @@ const normal = (value: unknown): any =>
         : held,
   )
 
-const PARTS = [
-  "UpdateExpression",
-  "ConditionExpression",
-  "FilterExpression",
-  "ProjectionExpression",
-  "ExpressionAttributeNames",
-  "ExpressionAttributeValues",
-] as const
-const partsOf = (input: Record<string, unknown>) =>
-  Object.fromEntries(PARTS.filter((part) => input[part] !== undefined).map((p) => [p, input[p]]))
-
-/** The expression parts of a request, a transaction's per item; reads leave out GetItem and Query. */
-const sentOf = (request: unknown): Record<string, unknown> | undefined => {
-  const [command, input] = Object.entries(request as Record<string, Record<string, any>>)[0]!
-  if (command === "getItem" || command === "query") return undefined
-  return normal(
-    input.TransactItems !== undefined
-      ? {
-          [command]: (input.TransactItems as ReadonlyArray<Record<string, any>>).map((item) =>
-            Object.fromEntries(Object.entries(item).map(([kind, body]) => [kind, partsOf(body)])),
-          ),
-        }
-      : { [command]: partsOf(input) },
-  )
-}
-
 const outcomeOf = (exit: Exit.Exit<unknown, unknown>): unknown => {
   if (Exit.isSuccess(exit)) return { ok: normal(exit.value) }
   const squashed = Cause.squash(exit.cause) as any
@@ -382,10 +378,7 @@ export const nestedKeyEncodingsSuite = (open: OpenTable) => {
               const why = Exit.isFailure(exit)
                 ? String((Cause.squash(exit.cause) as any)?.cause)
                 : undefined
-              const sent = log.flatMap((request) => {
-                const parts = sentOf(request)
-                return parts === undefined ? [] : [parts]
-              })
+              const sent = log.map((request) => wholeOf(request, table.name))
               const row = rowOf(yield* table.rows, entity)
               const back = yield* Effect.exit(db.entities[entity].get({ id: "a" }))
               return {
@@ -406,6 +399,15 @@ export const nestedKeyEncodingsSuite = (open: OpenTable) => {
         expect(got.outcome).toEqual(want.outcome)
         const says = refusal(name)
         if (says !== undefined) expect(got.why).toMatch(says)
+        // Named: a request differs from 1.40.0's own case only in a name it maps (the attribute a
+        // property's own name now names), or as a whole, where 1.40.0 read the row back after a
+        // write a domain spelling had lost, or where a refusal sends nothing; never in its key,
+        // expressions or values.
+        if (says === undefined) {
+          for (const path of differingPaths(fixture.cases[name]!.sent, got.sent)) {
+            expect(path).toMatch(/^\[\d+\](\..*\.ExpressionAttributeNames\.#\w+)?$/)
+          }
+        }
       }),
     )
   }
@@ -448,10 +450,10 @@ export const nestedKeyEncodingsSuite = (open: OpenTable) => {
             am: { N: "5" },
             amount: { N: "11" },
             note: { S: "n" },
-            tg: { L: [{ S: "t" }] },
+            tg: { L: [{ S: "x1" }] },
           },
         })
-        expect(got.readStray).toEqual({ amount: 5, note: "n", tags: ["t"] })
+        expect(got.readStray).toEqual({ amount: 5, note: "n", tags: ["x1"] })
         expect(got.cleared).toEqual({ M: { am: { N: "6" }, note: { S: "n" } } })
         expect(got.read).toEqual({ amount: 6, note: "n" })
       }),
