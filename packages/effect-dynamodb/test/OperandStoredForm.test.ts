@@ -78,7 +78,7 @@ const everyPosition = (
   requestsOnly = false,
 ) =>
   Effect.gen(function* () {
-    const settle = <A>(effect: Effect.Effect<A, unknown>) =>
+    const settle = <A>(effect: Effect.Effect<A, unknown, any>) =>
       requestsOnly ? Effect.exit(effect) : effect
     table.take()
     const collected = yield* settle(db.entities.E.scan().filter(condition).collect())
@@ -321,7 +321,10 @@ describe("a Date operand is put in the form the field stores a date", () => {
     { name: "Schema.Date, as ISO text", f: Schema.Date, sent: ISO },
     {
       name: "Schema.Date stored as epoch milliseconds",
-      f: Schema.Date.pipe(DynamoModel.storedAs(DynamoModel.DateEpochMs)),
+      // `storedAs` is typed for DateTime schemas; a Date field takes it as well.
+      f: Schema.Date.pipe(
+        DynamoModel.storedAs(DynamoModel.DateEpochMs) as (date: typeof Schema.Date) => Schema.Top,
+      ),
       sent: { N: "1000" },
     },
   ]
@@ -357,7 +360,7 @@ describe("every operand position puts it so", () => {
         Effect.gen(function* () {
           yield* db.entities.E.put({ id: "a", f: utc() }).asEffect()
           table.take()
-          const byExpr = yield* Query.collect(Query.filterExpr(E.scan(), eq(t.f, utc())))
+          const byExpr = yield* Query.collect(Query.filterExpr(E.scan(), eq(t.f as any, utc())))
           expect(operandsOf(table.take()[0]?.input)).toEqual([json(ISO)])
           const byFilter = yield* Query.collect(
             E.scan().pipe(E.filter((p: any, ops: any) => ops.eq(p.f, utc()))),
@@ -394,7 +397,8 @@ describe("every operand position puts it so", () => {
       yield* Effect.gen(function* () {
         const db = yield* DynamoClient.make({ entities: { E }, tables: { Main } })
         yield* db.entities.E.byText([1, 0])
-          .filter({ span: Duration.millis(1500) })
+          // The operand type is the stored scalar; an untyped caller's instance is put in that form.
+          .filter({ span: Duration.millis(1500) as never })
           .collect()
       }).pipe(
         Effect.provide(
