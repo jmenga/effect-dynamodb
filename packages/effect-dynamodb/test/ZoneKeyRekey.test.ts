@@ -274,6 +274,51 @@ describe("rows published 1.40.0 keyed by a zone's given name on Effect 4.1.3", (
     }),
   )
 
+  it.effect("before rekey, a second item can take the unique value: taken until it lets go", () =>
+    Effect.gen(function* () {
+      const table = seeded(written140.rows)
+      yield* onCodecs(table, (db) =>
+        Effect.gen(function* () {
+          // `u1` holds Asia/Kolkata under its given name, which 1.41.0 doesn't compose, so the
+          // value isn't enforced: `u9` takes it (another `at`, so only `byTz` is contested).
+          yield* db.entities.Unique.put({
+            id: "u9",
+            at: at("Asia/Kolkata", 60_000),
+            tz: zone("Asia/Kolkata"),
+            tzf: zone("Asia/Kolkata"),
+          }).asEffect()
+          const contested = (report: { conflicts: ReadonlyArray<any> }) =>
+            report.conflicts
+              .filter((conflict) => conflict.member === "Unique")
+              .map(({ kind, reason }) => [kind, reason])
+          // Every run reports `u1` taken, its sentinel left where it is: both items hold the value.
+          const first = yield* db.tables.Main.rekey({ repairIndexKeys: true })
+          expect(contested(first)).toEqual([["item", "taken"]])
+          const again = yield* db.tables.Main.rekey({ repairIndexKeys: true })
+          expect(contested(again)).toEqual([["item", "taken"]])
+          expect(again.sentinelsMoved).toBe(0)
+          const keys = keysOf(rowsOf(table)).join("\n")
+          expect(keys).toContain("$zones#v1#unique.bytz#asia/kolkata|")
+          expect(keys).toContain("$zones#v1#unique.bytz#asia/calcutta|")
+          // Once `u9` lets go of it, the next run moves `u1`'s sentinel, which then holds it.
+          yield* db.entities.Unique.delete({ id: "u9" }).asEffect()
+          const after = yield* db.tables.Main.rekey({ repairIndexKeys: true })
+          expect(contested(after)).toEqual([])
+          expect(after.sentinelsMoved).toBe(1)
+          const held = yield* Effect.exit(
+            db.entities.Unique.put({
+              id: "u8",
+              at: at("Asia/Kolkata", 120_000),
+              tz: zone("Asia/Kolkata"),
+              tzf: zone("Asia/Kolkata"),
+            }).asEffect(),
+          )
+          expect(JSON.stringify(held)).toContain("UniqueConstraintViolation")
+        }),
+      )
+    }),
+  )
+
   it.effect("before rekey, an alias zone's rows are unreachable by get, update and delete", () =>
     Effect.gen(function* () {
       const table = seeded(written140.rows)

@@ -5343,7 +5343,10 @@ any key holding nothing: `get` and `update` report `ItemNotFound` (an aggregate'
 `update` and `delete`, `AggregateAssemblyError`), a `delete` reports success and leaves it
 (`ItemNotFound` where it reads the item first: a unique constraint, soft delete), a `put`
 writes a second row, which `rekey` reports as `bothKeys` and leaves, and its unique value
-isn't enforced. The upgrade note says to run `rekey` first. `rekey` alone looks: `givenZoneReading`
+isn't enforced. Another item can take that value: every `rekey` then reports the row
+`taken` and leaves its sentinel where it is, both items holding the value, until the other
+item lets go of it, when the next `rekey` moves the sentinel (`ZoneKeyRekey.test.ts`).
+The upgrade note says to run `rekey` first. `rekey` alone looks: `givenZoneReading`
 (`internal/ZoneKeyText.ts`) takes a row's key-form record and its stored values, walks
 each key-form value as `walkLeaves` walks it, and takes each zone, or each text, under
 the name the row stores at the same place (the same index, property, `Option` value or
