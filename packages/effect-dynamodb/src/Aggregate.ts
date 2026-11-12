@@ -105,7 +105,9 @@ import {
   type Expr,
   emptyPartProblem,
   isEmptyExpr,
+  operandsAsStored,
   parseSimpleShorthand,
+  type StoredFormAt,
 } from "./internal/Expr.js"
 import {
   asReadGuard,
@@ -145,6 +147,7 @@ import {
   toAttributeMap,
   toAttributeValue,
   type UnstorableValue,
+  unstorableIn,
 } from "./Marshaller.js"
 import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
@@ -1727,6 +1730,27 @@ const makeAggregate = <TSchema extends Schema.Top>(
   const attrEncoders = buildAttrEncoders(schemaFields, resolveRef)
   const keyAttrEncoders = buildKeyAttrEncoders(schemaFields)
   const rootEncoders: NodeEncoders = { stored: attrEncoders, key: keyAttrEncoders }
+
+  /**
+   * What the root row stores for a value of a top-level field (#242): its encoder's form. The
+   * value itself where the field has none or it doesn't take the value, or what it gives DynamoDB
+   * can't store, and at a nested path or for an element (the encoders are per attribute). A list
+   * filter's operand that is one of Effect's instances is sent in this form (`operandsAsStored`).
+   */
+  const rootStoredFormAt: StoredFormAt = (segments, value, kind) => {
+    const encode =
+      segments.length === 1 && kind === "value" ? attrEncoders[String(segments[0])] : undefined
+    if (encode === undefined) return value
+    let asGiven = false
+    try {
+      const stored = encode(value, () => {
+        asGiven = true
+      })
+      return asGiven || unstorableIn({ stored }) !== undefined ? value : stored
+    } catch {
+      return value
+    }
+  }
 
   // Decode schema for read/assemble + input validation. Mirrors the raw `schema`
   // but recursively substitutes EVERY date / Redacted / transformed leaf — root
@@ -4237,7 +4261,11 @@ const makeAggregate = <TSchema extends Schema.Top>(
           // Root-item FilterExpression. Compiled once — the same two forms
           // `BoundQuery.filter()` takes, through the same `Expr` compiler, so
           // there is one filter vocabulary rather than a second dialect here.
-          const rootFilter = yield* compileListFilter(options?.filter, aggregateName)
+          const rootFilter = yield* compileListFilter(
+            options?.filter,
+            aggregateName,
+            rootStoredFormAt,
+          )
 
           // Attribute names that make up a resume key on the list index: the index
           // key plus the table key. A `LastEvaluatedKey` supplies them when there
@@ -7556,6 +7584,7 @@ const DELETE_BASE_DELAY_MS = 100
 const compileListFilter = <Model>(
   filter: ListFilter<Model> | undefined,
   aggregateName: string,
+  storedAt: StoredFormAt,
 ): Effect.Effect<CompileResult | undefined, ValidationError> => {
   if (filter === undefined) return Effect.succeed(undefined)
   const expr =
@@ -7575,7 +7604,10 @@ const compileListFilter = <Model>(
       }),
     )
   }
-  return Effect.succeed(isEmptyExpr(expr) ? undefined : compileExpr(expr))
+  // Its operands in the form the root row holds (#242).
+  return Effect.succeed(
+    isEmptyExpr(expr) ? undefined : compileExpr(operandsAsStored(expr, storedAt)),
+  )
 }
 
 // ---------------------------------------------------------------------------

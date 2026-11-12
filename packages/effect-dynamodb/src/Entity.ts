@@ -146,8 +146,10 @@ import {
   emptyPartProblem,
   isExpr,
   nonEmptyCondition,
+  operandsAsStored,
   parseShorthand,
   parseSimpleShorthand,
+  type StoredFormAt,
   toExpr,
 } from "./internal/Expr.js"
 import {
@@ -842,6 +844,12 @@ export interface Entity<
 
   /** @internal Domain field name → stored DynamoDB attribute name (`storedAs` renames). */
   readonly _resolveDbName: (domainName: string) => string
+
+  /**
+   * @internal What a write of a value at a path stores (#242): a condition's or filter's operand
+   * is put in this form (`operandsAsStored`).
+   */
+  readonly _storedFormAt: StoredFormAt
 
   /** @internal Entity schema version baked into composed keys. */
   readonly _entityVersion: number
@@ -2110,7 +2118,8 @@ export interface BoundEntity<
  */
 const compileCondition = (
   cond: Expr | ConditionInput | undefined,
-  resolveDbNameFn?: (name: string) => string,
+  resolveDbNameFn: (name: string) => string,
+  storedFormAt: StoredFormAt,
 ):
   | {
       expression: string
@@ -2120,7 +2129,7 @@ const compileCondition = (
   | undefined => {
   if (cond === undefined) return undefined
   const expr = isExpr(cond) ? cond : parseShorthand(cond)
-  return compileExpr(expr, resolveDbNameFn)
+  return compileExpr(operandsAsStored(expr, storedFormAt), resolveDbNameFn)
 }
 
 /** Name a get- or delete-shaped op for consumed-capacity reports (its builder carries it). */
@@ -2615,6 +2624,23 @@ const makeImpl = <
       uState.pathIfNotExists,
       uState.pathDeletes,
     ].some((ops) => ops !== undefined && ops.length > 0)
+
+  /**
+   * What a write of `value` at `segments` stores (#242): what `pathSet` (`"value"`) or
+   * `pathAppend` (`"element"`, of a one-element list) writes there. `value` itself where the
+   * path's schema doesn't take it, or what it gives DynamoDB can't store: sent as 1.40.0 sent
+   * it. A condition's or filter's operand that is one of Effect's instances is sent in this form
+   * (`operandsAsStored`), so it compares what a row holds.
+   */
+  const storedFormAt: StoredFormAt = (segments, value, kind) => {
+    const { encoded, issue } =
+      kind === "value"
+        ? encodePathValue(segments, value, "value")
+        : encodePathValue(segments, [value], "elements")
+    if (issue !== undefined) return value
+    const stored = kind === "value" ? encoded : Array.isArray(encoded) ? encoded[0] : value
+    return unstorableIn({ stored }) === undefined ? stored : value
+  }
 
   // resolvedRefs carries the actual ref-target entity objects; at runtime they
   // are operational Entities (for runtime-authored refs) so write-time hydration
@@ -7924,7 +7950,9 @@ const makeImpl = <
             opts.putKind === "create" && operation !== "upsert" ? createGuard(self) : undefined,
             opts.condition,
           )
-          let userCondition = condition ? compileCondition(condition, resolveDbName) : undefined
+          let userCondition = condition
+            ? compileCondition(condition, resolveDbName, storedFormAt)
+            : undefined
 
           // `create` over a projection tombstone (#154): the row takes the
           // tombstone's place, its checkpoints and revision carried over, on
@@ -7935,6 +7963,7 @@ const makeImpl = <
               userCondition = compileCondition(
                 withGuard(over.value, opts.condition) as Expr | ConditionInput,
                 resolveDbName,
+                storedFormAt,
               )
             }
           }
@@ -9166,7 +9195,7 @@ const makeImpl = <
             }
           }
         }
-        const uc = userCond ? compileCondition(userCond, resolveDbName) : undefined
+        const uc = userCond ? compileCondition(userCond, resolveDbName, storedFormAt) : undefined
         if (uc) {
           condParts.push(`(${uc.expression})`)
           Object.assign(writeNames, uc.names)
@@ -10146,7 +10175,7 @@ const makeImpl = <
       // A plain write already requires the item (`attribute_exists(#exists)`
       // below), so `patch`'s own exists guard would only repeat it.
       const sentCond = plainWrite ? uState.condition : userCond
-      const uc = sentCond ? compileCondition(sentCond, resolveDbName) : undefined
+      const uc = sentCond ? compileCondition(sentCond, resolveDbName, storedFormAt) : undefined
       if (uc) {
         condParts.push(`(${uc.expression})`)
         Object.assign(names, uc.names)
@@ -10802,7 +10831,9 @@ const makeImpl = <
             opts.condition,
           )
           const userCondition =
-            condition && !existenceOnly ? compileCondition(condition, resolveDbName) : undefined
+            condition && !existenceOnly
+              ? compileCondition(condition, resolveDbName, storedFormAt)
+              : undefined
           /**
            * What the delete returns: with `returnValues("allOld")`, the item it
            * removed — the one read (every read-first delete is guarded on it) or
@@ -11843,7 +11874,9 @@ const makeImpl = <
             names["#intInc"] = INCARNATION_TOKEN
             condParts.push("(attribute_exists(#intVer) OR attribute_not_exists(#intInc))")
           }
-          const uc = opts.condition ? compileCondition(opts.condition, resolveDbName) : undefined
+          const uc = opts.condition
+            ? compileCondition(opts.condition, resolveDbName, storedFormAt)
+            : undefined
           if (uc) {
             condParts.push(`(${uc.expression})`)
             Object.assign(names, uc.names)
@@ -12413,7 +12446,9 @@ const makeImpl = <
       // The user's condition is ANDed after the CAS, its names and values
       // after the CAS's, as 1.36 sent them.
       const uc =
-        userCondition !== undefined ? compileCondition(userCondition, resolveDbName) : undefined
+        userCondition !== undefined
+          ? compileCondition(userCondition, resolveDbName, storedFormAt)
+          : undefined
       const expressionOf = (clauses: ReadonlyArray<string>) =>
         [
           ...(clauses.length > 0 ? [`SET ${clauses.join(", ")}`] : []),
@@ -18104,6 +18139,7 @@ const makeImpl = <
     _decodeRecord: decodeRecord,
     /** @internal Domain field name → stored attribute name (`storedAs` renames). */
     _resolveDbName: resolveDbName,
+    _storedFormAt: storedFormAt,
     /** @internal Entity schema version baked into composed keys. */
     _entityVersion: entityVersion,
     _serializeSparseFields: serializeSparseFields,
@@ -18375,7 +18411,7 @@ export const bind = <
         pathBuilder: createPathBuilder(),
         conditionOps: createConditionOps(),
         provide,
-        ...entityNaming(entity._resolveDbName),
+        ...entityNaming(entity._resolveDbName, entity._storedFormAt),
         operation: { name: operation, target: entity.entityType },
       }
       return new BoundQueryImpl(
@@ -18746,7 +18782,7 @@ export const bind = <
           provide,
           skFields: orderBy ? [orderBy] : [],
           composeSkCondition,
-          ...entityNaming(entity._resolveDbName),
+          ...entityNaming(entity._resolveDbName, entity._storedFormAt),
           operation: { name: "Entity.history", target: entity.entityType },
         }
         return new BoundQueryImpl(q, bqConfig)

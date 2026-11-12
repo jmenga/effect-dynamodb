@@ -18,10 +18,11 @@ import type { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { Effect, Stream } from "effect"
 import type { DynamoClientError } from "../DynamoClient.js"
+import { toAttributeValue } from "../Marshaller.js"
 import * as Query from "../Query.js"
 import * as Capacity from "./Capacity.js"
-import type { ConditionOps, ConditionShorthand, Expr } from "./Expr.js"
-import { ExprTag, parseSimpleShorthand } from "./Expr.js"
+import type { ConditionOps, ConditionShorthand, Expr, StoredFormAt } from "./Expr.js"
+import { ExprTag, operandsAsStored, parseSimpleShorthand } from "./Expr.js"
 import { type PackedPath, type Path, type PathBuilder, storedPath } from "./PathBuilder.js"
 
 /**
@@ -627,14 +628,24 @@ const pathHeads = (node: unknown, into: Set<string> = new Set()): Set<string> =>
  * @internal An entity's naming (#133): filters and selects name the stored
  * attribute of each renamed field. A select of no renamed field stays the
  * plain projection, so an entity without renames sends what it always sent.
+ * With `storedAt`, a filter's operand that is one of Effect's instances is
+ * sent in the form the attribute holds (`operandsAsStored`, #242), judged by
+ * the domain path before it's renamed.
  */
 export const entityNaming = (
   resolve: ((domainName: string) => string) | undefined,
+  storedAt?: StoredFormAt,
 ): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> =>
   resolve === undefined
-    ? {}
+    ? storedAt === undefined
+      ? {}
+      : { renameExpr: (expr) => operandsAsStored(expr, storedAt) }
     : {
-        renameExpr: (expr) => renamePaths(expr, resolve) as Expr,
+        renameExpr: (expr) =>
+          renamePaths(
+            storedAt === undefined ? expr : operandsAsStored(expr, storedAt),
+            resolve,
+          ) as Expr,
         selectAs: (query, paths, form) =>
           paths.some((path) => typeof path[0] === "string" && resolve(path[0]) !== path[0])
             ? Query.selectRenamed(query, paths, resolve)
@@ -656,6 +667,8 @@ export const collectionNaming = (
     readonly resolve: (domainName: string) => string
     /** The member's domain field names, when known: filters and selects name only these. */
     readonly fields?: ReadonlySet<string> | undefined
+    /** What a write of a value at a path of the member's stores (#242): see {@link entityNaming}. */
+    readonly storedAt?: StoredFormAt | undefined
   }>,
 ): Pick<BoundQueryConfig<unknown>, "renameExpr" | "selectAs"> => {
   /**
@@ -678,20 +691,27 @@ export const collectionNaming = (
       const heads = [...pathHeads(expr)]
       const first = members[0]
       if (first === undefined) return expr
-      // Every member reads the same attributes: one expression, as before.
+      // Each member's operands in the form its attributes hold (#242).
+      const stored = members.map((m) =>
+        m.storedAt === undefined ? expr : operandsAsStored(expr, m.storedAt),
+      )
+      // Every member reads the same attributes, each operand in the same form: one expression,
+      // as before.
       if (
-        members.every((m) =>
-          heads.every((head) => attributeOf(m, head) === attributeOf(first, head)),
+        members.every(
+          (m, at) =>
+            heads.every((head) => attributeOf(m, head) === attributeOf(first, head)) &&
+            sameOperands(stored[at]!, stored[0]!),
         )
       ) {
-        return renamePaths(expr, (head) => attributeOf(first, head)) as Expr
+        return renamePaths(stored[0], (head) => attributeOf(first, head)) as Expr
       }
-      // They differ: each member's rows judged by its own attributes.
+      // They differ: each member's rows judged by its own attributes and forms.
       return {
         [ExprTag]: ExprTag,
         _tag: "or",
         exprs: members.map(
-          (m): Expr => ({
+          (m, at): Expr => ({
             [ExprTag]: ExprTag,
             _tag: "and",
             exprs: [
@@ -701,7 +721,7 @@ export const collectionNaming = (
                 left: { _tag: "path", segments: ["__edd_e__"] },
                 right: { _tag: "value", value: m.entityType },
               } as Expr,
-              renamePaths(expr, (head) => attributeOf(m, head)) as Expr,
+              renamePaths(stored[at], (head) => attributeOf(m, head)) as Expr,
             ],
           }),
         ),
@@ -735,6 +755,51 @@ export const collectionNaming = (
       })
     },
   }
+}
+
+/** The value operands of an expression, in order. */
+const operandValues = (node: unknown, into: Array<unknown> = []): Array<unknown> => {
+  if (Array.isArray(node)) {
+    for (const item of node) operandValues(item, into)
+    return into
+  }
+  if (node === null || typeof node !== "object") return into
+  const record = node as { readonly _tag?: unknown; readonly value?: unknown }
+  if (record._tag === "value") {
+    into.push(record.value)
+    return into
+  }
+  if (record._tag === "path" || record._tag === "size") return into
+  for (const value of Object.values(record)) operandValues(value, into)
+  return into
+}
+
+/** The attribute value an operand is sent as, or `undefined` where it can't be sent. */
+const sentAs = (value: unknown): string | undefined => {
+  try {
+    return JSON.stringify(toAttributeValue(value))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether two members send an expression's operands alike (#242): the same operand, or ones sent
+ * as the same attribute value. `operandsAsStored` hands an expression back as it is when it puts
+ * no operand in another form, so a filter holding none of Effect's instances is never marshalled
+ * here.
+ */
+const sameOperands = (a: Expr, b: Expr): boolean => {
+  if (a === b) return true
+  const [left, right] = [operandValues(a), operandValues(b)]
+  return (
+    left.length === right.length &&
+    left.every((value, at) => {
+      if (Object.is(value, right[at])) return true
+      const sent = sentAs(value)
+      return sent !== undefined && sent === sentAs(right[at])
+    })
+  )
 }
 
 /** An attribute no item ever has (#133): see {@link collectionNaming}. */

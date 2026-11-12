@@ -301,6 +301,101 @@ export const not = (expr: Expr): Expr => ({
 })
 
 // ---------------------------------------------------------------------------
+// Operands in the form the attribute holds (#242)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a write of `value` at the attribute path `segments` (domain names) stores: the value
+ * (`"value"`), or one element of the list there (`"element"`). `value` itself where the path's
+ * schema doesn't take it. Each entity supplies its own (`Entity._storedFormAt`).
+ */
+export type StoredFormAt = (
+  segments: ReadonlyArray<string | number>,
+  value: unknown,
+  kind: "value" | "element",
+) => unknown
+
+/**
+ * One of Effect's own instances (a `DateTime`, a zone, a `Duration`, a `BigDecimal`, a
+ * `Redacted`, an `Option`, …): an object whose prototype carries one of Effect's markers
+ * (`~effect/…`). The map DynamoDB hands back for one carries its marker as its own, so it isn't
+ * one. Reads property names only, never a value.
+ */
+const isEffectInstance = (value: unknown): boolean => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
+  for (
+    let at = Object.getPrototypeOf(value);
+    at !== null && at !== Object.prototype;
+    at = Object.getPrototypeOf(at)
+  ) {
+    if (Object.getOwnPropertyNames(at).some((key) => key.startsWith("~effect/"))) return true
+  }
+  return false
+}
+
+/**
+ * A condition's or filter's operands in the form the attribute each is compared with holds
+ * (#242). An operand that is one of Effect's instances is sent as `storedAt` gives it for the
+ * path it's compared with: what a write of it there stores. It was sent as the instance's map,
+ * which no row holds where the field stores the value another way: `eq(t.at, at)` on a
+ * `Schema.DateTimeZoned` compared that map with the ISO text the row holds, and never matched.
+ * A comparison, `between` and `in` compare the path's value; `contains` an element of it. Every
+ * other operand (a primitive, a plain object, a `Date`, one compared with no path, a
+ * `begins_with` prefix) is sent as given, and an expression holding none is returned as it is.
+ */
+export const operandsAsStored = (expr: Expr, storedAt: StoredFormAt): Expr => {
+  const asStored = (
+    operand: Operand,
+    path: Operand | undefined,
+    kind: "value" | "element",
+  ): Operand => {
+    if (path?._tag !== "path" || operand._tag !== "value" || !isEffectInstance(operand.value)) {
+      return operand
+    }
+    const stored = storedAt(path.segments, operand.value, kind)
+    return Object.is(stored, operand.value) ? operand : { _tag: "value", value: stored }
+  }
+  const same = (a: ReadonlyArray<unknown>, b: ReadonlyArray<unknown>): boolean =>
+    a.every((item, at) => item === b[at])
+  switch (expr._tag) {
+    case "eq":
+    case "ne":
+    case "lt":
+    case "lte":
+    case "gt":
+    case "gte": {
+      const left = asStored(expr.left, expr.right, "value")
+      const right = asStored(expr.right, expr.left, "value")
+      return left === expr.left && right === expr.right ? expr : { ...expr, left, right }
+    }
+    case "between": {
+      const low = asStored(expr.low, expr.operand, "value")
+      const high = asStored(expr.high, expr.operand, "value")
+      return low === expr.low && high === expr.high ? expr : { ...expr, low, high }
+    }
+    case "in": {
+      const values = expr.values.map((value) => asStored(value, expr.operand, "value"))
+      return same(values, expr.values) ? expr : { ...expr, values }
+    }
+    case "contains": {
+      const value = asStored(expr.value, expr.operand, "element")
+      return value === expr.value ? expr : { ...expr, value }
+    }
+    case "and":
+    case "or": {
+      const exprs = expr.exprs.map((part) => operandsAsStored(part, storedAt))
+      return same(exprs, expr.exprs) ? expr : { ...expr, exprs }
+    }
+    case "not": {
+      const inner = operandsAsStored(expr.expr, storedAt)
+      return inner === expr.expr ? expr : { ...expr, expr: inner }
+    }
+    default:
+      return expr
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Compiler — convert Expr ADT to DynamoDB expression string
 // ---------------------------------------------------------------------------
 

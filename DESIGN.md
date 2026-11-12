@@ -3681,6 +3681,35 @@ error, and the rejection is diagnosed into a `ValidationError` naming the
 `compileExpr` itself throws on anything `emptyPartProblem` refuses, so no
 caller can compile one by skipping the check — reaching it is a library bug.
 
+**Operands in the form the attribute holds (#242).** A condition's or filter's
+operand that is one of Effect's instances (its prototype carries one of
+Effect's `~effect/…` markers: a `DateTime`, a zone, a `Duration`, a
+`BigDecimal`, a `Redacted`, an `Option`, …) is sent as a write of it at the path
+it's compared with stores it. `operandsAsStored` (`internal/Expr.ts`) is the one
+place that decides; the stored form is the entity's `_storedFormAt`, which is
+`pathSet`'s encoder (`pathAppend`'s, of one element, for `contains`), and an
+aggregate `list` filter's is the root's attribute encoder for a top-level field
+(anywhere else, as given). Through 1.40.0 the instance was sent as its map, which
+no row holds where the field stores the value another way: `eq(t.at, at)` on a
+`Schema.DateTimeZoned` compared that map with the ISO text the row holds and
+never matched, and a condition naming it always failed; likewise a
+`Schema.DateTimeUtc` (ISO text, or a number under `storedAs`), a `Redacted` (its
+value) and a `Schema.DurationFromMillis` (a number). It covers each comparator,
+`between`, `isIn` and `contains`, in a callback or shorthand, in an entity's
+conditions (put, update, delete, `append`, a planned or transactional op's), a
+query's, scan's, `history`'s and `deleted.list`'s filter, a collection's (members
+that hold the operand in different forms are judged each by its own, in the `OR`
+over `__edd_e__` that renamed fields already use) and an aggregate's `list`
+filter. An instance whose map is the stored form (a zone, a `Duration`, a
+`BigDecimal`, an `Option` of a number, any value of an untyped field) is the
+bytes 1.40.0 sent, and an operand that isn't an instance (a primitive, a
+`Date`, a plain map, a path), a `begins_with` prefix, and one the path's schema
+doesn't take or whose stored form DynamoDB can't store, are sent as given. A
+`.where()` bound composes key text through the key form, as it did.
+`Transaction.check` takes a condition `Expression.condition` compiled with no
+entity, so its operand is still the instance's map. Pinned by
+`OperandsAsStored.test.ts` and `connected.operands-as-stored.test.ts`.
+
 **`patch` and missing items (#134).** `patch()` of a missing item fails with
 `ConditionalCheckFailed` on every path — including those that read first
 (retain, a unique-field change), which used to report `ItemNotFound`. A plain
