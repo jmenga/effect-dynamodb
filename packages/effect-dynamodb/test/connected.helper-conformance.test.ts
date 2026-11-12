@@ -3604,6 +3604,99 @@ const TIES: ReadonlyArray<Row> = [
   ),
 ]
 
+// Pages read past rows of one index key: ties before the start key are never read, so only ties on
+// the page itself count. On gsi1 (gpk "w": gsk 1, 2, 3, 3, 4; gpk "v": 1, 1, 2, 3) and on lsi1
+// (pk "l": lsk 1, 2, 3, 3, 4; pk "m": 1, 1, 2, 3).
+const SPREAD = ["1", "2", "3", "3", "4"]
+const EARLY = ["1", "1", "2", "3"]
+const TIED_PAGES: ReadonlyArray<Seed> = seeded([
+  ...SPREAD.map((gsk, i) => ({ pk: S(`w${i}`), sk: S("s"), gpk: S("w"), gsk: S(gsk) })),
+  ...EARLY.map((gsk, i) => ({ pk: S(`v${i}`), sk: S("s"), gpk: S("v"), gsk: S(gsk) })),
+  ...SPREAD.map((lsk, i) => ({ pk: S("l"), sk: S(`${i}`), lsk: S(lsk) })),
+  ...EARLY.map((lsk, i) => ({ pk: S("m"), sk: S(`${i}`), lsk: S(lsk) })),
+])
+const pageAfter = (
+  label: string,
+  index: "gsi1" | "lsi1",
+  partition: string,
+  start: Item,
+  extra: object,
+) =>
+  brief(
+    `ties: ${index}, ${label}`,
+    "Query",
+    index === "gsi1"
+      ? kc(
+          "gpk = :g",
+          { ":g": S(partition) },
+          { IndexName: index, ExclusiveStartKey: start, ...extra },
+        )
+      : kc(
+          "pk = :p",
+          { ":p": S(partition) },
+          { IndexName: index, ExclusiveStartKey: start, ...extra },
+        ),
+    TIED_PAGES,
+  )
+const gsiRow = (pk: string, gpk: string, gsk: string): Item => ({
+  pk: S(pk),
+  sk: S("s"),
+  gpk: S(gpk),
+  gsk: S(gsk),
+})
+const lsiRow = (pk: string, sk: string, lsk: string): Item => ({
+  pk: S(pk),
+  sk: S(sk),
+  lsk: S(lsk),
+})
+const TIE_PAGES: ReadonlyArray<Row> = [
+  pageAfter("ties before the start key, Limit 1", "gsi1", "v", gsiRow("v2", "v", "2"), {
+    Limit: 1,
+  }),
+  pageAfter("ties before the start key", "gsi1", "v", gsiRow("v2", "v", "2"), {}),
+  pageAfter("reverse, ties before the start key, Limit 1", "gsi1", "w", gsiRow("w1", "w", "2"), {
+    Limit: 1,
+    ScanIndexForward: false,
+  }),
+  pageAfter("ties inside the page, Limit 3, COUNT", "gsi1", "w", gsiRow("w1", "w", "2"), {
+    Limit: 3,
+    Select: "COUNT",
+  }),
+  pageAfter("reverse, ties inside the page, Limit 3, COUNT", "gsi1", "w", gsiRow("w4", "w", "4"), {
+    Limit: 3,
+    ScanIndexForward: false,
+    Select: "COUNT",
+  }),
+  pageAfter("a Limit splitting ties past the start key", "gsi1", "w", gsiRow("w1", "w", "2"), {
+    Limit: 1,
+    Select: "COUNT",
+  }),
+  pageAfter("a Limit stopping on the last of ties", "gsi1", "w", gsiRow("w1", "w", "2"), {
+    Limit: 2,
+    Select: "COUNT",
+  }),
+  pageAfter("ties before the start key, Limit 1", "lsi1", "m", lsiRow("m", "2", "2"), { Limit: 1 }),
+  pageAfter("reverse, ties before the start key, Limit 1", "lsi1", "l", lsiRow("l", "1", "2"), {
+    Limit: 1,
+    ScanIndexForward: false,
+  }),
+  pageAfter("ties inside the page, Limit 3, COUNT", "lsi1", "l", lsiRow("l", "1", "2"), {
+    Limit: 3,
+    Select: "COUNT",
+  }),
+  pageAfter(
+    "reverse, a Limit splitting ties past the start key",
+    "lsi1",
+    "m",
+    lsiRow("m", "2", "2"),
+    {
+      Limit: 1,
+      ScanIndexForward: false,
+      Select: "COUNT",
+    },
+  ),
+]
+
 // Numbers as each write stores them.
 const SPELLINGS = [
   "1.50",
@@ -3780,6 +3873,1188 @@ const PROTO: ReadonlyArray<Row> = [
 ]
 
 // ---------------------------------------------------------------------------
+// Values DynamoDB refuses, nesting, operator counts, parentheses, key conditions, request members
+// ---------------------------------------------------------------------------
+
+/** `inner` inside `levels` lists (`L`), maps (`M`), or both by turns (`LM`). */
+const nested = (
+  levels: number,
+  kind: "L" | "M" | "LM",
+  inner: AttributeValue = S("x"),
+): AttributeValue => {
+  let value = inner
+  for (let at = 0; at < levels; at++) {
+    value = kind === "L" || (kind === "LM" && at % 2 === 0) ? { L: [value] } : { M: { k: value } }
+  }
+  return value
+}
+/** A value as the AWS SDK sends it, whatever its type says. */
+const sent = (value: object) => value as AttributeValue
+const VK = (id: string): Item => ({ pk: S(id), sk: S("s") })
+const putOf = (label: string, attributes: Item, extra: object = {}): FullBrief => [
+  label,
+  "PutItem",
+  { TableName: "$T", Item: { ...VK("v"), ...attributes }, ...extra },
+]
+const tw1 = (label: string, ...items: ReadonlyArray<object>): FullBrief => [
+  label,
+  "TransactWriteItems",
+  { TransactItems: items },
+]
+const twPut = (item: Item, extra: object = {}) => ({
+  Put: { TableName: "$T", Item: item, ...extra },
+})
+const twUpdate = (expression: string | undefined, values?: Item, extra: object = {}) => ({
+  Update: {
+    TableName: "$T",
+    Key: KEY,
+    ...(expression !== undefined && { UpdateExpression: expression }),
+    ...(expression !== undefined && { ExpressionAttributeNames: namesIn(expression) }),
+    ...(values !== undefined && { ExpressionAttributeValues: values }),
+    ...extra,
+  },
+})
+
+/** Values and names DynamoDB refuses, in items, keys and expressions; and nesting past its limits. */
+const VALUES: ReadonlyArray<FullBrief> = [
+  putOf("a map key that is empty", { m: { M: { "": N("1") } } }),
+  putOf("an attribute name that is empty", { "": S("x") }),
+  putOf("an empty map key in a list", { l: { L: [{ M: { "": N("1") } }] } }),
+  putOf("an empty map key before a bad number", { m: { M: { "": N("1"), a: N("x") } } }),
+  putOf("a bad number before an empty map key", { m: { M: { a: N("x"), "": N("1") } } }),
+  putOf("an empty name before a bad number", { "": S("x"), a: N("x") }),
+  putOf("a bad number before an empty name", { a: N("x"), "": S("x") }),
+  putOf("NULL false", { x: sent({ NULL: false }) }),
+  putOf("a value of two types", { x: sent({ S: "a", N: "1" }) }),
+  putOf("a value of no type", { x: sent({}) }),
+  putOf("a number sent as a number", { x: sent({ N: 5 }) }),
+  putOf("a list holding a value of two types", { l: { L: [sent({ S: "a", N: "1" })] } }),
+  putOf("a map holding NULL false", { m: { M: { k: sent({ NULL: false }) } } }),
+  putOf("a key of no type", { pk: sent({}) }),
+  putOf("lists 31 deep", { d: nested(31, "L") }),
+  putOf("lists 32 deep", { d: nested(32, "L") }),
+  putOf("maps 31 deep", { d: nested(31, "M") }),
+  putOf("maps 32 deep", { d: nested(32, "M") }),
+  putOf("lists and maps 32 deep", { d: nested(32, "LM") }),
+  putOf("an empty map, 31 deep", { d: nested(30, "M", { M: {} }) }),
+  putOf("an empty list, 32 deep", { d: nested(31, "M", { L: [] }) }),
+  putOf("maps 32 deep before a bad number", { d: nested(32, "M"), e: N("x") }),
+  putOf("a bad number before maps 32 deep", { e: N("x"), d: nested(32, "M") }),
+  putOf("maps 32 deep holding a bad number", { d: nested(32, "M", N("x")) }),
+  [
+    "a key holding maps 32 deep, the key missing",
+    "PutItem",
+    { TableName: "$T", Item: { pk: S("v"), d: nested(32, "M") } },
+  ],
+  ["set a to maps 31 deep", ...RU("SET #a = :d", { "#a": "a" }, { ":d": nested(31, "M") })],
+  ["set a to maps 32 deep", ...RU("SET #a = :d", { "#a": "a" }, { ":d": nested(32, "M") })],
+  ["set a to maps 33 deep", ...RU("SET #a = :d", { "#a": "a" }, { ":d": nested(33, "M") })],
+  [
+    "set m.k to maps 30 deep",
+    ...RU("SET #m.#k = :d", { "#m": "m", "#k": "k" }, { ":d": nested(30, "M") }),
+  ],
+  [
+    "set m.k to maps 31 deep",
+    ...RU("SET #m.#k = :d", { "#m": "m", "#k": "k" }, { ":d": nested(31, "M") }),
+  ],
+  [
+    "set a to maps 32 deep, the condition failing",
+    ...RU(
+      "SET #a = :d",
+      { "#a": "a", "#n": "n" },
+      { ":d": nested(32, "M"), ":one": N("1") },
+      { ConditionExpression: "#n = :one" },
+    ),
+  ],
+  [
+    "set a to maps 32 deep, and pk",
+    ...RU(
+      "SET #a = :d, #pk = :v",
+      { "#a": "a", "#pk": "pk" },
+      { ":d": nested(32, "M"), ":v": S("q") },
+    ),
+  ],
+  [
+    "set a to maps 32 deep, and x to a missing attribute",
+    ...RU(
+      "SET #a = :d, #x = #zz",
+      { "#a": "a", "#x": "x", "#zz": "zz" },
+      { ":d": nested(32, "M") },
+    ),
+  ],
+  ["set m.e, #e an empty name", ...RU("SET #m.#e = :v", { "#m": "m", "#e": "" }, { ":v": N("1") })],
+  [
+    "a value 32 deep holding a bad number",
+    ...RU("SET #a = :d", { "#a": "a" }, { ":d": nested(32, "M", N("x")) }),
+  ],
+  [
+    "a value holding an empty map key",
+    ...RU("SET #a = :d", { "#a": "a" }, { ":d": { M: { "": N("1") } } }),
+  ],
+  tw1("a put holding an empty map key", twPut({ ...VK("t1"), m: { M: { "": N("1") } } })),
+  tw1("a put of maps 32 deep", twPut({ ...VK("t1"), d: nested(32, "M") })),
+  tw1(
+    "a check, then a put of a bad number",
+    tCheck(KEY, "attribute_exists(pk)"),
+    twPut({ ...VK("t2"), n: N("x") }),
+  ),
+  tw1("an update leaving maps 32 deep", twUpdate("SET #a = :d", { ":d": nested(32, "M") })),
+  tw1(
+    "a failing check, then an update leaving maps 32 deep",
+    tCheck(KEY, "attribute_not_exists(pk)"),
+    twUpdate("SET #a = :d", { ":d": nested(32, "M") }, { Key: VK("t3") }),
+  ),
+  tw1("a check of a value of two types", {
+    ConditionCheck: {
+      TableName: "$T",
+      Key: KEY,
+      ConditionExpression: "#n = :v",
+      ExpressionAttributeNames: { "#n": "n" },
+      ExpressionAttributeValues: { ":v": sent({ S: "a", N: "1" }) },
+    },
+  }),
+  tw1("a delete of a key holding an empty name", {
+    Delete: { TableName: "$T", Key: { ...KEY, "": S("x") } },
+  }),
+  [
+    "a put holding an empty map key",
+    "BatchWriteItem",
+    { RequestItems: { $T: [{ PutRequest: { Item: { ...VK("b1"), m: { M: { "": N("1") } } } } }] } },
+  ],
+  [
+    "a put of lists 32 deep",
+    "BatchWriteItem",
+    { RequestItems: { $T: [{ PutRequest: { Item: { ...VK("b1"), d: nested(32, "L") } } }] } },
+  ],
+  [
+    "a key holding a bad number",
+    "BatchGetItem",
+    { RequestItems: { $T: { Keys: [{ pk: S("p"), sk: N("x") }] } } },
+  ],
+  [
+    "a key of two types",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: { pk: S("p"), sk: sent({ S: "s", N: "1" }) } } },
+      ],
+    },
+  ],
+  [
+    "a key with another attribute holding a bad number",
+    "GetItem",
+    { TableName: "$T", Key: { ...KEY, x: N("x") } },
+  ],
+  [
+    "a start key of two types",
+    "Query",
+    {
+      TableName: "$T",
+      KeyConditionExpression: "pk = :p",
+      ExpressionAttributeValues: { ":p": S("p") },
+      ExclusiveStartKey: { pk: S("p"), sk: sent({ S: "s", N: "1" }) },
+    },
+  ],
+]
+
+const ors = (n: number) => Array.from({ length: n }, () => "#n = :one").join(" OR ")
+const sizes = (n: number) => Array.from({ length: n }, () => "size(#l) > :one").join(" AND ")
+/** `n` actions of one `+` each, kept short: an update expression holds at most 4 KB. */
+const sums = (n: number, from = 0) =>
+  Array.from({ length: n }, (_, at) => `#${at + from}=:o+:o`).join(",")
+const sumNames = (n: number, from = 0) =>
+  Object.fromEntries(Array.from({ length: n }, (_, at) => [`#${at + from}`, `a${at + from}`]))
+/** `n` actions of `if_not_exists` and `+` each (two operators). */
+const guardedSums = (n: number) =>
+  Array.from({ length: n }, (_, at) => `#i${at}=if_not_exists(#i${at},:o)+:o`).join(",")
+const guardedNames = (n: number) =>
+  Object.fromEntries(Array.from({ length: n }, (_, at) => [`#i${at}`, `i${at}`]))
+const deepPath = (segments: number) =>
+  ["#n", ...Array.from({ length: segments - 1 }, () => "#k")].join(".")
+const conditioned = (label: string, expr: string, values: Record<string, AttributeValue> = {}) =>
+  conditionRow({ label, expr, names: namesIn(expr), values: valuesIn(expr, { ...V, ...values }) })
+
+/** Operator counts (300 at most) and document paths (32 segments at most). */
+const LIMITS: ReadonlyArray<Row> = [
+  conditioned("150 comparisons ORed (299 operators)", ors(150)),
+  conditioned("NOT, then 150 comparisons ORed (300 operators)", `NOT (${ors(150)})`),
+  conditioned("151 comparisons ORed (301 operators)", ors(151)),
+  conditioned("201 comparisons ORed (401 operators)", ors(201)),
+  conditioned("100 sizes compared (299 operators)", sizes(100)),
+  conditioned("101 sizes compared (302 operators)", sizes(101)),
+  conditioned("301 operators, then an undefined value", `${ors(151)} OR #n = :zz`),
+  conditioned("301 operators, then a value of the wrong type", `${ors(151)} OR #n < :m`),
+  conditionRow({
+    label: "301 operators, a value unused",
+    expr: ors(151),
+    names: { "#n": "n" },
+    values: { ":one": N("1"), ":unused": N("2") },
+  }),
+  conditioned("a path of 32 segments", `${deepPath(32)} = :one`),
+  conditioned("a path of 33 segments", `${deepPath(33)} = :one`),
+  conditionRow({
+    label: "a path of 33 segments, holding an undefined name",
+    expr: `${deepPath(32)}.#u = :one`,
+    names: { "#n": "n", "#k": "k" },
+    values: { ":one": N("1") },
+  }),
+  conditionRow({
+    label: "an undefined name, then a path of 33 segments",
+    expr: `#u = :one AND ${deepPath(33)} = :one`,
+    names: { "#n": "n", "#k": "k" },
+    values: { ":one": N("1") },
+  }),
+  conditioned(
+    "a path of 33 segments, then an undefined value",
+    `${deepPath(33)} = :one AND #n = :zz`,
+  ),
+  fullRow(["300 sums", ...RU(`SET ${sums(300)}`, sumNames(300), { ":o": N("1") })]),
+  fullRow(["301 sums", ...RU(`SET ${sums(301)}`, sumNames(301), { ":o": N("1") })]),
+  fullRow([
+    "301 sums, then an undefined value",
+    ...RU(`SET ${sums(301)},#n=:zz`, { ...sumNames(301), "#n": "n" }, { ":o": N("1") }),
+  ]),
+  fullRow([
+    "280 sums and 10 if_not_exists sums (300 operators)",
+    ...RU(
+      `SET ${sums(280)},${guardedSums(10)}`,
+      { ...sumNames(280), ...guardedNames(10) },
+      { ":o": N("1") },
+    ),
+  ]),
+  fullRow([
+    "281 sums and 10 if_not_exists sums (301 operators)",
+    ...RU(
+      `SET ${sums(281)},${guardedSums(10)}`,
+      { ...sumNames(281), ...guardedNames(10) },
+      { ":o": N("1") },
+    ),
+  ]),
+  fullRow([
+    "a path of 33 segments",
+    ...RU(`SET ${deepPath(33)} = :one`, { "#n": "n", "#k": "k" }, { ":one": N("1") }),
+  ]),
+  fullRow([
+    "a path of 33 segments, after an undefined value",
+    ...RU(
+      `SET #a = :zz, ${deepPath(33)} = :one`,
+      { "#a": "a", "#n": "n", "#k": "k" },
+      { ":one": N("1") },
+    ),
+  ]),
+  fullRow([
+    "a projection of 33 segments",
+    "GetItem",
+    {
+      TableName: "$T",
+      Key: KEY,
+      ProjectionExpression: deepPath(33),
+      ExpressionAttributeNames: { "#n": "n", "#k": "k" },
+    },
+  ]),
+  fullRow([
+    "a projection of 32 segments",
+    "GetItem",
+    {
+      TableName: "$T",
+      Key: KEY,
+      ProjectionExpression: deepPath(32),
+      ExpressionAttributeNames: { "#n": "n", "#k": "k" },
+    },
+  ]),
+  queryRow(
+    "a filter of 301 operators",
+    {
+      FilterExpression: ors(151),
+      ExpressionAttributeNames: { "#n": "n" },
+      ExpressionAttributeValues: { ":one": N("1") },
+    },
+    "Scan",
+  ),
+  queryRow("a key condition of 301 operators", {
+    KeyConditionExpression: `pk = :p AND ${Array.from({ length: 150 }, () => "sk = :p").join(" AND ")} AND (${ors(75)})`,
+    ExpressionAttributeNames: { "#n": "n" },
+    ExpressionAttributeValues: { ":p": S("q"), ":one": N("1") },
+  }),
+  queryRow("a key condition of 301 operators, a nested key", {
+    KeyConditionExpression: `pk.a = :p AND ${Array.from({ length: 300 }, () => "sk = :p").join(" AND ")}`,
+    ExpressionAttributeValues: { ":p": S("q") },
+  }),
+]
+
+/** Parentheses round operands, `size` of a value, functions where they can't be, empty expressions. */
+const OPERAND_GROUPS: ReadonlyArray<BriefCondition> = [
+  "(#n) = :five",
+  "#n = (:five)",
+  "size((#l)) > :one",
+  "#n IN ((:one), :five)",
+  "#n BETWEEN (:one) AND (:five)",
+  "attribute_exists((#n))",
+  "begins_with((#s), (:s))",
+  "(size(#l)) > (:one)",
+  "(:five) = #n",
+  "NOT (#n) = :one",
+  "(#n) BETWEEN :one AND :five",
+  "(#n) IN (:five)",
+  "(#m).k = :one",
+  "(#l)[0] = :one",
+  "(#n)",
+  "((#n)) = :one",
+  "#n = ()",
+  "(:one, :one)",
+  "(#n) AND #n = :one",
+  "((#n = :five))",
+  "(#n = :five)",
+  "attribute_exists(#n) = :one",
+  "attribute_exists(#n) BETWEEN :one AND :five",
+  ":one = attribute_exists(#n)",
+  "contains(#s, :s) IN (:one)",
+  "attribute_exists(#n) AND #n = :five",
+  "foo(#n) = :one",
+  "foo(#n)",
+  "(size(#l))",
+  "size(#l)",
+  ["size(:t) = :three", { ":t": S("é\u{1F600}"), ":three": N("3") }],
+  ["size(:t) = :two", { ":t": S("é\u{1F600}"), ":two": N("2") }],
+  "size(:five) > :one",
+  "size(:bool) > :one",
+  "size(:nul) > :one",
+  "size(size(#l)) > :one",
+  "size(:L) = :one",
+  "size(:m) = :one",
+  "size(:b) = :one",
+  "size(:ss) = :one",
+  "begins_with(size(#l), :s)",
+  "contains(size(#l), :one)",
+  "begins_with(:s, :s)",
+  "#n = :zz AND foo(#n)",
+  "#n = :zz AND size(:five) > :one",
+  "size(:five) > :one AND #n = :zz",
+]
+
+/** Update expressions: operand groups, functions where they can't be, which problem is reported. */
+const UPDATE_GROUPS: ReadonlyArray<Brief> = [
+  "SET #a = (:v)",
+  "SET #n = (#n) + (:v)",
+  "SET #n = (#n + :v)",
+  "SET #n = ((#n) + :v)",
+  "SET #a = if_not_exists((#a), :v)",
+  "SET #a = (if_not_exists(#a, :v))",
+  "SET #a = (if_not_exists(#a, :v)) + :v",
+  "SET #l = list_append((#l), :L)",
+  "SET #a = ((:v))",
+  "SET #a = :v + ((:v))",
+  "SET #a = (:v + :v) + :v",
+  "SET #a = :v + (:v + :v)",
+  "SET #a = if_not_exists(#a, (:v + :v))",
+  "SET #a = if_not_exists(#a, :v + :v)",
+  "SET #l = list_append(#l, :v + :v)",
+  "SET (#a) = :v",
+  "REMOVE (#a)",
+  "ADD #a (:v)",
+  "SET #a = list_append(list_append(#l, :L), :L)",
+  "SET #a = if_not_exists(#a, list_append(#l, :L))",
+  "SET #a = list_append(if_not_exists(#l, :L), :L)",
+  "SET #a = if_not_exists(#a, if_not_exists(#b, :v))",
+  "SET #a = list_append(#l, :L) + :v",
+  "SET #a = size(#l)",
+  "SET #a = foo(#l)",
+  "SET #a = foo(#l), #b = list_append(list_append(#l, :L), :L)",
+  "SET #a = list_append(list_append(#l, :L), :L), #b = foo(#l)",
+  "SET #a = :v, #a = :w, #b = foo(#l)",
+]
+
+/** The names `expression` uses, `#nope` and `#u` left undefined. */
+const definedIn = (expression: string) =>
+  Object.fromEntries(
+    Object.entries(namesIn(expression)).filter(([key]) => key !== "#nope" && key !== "#u"),
+  )
+/** Which of several problems an update reports, read as written. */
+const WALKS: ReadonlyArray<FullBrief> = [
+  [
+    "walk: undefined value, then undefined name",
+    ...RU("SET #a = :zz, #b.#c = :v", names("a", "b"), { ":v": N("1") }),
+  ],
+  [
+    "walk: undefined name, then undefined value",
+    ...RU("SET #b.#c = :v, #a = :zz", names("a", "b"), { ":v": N("1") }),
+  ],
+  [
+    "walk: if_not_exists of a value, then undefined name",
+    ...RU("SET #a = if_not_exists(:v, :v), #b.#c = :v", names("a", "b"), { ":v": N("1") }),
+  ],
+  [
+    "walk: undefined name, then if_not_exists of a value",
+    ...RU("SET #b.#c = :v, #a = if_not_exists(:v, :v)", names("a", "b"), { ":v": N("1") }),
+  ],
+  [
+    "walk: ADD of a string, then undefined name",
+    ...RU("ADD #a :s, #b.#c :v", names("a", "b"), { ":v": N("1"), ":s": S("x") }),
+  ],
+  [
+    "walk: wrong operand, then undefined value",
+    ...RU("SET #a = :s + :v, #b = :zz", names("a", "b"), { ":v": N("1"), ":s": S("x") }),
+  ],
+  [
+    "walk: undefined value, then wrong operand",
+    ...RU("SET #b = :zz, #a = :s + :v", names("a", "b"), { ":v": N("1"), ":s": S("x") }),
+  ],
+  [
+    "walk: undefined value, in the value and the path",
+    ...RU("SET #b.#c = :zz", names("b"), { ":v": N("1") }),
+  ],
+  [
+    "walk: a path too deep, then undefined name",
+    ...RU(`SET ${deepPath(33)} = :v, #b.#c = :v`, names("n", "k", "b"), { ":v": N("1") }),
+  ],
+  [
+    "walk: overlaps a,b,a,b",
+    ...RU("SET #a = :v, #b = :v, #a = :w, #b = :w", names("a", "b"), {
+      ":v": N("1"),
+      ":w": N("2"),
+    }),
+  ],
+  [
+    "walk: overlaps a,a,b",
+    ...RU("SET #a = :v, #a = :w, #b = :v", names("a", "b"), { ":v": N("1"), ":w": N("2") }),
+  ],
+  [
+    "walk: overlap, then an undefined name",
+    ...RU("SET #a = :v, #a = :w, #b = #nope", names("a", "b"), { ":v": N("1"), ":w": N("2") }),
+  ],
+  [
+    "walk: overlap a, a.b, c",
+    ...RU("SET #a = :v, #a.#b = :w, #c = :v", names("a", "b", "c"), { ":v": N("1"), ":w": N("2") }),
+  ],
+  [
+    "walk: overlap, then a function misused",
+    ...RU("SET #a = :v, #a = :w, #b = foo(#l)", names("a", "b", "l"), {
+      ":v": N("1"),
+      ":w": N("2"),
+    }),
+  ],
+  [
+    "walk: undefined name, then 301 operators",
+    ...RU(`SET #b.#c=:o,${sums(301, 1)}`, { ...names("b"), ...sumNames(301, 1) }, { ":o": N("1") }),
+  ],
+  ...(
+    [
+      ["an overlap, then an undefined name", "#a, #a.#b, #nope"],
+      ["an undefined name, then an overlap", "#nope, #a, #a.#b"],
+      ["two overlaps", "#a, #b, #a.#c, #b.#c"],
+      ["an overlap, then another path", "#a, #a.#b, #c"],
+      ["a path too deep, then an overlap", `${deepPath(33)}, #a, #a.#b`],
+      ["an overlap, then a path too deep", `#a, #a.#b, ${deepPath(33)}`],
+      ["one path", "(#n)"],
+    ] as const
+  ).map(
+    ([label, expression]): FullBrief => [
+      `projection: ${label}`,
+      "GetItem",
+      {
+        TableName: "$T",
+        Key: KEY,
+        ProjectionExpression: expression,
+        ExpressionAttributeNames: definedIn(expression),
+      },
+    ],
+  ),
+]
+
+const kq = (
+  label: string,
+  expression: string,
+  values?: Record<string, AttributeValue>,
+  extra: object = {},
+) =>
+  queried(`key condition ${label}`, {
+    TableName: "$T",
+    KeyConditionExpression: expression,
+    ...(values !== undefined && { ExpressionAttributeValues: values }),
+    ...extra,
+  })
+const P = { ":p": S("p") }
+/** Key conditions DynamoDB Local refuses, and the order it finds their problems in. */
+const KEY_CONDITIONS: ReadonlyArray<Row> = [
+  kq("naming x twice, three parts", "pk = :p AND x = :a AND x = :b", {
+    ...P,
+    ":a": S("a"),
+    ":b": S("b"),
+  }),
+  kq("on x", "pk = :p AND x = :a", { ...P, ":a": S("a") }),
+  kq("naming pk twice", "pk = :p AND pk = :a", { ...P, ":a": S("a") }),
+  kq("pk <", "pk < :p", P),
+  kq("sk alone", "sk = :p", P),
+  kq("of three parts", "pk = :p AND sk = :a AND x = :b", { ...P, ":a": S("a"), ":b": S("b") }),
+  kq("pk <, and x", "pk < :p AND x = :a", { ...P, ":a": S("a") }),
+  kq("begins_with(pk)", "begins_with(pk, :p)", P),
+  kq("pk BETWEEN", "pk BETWEEN :p AND :a", { ...P, ":a": S("q") }),
+  kq("pk IN", "pk IN (:p)", P),
+  kq("contains(pk)", "contains(pk, :p)", P),
+  kq("attribute_exists(pk)", "attribute_exists(pk)"),
+  kq("attribute_not_exists(pk)", "attribute_not_exists(pk)"),
+  kq("attribute_type(pk) of a type", "attribute_type(pk, :s)", { ":s": S("S") }),
+  kq("attribute_type(pk) of no type", "attribute_type(pk, :p)", P),
+  kq("size(pk)", "size(pk) = :p", { ":p": N("1") }),
+  kq("pk.a", "pk.a = :p", P),
+  kq("pk[0]", "pk[0] = :p", P),
+  kq("pk = sk", "pk = sk"),
+  kq(":p = :p", ":p = :p", P),
+  kq(":a BETWEEN sk", "pk = :p AND :a BETWEEN sk AND :b", { ...P, ":a": S("a"), ":b": S("b") }),
+  kq("begins_with(:a, sk)", "pk = :p AND begins_with(:a, sk)", { ...P, ":a": S("a") }),
+  kq("naming sk twice, three parts", "pk = :p AND sk = :a AND sk = :b", {
+    ...P,
+    ":a": S("a"),
+    ":b": S("b"),
+  }),
+  kq("size(pk), OR", "size(pk) = :p OR pk = :p", { ":p": N("1") }),
+  kq("size(pk.a)", "size(pk.a) = :p", { ":p": N("1") }),
+  kq("pk.a = sk", "pk.a = sk"),
+  kq("pk.a <>", "pk.a <> :p", P),
+  kq("x.a", "pk = :p AND x.a = :a", { ...P, ":a": S("a") }),
+  kq("x.a alone", "x.a = :p", P),
+  kq("pk.a, OR", "pk.a = :p OR x = :p", P),
+  kq("OR, pk.a", "x = :p OR pk.a = :p", P),
+  kq("an undefined name, pk.a", "#u = :p AND pk.a = :p", P),
+  kq("pk.a, an undefined value", "pk.a = :p AND sk = :zz", P),
+  kq("sk.a", "pk = :p AND sk.a = :p", P),
+  kq("lsk.a on the table", "pk = :p AND lsk.a = :p", P),
+  kq("gpk.a on gsi1", "gpk.a = :p", P, { IndexName: "gsi1" }),
+  kq("pk.a on gsi1", "gpk = :p AND pk.a = :p", P, { IndexName: "gsi1" }),
+  kq("x.a on gsi1", "gpk = :p AND x.a = :p", P, { IndexName: "gsi1" }),
+  kq("begins_with(sk.a)", "pk = :p AND begins_with(sk.a, :p)", P),
+  kq("sk.a BETWEEN", "pk = :p AND sk.a BETWEEN :p AND :p", P),
+  kq("pk.a and sk.b", "pk.a = :p AND sk.b = :p", P),
+  kq("sk.b and pk.a", "sk.b = :p AND pk.a = :p", P),
+  kq("pk.a via a name", "#p.a = :p", P, { ExpressionAttributeNames: { "#p": "pk" } }),
+  kq("pk = :p AND :a <= sk", "pk = :p AND :a <= sk", { ...P, ":a": S("a") }),
+  kq("sk = :a AND pk = :p", "sk = :a AND pk = :p", { ...P, ":a": S("s") }),
+  kq("(pk) = (:p) AND (sk) = (:a)", "(pk) = (:p) AND (sk) = (:a)", { ...P, ":a": S("s") }),
+  kq("(pk = :p AND sk = :a)", "(pk = :p AND sk = :a)", { ...P, ":a": S("s") }),
+  kq("((pk = :p))", "((pk = :p))", P),
+  kq("begins_with((sk), (:a))", "pk = :p AND begins_with((sk), (:a))", { ...P, ":a": S("s") }),
+  kq(
+    "on lsk and sk of lsi1",
+    "pk = :p AND lsk = :a AND sk = :a",
+    { ...P, ":a": S("s") },
+    { IndexName: "lsi1" },
+  ),
+  queried("no key condition", {
+    TableName: "$T",
+    FilterExpression: "#n = :one",
+    ExpressionAttributeNames: { "#n": "n" },
+    ExpressionAttributeValues: { ":one": N("1") },
+  }),
+  queried("no key condition, a filter's syntax error", {
+    TableName: "$T",
+    FilterExpression: "#n = (",
+    ExpressionAttributeNames: { "#n": "n" },
+  }),
+]
+
+/** Requests missing a member, naming no table, or asking for what an operation doesn't return. */
+const MEMBERS: ReadonlyArray<FullBrief> = [
+  ["no Item", "PutItem", { TableName: "$T" }],
+  ["no Item, ReturnValues ALL_NEW", "PutItem", { TableName: "$T", ReturnValues: "ALL_NEW" }],
+  ["no Key", "GetItem", { TableName: "$T" }],
+  ["no Key", "DeleteItem", { TableName: "$T" }],
+  [
+    "no Key",
+    "UpdateItem",
+    {
+      TableName: "$T",
+      UpdateExpression: "SET #a = :v",
+      ExpressionAttributeNames: { "#a": "a" },
+      ExpressionAttributeValues: { ":v": N("1") },
+    },
+  ],
+  ["table ''", "GetItem", { TableName: "", Key: KEY }],
+  ["table ''", "PutItem", { TableName: "", Item: KEY }],
+  ["table '', no Item", "PutItem", { TableName: "" }],
+  [
+    "table '', ReturnValuesOnConditionCheckFailure ALL_NEW",
+    "PutItem",
+    { TableName: "", Item: KEY, ReturnValuesOnConditionCheckFailure: "ALL_NEW" },
+  ],
+  ["table ''", "DeleteItem", { TableName: "", Key: KEY }],
+  ["table ''", "UpdateItem", { TableName: "", Key: KEY }],
+  [
+    "table ''",
+    "Query",
+    { TableName: "", KeyConditionExpression: "pk = :p", ExpressionAttributeValues: P },
+  ],
+  ["table ''", "Scan", { TableName: "" }],
+  [
+    "table '' in a put",
+    "TransactWriteItems",
+    { TransactItems: [{ Put: { TableName: "", Item: KEY } }] },
+  ],
+  [
+    "table '', then a put with no Item",
+    "TransactWriteItems",
+    { TransactItems: [{ Put: { TableName: "", Item: KEY } }, { Put: { TableName: "$T" } }] },
+  ],
+  ["table ''", "BatchGetItem", { RequestItems: { "": { Keys: [KEY] } } }],
+  ["table ''", "BatchWriteItem", { RequestItems: { "": [{ PutRequest: { Item: KEY } }] } }],
+  ["table ''", "TransactGetItems", { TransactItems: [{ Get: { TableName: "", Key: KEY } }] }],
+  ["no table", "GetItem", { Key: KEY }],
+  ["no table, no Key", "GetItem", {}],
+  ["no table, names {}", "GetItem", { Key: KEY, ExpressionAttributeNames: {} }],
+  ["no table", "PutItem", { Item: KEY }],
+  ["no table, ReturnValues bogus", "PutItem", { Item: KEY, ReturnValues: "bogus" }],
+  ["no table, no Item", "PutItem", {}],
+  ["no table", "UpdateItem", { Key: KEY, UpdateExpression: "SET a = :v" }],
+  ["no table", "DeleteItem", { Key: KEY }],
+  ["no table", "Query", { KeyConditionExpression: "pk = :p", ExpressionAttributeValues: P }],
+  [
+    "no table, Limit 0",
+    "Query",
+    { KeyConditionExpression: "pk = :p", ExpressionAttributeValues: P, Limit: 0 },
+  ],
+  ["no table", "Scan", {}],
+  tw1("a put naming no table", { Put: { Item: VK("nt1") } }),
+  tw1("a delete naming no table", { Delete: { Key: KEY } }),
+  tw1("an update naming no table", {
+    Update: {
+      Key: KEY,
+      UpdateExpression: "SET #a = :v",
+      ExpressionAttributeNames: { "#a": "a" },
+      ExpressionAttributeValues: { ":v": N("1") },
+    },
+  }),
+  tw1("a check naming no table", {
+    ConditionCheck: { Key: KEY, ConditionExpression: "attribute_exists(pk)" },
+  }),
+  tw1("a check naming no table, no condition", { ConditionCheck: { Key: KEY } }),
+  tw1("a put naming no table, no Item", { Put: {} }),
+  tw1("a put, then a put naming no table", twPut(VK("nt2")), { Put: { Item: VK("nt3") } }),
+  tw1("two items naming no table", { Put: { Item: VK("nt4") } }, { Delete: { Key: KEY } }),
+  tw1("a bad number, then no table", twPut({ ...VK("nt5"), n: N("x") }), {
+    Put: { Item: VK("nt6") },
+  }),
+  tw1(
+    "no table, then a bad number",
+    { Put: { Item: VK("nt7") } },
+    twPut({ ...VK("nt8"), n: N("x") }),
+  ),
+  tw1(
+    "a condition's syntax error, then no table",
+    twPut(VK("nt9"), { ConditionExpression: "(((" }),
+    { Put: { Item: VK("nt10") } },
+  ),
+  tw1(
+    "table '', then no table",
+    { Put: { TableName: "", Item: KEY } },
+    { Put: { Item: VK("nt11") } },
+  ),
+  tw1("a key missing sk, then no table", twPut({ pk: S("nt12") }), { Put: { Item: VK("nt13") } }),
+  tw1(
+    "an update with no Key, then no table",
+    {
+      Update: {
+        TableName: "$T",
+        UpdateExpression: "SET #a = :v",
+        ExpressionAttributeNames: { "#a": "a" },
+        ExpressionAttributeValues: { ":v": N("1") },
+      },
+    },
+    { Put: { Item: VK("nt14") } },
+  ),
+  ["no table", "TransactGetItems", { TransactItems: [{ Get: { Key: KEY } }] }],
+  ["no table, no Key", "TransactGetItems", { TransactItems: [{ Get: {} }] }],
+  [
+    "no table, a bad key value",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { Key: { pk: { NULL: false }, sk: S("s") } } }] },
+  ],
+  [
+    "table '', a bad key value",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { TableName: "", Key: { pk: { NULL: false }, sk: S("s") } } }] },
+  ],
+  [
+    "no table, an undefined name in the projection",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { Key: KEY, ProjectionExpression: "#nope" } }] },
+  ],
+  [
+    "no table, then table ''",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { Key: KEY } }, { Get: { TableName: "", Key: KEY } }] },
+  ],
+  [
+    "table '', then no table",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { TableName: "", Key: KEY } }, { Get: { Key: KEY } }] },
+  ],
+  [
+    "table '', then an undefined name in the projection",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "", Key: KEY } },
+        { Get: { TableName: "$T", Key: KEY, ProjectionExpression: "#nope" } },
+      ],
+    },
+  ],
+  [
+    "an undefined name in the projection, then table ''",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: KEY, ProjectionExpression: "#nope" } },
+        { Get: { TableName: "", Key: KEY } },
+      ],
+    },
+  ],
+  [
+    "an undefined name in the projection, then no table",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: KEY, ProjectionExpression: "#nope" } },
+        { Get: { Key: KEY } },
+      ],
+    },
+  ],
+  [
+    "no table, then an undefined name in the projection",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { Key: KEY } },
+        { Get: { TableName: "$T", Key: KEY, ProjectionExpression: "#nope" } },
+      ],
+    },
+  ],
+  [
+    "no Key, then no table",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { TableName: "$T" } }, { Get: { Key: KEY } }] },
+  ],
+  [
+    "no table, then no Key",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { Key: KEY } }, { Get: { TableName: "$T" } }] },
+  ],
+  [
+    "no Key, then an undefined name in the projection",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T" } },
+        { Get: { TableName: "$T", Key: KEY, ProjectionExpression: "#nope" } },
+      ],
+    },
+  ],
+  [
+    "a bad key value, then no table",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: { pk: { NULL: false }, sk: S("s") } } },
+        { Get: { Key: KEY } },
+      ],
+    },
+  ],
+  [
+    "a bad key value, then an undefined name in the projection",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: { pk: { NULL: false }, sk: S("s") } } },
+        { Get: { TableName: "$T", Key: KEY, ProjectionExpression: "#nope" } },
+      ],
+    },
+  ],
+  [
+    "a bad key value, then no Key",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: { pk: { NULL: false }, sk: S("s") } } },
+        { Get: { TableName: "$T" } },
+      ],
+    },
+  ],
+  [
+    "a key missing sk, then no table",
+    "TransactGetItems",
+    { TransactItems: [{ Get: { TableName: "$T", Key: { pk: S("p") } } }, { Get: { Key: KEY } }] },
+  ],
+  [
+    "a key missing sk, then table ''",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: { pk: S("p") } } },
+        { Get: { TableName: "", Key: KEY } },
+      ],
+    },
+  ],
+  [
+    "a key missing sk, then an undefined name in the projection",
+    "TransactGetItems",
+    {
+      TransactItems: [
+        { Get: { TableName: "$T", Key: { pk: S("p") } } },
+        { Get: { TableName: "$T", Key: KEY, ProjectionExpression: "#nope" } },
+      ],
+    },
+  ],
+  [
+    "ReturnValuesOnConditionCheckFailure ALL_NEW",
+    ...RU(
+      "SET #a = :v",
+      { "#a": "a" },
+      { ":v": N("1") },
+      { ReturnValuesOnConditionCheckFailure: "ALL_NEW" },
+    ),
+  ],
+  [
+    "ReturnValuesOnConditionCheckFailure ALL_NEW, an undefined name",
+    ...RU(
+      "SET #a = :v",
+      { "#b": "b" },
+      { ":v": N("1") },
+      { ReturnValuesOnConditionCheckFailure: "ALL_NEW" },
+    ),
+  ],
+  [
+    "ReturnValuesOnConditionCheckFailure ALL_NEW",
+    "PutItem",
+    { TableName: "$T", Item: KEY, ReturnValuesOnConditionCheckFailure: "ALL_NEW" },
+  ],
+  [
+    "ReturnValuesOnConditionCheckFailure ALL_NEW",
+    "DeleteItem",
+    { TableName: "$T", Key: KEY, ReturnValuesOnConditionCheckFailure: "ALL_NEW" },
+  ],
+  [
+    "ReturnValuesOnConditionCheckFailure ALL_NEW, a key missing sk",
+    "DeleteItem",
+    { TableName: "$T", Key: { pk: S("p") }, ReturnValuesOnConditionCheckFailure: "ALL_NEW" },
+  ],
+  [
+    "ReturnValuesOnConditionCheckFailure none",
+    "DeleteItem",
+    { TableName: "$T", Key: KEY, ReturnValuesOnConditionCheckFailure: "none" },
+  ],
+  tw1(
+    "an update's ReturnValuesOnConditionCheckFailure ALL_NEW",
+    twUpdate("SET #a = :v", { ":v": N("1") }, { ReturnValuesOnConditionCheckFailure: "ALL_NEW" }),
+  ),
+  tw1("a put with no Item", { Put: { TableName: "$T" } }),
+  tw1("an update with no Key", {
+    Update: {
+      TableName: "$T",
+      UpdateExpression: "SET #a = :v",
+      ExpressionAttributeNames: { "#a": "a" },
+      ExpressionAttributeValues: { ":v": N("1") },
+    },
+  }),
+  tw1("a delete with no Key", { Delete: { TableName: "$T" } }),
+  tw1("a check with no Key", {
+    ConditionCheck: { TableName: "$T", ConditionExpression: "attribute_exists(pk)" },
+  }),
+  tw1("a check with no Key and no condition", { ConditionCheck: { TableName: "$T" } }),
+  tw1("a check with no condition", { ConditionCheck: { TableName: "$T", Key: KEY } }),
+  tw1("a check with values and no condition", {
+    ConditionCheck: { TableName: "$T", Key: KEY, ExpressionAttributeValues: { ":v": N("1") } },
+  }),
+  tw1("an update with values and no expression", twUpdate(undefined, { ":v": N("1") })),
+  tw1(
+    "an update with a condition only",
+    twUpdate(undefined, undefined, { ConditionExpression: "attribute_exists(pk)" }),
+  ),
+  tw1(
+    "an update with a condition and its values",
+    twUpdate(undefined, { ":n": N("5") }, { ConditionExpression: "n = :n" }),
+  ),
+  tw1(
+    "an update with names only",
+    twUpdate(undefined, undefined, { ExpressionAttributeNames: { "#a": "a" } }),
+  ),
+  tw1("an update with no expression", twUpdate(undefined, undefined, { Key: VK("fresh") })),
+  tw1(
+    "a put with values and no condition",
+    twPut(VK("t4"), { ExpressionAttributeValues: { ":v": N("1") } }),
+  ),
+  tw1("two items with no Key", { Delete: { TableName: "$T" } }, { Delete: { TableName: "$T" } }),
+  tw1("a check, then a put with no Item", tCheck(KEY, "attribute_exists(pk)"), {
+    Put: { TableName: "$T" },
+  }),
+  tw1("a put of a bad number, then a delete with no Key", twPut({ ...VK("t5"), n: N("x") }), {
+    Delete: { TableName: "$T" },
+  }),
+  ["a put with no Item", "BatchWriteItem", { RequestItems: { $T: [{ PutRequest: {} }] } }],
+  ["a delete with no Key", "BatchWriteItem", { RequestItems: { $T: [{ DeleteRequest: {} }] } }],
+  [
+    "a put with no Item, then a bad number",
+    "BatchWriteItem",
+    {
+      RequestItems: {
+        $T: [{ PutRequest: {} }, { PutRequest: { Item: { ...VK("b2"), n: N("x") } } }],
+      },
+    },
+  ],
+  ["a Get with no Key", "TransactGetItems", { TransactItems: [{ Get: { TableName: "$T" } }] }],
+  [
+    "Limit 0",
+    "Query",
+    { TableName: "$T", KeyConditionExpression: "pk = :p", ExpressionAttributeValues: P, Limit: 0 },
+  ],
+  [
+    "Limit 0, a filter's syntax error",
+    "Scan",
+    { TableName: "$T", Limit: 0, FilterExpression: "n = (" },
+  ],
+  ["Limit 0, Segment 3 of 2", "Scan", { TableName: "$T", Limit: 0, Segment: 3, TotalSegments: 2 }],
+  ["TotalSegments 2 alone", "Scan", { TableName: "$T", TotalSegments: 2 }],
+  ["Segment 0 alone", "Scan", { TableName: "$T", Segment: 0 }],
+  ["Segment 2 of 2", "Scan", { TableName: "$T", Segment: 2, TotalSegments: 2 }],
+  ["Segment -1 of 1", "Scan", { TableName: "$T", Segment: -1, TotalSegments: 1 }],
+  ["Segment 0 of 0", "Scan", { TableName: "$T", Segment: 0, TotalSegments: 0 }],
+  ["Segment 5 of 1000001", "Scan", { TableName: "$T", Segment: 5, TotalSegments: 1000001 }],
+  ["TotalSegments 1000001 alone", "Scan", { TableName: "$T", TotalSegments: 1000001 }],
+  [
+    "Segment 3 of 2, a filter's syntax error",
+    "Scan",
+    { TableName: "$T", Segment: 3, TotalSegments: 2, FilterExpression: "n = (" },
+  ],
+  [
+    "Segment 3 of 2, an undefined name",
+    "Scan",
+    {
+      TableName: "$T",
+      Segment: 3,
+      TotalSegments: 2,
+      FilterExpression: "#u = :one",
+      ExpressionAttributeValues: { ":one": N("1") },
+    },
+  ],
+  [
+    "values and no condition",
+    "PutItem",
+    { TableName: "$T", Item: KEY, ExpressionAttributeValues: { ":v": N("1") } },
+  ],
+  [
+    "names and no condition",
+    "PutItem",
+    { TableName: "$T", Item: KEY, ExpressionAttributeNames: { "#a": "a" } },
+  ],
+  [
+    "an empty names map and no condition",
+    "PutItem",
+    { TableName: "$T", Item: KEY, ExpressionAttributeNames: {} },
+  ],
+  [
+    "a names key without # and no condition",
+    "PutItem",
+    { TableName: "$T", Item: KEY, ExpressionAttributeNames: { a: "a" } },
+  ],
+  [
+    "values and no condition, a bad value",
+    "PutItem",
+    { TableName: "$T", Item: KEY, ExpressionAttributeValues: { ":v": N("x") } },
+  ],
+  [
+    "values and no condition",
+    "DeleteItem",
+    { TableName: "$T", Key: KEY, ExpressionAttributeValues: { ":v": N("1") } },
+  ],
+  [
+    "values and no expression",
+    "UpdateItem",
+    { TableName: "$T", Key: KEY, ExpressionAttributeValues: { ":v": N("1") } },
+  ],
+  [
+    "values and no filter",
+    "Scan",
+    { TableName: "$T", ExpressionAttributeValues: { ":v": N("1") } },
+  ],
+  [
+    "values and no key condition",
+    "Query",
+    { TableName: "$T", ExpressionAttributeValues: { ":v": N("1") } },
+  ],
+  [
+    "an empty names map",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "n = :one",
+      ExpressionAttributeNames: {},
+      ExpressionAttributeValues: { ":one": N("1") },
+    },
+  ],
+  [
+    "a names key without #",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "n = :one",
+      ExpressionAttributeNames: { a: "a" },
+      ExpressionAttributeValues: { ":one": N("1") },
+    },
+  ],
+  [
+    "a names key holding -",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "#n = :one",
+      ExpressionAttributeNames: { "#n": "n", "#a-b": "x" },
+      ExpressionAttributeValues: { ":one": N("1") },
+    },
+  ],
+  [
+    "a values key without :",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "n = :one",
+      ExpressionAttributeValues: { ":one": N("1"), v: N("1") },
+    },
+  ],
+  [
+    "an empty values map",
+    "Scan",
+    { TableName: "$T", FilterExpression: "attribute_exists(n)", ExpressionAttributeValues: {} },
+  ],
+  [
+    "a value 33 deep",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "n = :d",
+      ExpressionAttributeValues: { ":d": nested(33, "M") },
+    },
+  ],
+  [
+    "a value 32 deep",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "n = :d",
+      ExpressionAttributeValues: { ":d": nested(32, "M") },
+    },
+  ],
+  [
+    "a names value that is empty",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "#n = :one",
+      ExpressionAttributeNames: { "#n": "" },
+      ExpressionAttributeValues: { ":one": N("1") },
+    },
+  ],
+  [
+    "an empty names map, a bad values key",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "n = :one",
+      ExpressionAttributeNames: {},
+      ExpressionAttributeValues: { v: N("1") },
+    },
+  ],
+  [
+    "a bad values key, a bad value",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "n = :one",
+      ExpressionAttributeValues: { ":one": N("x"), v: N("1") },
+    },
+  ],
+  [
+    "a bad value, an empty name",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "#n = :one",
+      ExpressionAttributeNames: { "#n": "" },
+      ExpressionAttributeValues: { ":one": N("x") },
+    },
+  ],
+  [
+    "an empty ConditionExpression",
+    "DeleteItem",
+    { TableName: "$T", Key: KEY, ConditionExpression: "" },
+  ],
+  [
+    "a blank ConditionExpression",
+    "DeleteItem",
+    { TableName: "$T", Key: KEY, ConditionExpression: " " },
+  ],
+  ["an empty UpdateExpression", "UpdateItem", { TableName: "$T", Key: KEY, UpdateExpression: "" }],
+  [
+    "an empty UpdateExpression, with values",
+    "UpdateItem",
+    {
+      TableName: "$T",
+      Key: KEY,
+      UpdateExpression: "",
+      ExpressionAttributeValues: { ":v": N("1") },
+    },
+  ],
+  ["an empty FilterExpression", "Scan", { TableName: "$T", FilterExpression: "" }],
+  ["an empty KeyConditionExpression", "Query", { TableName: "$T", KeyConditionExpression: "" }],
+  [
+    "an empty ProjectionExpression",
+    "GetItem",
+    { TableName: "$T", Key: KEY, ProjectionExpression: "" },
+  ],
+  [
+    "a filter #n = (:one)",
+    "Scan",
+    {
+      TableName: "$T",
+      FilterExpression: "#n = (:one)",
+      ExpressionAttributeNames: { "#n": "n" },
+      ExpressionAttributeValues: { ":one": N("1") },
+    },
+  ],
+]
+
+const UPDATED = (
+  expression: string,
+  mode: "UPDATED_NEW" | "UPDATED_OLD",
+  values?: Item,
+): FullBrief => [`${mode} of ${expression}`, ...RV(expression, namesIn(expression), values, mode)]
+/** `UPDATED_NEW` / `UPDATED_OLD` of paths below a top-level attribute. */
+const UPDATED_VALUES: ReadonlyArray<FullBrief> = (
+  [
+    ["REMOVE #l[0]"],
+    ["REMOVE #m.#l[0]"],
+    ["REMOVE #l[0], #l[1]"],
+    ["SET #a = :x REMOVE #l[0]", { ":x": N("9") }],
+    ["SET #l[10] = :x", { ":x": N("9") }],
+    ["SET #m.#l[5] = :x", { ":x": N("9") }],
+    ["SET #l[3] = :x", { ":x": N("9") }],
+    ["SET #l[2] = :x", { ":x": N("9") }],
+    ["SET #m.#new = :x", { ":x": N("9") }],
+    ["SET #m.#k = :x", { ":x": N("9") }],
+    ["ADD #m.#cnt :one", { ":one": N("1") }],
+    ["ADD #m.#k :one", { ":one": N("1") }],
+    ["REMOVE #l[10]"],
+    ["REMOVE #m.#nope"],
+    ["REMOVE #m.#l[0], #m.#l[1]"],
+    ["REMOVE #n"],
+    ["REMOVE #zz"],
+    ["SET #a = :x", { ":x": N("9") }],
+    ["SET #n = :x", { ":x": N("9") }],
+    ["DELETE #ss :ss", { ":ss": { SS: ["a"] } }],
+    ["DELETE #ss :all", { ":all": { SS: ["a", "b"] } }],
+  ] as ReadonlyArray<readonly [string, Item?]>
+).flatMap(([expression, values]) => [
+  UPDATED(expression, "UPDATED_NEW", values),
+  UPDATED(expression, "UPDATED_OLD", values),
+])
+
+// ---------------------------------------------------------------------------
 // All the rows, and the ones the tables answer differently on purpose
 // ---------------------------------------------------------------------------
 
@@ -3805,8 +5080,17 @@ const ROWS: ReadonlyArray<Row> = (() => {
     ...LAST_KEYS,
     ...START_KEYS,
     ...TIES,
+    ...TIE_PAGES,
     ...STORED_NUMBERS,
     ...PROTO,
+    ...VALUES.map(fullRow),
+    ...LIMITS,
+    ...OPERAND_GROUPS.map(briefCondition),
+    ...UPDATE_GROUPS.map(briefUpdate),
+    ...WALKS.map(fullRow),
+    ...KEY_CONDITIONS,
+    ...MEMBERS.map(fullRow),
+    ...UPDATED_VALUES.map(fullRow),
   ]
   const byLabel = new Map<string, Row>()
   for (const row of all) {
@@ -3835,6 +5119,9 @@ const PROTO_AS_READ = {
   pk: S("p"),
   sk: S("s"),
 }
+/** The tables' refusal of a `Limit` stopping among rows of one index key. */
+const limitAmongTies = (limit: number, attribute: string) =>
+  `UnreadableRequest: The in-memory table doesn't read the Limit "${limit}": stopping among rows of one ${attribute} (DynamoDB Local's order among them is not modelled)`
 /** The tables' refusal of a request that reads among rows of one index key. */
 const amongTies = (field: string, key: Item, attribute: string) =>
   `UnreadableRequest: The in-memory table doesn't read the ${field} ${JSON.stringify(JSON.stringify(key))}: among rows of one ${attribute} (DynamoDB Local's order among them is not modelled)`
@@ -3938,9 +5225,35 @@ const KNOWN: Readonly<
       },
     },
     helper: {
-      unreadable:
-        "UnreadableRequest: The in-memory table doesn't read the Limit \"1\": stopping between rows of one gsk (DynamoDB Local's order among them is not modelled)",
+      unreadable: limitAmongTies(1, "gsk"),
     },
+  },
+  "ties: gsi1, a Limit splitting ties past the start key": {
+    reason:
+      "a Limit that stops between rows of one index key past the start key: which of them DynamoDB Local reads first is its own order (here w3, where table-key order reads w2), which the tables don't model, so they refuse to answer",
+    on: ["recording", "inMemory"],
+    local: {
+      ok: { Count: 1, ScannedCount: 1, LastEvaluatedKey: gsiRow("w3", "w", "3") },
+    },
+    helper: { unreadable: limitAmongTies(1, "gsk") },
+  },
+  "ties: gsi1, a Limit stopping on the last of ties": {
+    reason:
+      "a Limit that stops on the last of rows of one index key: which of them DynamoDB Local reads last, and so names in its LastEvaluatedKey, is its own order (here w2, where table-key order ends on w3), which the tables don't model, so they refuse to answer",
+    on: ["recording", "inMemory"],
+    local: {
+      ok: { Count: 2, ScannedCount: 2, LastEvaluatedKey: gsiRow("w2", "w", "3") },
+    },
+    helper: { unreadable: limitAmongTies(2, "gsk") },
+  },
+  "ties: lsi1, reverse, a Limit splitting ties past the start key": {
+    reason:
+      "a Limit that stops between rows of one index key past the start key, read in reverse: which of them DynamoDB Local reads first is its own order (here sk 0, where reverse table-key order reads sk 1), which the tables don't model, so they refuse to answer",
+    on: ["recording", "inMemory"],
+    local: {
+      ok: { Count: 1, ScannedCount: 1, LastEvaluatedKey: lsiRow("m", "0", "1") },
+    },
+    helper: { unreadable: limitAmongTies(1, "lsk") },
   },
 }
 

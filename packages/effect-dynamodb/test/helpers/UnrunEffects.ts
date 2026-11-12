@@ -9,15 +9,20 @@
  * over every test file of the workspace on each run. Names are resolved by scope, so a local that
  * shadows an import is the local.
  *
- * An Effect is recognised by how it is built: a member of `Effect`, `Stream` or `Layer` imported
- * from `effect` (`Effect.gen(…)`, `Effect.void`, `Fx.Effect.gen(…)` under `import * as Fx`, `gen(…)`
- * imported from `effect/Effect`; never a `run*`, an `is*` predicate or `Effect.fn`, which builds a
- * function), a `.pipe(…)` or `pipe(…)` over one or with one among its arguments and no runner among
- * them, `.asEffect()`, a typed client's operation (`db.entities.Users.put(…)`, any call chain off
- * `.entities.<Name>`, `.aggregates.<Name>` or `.collections.<name>`), a `const` holding one, and a
- * call of a local function every return of which is one. A runner is `Effect.run*` (the `*With`
- * forms once given their context), another object's `run*` member (`runtime.runPromise`,
- * `NodeRuntime.runMain`), a local alias of one, or a function returning a run.
+ * It reports only what the file itself proves. An Effect is recognised by how it is built: a
+ * member of `Effect`, `Stream` or `Layer` imported from `effect` (`Effect.gen(…)`, `Effect.void`,
+ * `Fx.Effect.gen(…)` under `import * as Fx`, `gen(…)` imported from `effect/Effect`; never a
+ * `run*`, an `is*` predicate, a `to*` conversion or `Effect.fn`, which builds a function); a
+ * `.pipe(…)` or `pipe(…)` whose last stage is such a member (`Effect.provide(layer)`) or a function
+ * every return of which builds an Effect (a pipe returns what its last stage does, so a pipe ending
+ * in anything else is not one, whatever it starts with); `.asEffect()`; a typed client's operation
+ * (a call chain off `db.entities.<Name>`, `db.aggregates.<Name>` or `db.collections.<name>`, `db` a
+ * local `const` bound by `yield* DynamoClient.make(…)`); a `const` holding one; and a call of a
+ * local function every return of which is one. A runner is `Effect.run*` (the `*With` forms once
+ * given their context), another object's `run*` member (`runtime.runPromise`,
+ * `NodeRuntime.runMain`), a local alias of one, or a local function that returns a run or runs one
+ * of its parameters anywhere in its body (`async (e) => await Effect.runPromise(e)`,
+ * `(e) => { Effect.runSync(e) }`).
  *
  * A test is a call of `it` / `test` / `describe` / `bench` / `suite` or a hook (`beforeAll`,
  * `beforeEach`, `afterAll`, `afterEach`) imported from vitest (an alias, a namespace member, an
@@ -28,24 +33,41 @@
  * Reported:
  * - `unrun-test-body`: a plain test's callback returns an Effect (through `?:`, `&&`, `||`, `??`
  *   and `,` too), or the callback is itself `Effect.fn(…)` or a local function returning an Effect.
- * - `dropped-effect`: an Effect left as a statement (`void` included), awaited (which yields the
- *   Effect, unrun), returned from a `forEach` callback or a `map` whose array is dropped, or held in
- *   a local `const` nothing reads. Not inside a callback handed to `expect(…)` (a construction
- *   asserted to throw), nor in a `*.types.test.ts` file, which only type-checks.
- * - `unawaited-run`: a promise run left as a statement (`.then` / `.catch` / `.finally` on one, an
- *   un-awaited `expect(…).resolves` / `.rejects` of one, `Promise.all` and kin over one, or a
- *   `forEach` / `map` callback returning one, included) or held in a local `const` nothing reads;
- *   and a dropped `runFork` / `runCallback` in a test callback that is not `async`.
+ * - `dropped-effect`: an Effect left as a statement (`void` included) or on the left of a `,`,
+ *   awaited (which yields the Effect, unrun), returned from a `forEach` callback or from a `map`
+ *   callback when the `map` call is itself left as a statement, or held in a local `const` nothing
+ *   reads. Not inside a callback handed to `expect(…)` (a construction asserted to throw), nor in a
+ *   `*.types.test.ts` file, which only type-checks.
+ * - `unawaited-run`: a promise run left as a statement or on the left of a `,` (`.then` / `.catch`
+ *   / `.finally` on one, an un-awaited `expect(…).resolves` / `.rejects` of one, `Promise.all` and
+ *   kin over an array literal holding one or a `map` returning one, a call of a local runner that
+ *   is `async` or returns one, or a `forEach` / `map` callback returning one, included) or held in a
+ *   local `const` nothing reads; and a dropped `runFork` / `runCallback` in a test callback that is
+ *   not `async`.
  *
  * In a `*.types.test.ts` file a returned Effect is reported only when it holds an `expect(…)`.
  *
- * Not reported, as a parse cannot tell:
- * - a value only its type shows to be an Effect: an imported helper's or a method's result, or a
- *   registrar or `Effect` re-exported by another module;
+ * Not reported, as the file alone doesn't prove it (each is a named case in
+ * `unrun-effects-guard.test.ts`):
+ * - a value only its type shows to be an Effect: an imported helper's or a method's result
+ *   (`(): Effect.Effect<void> => makeProgram()`); a pipe ending in an imported function, an
+ *   object's member (`h.run`) or a local function not known to build an Effect
+ *   (`pipe(program, withLayer)`); a typed client not bound in the file by
+ *   `yield* DynamoClient.make(…)`, or its groups destructured (`const { entities } = db`);
+ *   `Effect`'s members destructured (`const { gen } = Effect`); a registrar or `Effect` re-exported
+ *   by another module;
+ * - a registrar reached by element access (`it["skip"](…)`); a wrapper that hands its test body on
+ *   inside another function (`(n, f) => it(n, () => f())`), takes it in a destructured parameter,
+ *   or is itself wrapped by another wrapper;
  * - an Effect returned from inside `Effect.gen` (it may be returned on purpose, for
  *   `Effect.flatten` or `Stream.unwrap`);
- * - an Effect or promise kept in a variable that is read but never yielded or awaited;
- * - a wrapper that hands its test body on inside another function (`(n, f) => it(n, () => f())`);
+ * - an Effect or promise kept in a variable that is read but never yielded or awaited, in a `let`
+ *   nothing reads, assigned to a variable declared outside the test, or in a `const` holding a
+ *   `map`'s result;
+ * - an Effect handed to a function that ignores it (a local one included), to `setTimeout`, or
+ *   returned from a `.then` callback (`Promise.resolve().then(() => Effect.void)`);
+ * - a `forEach` callback passed by name (`xs.forEach(check)`), or an `async` one that awaits a run;
+ * - `void` on a run (`void Effect.runPromise(…)`), which says the promise is dropped on purpose;
  * - a `runFork` in an `async` test, which may await the fiber.
  *
  * `yield` without `*` inside `Effect.gen` is not reported: Effect 4 runs whatever is yielded.
@@ -83,6 +105,8 @@ const RUN = /^run(Promise|PromiseExit|Sync|SyncExit|Fork|Callback)(With)?$/
 const OTHER_RUN = /^run[A-Z]/
 /** `Effect.isEffect`, `Stream.isStream`, …: a boolean. */
 const PREDICATE = /^is[A-Z]/
+/** `Stream.toReadableStream`, `Stream.toAsyncIterable`, …: may convert to something else. */
+const CONVERSION = /^to[A-Z]/
 /** `Effect.fn(…)` builds a function that returns an Effect. */
 const FUNCTION_BUILDERS = new Set(["fn", "fnUntraced"])
 /** A typed client's members: `db.entities.Users.put(…)`. */
@@ -102,12 +126,11 @@ type Meaning =
   | { readonly kind: "runner"; readonly run: Run }
   | { readonly kind: "built" }
   | { readonly kind: "builder" }
+  | { readonly kind: "client" }
   | { readonly kind: "wrapper"; readonly indexes: ReadonlyArray<number> }
 
 type FunctionNode = ts.ArrowFunction | ts.FunctionExpression | ts.FunctionDeclaration
 
-/** A run whose outcome is unknown (a runner before the end of a pipe): neither an Effect nor a promise. */
-const UNKNOWN_RUN: Run = { promise: false, fork: false }
 const runOf = (name: string): Run => ({
   promise: /^run(Promise|PromiseExit)/.test(name),
   fork: /^run(Fork|Callback)/.test(name),
@@ -361,15 +384,40 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
     if (ts.isVariableDeclaration(declaration)) {
       const init = declaration.initializer
       if (init === undefined || !ts.isIdentifier(declaration.name)) return undefined
+      const constant = (declaration.parent.flags & ts.NodeFlags.Const) !== 0
+      if (constant && makesClient(init)) return { kind: "client" }
       const chains = aliasChains(init)
       if (chains !== undefined) return { kind: "registrar", chains }
       const meaning = functionMeaning(init)
       if (meaning !== undefined) return meaning
-      const constant = (declaration.parent.flags & ts.NodeFlags.Const) !== 0
       return constant && outcomes(init).every(buildsEffect) ? { kind: "built" } : undefined
     }
     if (ts.isFunctionDeclaration(declaration)) return functionMeaning(declaration)
     return undefined
+  }
+
+  /** `yield* DynamoClient.make(…)`, `DynamoClient` imported by that name: the typed client. */
+  const makesClient = (init: ts.Expression): boolean => {
+    const at = strip(init)
+    if (
+      !ts.isYieldExpression(at) ||
+      at.asteriskToken === undefined ||
+      at.expression === undefined
+    ) {
+      return false
+    }
+    const call = strip(at.expression)
+    if (!ts.isCallExpression(call)) return false
+    const callee = strip(call.expression)
+    if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== "make") return false
+    const owner = strip(callee.expression)
+    if (!ts.isIdentifier(owner)) return false
+    const declaration = declarationOf(owner)
+    return (
+      declaration !== undefined &&
+      ts.isImportSpecifier(declaration) &&
+      (declaration.propertyName ?? declaration.name).text === "DynamoClient"
+    )
   }
 
   /** The first parameter of a `layer(…)(name, (it) => …)` / `it.layer(…)(…)` body is an `it`. */
@@ -476,7 +524,9 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
     !(
       found.module === "Effect" &&
       (RUN.test(found.member) || FUNCTION_BUILDERS.has(found.member))
-    ) && !PREDICATE.test(found.member)
+    ) &&
+    !PREDICATE.test(found.member) &&
+    !CONVERSION.test(found.member)
 
   /** The run member a node names: `Effect.runPromise`, `runtime.runPromise`, `NodeRuntime.runMain`. */
   const runName = (node: ts.Expression): string | undefined => {
@@ -507,13 +557,59 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
     return ts.isArrowFunction(at) || ts.isFunctionExpression(at) ? functionRun(at) : undefined
   }
 
+  /**
+   * How a local function runs an Effect, if it does: it returns a run, or runs one of its
+   * parameters anywhere in its body (not in a function nested in it), as `async (e) => await
+   * Effect.runPromise(e)` and `(e) => { Effect.runSync(e) }` do. Its call is a promise when it is
+   * `async` or returns a run's promise (`.then` on one included).
+   */
   const functionRun = (fn: FunctionNode): Run | undefined => {
-    if (fn.asteriskToken !== undefined) return undefined
-    for (const expression of returned(fn)) {
+    if (fn.asteriskToken !== undefined || fn.body === undefined) return undefined
+    const results = returned(fn)
+    for (const expression of results) {
       const run = runCall(expression)
-      if (run !== undefined) return run
+      if (run !== undefined) return isAsync(fn) ? { promise: true, fork: run.fork } : run
     }
-    return undefined
+    if (!runsParameter(fn)) return undefined
+    return { promise: isAsync(fn) || results.some(promiseOf), fork: false }
+  }
+
+  /** Does a run in `fn`'s body (not in a function nested in it) name one of `fn`'s parameters? */
+  const runsParameter = (fn: FunctionNode): boolean => {
+    const parameters = new Set<ts.Node>()
+    for (const parameter of fn.parameters) {
+      parameters.add(parameter)
+      if (!ts.isIdentifier(parameter.name)) {
+        const bind = (name: ts.BindingName): void => {
+          if (ts.isIdentifier(name)) return
+          for (const element of name.elements) {
+            if (!ts.isOmittedExpression(element)) {
+              parameters.add(element)
+              bind(element.name)
+            }
+          }
+        }
+        bind(parameter.name)
+      }
+    }
+    const names = (node: ts.Node): boolean => {
+      if (ts.isIdentifier(node) && isReference(node)) {
+        const declaration = declarationOf(node)
+        if (declaration !== undefined && parameters.has(declaration)) return true
+      }
+      return ts.forEachChild(node, names) === true
+    }
+    let found = false
+    const visit = (node: ts.Node): void => {
+      if (found || functionBoundary(node)) return
+      if (ts.isCallExpression(node) && runCall(node) !== undefined && names(node)) {
+        found = true
+        return
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(fn.body!)
+    return found
   }
 
   /** `x.pipe(…)` or `pipe(x, …)`: the receiver and the functions piped through. */
@@ -541,19 +637,18 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
     runCalls.set(at, run)
     return run
   }
+  /** A pipe returns what its last stage does, so it runs an Effect only when that stage is a runner. */
   const runOfCall = (at: ts.CallExpression): Run | undefined => {
     const direct = runner(at.expression)
     if (direct !== undefined) return direct
-    const piped = pipeOf(at)
-    if (piped === undefined) return undefined
-    for (let i = piped.args.length - 1; i >= 0; i--) {
-      const run = runner(piped.args[i]!)
-      if (run !== undefined) return i === piped.args.length - 1 ? run : UNKNOWN_RUN
-    }
-    return undefined
+    const last = pipeOf(at)?.args.at(-1)
+    return last === undefined ? undefined : runner(last)
   }
 
-  /** Is this a call chain off a typed client's operation: `db.entities.Users.put(…).condition(…)`? */
+  /**
+   * Is this a call chain off a typed client's group (`db.entities.Users.put(…).condition(…)`), the
+   * client a local `const` bound by `yield* DynamoClient.make(…)`?
+   */
   const clientOperation = (call: ts.CallExpression): boolean => {
     let at: ts.Expression = call.expression
     for (;;) {
@@ -562,7 +657,10 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
         at = at.expression
       } else if (ts.isPropertyAccessExpression(at)) {
         const owner = strip(at.expression)
-        if (ts.isPropertyAccessExpression(owner) && CLIENT_GROUPS.has(owner.name.text)) return true
+        if (ts.isPropertyAccessExpression(owner) && CLIENT_GROUPS.has(owner.name.text)) {
+          const client = strip(owner.expression)
+          return ts.isIdentifier(client) && meaningOf(client)?.kind === "client"
+        }
         at = owner
       } else {
         return false
@@ -660,16 +758,24 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
     if (found !== undefined) return isEffectMember(found)
     const piped = pipeOf(at)
     if (piped !== undefined) {
-      return (
-        (piped.receiver !== undefined && buildsEffect(piped.receiver)) ||
-        piped.args.some((arg) => {
-          const fn = strip(arg)
-          return memberOf(ts.isCallExpression(fn) ? fn.expression : fn) !== undefined
-        })
-      )
+      const last = piped.args.at(-1)
+      if (last === undefined) return piped.receiver !== undefined && buildsEffect(piped.receiver)
+      return stageBuildsEffect(last)
     }
     if (ts.isPropertyAccessExpression(callee) && callee.name.text === "asEffect") return true
     return clientOperation(at)
+  }
+
+  /**
+   * Does a pipe's stage return an Effect, whatever it is given: a member of `Effect`, `Stream` or
+   * `Layer` (`Effect.asVoid`, `Effect.provide(layer)`), or a function every return of which builds
+   * one (`Effect.fn(…)`, `() => Effect.void`, a local one).
+   */
+  const stageBuildsEffect = (stage: ts.Expression): boolean => {
+    const at = strip(stage)
+    const found = memberOf(ts.isCallExpression(at) ? at.expression : at)
+    if (found !== undefined) return isEffectMember(found)
+    return buildsFunction(at)
   }
 
   /** A promise from a run: `Effect.runPromise(…)`, and `.then` / `.catch` / `.finally` on one. */
@@ -721,19 +827,26 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
     ) {
       return at.arguments.some((arg) => {
         const list = strip(arg)
-        return ts.isArrayLiteralExpression(list) && list.elements.some((each) => promiseOf(each))
+        if (ts.isArrayLiteralExpression(list)) return list.elements.some((each) => promiseOf(each))
+        return callbackReturns(list, ["map"]) === "promise"
       })
     }
     return false
   }
 
-  /** What a dropped `forEach(…)` / `map(…)` callback returns: an Effect, a run's promise, or neither. */
-  const droppedCallback = (node: ts.Expression): "effect" | "promise" | undefined => {
+  /**
+   * What the callback of a `forEach(…)` / `map(…)` call (of the `methods` named) returns: an Effect,
+   * a run's promise, or neither.
+   */
+  const callbackReturns = (
+    node: ts.Expression,
+    methods: ReadonlyArray<string> = ["forEach", "map"],
+  ): "effect" | "promise" | undefined => {
     const at = strip(node)
     if (!ts.isCallExpression(at)) return undefined
     const callee = strip(at.expression)
     if (!ts.isPropertyAccessExpression(callee)) return undefined
-    if (callee.name.text !== "forEach" && callee.name.text !== "map") return undefined
+    if (!methods.includes(callee.name.text)) return undefined
     const callback = at.arguments[0] === undefined ? undefined : strip(at.arguments[0])
     if (
       callback === undefined ||
@@ -871,17 +984,17 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
     for (const arg of call.arguments) checkBody(arg)
   }
 
-  /** What a statement drops, if anything: an Effect, or a run's promise. */
-  const droppedBy = (statement: ts.ExpressionStatement): Rule | undefined => {
-    const expression = strip(statement.expression)
+  /** What dropping `dropped` (a statement's expression, or the left of a `,`) drops: an Effect, or a run's promise. */
+  const droppedBy = (dropped: ts.Expression, at: ts.Node): Rule | undefined => {
+    const expression = strip(dropped)
     const operand = ts.isVoidExpression(expression) ? expression.expression : expression
-    if (!typesOnly && !insideExpectCallback(statement) && outcomes(operand).some(buildsEffect)) {
+    if (!typesOnly && !insideExpectCallback(at) && outcomes(operand).some(buildsEffect)) {
       return "dropped-effect"
     }
     if (ts.isVoidExpression(expression)) return undefined
     if (dropsPromise(expression)) return "unawaited-run"
-    if (runCall(expression)?.fork === true && inSyncTest(statement)) return "unawaited-run"
-    const callback = droppedCallback(expression)
+    if (runCall(expression)?.fork === true && inSyncTest(at)) return "unawaited-run"
+    const callback = callbackReturns(expression)
     if (callback === "effect" && !typesOnly) return "dropped-effect"
     return callback === "promise" ? "unawaited-run" : undefined
   }
@@ -910,8 +1023,12 @@ export const findUnrunEffects = (fileName: string, source: string): ReadonlyArra
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) checkRegistration(node)
     if (ts.isExpressionStatement(node)) {
-      const rule = droppedBy(node)
+      const rule = droppedBy(node.expression, node)
       if (rule !== undefined) report(rule, node)
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.CommaToken) {
+      const rule = droppedBy(node.left, node)
+      if (rule !== undefined) report(rule, node.left)
     }
     if (ts.isAwaitExpression(node) && !typesOnly && outcomes(node.expression).some(buildsEffect)) {
       report("dropped-effect", node)

@@ -20,7 +20,7 @@ import type {
 } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect } from "effect"
-import { classifyError } from "../../src/DynamoClient.js"
+import { classifyError, type DynamoClientService } from "../../src/DynamoClient.js"
 import {
   answering,
   deleteItem,
@@ -92,9 +92,11 @@ export const tableKeys = new Map<string, KeySchema>()
  * index key checks on writes. A table with none here declares none.
  */
 export const tableIndexes = new Map<string, Readonly<Record<string, IndexSchema>>>()
-const keysOf = (table: string): KeySchema => tableKeys.get(table) ?? { pk: "pk", sk: "sk" }
-const indexesOf = (table: string): Readonly<Record<string, IndexSchema>> =>
-  tableIndexes.get(table) ?? {}
+/** A table's key attributes; a request naming no table is refused before they are read. */
+const keysOf = (table: string | undefined): KeySchema =>
+  (table === undefined ? undefined : tableKeys.get(table)) ?? { pk: "pk", sk: "sk" }
+const indexesOf = (table: string | undefined): Readonly<Record<string, IndexSchema>> =>
+  (table === undefined ? undefined : tableIndexes.get(table)) ?? {}
 
 const escapePart = (text: string) => text.replace(/[\\|]/g, (c) => `\\${c}`)
 
@@ -116,7 +118,9 @@ export const keyOf = (table: string, item: Item) => {
 }
 
 /** The rows `table` holds: those whose store key starts with its name. */
-const rowsOf = (table: string) => {
+/** A table's items; a request naming no table reads none, and is refused before it reads them. */
+const rowsOf = (table: string | undefined) => {
+  if (table === undefined) return []
   const prefix = `${escapePart(table)}|`
   return [...store.entries()].filter(([key]) => key.startsWith(prefix)).map(([, item]) => item)
 }
@@ -155,12 +159,12 @@ const write = (
   return Effect.succeed(outcome.output)
 }
 
-export const InMemoryClient = mockDynamoClientLayer({
+const operations: Partial<DynamoClientService> = {
   query: (input) =>
     Effect.suspend(() => {
       calls.query++
       queried.push(input.ExpressionAttributeValues ?? {})
-      const table = input.TableName!
+      const table = input.TableName
       const rows = rowsOf(table)
       return answering(
         () => Effect.succeed(query(input as never, rows, keysOf(table), indexesOf(table)) as never),
@@ -257,4 +261,9 @@ export const InMemoryClient = mockDynamoClientLayer({
         return Effect.succeed({} as never)
       }, failure("TransactWriteItems"))
     }),
-})
+}
+
+export const InMemoryClient = mockDynamoClientLayer(
+  operations,
+  "modelled by the in-memory tables (InMemoryClient)",
+)

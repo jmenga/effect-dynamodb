@@ -29,51 +29,58 @@ import {
  * The default stub for an operation a test does not exercise. Dying (rather
  * than failing) means an unexpected call surfaces as a defect with the
  * operation name, not as a recoverable error the code under test might swallow.
+ * `by` says whose operations these are ("stubbed by this test", "modelled by
+ * the in-memory tables").
  */
-const notUsed = (operation: string) => () =>
-  Effect.die(`DynamoClient.${operation} is not stubbed by this test`)
+const notUsed = (operation: string, by: string) => () =>
+  Effect.die(`DynamoClient.${operation} is not ${by}`)
 
-/** A complete `DynamoClientService` whose every operation dies when invoked. */
-const unusedDynamoClient: DynamoClientService = {
-  createTable: notUsed("createTable"),
-  deleteTable: notUsed("deleteTable"),
-  describeTable: notUsed("describeTable"),
-  putItem: notUsed("putItem"),
-  getItem: notUsed("getItem"),
-  deleteItem: notUsed("deleteItem"),
-  updateItem: notUsed("updateItem"),
-  query: notUsed("query"),
-  scan: notUsed("scan"),
-  searchVectors: notUsed("searchVectors"),
-  batchGetItem: notUsed("batchGetItem"),
-  batchWriteItem: notUsed("batchWriteItem"),
-  transactGetItems: notUsed("transactGetItems"),
-  transactWriteItems: notUsed("transactWriteItems"),
-  updateTable: notUsed("updateTable"),
-  listTables: notUsed("listTables"),
-  createBackup: notUsed("createBackup"),
-  deleteBackup: notUsed("deleteBackup"),
-  listBackups: notUsed("listBackups"),
-  restoreTableFromBackup: notUsed("restoreTableFromBackup"),
-  describeContinuousBackups: notUsed("describeContinuousBackups"),
-  updateContinuousBackups: notUsed("updateContinuousBackups"),
-  restoreTableToPointInTime: notUsed("restoreTableToPointInTime"),
-  exportTableToPointInTime: notUsed("exportTableToPointInTime"),
-  describeExport: notUsed("describeExport"),
-  updateTimeToLive: notUsed("updateTimeToLive"),
-  describeTimeToLive: notUsed("describeTimeToLive"),
-  tagResource: notUsed("tagResource"),
-  untagResource: notUsed("untagResource"),
-  listTagsOfResource: notUsed("listTagsOfResource"),
-}
+/**
+ * A complete `DynamoClientService` whose every operation dies when invoked,
+ * naming it. Typed as the whole service, so an operation added to it fails to
+ * compile here until it has its default.
+ */
+const unusedDynamoClient = (by: string): DynamoClientService => ({
+  createTable: notUsed("createTable", by),
+  deleteTable: notUsed("deleteTable", by),
+  describeTable: notUsed("describeTable", by),
+  putItem: notUsed("putItem", by),
+  getItem: notUsed("getItem", by),
+  deleteItem: notUsed("deleteItem", by),
+  updateItem: notUsed("updateItem", by),
+  query: notUsed("query", by),
+  scan: notUsed("scan", by),
+  searchVectors: notUsed("searchVectors", by),
+  batchGetItem: notUsed("batchGetItem", by),
+  batchWriteItem: notUsed("batchWriteItem", by),
+  transactGetItems: notUsed("transactGetItems", by),
+  transactWriteItems: notUsed("transactWriteItems", by),
+  updateTable: notUsed("updateTable", by),
+  listTables: notUsed("listTables", by),
+  createBackup: notUsed("createBackup", by),
+  deleteBackup: notUsed("deleteBackup", by),
+  listBackups: notUsed("listBackups", by),
+  restoreTableFromBackup: notUsed("restoreTableFromBackup", by),
+  describeContinuousBackups: notUsed("describeContinuousBackups", by),
+  updateContinuousBackups: notUsed("updateContinuousBackups", by),
+  restoreTableToPointInTime: notUsed("restoreTableToPointInTime", by),
+  exportTableToPointInTime: notUsed("exportTableToPointInTime", by),
+  describeExport: notUsed("describeExport", by),
+  updateTimeToLive: notUsed("updateTimeToLive", by),
+  describeTimeToLive: notUsed("describeTimeToLive", by),
+  tagResource: notUsed("tagResource", by),
+  untagResource: notUsed("untagResource", by),
+  listTagsOfResource: notUsed("listTagsOfResource", by),
+})
 
 /**
  * Build a `DynamoClientService` from a partial set of operations. Anything not
- * supplied dies when invoked.
+ * supplied dies when invoked, naming the operation and `by`.
  */
 export const mockDynamoClient = (
   overrides: Partial<DynamoClientService> = {},
-): DynamoClientService => ({ ...unusedDynamoClient, ...overrides })
+  by = "stubbed by this test",
+): DynamoClientService => ({ ...unusedDynamoClient(by), ...overrides })
 
 /**
  * Build a `Layer` providing `DynamoClient` from a partial set of operations.
@@ -81,7 +88,8 @@ export const mockDynamoClient = (
  */
 export const mockDynamoClientLayer = (
   overrides: Partial<DynamoClientService> = {},
-): Layer.Layer<DynamoClient> => Layer.succeed(DynamoClient, mockDynamoClient(overrides))
+  by?: string,
+): Layer.Layer<DynamoClient> => Layer.succeed(DynamoClient, mockDynamoClient(overrides, by))
 
 /**
  * Build a command output from just the fields a test cares about.

@@ -35,39 +35,65 @@
  * set from `ExpressionAttributeValues`, or nested in a put's item, spelt as `BigDecimal.toString()`
  * prints it (`1E+21`); any other number as written.
  *
- * What this doesn't model, in one place. These are answered, not refused, each for the reason given:
+ * What this doesn't model, in one list. Nothing else is answered differently from DynamoDB Local
+ * on purpose; a difference the conformance rows find that isn't here is a bug.
+ *
+ * Answered, not refused, each for the reason given:
  *
  * - Tables: none is listed, so a request naming a table that doesn't exist is answered as an
- *   empty table where DynamoDB Local refuses it (`ResourceNotFoundException`); the tests name
- *   their tables freely.
+ *   empty table where DynamoDB Local refuses it (`ResourceNotFoundException`), and a table name
+ *   DynamoDB Local refuses (shorter than 3 characters, longer than 255, or holding a character
+ *   other than `a-z`, `A-Z`, `0-9`, `_`, `-` and `.`) is answered. The name "" and a request (or a
+ *   transaction's item) naming no table are refused as DynamoDB Local refuses them, the name "" by
+ *   `TransactGetItems` as a table that doesn't exist. The tests name their tables freely
+ *   (`<table>`, `T`).
  * - Rows of one index key returned in one answer come back in table-key order; DynamoDB Local
  *   returns them in an order of its own. Every row is still returned once, and tests that list an
- *   aggregate's rows read them together. A request whose answer depends on that order is refused
- *   by name: an `ExclusiveStartKey` among such rows (other than its own row), or a `Limit` that
- *   stops between them.
+ *   aggregate's rows read them together. A read whose answer depends on that order is refused by
+ *   name (below).
  * - A `Scan` reads rows in key order and splits `Segment`s by a hash of the key; DynamoDB Local's
  *   order and split are its own. Read to its end, a scan returns the same rows; which rows one page
  *   holds differs. The tests that page a scan (`rekey`'s resume tokens) check what the pages hold
  *   together.
- * - Sizes: nothing is refused or cut for its size (an item over 400 KB, a key over its length, a
- *   transaction over 4 MB, an expression over its length), and a `Query` or `Scan` page is never
- *   cut at 1 MB. `RecordingTable`'s `refuseBodiesOver` refuses a request body over a given size,
- *   as DynamoDB Local refuses one over 16 MiB.
+ * - Sizes: nothing is refused or cut for its size: an item over 400 KB, a key over its length, a
+ *   transaction over 4 MB, an expression over 4 KB (DynamoDB Local refuses one before reading it:
+ *   `Invalid <Kind>Expression: Expression size has exceeded the maximum allowed size;`); and a
+ *   `Query` or `Scan` page is never cut at 1 MB. `RecordingTable`'s `refuseBodiesOver` refuses a
+ *   request body over a given size, as DynamoDB Local refuses one over 16 MiB. An expression's
+ *   operators (more than 300) and nesting (a value, an item or a path past 32 levels) are
+ *   modelled, as DynamoDB Local refuses them.
  * - Capacity: `ReturnConsumedCapacity` is accepted and nothing is reported.
- * - Several problems in one request: of one kind (two index keys of the wrong type, …) it is
- *   refused by name, as which DynamoDB Local reports first is unmeasured; of different kinds, the
- *   problem this module checks first is reported, in the order measured for the pairs the
- *   conformance rows send.
+ * - Several problems of different kinds in one request: the one this module checks first is
+ *   reported, in the order measured for the pairs the conformance rows send.
  * - An empty value of an attribute that keys several indexes is reported naming the first index
  *   declared; which one DynamoDB Local names is unmeasured.
  * - An item holding a top-level `__proto__` attribute, in an error (a failed condition's item, a
  *   cancellation reason's): the AWS SDK fails to read it (a `TypeError`); the tables return it as
  *   the SDK reads one in a successful answer.
  *
- * Refused by name, as not modelled: a request field `checkFields` doesn't list (a `Scan`'s
- * `IndexName` among them: the library sends none), a projection of a list element, an
- * `attribute_type` whose type is a path, a `Select` or `Limit` DynamoDB Local refuses in words
- * unmeasured, and each check marked "unmeasured" below.
+ * Refused by name ({@link UnreadableRequest}), as not modelled:
+ *
+ * - A request field `checkFields` doesn't list: `ReturnItemCollectionMetrics`, a `Scan`'s
+ *   `IndexName` (the library sends neither) and the legacy parameters (`AttributesToGet`,
+ *   `KeyConditions`, `Expected`, …).
+ * - A `TransactWriteItems`' `ClientRequestToken`: what DynamoDB Local does with one is measured at
+ *   `TOKEN_NOT_MODELLED`. The library sends none; the AWS SDK fills one in below the client.
+ * - A `Limit`, `Segment` or `TotalSegments` that isn't an integer.
+ * - A value in a shape the AWS SDK never sends (an `S` that isn't a string, a `BOOL` that isn't a
+ *   boolean, …), which DynamoDB Local stores as something else.
+ * - A read whose answer depends on the order of rows of one index key: an `ExclusiveStartKey`
+ *   among them (other than its own row), or a `Limit` that stops among them on the page read
+ *   (between two of them, or on the last of several, whose `LastEvaluatedKey` would name the one
+ *   DynamoDB Local reads last).
+ * - A query of a local index holding key values of more than one type. An update can write one,
+ *   accepted as DynamoDB Local accepts it; DynamoDB Local then returns the rows in an order of its
+ *   own.
+ * - Several problems of one kind in one request (two index keys of the wrong type, …), as which
+ *   DynamoDB Local reports first is unmeasured.
+ * - A key condition naming several index keys through nested paths.
+ * - A projection of a list element; an `attribute_type` whose type is a path or a `size`.
+ * - A `Select` DynamoDB Local refuses in words unmeasured, and each check marked "unmeasured"
+ *   below.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -90,12 +116,14 @@ const refuse = (message: string): never => {
 
 /**
  * Whether `error` is DynamoDB's refusal of the request, as opposed to a defect: a
- * `ValidationException`, or the `TransactionCanceledException` a `TransactGetItems` key check
- * fails with.
+ * `ValidationException`, the `TransactionCanceledException` a `TransactGetItems` key check fails
+ * with, or the `ResourceNotFoundException` a `TransactGetItems` of a table named "" fails with.
  */
 export const isRefusal = (error: unknown): error is Error =>
   error instanceof Error &&
-  (error.name === "ValidationException" || error.name === "TransactionCanceledException")
+  (error.name === "ValidationException" ||
+    error.name === "TransactionCanceledException" ||
+    error.name === "ResourceNotFoundException")
 
 /** A request the in-memory tables don't read: a defect naming it, never an approximation. */
 export class UnreadableRequest extends Error {
@@ -410,16 +438,80 @@ const SET_EMPTY: Record<string, string> = {
   BS: "One or more parameter values were invalid: Binary sets should not be empty",
 }
 
-/** Why DynamoDB refuses to store `value`, if it does (a number it can't store, an empty or repeating set). */
-export const valueProblem = (value: AttributeValue): string | undefined => {
-  const type = typeOf(value)
+const TWO_TYPES =
+  "Supplied AttributeValue has more than one datatypes set, must contain exactly one of the supported datatypes"
+const NO_TYPE =
+  "Supplied AttributeValue is empty, must contain exactly one of the supported datatypes"
+const NULL_FALSE =
+  "One or more parameter values were invalid: Null attribute value types must have the value of true"
+const EMPTY_NAME = "Empty attribute name"
+const ITEM_DEPTH =
+  "Nesting Levels have exceeded supported limits: Attributes in the item have nested levels beyond supported limit"
+/** An update whose result holds an attribute nested too deep: the same refusal, worded shorter. */
+const UPDATE_DEPTH = "Nesting Levels have exceeded supported limits"
+
+/**
+ * The containers (maps and lists) a stored attribute's value may nest, the outermost counted:
+ * DynamoDB Local refuses 32 (`{ L: [{ L: [] }] }` is two). An `ExpressionAttributeValues` value
+ * may nest one more.
+ */
+export const ITEM_LEVELS = 31
+const VALUE_LEVELS = 32
+
+/** The containers `value` nests, itself counted when it is one. */
+const levelsOf = (value: AttributeValue): number =>
+  value.L !== undefined
+    ? 1 + Math.max(0, ...value.L.map(levelsOf))
+    : value.M !== undefined
+      ? 1 + Math.max(0, ...Object.values(value.M).map(levelsOf))
+      : 0
+
+/**
+ * Why DynamoDB refuses to store `value`, if it does, as DynamoDB Local finds it walking the value
+ * in the order it is written: a value of no type or of two; then, for a map or list, nesting past
+ * `levels` containers (`enclosing` hold it already); a number it can't read or store, a `NULL`
+ * that isn't `true`, an empty or repeating set; and in a map, each entry's value before its name,
+ * an empty name refused. A value the AWS SDK sends in a shape this doesn't model (a string that
+ * isn't one, a `BOOL` that isn't a boolean, …), which DynamoDB Local stores as something else, is
+ * refused by name.
+ */
+export const valueProblem = (
+  value: AttributeValue,
+  levels = ITEM_LEVELS,
+  enclosing = 0,
+): string | undefined => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return unreadable("the attribute value", shown(value), "not an attribute value")
+  }
+  const types = TYPES.filter((t) => (value as unknown as Record<string, unknown>)[t] !== undefined)
+  if (types.length > 1) return TWO_TYPES
+  if (types.length === 0) return NO_TYPE
+  const type = types[0]!
+  const loose = (detail: string) =>
+    unreadable("the attribute value", shown(value), `${detail} (not modelled)`)
+  const strings = (members: unknown) =>
+    Array.isArray(members) && members.every((member) => typeof member === "string")
   switch (type) {
+    case "S":
+      return typeof value.S === "string" ? undefined : loose("an S that isn't a string")
+    case "B":
+      return value.B instanceof Uint8Array ? undefined : loose("a B that isn't bytes")
+    case "BOOL":
+      return typeof value.BOOL === "boolean" ? undefined : loose("a BOOL that isn't a boolean")
+    case "NULL":
+      return value.NULL === true
+        ? undefined
+        : value.NULL === false
+          ? NULL_FALSE
+          : loose("a NULL that isn't a boolean")
     case "N": {
-      const d = parseDecimal(value.N!)
+      if (typeof value.N !== "string") return NOT_A_NUMBER
+      const d = parseDecimal(value.N)
       return d === undefined ? NOT_A_NUMBER : numberProblem(d)
     }
     case "SS": {
       const members = value.SS!
+      if (!strings(members)) return loose("an SS that isn't a list of strings")
       if (members.length === 0) return SET_EMPTY.SS
       if (new Set(members).size !== members.length) {
         return `One or more parameter values were invalid: Input collection [${members.join(", ")}] contains duplicates`
@@ -428,6 +520,7 @@ export const valueProblem = (value: AttributeValue): string | undefined => {
     }
     case "NS": {
       const members = value.NS!
+      if (!strings(members)) return loose("an NS that isn't a list of strings")
       if (members.length === 0) return SET_EMPTY.NS
       for (const member of members) {
         const d = parseDecimal(member)
@@ -441,27 +534,60 @@ export const valueProblem = (value: AttributeValue): string | undefined => {
     }
     case "BS": {
       const members = value.BS!
+      if (!Array.isArray(members) || !members.every((m) => m instanceof Uint8Array)) {
+        return loose("a BS that isn't a list of bytes")
+      }
       if (members.length === 0) return SET_EMPTY.BS
       if (members.some((x, i) => members.some((y, j) => j > i && sameBytes(x, y)))) {
         return "One or more parameter values were invalid: Input collection of type BS contains duplicates."
       }
       return undefined
     }
-    case "L":
-      for (const element of value.L!) {
-        const problem = valueProblem(element)
+    case "L": {
+      const elements = value.L as unknown
+      if (typeof elements === "string") return NO_TYPE
+      if (!Array.isArray(elements)) return loose("an L that isn't a list")
+      if (enclosing + 1 > levels) return ITEM_DEPTH
+      for (const element of elements) {
+        const problem = valueProblem(element, levels, enclosing + 1)
         if (problem !== undefined) return problem
       }
       return undefined
-    case "M":
-      for (const key of Object.keys(value.M!)) {
-        const problem = valueProblem(value.M![key]!)
+    }
+    default: {
+      const entries = value.M as unknown
+      if (typeof entries === "string") return NO_TYPE
+      if (entries === null || typeof entries !== "object" || Array.isArray(entries)) {
+        return loose("an M that isn't a map")
+      }
+      if (enclosing + 1 > levels) return ITEM_DEPTH
+      for (const key of Object.keys(entries)) {
+        const problem = valueProblem(value.M![key]!, levels, enclosing + 1)
         if (problem !== undefined) return problem
+        if (key === "") return EMPTY_NAME
       }
       return undefined
-    default:
-      return undefined
+    }
   }
+}
+
+/**
+ * Why DynamoDB refuses an item, key or start key, if it does: each attribute in the order it is
+ * written, its value ({@link valueProblem}) and then its name, which can't be empty. A key or
+ * start key (`what` names it) nesting a value past an item's limit is refused by name, as
+ * unmeasured.
+ */
+const attributesProblem = (attributes: Item, what?: string): string | undefined => {
+  for (const name of Object.keys(attributes)) {
+    const value = attributes[name]!
+    const problem = valueProblem(value)
+    if (problem === ITEM_DEPTH && what !== undefined) {
+      unreadable(what, shown(attributes), "a value nested past the item's limit (unmeasured)")
+    }
+    if (problem !== undefined) return problem
+    if (name === "") return EMPTY_NAME
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -628,17 +754,21 @@ const placeholdersOf = (
   usedValues: new Set(),
 })
 
-/** A value placeholder; `value` is `undefined` while a placeholder the request doesn't define is reported later. */
+/** A value placeholder; `value` is `undefined` when the request doesn't define it. */
 interface ValueNode {
   readonly kind: "value"
   readonly name: string
   readonly value: AttributeValue | undefined
 }
 
-type Operand =
-  | { readonly kind: "path"; readonly path: Path }
-  | ValueNode
-  | { readonly kind: "size"; readonly path: Path }
+/** A document path, with its problem when it has one (too deep, or a name the request doesn't define). */
+interface PathNode {
+  readonly kind: "path"
+  readonly path: Path
+  readonly problem?: string | undefined
+}
+
+type Operand = PathNode | ValueNode | { readonly kind: "size"; readonly of: Operand }
 
 type Condition =
   | { readonly kind: "and" | "or"; readonly left: Condition; readonly right: Condition }
@@ -665,9 +795,15 @@ type Condition =
     }
 
 type UpdateValue =
-  | { readonly kind: "path"; readonly path: Path }
+  | PathNode
   | ValueNode
-  | { readonly kind: "if_not_exists"; readonly path: Path; readonly fallback: UpdateValue }
+  | {
+      readonly kind: "if_not_exists"
+      /** The first argument as written; `path` is its path (a placeholder when it isn't one). */
+      readonly first: UpdateValue
+      readonly path: Path
+      readonly fallback: UpdateValue
+    }
   | { readonly kind: "list_append"; readonly first: UpdateValue; readonly second: UpdateValue }
   | {
       readonly kind: "arithmetic"
@@ -676,22 +812,49 @@ type UpdateValue =
       readonly right: UpdateValue
     }
 
+/** An update action; `problem` is its path's, when it has one. */
 type Action =
-  | { readonly kind: "SET"; readonly path: Path; readonly value: UpdateValue }
-  | { readonly kind: "REMOVE"; readonly path: Path }
-  | { readonly kind: "ADD" | "DELETE"; readonly path: Path; readonly value: ValueNode }
+  | {
+      readonly kind: "SET"
+      readonly path: Path
+      readonly problem?: string | undefined
+      readonly value: UpdateValue
+    }
+  | { readonly kind: "REMOVE"; readonly path: Path; readonly problem?: string | undefined }
+  | {
+      readonly kind: "ADD" | "DELETE"
+      readonly path: Path
+      readonly problem?: string | undefined
+      readonly value: ValueNode
+    }
 
-/** A recursive-descent reader over one expression's tokens. */
+/** A path holds at most this many segments (names and indexes). */
+const MAX_PATH_SEGMENTS = 32
+/** An expression holds at most this many operators. */
+const MAX_OPERATORS = 300
+
+/** Stands in for an operand or condition already refused, so the rest of the expression is read. */
+const NO_VALUE: ValueNode = { kind: "value", name: "", value: undefined }
+const NO_CONDITION: Condition = { kind: "exists", negate: false, path: [""] }
+
+/**
+ * A recursive-descent reader over one expression's tokens. DynamoDB Local refuses an expression in
+ * phases, measured: a syntax error, a reserved word or redundant parentheses as it parses (the
+ * first met); then a problem with a function call (an unknown name, or a function used where it
+ * can't be: the first met); then a problem each kind of expression finds walking what it parsed
+ * (conditions the first, updates and projections the last, see each reader); then too many
+ * operators.
+ */
 class Reader {
   readonly tokens: Array<Token>
   at = 0
+  private functionProblem: string | undefined
   constructor(
     readonly kind: string,
     readonly expression: string,
     readonly placeholders: Placeholders,
-    /** Leave a value placeholder the request doesn't define for a later check, rather than refuse it now. */
-    readonly deferUndefinedValues = false,
   ) {
+    if (expression === "") this.invalid("The expression can not be empty;")
     this.tokens = tokenize(kind, expression)
   }
 
@@ -733,21 +896,53 @@ class Reader {
     if (this.peek() !== undefined) this.syntaxError()
   }
 
-  invalid(message: string): never {
-    return refuse(`Invalid ${this.kind}Expression: ${message}`)
+  /** `message` as this expression's refusal. */
+  refusal(message: string): string {
+    return `Invalid ${this.kind}Expression: ${message}`
   }
 
-  /** A placeholder's or bare word's attribute name. */
-  attributeName(token: Token): string {
+  invalid(message: string): never {
+    return refuse(this.refusal(message))
+  }
+
+  /** A problem with a function call, reported (the first) once the expression parses. */
+  functionFound(message: string): void {
+    this.functionProblem ??= this.refusal(message)
+  }
+
+  /** Refuse the first problem with a function call, if there was one. */
+  reportFunctions(): void {
+    if (this.functionProblem !== undefined) refuse(this.functionProblem)
+  }
+
+  /** The index of the `)` closing the `(` at `open` (`-1`: none). */
+  closes(open: number): number {
+    let depth = 0
+    for (let at = open; at < this.tokens.length; at++) {
+      if (this.tokens[at]!.text === "(") depth++
+      if (this.tokens[at]!.text === ")" && --depth === 0) return at
+    }
+    return -1
+  }
+
+  /** At a `(`: refuse it when it holds nothing but another group (`((#a))`), as DynamoDB Local does as it parses. */
+  notRedundant(): void {
+    const close = this.closes(this.at)
+    if (close !== -1 && this.is("(", 1) && this.closes(this.at + 1) + 1 === close) {
+      this.invalid("The expression has redundant parentheses;")
+    }
+  }
+
+  /**
+   * A path segment's attribute name: a placeholder's (`undefinedName` when the request doesn't
+   * define it), or a bare word that isn't a reserved word.
+   */
+  attributeName(token: Token): { readonly name: string; readonly undefinedName?: string } {
     if (token.kind === "name") {
       const name = own(this.placeholders.names, token.text)
-      if (name === undefined) {
-        return this.invalid(
-          `An expression attribute name used in the document path is not defined; attribute name: ${token.text}`,
-        )
-      }
+      if (name === undefined) return { name: token.text, undefinedName: token.text }
       this.placeholders.usedNames.add(token.text)
-      return name
+      return { name }
     }
     if (token.kind === "word") {
       const upper = token.text.toUpperCase()
@@ -758,7 +953,7 @@ class Reader {
       if (RESERVED.has(upper)) {
         this.invalid(`Attribute name is a reserved keyword; reserved keyword: ${token.text}`)
       }
-      return token.text
+      return { name: token.text }
     }
     this.at--
     return this.syntaxError()
@@ -766,7 +961,6 @@ class Reader {
 
   valueNode(token: Token): ValueNode {
     const value = own(this.placeholders.values, token.text)
-    if (value === undefined && !this.deferUndefinedValues) this.invalid(undefinedValue(token.text))
     this.placeholders.usedValues.add(token.text)
     return { kind: "value", name: token.text, value }
   }
@@ -779,8 +973,14 @@ class Reader {
     return token.kind === "word" && !this.is("(", 1)
   }
 
-  path(): Path {
-    const segments: Array<Segment> = [this.attributeName(this.take())]
+  /**
+   * A document path and its problem: more than 32 segments (measured: counted before its names
+   * are resolved), else the first name the request doesn't define.
+   */
+  path(): PathNode {
+    const first = this.attributeName(this.take())
+    const segments: Array<Segment> = [first.name]
+    const undefinedNames = first.undefinedName === undefined ? [] : [first.undefinedName]
     for (;;) {
       if (this.is("[")) {
         this.at++
@@ -793,16 +993,68 @@ class Reader {
         this.expect("]")
       } else if (this.is(".")) {
         this.at++
-        segments.push(this.attributeName(this.take()))
+        const next = this.attributeName(this.take())
+        segments.push(next.name)
+        if (next.undefinedName !== undefined) undefinedNames.push(next.undefinedName)
       } else {
-        return segments
+        break
       }
     }
+    const problem =
+      segments.length > MAX_PATH_SEGMENTS
+        ? `The document path has too many nesting levels; nesting levels: ${segments.length}`
+        : undefinedNames.length > 0
+          ? `An expression attribute name used in the document path is not defined; attribute name: ${undefinedNames[0]}`
+          : undefined
+    return { kind: "path", path: segments, ...(problem !== undefined && { problem }) }
   }
 }
 
 const undefinedValue = (name: string) =>
   `An expression attribute value used in expression is not defined; attribute value: ${name}`
+
+/** Refuse an expression holding more than 300 operators; DynamoDB Local always reports 301. */
+const countOperators = (kind: string, count: number): void => {
+  if (count > MAX_OPERATORS) {
+    refuse(
+      `Invalid ${kind}Expression: The expression contains too many operators; operator count: ${MAX_OPERATORS + 1}`,
+    )
+  }
+}
+
+/** Two paths that overlap (one holds the other) or conflict (a name and an index at one place). */
+const clashOf = (one: Path, two: Path): "overlap" | "conflict" | undefined => {
+  const n = Math.min(one.length, two.length)
+  let at = 0
+  while (at < n && one[at] === two[at]) at++
+  return at === n ? "overlap" : typeof one[at] !== typeof two[at] ? "conflict" : undefined
+}
+
+/**
+ * An expression's paths that clash, as DynamoDB Local reports them (measured): the last path that
+ * clashes with an earlier one, against the first earlier one it clashes with, and as "path two"
+ * the expression's last path, whichever that is.
+ */
+const clashes = (paths: ReadonlyArray<Path>) => {
+  let found: { readonly one: Path; readonly clash: string } | undefined
+  for (let j = 0; j < paths.length; j++) {
+    for (const one of paths.slice(0, j)) {
+      const clash = clashOf(one, paths[j]!)
+      if (clash !== undefined) {
+        found = { one, clash }
+        break
+      }
+    }
+  }
+  return found
+}
+
+const clashRefusal = (
+  kind: string,
+  found: { readonly one: Path; readonly clash: string },
+  paths: ReadonlyArray<Path>,
+) =>
+  `Invalid ${kind}Expression: Two document paths ${found.clash} with each other; must remove or rewrite one of these paths; path one: ${pathText(found.one)}, path two: ${pathText(paths[paths.length - 1]!)}`
 
 // --- conditions -------------------------------------------------------------
 
@@ -817,16 +1069,66 @@ const FUNCTIONS = new Set([
   "size",
 ])
 const TYPE_NAMES = ["N", "BS", "L", "B", "NULL", "M", "S", "SS", "NS", "BOOL"]
+/** The types `size` of a value refuses (measured). */
+const SIZELESS = new Set(["N", "BOOL", "NULL"])
 
 const samePath = (a: Path, b: Path) => a.length === b.length && a.every((s, i) => s === b[i])
 
 const literal = (operand: Operand | UpdateValue): AttributeValue | undefined =>
   operand.kind === "value" ? operand.value : undefined
 
+const operandOperators = (operand: Operand): number =>
+  operand.kind === "size" ? 1 + operandOperators(operand.of) : 0
+
+/** A condition's operators: each comparison, `AND` / `OR` / `NOT`, `BETWEEN`, `IN` and function. */
+const conditionOperators = (condition: Condition): number => {
+  switch (condition.kind) {
+    case "and":
+    case "or":
+      return 1 + conditionOperators(condition.left) + conditionOperators(condition.right)
+    case "not":
+      return 1 + conditionOperators(condition.inner)
+    case "compare":
+      return 1 + operandOperators(condition.left) + operandOperators(condition.right)
+    case "between":
+      return (
+        1 +
+        [condition.subject, condition.low, condition.high].reduce(
+          (n, o) => n + operandOperators(o),
+          0,
+        )
+      )
+    case "in":
+      return (
+        1 + [condition.subject, ...condition.options].reduce((n, o) => n + operandOperators(o), 0)
+      )
+    case "exists":
+    case "type":
+      return 1
+    default:
+      return 1 + operandOperators(condition.subject) + operandOperators(condition.operand)
+  }
+}
+
+/**
+ * A condition, filter or key condition. Past the parse and function phases, DynamoDB Local reports
+ * the first problem met reading it as written (measured): an undefined name or value, a path too
+ * deep, an operand of the wrong type, operands that aren't distinct, `IN` over 100, a function's
+ * operands, `BETWEEN`'s bounds.
+ */
 class ConditionReader extends Reader {
+  private problem: string | undefined
+
+  found(message: string | undefined): void {
+    if (message !== undefined) this.problem ??= this.refusal(message)
+  }
+
   condition(): Condition {
     const result = this.or()
     this.done()
+    this.reportFunctions()
+    if (this.problem !== undefined) refuse(this.problem)
+    countOperators(this.kind, conditionOperators(result))
     return result
   }
 
@@ -856,19 +1158,63 @@ class ConditionReader extends Reader {
     return this.primary()
   }
 
-  primary(): Condition {
-    if (this.is("(")) {
-      if (this.is("(", 1) && this.closes(this.at + 1) + 1 === this.closes(this.at)) {
-        this.invalid("The expression has redundant parentheses;")
+  /**
+   * At a `(`: whether it groups an operand (`(#a) = :v`) rather than a condition, as DynamoDB
+   * Local reads it (measured): its `)` is followed by a comparison, `BETWEEN` or `IN` (or by a
+   * path's `.` or `[`, a syntax error there), or it holds one operand alone (`(#a)`, a syntax error
+   * at the end).
+   */
+  groupsOperand(): boolean {
+    const close = this.closes(this.at)
+    if (close === -1) return false
+    if (this.operatorAfter(close, [".", "["])) return true
+    const first = this.tokens[this.at + 1]
+    if (first?.kind === "word" && first.text !== "size" && this.tokens[this.at + 2]?.text === "(") {
+      return false
+    }
+    let depth = 0
+    for (let at = this.at + 1; at < close; at++) {
+      const text = this.tokens[at]!.text
+      if (text === "(") depth++
+      else if (text === ")") depth--
+      else if (
+        depth === 0 &&
+        (COMPARATORS.has(text) ||
+          ["AND", "OR", "NOT", "BETWEEN", "IN"].includes(text.toUpperCase()))
+      ) {
+        return false
       }
+    }
+    return true
+  }
+
+  /** Whether the token after `close` is a comparison, `BETWEEN`, `IN` or one of `also`. */
+  operatorAfter(close: number, also: ReadonlyArray<string> = []): boolean {
+    const next = this.tokens[close + 1]
+    return (
+      next !== undefined &&
+      (COMPARATORS.has(next.text) || ["BETWEEN", "IN", ...also].includes(next.text.toUpperCase()))
+    )
+  }
+
+  primary(): Condition {
+    if (this.is("(") && !this.groupsOperand()) {
+      this.notRedundant()
       this.at++
       const inner = this.or()
       this.expect(")")
       return inner
     }
     const token = this.peek()
-    if (token?.kind === "word" && this.is("(", 1) && token.text !== "size") {
-      if (!FUNCTIONS.has(token.text)) this.invalid(`Invalid function name; function: ${token.text}`)
+    // A function call is a condition unless a comparison, `BETWEEN` or `IN` follows it, which
+    // makes it an operand (measured: `attribute_exists(#a) = :v` is refused as a misused function).
+    if (
+      token?.kind === "word" &&
+      this.is("(", 1) &&
+      token.text !== "size" &&
+      FUNCTIONS.has(token.text) &&
+      !this.operatorAfter(this.closes(this.at + 1))
+    ) {
       return this.function(token.text)
     }
     const subject = this.operand()
@@ -889,7 +1235,7 @@ class ConditionReader extends Reader {
       }
       this.expect(")")
       if (options.length > 100) {
-        this.invalid(
+        this.found(
           `The IN operator is provided with too many operands; number of operands: ${options.length}`,
         )
       }
@@ -899,10 +1245,13 @@ class ConditionReader extends Reader {
     const op = this.peek()
     if (op === undefined || !COMPARATORS.has(op.text)) {
       if (subject.kind === "size") {
-        this.invalid(
+        this.functionFound(
           "The function is not allowed to be used this way in an expression; function: size",
         )
+        return NO_CONDITION
       }
+      // An unknown function used as a condition, already found.
+      if (subject === NO_VALUE) return NO_CONDITION
       return this.syntaxError()
     }
     this.at++
@@ -914,21 +1263,11 @@ class ConditionReader extends Reader {
     return { kind: "compare", op: op.text, left: subject, right }
   }
 
-  /** The index of the `)` closing the `(` at `open`. */
-  closes(open: number): number {
-    let depth = 0
-    for (let at = open; at < this.tokens.length; at++) {
-      if (this.tokens[at]!.text === "(") depth++
-      if (this.tokens[at]!.text === ")" && --depth === 0) return at
-    }
-    return -1
-  }
-
   /** `<`, `<=`, `>`, `>=` and `BETWEEN` refuse a literal operand they can't order. */
   orderable(op: string, side: Operand): void {
     const value = literal(side)
     if (value !== undefined && !ORDERED_TYPES.has(typeOf(value))) {
-      this.invalid(
+      this.found(
         `Incorrect operand type for operator or function; operator or function: ${op}, operand type: ${typeOf(value)}`,
       )
     }
@@ -937,7 +1276,7 @@ class ConditionReader extends Reader {
   distinct(op: string, first: Operand, rest: ReadonlyArray<Operand>): void {
     if (first.kind !== "path") return
     if (rest.some((other) => other.kind === "path" && samePath(other.path, first.path))) {
-      this.invalid(
+      this.found(
         `The first operand must be distinct from the remaining operands for this operator or function; operator: ${op}, first operand: ${pathText(first.path)}`,
       )
     }
@@ -947,7 +1286,12 @@ class ConditionReader extends Reader {
     for (const side of [subject, low, high]) this.orderable("BETWEEN", side)
     this.distinct("BETWEEN", subject, [low, high])
     const [a, b] = [literal(low), literal(high)]
-    if (a !== undefined && b !== undefined) {
+    if (
+      a !== undefined &&
+      b !== undefined &&
+      ORDERED_TYPES.has(typeOf(a)) &&
+      ORDERED_TYPES.has(typeOf(b))
+    ) {
       const bounds = () => {
         const text = (v: AttributeValue) =>
           v.B !== undefined
@@ -960,12 +1304,11 @@ class ConditionReader extends Reader {
         return `lower bound operand: ${text(a)}, upper bound operand: ${text(b)}`
       }
       if (typeOf(a) !== typeOf(b)) {
-        this.invalid(
+        this.found(
           `The BETWEEN operator requires same data type for lower and upper bounds; ${bounds()}`,
         )
-      }
-      if (order(a, b)! > 0) {
-        this.invalid(
+      } else if (order(a, b)! > 0) {
+        this.found(
           `The BETWEEN operator requires upper bound to be greater than or equal to lower bound; ${bounds()}`,
         )
       }
@@ -973,7 +1316,8 @@ class ConditionReader extends Reader {
     return { kind: "between", subject, low, high }
   }
 
-  arguments(name: string): Array<Operand> {
+  /** A call's operands; `name`'s count checked (`undefined`: a call already refused). */
+  arguments(name: string | undefined): Array<Operand> {
     this.expect("(")
     const args = [this.operand()]
     while (this.is(",")) {
@@ -981,20 +1325,21 @@ class ConditionReader extends Reader {
       args.push(this.operand())
     }
     this.expect(")")
+    if (name === undefined) return args
     const wanted = ["attribute_exists", "attribute_not_exists", "size"].includes(name) ? 1 : 2
     if (args.length !== wanted) {
-      this.invalid(
+      this.found(
         `Incorrect number of operands for operator or function; operator or function: ${name}, number of operands: ${args.length}`,
       )
+      while (args.length < wanted) args.push(NO_VALUE)
     }
     return args
   }
 
   pathArgument(name: string, operand: Operand): Path {
     if (operand.kind !== "path") {
-      return this.invalid(
-        `Operator or function requires a document path; operator or function: ${name}`,
-      )
+      this.found(`Operator or function requires a document path; operator or function: ${name}`)
+      return [""]
     }
     return operand.path
   }
@@ -1012,20 +1357,25 @@ class ConditionReader extends Reader {
         }
       case "attribute_type": {
         const path = this.pathArgument(name, args[0]!)
-        const type = literal(args[1]!)
-        if (type?.S === undefined) {
-          return type === undefined
-            ? unreadable(`the ${this.kind}Expression`, this.expression, "attribute_type of a path")
-            : this.invalid(
-                `Incorrect operand type for operator or function; operator or function: attribute_type, operand type: ${typeOf(type)}`,
-              )
+        const given = args[1]!
+        if (given.kind !== "value") {
+          return unreadable(
+            `the ${this.kind}Expression`,
+            this.expression,
+            "attribute_type of a path or size",
+          )
         }
-        if (!TYPE_NAMES.includes(type.S)) {
-          this.invalid(
+        const type = given.value
+        if (type !== undefined && type.S === undefined) {
+          this.found(
+            `Incorrect operand type for operator or function; operator or function: attribute_type, operand type: ${typeOf(type)}`,
+          )
+        } else if (type !== undefined && !TYPE_NAMES.includes(type.S!)) {
+          this.found(
             `Invalid attribute type name found; type: ${type.S}, valid types: {${TYPE_NAMES.join(",")}}`,
           )
         }
-        return { kind: "type", path, type: type.S }
+        return { kind: "type", path, type: type?.S ?? "" }
       }
       default: {
         const [subject, operand] = args as [Operand, Operand]
@@ -1033,8 +1383,12 @@ class ConditionReader extends Reader {
           for (const side of [subject, operand]) {
             const value = literal(side)
             if (value !== undefined && value.S === undefined && value.B === undefined) {
-              this.invalid(
+              this.found(
                 `Incorrect operand type for operator or function; operator or function: begins_with, operand type: ${typeOf(value)}`,
+              )
+            } else if (side.kind === "size") {
+              this.found(
+                "Incorrect operand type for operator or function; operator or function: begins_with, operand type: N",
               )
             }
           }
@@ -1044,28 +1398,48 @@ class ConditionReader extends Reader {
     }
   }
 
+  /** An operand: a value, a path, `size(…)` of either, or one in parentheses. */
   operand(): Operand {
     const token = this.peek()
     if (token === undefined) return this.syntaxError()
+    if (token.text === "(") {
+      this.notRedundant()
+      this.at++
+      const inner = this.operand()
+      this.expect(")")
+      return inner
+    }
     if (token.kind === "value") {
       this.at++
-      return this.valueNode(token)
+      const node = this.valueNode(token)
+      if (node.value === undefined) this.found(undefinedValue(node.name))
+      return node
     }
     if (token.kind === "word" && this.is("(", 1)) {
-      if (token.text !== "size") {
-        if (!FUNCTIONS.has(token.text))
-          this.invalid(`Invalid function name; function: ${token.text}`)
-        return unreadable(
-          `the ${this.kind}Expression`,
-          this.expression,
-          `${token.text}() as an operand`,
-        )
-      }
       this.at++
-      const [arg] = this.arguments("size")
-      return { kind: "size", path: this.pathArgument("size", arg!) }
+      if (token.text === "size") {
+        const [of] = this.arguments("size")
+        const value = literal(of!)
+        if (of!.kind === "size" || (value !== undefined && SIZELESS.has(typeOf(value)))) {
+          this.found(
+            `Incorrect operand type for operator or function; operator or function: size, operand type: ${value === undefined ? "N" : typeOf(value)}`,
+          )
+        }
+        return { kind: "size", of: of! }
+      }
+      this.functionFound(
+        FUNCTIONS.has(token.text)
+          ? `The function is not allowed to be used this way in an expression; function: ${token.text}`
+          : `Invalid function name; function: ${token.text}`,
+      )
+      this.arguments(undefined)
+      return NO_VALUE
     }
-    if (this.atPath()) return { kind: "path", path: this.path() }
+    if (this.atPath()) {
+      const node = this.path()
+      this.found(node.problem)
+      return node
+    }
     return this.syntaxError()
   }
 }
@@ -1082,9 +1456,14 @@ const OPERAND_TYPE_NAMES: Record<string, string> = {
   M: "MAP",
 }
 
+const LIST_APPEND_NESTED =
+  "The function is not allowed to be used this way in an expression; function: list_append"
+const IF_NOT_EXISTS_PATH =
+  "Operator or function requires a document path; operator or function: if_not_exists"
+
 class UpdateReader extends Reader {
   constructor(expression: string, placeholders: Placeholders) {
-    super("Update", expression, placeholders, true)
+    super("Update", expression, placeholders)
   }
 
   update(): ReadonlyArray<Action> {
@@ -1111,81 +1490,159 @@ class UpdateReader extends Reader {
   }
 
   action(section: string): Action {
-    const path = this.path()
-    if (section === "REMOVE") return { kind: "REMOVE", path }
+    const target = this.path()
+    const at = {
+      path: target.path,
+      ...(target.problem !== undefined && { problem: target.problem }),
+    }
+    if (section === "REMOVE") return { kind: "REMOVE", ...at }
     if (section === "SET") {
       this.expect("=")
-      return { kind: "SET", path, value: this.value() }
+      return { kind: "SET", ...at, value: this.setValue() }
     }
     const token = this.take()
     if (token.kind !== "value") {
       this.at--
       this.syntaxError()
     }
-    return { kind: section as "ADD" | "DELETE", path, value: this.valueNode(token) }
+    return { kind: section as "ADD" | "DELETE", ...at, value: this.valueNode(token) }
   }
 
-  value(): UpdateValue {
-    const left = this.term()
+  /**
+   * A `SET` action's value: an operand, `operand + operand` or `operand - operand`, or a value in
+   * parentheses. A `(` whose `)` a `+` or `-` follows groups the left operand, unless it holds an
+   * arithmetic itself (DynamoDB Local then refuses at the `+` after it).
+   */
+  setValue(): UpdateValue {
+    if (this.is("(")) {
+      this.notRedundant()
+      const close = this.closes(this.at)
+      const after = close === -1 ? undefined : this.tokens[close + 1]
+      if (!(after?.text === "+" || after?.text === "-") || this.holdsArithmetic(this.at, close)) {
+        this.at++
+        const inner = this.setValue()
+        this.expect(")")
+        return inner
+      }
+    }
+    const left = this.operand()
     if (this.is("+") || this.is("-")) {
       const op = this.take().text as "+" | "-"
-      return { kind: "arithmetic", op, left, right: this.term() }
+      const right = this.operand()
+      for (const side of [left, right]) {
+        if (side.kind === "list_append") this.functionFound(LIST_APPEND_NESTED)
+      }
+      return { kind: "arithmetic", op, left, right }
     }
     return left
   }
 
-  term(): UpdateValue {
-    if (this.is("(")) {
+  /** Whether the tokens inside the group `open`..`close` hold a `+` or `-` outside an inner group. */
+  holdsArithmetic(open: number, close: number): boolean {
+    let depth = 0
+    for (let at = open + 1; at < close; at++) {
+      const text = this.tokens[at]!.text
+      if (text === "(") depth++
+      else if (text === ")") depth--
+      else if (depth === 0 && (text === "+" || text === "-")) return true
+    }
+    return false
+  }
+
+  /** An operand: a value, a path, `if_not_exists(…)` or `list_append(…)`, or one in parentheses. */
+  operand(): UpdateValue {
+    const token = this.peek()
+    if (token === undefined) return this.syntaxError()
+    if (token.text === "(") {
+      this.notRedundant()
       this.at++
-      const inner = this.value()
+      const inner = this.operand()
       this.expect(")")
       return inner
     }
-    const token = this.peek()
-    if (token === undefined) return this.syntaxError()
     if (token.kind === "value") {
       this.at++
       return this.valueNode(token)
     }
     if (token.kind === "word" && this.is("(", 1)) {
       const name = token.text
-      if (name !== "if_not_exists" && name !== "list_append") {
-        return FUNCTIONS.has(name)
-          ? this.invalid(`The function is not allowed in an update expression; function: ${name}`)
-          : this.invalid(`Invalid function name; function: ${name}`)
-      }
       this.at += 2
-      const first = this.value()
-      this.expect(",")
-      const second = this.value()
-      this.expect(")")
-      if (name === "list_append") return { kind: "list_append", first, second }
-      if (first.kind !== "path") {
-        return this.invalid(
-          "Operator or function requires a document path; operator or function: if_not_exists",
+      if (name !== "if_not_exists" && name !== "list_append") {
+        this.functionFound(
+          FUNCTIONS.has(name)
+            ? `The function is not allowed in an update expression; function: ${name}`
+            : `Invalid function name; function: ${name}`,
         )
+        this.operand()
+        while (this.is(",")) {
+          this.at++
+          this.operand()
+        }
+        this.expect(")")
+        return NO_VALUE
       }
-      return { kind: "if_not_exists", path: first.path, fallback: second }
+      const first = this.operand()
+      this.expect(",")
+      const second = this.operand()
+      this.expect(")")
+      for (const arg of [first, second]) {
+        if (arg.kind === "list_append") this.functionFound(LIST_APPEND_NESTED)
+      }
+      if (name === "list_append") return { kind: "list_append", first, second }
+      return {
+        kind: "if_not_exists",
+        first,
+        path: first.kind === "path" ? first.path : [""],
+        fallback: second,
+      }
     }
-    if (this.atPath()) return { kind: "path", path: this.path() }
+    if (this.atPath()) return this.path()
     return this.syntaxError()
   }
 }
 
-/** The first problem DynamoDB finds in one action before reading the item (an undefined value, a literal of the wrong type). */
-const actionProblem = (action: Action): string | undefined => {
+const valueOperators = (value: UpdateValue): number => {
+  switch (value.kind) {
+    case "value":
+    case "path":
+      return 0
+    case "if_not_exists":
+      return 1 + valueOperators(value.first) + valueOperators(value.fallback)
+    case "list_append":
+      return 1 + valueOperators(value.first) + valueOperators(value.second)
+    case "arithmetic":
+      return 1 + valueOperators(value.left) + valueOperators(value.right)
+  }
+}
+
+/**
+ * The problem DynamoDB Local reports of an update's actions once they parse, overlaps and function
+ * calls aside (measured): it reads the actions as written, each action's value before its path,
+ * and keeps the last problem it meets, except that no other problem (an undefined value, an
+ * operand of the wrong type, `if_not_exists` of something not a path) replaces a path's (a name
+ * the request doesn't define, or a path too deep).
+ */
+const updateProblem = (actions: ReadonlyArray<Action>): string | undefined => {
+  let kept: { readonly message: string; readonly ofPath: boolean } | undefined
+  const meet = (message: string, kind: "path" | "value") => {
+    if (kind === "path" || kept?.ofPath !== true) kept = { message, ofPath: kind === "path" }
+  }
   const operandType = (op: string, value: AttributeValue) =>
-    `Invalid UpdateExpression: Incorrect operand type for operator or function; operator or function: ${op}, operand type: ${typeOf(value)}`
-  const walk = (value: UpdateValue): string | undefined => {
+    `Incorrect operand type for operator or function; operator or function: ${op}, operand type: ${typeOf(value)}`
+  const visit = (value: UpdateValue): void => {
     switch (value.kind) {
       case "value":
-        return value.value === undefined
-          ? `Invalid UpdateExpression: ${undefinedValue(value.name)}`
-          : undefined
+        if (value.value === undefined && value !== NO_VALUE)
+          meet(undefinedValue(value.name), "value")
+        return
       case "path":
-        return undefined
+        if (value.problem !== undefined) meet(value.problem, "path")
+        return
       case "if_not_exists":
-        return walk(value.fallback)
+        visit(value.first)
+        if (value.first.kind !== "path") meet(IF_NOT_EXISTS_PATH, "value")
+        visit(value.fallback)
+        return
       case "list_append":
       case "arithmetic": {
         const [op, sides, wanted] =
@@ -1193,55 +1650,39 @@ const actionProblem = (action: Action): string | undefined => {
             ? (["list_append", [value.first, value.second], "L"] as const)
             : ([value.op, [value.left, value.right], "N"] as const)
         for (const side of sides) {
-          const problem = walk(side)
-          if (problem !== undefined) return problem
+          visit(side)
           const given = literal(side)
-          if (given !== undefined && typeOf(given) !== wanted) return operandType(op, given)
+          if (given !== undefined && typeOf(given) !== wanted) meet(operandType(op, given), "value")
         }
-        return undefined
+        return
       }
     }
   }
-  switch (action.kind) {
-    case "REMOVE":
-      return undefined
-    case "SET":
-      return walk(action.value)
-    default: {
+  for (const action of actions) {
+    if (action.kind === "SET") visit(action.value)
+    if (action.kind === "ADD" || action.kind === "DELETE") {
       const given = action.value.value
-      if (given === undefined)
-        return `Invalid UpdateExpression: ${undefinedValue(action.value.name)}`
-      const type = typeOf(given)
-      const allowed = action.kind === "ADD" ? ["N", "SS", "NS", "BS"] : ["SS", "NS", "BS"]
-      return allowed.includes(type)
-        ? undefined
-        : `Invalid UpdateExpression: Incorrect operand type for operator or function; operator: ${action.kind}, operand type: ${OPERAND_TYPE_NAMES[type] ?? type}, typeSet: ALLOWED_FOR_${action.kind}_OPERAND`
-    }
-  }
-}
-
-/** Two of an update's paths that overlap (one holds the other) or conflict (a name and an index at one place). */
-const checkOverlaps = (kind: string, paths: ReadonlyArray<Path>): void => {
-  for (const [i, one] of paths.entries()) {
-    for (const two of paths.slice(i + 1)) {
-      const n = Math.min(one.length, two.length)
-      let at = 0
-      while (at < n && one[at] === two[at]) at++
-      const clash =
-        at === n ? "overlap" : typeof one[at] !== typeof two[at] ? "conflict" : undefined
-      if (clash !== undefined) {
-        refuse(
-          `Invalid ${kind}Expression: Two document paths ${clash} with each other; must remove or rewrite one of these paths; path one: ${pathText(one)}, path two: ${pathText(two)}`,
-        )
+      if (given === undefined) meet(undefinedValue(action.value.name), "value")
+      else {
+        const type = typeOf(given)
+        const allowed = action.kind === "ADD" ? ["N", "SS", "NS", "BS"] : ["SS", "NS", "BS"]
+        if (!allowed.includes(type)) {
+          meet(
+            `Incorrect operand type for operator or function; operator: ${action.kind}, operand type: ${OPERAND_TYPE_NAMES[type] ?? type}, typeSet: ALLOWED_FOR_${action.kind}_OPERAND`,
+            "value",
+          )
+        }
       }
     }
+    if (action.problem !== undefined) meet(action.problem, "path")
   }
+  return kept?.message
 }
 
 /**
- * The actions in the order DynamoDB Local visits them: a tree of the actions' paths, each level a
- * `HashMap` by segment, walked in that map's order. Of several refused actions it reports the
- * last one it visits (measured: `SET #a = #s + :n, #c = #zz + :n` reports `#zz` missing, and so
+ * The actions in the order DynamoDB Local applies them: a tree of the actions' paths, each level a
+ * `HashMap` by segment, walked in that map's order. Of several actions it can't apply it reports
+ * the last one it visits (measured: `SET #a = #s + :n, #c = #zz + :n` reports `#zz` missing, and so
  * does `SET #c = #zz + :n, #a = #s + :n`).
  */
 const visitOrder = (actions: ReadonlyArray<Action>): ReadonlyArray<Action> => {
@@ -1271,17 +1712,52 @@ const visitOrder = (actions: ReadonlyArray<Action>): ReadonlyArray<Action> => {
   return ordered
 }
 
-/** Read an update expression: its actions, refused as DynamoDB refuses them before reading the item. */
+/**
+ * Read an update expression as DynamoDB Local reads it (measured): parsed; then a problem with a
+ * function call; then paths that clash; then {@link updateProblem}; then too many operators (each
+ * `+`, `-`, `if_not_exists` and `list_append` counts).
+ */
 const readUpdate = (expression: string, placeholders: Placeholders): ReadonlyArray<Action> => {
-  const actions = new UpdateReader(expression, placeholders).update()
-  checkOverlaps(
+  const reader = new UpdateReader(expression, placeholders)
+  const actions = reader.update()
+  reader.reportFunctions()
+  const paths = actions.map((action) => action.path)
+  const clash = clashes(paths)
+  if (clash !== undefined) refuse(clashRefusal("Update", clash, paths))
+  const problem = updateProblem(actions)
+  if (problem !== undefined) refuse(`Invalid UpdateExpression: ${problem}`)
+  countOperators(
     "Update",
-    actions.map((action) => action.path),
+    actions.reduce(
+      (n, action) => n + (action.kind === "SET" ? valueOperators(action.value) : 0),
+      0,
+    ),
   )
-  let problem: string | undefined
-  for (const action of visitOrder(actions)) problem = actionProblem(action) ?? problem
-  if (problem !== undefined) refuse(problem)
   return actions
+}
+
+/**
+ * Read a projection expression as DynamoDB Local reads it (measured): parsed; then, reading its
+ * paths as written, the last problem met: a path's own (too deep, an undefined name) or a path
+ * clashing with an earlier one.
+ */
+const readProjection = (expression: string, placeholders: Placeholders): Array<Path> => {
+  const reader = new Reader("Projection", expression, placeholders)
+  const paths: Array<Path> = []
+  let kept: string | { readonly one: Path; readonly clash: string } | undefined
+  for (;;) {
+    const node = reader.path()
+    if (node.problem !== undefined) kept = reader.refusal(node.problem)
+    const one = paths.find((earlier) => clashOf(earlier, node.path) !== undefined)
+    if (one !== undefined) kept = { one, clash: clashOf(one, node.path)! }
+    paths.push(node.path)
+    if (!reader.is(",")) break
+    reader.at++
+  }
+  reader.done()
+  if (typeof kept === "string") refuse(kept)
+  else if (kept !== undefined) refuse(clashRefusal("Projection", kept, paths))
+  return paths
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,42 +1783,116 @@ export interface ExpressionInput {
   readonly ExpressionAttributeValues?: Record<string, AttributeValue> | undefined
 }
 
-/**
- * Read and check a request's expressions as DynamoDB does before it reads the item: the
- * placeholder maps, each value's content, each expression's syntax and operand types, and that
- * every placeholder defined is used. Throws DynamoDB Local's `ValidationException`, or
- * {@link UnreadableRequest} for an expression this doesn't read.
- */
-export const readExpressions = (input: ExpressionInput): Expressions => {
-  const names = input.ExpressionAttributeNames
-  const values = input.ExpressionAttributeValues
-  if (names !== undefined && Object.keys(names).length === 0) {
-    refuse("ExpressionAttributeNames must not be empty")
-  }
-  if (values !== undefined && Object.keys(values).length === 0) {
-    refuse("ExpressionAttributeValues must not be empty")
-  }
-  const expressions = [
+/** How DynamoDB Local ends its refusal of values given to a request with no expression using them. */
+const VALUES_WITHOUT_EXPRESSIONS: Record<string, string> = {
+  PutItem: "ConditionExpression is null",
+  DeleteItem: "ConditionExpression is null",
+  Put: "ConditionExpression is null",
+  Delete: "ConditionExpression is null",
+  UpdateItem: "UpdateExpression and ConditionExpression are null",
+  Scan: "FilterExpression is null",
+  Query: "FilterExpression and KeyConditionExpression are null",
+}
+
+const NAME_KEY = /^#[A-Za-z0-9_]+$/
+const VALUE_KEY = /^:[A-Za-z0-9_]+$/
+
+const usesValues = (input: ExpressionInput) =>
+  [
     input.UpdateExpression,
     input.ConditionExpression,
     input.KeyConditionExpression,
     input.FilterExpression,
-    input.ProjectionExpression,
-  ]
-  if (expressions.every((e) => e === undefined)) {
-    if (names !== undefined) {
-      refuse("ExpressionAttributeNames can only be specified when using expressions")
-    }
-    if (values !== undefined) {
-      refuse("ExpressionAttributeValues can only be specified when using expressions")
-    }
+  ].some((expression) => expression !== undefined)
+const usesNames = (input: ExpressionInput) =>
+  usesValues(input) || input.ProjectionExpression !== undefined
+
+/**
+ * Names or values given with no expression to use them, refused as DynamoDB Local refuses them
+ * (`operation` words the refusal). A write checks this before its item or key (measured).
+ */
+export const checkExpressionsGiven = (input: ExpressionInput, operation?: string): void => {
+  const names = input.ExpressionAttributeNames
+  const values = input.ExpressionAttributeValues
+  if (!usesNames(input) && names !== undefined && Object.keys(names).length > 0) {
+    refuse("ExpressionAttributeNames can only be specified when using expressions")
   }
-  for (const key of javaHashOrder(Object.keys(values ?? {}))) {
-    const problem = valueProblem(values![key]!)
+  if (!usesValues(input) && values !== undefined) {
+    if (Object.keys(values).length === 0 || input.ProjectionExpression !== undefined) {
+      unreadable(
+        "the ExpressionAttributeValues",
+        shown(values),
+        "given with no expression using values (unmeasured here)",
+      )
+    }
+    const ending =
+      own(VALUES_WITHOUT_EXPRESSIONS, operation ?? "") ??
+      unreadable(
+        "the ExpressionAttributeValues",
+        shown(values),
+        `given to ${operation ?? "this request"} with no expression using them (unmeasured)`,
+      )
+    refuse(`ExpressionAttributeValues can only be specified when using expressions: ${ending}`)
+  }
+}
+
+const badKey = (map: object, pattern: RegExp, what: string) =>
+  theProblem(
+    Object.keys(map)
+      .filter((key) => !pattern.test(key))
+      .map((key) => `${what} contains invalid key: Syntax error; key: "${key}"`),
+    `the ${what} keys`,
+  )
+
+/**
+ * A request's `ExpressionAttributeValues`, once given and not empty: each key a placeholder, then
+ * each value ({@link valueProblem}, nesting one container more than an item may), in the order
+ * DynamoDB Local walks them.
+ */
+const checkValues = (values: Record<string, AttributeValue> | undefined): void => {
+  if (values === undefined || Object.keys(values).length === 0) return
+  const badValueKey = badKey(values, VALUE_KEY, "ExpressionAttributeValues")
+  if (badValueKey !== undefined) refuse(badValueKey)
+  for (const key of javaHashOrder(Object.keys(values))) {
+    const problem = valueProblem(values[key]!, VALUE_LEVELS)
     if (problem !== undefined) {
       refuse(`ExpressionAttributeValues contains invalid value: ${problem} for key ${key}`)
     }
   }
+}
+
+/**
+ * Read and check a request's expressions as DynamoDB Local does before it reads the item
+ * (measured): names or values given with no expression to use them (`operation` words the
+ * refusal); the names, then the values, as maps (not empty, each key a placeholder); each value
+ * ({@link valueProblem}, nesting one container more than an item may); each name (not empty);
+ * the expressions, each read whole in turn (an update before its condition; a filter, then a
+ * projection, then a key condition); and every placeholder defined is used. Throws DynamoDB
+ * Local's `ValidationException`, or {@link UnreadableRequest} for what this doesn't read.
+ */
+export const readExpressions = (input: ExpressionInput, operation?: string): Expressions => {
+  const names = input.ExpressionAttributeNames
+  const values = input.ExpressionAttributeValues
+  checkExpressionsGiven(input, operation)
+  if (usesNames(input) && names !== undefined && Object.keys(names).length === 0) {
+    refuse("ExpressionAttributeNames must not be empty")
+  }
+  const badName =
+    names === undefined ? undefined : badKey(names, NAME_KEY, "ExpressionAttributeNames")
+  if (badName !== undefined) refuse(badName)
+  if (values !== undefined && Object.keys(values).length === 0) {
+    refuse("ExpressionAttributeValues must not be empty")
+  }
+  checkValues(values)
+  const emptyName = theProblem(
+    Object.keys(names ?? {})
+      .filter((key) => names![key] === "")
+      .map(
+        (key) => `ExpressionAttributeNames contains invalid value: ${EMPTY_NAME} for key ${key}`,
+      ),
+    "the ExpressionAttributeNames values",
+  )
+  if (emptyName !== undefined) refuse(emptyName)
   const placeholders = placeholdersOf(names, values)
   const read = (kind: string, expression: string | undefined) =>
     expression === undefined
@@ -1353,19 +1903,12 @@ export const readExpressions = (input: ExpressionInput): Expressions => {
       ? undefined
       : readUpdate(input.UpdateExpression, placeholders)
   const condition = read("Condition", input.ConditionExpression)
-  const keyCondition = read("KeyCondition", input.KeyConditionExpression)
   const filter = read("Filter", input.FilterExpression)
-  let projection: Array<Path> | undefined
-  if (input.ProjectionExpression !== undefined) {
-    const reader = new Reader("Projection", input.ProjectionExpression, placeholders)
-    projection = [reader.path()]
-    while (reader.is(",")) {
-      reader.at++
-      projection.push(reader.path())
-    }
-    reader.done()
-    checkOverlaps("Projection", projection)
-  }
+  const projection =
+    input.ProjectionExpression === undefined
+      ? undefined
+      : readProjection(input.ProjectionExpression, placeholders)
+  const keyCondition = read("KeyCondition", input.KeyConditionExpression)
   const unusedNames = Object.keys(names ?? {}).filter((k) => !placeholders.usedNames.has(k))
   if (unusedNames.length > 0) {
     refuse(
@@ -1385,10 +1928,12 @@ export const readExpressions = (input: ExpressionInput): Expressions => {
 // Conditions
 // ---------------------------------------------------------------------------
 
+/** An operand's value against `item`: `size` of a path or of a value (a string's UTF-16 units). */
 const operandValue = (operand: Operand, item: Item | undefined): AttributeValue | undefined => {
   if (operand.kind === "value") return operand.value
-  const value = readPath(item, operand.path)
-  if (operand.kind === "path" || value === undefined) return value
+  if (operand.kind === "path") return readPath(item, operand.path)
+  const value = operandValue(operand.of, item)
+  if (value === undefined) return undefined
   const type = typeOf(value)
   const size =
     type === "S"
@@ -1769,7 +2314,6 @@ const FIELDS: Record<string, ReadonlyArray<string>> = {
     "ReturnValues",
     "ReturnValuesOnConditionCheckFailure",
     "ReturnConsumedCapacity",
-    "ReturnItemCollectionMetrics",
   ],
   UpdateItem: [
     "TableName",
@@ -1781,7 +2325,6 @@ const FIELDS: Record<string, ReadonlyArray<string>> = {
     "ReturnValues",
     "ReturnValuesOnConditionCheckFailure",
     "ReturnConsumedCapacity",
-    "ReturnItemCollectionMetrics",
   ],
   DeleteItem: [
     "TableName",
@@ -1792,7 +2335,6 @@ const FIELDS: Record<string, ReadonlyArray<string>> = {
     "ReturnValues",
     "ReturnValuesOnConditionCheckFailure",
     "ReturnConsumedCapacity",
-    "ReturnItemCollectionMetrics",
   ],
   Query: [
     "TableName",
@@ -1830,15 +2372,10 @@ const FIELDS: Record<string, ReadonlyArray<string>> = {
     "ProjectionExpression",
     "ExpressionAttributeNames",
   ],
-  BatchWriteItem: ["RequestItems", "ReturnConsumedCapacity", "ReturnItemCollectionMetrics"],
+  BatchWriteItem: ["RequestItems", "ReturnConsumedCapacity"],
   TransactGetItems: ["TransactItems", "ReturnConsumedCapacity"],
   Get: ["TableName", "Key", "ProjectionExpression", "ExpressionAttributeNames"],
-  TransactWriteItems: [
-    "TransactItems",
-    "ClientRequestToken",
-    "ReturnConsumedCapacity",
-    "ReturnItemCollectionMetrics",
-  ],
+  TransactWriteItems: ["TransactItems", "ReturnConsumedCapacity"],
   Put: [
     "TableName",
     "Item",
@@ -1875,8 +2412,10 @@ const FIELDS: Record<string, ReadonlyArray<string>> = {
 }
 
 /**
- * A request's fields are ones `operation` reads. `ReturnConsumedCapacity` and
- * `ReturnItemCollectionMetrics` are accepted and not answered: the tables report no capacity.
+ * A request's fields are ones `operation` reads; any other is refused by name, as not modelled
+ * (`ReturnItemCollectionMetrics` among them: the library sends none). `ReturnConsumedCapacity` is
+ * accepted and not answered: the tables report no capacity. Both are on the list at the top of
+ * this module.
  */
 export const checkFields = (operation: string, input: object): void => {
   const known = FIELDS[operation]!
@@ -2123,16 +2662,29 @@ const updateIndexProblem = (
   return problem === undefined ? undefined : { typed: true, message: problem }
 }
 
+/**
+ * An update leaving an attribute nested past an item's limit is refused (measured: once the update
+ * is applied, before its index keys are checked; in a transaction, the whole request).
+ */
+const checkUpdatedDepth = (next: Item): void => {
+  if (Object.values(next).some((value) => levelsOf(value) > ITEM_LEVELS)) refuse(UPDATE_DEPTH)
+}
+
 const EMPTY_KEY = (attribute: string) =>
   "One or more parameter values are not valid. The AttributeValue for a key attribute cannot " +
   `contain an empty string value. Key: ${attribute}`
 const TYPE_MISMATCH = "One or more parameter values were invalid: Type mismatch for key"
 
-/** A `Key` names exactly the table's key attributes, each a non-empty `S`. */
+/**
+ * A `Key` holds only values DynamoDB reads ({@link attributesProblem}, checked first) and names
+ * exactly the table's key attributes, each a non-empty `S`.
+ */
 export const checkKey = (key: Item | undefined, schema: KeySchema): Item => {
+  if (key === undefined) return unreadable("the request", "Key", "missing (unmeasured here)")
+  const problem = attributesProblem(key, "the Key")
+  if (problem !== undefined) refuse(problem)
   const attributes = keyAttributes(schema)
   if (
-    key === undefined ||
     Object.keys(key).length !== attributes.length ||
     !attributes.every((attribute) => Object.hasOwn(key, attribute))
   ) {
@@ -2146,18 +2698,19 @@ export const checkKey = (key: Item | undefined, schema: KeySchema): Item => {
   return key
 }
 
-/** An `Item` holds the table's key attributes, each a non-empty `S`, and only values DynamoDB stores. */
+/**
+ * An `Item` holds only values DynamoDB stores ({@link attributesProblem}, checked first) and the
+ * table's key attributes, each a non-empty `S`.
+ */
 export const checkItem = (item: Item | undefined, schema: KeySchema): Item => {
-  if (item === undefined) return refuse("One of the required keys was not given a value")
+  if (item === undefined) return unreadable("the request", "Item", "missing (unmeasured here)")
+  const problem = attributesProblem(item)
+  if (problem !== undefined) refuse(problem)
   for (const attribute of keyAttributes(schema)) {
     const value = own(item, attribute)
     if (value === undefined) refuse("One of the required keys was not given a value")
     if (typeOf(value!) !== "S") refuse(TYPE_MISMATCH)
     if (value!.S === "") refuse(EMPTY_KEY(attribute))
-  }
-  for (const attribute of Object.keys(item)) {
-    const problem = valueProblem(item[attribute]!)
-    if (problem !== undefined) refuse(problem)
   }
   return item
 }
@@ -2205,14 +2758,18 @@ type WriteInput = ExpressionInput & {
 const attributes = (item: Item | undefined): { readonly Attributes?: Item } =>
   item === undefined ? {} : { Attributes: asRead(item) }
 
-/** The top-level attributes of `item` an update's actions name. */
+/**
+ * What `UPDATED_OLD` / `UPDATED_NEW` return (measured): of each action whose whole path `item` holds
+ * (the item before the update, or after it), the top-level attribute holding it. A `REMOVE` counts
+ * as any action: `REMOVE #l[0]` returns `l` after the update when it still has an element 0.
+ */
 const touched = (item: Item | undefined, actions: ReadonlyArray<Action>): Item | undefined => {
   if (item === undefined) return undefined
   const picked: Item = {}
   for (const action of actions) {
+    if (readPath(item, action.path) === undefined) continue
     const name = action.path[0] as string
-    const value = own(item, name)
-    if (value !== undefined) setOwn(picked, name, value)
+    setOwn(picked, name, own(item, name)!)
   }
   return Object.keys(picked).length === 0 ? undefined : picked
 }
@@ -2237,6 +2794,44 @@ const conditionHolds = (
 /** Reads the item stored under a key, once the request naming it has been checked. */
 export type Read = (key: Item) => Item | undefined
 
+const TABLE_NAME =
+  "Invalid table/index name.  Table/index names must be between 3 and 255 characters long, and may contain only the characters a-z, A-Z, 0-9, '_', '-', and '.'"
+
+/** A request naming no table, as DynamoDB Local refuses it (measured, before anything else). */
+const NO_TABLE = "Value null at 'tableName' failed to satisfy constraint: Member must not be null"
+
+/**
+ * A request's table name: none, or an empty one, is refused as DynamoDB Local refuses it (measured,
+ * before anything else the request holds; a transaction's items, below). Any other is answered, one
+ * DynamoDB Local refuses for its length or its characters included (listed at the top: the tests
+ * name tables `<table>`).
+ */
+const checkTableName = (name: string | undefined): void => {
+  if (name === undefined) refuse(NO_TABLE)
+  if (name === "") refuse(TABLE_NAME)
+}
+
+/** A transaction item naming no table, as DynamoDB Local refuses it (`at` from 0; measured). */
+const noTransactTable = (kind: string, at: number): never =>
+  refuse(
+    `Value null at 'transactItems.${at + 1}.member.${kind.charAt(0).toLowerCase()}${kind.slice(1)}.tableName' failed to satisfy constraint: Member must not be null`,
+  )
+
+/**
+ * A single write's `ReturnValuesOnConditionCheckFailure`, checked as DynamoDB Local checks it
+ * (measured: a put's after its item, a delete's before its key, an update's after its
+ * expressions). A transaction's items take any.
+ */
+const checkConditionReturnValues = (given: string | undefined): void => {
+  if (given !== undefined && given !== "ALL_OLD" && given !== "NONE") {
+    refuse(
+      `1 validation error detected: Value '${given}' at 'returnValuesOnConditionCheckFailure' failed to satisfy constraint: Member must satisfy enum value set: [ALL_OLD, NONE]`,
+    )
+  }
+}
+
+const NULL_KEY = "Cannot have null key for GetItem, DeleteItem, or UpdateItem"
+
 /** A `PutItem` as DynamoDB Local answers it. */
 export const putItem = (
   input: WriteInput,
@@ -2245,11 +2840,15 @@ export const putItem = (
   options?: WriteOptions,
 ): WriteOutcome => {
   checkFields("PutItem", input)
+  checkTableName(input.TableName)
   const returned = returnValues(input.ReturnValues, ["NONE", "ALL_OLD"])
+  checkExpressionsGiven(input, "PutItem")
+  if (input.Item === undefined) refuse("Item to put in PutItem cannot be null")
   const item = checkItem(input.Item, schema)
   const problem = putIndexProblem(item, options?.indexes ?? {}, schema)
   if (problem !== undefined) refuse(problem.message)
-  const { condition } = readExpressions(input)
+  checkConditionReturnValues(input.ReturnValuesOnConditionCheckFailure)
+  const { condition } = readExpressions(input, "PutItem")
   const current = read(keyOfItem(item, schema))
   if (!conditionHolds(condition, current, options)) {
     return { _tag: "ConditionFailed", error: conditionalCheckFailed(input, current) }
@@ -2269,6 +2868,7 @@ export const updateItem = (
   options?: WriteOptions,
 ): WriteOutcome => {
   checkFields("UpdateItem", input)
+  checkTableName(input.TableName)
   const returned = returnValues(input.ReturnValues, [
     "NONE",
     "ALL_OLD",
@@ -2276,8 +2876,11 @@ export const updateItem = (
     "ALL_NEW",
     "UPDATED_NEW",
   ])
+  checkExpressionsGiven(input, "UpdateItem")
+  if (input.Key === undefined) refuse(NULL_KEY)
   const key = checkKey(input.Key, schema)
-  const { condition, update = [] } = readExpressions(input)
+  const { condition, update = [] } = readExpressions(input, "UpdateItem")
+  checkConditionReturnValues(input.ReturnValuesOnConditionCheckFailure)
   const current = read(key)
   if (!conditionHolds(condition, current, options)) {
     return { _tag: "ConditionFailed", error: conditionalCheckFailed(input, current) }
@@ -2288,9 +2891,9 @@ export const updateItem = (
     }
   }
   const next = applyActions(update, current ?? clone(key))
+  checkUpdatedDepth(next)
   const problem = updateIndexProblem(next, update, options?.indexes ?? {}, schema)
   if (problem !== undefined) refuse(problem.message)
-  const written = update.filter((action) => action.kind !== "REMOVE")
   const output =
     returned === "ALL_OLD"
       ? attributes(current)
@@ -2299,7 +2902,7 @@ export const updateItem = (
         : returned === "UPDATED_OLD"
           ? attributes(touched(current, update))
           : returned === "UPDATED_NEW"
-            ? attributes(touched(next, written))
+            ? attributes(touched(next, update))
             : {}
   return { _tag: "Written", item: next, output }
 }
@@ -2312,9 +2915,13 @@ export const deleteItem = (
   options?: WriteOptions,
 ): WriteOutcome => {
   checkFields("DeleteItem", input)
+  checkTableName(input.TableName)
   const returned = returnValues(input.ReturnValues, ["NONE", "ALL_OLD"])
+  checkExpressionsGiven(input, "DeleteItem")
+  checkConditionReturnValues(input.ReturnValuesOnConditionCheckFailure)
+  if (input.Key === undefined) refuse(NULL_KEY)
   const key = checkKey(input.Key, schema)
-  const { condition } = readExpressions(input)
+  const { condition } = readExpressions(input, "DeleteItem")
   const current = read(key)
   if (!conditionHolds(condition, current, options)) {
     return { _tag: "ConditionFailed", error: conditionalCheckFailed(input, current) }
@@ -2328,13 +2935,19 @@ export const deleteItem = (
 
 /** A `GetItem`'s output. */
 export const getItem = (
-  input: ExpressionInput & { readonly Key?: Item | undefined },
+  input: ExpressionInput & {
+    readonly TableName?: string | undefined
+    readonly Key?: Item | undefined
+  },
   read: Read,
   schema: KeySchema,
 ): { readonly Item?: Item } => {
   checkFields("GetItem", input)
-  const key = checkKey(input.Key, schema)
+  checkTableName(input.TableName)
+  // Measured: a read's projection is checked before its key.
   const { projection } = readExpressions(input)
+  if (input.Key === undefined) refuse(NULL_KEY)
+  const key = checkKey(input.Key, schema)
   const current = read(key)
   if (current === undefined) return {}
   return { Item: asRead(projection === undefined ? current : project(current, projection)) }
@@ -2426,6 +3039,52 @@ const transactKey = (
   }
 }
 
+type TransactEntry = { readonly kind: string; readonly body: WriteInput }
+
+/**
+ * A transaction's values, checked first, item by item (measured: a refusal of the whole request):
+ * each item's `ExpressionAttributeValues` ({@link checkValues}), then its item or key
+ * ({@link attributesProblem}).
+ */
+const checkTransactValues = (entries: ReadonlyArray<TransactEntry>): void => {
+  for (const { kind, body } of entries) {
+    checkValues(body.ExpressionAttributeValues)
+    const held = kind === "Put" ? body.Item : body.Key
+    const problem =
+      held === undefined
+        ? undefined
+        : attributesProblem(held, kind === "Put" ? undefined : "the Key")
+    if (problem !== undefined) refuse(problem)
+  }
+}
+
+/** A `ConditionCheck` with no condition, or an `Update` with values and no expression: a missing member. */
+const expressionMissing = ({ kind, body }: TransactEntry): boolean =>
+  (kind === "ConditionCheck" && body.ConditionExpression === undefined) ||
+  (kind === "Update" &&
+    body.UpdateExpression === undefined &&
+    body.ConditionExpression === undefined &&
+    body.ExpressionAttributeValues !== undefined)
+
+/**
+ * A transaction item missing a member it needs, refused as DynamoDB Local refuses it (its key
+ * before its expression): a `Put`'s `Item`, a key, and {@link expressionMissing}'s.
+ */
+const checkTransactMember = ({ kind, body }: TransactEntry, at: number): void => {
+  const member =
+    kind === "Put"
+      ? body.Item === undefined && "put.item"
+      : body.Key === undefined
+        ? `${kind[0]!.toLowerCase()}${kind.slice(1)}.key`
+        : expressionMissing({ kind, body }) &&
+          (kind === "Update" ? "update.updateExpression" : "conditionCheck.conditionExpression")
+  if (member !== false) {
+    refuse(
+      `Value null at 'transactItems.${at + 1}.member.${member}' failed to satisfy constraint: Member must not be null`,
+    )
+  }
+}
+
 /** A refusal raised as a cancellation reason in a transaction; one with no key type is unmeasured there. */
 const asReason = (problem: IndexProblem, what: unknown): string => {
   if (problem.message === INVALID_VALUE_TYPE) {
@@ -2439,9 +3098,21 @@ const asReason = (problem: IndexProblem, what: unknown): string => {
 }
 
 /**
+ * Measured on DynamoDB Local: a committed transaction resent with its `ClientRequestToken` is
+ * answered with success and writes nothing (whatever the items hold now); resent with other items
+ * or another table it is refused (`IdempotentParameterMismatchException`); a cancelled one leaves
+ * its token unused. The library never sends one (the AWS SDK fills it in below the client).
+ */
+const TOKEN_NOT_MODELLED =
+  "not modelled (DynamoDB Local answers a committed transaction resent with its token with success, writing nothing, and one resent with other items with IdempotentParameterMismatchException)"
+
+/**
  * A `TransactWriteItems` as DynamoDB Local answers it. None, or over 100, items refuse it. Every
- * item's request is checked first (a refusal is request-wide; a key of the wrong type, or a put's
- * index key of the wrong type, is that item's `ValidationError` reason). Then the items are taken
+ * item's request is checked first, as DynamoDB Local checks it (measured; a refusal is
+ * request-wide): every item's values ({@link checkTransactValues}); then every item's
+ * expressions; then, item by item, its table name, a missing member ({@link checkTransactMember})
+ * and its key (a key of the wrong type, or a put's index key of the wrong type, is that item's
+ * `ValidationError` reason). Then the items are taken
  * in order, each against the item as the items before it left it: a failed condition is that
  * item's `ConditionalCheckFailed` reason (with the item as it stands, under `ALL_OLD`) and
  * touches nothing; an update of a key attribute cancels the transaction with that one reason;
@@ -2455,8 +3126,10 @@ export const transactWrite = (
   tables: Tables,
   options?: WriteOptions,
 ): TransactOutcome => {
+  const token = (input as { readonly ClientRequestToken?: unknown }).ClientRequestToken
+  if (token !== undefined) unreadable("the ClientRequestToken", String(token), TOKEN_NOT_MODELLED)
   checkFields("TransactWriteItems", input)
-  const ops = transactItems(input.TransactItems, NO_TRANSACT_WRITE_ITEMS).map((op) => {
+  const entries = transactItems(input.TransactItems, NO_TRANSACT_WRITE_ITEMS).map((op) => {
     const kinds = KINDS.filter((kind) => op[kind] !== undefined)
     if (
       kinds.length !== 1 ||
@@ -2473,9 +3146,20 @@ export const transactWrite = (
     const kind = kinds[0]!
     const body = op[kind] as WriteInput
     checkFields(kind, body)
-    if (kind === "ConditionCheck" && body.ConditionExpression === undefined) {
-      unreadable("the ConditionCheck", shown(body), "no ConditionExpression (unmeasured)")
-    }
+    return { kind, body }
+  })
+  checkTransactValues(entries)
+  const read = entries.map((entry) =>
+    expressionMissing(entry) ? undefined : readExpressions(entry.body, entry.kind),
+  )
+  // Measured: an item naming no table, the first, before every item's own checks below.
+  entries.forEach(({ kind, body }, at) => {
+    if (body.TableName === undefined) noTransactTable(kind, at)
+  })
+  const ops = entries.map((entry, at) => {
+    const { kind, body } = entry
+    checkTableName(body.TableName)
+    checkTransactMember(entry, at)
     const schema = tables.schema(body.TableName!)
     const indexes = tables.indexes(body.TableName!)
     const keyed = transactKey(
@@ -2485,7 +3169,7 @@ export const transactWrite = (
           : checkKey(body.Key, schema),
       body,
     )
-    const expressions = readExpressions(body)
+    const expressions = read[at]!
     let reason = keyed.reason
     if (kind === "Put" && reason === undefined) {
       const problem = putIndexProblem(body.Item!, indexes, schema)
@@ -2541,6 +3225,7 @@ export const transactWrite = (
         }
       }
       next = applyActions(update, current ?? clone(op.key))
+      checkUpdatedDepth(next)
       const problem = updateIndexProblem(next, update, op.indexes, op.schema)
       if (problem !== undefined && !problem.typed) refuse(problem.message)
       if (problem !== undefined) reason = asReason(problem, op.body)
@@ -2571,12 +3256,28 @@ export const transactGet = (
 ): { readonly Responses: ReadonlyArray<{ readonly Item?: Item }> } => {
   checkFields("TransactGetItems", input)
   const seen = new Set<string>()
-  const gets = transactItems(input.TransactItems, NO_TRANSACT_GET_ITEMS).map((op) => {
+  const bodies = transactItems(input.TransactItems, NO_TRANSACT_GET_ITEMS).map((op) => {
     if (op.Get === undefined || Object.keys(op).some((k) => k !== "Get" && op[k] !== undefined)) {
       return unreadable("the TransactItems entry", shown(op), "not a Get")
     }
     const body = op.Get as ExpressionInput & { TableName: string; Key: Item }
     checkFields("Get", body)
+    return body
+  })
+  // Measured: each item whole, in order, before the next: its table (none named, or one that
+  // doesn't exist: "", which none can be), its projection, its key (missing, its values, then the
+  // table's key schema, which cancels the read).
+  const gets = bodies.map((body) => {
+    if (body.TableName === undefined) refuse("Requested resource not found")
+    if (body.TableName === "") {
+      throw Object.assign(new Error("Cannot do operations on a non-existent table"), {
+        name: "ResourceNotFoundException",
+      })
+    }
+    const projection = readExpressions(body).projection
+    if (body.Key === undefined) refuse("Get Condition for key not in key list")
+    const problem = attributesProblem(body.Key, "the Key")
+    if (problem !== undefined) refuse(problem)
     const schema = tables.schema(body.TableName)
     try {
       checkKey(body.Key, schema)
@@ -2585,7 +3286,6 @@ export const transactGet = (
       if (!isRefusal(error)) throw error
       throw Object.assign(new Error(error.message), { name: "TransactionCanceledException" })
     }
-    const { projection } = readExpressions(body)
     return { body, schema, projection }
   })
   for (const { body, schema } of gets) {
@@ -2619,6 +3319,15 @@ export const batchGet = (
   }
   const total = entries.reduce((sum, [, request]) => sum + request.Keys.length, 0)
   if (total > 100) refuse(TOO_MANY_BATCH_GETS)
+  // Measured: every key's values (a refusal of the request), the table names, then each table's
+  // keys and projection, as below.
+  for (const [, request] of entries) {
+    for (const key of request.Keys as ReadonlyArray<Item>) {
+      const problem = attributesProblem(key, "the Key")
+      if (problem !== undefined) refuse(problem)
+    }
+  }
+  for (const [table] of entries) checkTableName(table)
   const Responses: Record<string, Array<Item>> = {}
   const requests = entries.map(([table, request]) => {
     checkFields("BatchGetItem table", request)
@@ -2650,6 +3359,24 @@ export const batchWrite = (
   if (entries.length === 0) refuse("BatchWriteItem cannot have a null or no requests set")
   const total = entries.reduce((sum, [, requests]) => sum + requests.length, 0)
   if (total > 25) refuse(TOO_MANY_BATCH_WRITES)
+  // Measured: request by request, a missing item or key, else its values (a refusal of the
+  // request); then the table names; then each table's requests, as below.
+  const held = entries.flatMap(([, requests]) =>
+    requests.flatMap(
+      (request): ReadonlyArray<{ item: Item | undefined; what?: string }> =>
+        request.PutRequest !== undefined
+          ? [{ item: request.PutRequest.Item as Item | undefined }]
+          : request.DeleteRequest !== undefined
+            ? [{ item: request.DeleteRequest.Key as Item | undefined, what: "the Key" }]
+            : [],
+    ),
+  )
+  for (const { item, what } of held) {
+    if (item === undefined) refuse("The supplied Item contains a null AttributeValue")
+    const problem = attributesProblem(item!, what)
+    if (problem !== undefined) refuse(problem)
+  }
+  for (const [table] of entries) checkTableName(table)
   const writes: Array<TableWrite> = []
   for (const [table, requests] of entries) {
     if (requests.length === 0) {
@@ -2697,8 +3424,12 @@ export const batchWrite = (
 
 /** The attributes a condition names at its top level. */
 const conditionAttributes = (condition: Condition): ReadonlyArray<string> => {
-  const operandNames = (operand: Operand) =>
-    operand.kind === "value" ? [] : [operand.path[0] as string]
+  const operandNames = (operand: Operand): ReadonlyArray<string> =>
+    operand.kind === "value"
+      ? []
+      : operand.kind === "size"
+        ? operandNames(operand.of)
+        : [operand.path[0] as string]
   switch (condition.kind) {
     case "and":
     case "or":
@@ -2719,31 +3450,107 @@ const conditionAttributes = (condition: Condition): ReadonlyArray<string> => {
   }
 }
 
-/** The parts of a key condition: `AND`ed comparisons, `BETWEEN`s and `begins_with`s, each on a key attribute. */
-const keyConditionParts = (condition: Condition): ReadonlyArray<Condition> => {
-  if (condition.kind === "and") {
-    return [...keyConditionParts(condition.left), ...keyConditionParts(condition.right)]
+const KEY_OPERATOR = "Invalid operator used in KeyConditionExpression: "
+const KEY_CONDITION = "Invalid condition in KeyConditionExpression: "
+
+/** A condition's operands, top level. */
+const operandsOf = (condition: Condition): ReadonlyArray<Operand> =>
+  condition.kind === "compare"
+    ? [condition.left, condition.right]
+    : condition.kind === "between"
+      ? [condition.subject, condition.low, condition.high]
+      : condition.kind === "in"
+        ? [condition.subject, ...condition.options]
+        : condition.kind === "begins_with" || condition.kind === "contains"
+          ? [condition.subject, condition.operand]
+          : []
+
+/** Every path a condition names, `size`'s included. */
+const pathsOf = (condition: Condition): ReadonlyArray<Path> => {
+  const ofOperand = (operand: Operand): ReadonlyArray<Path> =>
+    operand.kind === "path" ? [operand.path] : operand.kind === "size" ? ofOperand(operand.of) : []
+  switch (condition.kind) {
+    case "and":
+    case "or":
+      return [...pathsOf(condition.left), ...pathsOf(condition.right)]
+    case "not":
+      return pathsOf(condition.inner)
+    case "exists":
+    case "type":
+      return [condition.path]
+    default:
+      return operandsOf(condition).flatMap(ofOperand)
   }
-  if (condition.kind === "or" || condition.kind === "not") {
-    return refuse(
-      `Invalid operator used in KeyConditionExpression: ${condition.kind.toUpperCase()}`,
+}
+
+/**
+ * A key condition naming a key attribute through a nested path, refused as DynamoDB Local refuses
+ * it (measured, before the key condition's parts are checked): the table's partition key, then its
+ * sort key, then an index's key (whichever index the read names; `IndexKey` for an index's).
+ */
+const checkKeyScalars = (condition: Condition, table: KeySchema, indexes: Indexes): void => {
+  const nested = new Set(
+    pathsOf(condition)
+      .filter((path) => path.length > 1)
+      .map((path) => path[0] as string),
+  )
+  const scalars = (key: string) =>
+    `Key attributes must be scalars; list random access '[]' and map lookup '.' are not allowed: ${key}`
+  for (const attribute of [table.pk, table.sk]) {
+    if (nested.has(attribute)) refuse(scalars(`Key: ${attribute}`))
+  }
+  const ofIndexes = [
+    ...new Set(Object.values(indexes).flatMap((schema) => keyAttributes(schema))),
+  ].filter((attribute) => nested.has(attribute))
+  if (ofIndexes.length > 1) {
+    unreadable(
+      "the KeyConditionExpression",
+      ofIndexes.join(", "),
+      "several index keys through nested paths (which DynamoDB Local reports is not modelled)",
     )
   }
-  if (condition.kind === "compare" && condition.op === "<>") {
-    return refuse("Invalid operator used in KeyConditionExpression: <>")
+  if (ofIndexes.length === 1) refuse(scalars(`IndexKey: ${ofIndexes[0]}`))
+}
+
+/**
+ * A key condition's parts, its `AND`ed conditions, each checked as DynamoDB Local checks it
+ * (measured; the first part met, reading as written, that it refuses): `OR`, `NOT`, `<>`, `IN` and
+ * every function but `begins_with` are refused by name; then `size`; a nested path; two paths; no
+ * path; and a `BETWEEN` or `begins_with` whose first operand isn't the path.
+ */
+const keyConditionParts = (condition: Condition): ReadonlyArray<Condition> => {
+  switch (condition.kind) {
+    case "and":
+      return [...keyConditionParts(condition.left), ...keyConditionParts(condition.right)]
+    case "or":
+    case "not":
+      return refuse(KEY_OPERATOR + condition.kind.toUpperCase())
+    case "in":
+      return refuse(`${KEY_OPERATOR}IN`)
+    case "contains":
+      return refuse(`${KEY_OPERATOR}contains`)
+    case "exists":
+      return refuse(KEY_OPERATOR + (condition.negate ? "attribute_not_exists" : "attribute_exists"))
+    case "type":
+      return refuse(`${KEY_OPERATOR}attribute_type`)
   }
-  if (
-    condition.kind === "compare" ||
-    condition.kind === "between" ||
-    condition.kind === "begins_with"
-  ) {
-    return [condition]
+  if (condition.kind === "compare" && condition.op === "<>") return refuse(`${KEY_OPERATOR}<>`)
+  const operands = operandsOf(condition)
+  if (operands.some((operand) => operand.kind === "size")) {
+    refuse("KeyConditionExpressions cannot contain nested operations")
   }
-  return unreadable(
-    "the KeyConditionExpression part",
-    condition.kind,
-    "not a key condition (unmeasured wording)",
-  )
+  const paths = operands.filter((operand) => operand.kind === "path")
+  if (paths.some((operand) => operand.path.length > 1)) {
+    refuse("KeyConditionExpressions cannot have conditions on nested attributes")
+  }
+  if (paths.length > 1) refuse(`${KEY_CONDITION}Multiple attribute names used in one condition`)
+  if (paths.length === 0) refuse(`${KEY_CONDITION}No key attribute specified`)
+  if (condition.kind !== "compare" && operands[0]!.kind !== "path") {
+    refuse(
+      `${KEY_CONDITION}${condition.kind === "between" ? "BETWEEN" : "begins_with"} operator must have the key attribute as its first operand`,
+    )
+  }
+  return [condition]
 }
 
 export interface QueryInput extends ExpressionInput {
@@ -2868,6 +3675,8 @@ const START_PREDICATE = "The provided starting key does not match the range key 
  * index's, any key not naming exactly those attributes.
  */
 const checkStartKey = (start: Item, table: KeySchema, index: ReadIndex | undefined): void => {
+  const held = attributesProblem(start, "the ExclusiveStartKey")
+  if (held !== undefined) refuse(held)
   const given = Object.keys(start)
   if (given.length === 0) refuse(START_INVALID)
   const expected = [
@@ -2913,9 +3722,6 @@ const page = (
   lastKey: (row: Item) => Item,
   endsAt: (row: Item) => boolean = () => false,
 ) => {
-  if (input.Limit !== undefined && !(Number.isInteger(input.Limit) && input.Limit >= 1)) {
-    unreadable("the Limit", String(input.Limit), "not a positive integer (unmeasured wording)")
-  }
   const examined = input.Limit === undefined ? rows : rows.slice(0, input.Limit)
   const last = examined[examined.length - 1]
   const more =
@@ -2934,6 +3740,47 @@ const page = (
 
 const CONDITION_TYPE =
   "One or more parameter values were invalid: Condition parameter type does not match schema type"
+
+/** A read's `Limit` below 1 is refused (measured: before the request's expressions); one that isn't an integer, by name. */
+const checkLimit = (limit: number | undefined): void => {
+  if (limit === undefined) return
+  if (!Number.isInteger(limit)) {
+    unreadable("the Limit", String(limit), "not an integer (not modelled)")
+  }
+  if (limit < 1) refuse("Limit must be greater than or equal to 1")
+}
+
+/**
+ * A `Scan`'s `Segment` and `TotalSegments`, checked as DynamoDB Local checks them (measured: after
+ * the expressions): one given without the other; a segment outside `0 .. TotalSegments - 1`; more
+ * than 1,000,000 segments. Either one not an integer is refused by name.
+ */
+const checkSegments = (input: QueryInput): void => {
+  const { Segment: segment, TotalSegments: total } = input
+  for (const [name, value] of [
+    ["Segment", segment],
+    ["TotalSegments", total],
+  ] as const) {
+    if (value !== undefined && !Number.isInteger(value)) {
+      unreadable(`the ${name}`, String(value), "not an integer (not modelled)")
+    }
+  }
+  const constraint = (value: number, at: string, most: number) =>
+    `1 validation error detected: Value '${value}' at '${at}' failed to satisfy constraint: Member must have value less than or equal to ${most}`
+  if (total !== undefined && segment === undefined) {
+    refuse(
+      "If total segments is specified, a particular segment must also be specified for this request",
+    )
+  }
+  if (segment !== undefined && total === undefined) {
+    refuse("If segment is specified, total segment must also be specified")
+  }
+  if (segment !== undefined && total !== undefined && (segment < 0 || segment >= total)) {
+    refuse(constraint(segment, "segment", total - 1))
+  }
+  if (total !== undefined && total > 1_000_000)
+    refuse(constraint(total, "totalSegments", 1_000_000))
+}
 
 /** The literal values a key condition part compares its attribute with, or a defect for any other operand. */
 const keyOperands = (part: Condition): ReadonlyArray<AttributeValue> => {
@@ -2972,37 +3819,42 @@ const inclusiveEnd = (
 
 /**
  * DynamoDB Local orders an index's rows of one key by something of its own (measured: no order of
- * their table keys). A read whose rows would depend on that order is a defect naming it: a `Limit`
- * stopping between two of them, or an `ExclusiveStartKey` among them. Rows of one key that one
- * answer returns together come in table-key order, where DynamoDB Local's differs (listed at the
- * top of this module).
+ * their table keys). A read whose answer would depend on that order is a defect naming it:
+ *
+ * - an `ExclusiveStartKey` among them (other than its own row): which of them come after it;
+ * - a `Limit` that stops among them on the page this read returns, judged on `after` (the rows
+ *   past the start key, in the read's direction; rows before it are never read): between two of
+ *   them (which it returns), or on the last of several (which one its `LastEvaluatedKey` names).
+ *
+ * Rows of one key that one answer returns together come in table-key order, where DynamoDB Local's
+ * differs (listed at the top of this module).
  */
-const unorderedTies = (
-  input: QueryInput,
+const startAmongTies = (
   matched: ReadonlyArray<Item>,
   schema: KeySchema,
   table: KeySchema,
-  start: Item | undefined,
+  start: Item,
 ): void => {
-  const tie = (a: Item, b: Item) => sameValue(a[schema.sk]!, b[schema.sk]!)
-  const sameRow = (a: Item, b: Item) =>
-    sameValue(a[table.pk]!, b[table.pk]!) && sameValue(a[table.sk]!, b[table.sk]!)
-  const what = `rows of one ${schema.sk} (DynamoDB Local's order among them is not modelled)`
-  if (start !== undefined && matched.some((row) => tie(row, start) && !sameRow(row, start))) {
-    unreadable("the ExclusiveStartKey", shown(start), `among ${what}`)
-  }
-  const from =
-    start === undefined
-      ? matched
-      : matched.filter((row) => compareKeyValues(row[schema.sk]!, start[schema.sk]!) !== 0)
-  const limit = input.Limit ?? from.length
-  const examined = from.slice(0, limit)
-  const last = examined[examined.length - 1]
-  const next = from[examined.length]
-  if (last !== undefined && next !== undefined && tie(last, next)) {
-    unreadable("the Limit", String(input.Limit), `stopping between ${what}`)
+  const sameRow = (row: Item) =>
+    sameValue(row[table.pk]!, start[table.pk]!) && sameValue(row[table.sk]!, start[table.sk]!)
+  if (matched.some((row) => sameValue(row[schema.sk]!, start[schema.sk]!) && !sameRow(row))) {
+    unreadable("the ExclusiveStartKey", shown(start), `among ${unordered(schema)}`)
   }
 }
+
+const limitAmongTies = (input: QueryInput, after: ReadonlyArray<Item>, schema: KeySchema): void => {
+  const limit = input.Limit
+  if (limit === undefined || !Number.isInteger(limit) || limit < 1 || after.length < limit) return
+  const last = after[limit - 1]!
+  const tied = (row: Item | undefined) =>
+    row !== undefined && sameValue(row[schema.sk]!, last[schema.sk]!)
+  if (tied(after[limit]) || tied(after[limit - 2])) {
+    unreadable("the Limit", String(limit), `stopping among ${unordered(schema)}`)
+  }
+}
+
+const unordered = (schema: KeySchema) =>
+  `rows of one ${schema.sk} (DynamoDB Local's order among them is not modelled)`
 
 /**
  * A `Query`'s output over `rows` (every item of the table), on the table's keys or one of
@@ -3017,9 +3869,13 @@ export const query = (
   indexes: Indexes,
 ) => {
   checkFields("Query", input)
-  const expressions = readExpressions(input)
+  checkTableName(input.TableName)
+  checkLimit(input.Limit)
+  const expressions = readExpressions(input, "Query")
   if (expressions.keyCondition === undefined) {
-    return unreadable("the Query", shown(input), "no KeyConditionExpression")
+    return refuse(
+      "Either the KeyConditions or KeyConditionExpression parameter must be specified in the request.",
+    )
   }
   let index: ReadIndex | undefined
   if (input.IndexName !== undefined) {
@@ -3034,26 +3890,23 @@ export const query = (
     refuse("Consistent reads are not supported on global secondary indexes")
   }
   const schema = index?.schema ?? table
+  checkKeyScalars(expressions.keyCondition, table, indexes)
   const parts = keyConditionParts(expressions.keyCondition)
-  const on = (part: Condition): string | undefined => {
-    const attributes = conditionAttributes(part)
-    return attributes.length === 1 ? attributes[0] : undefined
+  // Each part names one attribute (`keyConditionParts`). Measured order: an attribute named twice;
+  // more than two parts; no partition key part; a partition key part other than `=`; a part on an
+  // attribute that isn't one of the read's keys.
+  const on = (part: Condition): string => conditionAttributes(part)[0]!
+  const named = parts.map(on)
+  if (new Set(named).size !== named.length) {
+    refuse("KeyConditionExpressions must only contain one condition per key")
   }
-  for (const attribute of keyAttributes(schema)) {
-    if (parts.filter((part) => on(part) === attribute).length > 1) {
-      refuse("KeyConditionExpressions must only contain one condition per key")
-    }
+  if (parts.length > 2) refuse("Conditions can be of length 1 or 2 only")
+  const missed = "Query condition missed key schema element"
+  const partition = parts.find((part) => on(part) === schema.pk) ?? refuse(missed)
+  if (partition.kind !== "compare" || partition.op !== "=") {
+    refuse("Query key condition not supported")
   }
-  const partition = parts.find((part) => on(part) === schema.pk)
-  if (
-    partition === undefined ||
-    partition.kind !== "compare" ||
-    partition.op !== "=" ||
-    parts.length > 2 ||
-    parts.some((part) => on(part) !== schema.pk && on(part) !== schema.sk)
-  ) {
-    return refuse("Query condition missed key schema element")
-  }
+  if (parts.some((part) => on(part) !== schema.pk && on(part) !== schema.sk)) refuse(missed)
   const sort = parts.find((part) => on(part) === schema.sk)
   for (const part of [partition, sort]) {
     if (part === undefined) continue
@@ -3108,10 +3961,11 @@ export const query = (
     )
     .sort(compare)
   if (!forward) matched.reverse()
-  if (index !== undefined) unorderedTies(input, matched, schema, table, start)
+  if (index !== undefined && start !== undefined) startAmongTies(matched, schema, table, start)
   if (start !== undefined) {
     matched = matched.filter((row) => (forward ? compare(row, start) > 0 : compare(row, start) < 0))
   }
+  if (index !== undefined) limitAmongTies(input, matched, schema)
   const lastKey = (row: Item): Item => ({
     ...keyOfItem(row, table),
     ...(index !== undefined && keyOfItem(row, index.schema)),
@@ -3133,7 +3987,10 @@ export const scan = (
   after: (start: Item) => ReadonlyArray<Item>,
 ) => {
   checkFields("Scan", input)
-  const expressions = readExpressions(input)
+  checkTableName(input.TableName)
+  checkLimit(input.Limit)
+  const expressions = readExpressions(input, "Scan")
+  checkSegments(input)
   const shape = shapeOf(input, expressions, table, undefined)
   const start = input.ExclusiveStartKey
   if (start !== undefined) checkStartKey(start, table, undefined)

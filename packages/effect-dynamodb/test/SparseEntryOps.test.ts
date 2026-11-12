@@ -2,7 +2,7 @@
  * Operations on a sparse map's entries, against what the published 1.39.0 did
  * (`fixtures/sparse-entry-ops-1.39.0.json`, from `helpers/SparseEntryOps.ts`), and the requests
  * the published 1.40.0 sent (`fixtures/sparse-entry-ops-requests-1.40.0.json`): every case sends
- * them, whole, unless `OVERRIDES` says why not.
+ * them, whole, unless `OVERRIDES` says why not and which it sends instead, whole.
  *
  * - **Every entry operation reaches the entry, whatever its key is called.** The record and the
  *   path operations, on a plain, a retained and a unique entity, alone and in a transaction, with
@@ -47,15 +47,20 @@ const sent140 = JSON.parse(
   ),
 ) as { readonly cases: Record<string, ReadonlyArray<SentRequest>> }
 
-/** Cases whose requests differ from the ones 1.40.0 sent, each with the reason. None does. */
-const OVERRIDES: Readonly<Record<string, string>> = {}
+/**
+ * Cases whose requests differ from the ones 1.40.0 sent: each with the reason, and the requests it
+ * sends instead, whole. None does.
+ */
+const OVERRIDES: Readonly<
+  Record<string, { readonly reason: string; readonly requests: ReadonlyArray<SentRequest> }>
+> = {}
 
-/** Runs a case, checking it sends 1.40.0's requests, whole, unless it is overridden. */
+/** Runs a case, checking it sends 1.40.0's requests, whole, or its override's, whole. */
 const capture = (each: Case) =>
   Effect.map(captureWithRequests(Lib as never, each), ({ outcome, requests }) => {
-    const reason = OVERRIDES[each.key]
-    if (reason === undefined) expect(requests).toEqual(sent140.cases[each.key])
-    else expect(requests, reason).not.toEqual(sent140.cases[each.key])
+    const override = OVERRIDES[each.key]
+    if (override === undefined) expect(requests).toEqual(sent140.cases[each.key])
+    else expect(requests, override.reason).toEqual(override.requests)
     return outcome
   })
 
@@ -76,10 +81,11 @@ it("the fixtures hold every case", () => {
   expect(Object.keys(sent140.cases)).toEqual(cases.map((each) => each.key))
 })
 
-it("every override names a case, with its reason", () => {
-  for (const [key, reason] of Object.entries(OVERRIDES)) {
+it("every override names a case, with its reason and requests that differ from 1.40.0's", () => {
+  for (const [key, { reason, requests }] of Object.entries(OVERRIDES)) {
     expect(Object.hasOwn(sent140.cases, key), key).toBe(true)
     expect(reason.length, key).toBeGreaterThan(0)
+    expect(requests, key).not.toEqual(sent140.cases[key])
   }
 })
 

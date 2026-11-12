@@ -40,9 +40,11 @@ import { beforeEach, describe, expect } from "vitest"
 import * as Batch from "../src/Batch.js"
 import { DynamoClient, type DynamoClientService } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
+import { encodeKeyCursor } from "../src/internal/Cursor.js"
+import * as Query from "../src/Query.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
-import { keyIdentity, UnreadableRequest } from "./helpers/DynamoExpressions.js"
+import { keyIdentity, query, UnreadableRequest } from "./helpers/DynamoExpressions.js"
 import {
   holds,
   InMemoryClient,
@@ -50,12 +52,14 @@ import {
   resetStore,
   sameValue,
   store,
+  tableIndexes,
 } from "./helpers/InMemoryTables.js"
 import {
   DDB_REPEATED_BATCH_ITEM,
   DDB_REPEATED_ITEM,
   DDB_UPDATE_INVALID_PATH,
   DDB_UPDATE_MISSING_ATTRIBUTE,
+  mockDynamoClient,
 } from "./helpers/MockDynamoClient.js"
 import { keyText, makeRecordingTable } from "./helpers/RecordingTable.js"
 
@@ -984,4 +988,304 @@ describe("an item is named by its table and its typed key", () => {
       expect(store.size).toBe(0)
     }),
   )
+})
+
+describe("rows of one index key: a read is refused only when its own page depends on their order", () => {
+  const S = (value: string): AttributeValue => ({ S: value })
+  const TABLE = { pk: "pk", sk: "sk" }
+  const INDEXES = { lsi: { pk: "pk", sk: "lsk" }, gsi: { pk: "gpk", sk: "gsk" } }
+  type Where = "table" | "lsi" | "gsi"
+  /** Row `i` holds `values[i]` as its index sort keys, and a table sort key in the same order. */
+  const rowsOf = (values: ReadonlyArray<string>): ReadonlyArray<Item> =>
+    values.map((value, i) => ({
+      pk: S("p"),
+      sk: S(`${value}${i}`),
+      lsk: S(value),
+      gpk: S("g"),
+      gsk: S(value),
+    }))
+  const keyOn = (where: Where, row: Item): Item => ({
+    pk: row.pk!,
+    sk: row.sk!,
+    ...(where === "lsi" && { lsk: row.lsk! }),
+    ...(where === "gsi" && { gpk: row.gpk!, gsk: row.gsk! }),
+  })
+  const requestOn = (where: Where, start: Item | undefined, extra: object) => ({
+    TableName: "t",
+    ...(where !== "table" && { IndexName: where }),
+    KeyConditionExpression: "#p = :p",
+    ExpressionAttributeNames: { "#p": where === "gsi" ? "gpk" : "pk" },
+    ExpressionAttributeValues: { ":p": S(where === "gsi" ? "g" : "p") },
+    ...(start !== undefined && { ExclusiveStartKey: keyOn(where, start) }),
+    ...extra,
+  })
+  const Limit = (limit: number) => ({ Limit: limit })
+  const reverse = (extra: object = {}) => ({ ScanIndexForward: false, ...extra })
+  /** The rows returned (by position in `values`), or which refusal. */
+  type Expected = ReadonlyArray<number> | "the Limit" | "the ExclusiveStartKey"
+  const CASES: ReadonlyArray<
+    readonly [
+      label: string,
+      values: ReadonlyArray<string>,
+      start: number,
+      extra: object,
+      table: ReadonlyArray<number>,
+      index: Expected,
+    ]
+  > = [
+    ["ties before the start key", ["1", "1", "2", "3"], 2, Limit(1), [3], [3]],
+    ["ties before the start key, no Limit", ["1", "1", "2", "3"], 2, {}, [3], [3]],
+    ["a Limit before the ties", ["1", "2", "3", "3", "4"], 0, Limit(1), [1], [1]],
+    [
+      "a Limit between ties past the start key",
+      ["1", "2", "3", "3", "4"],
+      1,
+      Limit(1),
+      [2],
+      "the Limit",
+    ],
+    ["a Limit on the last of ties", ["1", "2", "3", "3", "4"], 1, Limit(2), [2, 3], "the Limit"],
+    [
+      "a Limit on the last of ties, the last rows",
+      ["1", "2", "3", "3"],
+      1,
+      Limit(2),
+      [2, 3],
+      "the Limit",
+    ],
+    ["a Limit past the ties", ["1", "2", "3", "3", "4"], 1, Limit(3), [2, 3, 4], [2, 3, 4]],
+    ["ties past the start key, no Limit", ["1", "2", "3", "3"], 1, {}, [2, 3], [2, 3]],
+    ["the start key among ties", ["1", "2", "2", "3"], 1, Limit(1), [2], "the ExclusiveStartKey"],
+    [
+      "reverse, ties before the start key",
+      ["1", "2", "3", "3", "4"],
+      1,
+      reverse(Limit(1)),
+      [0],
+      [0],
+    ],
+    [
+      "reverse, a Limit between ties past the start key",
+      ["1", "1", "2", "3"],
+      2,
+      reverse(Limit(1)),
+      [1],
+      "the Limit",
+    ],
+    [
+      "reverse, a Limit on the last of ties",
+      ["1", "1", "2", "3"],
+      2,
+      reverse(Limit(2)),
+      [1, 0],
+      "the Limit",
+    ],
+    [
+      "reverse, a Limit past the ties",
+      ["1", "2", "3", "3", "4"],
+      4,
+      reverse(Limit(3)),
+      [3, 2, 1],
+      [3, 2, 1],
+    ],
+    [
+      "reverse, the start key among ties",
+      ["1", "2", "2", "3"],
+      2,
+      reverse(),
+      [1, 0],
+      "the ExclusiveStartKey",
+    ],
+  ]
+  for (const where of ["table", "lsi", "gsi"] as const) {
+    for (const [label, values, startAt, extra, onTable, onIndex] of CASES) {
+      const expected = where === "table" ? onTable : onIndex
+      it(`${where}: ${label}: ${typeof expected === "string" ? `refused, naming ${expected}` : `rows ${expected.join(", ")}`}`, () => {
+        const rows = rowsOf(values)
+        const read = () =>
+          query(requestOn(where, rows[startAt], extra) as never, rows, TABLE, INDEXES)
+        if (typeof expected === "string") {
+          const attribute = where === "lsi" ? "lsk" : "gsk"
+          expect(read).toThrow(UnreadableRequest)
+          expect(read).toThrow(
+            `The in-memory table doesn't read ${expected} ${
+              expected === "the Limit"
+                ? JSON.stringify(String((extra as { Limit: number }).Limit))
+                : ""
+            }`.trimEnd(),
+          )
+          expect(read).toThrow(
+            `${expected === "the Limit" ? "stopping among" : "among"} rows of one ${attribute} (DynamoDB Local's order among them is not modelled)`,
+          )
+        } else {
+          expect(read().Items).toEqual(expected.map((i) => rows[i]))
+        }
+      })
+    }
+  }
+
+  // The same reads through the library's query and cursor, on both tables.
+  const PUBLIC: ReadonlyArray<
+    readonly [
+      label: string,
+      values: ReadonlyArray<string>,
+      start: number,
+      reversed: boolean,
+      expected: Expected,
+    ]
+  > = [
+    ["a Limit between ties past the start key", ["1", "2", "3", "3", "4"], 1, false, "the Limit"],
+    ["ties before the start key", ["1", "1", "2", "3"], 2, false, [3]],
+    ["reverse, ties before the start key", ["1", "2", "3", "3", "4"], 1, true, [0]],
+    [
+      "reverse, a Limit between ties past the start key",
+      ["1", "1", "2", "3"],
+      2,
+      true,
+      "the Limit",
+    ],
+  ]
+  const onTables = {
+    "recording table": () => makeRecordingTable({ indexes: { gsi: INDEXES.gsi } }).layer,
+    InMemoryClient: () => {
+      resetStore()
+      tableIndexes.set("t", { gsi: INDEXES.gsi })
+      return InMemoryClient
+    },
+  }
+  for (const [name, layerOf] of Object.entries(onTables)) {
+    for (const [label, values, startAt, reversed, expected] of PUBLIC) {
+      it.effect(`${name}: Query.startFrom, gsi, Limit 1: ${label}`, () =>
+        Effect.gen(function* () {
+          const rows = rowsOf(values)
+          const layer = layerOf()
+          const read = Effect.gen(function* () {
+            const client = yield* DynamoClient
+            for (const item of rows) yield* client.putItem({ TableName: "t", Item: item })
+            const base = Query.make({
+              tableName: "t",
+              indexName: "gsi",
+              pkField: "gpk",
+              pkValue: "g",
+              skField: "gsk",
+              entityTypes: [],
+              decoder: (row) => Effect.succeed(row),
+            })
+            const ordered = reversed ? Query.reverse(base) : base
+            return yield* Query.execute(
+              Query.startFrom(
+                Query.limit(ordered, 1),
+                encodeKeyCursor(keyOn("gsi", rows[startAt]!)),
+              ),
+            )
+          })
+          const exit = yield* Effect.exit(Effect.provide(read, layer)).pipe(
+            Effect.ensuring(Effect.sync(() => tableIndexes.delete("t"))),
+          )
+          if (typeof expected === "string") {
+            expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBeInstanceOf(
+              UnreadableRequest,
+            )
+            expect(String(Exit.isFailure(exit) && Cause.squash(exit.cause))).toContain(
+              `doesn't read the Limit "1": stopping among rows of one gsk`,
+            )
+          } else {
+            // As the library reads them: unmarshalled.
+            expect(Exit.isSuccess(exit) && exit.value.items.map((row) => row.sk)).toEqual(
+              expected.map((i) => rows[i]!.sk!.S),
+            )
+          }
+        }),
+      )
+    }
+  }
+})
+
+describe("what the tables don't model fails by name", () => {
+  for (const [name, table] of Object.entries(TABLES)) {
+    it.effect(
+      `${name}: a transaction's ClientRequestToken is refused, and nothing is written`,
+      () =>
+        Effect.gen(function* () {
+          const { layer, seed, read } = table()
+          seed({ ...key("counter"), n: { N: "0" } })
+          const exit = yield* Effect.exit(
+            Effect.provide(
+              withClient((client) =>
+                client.transactWriteItems({
+                  ClientRequestToken: "token",
+                  TransactItems: [
+                    {
+                      Update: {
+                        TableName: "t",
+                        Key: key("counter"),
+                        UpdateExpression: "ADD #n :one",
+                        ExpressionAttributeNames: { "#n": "n" },
+                        ExpressionAttributeValues: { ":one": { N: "1" } },
+                      },
+                    },
+                  ],
+                }),
+              ),
+              layer,
+            ),
+          )
+          const defect = Exit.isFailure(exit) && Cause.squash(exit.cause)
+          expect(defect).toBeInstanceOf(UnreadableRequest)
+          expect(String(defect)).toContain(
+            `doesn't read the ClientRequestToken "token": not modelled (DynamoDB Local answers a committed transaction resent with its token with success, writing nothing`,
+          )
+          expect(read(key("counter"))).toEqual({ ...key("counter"), n: { N: "0" } })
+        }),
+    )
+  }
+
+  /** The client operations each table answers; every other one dies naming it. */
+  const MODELLED: Record<keyof typeof TABLES, readonly [string, ReadonlyArray<string>]> = {
+    "recording table": [
+      "modelled by the recording table",
+      [
+        "getItem",
+        "putItem",
+        "updateItem",
+        "deleteItem",
+        "query",
+        "scan",
+        "batchGetItem",
+        "batchWriteItem",
+        "transactGetItems",
+        "transactWriteItems",
+      ],
+    ],
+    InMemoryClient: [
+      "modelled by the in-memory tables (InMemoryClient)",
+      ["getItem", "putItem", "updateItem", "deleteItem", "query", "transactWriteItems"],
+    ],
+  }
+  const OPERATIONS = Object.keys(mockDynamoClient())
+  for (const [name, table] of Object.entries(TABLES)) {
+    const [by, modelled] = MODELLED[name as keyof typeof TABLES]
+    it.effect(
+      `${name}: every operation of the client it doesn't answer dies naming the operation`,
+      () =>
+        Effect.gen(function* () {
+          expect(modelled.filter((operation) => !OPERATIONS.includes(operation))).toEqual([])
+          const client = yield* Effect.provide(
+            withClient((client) => Effect.succeed(client)),
+            table().layer,
+          )
+          const others = OPERATIONS.filter((operation) => !modelled.includes(operation))
+          expect(others.length).toBeGreaterThan(0)
+          for (const operation of others) {
+            const call = client[operation as keyof DynamoClientService] as unknown as (
+              input: unknown,
+            ) => Effect.Effect<unknown, unknown>
+            const exit = yield* Effect.exit(call({}))
+            expect(
+              Exit.isFailure(exit) && Cause.hasDies(exit.cause) && Cause.squash(exit.cause),
+            ).toBe(`DynamoClient.${operation} is not ${by}`)
+          }
+        }),
+    )
+  }
 })

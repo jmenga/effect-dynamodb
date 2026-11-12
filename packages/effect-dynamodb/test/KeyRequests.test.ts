@@ -382,7 +382,8 @@ const captured = (world: World, v: Values) =>
     const table = makeRecordingTable({
       indexes: {
         ...indexesOf(Table.definition(world.MainTable)),
-        // The aggregate's collection index, which the table's definition doesn't read.
+        // The aggregate's collection index: the aggregate isn't registered on this table, so the
+        // table's definition doesn't hold it.
         lsi1: { pk: "pk", sk: "lsi1sk" },
       },
     })

@@ -28,7 +28,7 @@
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
 import { DynamoError } from "@effect-dynamodb/schema/Errors.js"
 import { Effect, Layer } from "effect"
-import { classifyError, DynamoClient } from "../../src/DynamoClient.js"
+import { classifyError, DynamoClient, type DynamoClientService } from "../../src/DynamoClient.js"
 import {
   answering,
   batchGet,
@@ -143,10 +143,11 @@ export const makeRecordingTable = (options?: {
   const requests: Array<Request> = []
   /** Run before each request is answered — another writer landing just before it. */
   const hooks: { onRequest?: ((request: Request) => void) | undefined } = {}
-  const schemaOf = (table: string | undefined): KeySchema => {
-    if (table === undefined) throw new UnreadableRequest("RecordingTable: a request names no table")
-    return tableKeys
-  }
+  /**
+   * Every table's key attributes, one name or none: a request naming no table is refused as
+   * DynamoDB Local refuses it (`checkTableName`) before any key is read against these.
+   */
+  const schemaOf = (_table: string | undefined): KeySchema => tableKeys
   const heldBy = (slot: Map<string | undefined, Item> | undefined, table: string) =>
     slot?.get(table) ?? slot?.get(undefined)
   const read = (table: string, key: Item) => heldBy(slots.get(textOf(key)), table)
@@ -264,7 +265,7 @@ export const makeRecordingTable = (options?: {
     return Effect.succeed(outcome.output as never)
   }
 
-  const client = mockDynamoClient({
+  const operations: Partial<DynamoClientService> = {
     getItem: (input) =>
       Effect.suspend(() => {
         record("GetItem", input)
@@ -382,7 +383,8 @@ export const makeRecordingTable = (options?: {
           return Effect.succeed({} as never)
         }, failure("TransactWriteItems"))
       }),
-  })
+  }
+  const client = mockDynamoClient(operations, "modelled by the recording table")
 
   return {
     items,

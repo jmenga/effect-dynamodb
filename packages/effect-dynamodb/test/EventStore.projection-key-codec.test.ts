@@ -45,29 +45,34 @@ describe.each([
   const w = P.world(now)
   const then = P.world(written)
 
+  /** The physical tables the two definitions name: two, or one both share. */
+  type Names = { readonly events: string; readonly read: string }
+  const TWO: Names = { events: "events", read: "read" }
+  const ONE: Names = { events: "shared", read: "shared" }
+
   /** The stream's rows in the events table, the read model's in the read table. */
-  const holding = (rows: {
-    readonly events: ReadonlyArray<P.Row>
-    readonly read: ReadonlyArray<P.Row>
-  }) => {
+  const holding = (
+    rows: { readonly events: ReadonlyArray<P.Row>; readonly read: ReadonlyArray<P.Row> },
+    names: Names = TWO,
+  ) => {
     const table = makeRecordingTable()
-    for (const row of rows.events) table.seed("events", row)
-    for (const row of rows.read) table.seed("read", row)
+    for (const row of rows.events) table.seed(names.events, row)
+    for (const row of rows.read) table.seed(names.read, row)
     return table
   }
   const seeded = () => holding(f.seed)
-  const on = <A>(table: Recording, body: Effect.Effect<A, unknown, any>) =>
+  const on = <A>(table: Recording, body: Effect.Effect<A, unknown, any>, names: Names = TWO) =>
     body.pipe(
       Effect.provide(
         Layer.mergeAll(
           table.layer,
-          w.EventsTable.layer({ name: "events" }),
-          w.ReadTable.layer({ name: "read" }),
+          w.EventsTable.layer({ name: names.events }),
+          w.ReadTable.layer({ name: names.read }),
         ),
       ),
     ) as Effect.Effect<A, unknown, never>
   /** `rekey` of the read model's table, then of the stream's. */
-  const rekey = (table: Recording) =>
+  const rekey = (table: Recording, names: Names = TWO) =>
     on(
       table,
       Effect.gen(function* () {
@@ -81,6 +86,7 @@ describe.each([
         })
         return { read, events }
       }),
+      names,
     )
   const at = (table: Recording, key: { readonly pk: string; readonly sk: string }) => {
     const row = table.items.get(`${key.pk}|${key.sk}`)
@@ -210,6 +216,26 @@ describe.each([
       expect(result.drained.delivered).toBe(3)
       expect(notes).toEqual(["Placed v1", "Added v2", "Cancelled v3"])
       expect(outboxItems(table)).toEqual([])
+    }),
+  )
+
+  it.effect("over one physical table, each definition's rekey passes over the other's rows", () =>
+    Effect.gen(function* () {
+      const table = holding(f.seed, ONE)
+      const { read, events } = yield* rekey(table, ONE)
+      expect(read.moved).toEqual({ ...ZERO, item: 2, outbox: written === now ? 0 : 1 })
+      expect(read.conflicts).toEqual([])
+      // The stream's rows are in the read model's table too, and no member of it.
+      expect(read.skipped).toMatchObject({ unregistered: f.seed.events.length })
+      expect(events.moved).toEqual({ ...ZERO, stream: written === now ? 0 : 1 })
+      expect(events.conflicts).toEqual([])
+      expect(events.skipped).toMatchObject({ unregistered: f.seed.read.length })
+      expect(at(table, w.rowKey.Removable)).toMatchObject({ orderId: "x:o 1", total: 5 })
+      expect(at(table, w.doubledKey.Removable)).toBeUndefined()
+
+      const again = yield* rekey(table, ONE)
+      expect(again.read.moved).toEqual(ZERO)
+      expect(again.events.moved).toEqual(ZERO)
     }),
   )
 
