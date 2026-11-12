@@ -6,11 +6,12 @@
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
-import type { DynamoEncoding } from "@effect-dynamodb/schema/DynamoModel.js"
+import { type DynamoEncoding, isConfiguredModel } from "@effect-dynamodb/schema/DynamoModel.js"
 import { ValidationError } from "@effect-dynamodb/schema/Errors.js"
 import { makeDefaultCrypto } from "@effect-dynamodb/schema/internal/DefaultCrypto.js"
 import type { UniqueConstraintDef } from "@effect-dynamodb/schema/internal/EntityConfig.js"
 import { resolveUniqueFields } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
+import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import { DateTime, Effect, Option, type Schema } from "effect"
 import { SecureRandom } from "effect/crypto"
@@ -56,6 +57,79 @@ export const rowWriters = (token: AttributeValue | undefined): ReadonlyArray<str
  */
 export const rowTokened = (entity: object): boolean =>
   (projectionLayoutsOf(entity)?.length ?? 0) > 1
+
+/**
+ * @internal The attributes a read model's rows and tombstones hold under names its definitions
+ * decide (#237), or `undefined` when its model's fields can't be listed: each model field, by its
+ * name and its stored name (`field:`); every key attribute of its table (`tableKeyAttributes`:
+ * every member's, every aggregate's and every event stream's index, its own included) and of its
+ * own indexes; its `created` / `updated` timestamps and its version; the table's TTL attribute
+ * (`ttlName`, from the table's layer, `undefined` where that isn't known: an aggregate's checks);
+ * and each of its projections' outboxes on its table, by key and index attribute. A sparse map's
+ * entries (`<prefix>#<key>`) always hold a `#`, so never one of the library's names.
+ */
+const rowItemNames = (
+  entity: object,
+  ttlName: string | undefined,
+): ReadonlySet<string> | undefined => {
+  const member = entity as {
+    readonly model?: unknown
+    readonly _renameToDynamo?: (item: Record<string, unknown>) => void
+    readonly _tableTag?: unknown
+    readonly indexes?: Record<
+      string,
+      { readonly pk: KeyPartLike; readonly sk?: KeyPartLike | undefined }
+    >
+    readonly systemFields?: {
+      readonly createdAt: string | null
+      readonly updatedAt: string | null
+      readonly version: string | null
+    }
+    readonly _projectionOutboxes?: ReadonlyArray<{
+      readonly table: { readonly Tag: unknown } | undefined
+      readonly pk: string
+      readonly sk: string
+      readonly index: { readonly pk: string; readonly sk: string } | undefined
+    }>
+  }
+  const model = isConfiguredModel(member.model) ? member.model.model : member.model
+  if (model === undefined) return undefined
+  const fields = getSchemaFields(model as Schema.Top)
+  if (fields === undefined) return undefined
+  const names = new Set<string>()
+  for (const field of Object.keys(fields)) {
+    names.add(field)
+    const probe: Record<string, unknown> = { [field]: 1 }
+    member._renameToDynamo?.(probe)
+    for (const stored of Object.keys(probe)) names.add(stored)
+  }
+  for (const index of Object.values(member.indexes ?? {})) {
+    names.add(index.pk.field)
+    if (index.sk !== undefined) names.add(index.sk.field)
+  }
+  for (const name of tableKeyAttributes(member._tableTag) ?? []) names.add(name)
+  const system = member.systemFields
+  for (const name of [system?.createdAt, system?.updatedAt, system?.version]) {
+    if (typeof name === "string") names.add(name)
+  }
+  if (ttlName !== undefined) names.add(ttlName)
+  for (const outbox of member._projectionOutboxes ?? []) {
+    if (outbox.table !== undefined && outbox.table.Tag !== member._tableTag) continue
+    names.add(outbox.pk).add(outbox.sk)
+    if (outbox.index !== undefined) names.add(outbox.index.pk).add(outbox.index.sk)
+  }
+  return names
+}
+
+/**
+ * @internal Whether a read model's rows may carry the row token (`ROW_TOKEN`, #237): its name is
+ * free on them (`rowItemNames`). The one decision, from the definitions and the table's TTL
+ * attribute (`ttlName`), never from a stored row: where anything the read model's definitions
+ * name is `__edd_rt__`, its rows carry none, no write names it or reads one, and its projections
+ * write, carry and refuse as on 1.40.0 (`rowTokened` only adds to this).
+ */
+export const rowTokenInUse = (entity: object, ttlName: string | undefined): boolean =>
+  rowItemNames(entity, ttlName)?.has(ROW_TOKEN) === false
 
 const tokenRandom = makeDefaultCrypto()
 
@@ -126,16 +200,19 @@ export const heldTerm = (
  * on a read model whose rows carry the token (`rowTokened`), the token's absence. A row without a
  * token was last written by a process still on 1.40.0, which writes none, or before the token:
  * the bookkeeping proves a write by either landed since, the token's absence one by this release.
+ * `inUse` is `rowTokenInUse`: where the token's name is taken, an attribute of that name is the
+ * user's, and only the bookkeeping is named.
  */
 export const asReadTerm = (
   entity: object,
   item: Record<string, AttributeValue>,
   names: Iterable<string>,
+  inUse: boolean,
 ): RawCondition | undefined => {
-  const read = item[ROW_TOKEN]
+  const read = inUse && Object.hasOwn(item, ROW_TOKEN) ? item[ROW_TOKEN] : undefined
   if (read !== undefined) return rowTokenTerm(read)
   const held = heldTerm(item, names)
-  return rowTokened(entity) ? andRaw(rowTokenTerm(undefined), held) : held
+  return inUse && rowTokened(entity) ? andRaw(rowTokenTerm(undefined), held) : held
 }
 
 /** @internal Both conditions, either of which may be absent. Their placeholders must differ. */
@@ -353,8 +430,9 @@ export const projectionTtlConflict = (
  * tombstone holds it natively and one written before may hold it packed. A row with nothing
  * packed carried packs nothing, so its request is unchanged.
  *
- * On a read model whose rows carry the row token (`rowTokened`), or when the tombstone holds one,
- * it also holds the bookkeeping of the other projections that had written the row (#237): those of
+ * Where the row token's name is free (`rowTokenInUse`, with the table's TTL attribute), on a read
+ * model whose rows carry it (`rowTokened`), or when the tombstone holds one, the tombstone also
+ * holds the bookkeeping of the other projections that had written the row (#237): those of
  * projections without `removal` are carried after, each attribute the others haven't named, in
  * the same way. The row gets a fresh token recording the projections whose bookkeeping it holds.
  * `term` proves the tombstone is still as read (`asReadTerm`): its token, else every projection's
@@ -465,9 +543,10 @@ export const overTombstone = (
       Object.assign(item, part)
       yield* entity._packFields(item, "create", new Set(stored))
     }
-    const read = Item[ROW_TOKEN]
-    const term = asReadTerm(entity, Item, taken)
-    if (rowTokened(entity) || read !== undefined) {
+    const inUse = rowTokenInUse(entity, resolveTtlAttributeName(table))
+    const read = inUse && Object.hasOwn(Item, ROW_TOKEN) ? Item[ROW_TOKEN] : undefined
+    const term = asReadTerm(entity, Item, taken, inUse)
+    if (inUse && (rowTokened(entity) || read !== undefined)) {
       // The projections whose bookkeeping the row holds: those this program doesn't define kept.
       const known = new Map(layouts.map((layout) => [layoutTag(layout), layout]))
       const writers = rowWriters(read).filter((tag) => {

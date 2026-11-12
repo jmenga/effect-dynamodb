@@ -4,7 +4,8 @@
  * `fixtures/outbox-rolling-1.40.0.json`):
  *
  * - Where `__edd_rm__` is a key attribute where a read model's outbox items are written, this
- *   release sends, stores and delivers exactly what 1.40.0 did.
+ *   release sends, stores and delivers exactly what 1.40.0 did (with two projections, the rows'
+ *   row token taken out: `helpers/RowTokens.ts`).
  * - The items this release writes (marks, items beside another's) are the ones 1.40.0's drainers
  *   were given and delivered, and this release's drainer sends the requests 1.40.0's did.
  * - Two projections of one read model at one revision: the second's item beside the first's,
@@ -38,6 +39,7 @@ import {
   rolling,
   type Tables,
 } from "./helpers/OutboxScenarios.js"
+import { namesRowToken, withoutRowToken } from "./helpers/RowTokens.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -153,9 +155,12 @@ describeConnected("outbox items' marks on DynamoDB Local (#237)", () => {
                 ClientLayer,
               )
               const fixture = namesFixture[at]!
-              expect(
-                asJson({ sent: ran.sent, delivered: ran.delivered, result: ran.result }),
-              ).toEqual(
+              // Two projections write the rows: each carries a row token, its name free. With it
+              // taken out, the requests and rows are 1.40.0's (`withoutRowToken`).
+              const tokened = projections === 2
+              expect(namesRowToken(ran.sent)).toBe(tokened)
+              const sent = asJson({ sent: ran.sent, delivered: ran.delivered, result: ran.result })
+              expect(tokened ? withoutRowToken(sent) : sent).toEqual(
                 asJson({
                   sent: fixture.sent,
                   delivered: fixture.delivered,
@@ -166,7 +171,8 @@ describeConnected("outbox items' marks on DynamoDB Local (#237)", () => {
                 const ledger = (yield* scan(tables[name])).filter((item) =>
                   String((item.__edd_e__ as { S?: string })?.S).startsWith("Ledger"),
                 )
-                expect(sorted(ledger)).toEqual(fixture.items[name])
+                expect(sorted(withoutRowToken(ledger))).toEqual(fixture.items[name])
+                if (name === "read") expect(namesRowToken(ledger)).toBe(tokened)
               }
             }),
           ).pipe(Effect.provide(ClientLayer)),

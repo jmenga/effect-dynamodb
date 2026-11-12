@@ -665,10 +665,11 @@ describe("the bind check counts each attribute as its row holds it after the las
     }),
   )
 
-  it.effect("a row token under the partition key's attribute", () =>
+  it.effect("the partition key's attribute named `__edd_rt__`: no row token, as 1.40.0", () =>
     Effect.gen(function* () {
-      // The table's partition attribute is `__edd_rt__`: on a read model two projections write, the
-      // row token (#237) replaces it on every row they write.
+      // The table's partition attribute is `__edd_rt__`: its name is taken (`rowTokenInUse`), so
+      // the rows of a read model two projections write carry no token (#237), and nothing writes
+      // it but the key, as on 1.40.0.
       const schema = DynamoSchema.make({ name: "rk", version: 1 })
       const Tallies = Entity.make({
         model: Schema.Struct({ id: Schema.String, version: Schema.Number, rev: Schema.Number }),
@@ -704,11 +705,10 @@ describe("the bind check counts each attribute as its row holds it after the las
           evolve: (state: any) => Effect.succeed(state),
           checkpoint,
         } as any)
-      // One projection writes no token.
       define("First", "version")
       expect(yield* bind).toBe("bound")
       define("Second", "rev")
-      expect(yield* bind).toEqual(refusal("Tallies", "Tally", `its projection rows' "__edd_rt__"`))
+      expect(yield* bind).toBe("bound")
     }),
   )
 

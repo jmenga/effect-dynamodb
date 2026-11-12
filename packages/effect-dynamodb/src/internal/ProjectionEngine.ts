@@ -95,6 +95,7 @@ import {
   OUTBOX_ROW_SK as ROW_SK,
   ROW_TOKEN,
   rowTokened,
+  rowTokenInUse,
   rowTokenTerm,
   rowWriters,
   serializeSparseOrFail,
@@ -384,8 +385,14 @@ interface Row {
   readonly values: Record<string, unknown>
   readonly tombstone: boolean
   readonly createdAt: unknown
-  /** The item as read: its row token, and another projection's bookkeeping as stored (#237). */
+  /** The item as read: another projection's bookkeeping as stored (#237). */
   readonly item: Record<string, AttributeValue>
+  /**
+   * The row token as read (#237): `undefined` when the row holds none, or where the token's name
+   * isn't free on the read model's rows (`rowTokenInUse`), where an attribute of that name is the
+   * user's.
+   */
+  readonly token: AttributeValue | undefined
 }
 
 /**
@@ -1205,17 +1212,29 @@ export const makeEngine = (config: EngineConfig) => {
     Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) => tc.name),
   )
 
+  /**
+   * Whether the read model's rows may carry the row token (`rowTokenInUse`, #237): decided from
+   * the definitions and the table's TTL attribute, never from a stored row.
+   */
+  const tokenInUse = Effect.suspend(() =>
+    Effect.map(readModel._tableTag as Effect.Effect<TableConfig>, (tc) =>
+      rowTokenInUse(readModel, resolveTtlAttributeName(tc)),
+    ),
+  )
+
   /** The row, read strongly consistent — raw, so a tombstone reads as one. */
   const readRow = (key: unknown): Effect.Effect<Option.Option<Row>, any, any> =>
     Effect.gen(function* () {
       const client = yield* Capacity.client
       const TableName = yield* tableName
+      const inUse = yield* tokenInUse
       const { Item: item } = yield* client.getItem({
         TableName,
         Key: toAttributeMap(composePrimaryKey(readModel as any, key as Record<string, unknown>)),
         ConsistentRead: true,
       })
       if (item === undefined) return Option.none<Row>()
+      const token = inUse && Object.hasOwn(item, ROW_TOKEN) ? item[ROW_TOKEN] : undefined
       if (item.__edd_e__?.S === tombstoneMarker(entityType)) {
         const raw = fromAttributeMap(item) as Record<string, unknown>
         const values: Record<string, unknown> = {}
@@ -1223,7 +1242,7 @@ export const makeEngine = (config: EngineConfig) => {
           const v = raw[dbName(f)]
           if (v !== undefined) values[f] = v
         }
-        return Option.some<Row>({ values, tombstone: true, createdAt: undefined, item })
+        return Option.some<Row>({ values, tombstone: true, createdAt: undefined, item, token })
       }
       const decoded = (yield* decodeMarshalledItem(readModel as any, item)) as Record<
         string,
@@ -1239,6 +1258,7 @@ export const makeEngine = (config: EngineConfig) => {
         tombstone: false,
         createdAt: createdAtField === null ? undefined : decoded[createdAtField],
         item,
+        token,
       })
     })
 
@@ -1710,9 +1730,10 @@ export const makeEngine = (config: EngineConfig) => {
       // On a read model whose rows carry the row token (#237), or on a row that holds one (a
       // program defining only this projection writes it too, so it never replaces another's write
       // landed since its read), a fresh one recording the projections whose bookkeeping the row
-      // holds after this write (`writersAfter`), and the term naming the one read.
-      const read = Option.isSome(row) ? row.value.item[ROW_TOKEN] : undefined
-      const tokened = rowTokened(readModel) || read !== undefined
+      // holds after this write (`writersAfter`), and the term naming the one read. Where the
+      // token's name is taken (`rowTokenInUse`), none: the write sends what 1.40.0 did.
+      const read = Option.isSome(row) ? row.value.token : undefined
+      const tokened = (yield* tokenInUse) && (rowTokened(readModel) || read !== undefined)
       const token = tokened
         ? yield* freshRowToken(
             writersAfter(read, Option.isSome(target) ? target.value : { ...kept, ...carried }),
@@ -1731,6 +1752,7 @@ export const makeEngine = (config: EngineConfig) => {
               readModel,
               row.value.item,
               held.map(([, stored]) => stored),
+              true,
             )
           : rowTokenTerm(undefined)
       // A row read without a token, a tombstone, names it: `create` over it keeps the checkpoints,
@@ -1919,9 +1941,7 @@ export const makeEngine = (config: EngineConfig) => {
             new LostRace(key, failed(returnOld ? storedOf(sent.failure, true) : undefined)),
           )
         }
-        const held = items.flatMap((_, i) =>
-          cancelled(i + 1) && stageOf(i) !== "none" ? [i] : [],
-        )
+        const held = items.flatMap((_, i) => (cancelled(i + 1) && stageOf(i) !== "none" ? [i] : []))
         if (held.length === 0) return yield* Effect.fail(sent.failure)
         const again = held.find((i) => stageOf(i) === "beside")
         if (again !== undefined) {
@@ -2416,11 +2436,12 @@ export const makeEngine = (config: EngineConfig) => {
             })
           }
           const carried = onRow(carriedOf(row))
-          if (Object.keys(carried).length > 0 && (yield* keepsData(row, mapped))) {
-            item = { ...mapped }
+          if (Object.keys(carried).length > 0) {
+            const candidate: Record<string, unknown> = { ...mapped }
             for (const [field, value] of Object.entries(carried)) {
-              if (item[field] === undefined) item[field] = value
+              if (candidate[field] === undefined) candidate[field] = value
             }
+            if (yield* keepsData(row.value, candidate)) item = candidate
           }
         }
         written = yield* writeRow(key, Option.some(item), {}, row, enqueued, nextRevision)
@@ -2463,7 +2484,7 @@ export const makeEngine = (config: EngineConfig) => {
     readonly value: unknown
   }> => {
     if (Option.isNone(row)) return []
-    const writers = new Set(rowWriters(row.value.item[ROW_TOKEN]))
+    const writers = new Set(rowWriters(row.value.token))
     writers.delete(ownTag)
     if (writers.size === 0) return []
     const values = row.value.tombstone
@@ -2641,14 +2662,11 @@ export const makeEngine = (config: EngineConfig) => {
    * any dropped attribute counts. An item the entity or the marshaller refuses keeps nothing: the
    * write then fails as it would have.
    */
-  const keepsData = (
-    row: Option.Option<Row>,
-    item: Record<string, unknown>,
-  ): Effect.Effect<boolean, never, any> =>
+  const keepsData = (row: Row, item: Record<string, unknown>): Effect.Effect<boolean, never, any> =>
     Effect.gen(function* () {
       const data = dataFields()
-      if (data === undefined || Option.isNone(row)) return false
-      const held = dataAttributesOf(row.value.item, data)
+      if (data === undefined) return false
+      const held = dataAttributesOf(row.item, data)
       if (held.length === 0) return true
       const built = yield* Effect.option(
         validateAndBuildPutItem(readModel as any, item, `${config.label}.write`),
