@@ -275,7 +275,9 @@ export const resolveRevision = (
  *
  * Outbox items live in the row's own partition (sort key
  * `<row sk>#outbox#<revision>#<n>`, `__edd_e__` `<entityType>#outbox`) — or
- * in `table` when given (keyed by `keys`, default `pk` / `sk`). In the read
+ * in `table` when given (keyed by `keys`, default `pk` / `sk`). An item whose
+ * key another read model's item holds (row keys of the same text, one
+ * revision) is written beside it, its key followed by `#<tag>` (#237). In the read
  * model's table they show in its change stream and in full-table scans (not
  * in the entity's reads, which filter on `__edd_e__`); a separate table keeps
  * them out of both. `index` (a sparse index whose key attributes only outbox

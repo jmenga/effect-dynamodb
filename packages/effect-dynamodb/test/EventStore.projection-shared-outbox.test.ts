@@ -12,9 +12,12 @@ import { DateTime, Effect, Layer, Schema, SchemaGetter } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
+import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { makeRoutedTables } from "./helpers/RoutedTables.js"
 
 class Placed extends Schema.TaggedClass<Placed>()("Placed", { amount: Schema.Number }) {}
 
@@ -470,6 +473,132 @@ describe("drainPending, read models whose keys only a value holding `#` can make
 })
 
 /**
+ * A keyed by `[shop]`, B by `[shop, branch]`, from revision `revisions[i]`: single-source
+ * projections, or multi-source ones (`multi`); with `removal`, an event of amount 0 removes the
+ * row, and its effect says so (total -1).
+ */
+const world = (
+  escapeKeys: boolean,
+  schemas: "same" | "different",
+  revisions: readonly [number, number] = [1, 10],
+  options: {
+    readonly multi?: boolean
+    readonly removal?: boolean
+    /** Over `helpers/InMemoryTables.ts` instead of a recording table per table. */
+    readonly memory?: boolean
+  } = {},
+) => {
+  const schema = DynamoSchema.make({ name: "one", version: 1, escapeKeys })
+  const Outbox = Table.make({ schema, entities: {} })
+  const sidesOf = [
+    { pk: ["shop"], key: { shop: "north#branch_b1", branch: "-" }, revision: revisions[0] },
+    { pk: ["shop", "branch"], key: { shop: "north", branch: "b1" }, revision: revisions[1] },
+  ] as const
+  const sides = sidesOf.map(({ pk, key, revision }, i) => {
+    const Ledgers = Entity.make({
+      model: Schema.Struct({
+        shop: Schema.String,
+        branch: Schema.String,
+        total: Schema.Number,
+        cp: Schema.optional(Schema.Number),
+        cpm: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
+        rev: Schema.optional(Schema.Number),
+      }),
+      entityType: "Ledger",
+      primaryKey: { pk: { field: "pk", composite: [...pk] }, sk: { field: "sk", composite: [] } },
+    } as any)
+    const ReadTable = Table.make({ schema, entities: { Ledgers } })
+    const effect =
+      i === 0 || schemas === "same"
+        ? Schema.Struct({ total: Schema.Number })
+        : Schema.Struct({ label: Schema.String })
+    const effectOf = (total: number) =>
+      i === 0 ? { total } : schemas === "same" ? { total: total + 100 } : { label: `b${total}` }
+    const evolve = (state: any, event: any) =>
+      Effect.succeed(
+        options.removal === true && event.data.amount === 0
+          ? EventStore.removeRow
+          : { ...state, total: state.total + event.data.amount },
+      )
+    const outbox = {
+      schema: effect,
+      effects: (_event: unknown, next: any) =>
+        next === undefined
+          ? options.removal === true
+            ? [effectOf(-1)]
+            : []
+          : [effectOf(next.total)],
+      table: Outbox,
+      index,
+    }
+    const Notifying =
+      options.multi === true
+        ? EventStore.multiProjection({
+            readModel: Ledgers,
+            initial: () => ({ ...key, total: 0 }),
+            sources: (source: any) => ({ orders: source(Orders, { key: () => key, evolve }) }),
+            checkpoints: { field: "cpm" },
+            revision: { field: "rev", initial: revision },
+            ...(options.removal === true && { removal: {} }),
+            outbox,
+          } as any)
+        : EventStore.projection({
+            stream: Orders,
+            readModel: Ledgers,
+            key: () => key,
+            initial: () => ({ ...key, total: 0 }),
+            evolve,
+            checkpoint: "cp",
+            revision: { field: "rev", initial: revision },
+            ...(options.removal === true && { removal: {} }),
+            outbox,
+          } as any)
+    /** Apply `events` of the `Order` stream. */
+    const apply = (events: ReadonlyArray<unknown>) =>
+      (Notifying as any).applyBatch(
+        options.multi === true ? events.map((event) => ({ stream: "orders", event })) : events,
+      ) as Effect.Effect<any>
+    return { Ledgers, ReadTable, Notifying: Notifying as any, apply, key, name: `read${i}` }
+  })
+  // One recording table per physical table: the read models' rows are at one key. A transaction
+  // spanning them is one transaction (`helpers/RoutedTables.ts`).
+  const routed = makeRoutedTables({ indexes: { outbox: { pk: index.pk, sk: index.sk } } }, "events")
+  const client = routed.client
+  const table = routed.table("outbox")
+  if (options.memory === true) resetStore()
+  const layer = Layer.mergeAll(
+    options.memory === true ? InMemoryClient : Layer.succeed(DynamoClient, client as any),
+    EventsTable.layer({ name: "events" }),
+    Outbox.layer({ name: "outbox" }),
+    ...sides.map((side) => side.ReadTable.layer({ name: side.name })),
+  )
+  const bound = DynamoClient.make({
+    entities: { A: sides[0]!.Ledgers, B: sides[1]!.Ledgers },
+    tables: { Outbox, R0: sides[0]!.ReadTable, R1: sides[1]!.ReadTable },
+  } as any)
+  const outboxItems = () =>
+    (options.memory === true
+      ? [...store].flatMap(([key, item]) => (key.startsWith("outbox|") ? [item] : []))
+      : [...table.items.values()]
+    ).filter((item) => item.__edd_e__?.S === "Ledger#outbox")
+  const events = (id: string, amounts: ReadonlyArray<number> = [2]) =>
+    Effect.gen(function* () {
+      yield* bound
+      yield* Orders.append(
+        { id },
+        amounts.map((amount) => new Placed({ amount })),
+        0,
+      )
+      return yield* Orders.read({ id })
+    })
+  const collect = () => {
+    const seen: Array<unknown> = []
+    return { seen, deliver: (effect: unknown) => Effect.sync(() => void seen.push(effect)) }
+  }
+  return { sides, routed, table, layer, outboxItems, events, collect }
+}
+
+/**
  * Read models whose ROW keys are the same text (#237): `[shop]` with `north#branch_b1` and
  * `[shop, branch]` with `north` and `b1`, under `escapeKeys: false`, on separate read tables with
  * one outbox. Their items sit under one row key, apart only by revision. Each drainer delivers
@@ -478,106 +607,6 @@ describe("drainPending, read models whose keys only a value holding `#` can make
  * other's and left it claimed).
  */
 describe("drain at a row key two read models write", () => {
-  const world = (escapeKeys: boolean, schemas: "same" | "different") => {
-    const schema = DynamoSchema.make({ name: "one", version: 1, escapeKeys })
-    const Outbox = Table.make({ schema, entities: {} })
-    const sidesOf = [
-      { pk: ["shop"], key: { shop: "north#branch_b1", branch: "-" }, revision: 1 },
-      { pk: ["shop", "branch"], key: { shop: "north", branch: "b1" }, revision: 10 },
-    ] as const
-    const sides = sidesOf.map(({ pk, key, revision }, i) => {
-      const Ledgers = Entity.make({
-        model: Schema.Struct({
-          shop: Schema.String,
-          branch: Schema.String,
-          total: Schema.Number,
-          cp: Schema.optional(Schema.Number),
-          rev: Schema.optional(Schema.Number),
-        }),
-        entityType: "Ledger",
-        primaryKey: { pk: { field: "pk", composite: [...pk] }, sk: { field: "sk", composite: [] } },
-      } as any)
-      const ReadTable = Table.make({ schema, entities: { Ledgers } })
-      const effect =
-        i === 0 || schemas === "same"
-          ? Schema.Struct({ total: Schema.Number })
-          : Schema.Struct({ label: Schema.String })
-      const Notifying = EventStore.projection({
-        stream: Orders,
-        readModel: Ledgers,
-        key: () => key,
-        initial: () => ({ ...key, total: 0 }),
-        evolve: (state: any, event: any) =>
-          Effect.succeed({ ...state, total: state.total + event.data.amount }),
-        checkpoint: "cp",
-        revision: { field: "rev", initial: revision },
-        outbox: {
-          schema: effect,
-          effects: (_event: unknown, next: any) =>
-            next === undefined
-              ? []
-              : [
-                  i === 0
-                    ? { total: next.total }
-                    : schemas === "same"
-                      ? { total: next.total + 100 }
-                      : { label: `b${next.total}` },
-                ],
-          table: Outbox,
-          index,
-        },
-      } as any)
-      return { Ledgers, ReadTable, Notifying: Notifying as any, name: `read${i}` }
-    })
-    // One recording table per physical table: the read models' rows are at one key.
-    const tables = new Map<string, ReturnType<typeof makeRecordingTable>>()
-    const tableOf = (name: string) => {
-      const known = tables.get(name)
-      if (known !== undefined) return known
-      const made = makeRecordingTable({ indexes: { outbox: { pk: index.pk, sk: index.sk } } })
-      tables.set(name, made)
-      return made
-    }
-    const client = new Proxy(tableOf("events").client, {
-      get: (_target, operation) => (input: any) => {
-        if (operation === "transactWriteItems") {
-          const groups = new Map<string, Array<unknown>>()
-          for (const item of input.TransactItems) {
-            const name = (Object.values(item)[0] as { readonly TableName: string }).TableName
-            groups.set(name, [...(groups.get(name) ?? []), item])
-          }
-          return Effect.forEach([...groups], ([name, items]) =>
-            (tableOf(name).client as any)[operation]({ ...input, TransactItems: items }),
-          ).pipe(Effect.as({}))
-        }
-        return (tableOf(String(input.TableName)).client as any)[operation](input)
-      },
-    })
-    const table = tableOf("outbox")
-    const layer = Layer.mergeAll(
-      Layer.succeed(DynamoClient, client as any),
-      EventsTable.layer({ name: "events" }),
-      Outbox.layer({ name: "outbox" }),
-      ...sides.map((side) => side.ReadTable.layer({ name: side.name })),
-    )
-    const bound = DynamoClient.make({
-      entities: { A: sides[0]!.Ledgers, B: sides[1]!.Ledgers },
-      tables: { Outbox, R0: sides[0]!.ReadTable, R1: sides[1]!.ReadTable },
-    } as any)
-    const outboxItems = () =>
-      [...table.items.values()].filter((item) => item.__edd_e__?.S === "Ledger#outbox")
-    const events = (id: string) =>
-      Effect.gen(function* () {
-        yield* bound
-        yield* Orders.append({ id }, [new Placed({ amount: 2 })], 0)
-        return yield* Orders.read({ id })
-      })
-    const collect = () => {
-      const seen: Array<unknown> = []
-      return { seen, deliver: (effect: unknown) => Effect.sync(() => void seen.push(effect)) }
-    }
-    return { sides, table, layer, outboxItems, events, collect }
-  }
   const B_EFFECT = { same: { total: 102 }, different: { label: "b2" } } as const
 
   for (const schemas of ["same", "different"] as const) {
@@ -650,5 +679,300 @@ describe("drain at a row key two read models write", () => {
       expect(queries).toHaveLength(3)
       for (const query of queries) expect(query.ExclusiveStartKey).toBeUndefined()
     }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("a drain passing over the other's item goes on after it (in memory)", () => {
+    // `helpers/InMemoryTables.ts` answers a start key: the drain reads on past B's item.
+    const w = world(false, "same", [1, 10], { memory: true })
+    return Effect.gen(function* () {
+      const events = yield* w.events("in-memory")
+      for (const side of w.sides) yield* side.apply(events)
+      const a = w.collect()
+      expect(yield* w.sides[0]!.Notifying.drainPending(a.deliver)).toEqual({
+        delivered: 1,
+        undelivered: [],
+      })
+      expect(a.seen).toEqual([{ total: 2 }])
+      const b = w.collect()
+      expect(yield* w.sides[1]!.Notifying.drainPending(b.deliver)).toEqual({
+        delivered: 1,
+        undelivered: [],
+      })
+      expect(b.seen).toEqual([{ total: 102 }])
+      expect(w.outboxItems()).toEqual([])
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+})
+
+/**
+ * Two read models whose row keys coincide (`escapeKeys` off: A's `shop` = `north#branch_b1` beside
+ * B's `north` and `b1`), writing at one revision (#237): their outbox items have one key. 1.40.0's
+ * Put of the second replaced the first, whose effect was never delivered. The Put is conditioned
+ * on its key holding nothing or the writer's own item; held by another's, the item is written
+ * beside it, at its key followed by the writer's tag, and each drainer delivers its own.
+ */
+describe("two read models writing at one revision at one row key", () => {
+  const AT = "000000000001#0000"
+  type W = ReturnType<typeof world>
+  /** The outbox items, each as the text after `#outbox#` and the read model it names. */
+  const layout = (w: W) =>
+    w
+      .outboxItems()
+      .map((item) => [item.sk?.S?.split("#outbox#")[1], item.__edd_rm__?.S] as const)
+      .sort(([x], [y]) => (x! < y! ? -1 : 1))
+  const tagsOf = (w: W) => w.sides.map((side) => readModelTag(side.Ledgers)!)
+  const outboxPuts = (w: W) =>
+    w.routed
+      .take()
+      .filter((request) => request.command === "TransactWriteItems")
+      .flatMap((request) =>
+        (request.input.TransactItems as ReadonlyArray<{ readonly Put?: any }>).flatMap((entry) =>
+          entry.Put?.TableName === "outbox" ? [entry.Put] : [],
+        ),
+      )
+  const drained = (w: W, side: number) =>
+    Effect.gen(function* () {
+      const c = w.collect()
+      const result = yield* w.sides[side]!.Notifying.drainPending(c.deliver)
+      return { result, seen: c.seen }
+    })
+  const B_EFFECT = { same: { total: 102 }, different: { label: "b2" } } as const
+
+  for (const schemas of ["same", "different"] as const) {
+    for (const first of [0, 1] as const) {
+      const second = first === 0 ? 1 : 0
+      it.effect(
+        `${first === 0 ? "A" : "B"} first (effect schemas ${schemas}): the second is written beside the first`,
+        () => {
+          const w = world(false, schemas, [1, 1])
+          return Effect.gen(function* () {
+            const tags = tagsOf(w)
+            const events = yield* w.events(`beside-${schemas}-${first}`)
+            yield* w.sides[first]!.apply(events)
+            w.routed.take()
+            yield* w.sides[second]!.apply(events)
+            const sent = w.routed.take()
+            // One read of the row; the transaction cancelled at the item, then sent with it beside.
+            expect(sent.filter((r) => r.command === "GetItem")).toHaveLength(1)
+            expect(sent.filter((r) => r.command === "Query")).toHaveLength(0)
+            const puts = sent
+              .filter((r) => r.command === "TransactWriteItems")
+              .flatMap((r) =>
+                (r.input.TransactItems as ReadonlyArray<{ readonly Put?: any }>).flatMap((e) =>
+                  e.Put?.TableName === "outbox" ? [e.Put] : [],
+                ),
+              )
+            expect(puts.map((put) => put.Item.sk.S.split("#outbox#")[1])).toEqual([
+              AT,
+              `${AT}#${tags[second]}`,
+            ])
+            for (const put of puts) {
+              expect(put.ConditionExpression).toBe("attribute_not_exists(#pk) OR #rm = :rm")
+              expect(put.ExpressionAttributeNames).toEqual({ "#pk": "pk", "#rm": "__edd_rm__" })
+              expect(put.ExpressionAttributeValues).toEqual({ ":rm": { S: tags[second] } })
+              // The index's sort key follows the item's.
+              expect(put.Item.obsk.S).toBe(`${put.Item.pk.S}#${put.Item.sk.S}`)
+            }
+            expect(puts[0].ReturnValuesOnConditionCheckFailure).toBeUndefined()
+            expect(puts[1].ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
+            // Both kept: the first where it was, the second beside it.
+            expect(layout(w)).toEqual([
+              [AT, tags[first]],
+              [`${AT}#${tags[second]}`, tags[second]],
+            ])
+            // Each drainer delivers its own, whichever drains first.
+            const effects = [{ total: 2 }, B_EFFECT[schemas]]
+            for (const side of [second, first]) {
+              expect(yield* drained(w, side)).toEqual({
+                result: { delivered: 1, undelivered: [] },
+                seen: [effects[side]],
+              })
+            }
+            expect(w.outboxItems()).toEqual([])
+          }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+        },
+      )
+    }
+  }
+
+  it.effect("drain by row: each passes over the other's, plain or beside", () => {
+    const w = world(false, "same", [1, 1])
+    return Effect.gen(function* () {
+      const events = yield* w.events("by-row")
+      for (const side of w.sides) yield* side.apply(events)
+      for (const [side, effect] of [
+        [0, { total: 2 }],
+        [1, { total: 102 }],
+      ] as const) {
+        const c = w.collect()
+        yield* w.sides[side]!.Notifying.drain(w.sides[side]!.key, c.deliver)
+        expect(c.seen).toEqual([effect])
+      }
+      expect(w.outboxItems()).toEqual([])
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("escapeKeys: true keeps the keys apart: each item where 1.40.0 wrote it", () => {
+    const w = world(true, "same", [1, 1])
+    return Effect.gen(function* () {
+      const events = yield* w.events("escaped")
+      for (const side of w.sides) yield* side.apply(events)
+      const puts = outboxPuts(w)
+      expect(puts).toHaveLength(2)
+      expect(puts.map((put) => put.ReturnValuesOnConditionCheckFailure)).toEqual([
+        undefined,
+        undefined,
+      ])
+      expect(layout(w).map(([at]) => at)).toEqual([AT, AT])
+      expect(new Set(w.outboxItems().map((item) => item.pk?.S)).size).toBe(2)
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("multi-source projections: the second is written beside the first", () => {
+    const w = world(false, "same", [1, 1], { multi: true })
+    return Effect.gen(function* () {
+      const tags = tagsOf(w)
+      const events = yield* w.events("multi")
+      for (const side of w.sides) yield* side.apply(events)
+      expect(layout(w)).toEqual([
+        [AT, tags[0]],
+        [`${AT}#${tags[1]}`, tags[1]],
+      ])
+      expect(yield* drained(w, 1)).toEqual({
+        result: { delivered: 1, undelivered: [] },
+        seen: [{ total: 102 }],
+      })
+      expect(yield* drained(w, 0)).toEqual({
+        result: { delivered: 1, undelivered: [] },
+        seen: [{ total: 2 }],
+      })
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+
+  it.effect("a removal's item beside the other's, the next position where it belongs", () => {
+    // A folds two events, the second removing its row: its tombstone and two items, the first
+    // at the key of B's item.
+    const w = world(false, "same", [1, 1], { removal: true })
+    return Effect.gen(function* () {
+      const tags = tagsOf(w)
+      const events = yield* w.events("removal", [2, 0])
+      yield* w.sides[1]!.apply(events.slice(0, 1))
+      yield* w.sides[0]!.apply(events)
+      expect(layout(w)).toEqual([
+        [AT, tags[1]],
+        [`${AT}#${tags[0]}`, tags[0]],
+        ["000000000001#0001", tags[0]],
+      ])
+      expect(yield* drained(w, 0)).toEqual({
+        result: { delivered: 2, undelivered: [] },
+        seen: [{ total: 2 }, { total: -1 }],
+      })
+      expect(yield* drained(w, 1)).toEqual({
+        result: { delivered: 1, undelivered: [] },
+        seen: [{ total: 102 }],
+      })
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+
+  it.effect(
+    "an item written before 1.41.0 (no mark) is never replaced: the new one goes beside",
+    () => {
+      const w = world(false, "same", [1, 1])
+      return Effect.gen(function* () {
+        const tags = tagsOf(w)
+        const events = yield* w.events("unmarked")
+        yield* w.sides[1]!.apply(events)
+        // B's item as 1.40.0 wrote it.
+        for (const item of w.table.items.values()) delete item.__edd_rm__
+        yield* w.sides[0]!.apply(events)
+        expect(layout(w)).toEqual([
+          [AT, undefined],
+          [`${AT}#${tags[0]}`, tags[0]],
+        ])
+        // A's drainer takes the unmarked item at a key it writes as its own, as 1.40.0 did.
+        expect(yield* drained(w, 0)).toEqual({
+          result: { delivered: 2, undelivered: [] },
+          seen: [{ total: 102 }, { total: 2 }],
+        })
+      }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+    },
+  )
+
+  for (const marked of [true, false]) {
+    it.effect(
+      `a revision written again after the row is gone, over its own ${marked ? "marked" : "unmarked"} item`,
+      () => {
+        // The row deleted outside the projection (or its tombstone expired): its revision starts
+        // again at 1, at the key of its own item still pending.
+        const w = world(false, "same", [1, 10])
+        return Effect.gen(function* () {
+          const tags = tagsOf(w)
+          const events = yield* w.events(`again-${marked}`, [2, 3])
+          yield* w.sides[0]!.apply(events.slice(0, 1))
+          if (!marked) for (const item of w.table.items.values()) delete item.__edd_rm__
+          w.routed.table("read0").items.clear()
+          w.routed.take()
+          yield* w.sides[0]!.apply(events)
+          const puts = outboxPuts(w)
+          if (marked) {
+            // Its own item: replaced, as on 1.40.0, in one transaction.
+            expect(puts).toHaveLength(2)
+            expect(layout(w)).toEqual([
+              [AT, tags[0]],
+              ["000000000001#0001", tags[0]],
+            ])
+            expect(yield* drained(w, 0)).toEqual({
+              result: { delivered: 2, undelivered: [] },
+              seen: [{ total: 2 }, { total: 5 }],
+            })
+          } else {
+            // Unmarked, it may be another's: written beside, and both are delivered.
+            expect(puts).toHaveLength(4)
+            expect(layout(w)).toEqual([
+              [AT, undefined],
+              [`${AT}#${tags[0]}`, tags[0]],
+              ["000000000001#0001", tags[0]],
+            ])
+            expect(yield* drained(w, 0)).toEqual({
+              result: { delivered: 3, undelivered: [] },
+              seen: [{ total: 2 }, { total: 2 }, { total: 5 }],
+            })
+          }
+        }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+      },
+    )
+  }
+
+  it.effect("the key beside held too: refused, naming both, and nothing written", () => {
+    const w = world(false, "same", [1, 1])
+    return Effect.gen(function* () {
+      const tags = tagsOf(w)
+      const events = yield* w.events("held-beside")
+      yield* w.sides[1]!.apply(events)
+      const [plain] = w.outboxItems()
+      const beside = `${plain!.sk!.S}#${tags[0]}`
+      w.table.items.set(`${plain!.pk!.S}|${beside}`, {
+        ...plain!,
+        sk: { S: beside },
+        __edd_rm__: { S: "zzz" },
+      })
+      // Every table's items; a table only read is no change.
+      const held = () => new Map([...w.routed.snapshot()].filter(([, items]) => items.size > 0))
+      const before = held()
+      const failed = (yield* Effect.flip(
+        w.sides[0]!.Notifying.apply(events[0]) as Effect.Effect<unknown, unknown>,
+      )) as { readonly _tag: string; readonly operation: string; readonly cause: unknown }
+      expect(failed._tag).toBe("ValidationError")
+      expect(failed.operation).toBe('EventStore.projection("Order" → "Ledger").outbox')
+      const message = String((failed.cause as Error).message)
+      expect(message).toContain("[EDD-9145]")
+      expect(message).toContain(JSON.stringify(tags[0]))
+      expect(message).toContain('naming read model "zzz"')
+      expect(message).toContain(JSON.stringify(beside))
+      expect(message).toContain("escapeKeys: true")
+      expect((failed.cause as Error).cause).toHaveProperty("_tag", "DynamoError")
+      // Nothing written: not the row, not an item.
+      expect(held()).toEqual(before)
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, any>
   })
 })

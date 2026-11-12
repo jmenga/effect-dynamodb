@@ -3,8 +3,9 @@
  * (`helpers/OutboxPairRequests.ts`): keys that meet only through a value holding `#`, and keys
  * that part where a number's key text can't spell the other's label. 1.39.0 bound them and applied
  * their events, each to its own keys: a client still binds them, and every request and stored item
- * is what the published 1.39.0 sent and stored, but each outbox item names its read model
- * (`__edd_rm__`, from 1.41.0).
+ * is what the published 1.39.0 and 1.40.0 sent and stored, but each outbox item names its read model
+ * (`__edd_rm__`, from 1.41.0) and its Put is conditioned on its key holding nothing or that read
+ * model's own item (`attribute_not_exists(#pk) OR #rm = :rm`, from 1.41.0): the only differences.
  */
 
 import { readFileSync } from "node:fs"
@@ -28,8 +29,21 @@ type Captured = {
 const read = (name: string): unknown =>
   JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8"))
 
-const fixture = read("outbox-pair-1.39.0.json") as Captured
-const typed = read("outbox-typed-pair-1.39.0.json") as Record<"off" | "on", Captured>
+/**
+ * What each published release sent and stored, captured once from it against DynamoDB Local: 1.39.0,
+ * and 1.40.0 (identical to 1.39.0's, by the same scenario helper compiled against the published
+ * package).
+ */
+const VERSIONS = ["1.39.0", "1.40.0"] as const
+const fixture = Object.fromEntries(
+  VERSIONS.map((version) => [version, read(`outbox-pair-${version}.json`) as Captured]),
+)
+const typed = Object.fromEntries(
+  VERSIONS.map((version) => [
+    version,
+    read(`outbox-typed-pair-${version}.json`) as Record<"off" | "on", Captured>,
+  ]),
+)
 
 /** A table's items, in key order, their attributes by name (a table keeps no order). */
 const itemsOf = (table: string) =>
@@ -61,9 +75,10 @@ const tagged = (item: Item, tag: string): Item =>
   )
 
 /**
- * What 1.39.0 sent and stored (`captured`), but each outbox item carrying the tag of the read model
+ * What a release sent and stored (`captured`), but each outbox item carrying the tag of the read model
  * whose projection wrote it (`__edd_rm__`, #237): the row written beside it in one transaction,
- * and the stored row it names.
+ * and the stored row it names. Its Put is conditioned on that tag (`outboxGuard`): nothing at its
+ * key, or that read model's own item. Nothing else differs.
  */
 const markedCapture = (captured: Captured, readModels: Record<string, unknown>): Captured => {
   const tags = Object.fromEntries(
@@ -84,7 +99,16 @@ const markedCapture = (captured: Captured, readModels: Record<string, unknown>):
         ...input,
         TransactItems: input.TransactItems.map((t) =>
           t.Put !== undefined && isOutbox(t.Put.Item)
-            ? { ...t, Put: { ...t.Put, Item: tagged(t.Put.Item, tags[row.Put!.TableName]!) } }
+            ? {
+                ...t,
+                Put: {
+                  ...t.Put,
+                  Item: tagged(t.Put.Item, tags[row.Put!.TableName]!),
+                  ConditionExpression: "attribute_not_exists(#pk) OR #rm = :rm",
+                  ExpressionAttributeNames: { "#pk": "pk", "#rm": "__edd_rm__" },
+                  ExpressionAttributeValues: { ":rm": { S: tags[row.Put!.TableName]! } },
+                },
+              }
             : t,
         ),
       },
@@ -109,7 +133,7 @@ const markedCapture = (captured: Captured, readModels: Record<string, unknown>):
 }
 
 /**
- * `sent` and the tables' items are what 1.39.0 sent and stored (`captured`), each outbox item
+ * `sent` and the tables' items are what a release sent and stored (`captured`), each outbox item
  * carrying its read model's tag.
  */
 const expectCaptured = (
@@ -127,10 +151,10 @@ const expectCaptured = (
 }
 
 describe("read models whose outbox keys meet only through a value holding `#`", () => {
-  it.effect("bind, and send and store what 1.39.0 did", () =>
+  it.effect.each(VERSIONS)("bind, and send and store what %s did", (version) =>
     Effect.gen(function* () {
       const { run, readModels } = scenario(lib, tables)
-      expectCaptured(yield* run(InMemoryClient), fixture, readModels)
+      expectCaptured(yield* run(InMemoryClient), fixture[version]!, readModels)
     }),
   )
 })
@@ -138,12 +162,14 @@ describe("read models whose outbox keys meet only through a value holding `#`", 
 describe("read models whose outbox keys part where a number's text can't spell a label", () => {
   // `n_0000000000000007` and `n_x_q`: a number's key text holds no `x`, so no key of one is a key
   // of the other, for any values.
-  it.effect.each(["off", "on"] as const)(
-    "bind, and send and store what 1.39.0 did, escapeKeys %s",
-    (setting) =>
-      Effect.gen(function* () {
-        const { run, readModels } = scenario(lib, tables, "typed", setting === "on")
-        expectCaptured(yield* run(InMemoryClient), typed[setting], readModels)
-      }),
+  it.effect.each(
+    VERSIONS.flatMap((version) =>
+      (["off", "on"] as const).map((setting) => [version, setting] as const),
+    ),
+  )("bind, and send and store what %s did, escapeKeys %s", ([version, setting]) =>
+    Effect.gen(function* () {
+      const { run, readModels } = scenario(lib, tables, "typed", setting === "on")
+      expectCaptured(yield* run(InMemoryClient), typed[version]![setting], readModels)
+    }),
   )
 })

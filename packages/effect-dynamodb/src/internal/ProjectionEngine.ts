@@ -84,6 +84,7 @@ import {
   serializeSparseOrFail,
   validateAndBuildPutItem,
 } from "./TransactableOps.js"
+import { withCause } from "./WriteDiagnosis.js"
 
 // ---------------------------------------------------------------------------
 // Removal (#154)
@@ -1282,11 +1283,17 @@ export const makeEngine = (config: EngineConfig) => {
   /** The tag this read model's outbox items carry (`readModelTag`). */
   const outboxTag = readModelTag(readModel)
 
+  /**
+   * The outbox items to write with the row, each at `<row sk>#outbox#<revision>#<n>`; one at a
+   * position in `beside` at that key followed by `#<tag>` (`outboxTag`), beside another read
+   * model's item there ({@link writeRow}).
+   */
   const outboxItems = (
     rowKey: Record<string, unknown>,
     revision: number,
     enqueued: ReadonlyArray<Enqueued>,
     mark: 2 | undefined,
+    beside: ReadonlySet<number>,
   ): Effect.Effect<ReadonlyArray<Record<string, AttributeValue>>, ValidationError> =>
     Effect.forEach(enqueued, (e, i) =>
       Effect.gen(function* () {
@@ -1309,7 +1316,8 @@ export const makeEngine = (config: EngineConfig) => {
         const keys = outboxKeys()
         const rowPk = String(rowKey[primary.pk.field])
         const rowSk = String(rowKey[primary.sk.field])
-        const sk = `${rowSk}#outbox#${pad(revision, 12)}#${pad(i, 4)}`
+        const at = `${rowSk}#outbox#${pad(revision, 12)}#${pad(i, 4)}`
+        const sk = beside.has(i) ? `${at}#${outboxTag}` : at
         const item: Record<string, unknown> = {
           [keys.pk]: rowPk,
           [keys.sk]: sk,
@@ -1334,15 +1342,25 @@ export const makeEngine = (config: EngineConfig) => {
       }),
     )
 
-  /** A lost race, from a single write's or a transaction's failure: the row's Put cancelled. */
-  const lostRaceOf = (error: unknown, transaction: boolean): boolean => {
-    const cause = (error as { readonly cause?: unknown })?.cause
-    if (!transaction) return isAwsConditionalCheckFailed(cause)
-    return (
-      isAwsTransactionCancelled(cause) &&
-      (cause.CancellationReasons ?? []).some((reason) => reason?.Code === "ConditionalCheckFailed")
-    )
-  }
+  /** A lost race, from a single write's failure: the row's Put cancelled. */
+  const lostRaceOf = (error: unknown): boolean =>
+    isAwsConditionalCheckFailed((error as { readonly cause?: unknown })?.cause)
+
+  /**
+   * The condition an outbox item's Put carries (#237): nothing at its key, or this read model's
+   * own item there (`OUTBOX_READ_MODEL`). A key holding another read model's item (two read models
+   * whose row keys coincide, writing at one revision), or an item without the mark (written before
+   * 1.41.0, which may be either's), cancels the write instead of replacing it ({@link writeRow}).
+   * `undefined` for a read model on no table, which writes no mark: its items are put as on 1.40.0.
+   */
+  const outboxGuard = (pk: string) =>
+    outboxTag === undefined
+      ? {}
+      : {
+          ConditionExpression: "attribute_not_exists(#pk) OR #rm = :rm",
+          ExpressionAttributeNames: { "#pk": pk, "#rm": OUTBOX_READ_MODEL },
+          ExpressionAttributeValues: { ":rm": { S: outboxTag } },
+        }
 
   /** The row (or tombstone) and any outbox items, written as one conditional unit. */
   const writeRow = (
@@ -1424,8 +1442,8 @@ export const makeEngine = (config: EngineConfig) => {
         return Option.some(written)
       }
 
-      const lostRace = (error: unknown, transaction: boolean) =>
-        Effect.fail(lostRaceOf(error, transaction) ? new LostRace(key) : error)
+      const lostRace = (error: unknown) =>
+        Effect.fail(lostRaceOf(error) ? new LostRace(key) : error)
       const rowPut = {
         Put: {
           TableName,
@@ -1438,22 +1456,75 @@ export const makeEngine = (config: EngineConfig) => {
         },
       } satisfies TransactWriteItem
       if (enqueued.length === 0) {
-        yield* client.putItem(rowPut.Put).pipe(Effect.catch((error) => lostRace(error, false)))
-      } else {
-        const OutboxTable = yield* outboxTable
-        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, mark)
-        yield* client
+        yield* client.putItem(rowPut.Put).pipe(Effect.catch((error) => lostRace(error)))
+        return target
+      }
+      // The row and its outbox items in one transaction, read by position (#237): the row's Put
+      // cancelled is a lost race, whatever else was; an item's alone is a key another read model's
+      // item holds (`outboxGuard`). Those items are written again beside it, at their key followed
+      // by `#<tag>` (`outboxItems`), so both effects are delivered, each by its own drainer, in
+      // order: the key sorts right after the other's and before the next position's. Nothing is
+      // read first, and an item at a free key is written where 1.40.0 wrote it. One of those held
+      // again can't be another read model's: it is reported, naming what holds it.
+      const OutboxTable = yield* outboxTable
+      const keys = outboxKeys()
+      let beside = new Set<number>()
+      while (true) {
+        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, mark, beside)
+        const sent = yield* client
           .transactWriteItems({
             TransactItems: [
               rowPut,
               ...items.map(
-                (Item) => ({ Put: { TableName: OutboxTable, Item } }) satisfies TransactWriteItem,
+                (Item, i) =>
+                  ({
+                    Put: {
+                      TableName: OutboxTable,
+                      Item,
+                      ...outboxGuard(keys.pk),
+                      ...(beside.has(i) && { ReturnValuesOnConditionCheckFailure: "ALL_OLD" }),
+                    },
+                  }) satisfies TransactWriteItem,
               ),
             ],
           })
-          .pipe(Effect.catch((error) => lostRace(error, true)))
+          .pipe(Effect.result)
+        if (Result.isSuccess(sent)) return target
+        const cause = (sent.failure as { readonly cause?: unknown })?.cause
+        if (!isAwsTransactionCancelled(cause)) return yield* Effect.fail(sent.failure)
+        const reasons = cause.CancellationReasons ?? []
+        const failed = (i: number) => reasons[i]?.Code === "ConditionalCheckFailed"
+        if (failed(0)) return yield* Effect.fail(new LostRace(key))
+        const held = items.flatMap((_, i) => (failed(i + 1) ? [i] : []))
+        if (held.length === 0) return yield* Effect.fail(sent.failure)
+        const again = held.find((i) => beside.has(i))
+        if (again !== undefined) {
+          const holder = reasons[again + 1]?.Item as Record<string, AttributeValue> | undefined
+          const other = holder?.[OUTBOX_READ_MODEL]?.S
+          return yield* new ValidationError({
+            entityType,
+            operation: `${config.label}.outbox`,
+            cause: withCause(
+              `[EDD-9145] ${config.label}: read model ${JSON.stringify(entityType)} ` +
+                `(${JSON.stringify(outboxTag)}) found another read model's outbox item at the key ` +
+                `of its item ${again} for revision ${revision ?? 0} of row ` +
+                `(${JSON.stringify(String(rowKey[primary.pk.field]))}, ` +
+                `${JSON.stringify(String(rowKey[primary.sk.field]))}), and the key it writes ` +
+                `beside it, ${JSON.stringify(items[again]![keys.sk]?.S)}, is held too, by ` +
+                (holder === undefined
+                  ? "an item"
+                  : `an item of ${JSON.stringify(holder.__edd_e__?.S ?? "no entity type")}` +
+                    (other === undefined ? "" : ` naming read model ${JSON.stringify(other)}`)) +
+                ". Nothing was written. Read models whose row keys coincide (a value holding `#` " +
+                "where the other's composites spell it) write their outbox items at one key; " +
+                "`escapeKeys: true` on the schema keeps their keys apart, as does giving one its " +
+                "own entity type, collection or schema.",
+              sent.failure,
+            ),
+          })
+        }
+        beside = new Set([...beside, ...held])
       }
-      return target
     })
 
   // -------------------------------------------------------------------------

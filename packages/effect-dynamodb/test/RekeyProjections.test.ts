@@ -14,9 +14,11 @@ import { Cause, DateTime, Effect, Exit, Layer, Schema } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import { fromAttributeMap, toAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { makeRoutedTables } from "./helpers/RoutedTables.js"
 
 class Opened extends Schema.TaggedClass<Opened>()("Opened", {}) {}
 class Added extends Schema.TaggedClass<Added>()("Added", { amount: Schema.Number }) {}
@@ -1841,50 +1843,16 @@ describe.each([
 })
 
 /**
- * A recording table per physical table, each request answered by the table it names (a
- * transaction's items by theirs, in turn), so a table's `rekey` scans its own rows only.
+ * A recording table per physical table, each request answered by the table it names, a
+ * transaction spanning them one transaction (`helpers/RoutedTables.ts`), so a table's `rekey`
+ * scans its own rows only.
  */
 const routedTables = () => {
-  const byName = new Map<string, RecordingTable>()
-  const named = (name: string): RecordingTable => {
-    const known = byName.get(name)
-    if (known !== undefined) return known
-    const made = makeRecordingTable()
-    byName.set(name, made)
-    return made
-  }
-  const first = named("t")
-  const client = new Proxy(first.client, {
-    get: (target, operation) => {
-      const value = (target as any)[operation]
-      if (typeof value !== "function") return value
-      return (input: any) => {
-        if (operation === "transactWriteItems" || operation === "transactGetItems") {
-          const groups = new Map<string, Array<unknown>>()
-          for (const item of input.TransactItems) {
-            const name = (Object.values(item)[0] as { readonly TableName: string }).TableName
-            groups.set(name, [...(groups.get(name) ?? []), item])
-          }
-          return Effect.forEach([...groups], ([name, items]) =>
-            (named(name).client as any)[operation]({ ...input, TransactItems: items }),
-          ).pipe(Effect.map((answers) => answers[0] ?? {}))
-        }
-        const name = input.TableName ?? Object.keys(input.RequestItems ?? {})[0] ?? "t"
-        return (named(String(name)).client as any)[operation](input)
-      }
-    },
-  })
+  const routed = makeRoutedTables()
   return {
-    layer: Layer.succeed(DynamoClient, client),
-    /** The recording table named `name`. */
-    table: named,
-    /** The requests sent to any table since the last call, and forget them. */
-    take: () => [...byName.values()].flatMap((table) => table.take()),
-    /** Every table's items, by table. */
-    snapshot: () =>
-      new Map([...byName].map(([name, table]) => [name, new Map(table.items)] as const)),
+    ...routed,
     /** The rows of `type` on table `name`. */
-    rows: (name: string, type: string) => rowsOf(named(name), type),
+    rows: (name: string, type: string) => rowsOf(routed.table(name), type),
   }
 }
 type RoutedTables = ReturnType<typeof routedTables>
@@ -2484,6 +2452,22 @@ describe("rekey decides whose an outbox item is, item by item (#237)", () => {
   const unmark = (tables: RoutedTables) => {
     for (const item of tables.table("o").items.values()) delete item.__edd_rm__
   }
+  /**
+   * The outbox items as 1.40.0 left them where two read models wrote at one key: the last one
+   * written there, replacing the first. From 1.41.0 the second is written beside the first, at its
+   * key followed by its read model's tag.
+   */
+  const asLeftBy140 = (tables: RoutedTables) => {
+    const items = tables.table("o").items
+    for (const [stored, item] of [...items]) {
+      const tag = item.__edd_rm__?.S
+      const sk = item.sk?.S
+      if (tag === undefined || sk === undefined || !sk.endsWith(`#${tag}`)) continue
+      const at = sk.slice(0, -(tag.length + 1))
+      items.delete(stored)
+      items.set(`${item.pk?.S}|${at}`, { ...item, sk: { S: at } })
+    }
+  }
   /** Every table's items: a table only read is no change. */
   const held = (tables: RoutedTables) =>
     new Map([...tables.snapshot()].filter(([, items]) => items.size > 0))
@@ -2556,6 +2540,51 @@ describe("rekey decides whose an outbox item is, item by item (#237)", () => {
     ) as Effect.Effect<void, unknown>
   })
 
+  it.effect.each([0, 1] as const)(
+    "items written at one revision, one beside the other, move by their own (side %s first)",
+    (first) => {
+      // One row key for both and one revision: the second item is written beside the first, at
+      // its key followed by its read model's tag. Rekey moves A's to A's key under escaping,
+      // keeping what follows the row's sort key; B's stays.
+      const tables = routedTables()
+      const s = sides(A_ROW, { ...B_ROW, idA: "xa" })
+      const written = pairs(Off, s)
+      const now = pairs(On, s)
+      const tags = written.built.map(({ Ledgers }) => readModelTag(Ledgers)!)
+      const second = first === 0 ? 1 : 0
+      const at = "#outbox#000000000001#0000"
+      const tail = (side: number) => (side === second ? `${at}#${tags[side]}` : at)
+      return Effect.gen(function* () {
+        const seeded = yield* events(Off)
+        yield* applyPair(written, first, seeded)
+        yield* applyPair(written, second, seeded)
+        const plainRow = "$pair#v1#ledger#ida_xa|$pair#v1#ledger#shop_north#branch_b1"
+        expect(outboxKeys(tables)).toEqual([`${plainRow}${at}`, `${plainRow}${at}#${tags[second]}`])
+        for (const options of [{ dryRun: true }, {}]) {
+          const report = yield* run(now, options)
+          expect(report.moved).toEqual({ ...ZERO, outbox: 1 })
+          expect(report.unchanged).toBe(1)
+          expect(report.ambiguous).toEqual([])
+          expect(report.conflicts).toEqual([])
+        }
+        expect(outboxKeys(tables)).toEqual(
+          [
+            `$pair#v1#ledger#ida_xa|$pair#v1#ledger#shop_north%23branch_b1${tail(0)}`,
+            `${plainRow}${tail(1)}`,
+          ].sort(),
+        )
+        const again = yield* run(now)
+        expect(again.moved).toEqual(ZERO)
+        expect(again.unchanged).toBe(2)
+        expect(yield* drained(now, 0)).toEqual([2])
+        expect(yield* drained(now, 1)).toEqual([2])
+        expect(outboxKeys(tables)).toEqual([])
+      }).pipe(
+        Effect.provide(Layer.mergeAll(tables.layer, written.layer, now.layer)),
+      ) as Effect.Effect<void, unknown>
+    },
+  )
+
   it.effect.each([
     ["both have a row there", "unsettled", "More than one of them has a row of its own at ROW."],
     [
@@ -2573,14 +2602,19 @@ describe("rekey decides whose an outbox item is, item by item (#237)", () => {
     ([title, reason, message]) => {
       const tables = routedTables()
       const tombstone = title.includes("tombstone")
-      // One row key for both: the item is the last one written there.
+      // One row key for both: 1.40.0 left one item there, the last one written.
       const s = sides(A_ROW, { ...B_ROW, idA: "xa" }, tombstone)
       const written = pairs(Off, s)
       const now = pairs(On, s)
       return Effect.gen(function* () {
         const seeded = yield* events(Off, tombstone)
         yield* applyPair(written, 0, seeded)
-        if (title.startsWith("both")) yield* applyPair(written, 1, seeded)
+        if (title.startsWith("both")) {
+          yield* applyPair(written, 1, seeded)
+          // The head wrote the second item beside the first; 1.40.0 replaced the first with it.
+          expect(outboxKeys(tables)).toHaveLength(2)
+          asLeftBy140(tables)
+        }
         unmark(tables)
         if (title.startsWith("neither")) tables.table("r0").items.clear()
         expect(tables.rows("r0", tombstone ? "Ledger#tombstone" : "Ledger")).toHaveLength(

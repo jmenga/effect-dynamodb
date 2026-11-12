@@ -11,8 +11,9 @@
  *   other. `fixtures/outbox-typed-pair-1.39.0.json` holds what the published 1.39.0 sent and stored
  *   for it, with `escapeKeys` off and on.
  *
- * Both fixtures were captured from the published 1.39.0 against DynamoDB Local. Never regenerate
- * them from this repo.
+ * Both fixtures were captured from the published 1.39.0 against DynamoDB Local, and their
+ * `-1.40.0` twins from the published 1.40.0 the same way (this file compiled against the published
+ * package; what it sent and stored equals 1.39.0's). Never regenerate them from this repo.
  *
  * The scenario takes the library as an argument, so the same code ran against the published 1.39.0
  * to make the fixture as runs against this repo's source to compare with it.

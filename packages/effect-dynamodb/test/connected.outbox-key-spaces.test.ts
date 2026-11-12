@@ -26,6 +26,7 @@ import { describe, expect } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
+import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import * as Table from "../src/Table.js"
 
 const ENDPOINT = Effect.runSync(
@@ -523,5 +524,59 @@ describeConnected("outbox key spaces on DynamoDB Local (#237)", () => {
         },
       )
     }
+  }
+
+  // A keyed by `shop` = `north#branch_b1`, B by `shop` = `north` then `branch` = `b1`: under
+  // `escapeKeys` off their rows' keys are one text, and both write their first effect at revision 1.
+  for (const escapeKeys of [false, true]) {
+    it.effect(
+      `two read models writing at one revision at one row key (escapeKeys ${escapeKeys ? "on" : "off"}): both effects kept and delivered`,
+      () => {
+        const p = physical()
+        const sides: ReadonlyArray<Side> = [
+          {
+            pk: ["shop"],
+            row: { n: 1n, n_x: "q", shop: "north#branch_b1", branch: "-", name: "a" },
+          },
+          {
+            pk: ["shop", "branch"],
+            row: { n: 1n, n_x: "q", shop: "north", branch: "b1", name: "a" },
+          },
+        ]
+        const w = pairs(escapeKeys, sides, {}, p.names)
+        const projections = w.projections()
+        const tags = w.ledgers.map((Ledgers) => readModelTag(Ledgers)!)
+        return Effect.gen(function* () {
+          yield* p.create
+          expect(yield* defectOf(w.client)).toBe("binds")
+          yield* w.Accounts.append({ account: "x" }, [new Opened(), new Added({ amount: 2 })], 0)
+          const events = yield* w.Accounts.read({ account: "x" })
+          for (const projection of projections) {
+            const result = yield* projection.applyBatch(events)
+            expect(result.failedPositions).toEqual([])
+          }
+          const items = yield* p.outbox
+          expect(items).toHaveLength(2)
+          const tails = items.map((key) => key.split("#outbox#")[1])
+          if (escapeKeys) {
+            // Apart: each where 1.40.0 wrote it.
+            expect(new Set(items.map((key) => key.split("|")[0])).size).toBe(2)
+            expect(tails).toEqual(["000000000001#0000", "000000000001#0000"])
+          } else {
+            // One key: B's written beside A's.
+            expect(new Set(items.map((key) => key.split("#outbox#")[0])).size).toBe(1)
+            expect(tails).toEqual(["000000000001#0000", `000000000001#0000#${tags[1]}`])
+          }
+          // B by its row passes over A's; A's sweep delivers A's; nothing is left.
+          expect(yield* delivered(projections[1], sides[1]!.row)).toEqual([2])
+          expect(yield* p.outbox).toHaveLength(1)
+          expect(yield* delivered(projections[0], undefined)).toEqual([2])
+          expect(yield* p.outbox).toEqual([])
+        }).pipe(
+          Effect.ensuring(p.drop),
+          Effect.provide(Layer.mergeAll(p.client, w.layer)),
+        ) as Effect.Effect<void, unknown>
+      },
+    )
   }
 })
