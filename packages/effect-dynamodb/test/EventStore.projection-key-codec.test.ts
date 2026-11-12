@@ -45,20 +45,24 @@ describe.each([
   const w = P.world(now)
   const then = P.world(written)
 
-  /** One physical table holds both tables' rows: their keys never meet. */
-  const holding = (rows: ReadonlyArray<P.Row>) => {
+  /** The stream's rows in the events table, the read model's in the read table. */
+  const holding = (rows: {
+    readonly events: ReadonlyArray<P.Row>
+    readonly read: ReadonlyArray<P.Row>
+  }) => {
     const table = makeRecordingTable()
-    for (const row of rows) table.items.set(`${row.pk!.S}|${row.sk!.S}`, row)
+    for (const row of rows.events) table.seed("events", row)
+    for (const row of rows.read) table.seed("read", row)
     return table
   }
-  const seeded = () => holding([...f.seed.events, ...f.seed.read])
+  const seeded = () => holding(f.seed)
   const on = <A>(table: Recording, body: Effect.Effect<A, unknown, any>) =>
     body.pipe(
       Effect.provide(
         Layer.mergeAll(
           table.layer,
-          w.EventsTable.layer({ name: "t" }),
-          w.ReadTable.layer({ name: "t" }),
+          w.EventsTable.layer({ name: "events" }),
+          w.ReadTable.layer({ name: "read" }),
         ),
       ),
     ) as Effect.Effect<A, unknown, never>
@@ -130,11 +134,11 @@ describe.each([
       expect(read.conflicts).toEqual([])
       expect(read.byMember.Removable?.moved.item).toBe(1)
       expect(read.byMember.Effected?.moved.item).toBe(1)
-      // One table holds both: each run passes over the other's rows.
-      expect(read.skipped).toMatchObject({ unregistered: f.seed.events.length })
+      // Two tables: each run reads its own table's rows alone.
+      expect(read.skipped).toMatchObject({ unregistered: 0 })
       expect(read.unchanged).toBe(written === now ? 1 : 0)
       expect(events.moved).toEqual({ ...ZERO, stream: written === now ? 0 : 1 })
-      expect(events.skipped).toMatchObject({ unregistered: f.seed.read.length })
+      expect(events.skipped).toMatchObject({ unregistered: 0 })
       expect(events.conflicts).toEqual([])
       expect(at(table, w.rowKey.Removable)).toMatchObject({ orderId: "x:o 1", total: 5 })
       expect(at(table, w.doubledKey.Removable)).toBeUndefined()
@@ -211,7 +215,7 @@ describe.each([
 
   it.effect("rekey leaves a row whose key 1.39.0's removal tombstoned, and reports it", () =>
     Effect.gen(function* () {
-      const table = holding([...f.final.events, ...f.final.read])
+      const table = holding(f.final)
       const { read } = yield* rekey(table)
       expect(read.conflicts).toEqual([
         {
@@ -245,8 +249,8 @@ describe.each([
       Effect.provide(
         Layer.mergeAll(
           Shapes.scanningFirst(table.layer, first),
-          w.EventsTable.layer({ name: "t" }),
-          w.ReadTable.layer({ name: "t" }),
+          w.EventsTable.layer({ name: "events" }),
+          w.ReadTable.layer({ name: "read" }),
         ),
       ),
     ) as Effect.Effect<Omit<Table.RekeyReport, "capacity">, unknown, never>
@@ -256,7 +260,7 @@ describe.each([
       `rekey puts the removal tombstone at the row's key, ${order}, and a rerun agrees`,
       () =>
         Effect.gen(function* () {
-          const table = holding([...f.final.events, ...f.final.read])
+          const table = holding(f.final)
           const report = yield* rekeyInOrder(table, first)
           const leftover = {
             member: "Removable",
@@ -285,7 +289,7 @@ describe.each([
 
   it.effect("rekey reports and leaves the same in either order, and a dry run agrees", () =>
     Effect.gen(function* () {
-      const [a, b] = P.removalOrders.map(() => holding([...f.final.events, ...f.final.read]))
+      const [a, b] = P.removalOrders.map(() => holding(f.final))
       const dry = [
         yield* rekeyInOrder(a!, P.removalOrders[0][1], true),
         yield* rekeyInOrder(b!, P.removalOrders[1][1], true),

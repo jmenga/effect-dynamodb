@@ -1797,10 +1797,21 @@ export const checkFields = (operation: string, input: object): void => {
   }
 }
 
-/** A table's (or index's) key attributes; every key these tables hold is an `S`. */
+/** A table's (or index's) key attributes; every table key these tables hold is an `S`. */
 export interface KeySchema {
   readonly pk: string
   readonly sk: string
+}
+
+/** A secondary index: its key attributes, its kind, and the attributes it holds. */
+export interface IndexSchema extends KeySchema {
+  /**
+   * `local` (an LSI) or `global` (a GSI). Left out: local when its partition key is the table's,
+   * global otherwise; a GSI on the table's partition key says so.
+   */
+  readonly kind?: "local" | "global" | undefined
+  /** What a read of the index returns: every attribute (the default), the keys only, or the keys and these. */
+  readonly projection?: "ALL" | "KEYS_ONLY" | ReadonlyArray<string> | undefined
 }
 
 const keyAttributes = (schema: KeySchema) => [schema.pk, schema.sk]

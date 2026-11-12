@@ -11,15 +11,18 @@
  * refused as DynamoDB Local refuses one over 16 MiB: HTTP 413, before it is read.
  *
  * A request DynamoDB refuses fails with DynamoDB Local's `ValidationException`, as the library's
- * client reports it (`DynamoValidationError`); a request this doesn't read is a defect naming it.
+ * client reports it (`DynamoValidationError`); a request this doesn't read is a defect naming it,
+ * found before anything is written. A transaction or batch is checked whole, then written whole.
  * Items are stored and returned as copies, so neither a caller nor the library can change a stored
- * item in place. `connected.helper-conformance.test.ts` compares the answers with DynamoDB Local's.
+ * item in place. `connected.helper-conformance.test.ts` compares the answers with DynamoDB Local's;
+ * what it doesn't model is listed at the top of `DynamoExpressions.ts`.
  *
- * `items` holds every table's items under `<pk>|<sk>`. An item a request wrote belongs to that
- * request's table: another table doesn't hold it (a read finds nothing, a query or scan passes it
- * by), and a write of another table's item under the same key is a defect, as `items` can't hold
- * both. An item a test put in `items` itself belongs to no table in particular, so every table
- * finds it until a request writes it.
+ * Items are held by table and key: one key in two tables is two items. `items` shows them all
+ * under their key text, `<pk>|<sk>` ({@link keyText}: a `\` or `|` inside either part escaped, so
+ * one text names one key). An item a request wrote belongs to that request's table; `seed` puts an
+ * item in a table as a write would. An item a test put in `items` belongs to no table in
+ * particular, so every table finds it until a request writes it. A text two tables hold an item
+ * under names neither alone, so `items.get` / `set` / `delete` of it is a defect.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -30,8 +33,10 @@ import {
   answering,
   batchGet,
   batchWrite,
+  checkItem,
   deleteItem,
   getItem,
+  type IndexSchema,
   type KeySchema,
   putItem,
   query,
@@ -78,15 +83,42 @@ export const tooLargeFailure = (operation: string) =>
     }),
   })
 
-/** A secondary index's key attributes. */
-export interface IndexKeys {
-  readonly pk: string
-  readonly sk: string
-}
+/** A secondary index: its key attributes, its kind and what it projects (`DynamoExpressions`). */
+export type IndexKeys = IndexSchema
 
 /** A refusal as the library's client reports it. */
 const failure = (operation: string) => (error: Error) =>
   Effect.fail(classifyError(operation)(error))
+
+const escapePart = (text: string) => text.replace(/[\\|]/g, (c) => `\\${c}`)
+
+/**
+ * The text `items` shows a key under: `<pk>|<sk>`, with a `\` or `|` inside either part escaped
+ * (`\\`, `\|`), so one text names one key. A key of neither kind of character reads as written.
+ */
+export const keyText = (pk: string, sk: string): string => `${escapePart(pk)}|${escapePart(sk)}`
+
+/** The key a {@link keyText} names, or `undefined` for text that isn't one. */
+const parseKeyText = (text: string): readonly [string, string] | undefined => {
+  const parts: Array<string> = []
+  let part = ""
+  for (let at = 0; at < text.length; at++) {
+    const c = text[at]!
+    if (c === "\\") {
+      const next = text[at + 1]
+      if (next !== "\\" && next !== "|") return undefined
+      part += next
+      at++
+    } else if (c === "|") {
+      parts.push(part)
+      part = ""
+    } else {
+      part += c
+    }
+  }
+  parts.push(part)
+  return parts.length === 2 ? [parts[0]!, parts[1]!] : undefined
+}
 
 /**
  * A fresh table: its items, the requests sent to it, and a `DynamoClient`
@@ -96,61 +128,122 @@ export const makeRecordingTable = (options?: {
   readonly indexes?: Readonly<Record<string, IndexKeys>> | undefined
   /** Refuse a request whose body is over this many bytes, as DynamoDB Local refuses one over 16 MiB. */
   readonly refuseBodiesOver?: number | undefined
-  /** The tables' key attributes (default `pk` / `sk`); `items` is keyed `<pk value>|<sk value>`. */
-  readonly keys?: IndexKeys | undefined
+  /** The tables' key attributes (default `pk` / `sk`); `items` shows them as `<pk value>|<sk value>`. */
+  readonly keys?: KeySchema | undefined
 }) => {
   const tableKeys: KeySchema = options?.keys ?? { pk: "pk", sk: "sk" }
   /**
-   * The key `items` holds an item (or key) under: `<pk>|<sk>`. A key that isn't text, or text
-   * holding `|`, would not name one item alone, so it is a defect here.
+   * Every item, by its key's text, then by the table it belongs to (`undefined`: a test put it in
+   * `items`, and every table finds it until a request writes it). Every key a request names is a
+   * non-empty `S` of the table's key attributes (`checkKey`), so the text names one key.
    */
-  const keyOf = (key: Item) => {
-    const parts = [key[tableKeys.pk]?.S, key[tableKeys.sk]?.S]
-    if (parts.some((part) => part === undefined || part.includes("|"))) {
-      throw new UnreadableRequest(
-        `RecordingTable keys items by their text keys, which ${JSON.stringify(parts)} can't be`,
-      )
-    }
-    return `${parts[0]}|${parts[1]}`
-  }
-  const items = new Map<string, Item>()
+  const slots = new Map<string, Map<string | undefined, Item>>()
+  const textOf = (key: Item) => keyText(key[tableKeys.pk]!.S!, key[tableKeys.sk]!.S!)
   const requests: Array<Request> = []
   /** Run before each request is answered — another writer landing just before it. */
   const hooks: { onRequest?: ((request: Request) => void) | undefined } = {}
-  /** The table each item a request wrote belongs to, by its key in `items`. */
-  const owners = new Map<string, string>()
   const schemaOf = (table: string | undefined): KeySchema => {
     if (table === undefined) throw new UnreadableRequest("RecordingTable: a request names no table")
     return tableKeys
   }
-  /** Whether `table` holds the item `items` keeps under `stored`. */
-  const holdsItem = (table: string, stored: string) =>
-    items.has(stored) && (owners.get(stored) ?? table) === table
-  const read = (table: string, key: Item) => {
-    const stored = keyOf(key)
-    return holdsItem(table, stored) ? items.get(stored) : undefined
+  const heldBy = (slot: Map<string | undefined, Item> | undefined, table: string) =>
+    slot?.get(table) ?? slot?.get(undefined)
+  const read = (table: string, key: Item) => heldBy(slots.get(textOf(key)), table)
+  /** One write, its key's text found: it can't fail, so a request's writes are found first, then made. */
+  const place = (table: string, text: string, item: Item | undefined) => {
+    const slot = slots.get(text) ?? new Map<string | undefined, Item>()
+    slot.delete(undefined)
+    if (item === undefined) slot.delete(table)
+    else slot.set(table, item)
+    if (slot.size === 0) slots.delete(text)
+    else slots.set(text, slot)
   }
-  const store = (table: string, key: Item, item: Item | undefined) => {
-    const stored = keyOf(key)
-    const owner = owners.get(stored)
-    if (items.has(stored) && owner !== undefined && owner !== table) {
-      if (item === undefined) return
+  /** Make every write, each one's key found before any is made. */
+  const apply = (writes: ReadonlyArray<TableWrite>) => {
+    const placed = writes.map((each) => [each.table, textOf(each.key), each.item] as const)
+    for (const [table, text, item] of placed) place(table, text, item)
+  }
+  /** The items `table` holds, with their keys' text. */
+  const rowsOf = (table: string) =>
+    [...slots.entries()].flatMap(([text, slot]) => {
+      const item = heldBy(slot, table)
+      return item === undefined ? [] : [[text, item] as const]
+    })
+  const tables: Tables = { schema: schemaOf, read }
+
+  /** The one item `items` shows under `text`; two tables' items there are a defect. */
+  const only = (text: string, what: string) => {
+    const slot = slots.get(text)
+    if (slot !== undefined && slot.size > 1) {
       throw new UnreadableRequest(
-        `RecordingTable keeps every table's items under <pk>|<sk>, and ${stored} is ${owner}'s; ${table} writes it too`,
+        `RecordingTable: items.${what}(${JSON.stringify(text)}) names an item of each of ${JSON.stringify([...slot.keys()])}`,
       )
     }
-    if (item === undefined) {
-      items.delete(stored)
-      owners.delete(stored)
-    } else {
-      items.set(stored, item)
-      owners.set(stored, table)
-    }
+    return slot
   }
-  /** The items `table` holds, by their keys in `items`. */
-  const rowsOf = (table: string) =>
-    [...items.entries()].filter(([stored]) => holdsItem(table, stored))
-  const tables: Tables = { schema: schemaOf, read }
+  /**
+   * Every item, keyed by its key's text; one key in two tables shows twice. A `Map` (so it
+   * compares equal to one holding the same entries) whose methods read and write `slots`.
+   */
+  const items = new Map<string, Item>()
+  const entries = function* (): Generator<[string, Item]> {
+    for (const [text, slot] of slots) for (const item of slot.values()) yield [text, item]
+  }
+  Object.defineProperties(items, {
+    get: {
+      value: (text: string): Item | undefined => {
+        const slot = only(text, "get")
+        return slot === undefined ? undefined : [...slot.values()][0]
+      },
+    },
+    set: {
+      value: (text: string, item: Item) => {
+        const slot = only(text, "set")
+        if (slot !== undefined) {
+          slot.set([...slot.keys()][0], item)
+          return items
+        }
+        if (parseKeyText(text) === undefined) {
+          throw new UnreadableRequest(
+            `RecordingTable: items.set(${JSON.stringify(text)}) names no key: keys are <pk>|<sk>, a \\ or | inside a part escaped (keyText)`,
+          )
+        }
+        slots.set(text, new Map([[undefined, item]]))
+        return items
+      },
+    },
+    delete: {
+      value: (text: string): boolean => only(text, "delete") !== undefined && slots.delete(text),
+    },
+    has: { value: (text: string): boolean => slots.has(text) },
+    clear: { value: (): void => slots.clear() },
+    size: {
+      get: (): number => {
+        let size = 0
+        for (const slot of slots.values()) size += slot.size
+        return size
+      },
+    },
+    entries: { value: entries },
+    keys: {
+      value: function* () {
+        for (const [text] of entries()) yield text
+      },
+    },
+    values: {
+      value: function* () {
+        for (const [, item] of entries()) yield item
+      },
+    },
+    [Symbol.iterator]: { value: entries },
+    forEach: {
+      value: (each: (item: Item, text: string, map: Map<string, Item>) => void): void => {
+        for (const [text, item] of entries()) each(item, text, items)
+      },
+    },
+  })
+  /** Put `item` in `table`, as a write of it would. */
+  const seed = (table: string, item: Item) => place(table, textOf(checkItem(item, tableKeys)), item)
   const record = (command: string, input: Record<string, any>) => {
     const request = { command, input: structuredClone(input) }
     requests.push(request)
@@ -165,11 +258,8 @@ export const makeRecordingTable = (options?: {
     if (outcome._tag === "ConditionFailed") {
       return Effect.fail(classifyError(operation)(outcome.error))
     }
-    store(table, key, outcome.item)
+    place(table, textOf(key), outcome.item)
     return Effect.succeed(outcome.output as never)
-  }
-  const apply = (writes: ReadonlyArray<TableWrite>) => {
-    for (const each of writes) store(each.table, each.key, each.item)
   }
 
   const client = mockDynamoClient({
@@ -237,11 +327,12 @@ export const makeRecordingTable = (options?: {
             for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0
             return hash % total
           }
+          // In the order of their keys' text, which names one key each.
           const rows = rowsOf(input.TableName!)
-            .filter(([key]) => segmentOf(key) === (input.Segment ?? 0))
+            .filter(([text]) => segmentOf(text) === (input.Segment ?? 0))
             .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
           const after = (start: Item) =>
-            rows.filter(([key]) => key > keyOf(start)).map(([, item]) => item)
+            rows.filter(([text]) => text > textOf(start)).map(([, item]) => item)
           return Effect.succeed(
             scan(
               input as never,
@@ -296,6 +387,7 @@ export const makeRecordingTable = (options?: {
 
   return {
     items,
+    seed,
     requests,
     hooks,
     client,

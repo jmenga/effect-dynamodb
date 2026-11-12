@@ -5,7 +5,9 @@
  * transaction's items taken in order. A request DynamoDB refuses fails with DynamoDB Local's
  * `ValidationException`, as the library's client reports it (`DynamoValidationError`); a failed
  * condition with `ConditionalCheckFailedException`; a request this doesn't read is a defect naming
- * it. `connected.helper-conformance.test.ts` compares the answers with DynamoDB Local's.
+ * it, found before anything is written. A transaction is checked whole, then written whole.
+ * `connected.helper-conformance.test.ts` compares the answers with DynamoDB Local's; what it
+ * doesn't model is listed at the top of `DynamoExpressions.ts`.
  *
  * Each table's keys are `pk` / `sk` (`S`) unless `tableKeys` says otherwise; a Query of a
  * secondary index needs the index's keys in `tableIndexes`.
@@ -23,6 +25,7 @@ import {
   answering,
   deleteItem,
   getItem,
+  type IndexSchema,
   type KeySchema,
   putItem,
   query,
@@ -38,7 +41,7 @@ export { holds, sameValue } from "./DynamoExpressions.js"
 
 export type Item = Record<string, AttributeValue>
 
-/** Every stored item, keyed `<table>|<pk>|<sk>`. */
+/** Every stored item, keyed `<table>|<pk>|<sk>` ({@link keyOf}). */
 export const store = new Map<string, Item>()
 export const calls = {
   query: 0,
@@ -85,22 +88,32 @@ export const resetCalls = () => {
 /** Key attribute names per table (default `pk` / `sk`). */
 export const tableKeys = new Map<string, KeySchema>()
 /** Secondary indexes' key attribute names, per table, for queries of an index. */
-export const tableIndexes = new Map<string, Readonly<Record<string, KeySchema>>>()
+export const tableIndexes = new Map<string, Readonly<Record<string, IndexSchema>>>()
 const keysOf = (table: string): KeySchema => tableKeys.get(table) ?? { pk: "pk", sk: "sk" }
 
+const escapePart = (text: string) => text.replace(/[\\|]/g, (c) => `\\${c}`)
+
 /**
- * The store key of a table's item (or key): `<table>|<pk>|<sk>`. A key that isn't text, or text
- * holding `|`, would not name one item alone, so it is a defect here.
+ * The store key of a table's item (or key): `<table>|<pk>|<sk>`, with a `\` or `|` inside any part
+ * escaped (`\\`, `\|`), so one text names one table's key; parts of neither character read as
+ * written. Every key a request names is a non-empty `S` of the table's key attributes
+ * (`checkKey`); an item a test stores must hold them too.
  */
 export const keyOf = (table: string, item: Item) => {
   const k = keysOf(table)
   const parts = [item[k.pk]?.S, item[k.sk]?.S]
-  if (parts.some((part) => part === undefined || part.includes("|"))) {
+  if (parts.some((part) => part === undefined)) {
     throw new UnreadableRequest(
-      `InMemoryTables keys items by their text keys, which ${JSON.stringify([item[k.pk], item[k.sk]])} can't be`,
+      `InMemoryTables: ${JSON.stringify([item[k.pk], item[k.sk]])} is not a key of ${table}, whose keys are text`,
     )
   }
-  return `${table}|${parts[0]}|${parts[1]}`
+  return [table, ...parts].map((part) => escapePart(part!)).join("|")
+}
+
+/** The rows `table` holds: those whose store key starts with its name. */
+const rowsOf = (table: string) => {
+  const prefix = `${escapePart(table)}|`
+  return [...store.entries()].filter(([key]) => key.startsWith(prefix)).map(([, item]) => item)
 }
 
 const tables: Tables = {
@@ -151,9 +164,7 @@ export const InMemoryClient = mockDynamoClientLayer({
                 `InMemoryTables: a query of index ${input.IndexName} of ${table} needs its keys in tableIndexes`,
               )
             })())
-      const rows = [...store.entries()]
-        .filter(([key]) => key.startsWith(`${table}|`))
-        .map(([, item]) => item)
+      const rows = rowsOf(table)
       return answering(
         () => Effect.succeed(query(input as never, rows, keysOf(table), index) as never),
         failure("Query"),
@@ -240,9 +251,13 @@ export const InMemoryClient = mockDynamoClientLayer({
         if (outcome._tag === "Cancelled") {
           return Effect.fail(classifyError("TransactWriteItems")(outcome.error))
         }
-        for (const each of outcome.writes) {
-          if (each.item === undefined) store.delete(keyOf(each.table, each.key))
-          else store.set(keyOf(each.table, each.key), each.item)
+        // Every write's store key found before any write is made.
+        const placed = outcome.writes.map(
+          (each) => [keyOf(each.table, each.key), each.item] as const,
+        )
+        for (const [key, item] of placed) {
+          if (item === undefined) store.delete(key)
+          else store.set(key, item)
         }
         return Effect.succeed({} as never)
       }, failure("TransactWriteItems"))

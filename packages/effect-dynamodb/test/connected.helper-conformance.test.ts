@@ -3064,26 +3064,6 @@ const KNOWN: Readonly<
       "DynamoDB Local cancels a transaction updating a key attribute with one ValidationError reason; not modelled, so the tables name the request as one they don't read",
     on: ["recording", "inMemory"],
   },
-  "tw: same key, two tables": {
-    reason:
-      "the recording table holds every table's items in one map keyed <pk>|<sk>, so it can't hold one key in two tables: writing another table's item under the same key is a defect, never a merge (InMemoryClient keys items by table, and agrees)",
-    on: ["recording"],
-  },
-  "bw: same key, two tables": {
-    reason:
-      "the recording table holds every table's items in one map keyed <pk>|<sk>: writing another table's item under the same key is a defect, never a merge",
-    on: ["recording"],
-  },
-  "tw: keys whose text joins to the same text": {
-    reason:
-      "the tables keep items under their key text <pk>|<sk>, where a key holding | would name another item too: such a key is a defect, never a merge",
-    on: ["recording", "inMemory"],
-  },
-  "bg: keys whose text joins to the same text": {
-    reason:
-      "the recording table keeps items under their key text <pk>|<sk>, where a key holding | would name another item too: such a key is a defect",
-    on: ["recording"],
-  },
 }
 
 // ---------------------------------------------------------------------------

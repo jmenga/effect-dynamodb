@@ -57,7 +57,7 @@ import {
   DDB_UPDATE_INVALID_PATH,
   DDB_UPDATE_MISSING_ATTRIBUTE,
 } from "./helpers/MockDynamoClient.js"
-import { makeRecordingTable } from "./helpers/RecordingTable.js"
+import { keyText, makeRecordingTable } from "./helpers/RecordingTable.js"
 
 type Item = Record<string, AttributeValue>
 
@@ -888,34 +888,100 @@ describe("an item is named by its table and its typed key", () => {
     }),
   )
 
-  it.effect("keys holding `|` are a defect the tables name, never a repeat", () =>
+  const joined: ReadonlyArray<Item> = [
+    { pk: { S: "a|b" }, sk: { S: "c" }, n: { N: "1" } },
+    { pk: { S: "a" }, sk: { S: "b|c" }, n: { N: "2" } },
+    { pk: { S: "a\\" }, sk: { S: "|b|c" }, n: { N: "3" } },
+  ]
+  const keysOnly = (item: Item) => ({ pk: item.pk!, sk: item.sk! })
+
+  it.effect("keys whose text joins alike are items like any other, in both tables", () =>
     Effect.gen(function* () {
-      const joined = [
-        { pk: { S: "a|b" }, sk: { S: "c" } },
-        { pk: { S: "a" }, sk: { S: "b|c" } },
-      ]
       const recording = makeRecordingTable()
-      const read = yield* Effect.exit(
-        Effect.provide(
-          withClient((client) => client.batchGetItem({ RequestItems: { t: { Keys: joined } } })),
-          recording.layer,
-        ),
+      const write = withClient((client) =>
+        client.transactWriteItems({
+          TransactItems: joined.map((item) => ({ Put: { TableName: "t", Item: item } })),
+        }),
       )
-      expect(Exit.isFailure(read) && Cause.squash(read.cause)).toBeInstanceOf(UnreadableRequest)
+      const read = withClient((client) =>
+        client.batchGetItem({ RequestItems: { t: { Keys: joined.map(keysOnly) } } }),
+      )
+      expect(yield* outcomeOf(write, recording.layer)).toEqual({ ok: {} })
+      const got = (yield* outcomeOf(read, recording.layer)) as {
+        readonly ok: { readonly Responses: { readonly t: ReadonlyArray<Item> } }
+      }
+      expect(got.ok.Responses.t).toEqual(joined)
+      expect(recording.items.get(keyText("a|b", "c"))).toEqual(joined[0])
+      expect(recording.items.get(keyText("a\\", "|b|c"))).toEqual(joined[2])
+      expect([...recording.items.keys()]).toEqual(
+        joined.map((item) => keyText(item.pk!.S!, item.sk!.S!)),
+      )
+
       resetStore()
-      const written = yield* Effect.exit(
-        Effect.provide(
-          withClient((client) =>
-            client.transactWriteItems({
-              TransactItems: joined.map((item) => ({ Put: { TableName: "t", Item: item } })),
-            }),
-          ),
-          InMemoryClient,
-        ),
+      expect(yield* outcomeOf(write, InMemoryClient)).toEqual({ ok: {} })
+      expect(joined.map((item) => store.get(keyOf("t", item)))).toEqual(joined)
+      expect(store.size).toBe(3)
+    }),
+  )
+
+  it.effect(
+    "recording table: one key in two tables is two items, and items names neither alone",
+    () =>
+      Effect.gen(function* () {
+        const recording = makeRecordingTable()
+        const write = withClient((client) =>
+          client.transactWriteItems({
+            TransactItems: [
+              { Put: { TableName: "one", Item: { ...key("a"), n: { N: "1" } } } },
+              { Put: { TableName: "two", Item: { ...key("a"), n: { N: "2" } } } },
+            ],
+          }),
+        )
+        expect(yield* outcomeOf(write, recording.layer)).toEqual({ ok: {} })
+        for (const [table, n] of [
+          ["one", "1"],
+          ["two", "2"],
+        ] as const) {
+          const got = yield* outcomeOf(
+            withClient((client) => client.getItem({ TableName: table, Key: key("a") })),
+            recording.layer,
+          )
+          expect(got).toEqual({ ok: { Item: { ...key("a"), n: { N: n } } } })
+        }
+        expect(recording.items.size).toBe(2)
+        expect(recording.items.has(keyText("a", "x"))).toBe(true)
+        expect(() => recording.items.get(keyText("a", "x"))).toThrow(UnreadableRequest)
+        expect(() => recording.items.delete(keyText("a", "x"))).toThrow(UnreadableRequest)
+        recording.seed("three", { ...key("b"), n: { N: "3" } })
+        expect(recording.items.get(keyText("b", "x"))).toEqual({ ...key("b"), n: { N: "3" } })
+        const elsewhere = yield* outcomeOf(
+          withClient((client) => client.getItem({ TableName: "one", Key: key("b") })),
+          recording.layer,
+        )
+        expect(elsewhere).toEqual({ ok: {} })
+      }),
+  )
+
+  it.effect("a transaction one of whose items this doesn't read writes nothing", () =>
+    Effect.gen(function* () {
+      const transaction = withClient((client) =>
+        client.transactWriteItems({
+          TransactItems: [
+            { Put: { TableName: "t", Item: { ...key("a"), n: { N: "1" } } } },
+            { Put: { TableName: "t", Item: key("b"), Unmodelled: true } as never },
+          ],
+        }),
       )
-      expect(Exit.isFailure(written) && Cause.squash(written.cause)).toBeInstanceOf(
+      const recording = makeRecordingTable()
+      const exit = yield* Effect.exit(Effect.provide(transaction, recording.layer))
+      expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBeInstanceOf(UnreadableRequest)
+      expect(recording.items.size).toBe(0)
+      resetStore()
+      const inMemory = yield* Effect.exit(Effect.provide(transaction, InMemoryClient))
+      expect(Exit.isFailure(inMemory) && Cause.squash(inMemory.cause)).toBeInstanceOf(
         UnreadableRequest,
       )
+      expect(store.size).toBe(0)
     }),
   )
 })
