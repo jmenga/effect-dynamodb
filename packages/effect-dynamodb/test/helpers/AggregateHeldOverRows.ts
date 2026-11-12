@@ -1,24 +1,19 @@
 /**
- * What a read gives back of a row's value, judged when a write builds the row (#241, `EDD-9159`).
+ * What a read gives back of a row's value, judged when `create` builds the row (#241, `EDD-9159`).
  *
- * - **A name a read takes off the row**, at the top of a value that keeps what it's given
- *   (`Schema.Unknown`, a record): `pk`, `sk`, `__edd_e__`, a name like `gsi1pk` / `lsiNote` the
- *   value doesn't declare there, a timestamp it doesn't declare. Published 1.39.0 and 1.40.0 wrote
- *   it and lost it on every read; a write holding one is refused, nothing sent. Nested below the
- *   top level, it's no attribute of the row: written and read back as on 1.40.0.
- * - **An attribute the library writes on the row that a read hands back** (a key attribute; a
- *   context attribute in a value that doesn't declare it): a value holding another value there read
- *   back the library's on 1.40.0, and is refused; one holding the row's value, or none, is written
- *   byte-identically and reads back the row's, since nothing stored tells the two apart. A copy a
- *   read gave (an `update` changing the root's context field over such a value) is the library's to
- *   fill, as it was. `Aggregate.make` refuses a field only where every write stores it (a required
- *   field, every union member's); a union member that doesn't declare it round-trips.
- * - **A discriminator** is the library's to fill: written with the discriminator's value whatever
- *   the value holds (a `Schema.BigInt` field holding `1n` for a discriminator `1`, an element copied
- *   from one sub-aggregate to another of the same model), as on 1.40.0.
- * - **`update` returns what a `get` after it reads**: on 1.40.0 it returned the mutated state as
- *   decoded, so a context copy or discriminator the write rewrote came back as it was before. Each
- *   such step is a named difference, asserted below.
+ * - **A name the library writes on the row** (`pk`, `sk`, `__edd_e__`, the collection sort key's
+ *   copy, a context attribute beneath the root), given at the top of a row's value as the caller
+ *   gave it: 1.40.0 wrote the library's value over it and every read handed that back. `create`
+ *   refuses a value other than the library's, nothing sent; the library's value, or none, is written
+ *   byte-identically to 1.40.0.
+ * - **Anything else is written and read as on 1.40.0**: a name the library doesn't write on that row
+ *   (`gsi1pk`, `lsiNote` where no index writes it, a timestamp, a nested name), a value the schema
+ *   can't place exactly (a union, a record), a custom `decompose`, a discriminator, and every
+ *   `update`, whatever its value holds: the state an update mutates is what the read gave, and what
+ *   the read filled in can't be told from what the caller set, so the library's value replaces it,
+ *   as on 1.40.0.
+ * - **`update` returns 1.40.0's result**, with one change: a member value's copy of a context
+ *   attribute is the value its row now holds, as a `get` after it reads it.
  *
  * `fixtures/aggregate-held-over-rows-1.40.0.json` holds what published 1.40.0 and 1.39.0 did for
  * each shape on DynamoDB Local. One suite, run on a recording table
@@ -34,6 +29,14 @@ import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
+import {
+  givenOverRow,
+  MIRRORED,
+  PARTITION,
+  SORT,
+  TYPE,
+  withCopiesRead,
+} from "./AggregateUpgradeSweep.js"
 
 type Row = Record<string, AttributeValue>
 type Request = { readonly command: string; readonly input: unknown }
@@ -91,14 +94,8 @@ type Shape = {
   readonly context?: ReadonlyArray<string>
   readonly timestamps?: unknown
   readonly steps?: ReadonlyArray<Change>
-  /** Refused by `Aggregate.make` (every write stores the name), with this message. */
-  readonly make?: string
   /** `create` refused, nothing sent, naming `member`, with this message. */
   readonly refused?: { readonly member: string; readonly message: string }
-  /** Steps refused, nothing written, by label. */
-  readonly stepRefused?: Readonly<
-    Record<string, { readonly member: string; readonly message: string }>
-  >
   /** What 1.40.0's `get` returned after `create`, for a refused shape: not what was given. */
   readonly read140?: unknown
 }
@@ -140,65 +137,39 @@ const ctx =
     ...extra,
   })
 
-const lost = (member: string, name: string, what?: string) =>
-  `[EDD-9159] "${member}" gives "${name}" a value at the top of its value, which is stored as the ` +
-  `attribute "${name}" of its row${what === undefined ? "" : `, also ${what}`}. A read takes that ` +
-  "attribute off the row whatever it holds"
-const misread = (member: string, name: string, held: string, what: string, library: string) =>
-  `[EDD-9159] "${member}" gives "${name}" the value ${held} at the top of its value, which is also ` +
-  `${what}. The library writes ${library} there over the value's own, and a read hands that back`
-const CONTEXT = "a context attribute the aggregate copies onto its rows"
-const MIRRORED = "the attribute holding the collection sort key's copy"
+/** `create` giving `name`, on `member`'s row, `given` where the library writes `library`. */
+const over = (member: string, name: string, given: string, what: string, library: string) => ({
+  member,
+  message: givenOverRow(member, name, given, what, library),
+})
+const PK = "$held#v1#held#a"
 
 export const shapes: Record<string, () => Shape> = {
   "an Unknown one edge holding pk": unknownOne(
     { text: "n", pk: "mine" },
-    {
-      refused: {
-        member: "note",
-        message: lost("note", "pk", "the attribute holding the partition key"),
-      },
-    },
+    { refused: over("note", "pk", "mine", PARTITION, PK) },
   ),
   "an Unknown one edge holding sk": unknownOne(
     { text: "n", sk: "mine" },
-    {
-      refused: {
-        member: "note",
-        message: lost("note", "sk", "the attribute holding its sort key"),
-      },
-    },
+    { refused: over("note", "sk", "mine", SORT, "$held#v1#note") },
   ),
   "an Unknown one edge holding __edd_e__": unknownOne(
     { text: "n", __edd_e__: "mine" },
-    {
-      refused: {
-        member: "note",
-        message: lost("note", "__edd_e__", "the attribute holding its entity type"),
-      },
-    },
+    { refused: over("note", "__edd_e__", "mine", TYPE, "Note") },
   ),
-  "an Unknown one edge holding gsi1pk": unknownOne(
-    { text: "n", gsi1pk: "mine" },
-    { refused: { member: "note", message: lost("note", "gsi1pk") } },
-  ),
-  "an Unknown one edge holding lsiNote": unknownOne(
-    { text: "n", lsiNote: "mine" },
-    { refused: { member: "note", message: lost("note", "lsiNote") } },
-  ),
+  // A name the library doesn't write on the row: written, and taken off every read, as on 1.40.0.
+  "an Unknown one edge holding gsi1pk": unknownOne({ text: "n", gsi1pk: "mine" }),
+  "an Unknown one edge holding lsiNote": unknownOne({ text: "n", lsiNote: "mine" }),
+  // A timestamp the library stamps isn't judged: stamped over it, as on 1.40.0.
   "an Unknown one edge holding createdAt, with timestamps": unknownOne(
     { text: "n", createdAt: "mine" },
-    { timestamps: true, refused: { member: "note", message: lost("note", "createdAt") } },
+    { timestamps: true },
   ),
-  "an Unknown element holding gsiTag": unknownMany(
-    { qty: 1, gsiTag: "mine" },
-    { refused: { member: "lines", message: lost("lines", "gsiTag") } },
-  ),
+  "an Unknown element holding gsiTag": unknownMany({ qty: 1, gsiTag: "mine" }),
   "a record element holding gsiTag": () => ({
     model: Schema.Struct({ id: S, lines: Schema.Array(Schema.Record(S, U)) }),
     edges: { lines: many() },
     input: { id: "a", lines: [{ qty: 1, gsiTag: "mine" }] },
-    refused: { member: "lines", message: lost("lines", "gsiTag") },
   }),
   // A custom `decompose` maps the value to rows itself, and its `assemble` maps them back: the
   // value reads back as given, and its rows are written as on 1.40.0.
@@ -220,7 +191,6 @@ export const shapes: Record<string, () => Shape> = {
       model: Schema.Struct({ id: S, part: Part }),
       edges: { part: sub(Part, { note: one() }, { side: 1 }) },
       input: { id: "a", part: { name: "p", note: { text: "n", gsi1sk: "mine" } } },
-      refused: { member: "note", message: lost("note", "gsi1sk") },
     }
   },
   "a struct one edge declaring pk (optional), keyed under PK, given mine": () => ({
@@ -228,7 +198,6 @@ export const shapes: Record<string, () => Shape> = {
     model: Schema.Struct({ id: S, note: Schema.Struct({ text: S, pk: opt(S) }) }),
     edges: { note: one() },
     input: { id: "a", note: { text: "n", pk: "mine" } },
-    refused: { member: "note", message: lost("note", "pk") },
   }),
   "an Unknown one edge holding them nested": unknownOne({
     text: "n",
@@ -253,6 +222,8 @@ export const shapes: Record<string, () => Shape> = {
     edges: { note: one() },
     input: { id: "a", note: { kind: "text", text: "hello" } },
   }),
+  // A union isn't judged: which member holds the name can't be told from the schema alone. Written
+  // as on 1.40.0, which reads back the library's copy.
   "a one edge union, a member declaring csk, given that member": () => ({
     collection: MIRROR,
     model: Schema.Struct({
@@ -264,20 +235,13 @@ export const shapes: Record<string, () => Shape> = {
     }),
     edges: { note: one() },
     input: { id: "a", note: { kind: "key", csk: "mine" } },
-    refused: {
-      member: "note",
-      message: misread("note", "csk", '"mine"', MIRRORED, '"$held#v1#note"'),
-    },
-    read140: { id: "a", note: { kind: "key", csk: "$held#v1#note" } },
   }),
   "a one edge declaring csk (required)": () => ({
     collection: MIRROR,
     model: Schema.Struct({ id: S, note: Schema.Struct({ text: S, csk: S }) }),
     edges: { note: one() },
     input: { id: "a", note: { text: "n", csk: "mine" } },
-    make:
-      '[EDD-9159] Aggregate "Root": the value of edge "note" declares a field "csk", which is also ' +
-      `${MIRRORED}.`,
+    refused: over("note", "csk", "mine", MIRRORED, "$held#v1#note"),
     read140: { id: "a", note: { text: "n", csk: "$held#v1#note" } },
   }),
   // Given none, the row holds the copy as it would holding it: written and read as on 1.40.0.
@@ -317,12 +281,6 @@ export const shapes: Record<string, () => Shape> = {
           },
         },
       ],
-      stepRefused: {
-        "note tenantId other": {
-          member: "note",
-          message: misread("note", "tenantId", '"other"', CONTEXT, '"t2"'),
-        },
-      },
     },
   ),
   "context: an Unknown element, updates": ctx(
@@ -341,12 +299,6 @@ export const shapes: Record<string, () => Shape> = {
           }),
         },
       ],
-      stepRefused: {
-        "element tenantId other": {
-          member: "lines",
-          message: misread("lines", "tenantId", '"other"', CONTEXT, '"t2"'),
-        },
-      },
     },
   ),
   "context: a struct one edge declaring tenantId": ctx(
@@ -427,28 +379,6 @@ export const shapes: Record<string, () => Shape> = {
   },
 }
 
-/**
- * The steps whose `update` 1.40.0 returned otherwise than the `get` after it read: the mutated state
- * as decoded, a context copy or discriminator the write rewrote as it was before.
- */
-const STALE_ON_140: Readonly<Record<string, ReadonlyArray<string>>> = {
-  "context: an Unknown one edge, updates": [
-    "root tenantId t2",
-    "note tenantId other",
-    "note without tenantId",
-  ],
-  "context: an Unknown element, updates": ["root tenantId t2", "element tenantId other"],
-  "context: a struct one edge declaring tenantId": ["root tenantId t2"],
-  "context: a struct element declaring tenantId": ["root tenantId t2"],
-  "context: a childless sub-aggregate declaring tenantId": ["root tenantId t2"],
-  "context: a sub-aggregate with an edge, both declaring tenantId": ["root tenantId t2"],
-  "context: a custom decompose and assemble": ["root tenantId t2"],
-  "two childless sub-aggregates of one model, an update copying one into the other": ["two = one"],
-  "two sub-aggregates of one model, an update copying one's elements into the other": [
-    "two.lines = one.lines",
-  ],
-}
-
 export interface Harness {
   /** Run `body` on a fresh, empty table keyed by `pk` (`"pk"`) and `sk`, with `lsi1` on `csk`. */
   readonly onTable: <A, E>(
@@ -516,7 +446,7 @@ export const suite = (
   harness: Harness,
   describeIt: (name: string, body: () => void) => void = describe,
 ) =>
-  describeIt("what a read gives back of a row's value, judged at write (EDD-9159)", () => {
+  describeIt("what a read gives back of a row's value, judged at create (EDD-9159)", () => {
     it("the fixture is published 1.40.0's and 1.39.0's, for every shape, and they agree", () => {
       expect(published.generatedFrom).toEqual(["effect-dynamodb@1.40.0", "effect-dynamodb@1.39.0"])
       expect(Object.keys(published["1.40.0"]).sort()).toEqual(Object.keys(shapes).sort())
@@ -526,17 +456,9 @@ export const suite = (
     for (const [label, defineShape] of Object.entries(shapes)) {
       const then = published["1.40.0"][label]!
       const shape = defineShape()
-      if (shape.make !== undefined) {
-        it(`${label}: every write stores it, 1.40.0 read back the library's; Aggregate.make refuses it`, () => {
-          expect(judged(then.create)).toEqual({ ok: shape.input })
-          expect(judged(then.get)).toEqual({ ok: shape.read140 })
-          expect(() => define(shape)).toThrow(shape.make)
-        })
-        continue
-      }
       if (shape.refused !== undefined) {
         const { member, message } = shape.refused
-        it(`${label}: 1.40.0 didn't read back what it was given; the write is refused, nothing sent`, () =>
+        it(`${label}: 1.40.0 read back the library's value, not the one given; create is refused, nothing sent`, () =>
           Effect.runPromise(
             harness.onTable(
               (tableName) =>
@@ -555,7 +477,7 @@ export const suite = (
                   const error = refusal(yield* Effect.exit(db.aggregates.A.create(shape.input)))
                   expect(error._tag).toBe("AggregateDecompositionError")
                   expect(error.member).toBe(member)
-                  expect(error.reason).toContain(message)
+                  expect(error.reason).toBe(message)
                   expect(yield* harness.requests(tableName)).toEqual([])
                   expect(yield* harness.rows(tableName)).toEqual([])
                 }),
@@ -564,7 +486,7 @@ export const suite = (
           ))
         continue
       }
-      it(`${label}: sends and stores what 1.40.0 did, and an update returns what a get reads`, () =>
+      it(`${label}: sends, stores and reads what 1.40.0 did, and update returns 1.40.0's result with context copies as stored`, () =>
         Effect.runPromise(
           harness.onTable(
             (tableName) =>
@@ -585,31 +507,13 @@ export const suite = (
                   judged(then.get),
                 )
                 yield* harness.requests(tableName)
-                const stale = STALE_ON_140[label] ?? []
                 for (const [i, { label: step, change }] of (shape.steps ?? [noop]).entries()) {
                   const was = then.steps[i]!
                   expect(was.step).toBe(step)
-                  const rowsBefore = sorted(yield* harness.rows(tableName))
-                  const exit = yield* Effect.exit(
-                    A.update({ id: "a" }, ({ state }: any) => change(state)),
+                  const update = outcome(
+                    yield* Effect.exit(A.update({ id: "a" }, ({ state }: any) => change(state))),
                   )
                   const sent = plain(yield* harness.requests(tableName))
-                  const refused = shape.stepRefused?.[step]
-                  if (refused !== undefined) {
-                    // 1.40.0 wrote it and read back the library's value.
-                    expect({ step, ...judged(was.update) }).not.toEqual({
-                      step,
-                      ...judged(was.get),
-                    })
-                    const error = refusal(exit)
-                    expect(error._tag).toBe("AggregateDecompositionError")
-                    expect(error.member).toBe(refused.member)
-                    expect(error.reason).toContain(refused.message)
-                    expect(sent.map((request) => request.command)).toEqual(["Query"])
-                    expect(sorted(yield* harness.rows(tableName))).toEqual(rowsBefore)
-                    continue
-                  }
-                  const update = outcome(exit)
                   expect({ step, requests: sent }).toEqual({ step, requests: was.requests })
                   expect({ step, rows: sorted(yield* harness.rows(tableName)) }).toEqual({
                     step,
@@ -618,14 +522,20 @@ export const suite = (
                   const get = outcome(yield* Effect.exit(A.get({ id: "a" })))
                   yield* harness.requests(tableName)
                   expect({ step, ...judged(get) }).toEqual({ step, ...judged(was.get) })
-                  // What `update` returns is what a `get` after it reads.
-                  expect({ step, ...judged(update) }).toEqual({ step, ...judged(get) })
-                  // The named difference: 1.40.0 returned the state as decoded.
-                  expect({ step, staleOn140: !stale.includes(step) }).toEqual({
+                  // 1.40.0's result, each context copy as the get after it reads it.
+                  const context = shape.context ?? []
+                  expect({ step, ...judged(update) }).toEqual({
                     step,
-                    staleOn140:
-                      JSON.stringify(judged(was.update)) === JSON.stringify(judged(was.get)),
+                    ...(was.update.ok === undefined
+                      ? judged(was.update)
+                      : { ok: withCopiesRead(was.update.ok, was.get.ok, shape.edges, context) }),
                   })
+                  if (update.ok !== undefined && get.ok !== undefined) {
+                    expect({
+                      step,
+                      copies: withCopiesRead(update.ok, get.ok, shape.edges, context),
+                    }).toEqual({ step, copies: update.ok })
+                  }
                 }
               }),
             shape.pk,

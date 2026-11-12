@@ -1,5 +1,5 @@
 /**
- * What a read gives back of a row's value, judged at write (EDD-9159), on a recording table.
+ * What a read gives back of a row's value, judged at create (EDD-9159), on a recording table.
  * The suite is `helpers/AggregateHeldOverRows.ts`; connected twin:
  * `connected.aggregate-held-over-rows.test.ts`.
  */
@@ -14,7 +14,7 @@ let made = 0
 suite({
   onTable: (body, pk = "pk") => {
     const tableName = `held-over-rows-${made++}`
-    const table = makeRecordingTable({ indexes: { [INDEX.name]: { pk, sk: INDEX.sk } } })
+    const table = makeRecordingTable({ pk, indexes: { [INDEX.name]: { pk, sk: INDEX.sk } } })
     tables.set(tableName, table)
     return body(tableName).pipe(
       Effect.provide(Layer.merge(table.layer, Main.layer({ name: tableName }))),

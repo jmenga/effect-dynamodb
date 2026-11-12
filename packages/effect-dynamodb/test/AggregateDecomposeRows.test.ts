@@ -610,9 +610,8 @@ describe("a transformed field under a custom decompose", () => {
         ),
       ).toBe(5)
       // The rows read (1); the new state, read as the domain value it is (3); the old rows' stored
-      // form (1); the new value, as 1.39.0 read it (1); the new rows' stored form (1); the rows the
-      // update leaves, assembled as a read would for what it returns (1). The rows read are
-      // decomposed once, as read.
+      // form (1); the new value, as 1.39.0 read it (1); the new rows' stored form (1). The rows
+      // read are decomposed once, as read.
       for (const note of ["unchanged", "changed"]) {
         expect(
           yield* run((db) =>
@@ -622,7 +621,7 @@ describe("a transformed field under a custom decompose", () => {
                 : { ...state, lines: state.lines.map((line: any) => ({ ...line, f: 6 })) },
             ),
           ),
-        ).toBe(8)
+        ).toBe(7)
       }
       // The rows read (1) and their stored form (1).
       expect(yield* run((db) => db.tables.Main.rekey())).toBe(2)

@@ -225,7 +225,6 @@ import {
   refuseAggregateKeyOverMovingValue,
   refuseAggregateKeysOverBothKinds,
   refuseManySortKeysOverMovingValue,
-  refuseValueFieldsOnRowAttributes,
   resolveAggregateStamps,
   rowKeysOn,
   subAggregateRowKind,
@@ -292,10 +291,16 @@ interface ResolvedNode {
   readonly ownDiscriminator?: Record<string, unknown>
   /**
    * What a read knows of this node's rows (#241): their kind, the names their value declares and
-   * the key attributes the library writes there. A read takes off what `readTakesOff` says, and a
-   * write whose value holds such a name is refused (`refuseHeldOverRows`).
+   * the key attributes the library writes there. A read takes off what `readTakesOff` says.
    */
   readonly readRow: ReadRow
+  /**
+   * The names a value of this node holds at its top level under the name it's stored under (#241,
+   * {@link placedFields}): `create` judges a value given for an attribute the library writes on the
+   * row by them (`EDD-9159`), and `update` gives its result's context copies by them. Undefined
+   * where the schema can't place one, or with a custom `decompose` or `assemble`.
+   */
+  readonly placed?: Placed | undefined
   readonly children: ReadonlyArray<ResolvedNode>
   readonly assemble?: ((items: ReadonlyArray<unknown>) => unknown) | undefined
   readonly decompose?: ((value: unknown) => ReadonlyArray<unknown>) | undefined
@@ -1395,69 +1400,85 @@ const asAttribute = (value: unknown): unknown => {
 }
 
 /**
- * `[EDD-9159]`, at write (#241): what a read gives back of a row's value, judged on the row a write
- * builds. `own` is what the value holds at its top level, in its stored form, before the library
- * writes its attributes ({@link DecomposedItem.own}); `row` is the row as built. For each name the
- * value gives a value:
- *
- * - **A discriminator**: the library's to fill. The row is written with the discriminator's value
- *   whatever the value holds there, as up to 1.40.0, and a read hands back the row's.
- * - **A name a read takes off the row** (`readTakesOff`: `pk`, `sk`, `__edd_e__`, a name like
- *   `gsi1pk` the value doesn't declare there or the library writes there; or a timestamp the value
- *   doesn't declare, `stamps`): the value would read back without it, so the write is refused. Up to
- *   1.40.0 it was written and lost on every read.
- * - **An attribute the library writes on the row that a read hands back** (a key attribute; a
- *   context attribute on an edge's row whose value doesn't declare it): refused where the row
- *   stores another value there, which a read would hand back in its place (up to 1.40.0 a silently
- *   changed value), unless it's the copy a read gave (`readCopy`: on `update`, what a row of that
- *   entity type held there as read), which the library fills as it always has. A value holding the
- *   row's own value there, or none, is written as up to 1.40.0 and reads back the row's: nothing
- *   stored tells the two apart. A context field the value declares is the copy `context` makes,
- *   filled by the library.
- *
- * Only the value's top level: a key nested below it is no attribute of the row, and a read leaves
- * it. A `many` edge with a custom `decompose` or `assemble` maps its value to rows and back itself,
- * so what a read gives back of the value can't be told from a row: its rows are written as up to
- * 1.40.0. Returns the refusal's reason, or `undefined`.
+ * Where a value at one place in the aggregate holds what it's given (#241): `"any"`, every name at
+ * its top level stored under that name, as given (`Schema.Unknown`, `Schema.Any`); a struct's or
+ * class's fields, by name, where its stored side names each as its domain side does. Through an
+ * optional field and a union with `null` or `undefined`. Undefined where the schema can't place a
+ * name exactly: a union of values, a record, a declaration, a transformation of the whole value or
+ * a renaming of its keys.
  */
-const heldOverRow = (
+type Placed = "any" | Readonly<Record<string, Schema.Top>>
+
+/** The {@link Placed} of a value of `schema`. */
+const placedFields = (schema: Schema.Top | undefined): Placed | undefined => {
+  if (schema === undefined) return undefined
+  const value = unwrapOptionalField(
+    DynamoModel.isConfiguredModel(schema) ? (schema.model as Schema.Top) : schema,
+  )
+  if (SchemaAST.isUnion(value.ast)) {
+    const members = (value as { readonly members?: ReadonlyArray<Schema.Top> }).members
+    if (!Array.isArray(members)) return undefined
+    const held = members.filter(
+      (member) => !SchemaAST.isNull(member.ast) && !SchemaAST.isUndefined(member.ast),
+    )
+    return held.length === 1 ? placedFields(held[0]) : undefined
+  }
+  if (SchemaAST.isUnknown(value.ast) || SchemaAST.isAny(value.ast)) return "any"
+  const fields = getSchemaFields(value)
+  if (fields === undefined) return undefined
+  const stored = SchemaAST.toEncoded(value.ast)
+  if (!SchemaAST.isObjects(stored)) return undefined
+  const domain = Object.keys(fields)
+  const names = stored.propertySignatures.map((property) => property.name)
+  return names.length === domain.length && names.every((name, i) => name === domain[i])
+    ? fields
+    : undefined
+}
+
+/** Whether `placed` places the name `name` at the top of a value. */
+const places = (placed: Placed | undefined, name: string): boolean =>
+  placed === "any" || (placed !== undefined && Object.hasOwn(placed, name))
+
+/**
+ * `[EDD-9159]`, on `create` only (#241): a value the caller's input gives at the top of a row's
+ * value for an attribute the library writes on that row, a key attribute ({@link rowKeysOn}: its
+ * type, the partition key, `sk`, the collection sort key's copy, the root's list keys) or, on a
+ * row beneath the root, a context attribute, which differs from what the library writes there. Up
+ * to 1.40.0 the library's value replaced it, and a read handed back the library's, or nothing.
+ *
+ * `item.input` is the caller's own value at the row's place, as given, before decoding filled
+ * anything in: a name it gives no value is not judged, so a decoding default, a value a read
+ * filled and a stamp never are. A value equal, as stored, to what the library writes is written as
+ * up to 1.40.0. A discriminator is the library's to fill, and not judged. Neither is a value whose
+ * place its schema can't place exactly ({@link placedFields}), nor a `many` edge with a custom
+ * `decompose` or `assemble`, which maps its value to rows and back itself. `row` is the row as
+ * built. Returns the refusal's reason, or `undefined`.
+ */
+const givenOverRow = (
   item: DecomposedItem,
   row: Record<string, AttributeValue>,
-  stamps: ReadonlySet<string>,
-  context: ReadonlySet<string>,
+  context: ReadonlyArray<string>,
   keyWhat: ReadonlyMap<string, string>,
-  readCopy: (entityType: string, name: string, held: unknown) => boolean,
 ): string | undefined => {
-  const { node, own, member } = item
+  const { node, own, input, member } = item
+  if (input === null || typeof input !== "object") return undefined
   if (node.decompose !== undefined || node.assemble !== undefined) return undefined
-  for (const [name, held] of Object.entries(own)) {
-    if (held === undefined) continue
-    const discriminator = node.discriminator?.[name]
-    if (discriminator !== undefined && typeof discriminator !== "function") continue
-    if (readTakesOff(node.readRow, name) || stamps.has(name)) {
-      const what = keyWhat.get(name)
-      return (
-        `[EDD-9159] "${member}" gives "${name}" a value at the top of its value, which is stored ` +
-        `as the attribute "${name}" of its row${what === undefined ? "" : `, also ${what}`}. A read ` +
-        `takes that attribute off the row whatever it holds, as it takes the library's own keys, ` +
-        `type and timestamps off, so the value would be lost. Leave it out of the value, nest it, ` +
-        `or name it something else.`
-      )
-    }
-    const isContext =
-      node.cardinality !== "root" && context.has(name) && !node.readRow.declared.has(name)
-    if (!node.readRow.keys.has(name) && !isContext) continue
+  const names = [...node.readRow.keys, ...(node.cardinality === "root" ? [] : context)]
+  for (const name of names) {
+    if (!places(node.placed, name)) continue
+    if (node.discriminator !== undefined && Object.hasOwn(node.discriminator, name)) continue
+    const value = given(input, name)
+    const held = own[name]
     const written = row[name]
-    if (written === undefined) continue
-    const stored = asAttribute(held)
-    if (deepEqual(stored, written) || readCopy(node.entityType, name, stored)) continue
+    if (value === undefined || held === undefined || written === undefined) continue
+    if (deepEqual(asAttribute(held), written)) continue
     const library = fromAttributeMap({ value: written }).value
     const what = keyWhat.get(name) ?? "a context attribute the aggregate copies onto its rows"
     return (
-      `[EDD-9159] "${member}" gives "${name}" the value ${shown(held)} at the top of its value, ` +
-      `which is also ${what}. The library writes ${shown(library)} there over the value's own, and ` +
-      `a read hands that back, so the value would be changed. Give it ${shown(library)}, leave it ` +
-      `out of the value, or name it something else.`
+      `[EDD-9159] "${member}" gives "${name}" the value ${shown(value)} at the top of its value, ` +
+      `which is also ${what}. The library writes ${shown(library)} there over the value's own, ` +
+      `so the value would not read back as given. Give it ${shown(library)}, leave it out of the ` +
+      `value, or name it something else.`
     )
   }
   return undefined
@@ -1932,7 +1953,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
   refuseManySortKeysOverMovingValue(aggregateName, config.timestamps, schemaFields, config.edges)
   refuseAggregateKeysOverBothKinds(aggregateName, schemaFields, config, config.edges)
-  refuseValueFieldsOnRowAttributes(aggregateName, schema, config)
   const withRowStamps = (node: ResolvedNode): ResolvedNode => ({
     ...node,
     rowStamps: rowStampsOf(node.ownFields),
@@ -1953,8 +1973,15 @@ const makeAggregate = <TSchema extends Schema.Top>(
       escapeKeys: config.schema.escapeKeys === true,
       rowKeys: config,
       readRow: readRowOf("root", config, declaredValueNames.own(schemaFields, config.edges)),
+      placed: placedFields(schema),
     }),
   )
+  // Rows that hold a stamp in the domain object: what `update` returns has to say what it wrote.
+  const declaresStamp = (node: ResolvedNode): boolean =>
+    node.rowStamps?.createdDeclared === true ||
+    node.rowStamps?.updatedDeclared === true ||
+    node.children.some(declaresStamp)
+  const returnsStamps = declaresStamp(rootNode)
 
   // Packed edge attributes, and those read by stored form, by item entity type (#147).
   const packedByType = collectPackedByType(rootNode)
@@ -2352,43 +2379,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
   }
 
   /**
-   * What a `get` reads back once an `update` lands (#241): the partition as read (`read`), less the
-   * rows the write deletes (`removed`, by sort key) and with the rows it puts (`groups`, in the order
-   * they're sent), assembled by the read's own function. What `update` returns, so it's what a `get`
-   * right after returns: a context copy it rewrote, a discriminator the library fills, a key the
-   * read takes off. Assembled before anything is sent and from rows already in hand, so no request
-   * is added, and an update whose rows wouldn't read back sends nothing.
-   */
-  const readBack = (
-    read: ReadonlyArray<Record<string, unknown>>,
-    removed: ReadonlyArray<string>,
-    groups: ReadonlyArray<{
-      readonly puts: ReadonlyArray<Record<string, AttributeValue>>
-      readonly deletes: ReadonlyArray<Record<string, AttributeValue>>
-    }>,
-    key: Record<string, unknown>,
-  ): Effect.Effect<unknown, AggregateAssemblyError | ValidationError> =>
-    Effect.gen(function* () {
-      const stored = new Map(read.map((item) => [String(item.sk), item]))
-      for (const sk of removed) stored.delete(sk)
-      for (const { deletes, puts } of groups) {
-        for (const item of deletes) stored.delete(String((item.sk as { S?: string }).S))
-        const written = puts.map((item) => fromAttributeMap(item) as Record<string, unknown>)
-        yield* unpackAggregateItems(written, dispatchByType, aggregateName)
-        for (const item of written) stored.set(String(item.sk), item)
-      }
-      return yield* assembleAggregate(
-        assembly,
-        rootNode,
-        [...stored.values()],
-        contextFields,
-        key,
-        aggregateName,
-        systemAttrs,
-      )
-    })
-
-  /**
    * Refuses the rows of a write that wouldn't read back: the rows it's about to write, through the read
    * path a `get` takes. Only two kinds of write pay for it: one of an aggregate holding a custom
    * declaration (`EDD-9126`), and one that stored a value as given, which no encoder of its field
@@ -2584,66 +2574,20 @@ const makeAggregate = <TSchema extends Schema.Top>(
     return byNode
   })()
 
-  /** Each key attribute the library writes on a row, by what it holds (`heldOverRow`). */
+  /** Each key attribute the library writes on a row, by what it holds (`givenOverRow`). */
   const keyWhat: ReadonlyMap<string, string> = new Map(rowKeysOn("root", config))
-  const contextNames: ReadonlySet<string> = new Set(contextFields)
 
   /**
-   * `[EDD-9159]`, at write (#241): each row of the aggregate as a write builds it (`built`, in the
-   * order of `groups`) judged by what a read gives back of its value ({@link heldOverRow}). Every
-   * row, not only those the write sends: a value changed only where the library writes over it
-   * compares equal to the row it read and sends nothing, and a read hands back the library's value,
-   * not the one given. `read` is what the write read of the aggregate (`update`), whose values a read
-   * gave are the library's to fill; none on `create`.
+   * `[EDD-9159]`, on `create` (#241): each row as the write builds it (`built`, in the order of
+   * `groups`) judged against the value the caller's input gave there ({@link givenOverRow}).
    */
-  const refuseHeldOverRows = (
+  const refuseGivenOverRows = (
     groups: ReadonlyArray<TransactionGroup>,
     built: ReadonlyArray<{ readonly items: ReadonlyArray<Record<string, AttributeValue>> }>,
-    read: ReadonlyArray<Record<string, unknown>>,
   ): Effect.Effect<void, AggregateDecompositionError> => {
-    // The rows read, and of each the attributes the library wrote over its value's own: a context
-    // attribute where the root's holds a value, the partition key and the collection sort key's
-    // copy, and the list keys on the root's row where every list composite holds a value (every
-    // aggregate write is a whole-row Put composing them from those). A value a read gave of one of
-    // those is the library's to fill; one the row stored as the value's own is the value's.
-    const rootSortKey = composeKey(config.schema, config.root.entityType, [])
-    const readRoot = read.find(
-      (row) => row.__edd_e__ === config.root.entityType && row.sk === rootSortKey,
-    )
-    const listFields = config.list === undefined ? [] : [config.list.pk.field, config.list.sk.field]
-    const listComposed =
-      readRoot !== undefined &&
-      config.list !== undefined &&
-      [...config.list.pk.composite, ...config.list.sk.composite].every((composite) =>
-        hasKeyValue(readRoot[composite]),
-      )
-    const libraryWrote = (row: Record<string, unknown>, name: string): boolean => {
-      if (row === readRoot) return keyWhat.has(name) && (!listFields.includes(name) || listComposed)
-      return (
-        (keyWhat.has(name) && !listFields.includes(name)) ||
-        (contextNames.has(name) &&
-          readRoot?.[name] !== undefined &&
-          deepEqual(readRoot[name], row[name]))
-      )
-    }
-    const readCopy = (entityType: string, name: string, held: unknown): boolean =>
-      read.some(
-        (row) =>
-          row.__edd_e__ === entityType &&
-          row[name] !== undefined &&
-          libraryWrote(row, name) &&
-          deepEqual(asAttribute(row[name]), held),
-      )
     for (const [g, group] of groups.entries()) {
       for (const [i, item] of group.items.entries()) {
-        const reason = heldOverRow(
-          item,
-          built[g]!.items[i]!,
-          stampsToStrip(item.node, systemAttrs),
-          contextNames,
-          keyWhat,
-          readCopy,
-        )
+        const reason = givenOverRow(item, built[g]!.items[i]!, contextFields, keyWhat)
         if (reason !== undefined) {
           return Effect.fail(
             new AggregateDecompositionError({
@@ -2656,6 +2600,24 @@ const makeAggregate = <TSchema extends Schema.Top>(
       }
     }
     return Effect.void
+  }
+
+  /**
+   * `update`'s result (#241): the mutated state as decoded, as up to 1.40.0, with each member
+   * value's copy of a context attribute as the row the write builds now stores it, read back
+   * ({@link contextCopiesAsStored}). The rest is 1.40.0's.
+   */
+  const withStoredContextCopies = (
+    decoded: unknown,
+    rowAt: (path: ReadonlyArray<string | number>) => RowNow | undefined,
+  ): unknown => {
+    if (contextFields.length === 0) return decoded
+    const stored = contextValuesOf(
+      decoded as Record<string, unknown>,
+      contextFields,
+      rootEncoders,
+    ).stored
+    return contextCopiesAsStored(rootNode, decoded, stored, rowAt, contextFields, resolveRef)
   }
 
   /**
@@ -3443,7 +3405,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
         ),
       )
       yield* refuseOtherKindKeys(newGroups, "aggregate.update")
-      yield* refuseHeldOverRows(newPacked, newDynamo, allItems)
       yield* refuseNotReadBack(newDynamo, key, "aggregate.update", storedAsGivenIn(newGroups))
 
       const newItemsByGroup = new Map(newDynamo.map((g) => [g.group, g.items]))
@@ -3504,16 +3465,6 @@ const makeAggregate = <TSchema extends Schema.Top>(
           )
         : []
 
-      // What's returned is what a `get` reads back once these writes land (`readBack`): the
-      // partition as read, with them applied. Up to 1.40.0 an `update` returned the mutated state
-      // as decoded, so a context copy the write rewrote came back as it was before.
-      const returned = yield* readBack(
-        allItems,
-        cleanup.map(({ sk }) => sk),
-        groupWrites,
-        key,
-      )
-
       if (groupWrites.length > 0) {
         yield* writeTransactionGroups(
           client,
@@ -3526,7 +3477,51 @@ const makeAggregate = <TSchema extends Schema.Top>(
       if (cleanup.length > 0) {
         yield* deleteOwnedRows(client, tableConfig.name, config.pk.field, cleanup)
       }
-      return returned as Schema.Schema.Type<TSchema>
+
+      if (!returnsStamps) {
+        // A member value's copy of a context attribute is what its row now holds (#241): the
+        // root's, on a row the write sent; what it held when read, on one it didn't.
+        const rowsNow = new Map<string, RowNow>()
+        for (const group of newGroups) {
+          const sent = groupChanged(group.name)
+          for (const item of group.items) {
+            if (item.path === undefined) continue
+            let now: RowNow | undefined
+            if (sent) now = { written: true }
+            else {
+              const sk = sortKeyOf(config.schema, item)
+              const other = otherCompositionSortKey(config.schema, item)
+              const row =
+                (sk === undefined ? undefined : readRows.get(sk)) ??
+                (other === undefined ? undefined : readRows.get(other))
+              if (row !== undefined) now = { row }
+            }
+            if (now !== undefined) rowsNow.set(JSON.stringify(item.path), now)
+          }
+        }
+        return withStoredContextCopies(decoded, (path) =>
+          rowsNow.get(JSON.stringify(path)),
+        ) as Schema.Schema.Type<TSchema>
+      }
+      // A stamp the domain object holds: what's returned is what's stored, as `get` would read it,
+      // and no read is needed to know that. The partition as read, with these writes applied.
+      const stored = new Map(allItems.map((item) => [String(item.sk), item]))
+      for (const { sk } of cleanup) stored.delete(sk)
+      for (const { deletes, puts } of groupWrites) {
+        for (const item of deletes) stored.delete(String((item.sk as { S?: string }).S))
+        const written = puts.map((item) => fromAttributeMap(item) as Record<string, unknown>)
+        yield* unpackAggregateItems(written, dispatchByType, aggregateName)
+        for (const item of written) stored.set(String(item.sk), item)
+      }
+      return (yield* assembleAggregate(
+        assembly,
+        rootNode,
+        [...stored.values()],
+        contextFields,
+        key,
+        aggregateName,
+        systemAttrs,
+      )) as Schema.Schema.Type<TSchema>
     })
 
   /** How many times `rekey` reads an aggregate again after a write changed it in between. */
@@ -4650,6 +4645,9 @@ const makeAggregate = <TSchema extends Schema.Top>(
             aggregateName,
             config.schema,
             { present: true, value: written, update: false },
+            undefined,
+            // The caller's own input, as given, which `EDD-9159` judges (`givenOverRow`).
+            input,
           )
 
           // 5. Build DynamoDB items with composed keys (create only ever PUTs).
@@ -4674,7 +4672,7 @@ const makeAggregate = <TSchema extends Schema.Top>(
             ),
           )
           yield* refuseOtherKindKeys(groups, "aggregate.create")
-          yield* refuseHeldOverRows(packedGroups, dynamoGroups, [])
+          yield* refuseGivenOverRows(packedGroups, dynamoGroups)
           yield* refuseNotReadBack(
             dynamoGroups,
             assembled,
@@ -5138,6 +5136,8 @@ interface ResolveNodeArgs {
   readonly elementEncoder?: AttrEncoder | undefined
   /** What a read knows of this node's rows (`readRowOf`). */
   readonly readRow: ReadRow
+  /** Where its value holds what it's given (`placedFields`). */
+  readonly placed?: Placed | undefined
   /** The aggregate's config, for the key attributes its rows are written with (`rowKeysOn`). */
   readonly rowKeys: RowKeyConfig
   readonly keyAttrEncoders?: AttrEncoders | undefined
@@ -5267,6 +5267,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             attrEncoders: buildAttrEncoders(valueFields, resolveRef),
             rowKeys: args.rowKeys,
             readRow: readRowOf("edge", args.rowKeys, declaredValueNames.one(parentFields, field)),
+            placed: placedFields(parentField),
             ...edgeStorage(
               edgePackedFields(
                 field,
@@ -5336,6 +5337,10 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
               args.rowKeys,
               declaredValueNames.many(parentFields, field, edge),
             ),
+            placed:
+              edge.decompose !== undefined || edge.assemble !== undefined
+                ? undefined
+                : placedFields(manyElementSchema(parentFields, field)),
             keyAttrEncoders: recomposed && escaped ? {} : entityKeyEncoders,
             ...(recomposed && {
               otherCompositionEncoders: escaped ? entityKeyEncoders : {},
@@ -5391,6 +5396,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
             args.rowKeys,
             declaredValueNames.own(subFields, bound.aggregate.edges),
           ),
+          placed: placedFields(bound.aggregate.schema),
           rowKeys: args.rowKeys,
           escapeKeys: args.escapeKeys,
         })
@@ -5414,6 +5420,7 @@ const resolveNode = (args: ResolveNodeArgs): ResolvedNode => {
     ...(discriminator !== undefined && { discriminator }),
     ...(ownDiscriminator !== undefined && { ownDiscriminator }),
     readRow: args.readRow,
+    ...(args.placed !== undefined && { placed: args.placed }),
     children,
     ...(assemble !== undefined && { assemble }),
     ...(decompose !== undefined && { decompose }),
@@ -6427,10 +6434,22 @@ interface DecomposedItem {
   readonly attributes: Record<string, unknown>
   /**
    * What the row's value holds at its top level, in its stored form, before the library writes its
-   * own attributes on the row (context, discriminators, keys, timestamps): what a write is judged
-   * on against the row it builds (`heldOverRow`, #241).
+   * own attributes on the row (context, discriminators, keys, timestamps): what `create` judges
+   * against the row it builds (`givenOverRow`, #241).
    */
   readonly own: Record<string, unknown>
+  /**
+   * `create` only: the caller's own value at this row's place, as given, before refs were hydrated
+   * or decoding filled anything in (`givenOverRow`, #241). Undefined where it gives none.
+   */
+  readonly input?: unknown
+  /**
+   * Where the row's value is in the value decomposed: the fields, and a `many` element's index,
+   * leading to it (`[]` for the root). Undefined for an element of a `many` edge with a custom
+   * `decompose`, whose rows aren't values at a place. `update` returns each member value's copy of
+   * a context attribute as the row there holds it once the write is done (#241).
+   */
+  readonly path?: ReadonlyArray<string | number> | undefined
   /**
    * Root item only: its attributes under the pre-#133 key encoders, which its
    * list-index composites are read from (see `buildKeyAttrEncoders`).
@@ -6506,6 +6525,164 @@ interface ContextValues {
   readonly key: Record<string, unknown>
 }
 
+/** `create`'s input at `field` of the caller's value `input`, as given (`payload[field]`). */
+const inputAt = (input: unknown, field: string): unknown =>
+  input !== null && typeof input === "object" ? given(input, field) : undefined
+
+/**
+ * The context values a write copies onto every row beneath the root, from the root's value: in
+ * their stored form (`stored`, what those rows hold) and as their keys read them (`key`). A domain
+ * date is encoded before marshalling, which would store it as `{ M: {} }`.
+ */
+const contextValuesOf = (
+  assembled: Record<string, unknown>,
+  contextFields: ReadonlyArray<string>,
+  encoders: NodeEncoders,
+): ContextValues => {
+  const contextValues: ContextValues = { stored: {}, key: {} }
+  for (const field of contextFields) {
+    const value = assembled[field]
+    const stored = encoders.stored[field]
+    const key = encoders.key[field]
+    contextValues.stored[field] = stored && value != null ? stored(value) : value
+    contextValues.key[field] = key && value != null ? key(value) : value
+  }
+  return contextValues
+}
+
+/** A copy of a value of the caller's, keeping its class. */
+const copyHolding = (value: object): Record<string, unknown> =>
+  Object.assign(Object.create(Object.getPrototypeOf(value)), value)
+
+/**
+ * What the row of a member value holds once `update`'s write is done: the write sent it, holding
+ * the root's context values over the value's own (`written`), or it's the row read (`row`, as the
+ * read handed it over).
+ */
+type RowNow = { readonly written: true } | { readonly row: Readonly<Record<string, unknown>> }
+
+/**
+ * `update`'s result with each member value's copy of a context attribute as its row now holds it,
+ * read back (#241). A write copies the root's context value (`stored`, {@link contextValuesOf})
+ * onto every row beneath the root, over what the member value held there, and a read hands back the
+ * row's: up to 1.40.0 `update` returned the copy the mutated state held, which a `get` right after
+ * didn't. A row the write didn't send keeps what it held when read (`rowAt`: a group the diff left
+ * alone, or one a retry finds unchanged after a failure left its rows behind the root). Wherever a
+ * member value's schema places the name ({@link placedFields}), held or not: a value that keeps
+ * what it's given takes the row's value as a read hands it back; a declared field, the row's value
+ * decoded by its schema as a read decodes it. A copy a read wouldn't hand back (taken off the row,
+ * or the row holding none) is left out, as a read leaves it out. A discriminator, a place the
+ * schema can't place exactly, a `many` edge with a custom `decompose` or `assemble` and a value
+ * whose row can't be told keep what the state held; a value no copy changes is returned as it is.
+ */
+const contextCopiesAsStored = (
+  root: ResolvedNode,
+  decoded: unknown,
+  stored: Readonly<Record<string, unknown>>,
+  rowAt: (path: ReadonlyArray<string | number>) => RowNow | undefined,
+  contextFields: ReadonlyArray<string>,
+  resolveRef: RefResolver | undefined,
+): unknown => {
+  // A declared field's decode, as assembly reads it.
+  const reads = new Map<Schema.Top, Map<string, (value: unknown) => Option.Option<unknown>>>()
+  const readField = (name: string, field: Schema.Top) => {
+    const byName = reads.get(field) ?? new Map()
+    reads.set(field, byName)
+    let read = byName.get(name)
+    if (read === undefined) {
+      read = Schema.decodeUnknownOption(
+        readingInstances(
+          substituteSchemaDeep(Schema.Struct({ [name]: field }), {
+            tolerantTransforms: true,
+            decodeOnly: true,
+            resolveRef,
+            absentReads: true,
+          }) as unknown as Schema.Codec<any>,
+        ),
+      )
+      byName.set(name, read)
+    }
+    return read
+  }
+  // What a read hands back of the context attribute `name` on the row `now` of `node`: `None` where
+  // it can't be told, `Some(undefined)` for nothing.
+  const readCopy = (node: ResolvedNode, now: RowNow, name: string): Option.Option<unknown> => {
+    const placed = node.placed
+    let row: unknown
+    try {
+      if (readTakesOff(node.readRow, name)) row = undefined
+      else if ("row" in now) row = Object.hasOwn(now.row, name) ? now.row[name] : undefined
+      else row = stored[name] === undefined ? undefined : asRead(stored[name])
+    } catch {
+      return Option.none()
+    }
+    if (placed === "any") return Option.some(row)
+    if (placed === undefined || !Object.hasOwn(placed, name)) return Option.none()
+    return Option.map(
+      readField(name, placed[name]!)(row === undefined ? {} : { [name]: row }),
+      (read) =>
+        Object.hasOwn(read as object, name) ? (read as Record<string, unknown>)[name] : undefined,
+    )
+  }
+  const member = (
+    node: ResolvedNode,
+    value: unknown,
+    path: ReadonlyArray<string | number>,
+  ): unknown => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value
+    const now = rowAt(path)
+    if (now === undefined) return value
+    let next: Record<string, unknown> | undefined
+    for (const name of contextFields) {
+      if (node.discriminator !== undefined && Object.hasOwn(node.discriminator, name)) continue
+      const read = readCopy(node, now, name)
+      if (Option.isNone(read)) continue
+      const holds = Object.hasOwn(value, name)
+      if (
+        read.value === undefined
+          ? !holds
+          : holds && deepEqual(read.value, (value as Record<string, unknown>)[name])
+      ) {
+        continue
+      }
+      next ??= copyHolding(value)
+      if (read.value === undefined) delete next[name]
+      else next[name] = read.value
+    }
+    return next ?? value
+  }
+  const walk = (
+    node: ResolvedNode,
+    value: unknown,
+    path: ReadonlyArray<string | number>,
+  ): unknown => {
+    if (value === null || typeof value !== "object") return value
+    let next: Record<string, unknown> | undefined
+    for (const child of node.children) {
+      const name = child.fieldName!
+      if (!Object.hasOwn(value, name)) continue
+      const was = (value as Record<string, unknown>)[name]
+      const at = [...path, name]
+      let now: unknown
+      if (child.cardinality === "many") {
+        if (child.decompose !== undefined || child.assemble !== undefined || !Array.isArray(was)) {
+          continue
+        }
+        const elements = was.map((element, index) => member(child, element, [...at, index]))
+        now = elements.every((element, i) => element === was[i]) ? was : elements
+      } else {
+        const held = member(child, was, at)
+        now = child.children.length > 0 ? walk(child, held, at) : held
+      }
+      if (now === was) continue
+      next ??= copyHolding(value)
+      next[name] = now
+    }
+    return next ?? value
+  }
+  return walk(root, decoded, [])
+}
+
 /**
  * Decompose an assembled domain object into DynamoDB items grouped by
  * sub-aggregate transaction boundaries.
@@ -6528,6 +6705,8 @@ const decomposeAggregate = (
    * compose one now (#241).
    */
   sharedKeys?: "keep" | undefined,
+  /** `create`'s input as the caller gave it, for each row's {@link DecomposedItem.input}. */
+  input?: unknown,
 ): Effect.Effect<ReadonlyArray<TransactionGroup>, AggregateDecompositionError> =>
   Effect.gen(function* () {
     const items: DecomposedItem[] = []
@@ -6541,15 +6720,7 @@ const decomposeAggregate = (
       return encode && value != null ? encode(value, asGiven) : value
     }
 
-    // Extract context values from the root, encoded for DynamoDB storage.
-    // Domain Date/DateTime objects must be encoded before toAttributeMap() marshalling,
-    // otherwise Date objects become { M: {} } (no enumerable properties).
-    const contextValues: ContextValues = { stored: {}, key: {} }
-    for (const field of contextFields) {
-      const value = assembled[field]
-      contextValues.stored[field] = encodeWith(encoders.stored, field, value)
-      contextValues.key[field] = encodeWith(encoders.key, field, value)
-    }
+    const contextValues = contextValuesOf(assembled, contextFields, encoders)
 
     // Root item: fields not claimed by edges
     const edgeFieldNames = new Set(rootNode.children.map((c) => c.fieldName).filter(Boolean))
@@ -6566,6 +6737,8 @@ const decomposeAggregate = (
       entityType: rootNode.entityType,
       attributes: rootAttrs,
       own: rootAttrs,
+      ...(input !== undefined && { input }),
+      path: [],
       keyAttributes: rootKeyAttrs,
       transactionGroup: "root",
       skComposites: [],
@@ -6589,6 +6762,8 @@ const decomposeAggregate = (
         aggregateName,
         schema,
         writtenField(written, child.fieldName!),
+        inputAt(input, child.fieldName!),
+        [child.fieldName!],
       )
     }
 
@@ -7174,6 +7349,10 @@ const decomposeNode = (
   schema: DynamoSchemaModule.DynamoSchema,
   /** The caller's own value here, on a write (see {@link Written}). */
   written: Written | undefined,
+  /** `create`'s input here, as the caller gave it ({@link DecomposedItem.input}). */
+  input: unknown,
+  /** Where `value` is in the value decomposed ({@link DecomposedItem.path}). */
+  path: ReadonlyArray<string | number>,
 ): Effect.Effect<void, AggregateDecompositionError> =>
   Effect.gen(function* () {
     // Optional edges may have null/undefined values — skip decomposition
@@ -7220,6 +7399,8 @@ const decomposeNode = (
         entityType: node.entityType,
         attributes: subRootAttrs,
         own: subRootOwn,
+        ...(input !== undefined && { input }),
+        path,
         transactionGroup: txGroup,
         skComposites: discValues.current,
         skCompositesOther: discValues.other,
@@ -7242,6 +7423,8 @@ const decomposeNode = (
           aggregateName,
           schema,
           writtenField(written, child.fieldName!),
+          inputAt(input, child.fieldName!),
+          [...path, child.fieldName!],
         )
       }
     } else if (node.cardinality === "one") {
@@ -7264,6 +7447,8 @@ const decomposeNode = (
         entityType: node.entityType,
         attributes: attrs,
         own,
+        ...(input !== undefined && { input }),
+        path,
         transactionGroup: parentGroup,
         skComposites: [...parentDiscriminators.current, ...ownDiscriminators.current],
         skCompositesOther: () => [...parentDiscriminators.other(), ...ownDiscriminators.other()],
@@ -7294,7 +7479,11 @@ const decomposeNode = (
         return attrs
       }
 
-      for (const elem of arrayItems) {
+      // An element's own value as given: the caller's element at its place, where no custom
+      // `decompose` maps the value to rows.
+      const givenElements = node.decompose === undefined && Array.isArray(input) ? input : []
+      for (const [index, elem] of arrayItems.entries()) {
+        const elementInput: unknown = givenElements[index]
         // The element's attributes in their STORED form — every nested date,
         // transformed scalar and hydrated ref encoded (#72, #133), and an element
         // whose schema shows no fields encoded as a whole (#241).
@@ -7329,6 +7518,8 @@ const decomposeNode = (
           entityType: node.entityType,
           attributes: attrs,
           own,
+          ...(elementInput !== undefined && { input: elementInput }),
+          ...(node.decompose === undefined && { path: [...path, index] }),
           transactionGroup: parentGroup,
           skComposites: [
             ...parentDiscriminators.current,

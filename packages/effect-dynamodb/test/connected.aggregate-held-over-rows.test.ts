@@ -1,5 +1,5 @@
 /**
- * What a read gives back of a row's value, judged at write (EDD-9159), against DynamoDB Local. The suite is `helpers/AggregateHeldOverRows.ts`; recording-table twin:
+ * What a read gives back of a row's value, judged at create (EDD-9159), against DynamoDB Local. The suite is `helpers/AggregateHeldOverRows.ts`; recording-table twin:
  * `AggregateHeldOverRows.test.ts`.
  *
  * Prerequisites:

@@ -4,19 +4,19 @@
  * sort key's copy, or a discriminator. The library writes its own value there over the value's, so
  * published 1.39.0 and 1.40.0 stored a row and read back something else than they were given.
  *
- * - **Read back, whatever was given, on every write** (a field every write stores that a read hands
- *   back: `id` as the partition key attribute, a required field as a list key whose composites
- *   every write stores): every row misread, so `Aggregate.make` refuses the definition, the pure
- *   one and the operational one alike. Only where every write stores it: an optional or nullable
- *   field, or one union member's, is judged on the value a write holds.
- * - **Read back, on the write that holds another value there** (the collection sort key's copy, a
- *   list key a write composes): refused at write; one holding none is written and read as 1.40.0
- *   did (1.39.0 died on a list composite with none: its list keys weren't sparse).
- * - **Taken off on a read** (`pk`, `sk`, `__edd_e__`, `gsi1pk` on the root, `readTakesOff`): a
- *   value given there was lost (or, held by a sort key composite, failed every read), so a write
- *   giving it one is refused. One giving it none is written and read as 1.40.0 did.
+ * - **`create` given another value there than the library's** (`id` as the partition key attribute,
+ *   `pk`, `sk`, `__edd_e__`, a list key a write composes, the collection sort key's copy): refused,
+ *   nothing sent. Given the library's value, or none, it's written and read as 1.40.0 did (1.39.0
+ *   died on a list composite with none: its list keys weren't sparse). `Aggregate.make` refuses
+ *   nothing: whether a write gives a field another value is known only at the write.
+ * - **A name the library doesn't write on that row** (`gsi1pk` with no list key composed): not
+ *   judged, written and read as on 1.40.0, which took it off the read.
  * - **A discriminator** is the library's to fill: written with the discriminator's value whatever
  *   the value holds, and read back so, as on 1.40.0.
+ * - **`update` isn't judged**: its state is what the read gave, and what the read filled in can't be
+ *   told from what the caller set, so the library's value replaces a value given there, as on
+ *   1.40.0, and it returns 1.40.0's result (the upgrade sweep, `AggregateUpgradeSweep.ts`, compares
+ *   each with what 1.40.0 sent, stored and returned).
  * - **A name the value declares that 1.40.0 took off by its prefix** (`gsiNote` on a `one` edge,
  *   `skills` on a sub-aggregate's root with an edge, `gsi2pk` on the root without a list) where the
  *   library writes no key of that name: read back as given. 1.40.0 lost it, or failed the read.
@@ -41,6 +41,15 @@ import { describe, expect, it } from "vitest"
 import * as Aggregate from "../../src/Aggregate.js"
 import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Table from "../../src/Table.js"
+import {
+  givenOverRow,
+  LIST_PK,
+  LIST_SK,
+  MIRRORED,
+  PARTITION,
+  SORT,
+  TYPE,
+} from "./AggregateUpgradeSweep.js"
 
 type Row = Record<string, AttributeValue>
 type Outcome = {
@@ -90,8 +99,6 @@ type Shape = {
   readonly pk?: string
   readonly collection?: unknown
   readonly list?: unknown
-  /** Refused by `Aggregate.make`, with this message. */
-  readonly make?: string
   /** Refused at `create`, nothing sent, with this message, naming `member`. */
   readonly write?: string
   readonly member?: string
@@ -112,16 +119,7 @@ const sub = (A: Module, Part: Schema.Top, edges: Record<string, unknown>) =>
     discriminator: { side: "x" },
   })
 
-const atMake = (owner: string, field: string, what: string) =>
-  `[EDD-9159] Aggregate "Root": ${owner} declares a field "${field}", which is also ${what}. ` +
-  "The library writes that attribute on the row over the value's own and a read hands it back"
-const lost = (member: string, field: string, what: string) =>
-  `[EDD-9159] "${member}" gives "${field}" a value at the top of its value, which is stored as the ` +
-  `attribute "${field}" of its row, also ${what}. A read takes that attribute off the row whatever ` +
-  "it holds"
-const misread = (member: string, field: string, held: string, what: string, library: string) =>
-  `[EDD-9159] "${member}" gives "${field}" the value ${held} at the top of its value, which is also ` +
-  `${what}. The library writes ${library} there over the value's own, and a read hands that back`
+const KEY = "$keyf#v1#keyf#a"
 const byRank = {
   index: "gsi1",
   name: "byRank",
@@ -134,16 +132,13 @@ const byPrio = (pk: string, sk: string) => ({
   pk: { field: pk, composite: [] },
   sk: { field: sk, composite: ["prio"] },
 })
-const PK = "the attribute holding the partition key"
-const SK = "the attribute holding its sort key"
-const TYPE = "the attribute holding its entity type"
 
 export const shapes: Record<string, (A: Module) => Shape> = {
   "root declares pk (optional), given mine": () => ({
     model: Schema.Struct({ id: S, pk: opt(S) }),
     edges: {},
     input: { id: "a", pk: "mine" },
-    write: lost("Root", "pk", PK),
+    write: givenOverRow("Root", "pk", "mine", PARTITION, KEY),
     member: "Root",
     read140: { ok: { id: "a" } },
   }),
@@ -157,14 +152,15 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     edges: {},
     input: { id: "a", title: "t" },
     pk: "id",
-    make: atMake("its root", "id", PK),
+    write: givenOverRow("Root", "id", "a", PARTITION, KEY),
+    member: "Root",
     read140: { ok: { id: "$keyf#v1#keyf#a", title: "t" } },
   }),
   "root declares sk (optional), given mine": () => ({
     model: Schema.Struct({ id: S, sk: opt(S) }),
     edges: {},
     input: { id: "a", sk: "mine" },
-    write: lost("Root", "sk", SK),
+    write: givenOverRow("Root", "sk", "mine", SORT, "$keyf#v1#root"),
     member: "Root",
     read140: { ok: { id: "a" } },
   }),
@@ -172,7 +168,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     model: Schema.Struct({ id: S, __edd_e__: opt(S) }),
     edges: {},
     input: { id: "a", __edd_e__: "mine" },
-    write: lost("Root", "__edd_e__", TYPE),
+    write: givenOverRow("Root", "__edd_e__", "mine", TYPE, "Root"),
     member: "Root",
     read140: { ok: { id: "a" } },
   }),
@@ -186,7 +182,8 @@ export const shapes: Record<string, (A: Module) => Shape> = {
       pk: { field: "status", composite: ["status"] },
       sk: { field: "lsk", composite: ["id"] },
     },
-    make: atMake("its root", "status", "the attribute holding its list partition key"),
+    write: givenOverRow("Root", "status", "open", LIST_PK, "$keyf#v1#bystatus#open"),
+    member: "Root",
     read140: { ok: { id: "a", status: "$keyf#v1#bystatus#open" } },
   }),
   "root declares the list sk attribute rank": () => ({
@@ -194,7 +191,8 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     edges: {},
     input: { id: "a", rank: "r1" },
     list: byRank,
-    make: atMake("its root", "rank", "the attribute holding its list sort key"),
+    write: givenOverRow("Root", "rank", "r1", LIST_SK, "$keyf#v1#byrank#r1"),
+    member: "Root",
     read140: { ok: { id: "a", rank: "$keyf#v1#byrank#r1" } },
   }),
   "root declares the list sk attribute rank (optional), given none": () => ({
@@ -215,30 +213,24 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     edges: {},
     input: { id: "a", lsk: "mine", prio: "p1" },
     list: byPrio("lpk", "lsk"),
-    write: misread(
-      "Root",
-      "lsk",
-      '"mine"',
-      "the attribute holding its list sort key",
-      '"$keyf#v1#byprio#p1"',
-    ),
+    write: givenOverRow("Root", "lsk", "mine", LIST_SK, "$keyf#v1#byprio#p1"),
     member: "Root",
     read140: { ok: { id: "a", lsk: "$keyf#v1#byprio#p1", prio: "p1" } },
   }),
+  // No list key is composed (its composite has no value), so the library writes no `gsi1pk`: not
+  // judged, and taken off the read, as on 1.40.0.
   "root declares the list pk attribute gsi1pk (optional), given mine": () => ({
     model: Schema.Struct({ id: S, gsi1pk: opt(S), prio: opt(S) }),
     edges: {},
     input: { id: "a", gsi1pk: "mine" },
     list: byPrio("gsi1pk", "gsi1sk"),
-    write: lost("Root", "gsi1pk", "the attribute holding its list partition key"),
-    member: "Root",
-    read140: { ok: { id: "a" } },
+    read: { id: "a" },
   }),
   "one edge value declares sk (optional), given mine": (A) => ({
     model: Schema.Struct({ id: S, note: Schema.Struct({ text: S, sk: opt(S) }) }),
     edges: { note: one(A) },
     input: { id: "a", note: { text: "n", sk: "mine" } },
-    write: lost("note", "sk", SK),
+    write: givenOverRow("note", "sk", "mine", SORT, "$keyf#v1#note"),
     member: "note",
     read140: { ok: { id: "a", note: { text: "n" } } },
   }),
@@ -254,7 +246,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     }),
     edges: { lines: many(A, ["sk"]) },
     input: { id: "a", lines: [{ sk: "x", qty: 1 }] },
-    write: lost("lines", "sk", SK),
+    write: givenOverRow("lines", "sk", "x", SORT, "$keyf#v1#line#x"),
     member: "lines",
     read140: { failed: "ValidationError", operation: "aggregate.assemble" },
   }),
@@ -265,7 +257,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     }),
     edges: { lines: many(A) },
     input: { id: "a", lines: [{ qty: 1, __edd_e__: "mine" }] },
-    write: lost("lines", "__edd_e__", TYPE),
+    write: givenOverRow("lines", "__edd_e__", "mine", TYPE, "Line"),
     member: "lines",
     read140: { ok: { id: "a", lines: [{ qty: 1 }] } },
   }),
@@ -275,7 +267,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
       model: Schema.Struct({ id: S, part: Part }),
       edges: { part: sub(A, Part, {}) },
       input: { id: "a", part: { name: "p", pk: "mine" } },
-      write: lost("part", "pk", PK),
+      write: givenOverRow("part", "pk", "mine", PARTITION, KEY),
       member: "part",
       read140: { ok: { id: "a", part: { name: "p" } } },
     }
@@ -286,13 +278,7 @@ export const shapes: Record<string, (A: Module) => Shape> = {
     input: { id: "a", note: { text: "n", csk: "mine" } },
     collection: { name: "keyf", index: "lsi1", sk: { field: "csk", composite: [] } },
     // Optional: a write giving none stores the copy there, and reads it back, as on 1.40.0.
-    write: misread(
-      "note",
-      "csk",
-      '"mine"',
-      "the attribute holding the collection sort key's copy",
-      '"$keyf#v1#note"',
-    ),
+    write: givenOverRow("note", "csk", "mine", MIRRORED, "$keyf#v1#note"),
     member: "note",
     read140: { ok: { id: "a", note: { text: "n", csk: "$keyf#v1#note" } } },
   }),
@@ -627,7 +613,7 @@ export const suite = (
           ))
       }
 
-      it("without an edge, its pkey read back the key text: given none, as on 1.40.0; given another, refused at write", () =>
+      it("without an edge, its pkey read back the key text: given none, as on 1.40.0; given another, create is refused", () =>
         Effect.runPromise(
           harness.onTable(
             (tableName) =>
@@ -636,7 +622,6 @@ export const suite = (
                   "childless sub-aggregate declaring pkey (optional), keyed under pkey, given none"
                 const read = { id: "a", part: { name: "p", pkey: "$strip#v1#strip#a" } }
                 expect(judged(then[label]!.get)).toEqual({ ok: read })
-                // Optional: not every write stores it, so `Aggregate.make` takes it.
                 expect(() => sub(pure, false)).not.toThrow()
                 const A = sub(Aggregate, false)
                 const db: any = yield* DynamoClient.make({
@@ -653,8 +638,8 @@ export const suite = (
                   reason?: string
                 }
                 expect(error._tag).toBe("AggregateDecompositionError")
-                expect(error.reason).toContain(
-                  misread("part", "pkey", '"mine"', PK, '"$strip#v1#strip#a"'),
+                expect(error.reason).toBe(
+                  givenOverRow("part", "pkey", "mine", PARTITION, "$strip#v1#strip#a"),
                 )
                 expect(yield* harness.commands(tableName)).toEqual([])
                 yield* db.aggregates.A.create({ id: "a", part: { name: "p" } })
@@ -666,7 +651,7 @@ export const suite = (
           ),
         ))
 
-      it("with an edge, its pkey was taken off, so only a write giving it a value is refused", () =>
+      it("with an edge, its pkey was taken off, so only a create giving it another value is refused", () =>
         Effect.runPromise(
           harness.onTable((tableName) =>
             Effect.gen(function* () {
@@ -694,107 +679,80 @@ export const suite = (
                 reason?: string
               }
               expect(error._tag).toBe("AggregateDecompositionError")
-              expect(error.reason).toContain(lost("part", "pkey", PK))
+              expect(error.reason).toBe(
+                givenOverRow("part", "pkey", "mine", PARTITION, "$strip#v1#strip#a"),
+              )
               expect(yield* harness.commands(tableName)).toEqual([])
             }),
           ),
         ))
     })
 
-    // An `update` judges what it writes as `create` does: one introducing a collision is refused
-    // after its read, with nothing written.
+    // `update` isn't judged (`EDD-9159` is `create`'s): its state is what the read gave, and what the
+    // read filled in can't be told from what the caller set. A value given where the library writes
+    // another is replaced by the library's, as on 1.40.0, and the update returns 1.40.0's result, the
+    // state as mutated, which a get after it doesn't read: the read hands back the library's value
+    // (a discriminator, a list key's text) or takes the attribute off (DESIGN.md §11 "What `update` returns" lists these).
+    // The upgrade sweep compares each with what published 1.40.0 sent, stored and returned.
     const updates: ReadonlyArray<{
-      readonly from: string
-      readonly change: (state: any) => any
-      readonly message: string
-      readonly member: string
-    }> = [
-      {
-        from: "root declares the list sk attribute lsk, given mine, its list composite prio given none",
-        change: (state) => ({ ...state, prio: "p1" }),
-        message: misread(
-          "Root",
-          "lsk",
-          '"mine"',
-          "the attribute holding its list sort key",
-          '"$keyf#v1#byprio#p1"',
-        ),
-        member: "Root",
-      },
-      {
-        from: "root declares pk (optional), given none",
-        change: (state) => ({ ...state, pk: "mine" }),
-        message: lost("Root", "pk", PK),
-        member: "Root",
-      },
-      {
-        from: "one edge value declares pk (optional), given none",
-        change: (state) => ({ ...state, note: { ...state.note, pk: "mine" } }),
-        message: lost("note", "pk", PK),
-        member: "note",
-      },
-    ]
-    for (const { from, change, message, member } of updates) {
-      it(`${from}: an update introducing a collision is refused, nothing written`, () =>
-        Effect.runPromise(
-          harness.onTable((tableName) =>
-            Effect.gen(function* () {
-              const shape = shapes[from]!(Aggregate)
-              const A = yield* bind(shape)
-              yield* A.create(shape.input)
-              const before = bySortKey(yield* harness.rows(tableName))
-              yield* harness.commands(tableName)
-              const exit = yield* Effect.exit(
-                A.update({ id: "a" }, ({ state }: any) => change(state)),
-              )
-              const error = Cause.squash((exit as Exit.Failure<unknown, unknown>).cause) as {
-                _tag?: string
-                member?: string
-                reason?: string
-              }
-              expect(error._tag).toBe("AggregateDecompositionError")
-              expect(error.member).toBe(member)
-              expect(error.reason).toContain(message)
-              expect(yield* harness.commands(tableName)).toEqual(["Query"])
-              expect(bySortKey(yield* harness.rows(tableName))).toEqual(before)
-            }),
-          ),
-        ))
-    }
-
-    // The library's to fill, as on 1.40.0: a discriminator, written with its value whatever the
-    // value holds; a key text or context copy a read gave, rewritten when what it copies changes.
-    const filled: ReadonlyArray<{
       readonly label: string
       readonly from: string
       readonly change: (state: any) => any
-      readonly read: unknown
       readonly commands: ReadonlyArray<string>
+      readonly update: unknown
+      readonly read: unknown
     }> = [
       {
-        label: "an update giving a one edge's discriminator another value: written as before",
+        label: "an update composing the list key over lsk, which holds mine",
+        from: "root declares the list sk attribute lsk, given mine, its list composite prio given none",
+        change: (state) => ({ ...state, prio: "p1" }),
+        commands: ["Query", "TransactWriteItems"],
+        update: { id: "a", lsk: "mine", prio: "p1" },
+        read: { id: "a", lsk: "$keyf#v1#byprio#p1", prio: "p1" },
+      },
+      {
+        label: "an update giving the root's pk a value",
+        from: "root declares pk (optional), given none",
+        change: (state) => ({ ...state, pk: "mine" }),
+        commands: ["Query", "TransactWriteItems"],
+        update: { id: "a", pk: "mine" },
+        read: { id: "a" },
+      },
+      {
+        label: "an update giving a one edge's pk a value",
+        from: "one edge value declares pk (optional), given none",
+        change: (state) => ({ ...state, note: { ...state.note, pk: "mine" } }),
+        commands: ["Query", "TransactWriteItems"],
+        update: { id: "a", note: { text: "n", pk: "mine" } },
+        read: { id: "a", note: { text: "n" } },
+      },
+      {
+        label: "an update giving a one edge's discriminator another value",
         from: "one edge value declares its discriminator kind, given it",
         change: (state) => ({ ...state, note: { ...state.note, kind: "b", text: "m" } }),
-        read: { id: "a", note: { text: "m", kind: "a" } },
         commands: ["Query", "TransactWriteItems"],
+        update: { id: "a", note: { text: "m", kind: "b" } },
+        read: { id: "a", note: { text: "m", kind: "a" } },
       },
       {
-        label: "an update giving a sub-aggregate's discriminator another value: nothing to write",
+        label: "an update giving a sub-aggregate's discriminator another value",
         from: "sub-aggregate declares its discriminator side, given it",
         change: (state) => ({ ...state, part: { ...state.part, side: "y" } }),
-        read: { id: "a", part: { name: "p", side: "x" } },
         commands: ["Query"],
+        update: { id: "a", part: { name: "p", side: "y" } },
+        read: { id: "a", part: { name: "p", side: "x" } },
       },
       {
-        label: "an update moving the list key a read gave in lsk: the new key text",
+        label: "an update moving the list key a read gave in lsk",
         from: "root declares the list sk attribute lsk (optional), its list composite prio given",
         change: (state) => ({ ...state, prio: "p2" }),
-        read: { id: "a", lsk: "$keyf#v1#byprio#p2", prio: "p2" },
         commands: ["Query", "TransactWriteItems"],
+        update: { id: "a", lsk: "$keyf#v1#byprio#p1", prio: "p2" },
+        read: { id: "a", lsk: "$keyf#v1#byprio#p2", prio: "p2" },
       },
     ]
-    for (const { label, from, change, read, commands } of filled) {
-      it(label, () =>
+    for (const { label, from, change, commands, update, read } of updates) {
+      it(`${label}: written as on 1.40.0, the library's value over it; returns the state as mutated`, () =>
         Effect.runPromise(
           harness.onTable((tableName) =>
             Effect.gen(function* () {
@@ -802,40 +760,28 @@ export const suite = (
               const A = yield* bind(shape)
               yield* A.create(shape.input)
               yield* harness.commands(tableName)
-              const update = outcome(
+              const result = outcome(
                 yield* Effect.exit(A.update({ id: "a" }, ({ state }: any) => change(state))),
               )
               expect(yield* harness.commands(tableName)).toEqual(commands)
-              expect(update).toEqual({ ok: read })
+              expect(result).toEqual({ ok: update })
               expect(outcome(yield* Effect.exit(A.get({ id: "a" })))).toEqual({ ok: read })
             }),
           ),
-        ),
-      )
+        ))
     }
 
     for (const [label, shapeOf] of Object.entries(shapes)) {
       const then = published["1.40.0"][label]!
       const shape = shapeOf(Aggregate)
-      if (shape.make !== undefined) {
-        it(`${label}: 1.40.0 read back the library's value; Aggregate.make refuses it`, () => {
-          expect(judged(then.create)).toEqual({ ok: shape.input })
-          expect(judged(then.get)).toEqual(shape.read140)
-          expect(judged(then.getAfterUpdate)).toEqual(shape.read140)
-          expect(() => define(Aggregate, shape)).toThrow(shape.make)
-          const pure = shapeOf(PureAggregate as unknown as Module)
-          expect(() => define(PureAggregate as unknown as Module, pure)).toThrow(shape.make)
-        })
-        continue
-      }
       if (shape.write !== undefined) {
-        it(`${label}: 1.40.0 read back something else; the write is refused, nothing sent`, () =>
+        it(`${label}: 1.40.0 read back something else; create is refused, nothing sent`, () =>
           Effect.runPromise(
             harness.onTable((tableName) =>
               Effect.gen(function* () {
                 expect(judged(then.create)).toEqual({ ok: shape.input })
                 expect(judged(then.get)).toEqual(shape.read140)
-                // The pure make takes it: the value isn't known until a write.
+                // The pure make takes it: whether a write gives another value is known at the write.
                 const pure = PureAggregate as unknown as Module
                 expect(() => define(pure, shapeOf(pure))).not.toThrow()
                 const A = yield* bind(shape)
@@ -849,7 +795,7 @@ export const suite = (
                 }
                 expect(error._tag).toBe("AggregateDecompositionError")
                 expect(error.member).toBe(shape.member)
-                expect(error.reason).toContain(shape.write)
+                expect(error.reason).toBe(shape.write)
                 expect(yield* harness.commands(tableName)).toEqual([])
                 expect(yield* harness.rows(tableName)).toEqual([])
               }),
