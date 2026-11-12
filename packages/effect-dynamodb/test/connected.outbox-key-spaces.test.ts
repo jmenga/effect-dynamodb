@@ -28,6 +28,7 @@ import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
 import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import * as Table from "../src/Table.js"
+import { markOf } from "./helpers/OutboxMarks.js"
 
 const ENDPOINT = Effect.runSync(
   Config.String("DYNAMODB_ENDPOINT").pipe(Config.withDefault("http://localhost:8000")),
@@ -142,9 +143,15 @@ const physical = () => {
       .map((item) => `${item.pk?.S}|${item.sk?.S}`)
       .sort()
   })
+  /** The outbox items as stored. */
+  const outboxItems = Effect.gen(function* () {
+    const ddb = yield* DynamoClient
+    const page = yield* ddb.scan({ TableName: names.o, ConsistentRead: true })
+    return (page.Items ?? []).filter((item) => item.__edd_e__?.S === "Ledger#outbox")
+  })
   /** The tables other than the outbox's that `GetItem` named since the last call. */
   const rowReads = () => gets.splice(0).filter((name) => name !== names.o)
-  return { names, client, create, drop, outbox, rowReads }
+  return { names, client, create, drop, outbox, outboxItems, rowReads }
 }
 
 /** One side: a `Ledger` read model keyed by `pk`, on a table of its own or a member of `O`. */
@@ -563,9 +570,17 @@ describeConnected("outbox key spaces on DynamoDB Local (#237)", () => {
             expect(new Set(items.map((key) => key.split("|")[0])).size).toBe(2)
             expect(tails).toEqual(["000000000001#0000", "000000000001#0000"])
           } else {
-            // One key: B's written beside A's.
+            // One key: B's written beside A's, at A's key followed by its mark (B's tag, then its
+            // effect's).
             expect(new Set(items.map((key) => key.split("#outbox#")[0])).size).toBe(1)
-            expect(tails).toEqual(["000000000001#0000", `000000000001#0000#${tags[1]}`])
+            const stored = yield* p.outboxItems
+            const marked = (i: number) =>
+              stored.filter((item) => item.__edd_rm__?.S?.startsWith(`${tags[i]}.`))
+            expect(marked(0)).toHaveLength(1)
+            expect(marked(1)).toHaveLength(1)
+            const mark = markOf(w.ledgers[1]!, marked(1)[0] as never)
+            expect(marked(1)[0]!.__edd_rm__).toEqual({ S: mark })
+            expect(tails).toEqual(["000000000001#0000", `000000000001#0000#${mark}`])
           }
           // B by its row passes over A's; A's sweep delivers A's; nothing is left.
           expect(yield* delivered(projections[1], sides[1]!.row)).toEqual([2])
