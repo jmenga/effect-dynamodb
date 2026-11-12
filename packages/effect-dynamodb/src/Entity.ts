@@ -12502,28 +12502,47 @@ const makeImpl = <
        * `EDD-9163` (#242): an `orderBy` stored as a map (an `Option`, a `Result`, a `Duration`,
        * a `BigDecimal`, a zone), a list, a boolean or null is a value `<` doesn't take, so DynamoDB
        * refuses the condition whatever the item holds (a field always stored so can never
-       * append; a null only fails the appends holding it). Not
-       * checked: the append is sent, and the refusal, confirmed against the condition sent
-       * (`OperandType`), is this. Any other diagnosis is the one every write gives.
+       * append; a null only fails the appends holding it). Not checked: the append is sent, and
+       * DynamoDB's refusal is recognised (`OperandType`) and then confirmed on the request that was
+       * sent: its condition holds the guard on this `orderBy`, DynamoDB named `<`, and the guard's
+       * own operand (`:_tsNewOb`, the new `orderBy`) is of the type it named. The stored side isn't
+       * known (nothing is read first), so a refusal of a stored value alone isn't confirmed. Any
+       * other operand-type refusal (the caller's condition comparing a null, a map, a boolean)
+       * is DynamoDB's error, passed through unchanged; any other diagnosis is the one every write
+       * gives.
        */
-      const orderByRefusal = (diagnosis: Diagnosis, original: unknown) =>
-        diagnosis._tag === "OperandType" && diagnosis.attribute === orderByName
-          ? new ValidationError({
-              entityType,
-              operation: "append",
-              cause: withCause(
-                `[EDD-9163] Entity "${entityType}": this append's timeSeries.orderBy field ` +
-                  `"${orderByField}" is stored as ${storedTypeName(diagnosis.operandType)}. An ` +
-                  "append writes only when the stored orderBy is below the new one, and " +
-                  `DynamoDB evaluates ${diagnosis.operator} only on numbers, strings and ` +
-                  "binary, so it refused the append. A field stored as a map, a list or a " +
-                  "boolean (an Option, a Result, a Duration, a BigDecimal, a zone) can never " +
-                  "order appends: order them by a field stored as a number or a string (a " +
-                  "date, a number, a Schema.DurationFromMillis). Nothing was written.",
-                original,
-              ),
-            })
-          : diagnosedValidationError(diagnosis, original, { operation: "append", entityType })
+      const orderByRefusal = (
+        diagnosis: Diagnosis,
+        original: unknown,
+        sent: TransactWriteItem["Update"],
+      ) => {
+        if (diagnosis._tag !== "OperandType") {
+          return diagnosedValidationError(diagnosis, original, { operation: "append", entityType })
+        }
+        const guardOperand = sent?.ExpressionAttributeValues?.[":_tsNewOb"]
+        const guardRefused =
+          diagnosis.operator === "<" &&
+          (sent?.ConditionExpression ?? "").includes("#_tsob < :_tsNewOb") &&
+          sent?.ExpressionAttributeNames?.["#_tsob"] === orderByName &&
+          guardOperand !== undefined &&
+          Object.keys(guardOperand)[0] === diagnosis.operandType
+        if (!guardRefused) return original as DynamoClientError
+        return new ValidationError({
+          entityType,
+          operation: "append",
+          cause: withCause(
+            `[EDD-9163] Entity "${entityType}": this append's timeSeries.orderBy field ` +
+              `"${orderByField}" is stored as ${storedTypeName(diagnosis.operandType)}. An ` +
+              "append writes only when the stored orderBy is below the new one, and " +
+              `DynamoDB evaluates ${diagnosis.operator} only on numbers, strings and ` +
+              "binary, so it refused the append. A field stored as a map, a list or a " +
+              "boolean (an Option, a Result, a Duration, a BigDecimal, a zone) can never " +
+              "order appends: order them by a field stored as a number or a string (a " +
+              "date, a number, a Schema.DurationFromMillis). Nothing was written.",
+            original,
+          ),
+        })
+      }
 
       // ---------- Execute TransactWriteItems ----------
       /** One attempt: the UpdateItem guarded by `cas` (and the user's condition), then the event Put. */
@@ -12576,7 +12595,8 @@ const makeImpl = <
             }),
             keys: entityKeys,
             optIn: ["OperandType"],
-            rewrite: orderByRefusal,
+            rewrite: (diagnosis, original) =>
+              orderByRefusal(diagnosis, original, appendItems[0]?.Update),
           }),
           Effect.matchEffect({
             onSuccess: () => Effect.succeed({ stale: false as const }),

@@ -78,7 +78,10 @@ const entityOf = (seqSchema: Schema.Top, field?: string) => {
   } as never) as any
 }
 
-/** Append each value in turn to a fresh table: each outcome, and the rows left. */
+/**
+ * Append each value in turn to a fresh table: each outcome, and the rows left. A value given as
+ * `{ seq, condition }` appends with that condition of the caller's.
+ */
 const appendEach = (Readings: any, values: ReadonlyArray<unknown>) => {
   const TableName = `orderby-operand-type-${Date.now()}-${tables++}`
   const Main = Table.make({ schema, entities: { Readings } })
@@ -105,9 +108,11 @@ const appendEach = (Readings: any, values: ReadonlyArray<unknown>) => {
         tables: { Main },
       } as never)
       const results: Array<unknown> = []
-      for (const seq of values) {
+      for (const value of values) {
+        const conditioned = value instanceof Conditioned ? value : undefined
+        const append = db.entities.Readings.append({ id: "r1", seq: conditioned?.seq ?? value })
         results.push(
-          yield* db.entities.Readings.append({ id: "r1", seq })
+          yield* (conditioned === undefined ? append : append.condition(conditioned.condition))
             .asEffect()
             .pipe(
               Effect.as("appended"),
@@ -122,6 +127,14 @@ const appendEach = (Readings: any, values: ReadonlyArray<unknown>) => {
   }).pipe(
     Effect.ensuring(Effect.ignore(send(() => raw.send(new DeleteTableCommand({ TableName }))))),
   ) as Effect.Effect<{ outcomes: Array<any>; rows: Array<unknown> }>
+}
+
+/** An append's `orderBy` value with a condition of the caller's. */
+class Conditioned {
+  constructor(
+    readonly seq: unknown,
+    readonly condition: (t: any, ops: any) => unknown,
+  ) {}
 }
 
 /** `EDD-9163` naming `orderBy`, its field and the type, DynamoDB's refusal one step down. */
@@ -258,4 +271,69 @@ describeConnected("an append whose orderBy is stored as a type < doesn't take (E
       }),
     )
   }
+})
+
+describeConnected("the caller's own condition is DynamoDB's to refuse (not EDD-9163)", () => {
+  /** DynamoDB's refusal of a comparison, passed through as 1.40.0 gave it. */
+  const expectDynamo = (outcome: any, operator: string, type: string) => {
+    expect(outcome?._tag).toBe("DynamoValidationError")
+    const message = String(outcome?.cause?.message)
+    expect(message).not.toContain("EDD-9163")
+    expect(message).toContain(`operator or function: ${operator}, operand type: ${type}`)
+  }
+  for (const [name, operator, type, condition] of [
+    ["null", "<", "NULL", (t: any, { lt }: any) => lt(t.seq, null)],
+    ["a map", "<", "M", (t: any, { lt }: any) => lt(t.seq, { a: 1 })],
+    ["a boolean", ">", "BOOL", (t: any, { gt }: any) => gt(t.seq, true)],
+    ["a list", "<", "L", (t: any, { lt }: any) => lt(t.seq, [1])],
+  ] as const) {
+    it.effect(`comparing the orderBy with ${name}: first append, then on the item`, () =>
+      Effect.gen(function* () {
+        const { outcomes, rows } = yield* appendEach(entityOf(Schema.Number), [
+          new Conditioned(1, condition),
+          1,
+          new Conditioned(2, condition),
+        ])
+        expectDynamo(outcomes[0], operator, type)
+        expect(outcomes[1]).toBe("appended")
+        expectDynamo(outcomes[2], operator, type)
+        // The one append that went through: the current item and its event.
+        expect(rows).toHaveLength(2)
+      }),
+    )
+  }
+
+  it.effect("comparing the orderBy with another type is a condition that doesn't hold", () =>
+    Effect.gen(function* () {
+      const condition = (t: any, { lt }: any) => lt(t.seq, "x")
+      const { outcomes, rows } = yield* appendEach(entityOf(Schema.Number), [
+        new Conditioned(1, condition),
+        1,
+        new Conditioned(2, condition),
+      ])
+      expect(outcomes[0]?._tag).toBe("ConditionalCheckFailed")
+      expect(outcomes[1]).toBe("appended")
+      expect(outcomes[2]?._tag).toBe("ConditionalCheckFailed")
+      expect(rows).toHaveLength(2)
+    }),
+  )
+
+  it.effect(
+    "a nullable orderBy: the caller's null is DynamoDB's, the append's own is EDD-9163",
+    () =>
+      Effect.gen(function* () {
+        const callers = (t: any, { lt }: any) => lt(t.seq, null)
+        const { outcomes, rows } = yield* appendEach(entityOf(Schema.NullOr(Schema.Number)), [
+          new Conditioned(1, callers),
+          null,
+          1,
+          new Conditioned(2, callers),
+        ])
+        expectDynamo(outcomes[0], "<", "NULL")
+        expectRefused(outcomes[1], "null (NULL)")
+        expect(outcomes[2]).toBe("appended")
+        expectDynamo(outcomes[3], "<", "NULL")
+        expect(rows).toHaveLength(2)
+      }),
+  )
 })

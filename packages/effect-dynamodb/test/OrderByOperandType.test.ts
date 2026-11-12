@@ -177,22 +177,53 @@ describe("an append whose orderBy is stored as a type < doesn't take (EDD-9163)"
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("names another attribute a user condition compares, without EDD-9163", () => {
-    const { layer } = refusing(requestRefusal("<", "M"))
-    return Effect.gen(function* () {
-      const db = yield* client
-      const error = yield* db.entities.Counts.append({ id: "c1", n: 1 })
-        .condition((t, { lt }) => lt(t.flag as never, Option.some(1) as never))
-        .asEffect()
-        .pipe(Effect.flip)
-      expect(error._tag).toBe("ValidationError")
-      const { message, dynamo } = causes(error as ValidationError)
-      expect(message).not.toContain("EDD-9163")
-      expect(message).toContain('compares "flag" with <')
-      expect(message).toContain("a map (M)")
-      expect(dynamo._tag).toBe("DynamoValidationError")
-    }).pipe(Effect.provide(layer))
-  })
+  it.effect(
+    "passes the caller's own refused comparison of another attribute through unchanged",
+    () => {
+      const { layer } = refusing(requestRefusal("<", "M"))
+      return Effect.gen(function* () {
+        const db = yield* client
+        const error = yield* db.entities.Counts.append({ id: "c1", n: 1 })
+          .condition((t, { lt }) => lt(t.flag as never, Option.some(1) as never))
+          .asEffect()
+          .pipe(Effect.flip)
+        expect(error._tag).toBe("DynamoValidationError")
+      }).pipe(Effect.provide(layer))
+    },
+  )
+
+  // The caller's condition compares the orderBy field itself with a value `<` doesn't take: the
+  // diagnosis names the orderBy attribute, but the guard's own operand is a number, so the append
+  // value isn't what DynamoDB refused. DynamoDB's error, as 1.40.0 gave it.
+  for (const [name, type, condition] of [
+    ["null", "NULL", (t: any, { lt }: any) => lt(t.n, null)],
+    ["a map", "M", (t: any, { lt }: any) => lt(t.n, { a: 1 })],
+    ["a boolean", "BOOL", (t: any, { gt }: any) => gt(t.n, true)],
+  ] as const) {
+    it.effect(
+      `passes the caller's comparison of the orderBy with ${name} through unchanged`,
+      () => {
+        const operator = name === "a boolean" ? ">" : "<"
+        const { sent, layer } = refusing(requestRefusal(operator, type))
+        return Effect.gen(function* () {
+          const db = yield* client
+          const error = yield* db.entities.Counts.append({ id: "c1", n: 1 })
+            .condition(condition as never)
+            .asEffect()
+            .pipe(Effect.flip)
+          expect(error._tag).toBe("DynamoValidationError")
+          expect(String((error as { cause?: { message?: string } }).cause?.message)).toContain(
+            `operand type: ${type}`,
+          )
+          expect(
+            sent[0]!.TransactItems?.[0]?.Update?.ExpressionAttributeValues?.[":_tsNewOb"],
+          ).toEqual({
+            N: "1",
+          })
+        }).pipe(Effect.provide(layer))
+      },
+    )
+  }
 
   it.effect("leaves a write that doesn't ask for the diagnosis as DynamoDB refused it", () => {
     const { layer } = refusing(
