@@ -42,6 +42,35 @@ export const DEFAULT_TTL_ATTRIBUTE_NAME = "_ttl"
 export const resolveTtlAttributeName = (tc: TableConfig): string =>
   tc.ttlAttributeName ?? DEFAULT_TTL_ATTRIBUTE_NAME
 
+const keyAttributesByTag = new WeakMap<object, Set<string>>()
+// A service key is a function as much as an object.
+const isTagObject = (tag: unknown): tag is object =>
+  (typeof tag === "object" && tag !== null) || typeof tag === "function"
+
+/**
+ * @internal The attributes a table's members write keys under, by its service (#237): the
+ * primary key's, every secondary index's (entity and aggregate) and every vector index's
+ * partition and filter attributes, as {@link resolveKeyAttributeTypes} lists them, and those of
+ * every aggregate made on the table without being registered on it and every event stream's
+ * index on it ({@link addTableKeyAttributes}). Any item holding one of them is indexed by it, so
+ * the library adds no attribute of its own under such a name. `undefined` for a service `make`
+ * didn't create.
+ */
+export const tableKeyAttributes = (tag: unknown): ReadonlySet<string> | undefined =>
+  isTagObject(tag) ? keyAttributesByTag.get(tag) : undefined
+
+/**
+ * @internal Adds the attributes an aggregate made on a table, or an event stream's indexes on it,
+ * write keys under (#237): neither is registered on the table, and their items are on it all the
+ * same.
+ */
+export const addTableKeyAttributes = (tag: unknown, names: Iterable<string>): void => {
+  if (!isTagObject(tag)) return
+  const known = keyAttributesByTag.get(tag) ?? new Set<string>()
+  for (const name of names) known.add(name)
+  keyAttributesByTag.set(tag, known)
+}
+
 /**
  * Counter for generating unique Tag identifiers.
  * Each `make()` call increments this to ensure distinct Context.Service tags.
@@ -176,7 +205,7 @@ export const make = <
   // One attribute has one `AttributeDefinitions` type: a Z-order (`B`) sort key
   // can't share its attribute with a string key half or a vector filter
   // attribute of another type (EDD-9091).
-  resolveKeyAttributeTypes(entities, aggregates, primary)
+  const keyAttributes = resolveKeyAttributeTypes(entities, aggregates, primary)
   // Two of an entity's key halves in one attribute must have the same fields, order and
   // casing (EDD-9106). `Entity.make` refused what no schema can reconcile; a casing an index
   // leaves to the schema resolves only here.
@@ -192,6 +221,7 @@ export const make = <
       entity._configure(config.schema, Tag)
     }
   }
+  addTableKeyAttributes(Tag, keyAttributes.keys())
 
   return {
     _tag: "Table" as const,

@@ -935,10 +935,10 @@ and retained history. None of these is ever regenerated from this repo.
 **Rows holding no values.** A projection's row tombstone or outbox item says which text its key is
 by `__edd_kt__` (`KeyText136.formOfMark`, `markOf`): none is off's, `1` that of 1.37.0 and 1.38.0, `2`
 that of `escapeKeys: true` when it differs from off's. `rekey` reads the key back by the mark. An
-outbox item written from 1.41.0 also names its read model by `__edd_rm__` (`readModelTag`, #237),
-part of no key, which `drainPending` and the outbox table's `rekey` read first
-(`outboxOwnership`); `rekey` moves an item as it is, tag and all, and adds none to an item
-written before. An item written beside another read model's (its key followed by `#<tag>`, §
+outbox item written from 1.41.0 also carries a mark, `__edd_rm__`, naming its read model and its
+effect (`outboxMark`, #237), part of no key, which `drainPending` and the outbox table's `rekey`
+read first (`outboxOwnership`); `rekey` moves an item as it is, mark and all, and adds none to an
+item written before. An item written beside another effect's (its key followed by `#<mark>`, §
 "The outbox") keeps that ending: `rekey` keeps whatever follows the row's sort key.
 
 #### `rekey`
@@ -7482,32 +7482,75 @@ instance).
     before the refusal included.
 - **The outbox** writes effects as items (`<entityType>#outbox`, sort key
   `<rowSk>#outbox#<revision>#<n>`) in the row's partition or in `outbox.table`,
-  in the row's transaction. Each item's Put is conditioned on its key holding
-  nothing or this read model's own item (`attribute_not_exists(#pk) OR #rm =
-  :rm`, `#rm` the tag `__edd_rm__`, from 1.41.0; `outboxGuard`). Read models
-  whose row keys are the same text, writing at one revision, have items at one
-  key: 1.39.0 and 1.40.0 put them unconditioned, so the second replaced the
-  first and its effect was never delivered. The transaction's reasons are read
-  by position: the row's (position 0) is a lost race, whatever else failed;
-  items' alone are keys another read model's items hold, and those items are
-  written again beside them, at the key followed by `#<tag>`, in the next
-  transaction (with `ReturnValuesOnConditionCheckFailure: ALL_OLD`), the others
-  where they were. The key sorts right after the other's and before the next
-  position's, so each drainer delivers its own in order, passing over the
-  other's. Nothing is read first, and an item at a free key is where 1.40.0
-  wrote it, so only coinciding keys change, and only on a collision is a
-  request added. An item without a tag (written before 1.41.0) may be either
-  read model's: it fails the condition and the new one goes beside it (better
-  than 1.40.0, which replaced it, even this read model's own). A tagged item of
-  this read model at the key (its revision starting again after its row was
-  deleted outside the projection, or its tombstone expired) passes the
-  condition and is replaced, as on 1.40.0. A key beside that is held too can't
-  be another read model's in normal operation (only the writer writes its tag):
-  `EDD-9145`, naming what holds it, nothing written. Not taken: refusing the
-  second write, diagnosed (`escapeKeys` cures it, but the write fails where
-  both effects can be kept); the tag in every item's key (a stored-format
-  change for every item, for a case only coinciding keys have); reading the
-  key before writing (a read on every write). `drain` claims the head item (a conditional update
+  in the row's transaction. From 1.41.0 each item carries a mark,
+  `__edd_rm__` = `<read model tag>.<effect tag>` (`outboxMark`): the read
+  model's tag (`readModelTag`), then a 64-bit FNV-1a hash, base 36, of the
+  projection (`layoutTag`) and the event (its source, stream id and version).
+  Each item's Put is conditioned on its key holding nothing or the item of
+  the same effect (`attribute_not_exists(#pk) OR #rm = :rm`, `#rm` the mark;
+  `outboxGuard`): a redelivery or retry replaces its own item, as on 1.40.0,
+  and nothing else is replaced. Two items meet at one key three ways: read
+  models whose row keys are the same text (`[shop]` with `north#branch_b1`
+  beside `[shop, branch]`, `escapeKeys` off) writing at one revision; two
+  projections of one read model, each with its own revision, writing at one
+  revision, which happens in the ordinary course; and one projection whose
+  revision starts again (its row deleted outside the projection, or its
+  tombstone expired) while an item of another event is still pending at the
+  key. 1.39.0 and 1.40.0 put items unconditioned, so the second replaced the
+  first and its effect was never delivered. The transaction's reasons are
+  read by position: the row's (position 0) is a lost race, whatever else
+  failed; items' alone are keys other effects' items hold, and the whole
+  transaction is sent again with those items at their next stage
+  (`outboxStages`), the others where they were. The stages, decided from the
+  definitions:
+  - `"none"`: no mark and no condition, as on 1.40.0, where the mark's name is
+    something else's (below).
+  - `"plain"`: the condition above.
+  - `"sameEvent"`: that, or an item without a mark (written before 1.41.0) of
+    the same event (`... OR (attribute_not_exists(#rm) AND #es = :es AND #ei =
+    :ei AND #ev = :ev)`, `source`, `streamId` and `version` as 1.40.0 stored
+    them), which is replaced, as on 1.40.0. Only where nothing else can have
+    written at the key: no other read model's keys can be this one's
+    (`outboxKeysApart`: on each table its outboxes are on, every other read
+    model writing outbox items there composes keys that can never be its own)
+    and no other projection of the read model writes outbox items (an item
+    records its event, not its projection: the other projection's item of the
+    same event would be replaced, and its effect lost).
+  - `"beside"`: at the key followed by `#<mark>`, which only this effect
+    writes, with `ReturnValuesOnConditionCheckFailure: ALL_OLD`.
+
+  A read model's items go `plain`, `sameEvent`, `beside` where `sameEvent`
+  applies, else `plain`, `beside`. The key beside sorts right after the
+  other's and before the next position's, so each drainer delivers its own in
+  order, passing over another read model's, and one read model's drainer
+  delivers both its projections' items, in key order. Nothing is read first,
+  an item at a free key is where 1.40.0 wrote it, and only a collision adds a
+  request (a cancelled transaction, then the one sent; two for an unmarked
+  item of another event). Two projections of one read model at one revision
+  collide in the ordinary course: each such write costs the second a
+  cancelled transaction. A key beside held too can't be another effect's in
+  normal operation (only the effect writes its mark): `EDD-9145`, naming what
+  holds it, nothing written. An item without a mark where `sameEvent` doesn't
+  apply may be another's: kept, and the new one beside it, so its effect is
+  delivered twice where it was this projection's own, rewritten after its row
+  was lost. Not taken: refusing the second write, diagnosed (`escapeKeys`
+  cures the read models' case, but the write fails where both effects can be
+  kept, and nothing cures the projections' case); the mark in every item's
+  key (a stored-format change for every item, for what only colliding keys
+  need); reading the key before writing (a read on every write).
+
+  **The mark's name.** A new library attribute is written only where its name
+  is free (`outboxMarkInUse`, one function, from the definitions): where
+  `__edd_rm__` is a key attribute of where the items are written (the outbox
+  table's key or index attributes, any key attribute of its table: a member's
+  primary or secondary index, a vector index's partition or filter attribute,
+  an aggregate made on the table, registered or not, an event stream's index;
+  `Table.tableKeyAttributes`), the read model's items carry no mark, their Put
+  no condition (`"none"`), and its drainers read no mark: exactly 1.40.0's
+  requests, items and deliveries (`fixtures/outbox-mark-names-1.40.0.json`),
+  and none of this protection. Never decided by what a stored item holds.
+
+  `drain` claims the head item (a conditional update
   with an expiring claim), delivers it, deletes it on its claim, and repeats:
   in order per row, at least once. `deliver` on `applyBatch` / `processBatch`
   drains after the write; `drainPending` sweeps through a sparse
@@ -7520,14 +7563,14 @@ instance).
   epoch, a number's key text, a literal's, any text for a string, `#`
   included: `KeyComposer.composeKeySpace` with `walkOpen`); what its reader
   would take isn't enough (a date's reader takes `x_q` as a date's text, which
-  no date writes). Then the item's read-model tag (`__edd_rm__`, written from
-  1.41.0: a hash of the schema's name and version, the entity type and its
+  no date writes). Then the read model its mark names (the text before the
+  first `.`; a hash of the schema's name and version, the entity type and its
   version, the primary collection and the primary key's composites,
   `readModelTag`) says whether it's this read model's. Read models whose keys
   meet only through a string value holding `#` (`[shop]` with `north#branch_b1`
   beside `[shop, branch]`), which bind as on 1.39.0, can't be told apart by
-  key; the tag tells them apart. An item written before 1.41.0, at a key the
-  read model writes, carries no tag: `drainPending` drains it, as 1.40.0 did
+  key; the mark tells them apart. An item written before 1.41.0, at a key the
+  read model writes, carries no mark: `drainPending` drains it, as 1.40.0 did
   every item of the index, so an item another read model's key can make too
   is drained by both drainers, as on 1.40.0. Outbox items are short-lived, so
   those drain away after an upgrade. The others' items are left unclaimed for
@@ -7540,13 +7583,20 @@ instance).
   are the ones 1.40.0 sent wherever a row holds only its own items. On 1.39.0 and 1.40.0
   it claimed another read model's head item, failed to decode it with its own
   schema, and left the claim, so that read model's drainer stopped there until
-  the claim expired. The tag is additive, part of no key: the published
-  1.40.0's `drainPending` delivers and deletes a tagged item exactly as an
-  untagged one, with the same requests
-  (`test/fixtures/outbox-marked-drain-1.40.0.json`), so a 1.40.0 drainer in a
-  rolling deployment drains what 1.41.0 writes, as it drains every item. The
-  outbox table's `rekey` asks the same function of every read model of the
-  entity type on the table, and reads the row an untagged item names only when
+  the claim expired.
+
+  **Rolling deployment.** The mark is part of no key, and an item beside
+  another is an ordinary key under the row's: the published 1.40.0's
+  `drainPending` and `drain`, given the items this release writes (marks, two
+  projections' items at one revision, an item beside its own after its row
+  was lost), deliver every one, in key order, and delete them, with the
+  requests this release's drainer sends (`fixtures/outbox-rolling-1.40.0.json`,
+  `test/OutboxRolling.test.ts`). A 1.40.0 drainer of read models whose row
+  keys are the same text still takes the other read model's items at its row
+  for its own, as it did before: those now include the items kept beside
+  them, so drainers of such read models are upgraded before their writers.
+  The outbox table's `rekey` asks the same function of every read model of the
+  entity type on the table, and reads the row an unmarked item names only when
   more than one can have written it and they'd move it apart (§7 "`rekey`").
 - **`EventStore.processBatch`** routes through each projection's internal
   routes (one per source stream; `bindProjection` wraps their decode and apply
@@ -8250,7 +8300,7 @@ for unrelated errors and the collision was caught only at review.
 | `EDD-9133` | `internal/TransactableOps.ts` (`addProjectionLayout`, `projectionTtlConflict`), through `internal/ProjectionEngine.ts` (`EventStore.projection` / `multiProjection`, `preflight`) | On a projection read model one of whose projections has `removal`, one stored attribute one projection keeps in two roles: a checkpoint, checkpoint map, checkpoint owner or revision it also uses in another role, compared by stored name. Thrown by the definition that completes the conflict (the projection's own, or the first `removal`), with nothing recorded. Without `removal` nothing is refused, nor are two projections keeping one attribute in different roles. The table's TTL attribute, known only at run time, is checked by every entry point that writes a row (not the drains) before it sends anything: an attribute a projection keeps that is stored as it, while a projection's tombstones set it (`removal.ttl`), fails every projection on the read model with a `ValidationError`. |
 | `EDD-9134` | `internal/ProjectionEngine.ts` (`sharedOutboxKeySpace`, `refuseSharedOutboxKeySpace`), through `DynamoClient.make`, a table's `rekey` and `EventStore.processBatch` | Two read models whose projections' outboxes are on one table, in the same key space (the partition and sort key text their primary keys compose: schema name and version, primary collection, entity type, the composites' labels, and what each composite's type can compose: a number's or bigint's key text, a literal union's members, `true` and `false`, or any text). `DynamoClient.make` (among the entities it binds and its tables' members) and `processBatch` (among the read models of the projections it's handed) refuse two whose keys can be the same with values that hold no `#`: their items would overwrite each other. A defect, before anything runs. Two whose keys meet only through a value holding `#`, or part where one's value can't spell the other's text (a number or a date beside a label), bind and run. `rekey` of the outbox's table asks the same question, with the outboxes of projections defined since the client was made, and of a member of that table claiming the outbox items of a read model's entity type, unless it composes its keys as the read model does (each composite of the same kind of key text, a literal union taken as its kind). 1.40.0's `rekey` also refused two whose items its reader could read as each other's (a value holding `#` included, a literal composite read as any text); from 1.41.0 it decides those item by item (`rekeyOutboxMember`, DESIGN §7 "`rekey`"). A member that is no read model (a projection object built by hand, with its routes and no read model) isn't compared, and runs as on 1.39.0. A `ValidationError`, before it sends anything; `rekey` of other tables runs. Tables are compared by the physical name the context gives them, so two handles on one table are one table. Read models that never meet at one of these can't be checked: key spaces must be distinct per outbox table. |
 | `EDD-9140` | `internal/SharedKeyAttribute.ts` (schema, `refuseStoredUnderLibraryAttribute` and `refuseReadAsSparseEntry`), through `Entity.make`, pure and operational, and through `DynamoClient.make` for the table's TTL attribute | An entity that would store an attribute under one the library writes itself: a model field named (under any rename) or renamed `__edd_e__` or a vector index's attribute (`__edd_v_<index>__`, `__edd_vp_<index>__`), or a timestamp or the version field so named (every row holds its entity type in `__edd_e__`, and every read filters on it), or an attribute the entity writes, under any name other than as that map's entry, that a row's reader takes as an entry of one of its sparse maps (`sparseReader`: `<prefix>#` and a non-empty key, so `<prefix>#` itself is allowed). That is every attribute a row holds under a name a definition or a table's configuration supplies: a key attribute (`writtenKeyAttributes`: the table's, each secondary index's, each vector index's), a model field by the attribute it's stored in (so a field named `data#x#y` and stored as `counter` loads), a sparse map's prefix and, under a `field:` rename, the attribute a put stores the map whole in, the timestamps and the version by the attribute they're stored in (a timestamp the model declares and renames is stored where that field is), `deletedAt` and a vector index's stash, and the table's TTL attribute for an entity that writes one, which `DynamoClient.make` checks, as the table's configuration names it. Whether an entity writes the TTL attribute is said in one place (`ttlRows`, from the functions its writes ask: `snapshotTtl`, `tombstoneTtl`, `eventTtl`): `versioned: { ttl }` without `retain` writes no snapshot, so it isn't refused at bind, and an update naming the attribute isn't refused as naming one the library manages (`unaddressable`), which it was on the release branch and wasn't on 1.39.0. A sparse map's prefix can't hold `#` (`DynamoModel.configure` refuses one), so only its renamed attribute can be read as another map's entry. The library's own fixed names hold no `#`, so none can be an entry. The reader moves such an attribute into the map: a key gives every row a phantom entry, `clearMap` removes it, and a put of that entry replaces the key; a timestamp or a renamed field leaves the row unreadable; a version reads as an entry and the row's version as 0; a TTL reads as an entry, and a time series event's is stripped with the map's entries, so the event never expires (`test/fixtures/sparse-library-attributes-1.39.0.json`). Refused at load or at bind, naming the map and the attribute. `EDD-9130` relies on it: a model attribute can be any name holding any text, but not one of these (§7 "Which rows in its partition are an aggregate's"). |
-| `EDD-9145` | `internal/ProjectionEngine.ts` (`writeRow`), through a projection's `apply`, `applyBatch`, `processBatch`, `catchUp` and `rebuild`, single- and multi-source | A projection's outbox item whose key held another read model's item (two read models whose row keys are the same text, writing at one revision: `outboxGuard` cancelled it) was written beside it, at its key followed by `#<tag>`, and that key is held too, by an item that isn't this read model's (`ALL_OLD` names it). Only the writer writes its tag, so no read model's item is there in normal operation. A `ValidationError` naming the read model, its tag, the row, the revision, the item's position, the key and what holds it, with `escapeKeys: true` (or another entity type, collection or schema) as the cure, and DynamoDB's error as the cause; the transaction was cancelled, so nothing was written. |
+| `EDD-9145` | `internal/ProjectionEngine.ts` (`writeRow`), through a projection's `apply`, `applyBatch`, `processBatch`, `catchUp` and `rebuild`, single- and multi-source | A projection's outbox item whose key held another effect's item (another read model's whose row keys are the same text, another projection's of the read model, or another event's: `outboxGuard` cancelled it) was written beside it, at its key followed by `#<mark>`, and that key is held too, by an item that isn't this effect's (`ALL_OLD` names it). Only the effect writes its mark, so nothing the library writes is there in normal operation. A `ValidationError` naming the read model, its tag, the row, the revision, the item's position, the key, the item's mark and what holds it, asking whether that item was written outside the projection, with DynamoDB's error as the cause; the transaction was cancelled, so nothing was written. |
 | `EDD-9158` | Retired, never released | Allocated during 1.41's development for refusing an entity-level ref's `${field}Id` for an entity keyed by more than one composite, and retired before release: a key whose other composites have an encoding default composes from the identifier alone, and 1.40.0 fetches and stores it. Such an id is fetched under the identifier, as on 1.40.0, and fails as it did where the key can't be composed. Don't reuse the number |
 | `EDD-9159` | `Aggregate.ts` (`givenOverRowReason`, `customOverRowReason`, through `refuseGivenOverRows`), at `create` only (`AggregateDecompositionError`, nothing sent) | A `create` whose input gives, at the top of a row's value (the root's, a sub-aggregate's root, a `one` edge's value, a `many` element, or a `many` edge's value through its custom `decompose` / `assemble`), a value for a name the library writes on that row (`__edd_e__`, the partition key attribute, `sk`, the collection sort key's copy, the root's list keys on a write composing them; on a row beneath the root, a context attribute) that a `get` right after would not return (#241): the row as built, read as a `get` reads it (unpacked, renamed, sparse fields restored, decoded by the member's own schema), compared with the value given (`sameValue`: sets by members, dates by instant, otherwise strictly, `5n` ≠ `5`, `-0` ≠ `0`, `1.5` ≠ `1.50`). A union or `Schema.suspend` root or sub-aggregate is read whole (`nodeReadOf`). Up to 1.40.0 the library's value replaced it and the read handed back something else, or failed. Equal: written as on 1.40.0. Given no value, a name the member places with another schema than the root's is refused only where that read fails (`unreadOverRowReason`, `customUnreadReason`). The value given is looked up under the name the input holds it by (`inputNameIn`: a `many` edge's `inputField`). Not judged: a discriminator, a name the library doesn't write on that row, a nested value, and `update`. `Aggregate.make` refuses nothing. The message names the member and the field and shows the value given and what the read returns (or its failure), each rendered unambiguously |
 | `EDD-9160` | `Aggregate.ts` (`refuseOtherSettingRows`), at `update` (`ValidationError`, nothing written) | An aggregate `update` about to write a group one of whose rows is stored under another sort key than this configuration composes for the value read from it (`sortKeyOf`, through `rowsReadAt`): written under the other `escapeKeys` setting (a `$`, `#` or other escaped character, a number other than a non-negative integer below 1e16, a negative `bigint`, in a `many` element's sort key or a discriminator value, or an `entity:` edge's composite its model encodes), before the setting was turned over (#241). Up to 1.40.0 the update wrote the group's rows under the new text beside the old, so every element read twice (or a doubled sub-aggregate root failed to read, or, with texts aliasing across the settings, one element's row overwrote another's). Not refused: a key whose text is the same under both settings, a row the update moves itself (an `entity:` edge's under 1.40.0's composition), a group the update doesn't write. The message names the member, the row's sort key and `rekey` |

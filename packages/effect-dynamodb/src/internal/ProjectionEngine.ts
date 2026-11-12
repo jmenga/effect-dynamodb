@@ -43,6 +43,7 @@ import {
 } from "@effect-dynamodb/schema/internal/EntitySchemas.js"
 import { decodingAsBefore } from "@effect-dynamodb/schema/internal/FailingAsBefore.js"
 import { getSchemaFields } from "@effect-dynamodb/schema/internal/SchemaAccessors.js"
+import { fnv1a64 } from "@effect-dynamodb/schema/internal/ZOrderCurve.js"
 import type { IndexDefinition } from "@effect-dynamodb/schema/KeyComposer.js"
 import * as KeyComposer from "@effect-dynamodb/schema/KeyComposer.js"
 import {
@@ -74,8 +75,10 @@ import {
   OUTBOX_CLAIMED_UNTIL as CLAIMED_UNTIL,
   composePrimaryKey,
   KEY_TEXT,
+  layoutTag,
   marshalOrFail,
   OUTBOX_READ_MODEL,
+  outboxMarkInUse,
   type ProjectionRole,
   projectionTtlChecked,
   projectionTtlConflict,
@@ -735,6 +738,76 @@ export const readModelTag = (entity: unknown): string | undefined => {
   return hash.toString(36)
 }
 
+/**
+ * @internal The mark an outbox item carries (`OUTBOX_READ_MODEL`, #237): the read model's tag
+ * (`readModelTag`), then the effect's, a 64-bit FNV-1a hash of the projection (`layoutTag`) and
+ * the event (its source, stream id and version). An item's `Put` replaces only an item carrying
+ * the same mark (`writeRow`): a redelivery or retry of the same effect. Any other item at its key,
+ * another projection's of the read model, another event's of the projection (its revision started
+ * again after its row was lost), or another read model's, is kept, and the item written beside it.
+ */
+export const outboxMark = (
+  readModel: string,
+  projection: string,
+  event: { readonly source: string; readonly streamId: unknown; readonly version: number },
+): string =>
+  `${readModel}.${fnv1a64(
+    new TextEncoder().encode(
+      JSON.stringify([projection, event.source, String(event.streamId), event.version]),
+    ),
+  ).toString(36)}`
+
+/** The read model an outbox item's mark names: its text before the first `.` (`outboxMark`). */
+const markedReadModel = (mark: string): string => {
+  const dot = mark.indexOf(".")
+  return dot < 0 ? mark : mark.slice(0, dot)
+}
+
+/**
+ * Read models whose projections write outbox items, by the service key of the table they write
+ * them to, and each read model's projections with an outbox (`layoutTag`), as they are defined.
+ */
+const outboxWriters = new Map<string, Set<object>>()
+const outboxProjections = new WeakMap<object, Set<string>>()
+
+/** The service keys of the tables a read model's projections write outbox items to. */
+const outboxTablesOf = (readModel: object): ReadonlyArray<string | undefined> => {
+  const member = readModel as {
+    readonly _tableTag?: { readonly key?: string }
+    readonly _projectionOutboxes?: ReadonlyArray<{
+      readonly table: { readonly Tag: { readonly key?: string } } | undefined
+    }>
+  }
+  return (member._projectionOutboxes ?? []).map(
+    (outbox) => (outbox.table?.Tag ?? member._tableTag)?.key,
+  )
+}
+
+/**
+ * @internal Whether no other read model defined writes outbox items whose keys can be this read
+ * model's (#237), decided from the definitions: on each table its outboxes are on, every other
+ * read model with an outbox there (another key template, `readModelTag`) composes keys that can
+ * never be this one's (`keySpaceOf`, `"owned"`: any value, `#` included). Then an item without a
+ * mark at a key this read model writes was written by this read model before 1.41.0, and a `Put`
+ * of the same event replaces it, as 1.40.0's did (`writeRow`). `false` where a key space can't be
+ * composed or a table isn't known.
+ */
+export const outboxKeysApart = (readModel: object): boolean => {
+  const own = keySpaceOf(readModel, "owned")
+  const tag = readModelTag(readModel)
+  if (own === undefined || tag === undefined) return false
+  const mine = outboxSpaceOf(own)
+  for (const table of outboxTablesOf(readModel)) {
+    if (table === undefined) return false
+    for (const other of outboxWriters.get(table) ?? []) {
+      if (other === readModel || readModelTag(other) === tag) continue
+      const space = keySpaceOf(other, "owned")
+      if (space === undefined || spacesMeet(mine, outboxSpaceOf(space))) return false
+    }
+  }
+  return true
+}
+
 /** Whose an outbox item is, as one read model sees it ({@link outboxOwnership}). */
 export type OutboxOwnership = "mine" | "foreign" | "unmarked"
 
@@ -771,9 +844,11 @@ export const outboxOwnership = (
       if (pk === undefined || sk === undefined) return "foreign"
       if (!spacesMeet(space, { pk: whole(pk), sk: whole(sk) })) return "foreign"
     }
-    const marked = item[OUTBOX_READ_MODEL]?.S
+    // A read model whose items carry no mark reads none (`outboxMarkInUse`): `__edd_rm__` is
+    // something else's there.
+    const marked = outboxMarkInUse(readModel) ? item[OUTBOX_READ_MODEL]?.S : undefined
     if (marked === undefined) return "unmarked"
-    return marked === tag ? "mine" : "foreign"
+    return markedReadModel(marked) === tag ? "mine" : "foreign"
   }
   ownershipOf.set(readModel, decide)
   return decide
@@ -848,7 +923,8 @@ export const rekeyOutboxMember = (
       })
       if (owners.length === 0) {
         const named =
-          marked !== undefined && !candidates.some((c) => readModelTag(c.readModel) === marked)
+          marked !== undefined &&
+          !candidates.some((c) => readModelTag(c.readModel) === markedReadModel(marked))
         return { skipped: { [named ? "unregistered" : "unrecognizedKey"]: 1 } } as RekeyTally
       }
       const first = owners[0]!
@@ -1007,12 +1083,15 @@ export const makeEngine = (config: EngineConfig) => {
   // `removal`, for the checks of `[EDD-9133]`. Rows may be tombstones (#154) when one has
   // `removal`: the entity's `create` takes one's place, keeping the checkpoints of the projection
   // with `removal` that wrote it, with its revision one higher (`overTombstone`).
-  addProjectionLayout(readModel, {
+  const ownLayout = {
     label: config.label,
     roles,
     removal: config.removal !== undefined,
     ttl: config.removal?.ttl !== undefined,
-  })
+  }
+  addProjectionLayout(readModel, ownLayout)
+  /** This projection's tag (`layoutTag`), in its outbox items' marks (`outboxMark`). */
+  const ownTag = layoutTag(ownLayout)
 
   // Every projection's outbox, kept on the read model, one entry per distinct layout, the one defined
   // last at the end: a second projection doesn't hide the first's, which stays callable, and one
@@ -1039,6 +1118,18 @@ export const makeEngine = (config: EngineConfig) => {
       ...(holder._projectionOutboxes ?? []).filter((other) => !same(other)),
       layout,
     ]
+    // Where its items are, beside the other read models', for `outboxKeysApart`; and that the
+    // read model has this projection with an outbox.
+    const into = ((config.outbox.table?.Tag ?? readModel._tableTag) as { key?: string } | undefined)
+      ?.key
+    if (into !== undefined) {
+      const writers = outboxWriters.get(into) ?? new Set<object>()
+      writers.add(readModel)
+      outboxWriters.set(into, writers)
+    }
+    const projections = outboxProjections.get(readModel) ?? new Set<string>()
+    projections.add(ownTag)
+    outboxProjections.set(readModel, projections)
   }
 
   const tableName = Effect.suspend(() =>
@@ -1280,20 +1371,45 @@ export const makeEngine = (config: EngineConfig) => {
       ? undefined
       : readBackOf(config.outbox.schema, () => readingStreamValues(config.outbox!.schema))
 
-  /** The tag this read model's outbox items carry (`readModelTag`). */
+  /** The tag of this read model's key template (`readModelTag`), its items' marks begin with. */
   const outboxTag = readModelTag(readModel)
 
   /**
-   * The outbox items to write with the row, each at `<row sk>#outbox#<revision>#<n>`; one at a
-   * position in `beside` at that key followed by `#<tag>` (`outboxTag`), beside another read
-   * model's item there ({@link writeRow}).
+   * How an outbox item's `Put` stands toward what is at its key, tried in turn as the write is
+   * cancelled there (`outboxStages`):
+   *
+   * - `"none"`: no mark, no condition: the item replaces what's there, as on 1.40.0.
+   * - `"plain"`: the key holds nothing, or this effect's item (`outboxMark`).
+   * - `"sameEvent"`: that, or an item without a mark (written before 1.41.0) of the same event.
+   * - `"beside"`: at the key followed by `#<mark>`, which only this effect writes.
+   */
+  type OutboxStage = "none" | "plain" | "sameEvent" | "beside"
+
+  /**
+   * The stages of this read model's outbox items, decided from the definitions (#237). Its items
+   * carry no mark where the name is something else's (`outboxMarkInUse`). An item without a mark
+   * at its key (written before 1.41.0) is its own only where no other read model's keys can be its
+   * own (`outboxKeysApart`) and no other projection of it writes outbox items (an item records
+   * its event, not its projection): then the same event's is replaced, as on 1.40.0, after the
+   * plain `Put` is cancelled. Anywhere else it is kept, and the item written beside it.
+   */
+  const outboxStages = (): ReadonlyArray<OutboxStage> => {
+    if (outboxTag === undefined || !outboxMarkInUse(readModel)) return ["none"]
+    return outboxKeysApart(readModel) && (outboxProjections.get(readModel)?.size ?? 0) <= 1
+      ? ["plain", "sameEvent", "beside"]
+      : ["plain", "beside"]
+  }
+
+  /**
+   * The outbox items to write with the row, each at `<row sk>#outbox#<revision>#<n>`, or, at the
+   * stage `"beside"`, at that key followed by `#<mark>` ({@link writeRow}).
    */
   const outboxItems = (
     rowKey: Record<string, unknown>,
     revision: number,
     enqueued: ReadonlyArray<Enqueued>,
     mark: 2 | undefined,
-    beside: ReadonlySet<number>,
+    stageOf: (i: number) => OutboxStage,
   ): Effect.Effect<ReadonlyArray<Record<string, AttributeValue>>, ValidationError> =>
     Effect.forEach(enqueued, (e, i) =>
       Effect.gen(function* () {
@@ -1316,15 +1432,24 @@ export const makeEngine = (config: EngineConfig) => {
         const keys = outboxKeys()
         const rowPk = String(rowKey[primary.pk.field])
         const rowSk = String(rowKey[primary.sk.field])
+        const stage = stageOf(i)
+        const marked =
+          stage === "none"
+            ? undefined
+            : outboxMark(outboxTag!, ownTag, {
+                source: e.source,
+                streamId: e.event.streamId,
+                version: e.event.version,
+              })
         const at = `${rowSk}#outbox#${pad(revision, 12)}#${pad(i, 4)}`
-        const sk = beside.has(i) ? `${at}#${outboxTag}` : at
+        const sk = stage === "beside" ? `${at}#${marked}` : at
         const item: Record<string, unknown> = {
           [keys.pk]: rowPk,
           [keys.sk]: sk,
           __edd_e__: outboxMarker(entityType),
           [ROW_PK]: rowPk,
           [ROW_SK]: rowSk,
-          ...(outboxTag !== undefined && { [OUTBOX_READ_MODEL]: outboxTag }),
+          ...(marked !== undefined && { [OUTBOX_READ_MODEL]: marked }),
           effect: encoded,
           source: e.source,
           streamId: e.event.streamId,
@@ -1347,20 +1472,40 @@ export const makeEngine = (config: EngineConfig) => {
     isAwsConditionalCheckFailed((error as { readonly cause?: unknown })?.cause)
 
   /**
-   * The condition an outbox item's Put carries (#237): nothing at its key, or this read model's
-   * own item there (`OUTBOX_READ_MODEL`). A key holding another read model's item (two read models
-   * whose row keys coincide, writing at one revision), or an item without the mark (written before
-   * 1.41.0, which may be either's), cancels the write instead of replacing it ({@link writeRow}).
-   * `undefined` for a read model on no table, which writes no mark: its items are put as on 1.40.0.
+   * The condition an outbox item's `Put` carries at `stage` (#237, `outboxStages`): nothing at its
+   * key, or the item of the same effect (`outboxMark`); at `"sameEvent"`, also an item without a
+   * mark of the same event (its `source`, `streamId` and `version`, as 1.40.0 stored them). None
+   * at `"none"`. Another item cancels the write instead of being replaced ({@link writeRow}).
    */
-  const outboxGuard = (pk: string) =>
-    outboxTag === undefined
-      ? {}
-      : {
-          ConditionExpression: "attribute_not_exists(#pk) OR #rm = :rm",
-          ExpressionAttributeNames: { "#pk": pk, "#rm": OUTBOX_READ_MODEL },
-          ExpressionAttributeValues: { ":rm": { S: outboxTag } },
-        }
+  const outboxGuard = (pk: string, Item: Record<string, AttributeValue>, stage: OutboxStage) => {
+    if (stage === "none") return {}
+    const rm = Item[OUTBOX_READ_MODEL]!
+    if (stage !== "sameEvent") {
+      return {
+        ConditionExpression: "attribute_not_exists(#pk) OR #rm = :rm",
+        ExpressionAttributeNames: { "#pk": pk, "#rm": OUTBOX_READ_MODEL },
+        ExpressionAttributeValues: { ":rm": rm },
+      }
+    }
+    return {
+      ConditionExpression:
+        "attribute_not_exists(#pk) OR #rm = :rm OR " +
+        "(attribute_not_exists(#rm) AND #es = :es AND #ei = :ei AND #ev = :ev)",
+      ExpressionAttributeNames: {
+        "#pk": pk,
+        "#rm": OUTBOX_READ_MODEL,
+        "#es": "source",
+        "#ei": "streamId",
+        "#ev": "version",
+      },
+      ExpressionAttributeValues: {
+        ":rm": rm,
+        ":es": Item.source!,
+        ":ei": Item.streamId!,
+        ":ev": Item.version!,
+      },
+    }
+  }
 
   /** The row (or tombstone) and any outbox items, written as one conditional unit. */
   const writeRow = (
@@ -1460,17 +1605,20 @@ export const makeEngine = (config: EngineConfig) => {
         return target
       }
       // The row and its outbox items in one transaction, read by position (#237): the row's Put
-      // cancelled is a lost race, whatever else was; an item's alone is a key another read model's
-      // item holds (`outboxGuard`). Those items are written again beside it, at their key followed
-      // by `#<tag>` (`outboxItems`), so both effects are delivered, each by its own drainer, in
-      // order: the key sorts right after the other's and before the next position's. Nothing is
-      // read first, and an item at a free key is written where 1.40.0 wrote it. One of those held
-      // again can't be another read model's: it is reported, naming what holds it.
+      // cancelled is a lost race, whatever else was; an item's alone is a key holding another
+      // effect's item (`outboxGuard`). The whole transaction is sent again, those items at their
+      // next stage (`outboxStages`): an item without a mark of the same event replaced, then the
+      // item beside it, at its key followed by `#<mark>` (`outboxItems`), so both effects are
+      // delivered, in order: the key sorts right after the other's and before the next
+      // position's. Nothing is read first, and an item at a free key is written where 1.40.0
+      // wrote it. One held beside too is reported, naming what holds it.
       const OutboxTable = yield* outboxTable
       const keys = outboxKeys()
-      let beside = new Set<number>()
+      const stages = outboxStages()
+      const reached = new Map<number, number>()
+      const stageOf = (i: number) => stages[reached.get(i) ?? 0]!
       while (true) {
-        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, mark, beside)
+        const items = yield* outboxItems(rowKey, revision ?? 0, enqueued, mark, stageOf)
         const sent = yield* client
           .transactWriteItems({
             TransactItems: [
@@ -1481,8 +1629,10 @@ export const makeEngine = (config: EngineConfig) => {
                     Put: {
                       TableName: OutboxTable,
                       Item,
-                      ...outboxGuard(keys.pk),
-                      ...(beside.has(i) && { ReturnValuesOnConditionCheckFailure: "ALL_OLD" }),
+                      ...outboxGuard(keys.pk, Item, stageOf(i)),
+                      ...(stageOf(i) === "beside" && {
+                        ReturnValuesOnConditionCheckFailure: "ALL_OLD",
+                      }),
                     },
                   }) satisfies TransactWriteItem,
               ),
@@ -1495,9 +1645,9 @@ export const makeEngine = (config: EngineConfig) => {
         const reasons = cause.CancellationReasons ?? []
         const failed = (i: number) => reasons[i]?.Code === "ConditionalCheckFailed"
         if (failed(0)) return yield* Effect.fail(new LostRace(key))
-        const held = items.flatMap((_, i) => (failed(i + 1) ? [i] : []))
+        const held = items.flatMap((_, i) => (failed(i + 1) && stageOf(i) !== "none" ? [i] : []))
         if (held.length === 0) return yield* Effect.fail(sent.failure)
-        const again = held.find((i) => beside.has(i))
+        const again = held.find((i) => stageOf(i) === "beside")
         if (again !== undefined) {
           const holder = reasons[again + 1]?.Item as Record<string, AttributeValue> | undefined
           const other = holder?.[OUTBOX_READ_MODEL]?.S
@@ -1506,24 +1656,26 @@ export const makeEngine = (config: EngineConfig) => {
             operation: `${config.label}.outbox`,
             cause: withCause(
               `[EDD-9145] ${config.label}: read model ${JSON.stringify(entityType)} ` +
-                `(${JSON.stringify(outboxTag)}) found another read model's outbox item at the key ` +
-                `of its item ${again} for revision ${revision ?? 0} of row ` +
+                `(${JSON.stringify(outboxTag)}) found another effect's item at the key of its ` +
+                `outbox item ${again} for revision ${revision ?? 0} of row ` +
                 `(${JSON.stringify(String(rowKey[primary.pk.field]))}, ` +
                 `${JSON.stringify(String(rowKey[primary.sk.field]))}), and the key it writes ` +
-                `beside it, ${JSON.stringify(items[again]![keys.sk]?.S)}, is held too, by ` +
+                `beside it, ${JSON.stringify(items[again]![keys.sk]?.S)}, which only this ` +
+                `effect writes (${JSON.stringify(items[again]![OUTBOX_READ_MODEL]?.S)}), is held ` +
+                "too, by " +
                 (holder === undefined
                   ? "an item"
                   : `an item of ${JSON.stringify(holder.__edd_e__?.S ?? "no entity type")}` +
-                    (other === undefined ? "" : ` naming read model ${JSON.stringify(other)}`)) +
-                ". Nothing was written. Read models whose row keys coincide (a value holding `#` " +
-                "where the other's composites spell it) write their outbox items at one key; " +
-                "`escapeKeys: true` on the schema keeps their keys apart, as does giving one its " +
-                "own entity type, collection or schema.",
+                    (other === undefined
+                      ? " carrying no mark"
+                      : ` marked ${JSON.stringify(other)}`)) +
+                ". Nothing was written. The library writes nothing else at that key: was the " +
+                "item written outside the projection?",
               sent.failure,
             ),
           })
         }
-        beside = new Set([...beside, ...held])
+        for (const i of held) reached.set(i, (reached.get(i) ?? 0) + 1)
       }
     })
 

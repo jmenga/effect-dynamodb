@@ -3,9 +3,10 @@
  * (`helpers/OutboxPairRequests.ts`): keys that meet only through a value holding `#`, and keys
  * that part where a number's key text can't spell the other's label. 1.39.0 bound them and applied
  * their events, each to its own keys: a client still binds them, and every request and stored item
- * is what the published 1.39.0 and 1.40.0 sent and stored, but each outbox item names its read model
- * (`__edd_rm__`, from 1.41.0) and its Put is conditioned on its key holding nothing or that read
- * model's own item (`attribute_not_exists(#pk) OR #rm = :rm`, from 1.41.0): the only differences.
+ * is what the published 1.39.0 and 1.40.0 sent and stored, but each outbox item carries its mark
+ * (`__edd_rm__`, from 1.41.0: its read model's tag, then its effect's) and its Put is conditioned on
+ * its key holding nothing or the same effect's item (`attribute_not_exists(#pk) OR #rm = :rm`, from
+ * 1.41.0): the only differences.
  */
 
 import { readFileSync } from "node:fs"
@@ -19,6 +20,7 @@ import * as EventStore from "../src/EventStore.js"
 import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import * as Table from "../src/Table.js"
 import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
+import { markOf } from "./helpers/OutboxMarks.js"
 import { type Sent, scenario } from "./helpers/OutboxPairRequests.js"
 
 type Captured = {
@@ -61,7 +63,7 @@ const lib = { DynamoSchema, Table, Entity, EventStore, DynamoClient }
 
 type Item = Record<string, { readonly S?: string }>
 
-/** `item` with the read model's tag after the row it names, where 1.41.0 writes it. */
+/** `item` with its mark after the row it names, where 1.41.0 writes it. */
 const tagged = (item: Item, tag: string): Item =>
   Object.fromEntries(
     Object.entries(item).flatMap(([name, value]) =>
@@ -75,10 +77,10 @@ const tagged = (item: Item, tag: string): Item =>
   )
 
 /**
- * What a release sent and stored (`captured`), but each outbox item carrying the tag of the read model
- * whose projection wrote it (`__edd_rm__`, #237): the row written beside it in one transaction,
- * and the stored row it names. Its Put is conditioned on that tag (`outboxGuard`): nothing at its
- * key, or that read model's own item. Nothing else differs.
+ * What a release sent and stored (`captured`), but each outbox item carrying the mark of the read
+ * model whose projection wrote it and of its effect (`__edd_rm__`, #237): the row written beside it
+ * in one transaction, and the stored row it names. Its Put is conditioned on that mark
+ * (`outboxGuard`): nothing at its key, or the same effect's item. Nothing else differs.
  */
 const markedCapture = (captured: Captured, readModels: Record<string, unknown>): Captured => {
   const tags = Object.fromEntries(
@@ -103,10 +105,15 @@ const markedCapture = (captured: Captured, readModels: Record<string, unknown>):
                 ...t,
                 Put: {
                   ...t.Put,
-                  Item: tagged(t.Put.Item, tags[row.Put!.TableName]!),
+                  Item: tagged(
+                    t.Put.Item,
+                    markOf(readModels[row.Put!.TableName] as object, t.Put.Item),
+                  ),
                   ConditionExpression: "attribute_not_exists(#pk) OR #rm = :rm",
                   ExpressionAttributeNames: { "#pk": "pk", "#rm": "__edd_rm__" },
-                  ExpressionAttributeValues: { ":rm": { S: tags[row.Put!.TableName]! } },
+                  ExpressionAttributeValues: {
+                    ":rm": { S: markOf(readModels[row.Put!.TableName] as object, t.Put.Item) },
+                  },
                 },
               }
             : t,
@@ -126,7 +133,7 @@ const markedCapture = (captured: Captured, readModels: Record<string, unknown>):
     items: {
       ...captured.items,
       outbox: (captured.items.outbox as ReadonlyArray<Item>).map((item) =>
-        isOutbox(item) ? tagged(item, tags[owner(item)]!) : item,
+        isOutbox(item) ? tagged(item, markOf(readModels[owner(item)] as object, item)) : item,
       ),
     },
   }

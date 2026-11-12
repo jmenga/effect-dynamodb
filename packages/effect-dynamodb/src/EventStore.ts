@@ -159,6 +159,7 @@ import {
 import { fromAttributeMap, toAttributeMap } from "./Marshaller.js"
 import * as Query from "./Query.js"
 import {
+  addTableKeyAttributes,
   DEFAULT_TTL_ATTRIBUTE_NAME,
   resolveTtlAttributeName,
   type Table,
@@ -2922,6 +2923,9 @@ export const makeStream = <
   const indexAttributes = streamIndexes.flatMap((idx) =>
     idx.type === "gsi" ? [idx.pk, idx.sk] : [idx.sk],
   )
+  // They are key attributes of the stream's table: the library adds none of its own under their
+  // names (`Table.tableKeyAttributes`, #237).
+  addTableKeyAttributes(config.table.Tag, indexAttributes)
 
   // Build union schema from event schemas for decoding
   const eventUnion: Schema.Top =

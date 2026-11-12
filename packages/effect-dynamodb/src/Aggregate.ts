@@ -141,6 +141,7 @@ import {
   OUTBOX_READ_MODEL,
   OUTBOX_ROW_PK,
   OUTBOX_ROW_SK,
+  outboxMarkInUse,
 } from "./internal/TransactableOps.js"
 import {
   type Diagnosis,
@@ -160,7 +161,7 @@ import {
   type UnstorableValue,
   unstorableIn,
 } from "./Marshaller.js"
-import { resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
+import { addTableKeyAttributes, resolvePrimaryKey, type Table, type TableConfig } from "./Table.js"
 
 export type {
   Cursor,
@@ -2383,6 +2384,16 @@ const makeAggregate = <TSchema extends Schema.Top>(
       )
     }
   }
+
+  // Its key attributes are the table's, registered on it or not: the library adds none of its own
+  // under their names (`Table.tableKeyAttributes`, #237).
+  addTableKeyAttributes(config.table.Tag, [
+    config.pk.field,
+    tablePrimary?.pk ?? config.pk.field,
+    tablePrimary?.sk ?? "sk",
+    ...(config.collection.sk === undefined ? [] : [config.collection.sk.field]),
+    ...(config.list ? [config.list.pk.field, config.list.sk.field] : []),
+  ])
 
   refuseAggregateKeyInTableKey(
     aggregateName,
@@ -7979,7 +7990,8 @@ const entityWriters = (entity: unknown): ReadonlyArray<AttributeWriter> => {
           [
             ...(outbox.sk === undefined ? [] : [outbox.sk]),
             OUTBOX_ROW_SK,
-            OUTBOX_READ_MODEL,
+            // The mark, where its items carry one: where its name is a key's, that is listed.
+            ...(outboxMarkInUse(e) ? [OUTBOX_READ_MODEL] : []),
             "effect",
             "source",
             "streamId",

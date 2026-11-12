@@ -23,6 +23,7 @@ import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import { fromAttributeValue, toAttributeMap, toAttributeValue } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import * as Transaction from "../src/Transaction.js"
+import { markOf } from "./helpers/OutboxMarks.js"
 import { makeRecordingTable, type Request } from "./helpers/RecordingTable.js"
 
 type Pinned = {
@@ -422,12 +423,9 @@ const steady = (node: unknown): unknown =>
       : node
 
 /**
- * `requests` without the read-model tag 1.41.0 writes on each outbox item (`__edd_rm__`, #237),
- * which is the projection's read model's, and how many items held it.
- */
-/**
- * The requests without what 1.41.0 adds to an outbox item's `Put` (#237): the read model's tag on
- * the item, and the condition that it replaces no other read model's item. Each is checked.
+ * The requests without what 1.41.0 adds to an outbox item's `Put` (#237): its mark on the item
+ * (`__edd_rm__`: the projection's read model's tag, then its effect's), and the condition that it
+ * replaces no other effect's item. Each is checked, and how many items held the mark is counted.
  */
 const untagged = (requests: unknown): { readonly tagged: number; readonly as139: unknown } => {
   let tagged = 0
@@ -443,14 +441,16 @@ const untagged = (requests: unknown): { readonly tagged: number; readonly as139:
         "#pk": "pk",
         "#rm": "__edd_rm__",
       })
+      const item = (node as { readonly Item: Record<string, { readonly S?: string }> }).Item
       expect((node as Record<string, unknown>).ExpressionAttributeValues).toEqual({
-        ":rm": { S: readModelTag(Summaries) },
+        ":rm": { S: markOf(Summaries, item) },
       })
       guarded++
     }
     for (const [name, value] of Object.entries(node)) {
       if (name === "__edd_rm__") {
-        expect(value).toEqual({ S: readModelTag(Summaries) })
+        expect(value).toEqual({ S: markOf(Summaries, node as Record<string, { S?: string }>) })
+        expect((value as { S: string }).S.startsWith(`${readModelTag(Summaries)}.`)).toBe(true)
         tagged++
         continue
       }

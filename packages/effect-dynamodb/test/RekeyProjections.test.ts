@@ -2455,7 +2455,7 @@ describe("rekey decides whose an outbox item is, item by item (#237)", () => {
   /**
    * The outbox items as 1.40.0 left them where two read models wrote at one key: the last one
    * written there, replacing the first. From 1.41.0 the second is written beside the first, at its
-   * key followed by its read model's tag.
+   * key followed by its mark.
    */
   const asLeftBy140 = (tables: RoutedTables) => {
     const items = tables.table("o").items
@@ -2544,8 +2544,8 @@ describe("rekey decides whose an outbox item is, item by item (#237)", () => {
     "items written at one revision, one beside the other, move by their own (side %s first)",
     (first) => {
       // One row key for both and one revision: the second item is written beside the first, at
-      // its key followed by its read model's tag. Rekey moves A's to A's key under escaping,
-      // keeping what follows the row's sort key; B's stays.
+      // its key followed by its mark (its read model's tag, then its effect's). Rekey moves A's to
+      // A's key under escaping, keeping what follows the row's sort key; B's stays.
       const tables = routedTables()
       const s = sides(A_ROW, { ...B_ROW, idA: "xa" })
       const written = pairs(Off, s)
@@ -2553,13 +2553,17 @@ describe("rekey decides whose an outbox item is, item by item (#237)", () => {
       const tags = written.built.map(({ Ledgers }) => readModelTag(Ledgers)!)
       const second = first === 0 ? 1 : 0
       const at = "#outbox#000000000001#0000"
-      const tail = (side: number) => (side === second ? `${at}#${tags[side]}` : at)
+      let mark = ""
+      const tail = (side: number) => (side === second ? `${at}#${mark}` : at)
       return Effect.gen(function* () {
         const seeded = yield* events(Off)
         yield* applyPair(written, first, seeded)
         yield* applyPair(written, second, seeded)
+        mark = [...tables.table("o").items.values()]
+          .map((item) => item.__edd_rm__?.S ?? "")
+          .find((held) => held.startsWith(`${tags[second]}.`))!
         const plainRow = "$pair#v1#ledger#ida_xa|$pair#v1#ledger#shop_north#branch_b1"
-        expect(outboxKeys(tables)).toEqual([`${plainRow}${at}`, `${plainRow}${at}#${tags[second]}`])
+        expect(outboxKeys(tables)).toEqual([`${plainRow}${at}`, `${plainRow}${at}#${mark}`])
         for (const options of [{ dryRun: true }, {}]) {
           const report = yield* run(now, options)
           expect(report.moved).toEqual({ ...ZERO, outbox: 1 })

@@ -12,10 +12,10 @@ import { DateTime, Effect, Layer, Schema, SchemaGetter } from "effect"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Entity from "../src/Entity.js"
 import * as EventStore from "../src/EventStore.js"
-import { readModelTag } from "../src/internal/ProjectionEngine.js"
 import { fromAttributeMap } from "../src/Marshaller.js"
 import * as Table from "../src/Table.js"
 import { InMemoryClient, resetStore, store } from "./helpers/InMemoryTables.js"
+import { markOf, tagOf } from "./helpers/OutboxMarks.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { makeRoutedTables } from "./helpers/RoutedTables.js"
 
@@ -708,28 +708,44 @@ describe("drain at a row key two read models write", () => {
  * Two read models whose row keys coincide (`escapeKeys` off: A's `shop` = `north#branch_b1` beside
  * B's `north` and `b1`), writing at one revision (#237): their outbox items have one key. 1.40.0's
  * Put of the second replaced the first, whose effect was never delivered. The Put is conditioned
- * on its key holding nothing or the writer's own item; held by another's, the item is written
- * beside it, at its key followed by the writer's tag, and each drainer delivers its own.
+ * on its key holding nothing or the item of the same effect (its mark, `outboxMark`); held by
+ * another's, the item is written beside it, at its key followed by its mark, and each drainer
+ * delivers its own.
  */
 describe("two read models writing at one revision at one row key", () => {
   const AT = "000000000001#0000"
   type W = ReturnType<typeof world>
-  /** The outbox items, each as the text after `#outbox#` and the read model it names. */
+  /** The side whose read model a mark names. */
+  const ownerOf = (w: W, mark: string | undefined) =>
+    mark === undefined
+      ? undefined
+      : w.sides.findIndex((side) => mark.startsWith(`${tagOf(side.Ledgers)}.`))
+  /**
+   * The outbox items, each as the text after `#outbox#` (a mark in it as `<mark>`) and the side
+   * whose read model it names; each item's mark is the one its side composes for its event, and
+   * one beside another's is at its key followed by that mark.
+   */
   const layout = (w: W) =>
     w
       .outboxItems()
-      .map((item) => [item.sk?.S?.split("#outbox#")[1], item.__edd_rm__?.S] as const)
-      .sort(([x], [y]) => (x! < y! ? -1 : 1))
-  const tagsOf = (w: W) => w.sides.map((side) => readModelTag(side.Ledgers)!)
-  const outboxPuts = (w: W) =>
-    w.routed
-      .take()
+      .map((item) => {
+        const mark = item.__edd_rm__?.S
+        const owner = ownerOf(w, mark)
+        if (owner !== undefined) expect(mark).toBe(markOf(w.sides[owner]!.Ledgers, item))
+        const at = item.sk!.S!.split("#outbox#")[1]!
+        return [mark === undefined ? at : at.replace(`#${mark}`, "#<mark>"), owner] as const
+      })
+      .sort(([x], [y]) => (x < y ? -1 : 1))
+  const tagsOf = (w: W) => w.sides.map((side) => tagOf(side.Ledgers))
+  const outboxPutsIn = (sent: ReadonlyArray<{ readonly command: string; readonly input: any }>) =>
+    sent
       .filter((request) => request.command === "TransactWriteItems")
       .flatMap((request) =>
         (request.input.TransactItems as ReadonlyArray<{ readonly Put?: any }>).flatMap((entry) =>
           entry.Put?.TableName === "outbox" ? [entry.Put] : [],
         ),
       )
+  const outboxPuts = (w: W) => outboxPutsIn(w.routed.take())
   const drained = (w: W, side: number) =>
     Effect.gen(function* () {
       const c = w.collect()
@@ -746,30 +762,28 @@ describe("two read models writing at one revision at one row key", () => {
         () => {
           const w = world(false, schemas, [1, 1])
           return Effect.gen(function* () {
-            const tags = tagsOf(w)
             const events = yield* w.events(`beside-${schemas}-${first}`)
             yield* w.sides[first]!.apply(events)
             w.routed.take()
             yield* w.sides[second]!.apply(events)
             const sent = w.routed.take()
-            // One read of the row; the transaction cancelled at the item, then sent with it beside.
+            // One read of the row; the transaction cancelled at the item, then sent with it beside:
+            // two transactions, each recorded once.
             expect(sent.filter((r) => r.command === "GetItem")).toHaveLength(1)
             expect(sent.filter((r) => r.command === "Query")).toHaveLength(0)
-            const puts = sent
-              .filter((r) => r.command === "TransactWriteItems")
-              .flatMap((r) =>
-                (r.input.TransactItems as ReadonlyArray<{ readonly Put?: any }>).flatMap((e) =>
-                  e.Put?.TableName === "outbox" ? [e.Put] : [],
-                ),
-              )
+            expect(sent.filter((r) => r.command === "TransactWriteItems")).toHaveLength(2)
+            const puts = outboxPutsIn(sent)
+            const mark = markOf(w.sides[second]!.Ledgers, puts[0].Item)
+            expect(mark.startsWith(`${tagsOf(w)[second]}.`)).toBe(true)
             expect(puts.map((put) => put.Item.sk.S.split("#outbox#")[1])).toEqual([
               AT,
-              `${AT}#${tags[second]}`,
+              `${AT}#${mark}`,
             ])
             for (const put of puts) {
+              expect(put.Item.__edd_rm__).toEqual({ S: mark })
               expect(put.ConditionExpression).toBe("attribute_not_exists(#pk) OR #rm = :rm")
               expect(put.ExpressionAttributeNames).toEqual({ "#pk": "pk", "#rm": "__edd_rm__" })
-              expect(put.ExpressionAttributeValues).toEqual({ ":rm": { S: tags[second] } })
+              expect(put.ExpressionAttributeValues).toEqual({ ":rm": { S: mark } })
               // The index's sort key follows the item's.
               expect(put.Item.obsk.S).toBe(`${put.Item.pk.S}#${put.Item.sk.S}`)
             }
@@ -777,8 +791,8 @@ describe("two read models writing at one revision at one row key", () => {
             expect(puts[1].ReturnValuesOnConditionCheckFailure).toBe("ALL_OLD")
             // Both kept: the first where it was, the second beside it.
             expect(layout(w)).toEqual([
-              [AT, tags[first]],
-              [`${AT}#${tags[second]}`, tags[second]],
+              [AT, first],
+              [`${AT}#<mark>`, second],
             ])
             // Each drainer delivers its own, whichever drains first.
             const effects = [{ total: 2 }, B_EFFECT[schemas]]
@@ -831,12 +845,11 @@ describe("two read models writing at one revision at one row key", () => {
   it.effect("multi-source projections: the second is written beside the first", () => {
     const w = world(false, "same", [1, 1], { multi: true })
     return Effect.gen(function* () {
-      const tags = tagsOf(w)
       const events = yield* w.events("multi")
       for (const side of w.sides) yield* side.apply(events)
       expect(layout(w)).toEqual([
-        [AT, tags[0]],
-        [`${AT}#${tags[1]}`, tags[1]],
+        [AT, 0],
+        [`${AT}#<mark>`, 1],
       ])
       expect(yield* drained(w, 1)).toEqual({
         result: { delivered: 1, undelivered: [] },
@@ -854,14 +867,13 @@ describe("two read models writing at one revision at one row key", () => {
     // at the key of B's item.
     const w = world(false, "same", [1, 1], { removal: true })
     return Effect.gen(function* () {
-      const tags = tagsOf(w)
       const events = yield* w.events("removal", [2, 0])
       yield* w.sides[1]!.apply(events.slice(0, 1))
       yield* w.sides[0]!.apply(events)
       expect(layout(w)).toEqual([
-        [AT, tags[1]],
-        [`${AT}#${tags[0]}`, tags[0]],
-        ["000000000001#0001", tags[0]],
+        [AT, 1],
+        [`${AT}#<mark>`, 0],
+        ["000000000001#0001", 0],
       ])
       expect(yield* drained(w, 0)).toEqual({
         result: { delivered: 2, undelivered: [] },
@@ -879,7 +891,6 @@ describe("two read models writing at one revision at one row key", () => {
     () => {
       const w = world(false, "same", [1, 1])
       return Effect.gen(function* () {
-        const tags = tagsOf(w)
         const events = yield* w.events("unmarked")
         yield* w.sides[1]!.apply(events)
         // B's item as 1.40.0 wrote it.
@@ -887,7 +898,7 @@ describe("two read models writing at one revision at one row key", () => {
         yield* w.sides[0]!.apply(events)
         expect(layout(w)).toEqual([
           [AT, undefined],
-          [`${AT}#${tags[0]}`, tags[0]],
+          [`${AT}#<mark>`, 0],
         ])
         // A's drainer takes the unmarked item at a key it writes as its own, as 1.40.0 did.
         expect(yield* drained(w, 0)).toEqual({
@@ -903,10 +914,10 @@ describe("two read models writing at one revision at one row key", () => {
       `a revision written again after the row is gone, over its own ${marked ? "marked" : "unmarked"} item`,
       () => {
         // The row deleted outside the projection (or its tombstone expired): its revision starts
-        // again at 1, at the key of its own item still pending.
+        // again at 1, at the key of its own item still pending, and the same event is applied
+        // again.
         const w = world(false, "same", [1, 10])
         return Effect.gen(function* () {
-          const tags = tagsOf(w)
           const events = yield* w.events(`again-${marked}`, [2, 3])
           yield* w.sides[0]!.apply(events.slice(0, 1))
           if (!marked) for (const item of w.table.items.values()) delete item.__edd_rm__
@@ -915,23 +926,25 @@ describe("two read models writing at one revision at one row key", () => {
           yield* w.sides[0]!.apply(events)
           const puts = outboxPuts(w)
           if (marked) {
-            // Its own item: replaced, as on 1.40.0, in one transaction.
+            // The same effect's item: replaced, as on 1.40.0, in one transaction.
             expect(puts).toHaveLength(2)
             expect(layout(w)).toEqual([
-              [AT, tags[0]],
-              ["000000000001#0001", tags[0]],
+              [AT, 0],
+              ["000000000001#0001", 0],
             ])
             expect(yield* drained(w, 0)).toEqual({
               result: { delivered: 2, undelivered: [] },
               seen: [{ total: 2 }, { total: 5 }],
             })
           } else {
-            // Unmarked, it may be another's: written beside, and both are delivered.
+            // Unmarked, at a key B writes too, it may be B's: written beside, and both are
+            // delivered (on a table where no other read model's keys can be A's, it is replaced:
+            // `outbox items of one read model`, below).
             expect(puts).toHaveLength(4)
             expect(layout(w)).toEqual([
               [AT, undefined],
-              [`${AT}#${tags[0]}`, tags[0]],
-              ["000000000001#0001", tags[0]],
+              [`${AT}#<mark>`, 0],
+              ["000000000001#0001", 0],
             ])
             expect(yield* drained(w, 0)).toEqual({
               result: { delivered: 3, undelivered: [] },
@@ -943,6 +956,35 @@ describe("two read models writing at one revision at one row key", () => {
     )
   }
 
+  it.effect("another event of its own at the key (its row gone): kept, the new one beside", () => {
+    // Two streams fold into A's row. The row is lost with the first stream's item pending; the
+    // second stream's event then writes at revision 1 again, at that item's key.
+    const w = world(false, "same", [1, 10])
+    return Effect.gen(function* () {
+      const first = yield* w.events("own-first")
+      const second = yield* w.events("own-second", [5])
+      yield* w.sides[0]!.apply(first)
+      w.routed.table("read0").items.clear()
+      w.routed.take()
+      yield* w.sides[0]!.apply(second)
+      const puts = outboxPuts(w)
+      // Cancelled at the item, then written beside it.
+      expect(puts.map((put) => put.Item.sk.S.split("#outbox#")[1])).toEqual([
+        AT,
+        `${AT}#${markOf(w.sides[0]!.Ledgers, puts[0].Item)}`,
+      ])
+      expect(layout(w)).toEqual([
+        [AT, 0],
+        [`${AT}#<mark>`, 0],
+      ])
+      // Both delivered, in the order written.
+      expect(yield* drained(w, 0)).toEqual({
+        result: { delivered: 2, undelivered: [] },
+        seen: [{ total: 2 }, { total: 5 }],
+      })
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, unknown>
+  })
+
   it.effect("the key beside held too: refused, naming both, and nothing written", () => {
     const w = world(false, "same", [1, 1])
     return Effect.gen(function* () {
@@ -950,7 +992,9 @@ describe("two read models writing at one revision at one row key", () => {
       const events = yield* w.events("held-beside")
       yield* w.sides[1]!.apply(events)
       const [plain] = w.outboxItems()
-      const beside = `${plain!.sk!.S}#${tags[0]}`
+      // A's item for the same event, beside B's.
+      const mark = markOf(w.sides[0]!.Ledgers, plain!)
+      const beside = `${plain!.sk!.S}#${mark}`
       w.table.items.set(`${plain!.pk!.S}|${beside}`, {
         ...plain!,
         sk: { S: beside },
@@ -959,6 +1003,7 @@ describe("two read models writing at one revision at one row key", () => {
       // Every table's items; a table only read is no change.
       const held = () => new Map([...w.routed.snapshot()].filter(([, items]) => items.size > 0))
       const before = held()
+      w.routed.take()
       const failed = (yield* Effect.flip(
         w.sides[0]!.Notifying.apply(events[0]) as Effect.Effect<unknown, unknown>,
       )) as { readonly _tag: string; readonly operation: string; readonly cause: unknown }
@@ -967,12 +1012,38 @@ describe("two read models writing at one revision at one row key", () => {
       const message = String((failed.cause as Error).message)
       expect(message).toContain("[EDD-9145]")
       expect(message).toContain(JSON.stringify(tags[0]))
-      expect(message).toContain('naming read model "zzz"')
+      expect(message).toContain(`(${JSON.stringify(mark)})`)
+      expect(message).toContain('marked "zzz"')
       expect(message).toContain(JSON.stringify(beside))
-      expect(message).toContain("escapeKeys: true")
+      expect(message).toContain("Nothing was written")
       expect((failed.cause as Error).cause).toHaveProperty("_tag", "DynamoError")
-      // Nothing written: not the row, not an item.
+      // Two transactions, both cancelled whole: nothing written, not the row, not an item.
+      expect(outboxPuts(w)).toHaveLength(2)
       expect(held()).toEqual(before)
+    }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, any>
+  })
+
+  it.effect("the key beside held by an unmarked item: refused, saying it carries no mark", () => {
+    const w = world(false, "same", [1, 1])
+    return Effect.gen(function* () {
+      const events = yield* w.events("held-unmarked")
+      yield* w.sides[1]!.apply(events)
+      const [plain] = w.outboxItems()
+      const beside = `${plain!.sk!.S}#${markOf(w.sides[0]!.Ledgers, plain!)}`
+      const { __edd_rm__: _, ...unmarked } = plain!
+      w.table.items.set(`${plain!.pk!.S}|${beside}`, { ...unmarked, sk: { S: beside } })
+      const failed = (yield* Effect.flip(
+        w.sides[0]!.Notifying.apply(events[0]) as Effect.Effect<unknown, unknown>,
+      )) as { readonly cause: unknown }
+      const message = String((failed.cause as Error).message)
+      expect(message).toContain("[EDD-9145]")
+      expect(message).toContain('an item of "Ledger#outbox" carrying no mark')
+      // Retried, it is refused again: nothing is replaced on the way.
+      const again = (yield* Effect.flip(
+        w.sides[0]!.Notifying.apply(events[0]) as Effect.Effect<unknown, unknown>,
+      )) as { readonly cause: unknown }
+      expect(String((again.cause as Error).message)).toContain("[EDD-9145]")
+      expect(w.outboxItems()).toHaveLength(2)
     }).pipe(Effect.provide(w.layer)) as Effect.Effect<void, any>
   })
 })

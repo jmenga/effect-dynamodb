@@ -19,22 +19,33 @@ type Entry = Record<string, { readonly TableName?: string }>
 const tableOfEntry = (entry: Entry): string => String(Object.values(entry)[0]?.TableName)
 
 /**
- * Tables made on first use, each with `options` (its secondary indexes); `first` answers a request
- * naming no table.
+ * Tables made on first use, each with `options` (its keys and secondary indexes), or the options
+ * `options` gives its name; `first` answers a request naming no table.
  */
 export const makeRoutedTables = (
-  options?: Parameters<typeof makeRecordingTable>[0],
+  options?:
+    | Parameters<typeof makeRecordingTable>[0]
+    | ((name: string) => Parameters<typeof makeRecordingTable>[0]),
   first = "t",
 ) => {
   const byName = new Map<string, RecordingTable>()
   const named = (name: string): RecordingTable => {
     const known = byName.get(name)
     if (known !== undefined) return known
-    const made = makeRecordingTable(options)
+    const made = makeRecordingTable(typeof options === "function" ? options(name) : options)
     byName.set(name, made)
     return made
   }
   const base = named(first)
+  /**
+   * Every request, in the order sent, each once and whole: a transaction spanning tables is one
+   * request, however many tables' parts it was answered by.
+   */
+  const sent: Array<{ readonly command: string; readonly input: any }> = []
+  const record = (command: string, input: unknown) =>
+    sent.push({ command, input: structuredClone(input) })
+  /** `operation`'s command name, as `RecordingTable` records it: `getItem` → `GetItem`. */
+  const commandOf = (operation: string) => operation.charAt(0).toUpperCase() + operation.slice(1)
 
   /** `input`'s entries by table, each with its position in the request. */
   const groupsOf = (input: { readonly TransactItems?: ReadonlyArray<Entry> }) => {
@@ -110,9 +121,20 @@ export const makeRoutedTables = (
     get: (target, operation) => {
       const value = (target as any)[operation]
       if (typeof value !== "function") return value
-      if (operation === "transactWriteItems") return transactWriteItems
-      if (operation === "transactGetItems") return transactGetItems
+      if (operation === "transactWriteItems") {
+        return (input: any) => {
+          record("TransactWriteItems", input)
+          return transactWriteItems(input)
+        }
+      }
+      if (operation === "transactGetItems") {
+        return (input: any) => {
+          record("TransactGetItems", input)
+          return transactGetItems(input)
+        }
+      }
       return (input: any) => {
+        record(commandOf(String(operation)), input)
         const name = input.TableName ?? Object.keys(input.RequestItems ?? {})[0] ?? first
         return (named(String(name)).client as any)[operation](input)
       }
@@ -124,8 +146,14 @@ export const makeRoutedTables = (
     layer: Layer.succeed(DynamoClient, client),
     /** The recording table named `name`. */
     table: named,
-    /** The requests sent to any table since the last call, and forget them. */
-    take: () => [...byName.values()].flatMap((table) => table.take()),
+    /**
+     * The requests sent to any table since the last call, in order, a transaction once however
+     * many tables it spans, and forget them (each table's own record too).
+     */
+    take: () => {
+      for (const table of byName.values()) table.take()
+      return sent.splice(0, sent.length)
+    },
     /** Every table's items, by table. */
     snapshot: () =>
       new Map([...byName].map(([name, table]) => [name, new Map(table.items)] as const)),
