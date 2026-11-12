@@ -14,6 +14,7 @@ import { DynamoClient } from "../../src/DynamoClient.js"
 import * as Entity from "../../src/Entity.js"
 import * as Table from "../../src/Table.js"
 import * as Transaction from "../../src/Transaction.js"
+import { indexesOf } from "./DynamoExpressions.js"
 import { makeRecordingTable } from "./RecordingTable.js"
 
 export const schema = DynamoSchema.make({ name: "clears", version: 1 })
@@ -53,12 +54,7 @@ export const clientOf = (world: World) =>
     tables: { MainTable: world.MainTable },
   } as never) as Effect.Effect<any, never, any>
 
-const physicalIndexes = (world: World) =>
-  Object.fromEntries(
-    Object.entries(world.Rows.indexes as Record<string, any>)
-      .filter(([name]) => name !== "primary")
-      .map(([, index]) => [index.index, { pk: index.pk.field, sk: index.sk.field }]),
-  )
+const physicalIndexes = (world: World) => indexesOf(Table.definition(world.MainTable))
 
 /** An in-memory table: everything sent is seen. */
 export const recordingHarness: Harness = {

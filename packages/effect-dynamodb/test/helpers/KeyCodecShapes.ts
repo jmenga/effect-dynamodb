@@ -236,7 +236,8 @@ export const fixture: {
 /** The secondary indexes a recording table serves for {@link world}'s entities. */
 export const indexes = {
   gsi1: { pk: "gsi1pk", sk: "gsi1sk" },
-  gsi2: { pk: "gsi2pk", sk: "gsi2sk" },
+  // byFacets' Z-order sort key is binary.
+  gsi2: { pk: "gsi2pk", sk: "gsi2sk", skType: "B" },
 } as const
 
 /** The writes 1.39.0 made for the fixture, made now. */

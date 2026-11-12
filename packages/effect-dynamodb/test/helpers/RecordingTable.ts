@@ -122,7 +122,8 @@ const parseKeyText = (text: string): readonly [string, string] | undefined => {
 
 /**
  * A fresh table: its items, the requests sent to it, and a `DynamoClient`
- * layer over both. `indexes` names the secondary indexes a Query may read.
+ * layer over both. `indexes` declares the table's secondary indexes (keys, kind, projection),
+ * which queries read and writes check their keys against.
  */
 export const makeRecordingTable = (options?: {
   readonly indexes?: Readonly<Record<string, IndexKeys>> | undefined
@@ -169,7 +170,8 @@ export const makeRecordingTable = (options?: {
       const item = heldBy(slot, table)
       return item === undefined ? [] : [[text, item] as const]
     })
-  const tables: Tables = { schema: schemaOf, read }
+  const indexes = options?.indexes ?? {}
+  const tables: Tables = { schema: schemaOf, indexes: () => indexes, read }
 
   /** The one item `items` shows under `text`; two tables' items there are a defect. */
   const only = (text: string, what: string) => {
@@ -278,7 +280,9 @@ export const makeRecordingTable = (options?: {
         if (refused("PutItem", input)) return Effect.fail(tooLargeFailure("PutItem"))
         return answering(() => {
           const table = input.TableName!
-          const outcome = putItem(input as never, (key) => read(table, key), schemaOf(table))
+          const outcome = putItem(input as never, (key) => read(table, key), schemaOf(table), {
+            indexes,
+          })
           return write("PutItem", table, input.Item!, outcome)
         }, failure("PutItem"))
       }),
@@ -287,7 +291,9 @@ export const makeRecordingTable = (options?: {
         record("UpdateItem", input)
         return answering(() => {
           const table = input.TableName!
-          const outcome = updateItem(input as never, (key) => read(table, key), schemaOf(table))
+          const outcome = updateItem(input as never, (key) => read(table, key), schemaOf(table), {
+            indexes,
+          })
           return write("UpdateItem", table, input.Key!, outcome)
         }, failure("UpdateItem"))
       }),
@@ -305,15 +311,8 @@ export const makeRecordingTable = (options?: {
         record("Query", input)
         return answering(() => {
           const schema = schemaOf(input.TableName)
-          const index =
-            input.IndexName === undefined
-              ? undefined
-              : (options?.indexes?.[input.IndexName] ??
-                (() => {
-                  throw new UnreadableRequest(`RecordingTable: no index ${input.IndexName}`)
-                })())
           const rows = rowsOf(input.TableName!).map(([, item]) => item)
-          return Effect.succeed(query(input as never, rows, schema, index) as never)
+          return Effect.succeed(query(input as never, rows, schema, indexes) as never)
         }, failure("Query"))
       }),
     scan: (input) =>

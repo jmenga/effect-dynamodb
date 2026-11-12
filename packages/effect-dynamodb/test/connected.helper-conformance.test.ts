@@ -1,17 +1,18 @@
 /**
  * The in-memory tables the unit tests run on, against DynamoDB Local (#243).
  *
- * `helpers/RecordingTable.ts` and `helpers/InMemoryTables.ts` answer every request through
- * `helpers/DynamoExpressions.ts`, as DynamoDB Local answers it. Each row here sends one request, on
+ * `helpers/RecordingTable.ts` and `helpers/InMemoryTables.ts` answer requests through
+ * `helpers/DynamoExpressions.ts`, as DynamoDB Local answers them. Each row here sends one request, on
  * the same stored items, to DynamoDB Local, to the recording table and (for the operations it
  * serves) to `InMemoryClient`, and compares the answers: the output, or the error's name, message,
  * cancellation reasons and returned item, and every item each table holds afterwards. A condition
  * row is also put to `holds` itself. Numbers are compared as spelled, sets in any order, a scan's
  * and a batch read's items in any order.
  *
- * Rows the tables answer differently on purpose are in `KNOWN`, each with its reason, and each is
- * asserted still to differ (and one that differs only in how a number is spelled, to agree by
- * value): the number of differences is the number of entries there.
+ * Rows the tables answer differently on purpose are in `KNOWN`, each with its reason and both
+ * answers, each asserted exactly, the tables afterwards still compared: the number of differences
+ * is the number of entries there. What the helpers don't model at all is listed at the top of
+ * `helpers/DynamoExpressions.ts`, and a request of that kind is a defect naming it.
  *
  * - updates: every update action and operand, numbers, sets, list indexes, overlapping paths, the
  *   grammar's spacing, case and clause order, and refusals;
@@ -22,6 +23,10 @@
  *   update, one key in two tables, keys whose text would join to the same text;
  * - key and request checks, unused and undefined placeholders, return values, queries on the
  *   table and on a secondary index, scans, a top-level `__proto__` attribute;
+ * - secondary index keys a write gives (types and empty values, on puts, updates, transactions and
+ *   batches), the item counts a request may hold, key conditions and `Select`, what each kind of
+ *   index projection returns, where a read stops (`LastEvaluatedKey` at the end of a range) and
+ *   where it may start (`ExclusiveStartKey` of every shape), and numbers as each write stores them;
  * - every reserved word, as an attribute name;
  * - the absent sparse-map entry operations `SparseEntryOps.test.ts` runs (refused, and written
  *   whole), through the library on DynamoDB Local and on the recording table.
@@ -50,14 +55,14 @@ import { SecureRandom } from "effect/crypto"
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { DynamoClient } from "../src/DynamoClient.js"
 import * as Lib from "../src/index.js"
-import { asRead, holds, isRefusal, reservedWords } from "./helpers/DynamoExpressions.js"
 import {
-  InMemoryClient,
-  resetStore,
-  store,
-  keyOf as storeKey,
-  tableIndexes,
-} from "./helpers/InMemoryTables.js"
+  asRead,
+  holds,
+  type Indexes,
+  isRefusal,
+  reservedWords,
+} from "./helpers/DynamoExpressions.js"
+import { InMemoryClient, resetStore, store, tableIndexes } from "./helpers/InMemoryTables.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import { entryOps, primaryKey } from "./helpers/SparseEntryOps.js"
 
@@ -92,8 +97,20 @@ const TABLES: Readonly<Record<string, string>> = {
   $T2: `conformance-${stamp}-two`,
 }
 type TableName = "$T" | "$T2"
-/** `$T`'s secondary index. */
-const INDEXES = { gsi1: { pk: "gpk", sk: "gsk" } }
+/**
+ * `$T`'s secondary indexes, as the helpers are told of them and as `$T` is created with them, in
+ * that order: local indexes of every projection, global ones of every projection, a binary sort
+ * key, and indexes sharing a key attribute.
+ */
+const INDEXES = {
+  lsi1: { pk: "pk", sk: "lsk" },
+  lsi2: { pk: "pk", sk: "lsk2", projection: "KEYS_ONLY" },
+  lsi3: { pk: "pk", sk: "lsk3", projection: ["inc"] },
+  gsi1: { pk: "gpk", sk: "gsk" },
+  gsib: { pk: "gpk", sk: "gbk", skType: "B" },
+  gsik: { pk: "gpk2", sk: "gsk2", projection: "KEYS_ONLY" },
+  gsii: { pk: "gpk2", sk: "lsk3", projection: ["inc", "other"] },
+} satisfies Indexes
 
 const COMMANDS = {
   GetItem: GetItemCommand,
@@ -2900,6 +2917,789 @@ const QUERIES: ReadonlyArray<Row> = [
 ]
 
 // ---------------------------------------------------------------------------
+// Secondary index keys written, request sizes, reads of an index, numbers as stored
+// ---------------------------------------------------------------------------
+
+/** An item holding a key of every index of `$T`. */
+const INDEXED: Item = {
+  ...KEY,
+  lsk: S("l"),
+  lsk2: S("l2"),
+  lsk3: S("l3"),
+  gpk: S("g"),
+  gsk: S("k"),
+  gbk: { B: bytes(1) },
+  gpk2: S("g2"),
+  gsk2: S("k2"),
+  inc: S("i"),
+  other: S("o"),
+  n: N("1"),
+}
+const brief = (
+  label: string,
+  command: Command,
+  input: Record<string, unknown>,
+  seed: ReadonlyArray<Seed> = seeded([INDEXED]),
+): Row => ({ label, command, input, seed })
+const QK: Item = { pk: S("q"), sk: S("s") }
+const putIndexed = (label: string, attributes: Item) =>
+  brief(`index keys: put ${label}`, "PutItem", { TableName: "$T", Item: { ...QK, ...attributes } })
+const updateIndexed = (
+  label: string,
+  expression: string,
+  values?: Record<string, AttributeValue>,
+  extra: object = {},
+  key: Item = KEY,
+) =>
+  brief(`index keys: update ${label}`, "UpdateItem", {
+    TableName: "$T",
+    Key: key,
+    UpdateExpression: expression,
+    ...(values !== undefined && { ExpressionAttributeValues: values }),
+    ...extra,
+  })
+const twIndexed = (label: string, items: ReadonlyArray<object>) =>
+  brief(`index keys: tw ${label}`, "TransactWriteItems", { TransactItems: items })
+const tPut = (item: Item) => ({ Put: { TableName: "$T", Item: item } })
+const tUpdate = (expression: string, values?: Record<string, AttributeValue>, extra = {}) => ({
+  Update: {
+    TableName: "$T",
+    Key: KEY,
+    UpdateExpression: expression,
+    ...(values !== undefined && { ExpressionAttributeValues: values }),
+    ...extra,
+  },
+})
+const tCheck = (key: Item, expression: string) => ({
+  ConditionCheck: { TableName: "$T", Key: key, ConditionExpression: expression },
+})
+
+const INDEX_WRITES: ReadonlyArray<Row> = [
+  putIndexed("gsk N", { gpk: S("g"), gsk: N("1") }),
+  putIndexed("gsk N, no gpk", { gsk: N("1") }),
+  putIndexed("gpk N", { gpk: N("1") }),
+  putIndexed("gsk ''", { gpk: S("g"), gsk: S("") }),
+  putIndexed("gpk ''", { gpk: S(""), gsk: S("x") }),
+  putIndexed("lsk ''", { lsk: S("") }),
+  putIndexed("lsk N", { lsk: N("1") }),
+  putIndexed("gbk S", { gbk: S("x") }),
+  putIndexed("gbk empty B", { gbk: { B: bytes() } }),
+  putIndexed("lsk N and gsk ''", { lsk: N("1"), gsk: S("") }),
+  putIndexed("gsk '' and lsk N", { gsk: S(""), lsk: N("1") }),
+  putIndexed("gsk M", { gsk: { M: {} } }),
+  putIndexed("gsk NULL", { gsk: { NULL: true } }),
+  putIndexed("lsk3 '' (two indexes)", { lsk3: S("") }),
+  putIndexed("every key", { ...INDEXED, ...QK }),
+  updateIndexed("SET gsk = N", "SET gsk = :v", { ":v": N("1") }),
+  updateIndexed("SET gsk = ''", "SET gsk = :v", { ":v": S("") }),
+  updateIndexed("SET gpk = ''", "SET gpk = :v", { ":v": S("") }),
+  updateIndexed("SET lsk = N", "SET lsk = :v", { ":v": N("1") }),
+  updateIndexed("SET lsk = ''", "SET lsk = :v", { ":v": S("") }),
+  updateIndexed("SET lsk3 = N (local and global)", "SET lsk3 = :v", { ":v": N("1") }),
+  updateIndexed("ADD gsk 1", "ADD gsk :v", { ":v": N("1") }),
+  updateIndexed("SET gsk = N, no item", "SET gsk = :v", { ":v": N("1") }, {}, QK),
+  updateIndexed("SET gsk = '', no item", "SET gsk = :v", { ":v": S("") }, {}, QK),
+  updateIndexed(
+    "SET gsk = N, its condition failing",
+    "SET gsk = :v",
+    { ":v": N("1"), ":x": S("zz") },
+    { ConditionExpression: "pk = :x" },
+  ),
+  updateIndexed("SET gbk = S", "SET gbk = :v", { ":v": S("x") }),
+  updateIndexed("SET gsk = n (a number copied)", "SET gsk = n"),
+  updateIndexed("SET gsk = M", "SET gsk = :v", { ":v": { M: {} } }),
+  updateIndexed("SET gsk = '' and lsk = N", "SET gsk = :a, lsk = :b", {
+    ":a": S(""),
+    ":b": N("1"),
+  }),
+  updateIndexed("SET gsk = '', n = n + 'x'", "SET gsk = :a, n = n + :b", {
+    ":a": S(""),
+    ":b": S("x"),
+  }),
+  updateIndexed("REMOVE gsk", "REMOVE gsk"),
+  twIndexed("put gsk N", [tPut({ ...QK, gsk: N("1") })]),
+  twIndexed("put gsk ''", [tPut({ ...QK, gsk: S("") })]),
+  twIndexed("put, put gsk N", [tPut({ ...K("q1") }), tPut({ ...QK, gsk: N("1") })]),
+  twIndexed("put gsk N, a failing check", [
+    tPut({ ...QK, gsk: N("1") }),
+    tCheck(KEY, "attribute_not_exists(pk)"),
+  ]),
+  twIndexed("a failing check, put gsk N", [
+    tCheck(KEY, "attribute_not_exists(pk)"),
+    tPut({ ...QK, gsk: N("1") }),
+  ]),
+  twIndexed("update SET gsk = N", [tUpdate("SET gsk = :v", { ":v": N("1") })]),
+  twIndexed("update SET gsk = ''", [tUpdate("SET gsk = :v", { ":v": S("") })]),
+  twIndexed("update SET lsk = N", [tUpdate("SET lsk = :v", { ":v": N("1") })]),
+  twIndexed("put, update SET gsk = N", [
+    tPut({ ...K("q1") }),
+    tUpdate("SET gsk = :v", { ":v": N("1") }),
+  ]),
+  twIndexed("update SET gsk = N, its condition failing", [
+    tUpdate("SET gsk = :v", { ":v": N("1") }, { ConditionExpression: "attribute_not_exists(pk)" }),
+  ]),
+  twIndexed("put pk N", [tPut({ pk: N("1"), sk: S("s") })]),
+  twIndexed("put, put pk N", [tPut(K("q1")), tPut({ pk: N("1"), sk: S("s") })]),
+  twIndexed("put pk ''", [tPut({ pk: S(""), sk: S("s") })]),
+  twIndexed("put, put pk ''", [tPut(K("q1")), tPut({ pk: S(""), sk: S("s") })]),
+  twIndexed("update of key pk N", [
+    {
+      Update: {
+        ...tUpdate("SET a = :a", { ":a": N("1") }).Update,
+        Key: { pk: N("1"), sk: S("s") },
+      },
+    },
+  ]),
+  twIndexed("delete of key pk N", [
+    { Delete: { TableName: "$T", Key: { pk: N("1"), sk: S("s") } } },
+  ]),
+  twIndexed("check of key pk N", [tCheck({ pk: N("1"), sk: S("s") }, "attribute_exists(pk)")]),
+  twIndexed("delete of key pk ''", [
+    { Delete: { TableName: "$T", Key: { pk: S(""), sk: S("s") } } },
+  ]),
+  twIndexed("delete of a key with another attribute", [
+    { Delete: { TableName: "$T", Key: { ...KEY, x: S("x") } } },
+  ]),
+  twIndexed("delete of a key without sk", [{ Delete: { TableName: "$T", Key: { pk: S("p") } } }]),
+  twIndexed("update SET pk", [tUpdate("SET pk = :a", { ":a": S("x") })]),
+  twIndexed("update REMOVE sk", [tUpdate("REMOVE sk")]),
+  twIndexed("update SET pk, its condition failing", [
+    tUpdate("SET pk = :a", { ":a": S("x") }, { ConditionExpression: "attribute_not_exists(pk)" }),
+  ]),
+  twIndexed("a failing check, update SET pk", [
+    tCheck(K("q1"), "attribute_not_exists(pk)"),
+    tUpdate("SET pk = :a", { ":a": S("x") }),
+  ]),
+  twIndexed("update SET pk, put pk N", [
+    tUpdate("SET pk = :a", { ":a": S("x") }),
+    tPut({ pk: N("1"), sk: S("s") }),
+  ]),
+  twIndexed("put pk N, update SET pk", [
+    tPut({ pk: N("1"), sk: S("s") }),
+    tUpdate("SET pk = :a", { ":a": S("x") }),
+  ]),
+  twIndexed("put pk N, one item twice", [tPut({ pk: N("1"), sk: S("s") }), tPut(KEY), tPut(KEY)]),
+  twIndexed("put pk N, update SET a = n + 'x'", [
+    tPut({ pk: N("1"), sk: S("s") }),
+    tUpdate("SET a = n + :x", { ":x": S("x") }),
+  ]),
+  twIndexed("update SET a = n + 'x', put pk N", [
+    tUpdate("SET a = n + :x", { ":x": S("x") }),
+    tPut({ pk: N("1"), sk: S("s") }),
+  ]),
+  twIndexed("put gsk N, put pk N", [
+    tPut({ ...QK, gsk: N("1") }),
+    tPut({ pk: N("1"), sk: S("s") }),
+  ]),
+  brief("index keys: tg of key pk N", "TransactGetItems", {
+    TransactItems: [{ Get: { TableName: "$T", Key: { pk: N("1"), sk: S("s") } } }],
+  }),
+  brief("index keys: bw put gsk N", "BatchWriteItem", {
+    RequestItems: { $T: [{ PutRequest: { Item: { ...QK, gsk: N("1") } } }] },
+  }),
+  brief("index keys: bw put gsk ''", "BatchWriteItem", {
+    RequestItems: { $T: [{ PutRequest: { Item: { ...QK, gsk: S("") } } }] },
+  }),
+]
+
+/** `n` keys `c0`, `c1`, … (or under another prefix). */
+const keysOf = (n: number, prefix = "c") =>
+  Array.from({ length: n }, (_, i) => ({ pk: S(`${prefix}${i}`), sk: S("s") }))
+const COUNTS: ReadonlyArray<Row> = [
+  brief("counts: tw 101", "TransactWriteItems", {
+    TransactItems: keysOf(101).map((Item) => ({ Put: { TableName: "$T", Item } })),
+  }),
+  brief("counts: tw 100", "TransactWriteItems", {
+    TransactItems: keysOf(100, "t").map((Item) => ({ Put: { TableName: "$T", Item } })),
+  }),
+  brief("counts: tw 0", "TransactWriteItems", { TransactItems: [] }),
+  brief("counts: tw 101, one of them refused", "TransactWriteItems", {
+    TransactItems: [
+      ...keysOf(100).map((Item) => ({ Put: { TableName: "$T", Item } })),
+      { Put: { TableName: "$T", Item: { pk: N("1"), sk: S("s") } } },
+    ],
+  }),
+  brief("counts: tg 101", "TransactGetItems", {
+    TransactItems: keysOf(101).map((Key) => ({ Get: { TableName: "$T", Key } })),
+  }),
+  brief("counts: tg 0", "TransactGetItems", { TransactItems: [] }),
+  brief("counts: bw 26", "BatchWriteItem", {
+    RequestItems: { $T: keysOf(26).map((Item) => ({ PutRequest: { Item } })) },
+  }),
+  brief("counts: bw 26 over two tables", "BatchWriteItem", {
+    RequestItems: {
+      $T: keysOf(13).map((Item) => ({ PutRequest: { Item } })),
+      $T2: keysOf(13).map((Item) => ({ PutRequest: { Item } })),
+    },
+  }),
+  brief("counts: bw 26, one key twice", "BatchWriteItem", {
+    RequestItems: {
+      $T: [...keysOf(25), keysOf(1)[0]!].map((Item) => ({ PutRequest: { Item } })),
+    },
+  }),
+  brief("counts: bw 0", "BatchWriteItem", { RequestItems: {} }),
+  brief("counts: bw a table with 0", "BatchWriteItem", { RequestItems: { $T: [] } }),
+  brief("counts: bg 101", "BatchGetItem", { RequestItems: { $T: { Keys: keysOf(101) } } }),
+  brief("counts: bg 101 over two tables", "BatchGetItem", {
+    RequestItems: { $T: { Keys: keysOf(50) }, $T2: { Keys: keysOf(51) } },
+  }),
+  brief("counts: bg 100", "BatchGetItem", { RequestItems: { $T: { Keys: keysOf(100) } } }),
+  brief("counts: bg 0", "BatchGetItem", { RequestItems: {} }),
+  brief("counts: bg a table with 0", "BatchGetItem", { RequestItems: { $T: { Keys: [] } } }),
+]
+
+const kc = (expression: string, values: Record<string, AttributeValue>, extra: object = {}) => ({
+  TableName: "$T",
+  KeyConditionExpression: expression,
+  ExpressionAttributeValues: values,
+  ...extra,
+})
+const queried = (label: string, input: Record<string, unknown>) =>
+  brief(`reads: ${label}`, "Query", input)
+const QUERY_CHECKS: ReadonlyArray<Row> = [
+  queried(
+    "begins_with sk ''",
+    kc("pk = :p AND begins_with(sk, :e)", { ":p": S("p"), ":e": S("") }),
+  ),
+  queried("sk > ''", kc("pk = :p AND sk > :e", { ":p": S("p"), ":e": S("") })),
+  queried("sk = ''", kc("pk = :p AND sk = :e", { ":p": S("p"), ":e": S("") })),
+  queried(
+    "sk BETWEEN '' AND b",
+    kc("pk = :p AND sk BETWEEN :e AND :b", { ":p": S("p"), ":e": S(""), ":b": S("b") }),
+  ),
+  queried("pk = ''", kc("pk = :e", { ":e": S("") })),
+  queried("pk = '', sk > N", kc("pk = :e AND sk > :n", { ":e": S(""), ":n": N("1") })),
+  queried("gsi1 gpk = ''", kc("gpk = :e", { ":e": S("") }, { IndexName: "gsi1" })),
+  queried(
+    "gsi1 begins_with gsk ''",
+    kc("gpk = :g AND begins_with(gsk, :e)", { ":g": S("g"), ":e": S("") }, { IndexName: "gsi1" }),
+  ),
+  queried(
+    "lsi1 lsk > ''",
+    kc("pk = :p AND lsk > :e", { ":p": S("p"), ":e": S("") }, { IndexName: "lsi1" }),
+  ),
+  queried(
+    "gsib gbk > S",
+    kc("gpk = :g AND gbk > :s", { ":g": S("g"), ":s": S("a") }, { IndexName: "gsib" }),
+  ),
+  queried(
+    "gsib begins_with gbk S",
+    kc("gpk = :g AND begins_with(gbk, :s)", { ":g": S("g"), ":s": S("a") }, { IndexName: "gsib" }),
+  ),
+  queried(
+    "gsib gbk BETWEEN S",
+    kc(
+      "gpk = :g AND gbk BETWEEN :s AND :t",
+      { ":g": S("g"), ":s": S("a"), ":t": S("b") },
+      { IndexName: "gsib" },
+    ),
+  ),
+  queried(
+    "gsib gbk > B",
+    kc("gpk = :g AND gbk > :s", { ":g": S("g"), ":s": { B: bytes(0) } }, { IndexName: "gsib" }),
+  ),
+  queried("sk > N", kc("pk = :p AND sk > :n", { ":p": S("p"), ":n": N("1") })),
+  queried("sk > B", kc("pk = :p AND sk > :n", { ":p": S("p"), ":n": { B: bytes(1) } })),
+  queried("pk = N", kc("pk = :n", { ":n": N("1") })),
+  queried(
+    "COUNT and a projection",
+    kc("pk = :p", { ":p": S("p") }, { Select: "COUNT", ProjectionExpression: "n" }),
+  ),
+  queried(
+    "SPECIFIC_ATTRIBUTES without a projection",
+    kc("pk = :p", { ":p": S("p") }, { Select: "SPECIFIC_ATTRIBUTES" }),
+  ),
+  queried(
+    "SPECIFIC_ATTRIBUTES with a projection",
+    kc("pk = :p", { ":p": S("p") }, { Select: "SPECIFIC_ATTRIBUTES", ProjectionExpression: "n" }),
+  ),
+  queried(
+    "ALL_ATTRIBUTES and a projection",
+    kc("pk = :p", { ":p": S("p") }, { Select: "ALL_ATTRIBUTES", ProjectionExpression: "n" }),
+  ),
+  queried("ALL_ATTRIBUTES", kc("pk = :p", { ":p": S("p") }, { Select: "ALL_ATTRIBUTES" })),
+  queried(
+    "ALL_PROJECTED_ATTRIBUTES of the table",
+    kc("pk = :p", { ":p": S("p") }, { Select: "ALL_PROJECTED_ATTRIBUTES" }),
+  ),
+  queried(
+    "two sort key conditions",
+    kc("pk = :p AND sk > :a AND sk < :b", { ":p": S("p"), ":a": S("a"), ":b": S("z") }),
+  ),
+  queried(
+    "two sort key conditions, begins_with and >",
+    kc("pk = :p AND begins_with(sk, :a) AND sk > :b", {
+      ":p": S("p"),
+      ":a": S("a"),
+      ":b": S("z"),
+    }),
+  ),
+  queried("two partition key conditions", kc("pk = :p AND pk = :p", { ":p": S("p") })),
+  queried(
+    "two sort key conditions, one empty",
+    kc("pk = :p AND sk > :e AND sk < :b", { ":p": S("p"), ":e": S(""), ":b": S("z") }),
+  ),
+  queried(
+    "lsi1, consistent",
+    kc("pk = :p", { ":p": S("p") }, { IndexName: "lsi1", ConsistentRead: true }),
+  ),
+  queried(
+    "gsi1, consistent",
+    kc("gpk = :p", { ":p": S("g") }, { IndexName: "gsi1", ConsistentRead: true }),
+  ),
+  queried(
+    "gsi1, consistent, an empty start key",
+    kc(
+      "gpk = :p",
+      { ":p": S("g") },
+      { IndexName: "gsi1", ConsistentRead: true, ExclusiveStartKey: {} },
+    ),
+  ),
+  queried("the sort key value first", kc("pk = :p AND :b >= sk", { ":p": S("p"), ":b": S("t") })),
+  brief("reads: scan, COUNT and a projection", "Scan", {
+    TableName: "$T",
+    Select: "COUNT",
+    ProjectionExpression: "n",
+  }),
+  brief("reads: scan, ALL_PROJECTED_ATTRIBUTES", "Scan", {
+    TableName: "$T",
+    Select: "ALL_PROJECTED_ATTRIBUTES",
+  }),
+  brief("reads: scan, SPECIFIC_ATTRIBUTES", "Scan", {
+    TableName: "$T",
+    Select: "SPECIFIC_ATTRIBUTES",
+    ProjectionExpression: "n, sk",
+  }),
+  brief("reads: scan, COUNT", "Scan", { TableName: "$T", Select: "COUNT" }),
+]
+
+const PROJECTIONS: ReadonlyArray<Row> = (
+  [
+    ["lsi2 KEYS_ONLY", kc("pk = :p", { ":p": S("p") }, { IndexName: "lsi2" })],
+    ["lsi3 INCLUDE inc", kc("pk = :p", { ":p": S("p") }, { IndexName: "lsi3" })],
+    ["gsik KEYS_ONLY", kc("gpk2 = :p", { ":p": S("g2") }, { IndexName: "gsik" })],
+    ["gsii INCLUDE inc, other", kc("gpk2 = :p", { ":p": S("g2") }, { IndexName: "gsii" })],
+    ["lsi1 ALL", kc("pk = :p", { ":p": S("p") }, { IndexName: "lsi1" })],
+  ] as const
+).flatMap(([name, base]) => {
+  const values = base.ExpressionAttributeValues
+  const filtered = (filter: string, value: Record<string, AttributeValue>, extra: object = {}) => ({
+    ...base,
+    FilterExpression: filter,
+    ExpressionAttributeValues: { ...values, ...value },
+    ...extra,
+  })
+  return [
+    queried(`${name}`, base),
+    queried(`${name}, ALL_ATTRIBUTES`, { ...base, Select: "ALL_ATTRIBUTES" }),
+    queried(`${name}, ALL_PROJECTED_ATTRIBUTES`, { ...base, Select: "ALL_PROJECTED_ATTRIBUTES" }),
+    queried(`${name}, COUNT`, { ...base, Select: "COUNT" }),
+    queried(`${name}, projection n`, { ...base, ProjectionExpression: "n" }),
+    queried(`${name}, projection inc, sk`, { ...base, ProjectionExpression: "inc, sk" }),
+    queried(`${name}, projection m.x`, { ...base, ProjectionExpression: "m.x" }),
+    queried(`${name}, filter n`, filtered("n = :one", { ":one": N("1") })),
+    queried(`${name}, filter inc`, filtered("inc = :i", { ":i": S("i") })),
+    queried(`${name}, filter sk`, filtered("sk = :i", { ":i": S("s") })),
+    queried(
+      `${name}, filter n, ALL_ATTRIBUTES`,
+      filtered("n = :one", { ":one": N("1") }, { Select: "ALL_ATTRIBUTES" }),
+    ),
+    queried(
+      `${name}, filter n, COUNT`,
+      filtered("n = :one", { ":one": N("1") }, { Select: "COUNT" }),
+    ),
+    queried(`${name}, filter n.x`, filtered("n.x = :one", { ":one": N("1") })),
+    queried(
+      `${name}, filter n, projection inc`,
+      filtered("n = :one", { ":one": N("1") }, { ProjectionExpression: "inc" }),
+    ),
+  ]
+})
+
+// Where a read stops: three partitions of three items, read to the end of a range.
+const LEK_SEED: ReadonlyArray<Item> = ["p", "p2", "o"].flatMap((pk) =>
+  ["a", "b", "c"].map((v, i) => ({
+    pk: S(pk),
+    sk: S(v),
+    lsk: S(v),
+    gpk: S(pk === "p" ? "g" : `g${pk}`),
+    gsk: S(v),
+    n: N(String(i)),
+  })),
+)
+const LEK_KEYS = [
+  ["the table", undefined, "pk", "sk", "p"],
+  ["lsi1", "lsi1", "pk", "lsk", "p"],
+  ["gsi1", "gsi1", "gpk", "gsk", "g"],
+] as const
+type Bound = readonly [label: string, clause: string, test: (v: string) => boolean, values: Item]
+const LEK_BOUNDS: ReadonlyArray<Bound> = [
+  ["none", "", () => true, {}],
+  ...["a", "b", "c"].flatMap(
+    (x): ReadonlyArray<Bound> => [
+      [`= ${x}`, "AND #s = :x", (v) => v === x, { ":x": S(x) }],
+      [`begins_with ${x}`, "AND begins_with(#s, :x)", (v) => v.startsWith(x), { ":x": S(x) }],
+      [`< ${x}`, "AND #s < :x", (v) => v < x, { ":x": S(x) }],
+      [`<= ${x}`, "AND #s <= :x", (v) => v <= x, { ":x": S(x) }],
+      [`> ${x}`, "AND #s > :x", (v) => v > x, { ":x": S(x) }],
+      [`>= ${x}`, "AND #s >= :x", (v) => v >= x, { ":x": S(x) }],
+    ],
+  ),
+  ...(
+    [
+      ["a", "a"],
+      ["a", "b"],
+      ["b", "c"],
+      ["a", "c"],
+      ["b", "z"],
+      ["0", "a"],
+      ["c", "c"],
+      ["0", "z"],
+    ] as const
+  ).map(
+    ([lo, hi]): Bound => [
+      `BETWEEN ${lo} AND ${hi}`,
+      "AND #s BETWEEN :lo AND :hi",
+      (v) => lo <= v && v <= hi,
+      { ":lo": S(lo), ":hi": S(hi) },
+    ],
+  ),
+  ["the value first, :x >= #s", "AND :x >= #s", (v) => v <= "b", { ":x": S("b") }],
+  ["the value first, :x <= #s", "AND :x <= #s", (v) => v >= "b", { ":x": S("b") }],
+]
+/** Each range read with a `Limit` of the items it holds, so the read stops on its last one. */
+const LAST_KEYS: ReadonlyArray<Row> = LEK_KEYS.flatMap(([name, index, pk, sk, p]) =>
+  [true, false].flatMap((forward) =>
+    LEK_BOUNDS.flatMap(([label, clause, test, values]) => {
+      const matched = ["a", "b", "c"].filter(test).length
+      if (matched === 0) return []
+      const input = (filtered: boolean) => ({
+        TableName: "$T",
+        ...(index !== undefined && { IndexName: index }),
+        KeyConditionExpression: `#p = :p ${clause}`,
+        ExpressionAttributeNames: {
+          "#p": pk,
+          ...(clause !== "" && { "#s": sk }),
+          ...(filtered && { "#n": "n" }),
+        },
+        ExpressionAttributeValues: {
+          ":p": S(p),
+          ...values,
+          ...(filtered && { ":big": N("100") }),
+        },
+        ...(filtered && { FilterExpression: "#n < :big" }),
+        ScanIndexForward: forward,
+        Limit: matched,
+      })
+      const of = `${name}, ${forward ? "forward" : "reversed"}, ${label}, Limit ${matched}`
+      return [
+        brief(`last key: ${of}`, "Query", input(false), seeded(LEK_SEED)),
+        ...(label.startsWith("<=") || label.startsWith(">=") || label.startsWith("BETWEEN")
+          ? [brief(`last key: ${of}, a filter`, "Query", input(true), seeded(LEK_SEED))]
+          : []),
+      ]
+    }),
+  ),
+)
+
+// Where a read starts: `ExclusiveStartKey`s of every shape, on the table and on each index.
+const startKey = (key: Record<string, string | AttributeValue>): Item =>
+  Object.fromEntries(
+    Object.entries(key).map(([name, value]) => [
+      name,
+      typeof value === "string" ? S(value) : value,
+    ]),
+  )
+const startingAt = (
+  label: string,
+  extra: object,
+  key: Record<string, string | AttributeValue>,
+  command: Command = "Query",
+) =>
+  brief(
+    `start key: ${label}: ${show(key)}`,
+    command,
+    command === "Query"
+      ? {
+          TableName: "$T",
+          KeyConditionExpression: "#p = :p",
+          ExpressionAttributeNames: { "#p": "pk" },
+          ExpressionAttributeValues: { ":p": S("p") },
+          ...extra,
+          ExclusiveStartKey: startKey(key),
+        }
+      : { TableName: "$T", ...extra, ExclusiveStartKey: startKey(key) },
+    seeded(LEK_SEED),
+  )
+const onSk = (expression: string, values: Item) => ({
+  KeyConditionExpression: `#p = :p AND ${expression}`,
+  ExpressionAttributeNames: { "#p": "pk", "#s": "sk" },
+  ExpressionAttributeValues: { ":p": S("p"), ...values },
+})
+const viaLsi = { IndexName: "lsi1" }
+const viaGsi = {
+  IndexName: "gsi1",
+  KeyConditionExpression: "#p = :p",
+  ExpressionAttributeNames: { "#p": "gpk" },
+  ExpressionAttributeValues: { ":p": S("g") },
+}
+const START_KEYS: ReadonlyArray<Row> = [
+  ...[
+    { pk: "p", sk: "a" },
+    { pk: "p", sk: "zz" },
+    { pk: "p2", sk: "a" },
+    { pk: "o", sk: "a" },
+    { pk: "p", sk: "a", x: "1" },
+    { pk: "p", sk: "a", lsk: "a" },
+    { pk: "p" },
+    { sk: "a" },
+    { gpk: "g", gsk: "a" },
+    { pk: "p", gsk: "a" },
+    { pk: N("1"), sk: "a" },
+    { pk: "p", sk: N("1") },
+    { pk: "", sk: "a" },
+    { pk: "p", sk: "" },
+    {},
+    { pk: "p", sk: "a", x: N("1") },
+    { pk: N("1") },
+    { pk: "p2", sk: N("1") },
+    { pk: "p", sk: { M: {} } },
+  ].map((key) => startingAt("the table", {}, key)),
+  ...[
+    { pk: "p", sk: "z" },
+    { pk: "p", sk: "a" },
+    { pk: "p2", sk: "a" },
+    { pk: "p", sk: "b" },
+  ].map((key) => startingAt("the table, sk <= b", onSk("#s <= :b", { ":b": S("b") }), key)),
+  ...[
+    { pk: "p", sk: "z" },
+    { pk: "p", sk: "0" },
+  ].map((key) =>
+    startingAt(
+      "the table, sk <= b, reversed",
+      { ...onSk("#s <= :b", { ":b": S("b") }), ScanIndexForward: false },
+      key,
+    ),
+  ),
+  ...[
+    { pk: "p", sk: "a" },
+    { pk: "p", sk: "c" },
+    { pk: "p", sk: "b" },
+    { pk: "p", sk: "bz" },
+  ].map((key) =>
+    startingAt("the table, begins_with b", onSk("begins_with(#s, :b)", { ":b": S("b") }), key),
+  ),
+  ...[
+    { pk: "p", sk: "a" },
+    { pk: "p", sk: "d" },
+    { pk: "p", sk: "b" },
+    { pk: "p", sk: "c" },
+  ].map((key) =>
+    startingAt(
+      "the table, BETWEEN b AND c",
+      onSk("#s BETWEEN :a AND :b", { ":a": S("b"), ":b": S("c") }),
+      key,
+    ),
+  ),
+  ...[
+    { pk: "p", sk: "a" },
+    { pk: "p", sk: "b" },
+  ].map((key) => startingAt("the table, sk = b", onSk("#s = :b", { ":b": S("b") }), key)),
+  startingAt("the table, Limit 1", { Limit: 1 }, { pk: "p", sk: "b" }),
+  ...[
+    { pk: "p", sk: "a", lsk: "a" },
+    { pk: "p", sk: "a" },
+    { pk: "p", lsk: "a" },
+    { pk: "p", sk: "a", lsk: "a", x: "1" },
+    { pk: "p2", sk: "a", lsk: "a" },
+    { pk: "p", sk: "a", lsk: "zz" },
+    { pk: "p", sk: "a", gsk: "a" },
+    { pk: "p", sk: "a", lsk: N("1") },
+    { pk: "p", sk: "a", lsk: "" },
+    { pk: "p", sk: N("1"), lsk: "a" },
+    { pk: "p", sk: "", lsk: "a" },
+    { pk: "", sk: "a", lsk: "a" },
+    {},
+  ].map((key) => startingAt("lsi1", viaLsi, key)),
+  startingAt(
+    "lsi1, lsk <= b",
+    {
+      ...viaLsi,
+      ...onSk("#s <= :b", { ":b": S("b") }),
+      ExpressionAttributeNames: { "#p": "pk", "#s": "lsk" },
+    },
+    { pk: "p", sk: "a", lsk: "z" },
+  ),
+  ...[
+    { pk: "p", sk: "a", gpk: "g", gsk: "a" },
+    { gpk: "g", gsk: "a" },
+    { pk: "p", sk: "a" },
+    { pk: "p", sk: "a", gpk: "g" },
+    { pk: "p", sk: "a", gpk: "g", gsk: "a", x: "1" },
+    { pk: "p", sk: "a", gpk: "gp2", gsk: "a" },
+    { pk: "p", sk: "a", gpk: "g", gsk: "zz" },
+    { pk: "p", sk: "a", gpk: "g", lsk: "a" },
+    { pk: "p", sk: "a", gpk: "g", gsk: N("1") },
+    { pk: "p", sk: "a", gpk: N("1"), gsk: "a" },
+    { pk: "p", sk: "a", gpk: "g", gsk: "" },
+    { pk: "p", sk: "a", gpk: "", gsk: "a" },
+    { pk: N("1"), sk: "a", gpk: "g", gsk: "a" },
+    { pk: "", sk: "a", gpk: "g", gsk: "a" },
+    { pk: "p", sk: "", gpk: "g", gsk: "a" },
+    {},
+  ].map((key) => startingAt("gsi1", viaGsi, key)),
+  // Among rows of one index key, which DynamoDB Local orders by something of its own.
+  startingAt("lsi1, COUNT", { ...viaLsi, Select: "COUNT" }, { pk: "p", sk: "zz", lsk: "a" }),
+  startingAt(
+    "gsi1, COUNT",
+    { ...viaGsi, Select: "COUNT" },
+    { pk: "zz", sk: "zz", gpk: "g", gsk: "a" },
+  ),
+  startingAt(
+    "gsi1, gsk <= b",
+    {
+      ...viaGsi,
+      KeyConditionExpression: "#p = :p AND #s <= :b",
+      ExpressionAttributeNames: { "#p": "gpk", "#s": "gsk" },
+      ExpressionAttributeValues: { ":p": S("g"), ":b": S("b") },
+    },
+    { pk: "p", sk: "a", gpk: "g", gsk: "z" },
+  ),
+  ...[
+    { pk: "p", sk: "a" },
+    { pk: "p", sk: "a", x: "1" },
+    { pk: "p" },
+    { gpk: "g", gsk: "a" },
+    { pk: "nope", sk: "a" },
+    {},
+    { pk: N("1"), sk: "a" },
+    { pk: "", sk: "a" },
+    { pk: "p", sk: "" },
+    { pk: "p", lsk: "a" },
+  ].map((key) => startingAt("scan", {}, key, "Scan")),
+]
+
+// Rows of one index key, which DynamoDB Local orders by something of its own.
+const TIED: ReadonlyArray<Seed> = seeded(
+  ["a", "b", "c"].map((pk) => ({ pk: S(pk), sk: S("s"), gpk: S("t"), gsk: S("k") })),
+)
+const TIES: ReadonlyArray<Row> = [
+  brief(
+    "ties: gsi1 returns rows of one gsk",
+    "Query",
+    kc("gpk = :g", { ":g": S("t") }, { IndexName: "gsi1", ProjectionExpression: "pk" }),
+    TIED,
+  ),
+  brief(
+    "ties: gsi1, Limit 1, COUNT",
+    "Query",
+    kc("gpk = :g", { ":g": S("t") }, { IndexName: "gsi1", Limit: 1, Select: "COUNT" }),
+    TIED,
+  ),
+  brief(
+    "ties: gsi1, COUNT",
+    "Query",
+    kc("gpk = :g", { ":g": S("t") }, { IndexName: "gsi1", Select: "COUNT" }),
+    TIED,
+  ),
+]
+
+// Numbers as each write stores them.
+const SPELLINGS = [
+  "1.50",
+  "1e-7",
+  "1e21",
+  "007",
+  "-0",
+  "0.0",
+  "1E+2",
+  "100",
+  "1.0e2",
+  "-1.50",
+  "123456789012345678901234567890.0",
+  "0.000001",
+  "0.0000001",
+  "12.3e-8",
+  "-007.10",
+  "0e5",
+  "1.23e+30",
+  "+5",
+]
+const SPELLED: Item = {
+  ...Object.fromEntries(SPELLINGS.map((v, i) => [`n${i}`, N(v)])),
+  l: { L: SPELLINGS.map(N) },
+  m: { M: Object.fromEntries(SPELLINGS.map((v, i) => [`m${i}`, N(v)])) },
+  ns: { NS: ["1.50", "1e-7", "1e21", "007", "-0.5"] },
+  lns: { L: [{ NS: ["1e21", "1.50", "1e-7"] }] },
+}
+const STORED_NUMBERS: ReadonlyArray<Row> = [
+  brief("numbers: put", "PutItem", { TableName: "$T", Item: { ...QK, ...SPELLED } }, []),
+  brief(
+    "numbers: tw put",
+    "TransactWriteItems",
+    { TransactItems: [{ Put: { TableName: "$T", Item: { ...QK, ...SPELLED } } }] },
+    [],
+  ),
+  brief(
+    "numbers: bw put",
+    "BatchWriteItem",
+    { RequestItems: { $T: [{ PutRequest: { Item: { ...QK, ...SPELLED } } }] } },
+    [],
+  ),
+  brief(
+    "numbers: update SET",
+    "UpdateItem",
+    {
+      TableName: "$T",
+      Key: QK,
+      UpdateExpression: "SET a = :a, b = :b, ns = :ns, l = :l, m = :m, c = if_not_exists(c, :ns)",
+      ExpressionAttributeValues: {
+        ":a": N("1.50"),
+        ":b": N("1e21"),
+        ":ns": { NS: ["1e21", "1.50", "007", "1e-7"] },
+        ":l": { L: [N("1e21"), { NS: ["1e21", "1.50"] }] },
+        ":m": { M: { x: N("007"), y: { NS: ["1e-7"] } } },
+      },
+    },
+    [],
+  ),
+  brief(
+    "numbers: update SET list_append",
+    "UpdateItem",
+    {
+      TableName: "$T",
+      Key: KEY,
+      UpdateExpression: "SET l = list_append(l, :l), n0 = n0",
+      ExpressionAttributeValues: { ":l": { L: [N("1e21"), { NS: ["1e21"] }] } },
+    },
+    seeded([{ ...KEY, ...SPELLED }]),
+  ),
+  brief(
+    "numbers: put ALL_OLD",
+    "PutItem",
+    { TableName: "$T", Item: KEY, ReturnValues: "ALL_OLD" },
+    seeded([{ ...KEY, ...SPELLED }]),
+  ),
+  brief(
+    "numbers: query",
+    "Query",
+    kc("pk = :p", { ":p": S("p") }),
+    seeded([{ ...KEY, ...SPELLED }]),
+  ),
+  brief(
+    "numbers: a condition on 1.50 = 1.5",
+    "PutItem",
+    {
+      TableName: "$T",
+      Item: KEY,
+      ConditionExpression: "n0 = :x",
+      ExpressionAttributeValues: { ":x": N("1.5") },
+    },
+    seeded([{ ...KEY, ...SPELLED }]),
+  ),
+]
+
+// ---------------------------------------------------------------------------
 // A top-level `__proto__` (N5)
 // ---------------------------------------------------------------------------
 
@@ -2998,6 +3798,14 @@ const ROWS: ReadonlyArray<Row> = (() => {
     ...REQUESTS.map(fullRow),
     ...KEYED.map(fullRow),
     ...QUERIES,
+    ...INDEX_WRITES,
+    ...COUNTS,
+    ...QUERY_CHECKS,
+    ...PROJECTIONS,
+    ...LAST_KEYS,
+    ...START_KEYS,
+    ...TIES,
+    ...STORED_NUMBERS,
     ...PROTO,
   ]
   const byLabel = new Map<string, Row>()
@@ -3014,9 +3822,26 @@ const ROWS: ReadonlyArray<Row> = (() => {
 })()
 
 type Backend = "recording" | "inMemory" | "holds"
+/** The AWS SDK's failure reading an error's item that holds a top-level `__proto__`. */
+const SDK_PROTO_FAILURE =
+  "Cannot read properties of undefined (reading 'B')\n  Deserialization error: to see the raw response, inspect the hidden field {error}.$response on this object."
 /**
- * Rows a helper answers differently from DynamoDB Local, on purpose, and why. `byValue`: the
- * answers differ only in how a number is spelled, and agree compared by value.
+ * The `__proto__` item as the AWS SDK reads it from a successful answer, as compared: the
+ * top-level attribute an own property without a value, the nested one as stored.
+ */
+const PROTO_AS_READ = {
+  "__proto__ (own)": "<undefined>",
+  m: { M: { "__proto__ (own)": S("x"), k: N("2") } },
+  pk: S("p"),
+  sk: S("s"),
+}
+/** The tables' refusal of a request that reads among rows of one index key. */
+const amongTies = (field: string, key: Item, attribute: string) =>
+  `UnreadableRequest: The in-memory table doesn't read the ${field} ${JSON.stringify(JSON.stringify(key))}: among rows of one ${attribute} (DynamoDB Local's order among them is not modelled)`
+/**
+ * Rows a helper answers differently from DynamoDB Local, on purpose, and why: DynamoDB Local's
+ * answer and the helper's, each exactly (numbers as spelled). Every item each table holds
+ * afterwards is the same.
  */
 const KNOWN: Readonly<
   Record<
@@ -3024,45 +3849,98 @@ const KNOWN: Readonly<
     {
       readonly reason: string
       readonly on: ReadonlyArray<Backend>
-      readonly byValue?: true
+      readonly local: unknown
+      readonly helper: unknown
     }
   >
 > = {
-  'update: SET #zz = :x {":x":{"NS":["100","0.10","1e-7","1e21"]}}': {
-    reason:
-      "DynamoDB Local stores a number set written from a request's value as Java's BigDecimal prints each member (1e21 as 1E+21, 1e-7 as 1E-7); the tables keep the request's spelling",
-    on: ["recording", "inMemory"],
-    byValue: true,
-  },
   "__proto__: a failed condition's item": {
     reason:
       "the AWS SDK fails to read an error's item holding a top-level __proto__ attribute (a TypeError, 'Deserialization error'); the tables return the item as the SDK reads a successful answer's",
     on: ["recording", "inMemory"],
+    local: { error: "TypeError", message: SDK_PROTO_FAILURE },
+    helper: {
+      error: "ConditionalCheckFailedException",
+      message: "The conditional request failed",
+      Item: PROTO_AS_READ,
+    },
   },
   "__proto__: a cancellation reason's item": {
     reason:
       "the AWS SDK fails to read a cancellation reason's item holding a top-level __proto__ attribute (a TypeError, 'Deserialization error'); the tables return the item as the SDK reads a successful answer's",
     on: ["recording", "inMemory"],
+    local: { error: "TypeError", message: SDK_PROTO_FAILURE },
+    helper: {
+      error: "TransactionCanceledException",
+      message:
+        "Transaction cancelled, please refer cancellation reasons for specific reasons [ConditionalCheckFailed]",
+      reasons: [
+        {
+          Code: "ConditionalCheckFailed",
+          Message: "The conditional request failed.",
+          Item: PROTO_AS_READ,
+        },
+      ],
+    },
   },
   "GetItem: get: no such table": {
     reason:
       "the tables keep no list of tables: any name a request gives is a table, empty until written; DynamoDB Local refuses a table that doesn't exist (ResourceNotFoundException)",
     on: ["recording", "inMemory"],
+    local: {
+      error: "ResourceNotFoundException",
+      message: "Cannot do operations on a non-existent table",
+    },
+    helper: { ok: {} },
   },
-  "TransactWriteItems: tw: put N pk": {
+  'start key: lsi1, COUNT: {"pk":"p","sk":"zz","lsk":"a"}': {
     reason:
-      "DynamoDB Local cancels a transaction whose key is of the wrong type with one ValidationError reason; not modelled, so the tables name the request as one they don't read",
+      "a start key among rows of one index sort key (other than its own row): DynamoDB Local places it by its own order among them, which the tables don't model, so they refuse to answer",
     on: ["recording", "inMemory"],
+    local: { ok: { Count: 3, ScannedCount: 3 } },
+    helper: {
+      unreadable: amongTies("ExclusiveStartKey", { pk: S("p"), sk: S("zz"), lsk: S("a") }, "lsk"),
+    },
   },
-  "TransactWriteItems: tw: update of a key attribute": {
+  'start key: gsi1, COUNT: {"pk":"zz","sk":"zz","gpk":"g","gsk":"a"}': {
     reason:
-      "DynamoDB Local cancels a transaction updating a key attribute with one ValidationError reason, however many items it has; not modelled, so the tables name the request as one they don't read",
+      "a start key among rows of one index sort key (other than its own row): DynamoDB Local places it by its own order among them, which the tables don't model, so they refuse to answer",
     on: ["recording", "inMemory"],
+    local: { ok: { Count: 3, ScannedCount: 3 } },
+    helper: {
+      unreadable: amongTies(
+        "ExclusiveStartKey",
+        { pk: S("zz"), sk: S("zz"), gpk: S("g"), gsk: S("a") },
+        "gsk",
+      ),
+    },
   },
-  "TransactWriteItems: tx: key attribute update": {
+  "ties: gsi1 returns rows of one gsk": {
     reason:
-      "DynamoDB Local cancels a transaction updating a key attribute with one ValidationError reason; not modelled, so the tables name the request as one they don't read",
+      "DynamoDB Local returns rows of one index key in an order of its own (here c, b, a); the tables return them in table-key order, as every item is still returned once",
     on: ["recording", "inMemory"],
+    local: {
+      ok: { Count: 3, ScannedCount: 3, Items: ["c", "b", "a"].map((pk) => ({ pk: S(pk) })) },
+    },
+    helper: {
+      ok: { Count: 3, ScannedCount: 3, Items: ["a", "b", "c"].map((pk) => ({ pk: S(pk) })) },
+    },
+  },
+  "ties: gsi1, Limit 1, COUNT": {
+    reason:
+      "a Limit that stops between rows of one index key: which of them DynamoDB Local reads first is its own order, which the tables don't model, so they refuse to answer",
+    on: ["recording", "inMemory"],
+    local: {
+      ok: {
+        Count: 1,
+        ScannedCount: 1,
+        LastEvaluatedKey: { gpk: S("t"), gsk: S("k"), pk: S("c"), sk: S("s") },
+      },
+    },
+    helper: {
+      unreadable:
+        "UnreadableRequest: The in-memory table doesn't read the Limit \"1\": stopping between rows of one gsk (DynamoDB Local's order among them is not modelled)",
+    },
   },
 }
 
@@ -3252,16 +4130,18 @@ const onRecording = async (row: Row): Promise<Answer> => {
 const onInMemory = async (row: Row): Promise<Answer | undefined> => {
   if (!IN_MEMORY.has(row.command)) return undefined
   resetStore()
-  for (const seed of row.seed) {
-    const name = TABLES[seed.table]!
-    store.set(storeKey(name, seed.item), named(seed.item))
-  }
   const exit = await Effect.runPromiseExit(
     Effect.gen(function* () {
       const client = (yield* DynamoClient) as unknown as Record<
         string,
         (input: unknown) => Effect.Effect<unknown, unknown>
       >
+      // Stored as DynamoDB Local stores them: through a put.
+      for (const seed of row.seed) {
+        yield* Effect.orDie(
+          client.putItem!({ TableName: TABLES[seed.table], Item: named(seed.item) }),
+        )
+      }
       return yield* client[METHODS[row.command]]!(named(row.input))
     }).pipe(Effect.provide(InMemoryClient)),
   )
@@ -3298,8 +4178,34 @@ const localHolds = (answer: any) =>
 // The comparison
 // ---------------------------------------------------------------------------
 
-const createTable = (name: string, indexed: boolean) =>
-  raw.send(
+/** A `CreateTable` index's key schema and projection, from its `INDEXES` entry. */
+const indexDefinition = ([name, index]: readonly [string, Indexes[string]]) => ({
+  IndexName: name,
+  KeySchema: [
+    { AttributeName: index.pk, KeyType: "HASH" as const },
+    { AttributeName: index.sk, KeyType: "RANGE" as const },
+  ],
+  Projection:
+    index.projection === undefined || typeof index.projection === "string"
+      ? { ProjectionType: index.projection ?? "ALL" }
+      : { ProjectionType: "INCLUDE" as const, NonKeyAttributes: [...index.projection] },
+})
+
+const createTable = (name: string, indexed: boolean) => {
+  const indexes: ReadonlyArray<readonly [string, Indexes[string]]> = indexed
+    ? Object.entries(INDEXES as Indexes)
+    : []
+  const local = indexes.filter(([, index]) => index.pk === "pk")
+  const global = indexes.filter(([, index]) => index.pk !== "pk")
+  const types = new Map<string, "S" | "N" | "B">([
+    ["pk", "S"],
+    ["sk", "S"],
+  ])
+  for (const [, index] of indexes) {
+    types.set(index.pk, index.pkType ?? "S")
+    types.set(index.sk, index.skType ?? "S")
+  }
+  return raw.send(
     new CreateTableCommand({
       TableName: name,
       BillingMode: "PAY_PER_REQUEST",
@@ -3307,32 +4213,17 @@ const createTable = (name: string, indexed: boolean) =>
         { AttributeName: "pk", KeyType: "HASH" },
         { AttributeName: "sk", KeyType: "RANGE" },
       ],
-      AttributeDefinitions: [
-        { AttributeName: "pk", AttributeType: "S" },
-        { AttributeName: "sk", AttributeType: "S" },
-        ...(indexed
-          ? [
-              { AttributeName: "gpk", AttributeType: "S" as const },
-              { AttributeName: "gsk", AttributeType: "S" as const },
-            ]
-          : []),
-      ],
-      ...(indexed && {
-        GlobalSecondaryIndexes: [
-          {
-            IndexName: "gsi1",
-            KeySchema: [
-              { AttributeName: "gpk", KeyType: "HASH" as const },
-              { AttributeName: "gsk", KeyType: "RANGE" as const },
-            ],
-            Projection: { ProjectionType: "ALL" as const },
-          },
-        ],
-      }),
+      AttributeDefinitions: [...types].map(([AttributeName, AttributeType]) => ({
+        AttributeName,
+        AttributeType,
+      })),
+      ...(local.length > 0 && { LocalSecondaryIndexes: local.map(indexDefinition) }),
+      ...(global.length > 0 && { GlobalSecondaryIndexes: global.map(indexDefinition) }),
     }),
   )
+}
 
-describeConnected("the in-memory tables answer every request as DynamoDB Local does", () => {
+describeConnected("the in-memory tables, request by request, against DynamoDB Local", () => {
   beforeAll(async () => {
     await createTable(TABLES.$T!, true)
     await createTable(TABLES.$T2!, false)
@@ -3360,7 +4251,10 @@ describeConnected("the in-memory tables answer every request as DynamoDB Local d
   for (const row of ROWS) {
     it(row.label, async () => {
       const known = KNOWN[row.label]
-      /** Numbers as spelled, unless the row is known to differ, in spelling or otherwise. */
+      /**
+       * Numbers as spelled. A row known to differ: DynamoDB Local's answer and the helper's are
+       * each exactly the ones listed, and the tables are the same.
+       */
       const compare = (
         backend: Backend,
         got: (exact: boolean) => unknown,
@@ -3368,12 +4262,13 @@ describeConnected("the in-memory tables answer every request as DynamoDB Local d
       ) => {
         if (!known?.on.includes(backend)) {
           expect({ [backend]: got(true) }).toEqual({ [backend]: expected(true) })
-        } else if (known.byValue) {
-          expect(show(got(true)), `${backend}: ${known.reason}`).not.toBe(show(expected(true)))
-          expect({ [backend]: got(false) }).toEqual({ [backend]: expected(false) })
-        } else {
-          expect(show(got(false)), `${backend}: ${known.reason}`).not.toBe(show(expected(false)))
+          return
         }
+        const helper = got(true) as { answer: unknown; tables: unknown }
+        const local = expected(true) as { answer: unknown; tables: unknown }
+        expect({ [backend]: helper.tables }).toEqual({ [backend]: local.tables })
+        expect({ local: local.answer }, known.reason).toEqual({ local: known.local })
+        expect({ [backend]: helper.answer }, known.reason).toEqual({ [backend]: known.helper })
       }
       const local = await onLocal(row)
       const expected = (exact: boolean) => view(row.command, local, exact)

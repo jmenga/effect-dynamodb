@@ -138,7 +138,10 @@ const otherText = (escapeKeys: boolean) =>
 
 const tableOf = () =>
   makeRecordingTable({
-    indexes: { gsi1: { pk: "gsi1pk", sk: "gsi1sk" }, gsi2: { pk: "gsi2pk", sk: "gsi2sk" } },
+    indexes: {
+      gsi1: { pk: "gsi1pk", sk: "gsi1sk" },
+      gsi2: { pk: "gsi2pk", sk: "gsi2sk", skType: "B" },
+    },
   })
 
 const layerOf = (w: ReturnType<typeof world>, table: ReturnType<typeof tableOf>) =>

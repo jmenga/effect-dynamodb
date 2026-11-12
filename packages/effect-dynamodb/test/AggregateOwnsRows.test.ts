@@ -1193,16 +1193,28 @@ describe("with `ownsRows`, update deletes the rows of a changed node the new sta
 
   it.effect("cleanup goes up to 100 Deletes to a request", () =>
     Effect.gen(function* () {
-      const hidden = Array.from({ length: 150 }, (_, i) => ({
-        lid: `h${String(i).padStart(3, "0")}`,
-        note: "hidden",
-      }))
-      const { table, run, rows } = world()
+      const { table, run, rows, seed } = world()
       succeed(
         yield* run((db) =>
-          db.aggregates.Orders.create(created([{ lid: "x y", note: "shown" }, ...hidden])),
+          db.aggregates.Orders.create(
+            created([
+              { lid: "x y", note: "shown" },
+              { lid: "h000", note: "hidden" },
+            ]),
+          ),
         ),
       )
+      // 150 hidden lines: one create can't write them (a transaction holds at most 100 items), so
+      // the rest are copies of the one it wrote.
+      const first = rows().find((row) => row.note?.S === "hidden")!
+      expect(first.sk?.S?.endsWith("h000")).toBe(true)
+      seed(
+        Array.from({ length: 149 }, (_, i) => {
+          const lid = `h${String(i + 1).padStart(3, "0")}`
+          return { ...first, lid: { S: lid }, sk: { S: `${first.sk!.S!.slice(0, -4)}${lid}` } }
+        }),
+      )
+      expect(rows().filter((row) => row.note?.S === "hidden")).toHaveLength(150)
       table.requests.length = 0
       succeed(
         yield* run((db) =>

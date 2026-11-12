@@ -3,10 +3,13 @@
  * `RecordingTable`) and `MockDynamoClient.applyUpdate`: expressions read and evaluated, requests
  * checked, items written, transactions run.
  *
- * Every answer here was measured on DynamoDB Local (`amazon/dynamodb-local`), and
- * `connected.helper-conformance.test.ts` sends the same requests to DynamoDB Local and to both
- * tables and compares the answers; the rows where they knowingly differ are listed there, with the
- * reason. What it reads:
+ * The rule: every request the library sends is answered as DynamoDB Local (`amazon/dynamodb-local`)
+ * answers it, and anything this doesn't model throws {@link UnreadableRequest}, which the tables
+ * surface as a defect naming it, before anything is written: never an approximation. The answers
+ * were measured on DynamoDB Local, and `connected.helper-conformance.test.ts` sends the same
+ * requests to DynamoDB Local and to both tables and compares the answers, every item each table
+ * holds afterwards included; a row answered differently on purpose is listed there (`KNOWN`) with
+ * both answers, exactly. What it reads:
  *
  * - Condition, filter and key condition expressions: comparisons, `BETWEEN`, `IN`, `AND` / `OR` /
  *   `NOT`, parentheses, `attribute_exists`, `attribute_not_exists`, `attribute_type`,
@@ -15,17 +18,56 @@
  * - Update expressions: `SET` (`+`, `-`, `if_not_exists`, `list_append`), `REMOVE`, `ADD` and
  *   `DELETE`, sections in any order and keywords in any case, whitespace optional.
  * - Projection expressions of attribute and map-key paths.
+ * - Reads: `GetItem`, `Query` of the table or a declared index (local or global, its projection,
+ *   `Select`, `ConsistentRead`, `Limit` counting rows examined, `ExclusiveStartKey` /
+ *   `LastEvaluatedKey`), `Scan`, `BatchGetItem`, `TransactGetItems`.
+ * - Writes: `PutItem`, `UpdateItem`, `DeleteItem`, `BatchWriteItem`, `TransactWriteItems` (checked
+ *   whole, its items taken in order, then written whole), each checking the table's and every
+ *   declared index's key attributes as DynamoDB Local does.
  *
  * A request DynamoDB refuses throws DynamoDB Local's `ValidationException`, worded as it words it.
- * A request this doesn't read (an expression it can't parse, a request field it doesn't model)
- * throws {@link UnreadableRequest}, which the tables surface as a defect naming it: never an
- * approximation.
  *
  * Numbers are exact, as DynamoDB Local's (Java's `BigDecimal`): `+` / `-` keep the larger scale
  * and are written in plain notation (`5 + 0.50` stores `5.50`), a set `ADD` or `DELETE` writes is
- * sorted with its numbers normalised, and numbers compare by value everywhere. A number given as a
- * literal is stored as written, where DynamoDB Local respells some (`PutItem`'s top-level numbers,
- * a literal number set): one of the listed differences.
+ * sorted with its numbers normalised, and numbers compare by value everywhere. A number a request
+ * gives is stored as DynamoDB Local stores it: a put's top-level number, and each member of a
+ * top-level number set, normalised (`1.50` as `1.5`, `1e21` as `1000000000000000000000`); a number
+ * set from `ExpressionAttributeValues`, or nested in a put's item, spelt as `BigDecimal.toString()`
+ * prints it (`1E+21`); any other number as written.
+ *
+ * What this doesn't model, in one place. These are answered, not refused, each for the reason given:
+ *
+ * - Tables: none is listed, so a request naming a table that doesn't exist is answered as an
+ *   empty table where DynamoDB Local refuses it (`ResourceNotFoundException`); the tests name
+ *   their tables freely.
+ * - Rows of one index key returned in one answer come back in table-key order; DynamoDB Local
+ *   returns them in an order of its own. Every row is still returned once, and tests that list an
+ *   aggregate's rows read them together. A request whose answer depends on that order is refused
+ *   by name: an `ExclusiveStartKey` among such rows (other than its own row), or a `Limit` that
+ *   stops between them.
+ * - A `Scan` reads rows in key order and splits `Segment`s by a hash of the key; DynamoDB Local's
+ *   order and split are its own. Read to its end, a scan returns the same rows; which rows one page
+ *   holds differs. The tests that page a scan (`rekey`'s resume tokens) check what the pages hold
+ *   together.
+ * - Sizes: nothing is refused or cut for its size (an item over 400 KB, a key over its length, a
+ *   transaction over 4 MB, an expression over its length), and a `Query` or `Scan` page is never
+ *   cut at 1 MB. `RecordingTable`'s `refuseBodiesOver` refuses a request body over a given size,
+ *   as DynamoDB Local refuses one over 16 MiB.
+ * - Capacity: `ReturnConsumedCapacity` is accepted and nothing is reported.
+ * - Several problems in one request: of one kind (two index keys of the wrong type, …) it is
+ *   refused by name, as which DynamoDB Local reports first is unmeasured; of different kinds, the
+ *   problem this module checks first is reported, in the order measured for the pairs the
+ *   conformance rows send.
+ * - An empty value of an attribute that keys several indexes is reported naming the first index
+ *   declared; which one DynamoDB Local names is unmeasured.
+ * - An item holding a top-level `__proto__` attribute, in an error (a failed condition's item, a
+ *   cancellation reason's): the AWS SDK fails to read it (a `TypeError`); the tables return it as
+ *   the SDK reads one in a successful answer.
+ *
+ * Refused by name, as not modelled: a request field `checkFields` doesn't list (a `Scan`'s
+ * `IndexName` among them: the library sends none), a projection of a list element, an
+ * `attribute_type` whose type is a path, a `Select` or `Limit` DynamoDB Local refuses in words
+ * unmeasured, and each check marked "unmeasured" below.
  */
 
 import type { AttributeValue } from "@aws-sdk/client-dynamodb"
@@ -1461,7 +1503,7 @@ export const holds = (
 const computeValue = (value: UpdateValue, before: Item): AttributeValue => {
   switch (value.kind) {
     case "value":
-      return value.value!
+      return literalWritten(value.value!)
     case "path":
       return readPath(before, value.path) ?? refuse(DDB_UPDATE_MISSING_ATTRIBUTE)
     case "if_not_exists": {
@@ -1513,6 +1555,54 @@ const writtenSet = (
 }
 
 const normalised = (d: Decimal) => plainText(stripZeros(d))
+
+/** `value` with each of its map's or list's values replaced by `each` of it. */
+const mapValues = (
+  value: AttributeValue,
+  each: (inner: AttributeValue) => AttributeValue,
+): AttributeValue => {
+  if (value.L !== undefined) return { L: value.L.map(each) }
+  if (value.M !== undefined) {
+    const out: Item = {}
+    for (const key of Object.keys(value.M)) setOwn(out, key, each(value.M[key]!))
+    return { M: out }
+  }
+  return value
+}
+
+/**
+ * A value as DynamoDB Local stores it from a request's `ExpressionAttributeValues` (`SET`, at any
+ * depth, through `if_not_exists` and `list_append` too), or nested in a put's item: every number
+ * set's members spelt as Java's `BigDecimal.toString()` prints them (`1e21` as `1E+21`, `1.50` as
+ * written) and sorted; a number as written. A value copied from the item keeps its spelling.
+ */
+const literalWritten = (value: AttributeValue): AttributeValue =>
+  value.NS !== undefined
+    ? writtenSet("NS", value.NS, scientificText)
+    : mapValues(value, literalWritten)
+
+/**
+ * An item as DynamoDB Local stores it from a put (`PutItem`, a transaction's or a batch's): a
+ * top-level number, and each member of a top-level number set, normalised (`1.50` as `1.5`, `1e21`
+ * as `1000000000000000000000`, `007` as `7`, `-0` as `0`); nested values as {@link literalWritten}.
+ */
+const putWritten = (item: Item): Item => {
+  const source = clone(item)
+  const out: Item = {}
+  for (const name of Object.keys(source)) {
+    const value = source[name]!
+    setOwn(
+      out,
+      name,
+      value.N !== undefined
+        ? { N: normalised(decimalOf(value.N)) }
+        : value.NS !== undefined
+          ? writtenSet("NS", value.NS, normalised)
+          : mapValues(value, literalWritten),
+    )
+  }
+  return out
+}
 
 /** What one action writes at its path: a value, or (`undefined`) its removal. */
 interface Write {
@@ -1803,18 +1893,235 @@ export interface KeySchema {
   readonly sk: string
 }
 
-/** A secondary index: its key attributes, its kind, and the attributes it holds. */
+/** A key attribute's type. */
+export type KeyType = "S" | "N" | "B"
+
+/** A secondary index: its key attributes and their types, its kind, and the attributes it holds. */
 export interface IndexSchema extends KeySchema {
   /**
    * `local` (an LSI) or `global` (a GSI). Left out: local when its partition key is the table's,
    * global otherwise; a GSI on the table's partition key says so.
    */
   readonly kind?: "local" | "global" | undefined
-  /** What a read of the index returns: every attribute (the default), the keys only, or the keys and these. */
+  /** The partition key's type (default `S`). */
+  readonly pkType?: KeyType | undefined
+  /** The sort key's type (default `S`; a Z-order sort key is `B`). */
+  readonly skType?: KeyType | undefined
+  /** What a read of the index holds: every attribute (the default), the keys only, or the keys and these. */
   readonly projection?: "ALL" | "KEYS_ONLY" | ReadonlyArray<string> | undefined
 }
 
+/** A table's secondary indexes, by name, in the order its `CreateTable` declares them. */
+export type Indexes = Readonly<Record<string, IndexSchema>>
+
+interface CreateTableIndex {
+  readonly IndexName?: string | undefined
+  readonly KeySchema?: ReadonlyArray<{ readonly AttributeName?: string; readonly KeyType?: string }>
+  readonly Projection?: {
+    readonly ProjectionType?: string | undefined
+    readonly NonKeyAttributes?: ReadonlyArray<string> | undefined
+  }
+}
+
+/**
+ * The secondary indexes a `CreateTable` input declares (`Table.definition`'s, say), as the
+ * in-memory tables take them: local indexes first, then global ones, as DynamoDB Local is created
+ * with them. An index this doesn't read (no sort key, a key attribute of no declared type) is a
+ * defect.
+ */
+export const indexesOf = (definition: {
+  readonly AttributeDefinitions?: ReadonlyArray<{
+    readonly AttributeName?: string | undefined
+    readonly AttributeType?: string | undefined
+  }>
+  readonly LocalSecondaryIndexes?: ReadonlyArray<CreateTableIndex> | undefined
+  readonly GlobalSecondaryIndexes?: ReadonlyArray<CreateTableIndex> | undefined
+}): Indexes => {
+  const declared = (attribute: string): KeyType => {
+    const type = definition.AttributeDefinitions?.find(
+      (each) => each.AttributeName === attribute,
+    )?.AttributeType
+    if (type !== "S" && type !== "N" && type !== "B") {
+      return unreadable("the index key attribute", attribute, "of no declared type")
+    }
+    return type
+  }
+  const out: Record<string, IndexSchema> = {}
+  const add = (index: CreateTableIndex, kind: "local" | "global") => {
+    const key = (type: string) =>
+      index.KeySchema?.find((each) => each.KeyType === type)?.AttributeName
+    const pk = key("HASH")
+    const sk = key("RANGE")
+    if (index.IndexName === undefined || pk === undefined || sk === undefined) {
+      return unreadable("the index", shown(index), "not a partition and sort key")
+    }
+    const projection = index.Projection?.ProjectionType ?? "ALL"
+    setOwn(out, index.IndexName, {
+      pk,
+      sk,
+      kind,
+      pkType: declared(pk),
+      skType: declared(sk),
+      projection:
+        projection === "INCLUDE"
+          ? [...(index.Projection?.NonKeyAttributes ?? [])]
+          : projection === "KEYS_ONLY"
+            ? "KEYS_ONLY"
+            : "ALL",
+    })
+  }
+  for (const index of definition.LocalSecondaryIndexes ?? []) add(index, "local")
+  for (const index of definition.GlobalSecondaryIndexes ?? []) add(index, "global")
+  return out
+}
+
 const keyAttributes = (schema: KeySchema) => [schema.pk, schema.sk]
+
+/** Whether `index` is a local secondary index of `table`; a local one on another partition key is a defect. */
+const isLocal = (name: string, index: IndexSchema, table: KeySchema): boolean => {
+  const local = (index.kind ?? (index.pk === table.pk ? "local" : "global")) === "local"
+  if (local && index.pk !== table.pk) {
+    unreadable("the index", name, `a local index keyed by ${index.pk}, not the table's ${table.pk}`)
+  }
+  return local
+}
+
+/** The type of one of `index`'s key attributes; the table's own are `S`. */
+const keyTypeIn = (index: IndexSchema | undefined, table: KeySchema, attribute: string): KeyType =>
+  attribute === table.pk || attribute === table.sk || index === undefined
+    ? "S"
+    : ((attribute === index.pk ? index.pkType : index.skType) ?? "S")
+
+/** The attributes a read of `index` holds: `undefined` for every attribute. */
+const projectedBy = (index: IndexSchema, table: KeySchema): ReadonlySet<string> | undefined => {
+  const projection = index.projection ?? "ALL"
+  if (projection === "ALL") return undefined
+  return new Set([
+    table.pk,
+    table.sk,
+    index.pk,
+    index.sk,
+    ...(projection === "KEYS_ONLY" ? [] : projection),
+  ])
+}
+
+/** The one problem of several DynamoDB Local might report first, or a defect when there are more. */
+const theProblem = (problems: ReadonlyArray<string>, what: string): string | undefined => {
+  const distinct = [...new Set(problems)]
+  if (distinct.length > 1) {
+    unreadable(what, shown(distinct), "more than one problem, reported in an order not measured")
+  }
+  return distinct[0]
+}
+
+const INDEX_TYPE_MISMATCH = "One or more parameter values were invalid: Type mismatch for Index Key"
+const INVALID_VALUE_TYPE = "Invalid attribute value type"
+const indexEmpty = (index: string, attribute: string, binary: boolean) =>
+  "One or more parameter values are not valid. A value specified for a secondary index key is " +
+  `not supported. The AttributeValue for a key attribute cannot contain an empty ${binary ? "binary" : "string"} value. IndexName: ${index}, IndexKey: ${attribute}`
+const UPDATE_INDEX_EMPTY =
+  "One or more parameter values are not valid. The update expression attempted to update a " +
+  "secondary index key to a value that is not supported. The AttributeValue for a key attribute " +
+  "cannot contain an empty string value."
+
+/**
+ * The indexes' key attributes that aren't the table's: each with its type and the indexes it keys,
+ * in their order. Two indexes declaring one attribute with two types are a defect.
+ */
+const indexKeysOf = (indexes: Indexes, table: KeySchema) => {
+  const keys = new Map<
+    string,
+    { readonly type: KeyType; readonly indexes: Array<{ name: string; local: boolean }> }
+  >()
+  for (const [name, index] of Object.entries(indexes)) {
+    const local = isLocal(name, index, table)
+    for (const attribute of [index.pk, index.sk]) {
+      if (attribute === table.pk || attribute === table.sk) continue
+      const type = keyTypeIn(index, table, attribute)
+      const held = keys.get(attribute) ?? { type, indexes: [] }
+      if (held.type !== type) {
+        unreadable("the indexes", name, `${attribute} declared both ${held.type} and ${type}`)
+      }
+      held.indexes.push({ name, local })
+      keys.set(attribute, held)
+    }
+  }
+  return keys
+}
+
+const isEmptyKeyValue = (value: AttributeValue) =>
+  (value.S !== undefined && value.S === "") || (value.B !== undefined && value.B.length === 0)
+
+/** A problem with an item's index keys: a wrong type (`typed`), or an empty value. */
+interface IndexProblem {
+  readonly typed: boolean
+  readonly message: string
+}
+
+/**
+ * Why DynamoDB Local refuses the index keys a put's item holds, if it does: a value of no key type
+ * or of another type than the index's (`typed`, reported first), else an empty string or binary,
+ * naming the first index it keys.
+ */
+const putIndexProblem = (
+  item: Item,
+  indexes: Indexes,
+  table: KeySchema,
+): IndexProblem | undefined => {
+  const typed: Array<string> = []
+  const empty: Array<string> = []
+  for (const [attribute, key] of indexKeysOf(indexes, table)) {
+    const value = own(item, attribute)
+    if (value === undefined) continue
+    const type = typeOf(value)
+    if (!["S", "N", "B"].includes(type)) typed.push(INVALID_VALUE_TYPE)
+    else if (type !== key.type) typed.push(INDEX_TYPE_MISMATCH)
+    else if (isEmptyKeyValue(value)) {
+      empty.push(indexEmpty(key.indexes[0]!.name, attribute, type === "B"))
+    }
+  }
+  const problem = theProblem(typed, "the item's index keys")
+  if (problem !== undefined) return { typed: true, message: problem }
+  const blank = theProblem(empty, "the item's index keys")
+  return blank === undefined ? undefined : { typed: false, message: blank }
+}
+
+/**
+ * Why DynamoDB Local refuses the index keys an update writes (`SET` / `ADD` of one), once its
+ * condition held: an empty string (reported first), else a value of no key type, or of another
+ * type than a global index's (`typed`; a local index's key isn't checked on an update).
+ */
+const updateIndexProblem = (
+  next: Item,
+  actions: ReadonlyArray<Action>,
+  indexes: Indexes,
+  table: KeySchema,
+): IndexProblem | undefined => {
+  const keys = indexKeysOf(indexes, table)
+  const written = new Set(
+    actions.filter((action) => action.kind !== "REMOVE").map((action) => action.path[0] as string),
+  )
+  const typed: Array<string> = []
+  let empty = false
+  for (const attribute of written) {
+    const key = keys.get(attribute)
+    const value = own(next, attribute)
+    if (key === undefined || value === undefined) continue
+    const type = typeOf(value)
+    const global = key.indexes.some((index) => !index.local)
+    if (type === "S" && value.S === "") empty = true
+    else if (type === "B" && value.B!.length === 0) {
+      unreadable("the update of", attribute, "an empty binary index key (unmeasured)")
+    } else if (!["S", "N", "B"].includes(type)) {
+      if (!global)
+        unreadable("the update of", attribute, "a local index key of no key type (unmeasured)")
+      typed.push(INVALID_VALUE_TYPE)
+    } else if (type !== key.type && global) typed.push(INDEX_TYPE_MISMATCH)
+  }
+  if (empty) return { typed: false, message: UPDATE_INDEX_EMPTY }
+  const problem = theProblem(typed, "the update's index keys")
+  return problem === undefined ? undefined : { typed: true, message: problem }
+}
 
 const EMPTY_KEY = (attribute: string) =>
   "One or more parameter values are not valid. The AttributeValue for a key attribute cannot " +
@@ -1911,10 +2218,12 @@ const touched = (item: Item | undefined, actions: ReadonlyArray<Action>): Item |
 }
 
 /**
- * Options the in-memory tables give a write: `failCondition`, consulted for each write carrying
- * a condition, makes that condition fail whatever it says (another writer won).
+ * Options the in-memory tables give a write: the table's secondary `indexes`, whose keys a write
+ * is checked against; and `failCondition`, consulted for each write carrying a condition, which
+ * makes that condition fail whatever it says (another writer won).
  */
 export interface WriteOptions {
+  readonly indexes?: Indexes | undefined
   readonly failCondition?: (() => boolean) | undefined
 }
 
@@ -1938,6 +2247,8 @@ export const putItem = (
   checkFields("PutItem", input)
   const returned = returnValues(input.ReturnValues, ["NONE", "ALL_OLD"])
   const item = checkItem(input.Item, schema)
+  const problem = putIndexProblem(item, options?.indexes ?? {}, schema)
+  if (problem !== undefined) refuse(problem.message)
   const { condition } = readExpressions(input)
   const current = read(keyOfItem(item, schema))
   if (!conditionHolds(condition, current, options)) {
@@ -1945,7 +2256,7 @@ export const putItem = (
   }
   return {
     _tag: "Written",
-    item: clone(item),
+    item: putWritten(item),
     output: returned === "ALL_OLD" ? attributes(current) : {},
   }
 }
@@ -1977,6 +2288,8 @@ export const updateItem = (
     }
   }
   const next = applyActions(update, current ?? clone(key))
+  const problem = updateIndexProblem(next, update, options?.indexes ?? {}, schema)
+  if (problem !== undefined) refuse(problem.message)
   const written = update.filter((action) => action.kind !== "REMOVE")
   const output =
     returned === "ALL_OLD"
@@ -2027,9 +2340,10 @@ export const getItem = (
   return { Item: asRead(projection === undefined ? current : project(current, projection)) }
 }
 
-/** Where a table finds an item and its key attributes. */
+/** Where a table finds an item, its key attributes and its secondary indexes. */
 export interface Tables {
   readonly schema: (table: string) => KeySchema
+  readonly indexes: (table: string) => Indexes
   readonly read: (table: string, key: Item) => Item | undefined
 }
 
@@ -2060,35 +2374,81 @@ export const transactionCanceled = (
   )
 
 const KINDS = ["Put", "Update", "Delete", "ConditionCheck"] as const
+const MISSING_KEY = "One of the required keys was not given a value"
+const KEY_COUNT = "The number of conditions on the keys is invalid"
+
+/** DynamoDB Local's refusals of a request naming too many, or no, items. */
+const TOO_MANY_TRANSACT_ITEMS = "Member must have length less than or equal to 100"
+const NO_TRANSACT_WRITE_ITEMS =
+  "Value [] at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1"
+const NO_TRANSACT_GET_ITEMS =
+  "Value null at 'transactItems' failed to satisfy constraint: Member must not be null"
+const TOO_MANY_BATCH_WRITES = "Too many items requested for the BatchWriteItem call"
+const TOO_MANY_BATCH_GETS = "Too many items requested for the BatchGetItem call"
+
+/** A transaction's items: none, or over 100, refuse it before anything else. */
+const transactItems = (
+  items: ReadonlyArray<Record<string, any>> | undefined,
+  none: string,
+): ReadonlyArray<Record<string, any>> => {
+  if (items === undefined)
+    return unreadable("the transaction", "TransactItems", "missing (unmeasured)")
+  if (items.length === 0) refuse(none)
+  if (items.length > 100) refuse(TOO_MANY_TRANSACT_ITEMS)
+  return items
+}
 
 /**
- * A key or item check inside a transaction write. DynamoDB Local refuses the request when a `Put`
- * item lacks a key attribute, but cancels the transaction with a `ValidationError` reason for
- * other key problems, which these tables don't model.
+ * A transaction item's key. A key of another type than the table's is that item's
+ * `ValidationError` reason (`reason`); a missing, extra or empty key attribute refuses the request.
  */
-const inTransaction = <A>(check: () => A, what: unknown, refused: ReadonlyArray<string>): A => {
+const transactKey = (
+  check: () => Item,
+  what: unknown,
+): { readonly key?: Item | undefined; readonly reason?: string | undefined } => {
   try {
-    return check()
+    return { key: check() }
   } catch (error) {
-    if (isRefusal(error) && !refused.includes(error.message)) {
-      return unreadable(
-        "the transaction item",
-        shown(what),
-        `${error.message} (DynamoDB Local's answer to this in a transaction is not modelled)`,
-      )
+    if (!isRefusal(error)) throw error
+    if (error.message === TYPE_MISMATCH) return { reason: TYPE_MISMATCH }
+    if (
+      error.message === MISSING_KEY ||
+      error.message === KEY_COUNT ||
+      error.message.startsWith(EMPTY_KEY(""))
+    ) {
+      throw error
     }
-    throw error
+    return unreadable(
+      "the transaction item",
+      shown(what),
+      `${error.message} (DynamoDB Local's answer to this in a transaction is not modelled)`,
+    )
   }
 }
-const MISSING_KEY = "One of the required keys was not given a value"
+
+/** A refusal raised as a cancellation reason in a transaction; one with no key type is unmeasured there. */
+const asReason = (problem: IndexProblem, what: unknown): string => {
+  if (problem.message === INVALID_VALUE_TYPE) {
+    unreadable(
+      "the transaction item",
+      shown(what),
+      `${problem.message} (unmeasured in a transaction)`,
+    )
+  }
+  return problem.message
+}
 
 /**
- * A `TransactWriteItems` as DynamoDB Local answers it. Every item's request is checked first (a
- * refusal is request-wide); then the items are taken in order, each against the item as the
- * items before it left it: a failed condition is that item's `ConditionalCheckFailed` reason
- * (with the item as it stands, under `ALL_OLD`) and touches nothing; an update the item can't
- * take is a request-wide refusal; and an item already touched by an earlier item refuses the
- * request as naming one item twice. One failed condition cancels the transaction.
+ * A `TransactWriteItems` as DynamoDB Local answers it. None, or over 100, items refuse it. Every
+ * item's request is checked first (a refusal is request-wide; a key of the wrong type, or a put's
+ * index key of the wrong type, is that item's `ValidationError` reason). Then the items are taken
+ * in order, each against the item as the items before it left it: a failed condition is that
+ * item's `ConditionalCheckFailed` reason (with the item as it stands, under `ALL_OLD`) and
+ * touches nothing; an update of a key attribute cancels the transaction with that one reason;
+ * an update the item can't take, or an empty index key, refuses the request; an update's global
+ * index key of the wrong type is its `ValidationError` reason; and an item already touched by an
+ * earlier item refuses the request as naming one item twice. Any reason other than `None`
+ * cancels the transaction. Nothing is written until every item is taken.
  */
 export const transactWrite = (
   input: { readonly TransactItems?: ReadonlyArray<Record<string, any>> | undefined },
@@ -2096,7 +2456,7 @@ export const transactWrite = (
   options?: WriteOptions,
 ): TransactOutcome => {
   checkFields("TransactWriteItems", input)
-  const ops = (input.TransactItems ?? []).map((op) => {
+  const ops = transactItems(input.TransactItems, NO_TRANSACT_WRITE_ITEMS).map((op) => {
     const kinds = KINDS.filter((kind) => op[kind] !== undefined)
     if (
       kinds.length !== 1 ||
@@ -2117,31 +2477,41 @@ export const transactWrite = (
       unreadable("the ConditionCheck", shown(body), "no ConditionExpression (unmeasured)")
     }
     const schema = tables.schema(body.TableName!)
-    const key = inTransaction(
+    const indexes = tables.indexes(body.TableName!)
+    const keyed = transactKey(
       () =>
         kind === "Put"
           ? keyOfItem(checkItem(body.Item, schema), schema)
           : checkKey(body.Key, schema),
       body,
-      [MISSING_KEY],
     )
     const expressions = readExpressions(body)
-    for (const action of expressions.update ?? []) {
-      if (keyAttributes(schema).includes(action.path[0] as string)) {
-        unreadable(
-          "the transaction",
-          shown(body),
-          "an update of a key attribute (cancelled with a ValidationError reason on DynamoDB Local; not modelled)",
-        )
-      }
+    let reason = keyed.reason
+    if (kind === "Put" && reason === undefined) {
+      const problem = putIndexProblem(body.Item!, indexes, schema)
+      if (problem !== undefined && !problem.typed) refuse(problem.message)
+      if (problem !== undefined) reason = asReason(problem, body)
     }
-    return { kind, body, table: body.TableName!, key, schema, expressions }
+    return {
+      kind,
+      body,
+      table: body.TableName!,
+      key: keyed.key,
+      schema,
+      indexes,
+      expressions,
+      reason,
+    }
   })
   const state = new Map<string, Item | undefined>()
   const done = new Set<string>()
   const writes: Array<TableWrite> = []
   const reasons: Array<{ Code: string; Message?: string; Item?: Item }> = []
   for (const op of ops) {
+    if (op.reason !== undefined || op.key === undefined) {
+      reasons.push({ Code: "ValidationError", Message: op.reason! })
+      continue
+    }
     const identity = keyIdentity(op.table, op.key, keyAttributes(op.schema))
     const current = state.has(identity) ? state.get(identity) : tables.read(op.table, op.key)
     if (!conditionHolds(op.expressions.condition, current, options)) {
@@ -2154,16 +2524,36 @@ export const transactWrite = (
       })
       continue
     }
-    const next =
-      op.kind === "Put"
-        ? clone(op.body.Item!)
-        : op.kind === "Update"
-          ? applyActions(op.expressions.update ?? [], current ?? clone(op.key))
-          : op.kind === "Delete"
-            ? undefined
-            : current
+    let next: Item | undefined
+    let reason: string | undefined
+    if (op.kind === "Update") {
+      const update = op.expressions.update ?? []
+      const named = update.find((action) =>
+        keyAttributes(op.schema).includes(action.path[0] as string),
+      )
+      if (named !== undefined) {
+        // Measured: one reason, however many items the transaction has.
+        return {
+          _tag: "Cancelled",
+          error: transactionCanceled([
+            { Code: "ValidationError", Message: keyAttributeRefusal(named.path[0] as string) },
+          ]),
+        }
+      }
+      next = applyActions(update, current ?? clone(op.key))
+      const problem = updateIndexProblem(next, update, op.indexes, op.schema)
+      if (problem !== undefined && !problem.typed) refuse(problem.message)
+      if (problem !== undefined) reason = asReason(problem, op.body)
+    } else {
+      next =
+        op.kind === "Put" ? putWritten(op.body.Item!) : op.kind === "Delete" ? undefined : current
+    }
     if (done.has(identity)) refuse(DDB_REPEATED_ITEM)
     done.add(identity)
+    if (reason !== undefined) {
+      reasons.push({ Code: "ValidationError", Message: reason })
+      continue
+    }
     state.set(identity, next)
     if (op.kind !== "ConditionCheck") writes.push({ table: op.table, key: op.key, item: next })
     reasons.push({ Code: "None" })
@@ -2181,7 +2571,7 @@ export const transactGet = (
 ): { readonly Responses: ReadonlyArray<{ readonly Item?: Item }> } => {
   checkFields("TransactGetItems", input)
   const seen = new Set<string>()
-  const gets = (input.TransactItems ?? []).map((op) => {
+  const gets = transactItems(input.TransactItems, NO_TRANSACT_GET_ITEMS).map((op) => {
     if (op.Get === undefined || Object.keys(op).some((k) => k !== "Get" && op[k] !== undefined)) {
       return unreadable("the TransactItems entry", shown(op), "not a Get")
     }
@@ -2218,11 +2608,22 @@ export const batchGet = (
   tables: Tables,
 ): { readonly Responses: Record<string, Array<Item>>; readonly UnprocessedKeys: {} } => {
   checkFields("BatchGetItem", input)
+  const entries = Object.entries(input.RequestItems ?? {})
+  if (entries.length === 0) refuse("BatchGetItem must have some requests set")
+  for (const [table, request] of entries) {
+    if ((request.Keys ?? []).length === 0) {
+      refuse(
+        `The list of keys in RequestItems for BatchGetItem is required: ${table} has empty list`,
+      )
+    }
+  }
+  const total = entries.reduce((sum, [, request]) => sum + request.Keys.length, 0)
+  if (total > 100) refuse(TOO_MANY_BATCH_GETS)
   const Responses: Record<string, Array<Item>> = {}
-  const requests = Object.entries(input.RequestItems ?? {}).map(([table, request]) => {
+  const requests = entries.map(([table, request]) => {
     checkFields("BatchGetItem table", request)
     const schema = tables.schema(table)
-    const keys = (request.Keys ?? []) as ReadonlyArray<Item>
+    const keys = request.Keys as ReadonlyArray<Item>
     for (const key of keys) checkKey(key, schema)
     const identities = keys.map((key) => keyIdentity(table, key, keyAttributes(schema)))
     if (new Set(identities).size !== identities.length) refuse(DDB_REPEATED_BATCH_ITEM)
@@ -2239,15 +2640,23 @@ export const batchGet = (
   return { Responses, UnprocessedKeys: {} }
 }
 
-/** A `BatchWriteItem`'s writes, in request order. */
+/** A `BatchWriteItem`'s writes, in request order, every request checked before any is returned. */
 export const batchWrite = (
   input: { readonly RequestItems?: Record<string, ReadonlyArray<Record<string, any>>> | undefined },
   tables: Tables,
 ): ReadonlyArray<TableWrite> => {
   checkFields("BatchWriteItem", input)
+  const entries = Object.entries(input.RequestItems ?? {})
+  if (entries.length === 0) refuse("BatchWriteItem cannot have a null or no requests set")
+  const total = entries.reduce((sum, [, requests]) => sum + requests.length, 0)
+  if (total > 25) refuse(TOO_MANY_BATCH_WRITES)
   const writes: Array<TableWrite> = []
-  for (const [table, requests] of Object.entries(input.RequestItems ?? {})) {
+  for (const [table, requests] of entries) {
+    if (requests.length === 0) {
+      refuse(`The batch write request list for a table cannot be null or empty: ${table}`)
+    }
     const schema = tables.schema(table)
+    const indexes = tables.indexes(table)
     const identities: Array<string> = []
     for (const request of requests) {
       const kinds = ["PutRequest", "DeleteRequest"].filter((kind) => request[kind] !== undefined)
@@ -2263,9 +2672,18 @@ export const batchWrite = (
       }
       if (request.PutRequest !== undefined) {
         const item = checkItem(request.PutRequest.Item, schema)
+        const problem = putIndexProblem(item, indexes, schema)
+        if (problem?.message === INVALID_VALUE_TYPE) {
+          unreadable(
+            "the BatchWriteItem request",
+            shown(request),
+            `${problem.message} (unmeasured)`,
+          )
+        }
+        if (problem !== undefined) refuse(problem.message)
         const key = keyOfItem(item, schema)
         identities.push(keyIdentity(table, key, keyAttributes(schema)))
-        writes.push({ table, key, item: clone(item) })
+        writes.push({ table, key, item: putWritten(item) })
       } else {
         const key = checkKey(request.DeleteRequest.Key, schema)
         identities.push(keyIdentity(table, key, keyAttributes(schema)))
@@ -2340,66 +2758,291 @@ export interface QueryInput extends ExpressionInput {
   readonly TotalSegments?: number | undefined
 }
 
-/** A read's page: the rows it examined (after `ExclusiveStartKey`, up to `Limit`), filtered and projected. */
+/** A read's index: its name, its keys and whether it is local. */
+interface ReadIndex {
+  readonly name: string
+  readonly schema: IndexSchema
+  readonly local: boolean
+}
+
+/**
+ * What a read returns of each row, `Select` and `ProjectionExpression` checked as DynamoDB Local
+ * checks them: `undefined` for a count; on an index, its projected attributes by default; a
+ * global index's projection refuses `ALL_ATTRIBUTES` and names outside it; a local index's reads
+ * any attribute (DynamoDB fetches it from the table).
+ */
+const shapeOf = (
+  input: QueryInput,
+  expressions: Expressions,
+  table: KeySchema,
+  index: ReadIndex | undefined,
+): ((row: Item) => Item) | undefined => {
+  const projection = expressions.projection
+  const select = input.Select
+  if (
+    select !== undefined &&
+    !["ALL_ATTRIBUTES", "ALL_PROJECTED_ATTRIBUTES", "COUNT", "SPECIFIC_ATTRIBUTES"].includes(select)
+  ) {
+    unreadable("the Select", select, "not a Select DynamoDB reads (unmeasured wording)")
+  }
+  if (select === "COUNT" && projection !== undefined) {
+    refuse("Cannot specify the ProjectionExpression when choosing to get only the Count")
+  }
+  if (select === "SPECIFIC_ATTRIBUTES" && projection === undefined) {
+    refuse(
+      "Must specify the AttributesToGet or ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES",
+    )
+  }
+  if (select === "ALL_ATTRIBUTES" && projection !== undefined) {
+    refuse("Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES")
+  }
+  if (select === "ALL_PROJECTED_ATTRIBUTES") {
+    if (index === undefined) {
+      refuse("ALL_PROJECTED_ATTRIBUTES can be used only when Querying using an IndexName")
+    }
+    if (projection !== undefined) {
+      unreadable("the Select", select, "with a ProjectionExpression (unmeasured)")
+    }
+  }
+  const projected = index === undefined ? undefined : projectedBy(index.schema, table)
+  if (select === "COUNT") return undefined
+  if (projection !== undefined) return (row) => project(row, projection)
+  if (select === "ALL_ATTRIBUTES" || projected === undefined) return (row) => row
+  return (row) => {
+    const out: Item = {}
+    for (const name of Object.keys(row)) {
+      if (projected.has(name)) setOwn(out, name, row[name]!)
+    }
+    return out
+  }
+}
+
+/**
+ * A query of an index whose projection isn't `ALL`: a filter naming an attribute it doesn't hold
+ * is refused, then (of a global index) `ALL_ATTRIBUTES`, then a `ProjectionExpression` naming one.
+ */
+const checkProjected = (
+  input: QueryInput,
+  expressions: Expressions,
+  table: KeySchema,
+  index: ReadIndex | undefined,
+): void => {
+  const projected = index === undefined ? undefined : projectedBy(index.schema, table)
+  if (index === undefined || projected === undefined) return
+  const outside = (names: ReadonlyArray<string>) =>
+    theProblem(
+      names.filter((name) => !projected.has(name)),
+      `the attributes ${index.name} doesn't project`,
+    )
+  const filtered =
+    expressions.filter === undefined ? undefined : outside(conditionAttributes(expressions.filter))
+  if (filtered !== undefined) {
+    refuse(
+      `One or more parameter values were invalid: Secondary index ${index.name} does not project one or more filter attributes: [${filtered}]`,
+    )
+  }
+  if (!index.local && input.Select === "ALL_ATTRIBUTES") {
+    refuse(
+      `One or more parameter values were invalid: Select type ALL_ATTRIBUTES is not supported for global secondary index ${index.name} because its projection type is not ALL`,
+    )
+  }
+  if (!index.local && expressions.projection !== undefined) {
+    const named = outside(expressions.projection.map((path) => path[0] as string))
+    if (named !== undefined) {
+      refuse(
+        `One or more parameter values were invalid: Global secondary index ${index.name} does not project [${named}]`,
+      )
+    }
+  }
+}
+
+const START_INVALID = "The provided starting key is invalid"
+const START_SIZE = "Exclusive Start Key must have same size as table's key schema"
+const START_TYPE = "Type mismatch for attribute to update"
+const START_PREDICATE = "The provided starting key does not match the range key predicate"
+
+/**
+ * An `ExclusiveStartKey` checked as DynamoDB Local checks it: it names exactly the table's key
+ * attributes (and, for an index, the index's), of their types and not empty. A read of the table
+ * or a local index refuses a key of another size before one naming other attributes; a global
+ * index's, any key not naming exactly those attributes.
+ */
+const checkStartKey = (start: Item, table: KeySchema, index: ReadIndex | undefined): void => {
+  const given = Object.keys(start)
+  if (given.length === 0) refuse(START_INVALID)
+  const expected = [
+    ...new Set([table.pk, table.sk, ...(index === undefined ? [] : keyAttributes(index.schema))]),
+  ]
+  const names = expected.every((attribute) => Object.hasOwn(start, attribute))
+  if (index === undefined || index.local) {
+    if (given.length !== expected.length) refuse(START_SIZE)
+    if (!names) refuse(START_INVALID)
+  } else if (given.length !== expected.length || !names) {
+    refuse(START_INVALID)
+  }
+  const problems: Array<string> = []
+  for (const attribute of expected) {
+    const value = start[attribute]!
+    const type = keyTypeIn(index?.schema, table, attribute)
+    if (typeOf(value) !== type) problems.push(START_TYPE)
+    else if (isEmptyKeyValue(value)) {
+      const ofTable = attribute === table.pk || attribute === table.sk
+      if (!ofTable && type === "B") {
+        unreadable("the ExclusiveStartKey", shown(start), "an empty binary key (unmeasured)")
+      }
+      const partition = attribute === table.pk || attribute === index?.schema.pk
+      problems.push(
+        `${partition ? "The query can return at most one row and cannot be restarted. " : ""}${START_INVALID}: ${ofTable ? EMPTY_KEY(attribute) : indexEmpty(index!.name, attribute, false)}`,
+      )
+    }
+  }
+  const problem = theProblem(problems, "the ExclusiveStartKey")
+  if (problem !== undefined) refuse(problem)
+}
+
+/**
+ * A read's page: the rows it examined (after `ExclusiveStartKey`, up to `Limit`), filtered and
+ * shaped. A read that stops at its `Limit` says where (`LastEvaluatedKey`), even when nothing is
+ * left after that row, unless `endsAt` says the row is the last its key condition can reach.
+ */
 const page = (
   input: QueryInput,
   rows: ReadonlyArray<Item>,
   expressions: Expressions,
+  shape: ((row: Item) => Item) | undefined,
   lastKey: (row: Item) => Item,
+  endsAt: (row: Item) => boolean = () => false,
 ) => {
   if (input.Limit !== undefined && !(Number.isInteger(input.Limit) && input.Limit >= 1)) {
     unreadable("the Limit", String(input.Limit), "not a positive integer (unmeasured wording)")
   }
-  const select =
-    input.Select ??
-    (expressions.projection === undefined ? "ALL_ATTRIBUTES" : "SPECIFIC_ATTRIBUTES")
-  if (!["ALL_ATTRIBUTES", "COUNT", "SPECIFIC_ATTRIBUTES"].includes(select)) {
-    unreadable("the Select", select, "not modelled")
-  }
   const examined = input.Limit === undefined ? rows : rows.slice(0, input.Limit)
   const last = examined[examined.length - 1]
-  // A read that stops at its `Limit` says where, even when nothing is left after that row.
   const more =
-    last !== undefined && (examined.length < rows.length || examined.length === input.Limit)
+    last !== undefined &&
+    (examined.length < rows.length || (examined.length === input.Limit && !endsAt(last)))
   const kept = examined.filter(
     (row) => expressions.filter === undefined || evaluate(expressions.filter, row),
   )
   return {
-    ...(select !== "COUNT" && {
-      Items: kept.map((row) =>
-        asRead(expressions.projection === undefined ? row : project(row, expressions.projection)),
-      ),
-    }),
+    ...(shape !== undefined && { Items: kept.map((row) => asRead(shape(row))) }),
     Count: kept.length,
     ScannedCount: examined.length,
     ...(more && { LastEvaluatedKey: lastKey(last) }),
   }
 }
 
+const CONDITION_TYPE =
+  "One or more parameter values were invalid: Condition parameter type does not match schema type"
+
+/** The literal values a key condition part compares its attribute with, or a defect for any other operand. */
+const keyOperands = (part: Condition): ReadonlyArray<AttributeValue> => {
+  const operands =
+    part.kind === "compare"
+      ? [part.left, part.right]
+      : part.kind === "between"
+        ? [part.subject, part.low, part.high]
+        : part.kind === "begins_with"
+          ? [part.subject, part.operand]
+          : []
+  const values = operands.filter((operand) => operand.kind !== "path")
+  if (values.some((operand) => operand.kind !== "value") || values.length !== operands.length - 1) {
+    unreadable("the KeyConditionExpression part", shown(part), "an operand that isn't a value")
+  }
+  return values.map((operand) => (operand as ValueNode).value!)
+}
+
 /**
- * A `Query`'s output over `rows` (every item of the table), on the table's keys or an index's: the
- * key condition checked as DynamoDB checks it, rows in sort-key order (then by table key), paged
- * by `ExclusiveStartKey` / `Limit` (rows examined before the filter), filtered and projected.
+ * The sort key value a key condition part ends its range at, read in `forward` order, when the
+ * range includes it: `<=` (or `BETWEEN`'s high value) forward, `>=` (or the low value) in reverse.
+ * DynamoDB Local returns no `LastEvaluatedKey` when a table read's `Limit` stops on that row.
+ */
+const inclusiveEnd = (
+  part: Condition | undefined,
+  forward: boolean,
+): AttributeValue | undefined => {
+  if (part === undefined) return undefined
+  if (part.kind === "between") return forward ? literal(part.high) : literal(part.low)
+  if (part.kind !== "compare") return undefined
+  const flipped: Record<string, string> = { "<": ">", "<=": ">=", ">": "<", ">=": "<=" }
+  const op = part.left.kind === "path" ? part.op : (flipped[part.op] ?? part.op)
+  const value = literal(part.left) ?? literal(part.right)
+  return (forward ? op === "<=" : op === ">=") ? value : undefined
+}
+
+/**
+ * DynamoDB Local orders an index's rows of one key by something of its own (measured: no order of
+ * their table keys). A read whose rows would depend on that order is a defect naming it: a `Limit`
+ * stopping between two of them, or an `ExclusiveStartKey` among them. Rows of one key that one
+ * answer returns together come in table-key order, where DynamoDB Local's differs (listed at the
+ * top of this module).
+ */
+const unorderedTies = (
+  input: QueryInput,
+  matched: ReadonlyArray<Item>,
+  schema: KeySchema,
+  table: KeySchema,
+  start: Item | undefined,
+): void => {
+  const tie = (a: Item, b: Item) => sameValue(a[schema.sk]!, b[schema.sk]!)
+  const sameRow = (a: Item, b: Item) =>
+    sameValue(a[table.pk]!, b[table.pk]!) && sameValue(a[table.sk]!, b[table.sk]!)
+  const what = `rows of one ${schema.sk} (DynamoDB Local's order among them is not modelled)`
+  if (start !== undefined && matched.some((row) => tie(row, start) && !sameRow(row, start))) {
+    unreadable("the ExclusiveStartKey", shown(start), `among ${what}`)
+  }
+  const from =
+    start === undefined
+      ? matched
+      : matched.filter((row) => compareKeyValues(row[schema.sk]!, start[schema.sk]!) !== 0)
+  const limit = input.Limit ?? from.length
+  const examined = from.slice(0, limit)
+  const last = examined[examined.length - 1]
+  const next = from[examined.length]
+  if (last !== undefined && next !== undefined && tie(last, next)) {
+    unreadable("the Limit", String(input.Limit), `stopping between ${what}`)
+  }
+}
+
+/**
+ * A `Query`'s output over `rows` (every item of the table), on the table's keys or one of
+ * `indexes`: `Select`, the key condition, the projection and the `ExclusiveStartKey` checked as
+ * DynamoDB Local checks them; rows in sort-key order (then by table key); paged by
+ * `ExclusiveStartKey` / `Limit` (rows examined before the filter), filtered and shaped.
  */
 export const query = (
   input: QueryInput,
   rows: ReadonlyArray<Item>,
   table: KeySchema,
-  index: KeySchema | undefined,
+  indexes: Indexes,
 ) => {
   checkFields("Query", input)
   const expressions = readExpressions(input)
   if (expressions.keyCondition === undefined) {
     return unreadable("the Query", shown(input), "no KeyConditionExpression")
   }
-  const schema = index ?? table
-  if (index !== undefined && input.ConsistentRead === true) {
+  let index: ReadIndex | undefined
+  if (input.IndexName !== undefined) {
+    const schema = own(indexes, input.IndexName)
+    if (schema === undefined) {
+      return unreadable("the IndexName", input.IndexName, "not an index the table declares")
+    }
+    index = { name: input.IndexName, schema, local: isLocal(input.IndexName, schema, table) }
+  }
+  const shape = shapeOf(input, expressions, table, index)
+  if (index !== undefined && !index.local && input.ConsistentRead === true) {
     refuse("Consistent reads are not supported on global secondary indexes")
   }
+  const schema = index?.schema ?? table
   const parts = keyConditionParts(expressions.keyCondition)
   const on = (part: Condition): string | undefined => {
     const attributes = conditionAttributes(part)
     return attributes.length === 1 ? attributes[0] : undefined
+  }
+  for (const attribute of keyAttributes(schema)) {
+    if (parts.filter((part) => on(part) === attribute).length > 1) {
+      refuse("KeyConditionExpressions must only contain one condition per key")
+    }
   }
   const partition = parts.find((part) => on(part) === schema.pk)
   if (
@@ -2407,16 +3050,25 @@ export const query = (
     partition.kind !== "compare" ||
     partition.op !== "=" ||
     parts.length > 2 ||
-    parts.some((part) => on(part) !== schema.pk && on(part) !== schema.sk) ||
-    (parts.length === 2 && parts.every((part) => on(part) === schema.pk))
+    parts.some((part) => on(part) !== schema.pk && on(part) !== schema.sk)
   ) {
     return refuse("Query condition missed key schema element")
   }
-  const partitionValue = literal(partition.left) ?? literal(partition.right)
-  if (partitionValue === undefined || typeOf(partitionValue) !== "S") {
-    refuse(
-      "One or more parameter values were invalid: Condition parameter type does not match schema type",
-    )
+  const sort = parts.find((part) => on(part) === schema.sk)
+  for (const part of [partition, sort]) {
+    if (part === undefined) continue
+    const attribute = on(part)!
+    const type = keyTypeIn(index?.schema, table, attribute)
+    for (const value of keyOperands(part)) {
+      if (isEmptyKeyValue(value)) {
+        refuse(
+          attribute === table.pk || attribute === table.sk
+            ? EMPTY_KEY(attribute)
+            : indexEmpty(index!.name, attribute, value.B !== undefined),
+        )
+      }
+      if (typeOf(value) !== type) refuse(CONDITION_TYPE)
+    }
   }
   if (expressions.filter !== undefined) {
     const named = conditionAttributes(expressions.filter).find(
@@ -2426,6 +3078,21 @@ export const query = (
       refuse(
         `Filter Expression can only contain non-primary key attributes: Primary key attribute: ${named}`,
       )
+    }
+  }
+  checkProjected(input, expressions, table, index)
+  const forward = input.ScanIndexForward !== false
+  // Measured: a read of the table's own keys treats its range's inclusive end, in the direction
+  // it reads, as exclusive: it stops there without a key, and won't start from it.
+  const end = index === undefined ? inclusiveEnd(sort, forward) : undefined
+  const start = input.ExclusiveStartKey
+  if (start !== undefined) {
+    checkStartKey(start, table, index)
+    if (
+      !parts.every((part) => evaluate(part, start)) ||
+      (end !== undefined && sameValue(start[schema.sk]!, end))
+    ) {
+      refuse(START_PREDICATE)
     }
   }
   const tableOrder = (a: Item, b: Item) =>
@@ -2440,23 +3107,24 @@ export const query = (
         parts.every((part) => evaluate(part, row)),
     )
     .sort(compare)
-  const forward = input.ScanIndexForward !== false
   if (!forward) matched.reverse()
-  const start = input.ExclusiveStartKey
+  if (index !== undefined) unorderedTies(input, matched, schema, table, start)
   if (start !== undefined) {
     matched = matched.filter((row) => (forward ? compare(row, start) > 0 : compare(row, start) < 0))
   }
   const lastKey = (row: Item): Item => ({
     ...keyOfItem(row, table),
-    ...(index !== undefined && keyOfItem(row, index)),
+    ...(index !== undefined && keyOfItem(row, index.schema)),
   })
-  return page(input, matched, expressions, lastKey)
+  const endsAt = (row: Item) => end !== undefined && sameValue(row[schema.sk]!, end)
+  return page(input, matched, expressions, shape, lastKey, endsAt)
 }
 
 /**
  * A `Scan`'s output over `rows`, which the table gives in its own order with `Segment` /
- * `TotalSegments` already applied: paged by `ExclusiveStartKey` (`after` gives the rows past it)
- * and `Limit`, filtered and projected.
+ * `TotalSegments` already applied: `Select` and the `ExclusiveStartKey` checked as DynamoDB Local
+ * checks them, paged by `ExclusiveStartKey` (`after` gives the rows past it) and `Limit`,
+ * filtered and shaped.
  */
 export const scan = (
   input: QueryInput,
@@ -2466,8 +3134,11 @@ export const scan = (
 ) => {
   checkFields("Scan", input)
   const expressions = readExpressions(input)
-  const from = input.ExclusiveStartKey === undefined ? rows : after(input.ExclusiveStartKey)
-  return page(input, from, expressions, (row) => keyOfItem(row, table))
+  const shape = shapeOf(input, expressions, table, undefined)
+  const start = input.ExclusiveStartKey
+  if (start !== undefined) checkStartKey(start, table, undefined)
+  const from = start === undefined ? rows : after(start)
+  return page(input, from, expressions, shape, (row) => keyOfItem(row, table))
 }
 
 /** Run `answer`; a refusal becomes `onRefusal`'s failure, anything else thrown stays a defect. */

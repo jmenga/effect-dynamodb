@@ -34,6 +34,7 @@ import {
   serviceOf,
   withConsumedCapacity,
 } from "./helpers/CapacityMock.js"
+import { indexesOf } from "./helpers/DynamoExpressions.js"
 import { InMemoryClient, resetStore, tableIndexes } from "./helpers/InMemoryTables.js"
 import { mockDynamoClient } from "./helpers/MockDynamoClient.js"
 
@@ -634,9 +635,8 @@ const cases: ReadonlyArray<Case> = [
 ]
 
 tableIndexes.set("shop-table", {
-  gsi1: { pk: "gsi1pk", sk: "gsi1sk" },
-  gsi3: { pk: "gsi3pk", sk: "gsi3sk" },
-  gsi4: { pk: "gsi4pk", sk: "gsi4sk" },
+  ...indexesOf(Table.definition(MainTable)),
+  // The aggregate's collection index and the stream's index, which the table's definition doesn't read.
   lsi1: { pk: "pk", sk: "lsi1sk" },
 })
 beforeEach(() => resetStore())

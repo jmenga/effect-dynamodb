@@ -5,11 +5,13 @@
 
 import { describe, it } from "@effect/vitest"
 import { Effect } from "effect"
+import * as Table from "../src/Table.js"
+import { indexesOf } from "./helpers/DynamoExpressions.js"
 import { makeRecordingTable } from "./helpers/RecordingTable.js"
 import * as RekeyRepair from "./helpers/RekeyRepair.js"
 
-const harness = RekeyRepair.harnessOn(() => {
-  const table = makeRecordingTable({ indexes: RekeyRepair.RECORDING_INDEXES })
+const harness = RekeyRepair.harnessOn((world) => {
+  const table = makeRecordingTable({ indexes: indexesOf(Table.definition(world.MainTable)) })
   return { tableName: "t", client: table.layer, acquire: Effect.void, release: Effect.void }
 })
 

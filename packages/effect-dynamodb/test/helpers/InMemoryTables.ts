@@ -87,9 +87,14 @@ export const resetCalls = () => {
 
 /** Key attribute names per table (default `pk` / `sk`). */
 export const tableKeys = new Map<string, KeySchema>()
-/** Secondary indexes' key attribute names, per table, for queries of an index. */
+/**
+ * Secondary indexes, per table: their keys, kind and projection, for queries of an index and the
+ * index key checks on writes. A table with none here declares none.
+ */
 export const tableIndexes = new Map<string, Readonly<Record<string, IndexSchema>>>()
 const keysOf = (table: string): KeySchema => tableKeys.get(table) ?? { pk: "pk", sk: "sk" }
+const indexesOf = (table: string): Readonly<Record<string, IndexSchema>> =>
+  tableIndexes.get(table) ?? {}
 
 const escapePart = (text: string) => text.replace(/[\\|]/g, (c) => `\\${c}`)
 
@@ -118,6 +123,7 @@ const rowsOf = (table: string) => {
 
 const tables: Tables = {
   schema: keysOf,
+  indexes: indexesOf,
   read: (table, key) => store.get(keyOf(table, key)),
 }
 
@@ -155,18 +161,9 @@ export const InMemoryClient = mockDynamoClientLayer({
       calls.query++
       queried.push(input.ExpressionAttributeValues ?? {})
       const table = input.TableName!
-      const index =
-        input.IndexName === undefined
-          ? undefined
-          : (tableIndexes.get(table)?.[input.IndexName] ??
-            (() => {
-              throw new UnreadableRequest(
-                `InMemoryTables: a query of index ${input.IndexName} of ${table} needs its keys in tableIndexes`,
-              )
-            })())
       const rows = rowsOf(table)
       return answering(
-        () => Effect.succeed(query(input as never, rows, keysOf(table), index) as never),
+        () => Effect.succeed(query(input as never, rows, keysOf(table), indexesOf(table)) as never),
         failure("Query"),
       )
     }),
@@ -192,9 +189,7 @@ export const InMemoryClient = mockDynamoClientLayer({
           input as never,
           (key) => store.get(keyOf(table, key)),
           keysOf(table),
-          {
-            failCondition,
-          },
+          { failCondition, indexes: indexesOf(table) },
         )
         return write("PutItem", table, input.Item!, outcome) as never
       }, failure("PutItem"))
@@ -208,7 +203,7 @@ export const InMemoryClient = mockDynamoClientLayer({
           input as never,
           (key) => store.get(keyOf(table, key)),
           keysOf(table),
-          { failCondition },
+          { failCondition, indexes: indexesOf(table) },
         )
         return write("UpdateItem", table, input.Key!, outcome) as never
       }, failure("UpdateItem"))
